@@ -478,7 +478,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         &revision,
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
-    assert!(claude_terminal_authority_hold_is_bound(&held, &terminal));
+    assert!(claude_authority_hold_is_bound(&held, &terminal));
 
     let mut retry = ScanIndex::default();
     bind_authority_quarantine(
@@ -489,7 +489,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
     );
     // FLIPS on the pre-bridge head: RetryPending was always progress-blocking.
-    assert!(claude_terminal_authority_hold_is_bound(&held, &retry));
+    assert!(claude_authority_hold_is_bound(&held, &retry));
 
     // A correction grant keeps a RetryPending hold blocking.
     let mut retry_correction = retry.clone();
@@ -504,10 +504,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
             owed_member_ids: BTreeSet::from([held.source_session_id.clone()]),
         });
     }
-    assert!(!claude_terminal_authority_hold_is_bound(
-        &held,
-        &retry_correction
-    ));
+    assert!(!claude_authority_hold_is_bound(&held, &retry_correction));
 
     let mut other_revision = ScanIndex::default();
     bind_authority_quarantine(
@@ -517,10 +514,7 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         &hex64('b'),
         ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
     );
-    assert!(!claude_terminal_authority_hold_is_bound(
-        &held,
-        &other_revision
-    ));
+    assert!(!claude_authority_hold_is_bound(&held, &other_revision));
 
     let mut unbound_witness = terminal.clone();
     unbound_witness
@@ -528,14 +522,11 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         .get_mut(&family_root)
         .expect("retained witness")
         .evidence_fingerprint = hex64('f');
-    assert!(!claude_terminal_authority_hold_is_bound(
-        &held,
-        &unbound_witness
-    ));
+    assert!(!claude_authority_hold_is_bound(&held, &unbound_witness));
 
     let mut unknown_revision = held.clone();
     unknown_revision.source_file_fingerprint = None;
-    assert!(!claude_terminal_authority_hold_is_bound(
+    assert!(!claude_authority_hold_is_bound(
         &unknown_revision,
         &terminal
     ));

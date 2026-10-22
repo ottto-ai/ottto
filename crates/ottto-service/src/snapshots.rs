@@ -2938,12 +2938,15 @@ impl ClaudeUsageAuthorityDisposition {
             .collect()
     }
 
-    /// Held revisions that a later page of the same traversal could still
-    /// change. Two hold classes cannot progress within a traversal:
+    /// Held revisions that owe the traversal a clean follow-up. Two hold
+    /// classes do not:
     ///
-    /// - an authority demotion whose root carries a bounded `UnprovenTerminal`
-    ///   record bound to the retained witness and to this exact revision; the
-    ///   candidate gate skips that revision until the family changes;
+    /// - an authority demotion whose root carries a bounded record bound to
+    ///   the retained witness and to this exact revision: `UnprovenTerminal`,
+    ///   or `RetryPending` without a correction grant (the path-(a) bridge).
+    ///   The record keeps the family's retry clock and quarantine, and the
+    ///   candidate gate selects the family again only when it changes or its
+    ///   retry is due; the held key keeps its committed revision;
     /// - an account deferral, whose verdict depends on the body and the local
     ///   request evidence rather than on traversal completeness. Its key keeps
     ///   the committed revision and is reparsed by every later generation.
@@ -2970,7 +2973,7 @@ impl ClaudeUsageAuthorityDisposition {
                 {
                     return !account_holds_recorded;
                 }
-                !claude_terminal_authority_hold_is_bound(snapshot, index)
+                !claude_authority_hold_is_bound(snapshot, index)
             })
             .map(|snapshot| snapshot.snapshot_fingerprint.clone())
             .collect()
@@ -4024,11 +4027,14 @@ fn claude_family_carry_cancellation_admitted(
     cost.add(growth_bytes).is_some() && cost.add(requeue_path_bytes).is_some()
 }
 
-/// A demoted revision cannot progress within a traversal only while its family
-/// quarantine is terminal, bounded, bound to the retained witness, and records
-/// exactly this revision: the candidate gate then skips it until the family
-/// changes. Every other shape can still change on a later page.
-fn claude_terminal_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) -> bool {
+/// A demoted revision owes no clean follow-up only while its family quarantine
+/// is bounded, bound to the retained witness, and records exactly this
+/// revision: the candidate gate then skips it until the family changes (or,
+/// for RetryPending, its retry is due). A terminal record always qualifies. A
+/// RetryPending record qualifies only without a correction grant (path-(a)
+/// bridge): its hold, quarantine and retry clock are unchanged, and its
+/// pending count keeps the census withheld. Every other shape still blocks.
+fn claude_authority_hold_is_bound(snapshot: &SnapshotItem, index: &ScanIndex) -> bool {
     let Some(revision) = snapshot.source_file_fingerprint.as_ref() else {
         return false;
     };
@@ -4038,7 +4044,13 @@ fn claude_terminal_authority_hold_is_bound(snapshot: &SnapshotItem, index: &Scan
         .get(&root_session_id)
         .zip(index.claude_usage_family_witnesses.get(&root_session_id))
         .is_some_and(|(record, witness)| {
-            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+            let bounded_disposition = match record.disposition {
+                ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal => true,
+                ClaudeUsageAuthorityQuarantineDisposition::RetryPending => {
+                    record.proof_correction.is_none()
+                }
+            };
+            bounded_disposition
                 && claude_usage_authority_preserves_pending(record, witness)
                 && record
                     .member_source_file_fingerprints
@@ -6462,11 +6474,15 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             index.claude_request_identity_contract.as_deref() == Some(identity_contract);
         let fence_stays_closed =
             overflowed_before && index.claude_duplicate_request_witness_overflowed;
+        // Path-(a) bridge: RetryPending authority debt no longer marks the
+        // sweep, so the latch also requires that no such debt remains.
+        let sweep_fully_settled = !index.bounded_sweep_had_unsettled_upload
+            && index.claude_usage_authority_pending_count() == 0;
         let identity_contract_rearm = index.claude_request_identity_contract_changed
             && fence_stays_closed
             && census_complete
             && identity_contract_recorded
-            && !index.bounded_sweep_had_unsettled_upload;
+            && sweep_fully_settled;
         // Fence recovery: members an earlier skip left unread stay unobserved,
         // and their families' pending goes stale. When witnessed families
         // this window did not read, which the BASE re-arm would have re-read,
@@ -6476,7 +6492,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         // An unchanged settled proof owes no replay only while the fence was
         // closed before and stays closed after this census, nothing re-arms
         // every file, the identity contract is unchanged, the sweep settled,
-        // and the accepted ledger is current and not being rebuilt.
+        // and the accepted ledger is current and not being rebuilt. Authority
+        // debt alone does not unsettle the sweep; `claude_unchanged_proof_roots`
+        // still excludes every quarantined or demoting root.
         let unchanged_proof_gate = fence_stays_closed
             && !full_rearm
             && !index.claude_request_identity_contract_changed
@@ -6485,11 +6503,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             && claude_accepted_ledger_is_current(index)
             && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
         // A partially settled page earlier in this traversal (shed, lost ACK
-        // or refused CAS) keeps the latch; so does a partial save of this one.
+        // or refused CAS) keeps the latch; so does a partial save of this one,
+        // and so does any RetryPending authority family.
         if census_complete
             && (full_rearm || identity_contract_rearm || fence_recovery_rearm)
             && identity_contract_recorded
-            && !index.bounded_sweep_had_unsettled_upload
+            && sweep_fully_settled
         {
             index.claude_request_identity_contract_changed = false;
         }

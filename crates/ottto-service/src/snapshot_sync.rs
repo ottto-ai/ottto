@@ -269,13 +269,14 @@ fn exclude_held_effective_body_witness_revision(
 /// Commit a `Completed` upload that left local holds. Every uploaded entity was
 /// accepted or unchanged; only the held revisions are unsettled.
 ///
-/// A hold that the same traversal could still change (`progress_blocking`,
-/// which includes any RetryPending authority family) keeps the conservative
-/// partial commit and marks the sweep unsettled, so the generation needs one
-/// clean follow-up. Otherwise every hold is non-progressing: held keys keep
-/// their committed revision, every other key commits as the no-hold save
-/// would, and the traversal may settle. The caller keeps backfill and replay
-/// completion pending, and the durable hold disclosure keeps health red.
+/// A hold that owes a clean follow-up (`progress_blocking`) keeps the
+/// conservative partial commit and marks the sweep unsettled, so the
+/// generation needs one clean follow-up. Otherwise every hold is
+/// non-progressing (account deferrals and bound authority holds, including
+/// bound RetryPending families under the path-(a) bridge): held keys keep their
+/// committed revision, every other key commits as the no-hold save would, and
+/// the traversal may settle. The caller keeps backfill and replay completion
+/// pending, and the durable hold disclosure keeps health red.
 ///
 /// A non-progressing hold in a Claude family that retains authority evidence
 /// but has no committed entry to restore, as after a historical replay reset,
@@ -319,7 +320,9 @@ fn commit_completed_with_local_holds(
 struct LocalHoldSettlement {
     /// Sessions held locally on this page.
     held_entity_count: usize,
-    /// RetryPending Claude authority families anywhere in the index.
+    /// RetryPending Claude authority families anywhere in the index. They keep
+    /// full completion (backfill, replay) pending, but since the path-(a)
+    /// bridge they no longer make an unrelated page progress-blocking.
     retry_pending_family_count: usize,
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
@@ -359,13 +362,17 @@ impl LocalHoldSettlement {
             retry_pending_family_count,
             held_fingerprints,
             account_deferred_fingerprints,
-            progress_blocking: retry_pending_family_count > 0
-                || !progress_blocking_held_fingerprints.is_empty(),
+            progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
         }
     }
 
     fn any(&self) -> bool {
         self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+
+    /// Whether this page itself held any entity.
+    fn page_held(&self) -> bool {
+        self.held_entity_count > 0
     }
 }
 
@@ -390,8 +397,10 @@ fn settle_completed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
 ) -> UploadIndexSettlement {
-    if !holds.any() {
-        let fully_settled = upload_settled_without_account_holds(&index, true);
+    if !holds.page_held() {
+        // RetryPending debt elsewhere settles this page as a no-hold page
+        // would, and only keeps full completion pending.
+        let fully_settled = upload_settled_without_account_holds(&index, !holds.any());
         return UploadIndexSettlement {
             index,
             fully_settled,
@@ -426,9 +435,10 @@ static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
 /// still discloses the rejected usage. Its holds settle exactly as on a
-/// `Completed` page: when every hold is non-progressing (no RetryPending
-/// family anywhere) and restorable, held keys keep their committed revision
-/// and the traversal may settle; backfill and replay stay pending.
+/// `Completed` page: when every hold on this page is non-progressing and
+/// restorable, held keys keep their committed revision and the traversal may
+/// settle; backfill and replay stay pending. A RetryPending family elsewhere
+/// keeps only full completion pending (path-(a) bridge).
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -437,7 +447,7 @@ fn settle_checkpointed_upload(
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
-        && holds.any()
+        && holds.page_held()
         && !holds.progress_blocking
         && index.locally_held_keys_restorable(
             committed_index,
@@ -452,7 +462,7 @@ fn settle_checkpointed_upload(
             &holds.held_fingerprints,
             &holds.account_deferred_fingerprints,
         )
-    } else if holds.any() {
+    } else if holds.page_held() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -461,7 +471,7 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
+    let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled();
     }
@@ -7138,10 +7148,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
-        // until a complete family pass reconstructs the exact witness.
+        // until a complete family pass reconstructs the exact witness. The
+        // debt alone does not mark the sweep unsettled (path-(a) bridge): each
+        // held revision settles or blocks on its own page, and full completion
+        // stays pending while any RetryPending family remains.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
