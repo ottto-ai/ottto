@@ -40,15 +40,18 @@ pub(crate) const CLAUDE_REQUEST_CENSUS_CANARY: (u16, &str) = (
     1,
     "e8e0dbc0cce7d3afefdb65752cda8f8236c6f5704a00aa1080e46620473e0ff5",
 );
-/// 16 MiB of hashes (request and message-only hashes of transcript and
-/// telemetry records together). A record that would push the total past it is
+/// 16 MiB of hashes per census. The scan index's census (transcript records)
+/// and the P1 ledger's own census (telemetry, message-only, family and sweep
+/// records) each have this bound and the serialized one below: two separate
+/// budgets, not one shared. A record that would push the total past it is
 /// kept as an `OverBudget` tombstone without hashes, which never counts as
 /// observed.
 pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_HASHES: usize = 2_097_152;
 /// Serialized budget of the whole census field (keys, fixed fields and base64
 /// hashes), charged exactly at insert. The hash bound alone serializes to
 /// about 22.4 MB; the rest is keys and fixed fields with headroom for long
-/// paths. Expected use is about 9 MB (D1 records plus telemetry records).
+/// paths. Measured at M4 size: about 9.5 MB for the index's transcript
+/// records and about 23 MB for the ledger.
 pub(crate) const MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES: usize = 48 * 1024 * 1024;
 /// Part of the serialized budget only tombstones may use, so a record that
 /// does not fit always leaves an `OverBudget` tombstone behind (never a silent
@@ -194,8 +197,6 @@ pub(crate) struct ClaudeLedgerSweep {
 pub(crate) struct ClaudeFamilyMemo {
     pub(crate) removed_requests: u64,
     pub(crate) removed_tokens: u64,
-    /// Digest of the grain rows last written for the family (0: none).
-    pub(crate) rows_digest: u64,
     /// The snapshot id of the family row this memo describes: a later
     /// removal delta names it as its basis.
     pub(crate) snapshot: u64,
@@ -970,7 +971,6 @@ impl Serialize for ClaudeRequestCensusRecord {
         if let Some(memo) = &ledger.family {
             map.serialize_entry("fr", &memo.removed_requests)?;
             map.serialize_entry("ft", &memo.removed_tokens)?;
-            map.serialize_entry("fd", &memo.rows_digest)?;
             map.serialize_entry("fs", &memo.snapshot)?;
         }
         if let Some(facts) = &ledger.facts {
@@ -1604,10 +1604,10 @@ impl<'de> Visitor<'de> for RecordVisitor {
         Ok(None)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        const FIELDS: [&str; 38] = [
+        const FIELDS: [&str; 37] = [
             "v", "fp", "w", "s", "tw", "u", "h", "b", "f", "bi", "bd", "bn", "r", "ur", "ut", "to",
             "td", "tn", "ta", "tc", "tl", "tv", "tw2", "tm", "te", "tk", "xa", "xs", "xp", "xq",
-            "xk", "m", "sk", "sd", "fr", "ft", "fd", "fs",
+            "xk", "m", "sk", "sd", "fr", "ft", "fs",
         ];
         let mut seen = 0_u64;
         let mut malformed = false;
@@ -1712,7 +1712,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
             ]),
             group(&["xa", "xs", "xp", "xq", "xk"]),
             group(&["sk", "sd"]),
-            group(&["fr", "ft", "fd", "fs"]),
+            group(&["fr", "ft", "fs"]),
         ) else {
             return Ok(None);
         };
@@ -1759,8 +1759,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
         let family = family.map(|values| ClaudeFamilyMemo {
             removed_requests: values[0],
             removed_tokens: values[1],
-            rows_digest: values[2],
-            snapshot: values[3],
+            snapshot: values[2],
         });
         // Facts belong to a telemetry record and hold exactly one fact per
         // hash; anything else is malformed.
@@ -2248,9 +2247,11 @@ pub(crate) fn record_claude_request_census(
     if let Some(old) = index.claude_request_census.get(parse.index_key) {
         // S3(d): the same verified revision under the same derivation must
         // yield the same census. Residue, lossy and budget tombstones (whose
-        // shape and hashes the budget replaced) are excluded.
+        // shape and hashes the budget replaced) and retired records (whose
+        // hashes retirement dropped) are excluded.
         let comparable = |record: &ClaudeRequestCensusRecord| {
             !record.unverified
+                && record.retired.is_none()
                 && !matches!(
                     record.shape,
                     ClaudeRequestCensusShape::Lossy | ClaudeRequestCensusShape::OverBudget
@@ -2265,6 +2266,18 @@ pub(crate) fn record_claude_request_census(
         {
             let state = &mut index.claude_request_census_shadow;
             state.derivation_drift = state.derivation_drift.saturating_add(1);
+        }
+        // An unchanged re-parse of a retired record (a backfill, a resume
+        // miss) stays retired while its file is still past the cutoff: its
+        // hashes, and the index bytes, do not bounce back.
+        let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
+        if old.retired.is_some()
+            && window > 0
+            && old.derivation == record.derivation
+            && old.source_file_fingerprint == record.source_file_fingerprint
+            && record.modified.is_some_and(|modified| modified < cutoff)
+        {
+            record.retire();
         }
     }
     let _ = index
@@ -2347,7 +2360,8 @@ pub(crate) fn transcript_retirements() -> (u64, u64) {
 /// index entry's): a record whose file was last modified more than 35 days
 /// before this window keeps its hash count and drops its hashes. A later
 /// request in another file that reuses one of those ids then counts as
-/// `owned_after_retirement` (an undercount risk the ledger discloses).
+/// `owned_after_retirement` (an overcount risk the ledger discloses: the
+/// copy is counted although the original already was).
 ///
 /// A vanished file (StateMissing's red producer removes its index entry at
 /// page end) is not retired here: the terminal prune drops its record and
@@ -2364,20 +2378,23 @@ fn retire_claude_transcript_records(index: &mut ScanIndex, window: u64) -> u64 {
     let mut aged = 0_u64;
     let mut freed = (0_usize, 0_usize);
     for (key, record) in census.records.iter_mut() {
-        if record.is_birth_stub()
-            || record.retired.is_some()
-            || record.hash_count() == 0
-            || !record.modified.is_some_and(|modified| modified < cutoff)
-        {
+        if record.is_birth_stub() || record.retired.is_some() || record.hash_count() == 0 {
             continue;
         }
         // Not dirty: the indexed revision is still the one the record (and
-        // its mtime) describes. The entry is read for its fingerprint only.
-        let clean = files.get(key.as_str()).is_some_and(|entry| {
+        // its mtime) describes.
+        let Some(entry) = files.get(key.as_str()).filter(|entry| {
             decode_fingerprint(&entry.source_file_fingerprint)
                 .is_some_and(|fingerprint| fingerprint == record.source_file_fingerprint)
-        });
-        if !clean {
+        }) else {
+            continue;
+        };
+        // A record written before `m` (#664) takes the entry's mtime: the
+        // equal fingerprint hashes that same mtime.
+        let modified = record
+            .modified
+            .or((entry.modified_unix_seconds > 0).then_some(entry.modified_unix_seconds));
+        if !modified.is_some_and(|modified| modified < cutoff) {
             continue;
         }
         let before = (record.hash_count(), entry_serialized_bytes(key, record));

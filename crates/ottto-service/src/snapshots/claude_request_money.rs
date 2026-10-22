@@ -16,15 +16,25 @@
 //!
 //! Each authoritative Claude page builds a second body beside the live one
 //! (`body::build_claude_request_body`), checks its certificate, and writes
-//! the B1 pricing rows: one `grain` row per differing slice (hour, model,
-//! pricing selectors, token components, own costs, an explanation
-//! category), one `family` row with old/new totals and the true removal
-//! delta, and a `coverage` row that is false whenever anything (a refused
-//! page, a truncated day, an unbuilt member, a held unit, unread rows, an
-//! unfinished telemetry sweep) leaves the day unusable for the exit
-//! criterion. All of its memory is admitted before allocation against the
-//! shadow's own ceiling and its work runs under a deadline; a refusal skips
-//! the page's shadow, writes a false coverage row and is counted.
+//! the B1 pricing rows of every family of the page: one `grain` row per
+//! differing slice (hour, model, pricing selectors, token components, own
+//! costs, an explanation category), one `family` row with old/new totals
+//! and the removal delta, and the page's `coverage` row, false whenever
+//! anything (a refused page, a truncated day, an unbuilt member, a held
+//! unit, unread rows, no telemetry certificate) leaves the day unusable for
+//! the exit criterion. The reader keeps each family's latest rows by
+//! `snapshot` (page sequence); nothing is deduplicated on the writer side. A
+//! page whose batch is dropped or not written owes a false coverage row to
+//! its day, written with the next batch. All of its memory is admitted
+//! before allocation against the shadow's own ceiling and its work runs
+//! under a deadline; a refusal skips the page's shadow, writes a false
+//! coverage row and is counted.
+//!
+//! The shadow never fails or stalls the live page: a panic is caught (the
+//! shadow is then off for the rest of the process, counted), every phase
+//! under the sync lock checks the page deadline, and a local file
+//! (`<support>/claude-request-money-shadow.off`) turns it off without a
+//! release.
 
 pub(crate) mod body;
 pub(crate) mod capture;
@@ -61,7 +71,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
@@ -90,6 +100,9 @@ const GROWTH_STEP_BYTES: usize = 256 * 1024;
 /// Daily JSONL: per-day byte cap and days kept. The last bytes of the cap
 /// are kept for the seal row (a false coverage row naming the truncation).
 const JSONL_DAY_CAP_BYTES: u64 = 8 * 1024 * 1024;
+/// The writer streams a batch's rows through one buffer of this size
+/// (admitted with the batch): never a second copy of the rows.
+const JSONL_WRITE_BUFFER_BYTES: usize = 64 * 1024;
 const JSONL_SEAL_RESERVE_BYTES: u64 = 512;
 const JSONL_RETENTION_DAYS: i64 = 7;
 const JSONL_PREFIX: &str = "claude-request-money-shadow-";
@@ -98,6 +111,12 @@ const JSONL_MAX_DIR_ENTRIES: usize = 1024;
 const FAMILY_MEMO_RETENTION_SECONDS: u64 = 35 * 86_400;
 /// `mh:` records checked against their file's record per page.
 const MESSAGE_PRUNE_PER_PAGE: usize = 256;
+/// The walked part of the ledger state counts is refreshed at most this
+/// often (it walks every record).
+const STATE_COUNTS_REFRESH: Duration = Duration::from_secs(60);
+/// The shadow's local kill switch: this file in the support directory turns
+/// it off.
+const SHADOW_OFF_FILE: &str = "claude-request-money-shadow.off";
 
 // Per-element admission charges (bytes), generous for the owned strings.
 const UNIT_BYTES: usize = 512;
@@ -488,7 +507,6 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) families_union_partial: u64,
     pub(crate) families_unbuilt: u64,
     pub(crate) families_coverage_complete: u64,
-    pub(crate) families_rows_unchanged: u64,
     pub(crate) certificate_mismatch: u64,
     pub(crate) units_counted: u64,
     pub(crate) units_owned: u64,
@@ -570,6 +588,13 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) ledger_save_bytes: u64,
     /// The page's dirty shards were not admitted (they wait).
     pub(crate) ledger_save_refused: u64,
+    /// The page deadline passed while serializing shards (they wait).
+    pub(crate) ledger_save_late: u64,
+    /// Dirty shards larger than one page's save bound (never written; no
+    /// certificate is saved over them).
+    pub(crate) ledger_save_oversized: u64,
+    /// Ledger loads given up for want of admission (process total).
+    pub(crate) ledger_loads_refused: u64,
     /// The writer's outbox was full: the batch was dropped.
     pub(crate) batch_dropped: u64,
     pub(crate) captures_taken: u64,
@@ -581,8 +606,6 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     /// Memos not advanced because their batch's rows were not all written
     /// (reported by the page after the write).
     pub(crate) family_memos_withheld: u64,
-    /// Families whose previous memo is still in a batch being written.
-    pub(crate) family_memos_pending: u64,
     pub(crate) removed_change_available: u64,
     pub(crate) removed_change_unavailable: u64,
     /// The writer's JSONL outcome of the batches finished since the last
@@ -591,6 +614,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) jsonl_truncated: u64,
     pub(crate) jsonl_sealed: u64,
     pub(crate) jsonl_failed: u64,
+    /// False coverage rows written for earlier dropped or unwritten batches.
+    pub(crate) jsonl_owed_written: u64,
     /// Rows this page handed to the writer.
     pub(crate) jsonl_queued: u64,
     /// Members not in the page whose census `u` was known / unknown
@@ -598,6 +623,7 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) absent_members_old_known: u64,
     pub(crate) absent_members_old_unknown: u64,
     pub(crate) coverage_complete: u64,
+    /// Time under the sync lock, every phase included but this line's write.
     pub(crate) elapsed_us: u64,
 }
 
@@ -771,6 +797,27 @@ struct CoverageRow {
     truncated: bool,
     telemetry_sweep_complete: bool,
     rows_unavailable_roots: u64,
+    /// Owed by a page whose batch was dropped or not written.
+    dropped: bool,
+}
+
+impl CoverageRow {
+    /// The false row a dropped or unwritten batch owes its day.
+    fn owed(observed_unix: u64) -> Self {
+        Self {
+            row: "coverage",
+            v: JSONL_VERSION,
+            observed_unix,
+            coverage_complete: false,
+            families: 0,
+            families_incomplete: 0,
+            refused: false,
+            truncated: false,
+            telemetry_sweep_complete: false,
+            rows_unavailable_roots: 0,
+            dropped: true,
+        }
+    }
 }
 
 fn undecided_wire(reason: ClaudeUndecidedBy) -> &'static str {
@@ -849,18 +896,48 @@ pub(crate) fn shadow_page(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
 ) {
-    if !shadow_enabled(support_dir) {
+    if !shadow_enabled(support_dir)
+        || SHADOW_PANICKED.load(Ordering::Acquire)
+        || support_dir.join(SHADOW_OFF_FILE).exists()
+    {
         return;
     }
-    shadow_page_at(
-        support_dir,
-        snapshots,
-        index,
-        api_report,
-        trace_report,
-        census_complete,
-        now_unix(),
+    guarded(|| {
+        shadow_page_at(
+            support_dir,
+            snapshots,
+            index,
+            api_report,
+            trace_report,
+            census_complete,
+            now_unix(),
+        );
+    });
+}
+
+/// A panic of the shadow ends in the shadow: it is counted, the shadow is
+/// off for the rest of the process, and the live page goes on (every hold
+/// it took is released by unwinding).
+static SHADOW_PANICKED: AtomicBool = AtomicBool::new(false);
+static SHADOW_PANICS: AtomicU64 = AtomicU64::new(0);
+
+fn guarded(run: impl FnOnce()) {
+    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)).is_ok() {
+        return;
+    }
+    SHADOW_PANICKED.store(true, Ordering::Release);
+    let panics = SHADOW_PANICS.fetch_add(1, Ordering::AcqRel) + 1;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "local snapshot sync: claude request money shadow off after a panic {{\"shadow_panics\":{panics}}}"
     );
+}
+
+#[cfg(test)]
+pub(crate) fn guarded_for_test(run: impl FnOnce()) -> (bool, u64) {
+    guarded(run);
+    let panicked = SHADOW_PANICKED.swap(false, Ordering::AcqRel);
+    (panicked, SHADOW_PANICS.load(Ordering::Acquire))
 }
 
 /// Index keys of each page (root, member) and the indexed members of each
@@ -906,6 +983,8 @@ struct PageEnd<'a> {
     now: u64,
     census_complete: bool,
     started: Instant,
+    /// The page deadline: the ledger's save stops at it too.
+    deadline: Instant,
     tail: ClaudeTelemetryTailCounts,
     rows: ClaudeRowCounts,
     scope: claude_request_ledger::ClaudeScopeDebt,
@@ -931,6 +1010,7 @@ pub(crate) fn shadow_page_at(
         now,
         census_complete,
         started,
+        deadline,
         tail: ClaudeTelemetryTailCounts::default(),
         rows: ClaudeRowCounts::default(),
         scope: claude_request_ledger::ClaudeScopeDebt::default(),
@@ -1007,7 +1087,7 @@ pub(crate) fn shadow_page_at(
     if std::mem::take(&mut ledger.load_damaged) {
         // A shard was lost: its claims are gone, so is the certificate.
         counts.ledger_load_damaged = 1;
-        drop_certificate(ledger, now);
+        drop_certificate(ledger);
         end.tail.certificate_dropped += 1;
     }
 
@@ -1087,7 +1167,7 @@ pub(crate) fn shadow_page_at(
     counts.telemetry_retired_pressure =
         claude_request_ledger::retire_telemetry_under_pressure(ledger);
     if counts.telemetry_retired_pressure > 0 {
-        drop_certificate(ledger, now);
+        drop_certificate(ledger);
         end.tail.certificate_dropped += 1;
     }
     prune_message_records(ledger, index, &mut counts);
@@ -1277,6 +1357,7 @@ pub(crate) fn shadow_page_at(
         sessions: &sessions,
         trace: &traces,
         telemetry_complete_through: complete_through,
+        deadline,
     };
     let retired_roots =
         claude_request_ledger::roots_with_retired_records(&index.claude_request_census);
@@ -1351,6 +1432,10 @@ pub(crate) fn shadow_page_at(
             captures: family_captures,
         };
         let body = build_claude_request_body(&family, &ctx, &collisions, now, &mut counts);
+        if ctx.late() {
+            late = true;
+            break;
+        }
         if retired_roots.contains(root) {
             counts.possible_retired_copies += body.units.requests;
         }
@@ -1366,7 +1451,9 @@ pub(crate) fn shadow_page_at(
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
 
-    // Rows, memos and the coverage flag.
+    // Rows, memos and the coverage flag. Every family of the page writes its
+    // rows (the day's cap bounds them); the reader keeps each family's latest
+    // by `snapshot`.
     let sweep_complete = telemetry_certified(ledger);
     let mut lines = Vec::new();
     let mut memos = Vec::with_capacity(bodies.len());
@@ -1377,22 +1464,17 @@ pub(crate) fn shadow_page_at(
         families_incomplete += u64::from(!complete);
         let family = hashed_id(root);
         let memo_key = family_key(root);
-        // A memo still in a batch being written is no basis yet.
-        let pending = ledger.family_pending(&memo_key);
-        counts.family_memos_pending += u64::from(pending);
+        // The removal delta's basis: the last complete body whose rows were
+        // written (a memo moves only when its batch is published), named by
+        // its snapshot.
         let memo = ledger
             .get(&memo_key)
             .and_then(ClaudeRequestCensusRecord::family_memo)
-            .map(|(revision, memo)| (*revision, memo))
-            .filter(|_| !pending);
+            .map(|(revision, memo)| (*revision, memo));
         let (removed_change, basis, unavailable) = match (complete, memo) {
-            _ if pending => (None, None, Some("previous_unpublished")),
             (false, _) => (None, None, Some("body_incomplete")),
             (true, None) => (None, None, Some("no_previous_body")),
             (true, Some((revision, _))) if revision != union => (None, None, Some("union_changed")),
-            (true, Some((_, memo))) if memo.removed_requests == u64::MAX => {
-                (None, None, Some("no_previous_body"))
-            }
             (true, Some((_, memo))) => (
                 Some(SignedRequestsTokens {
                     requests: i128::from(body.removed.requests) - i128::from(memo.removed_requests),
@@ -1411,17 +1493,8 @@ pub(crate) fn shadow_page_at(
         } else {
             counts.removed_change_unavailable += 1;
         }
-        // Skip a family whose rows did not change since its last written
-        // ones today (the reader keeps each family's latest snapshot); never
-        // while its previous rows are still being written.
-        let digest = rows_digest(now, &body, complete);
-        if memo.is_some_and(|(_, memo)| memo.rows_digest == digest) {
-            counts.families_rows_unchanged += 1;
-            continue;
-        }
-        let mut family_lines = Vec::with_capacity(body.grains.len() + 1);
         for (key, (old, new)) in &body.grains {
-            family_lines.push(grain_line(snapshot, &family, key, old, new));
+            lines.extend(grain_line(snapshot, &family, key, old, new));
         }
         let row = FamilyRow {
             row: "family",
@@ -1455,47 +1528,20 @@ pub(crate) fn shadow_page_at(
             absent_old: (&absent_old).into(),
             absent_old_unknown,
         };
-        family_lines.push(serde_json::to_string(&row).ok());
-        lines.extend(family_lines.into_iter().flatten());
-        if pending {
-            // Its basis moves when the earlier batch is acknowledged.
-            continue;
-        }
-        // The memo: removals move only with a complete body, which is then
-        // the basis (this row's snapshot) of the next removal delta.
-        let (revision, next) = match (complete, memo) {
-            (true, _) => (
-                union,
-                ClaudeFamilyMemo {
+        lines.extend(serde_json::to_string(&row).ok());
+        // Only a complete body is a basis; it moves when its rows land.
+        if complete {
+            memos.push(PendingMemo {
+                key: memo_key,
+                revision: union,
+                observed_unix: now,
+                memo: ClaudeFamilyMemo {
                     removed_requests: body.removed.requests,
                     removed_tokens: body.removed.tokens,
-                    rows_digest: digest,
                     snapshot,
                 },
-            ),
-            (false, Some((revision, memo))) => (
-                revision,
-                ClaudeFamilyMemo {
-                    rows_digest: digest,
-                    ..memo
-                },
-            ),
-            (false, None) => (
-                union,
-                ClaudeFamilyMemo {
-                    removed_requests: u64::MAX,
-                    removed_tokens: u64::MAX,
-                    rows_digest: digest,
-                    snapshot: 0,
-                },
-            ),
-        };
-        memos.push(PendingMemo {
-            key: memo_key,
-            revision,
-            observed_unix: now,
-            memo: next,
-        });
+            });
+        }
     }
     counts.family_memos_dropped = drop_old_family_memos(ledger, now);
     let page_complete = families_incomplete == 0 && census_complete && sweep_complete;
@@ -1511,10 +1557,12 @@ pub(crate) fn shadow_page_at(
         truncated: false,
         telemetry_sweep_complete: sweep_complete,
         rows_unavailable_roots: counts.rows_unavailable_roots,
+        dropped: false,
     };
-    // The rows move to the batch under their own admission; the page's
-    // admission ends here.
-    let line_bytes = lines.iter().map(|line| line.len() + 1).sum::<usize>() + 1024;
+    // The rows move to the batch under their own admission (with the
+    // writer's one stream buffer); the page's admission ends here.
+    let line_bytes =
+        lines.iter().map(|line| line.len() + 1).sum::<usize>() + 1024 + JSONL_WRITE_BUFFER_BYTES;
     let batch = ShadowReservation::admit(line_bytes);
     counts.admitted_peak_bytes = budget.granted().saturating_add(line_bytes) as u64;
     drop(budget);
@@ -1531,7 +1579,7 @@ pub(crate) fn shadow_page_at(
         lines,
         coverage,
         memos,
-        Some(reservation),
+        Some((reservation, JSONL_WRITE_BUFFER_BYTES)),
         &mut counts,
     );
     emit(&end, Some(&*ledger), index, &mut counts);
@@ -1568,8 +1616,12 @@ fn refuse(
         truncated: false,
         telemetry_sweep_complete: false,
         rows_unavailable_roots: 0,
+        dropped: false,
     };
-    let reservation = ShadowReservation::admit(1024);
+    // Without the buffer's admission the writer streams unbuffered.
+    let reservation = ShadowReservation::admit(1024 + JSONL_WRITE_BUFFER_BYTES)
+        .map(|reservation| (reservation, JSONL_WRITE_BUFFER_BYTES))
+        .or_else(|| ShadowReservation::admit(1024).map(|reservation| (reservation, 0)));
     hand_off(
         end,
         ledger.as_deref_mut(),
@@ -1584,30 +1636,38 @@ fn refuse(
 }
 
 /// Hand the page's rows, its coverage row, its memos and the ledger's
-/// bounded save to the writer (after the page, outside the sync lock).
+/// bounded save to the writer (after the page, outside the sync lock). A
+/// dropped batch owes its day a false coverage row (Sol R3-6).
 fn hand_off(
     end: &PageEnd<'_>,
     ledger: Option<&mut ClaudeLedger>,
     rows: Vec<String>,
     coverage: CoverageRow,
     memos: Vec<PendingMemo>,
-    reservation: Option<ShadowReservation>,
+    reservation: Option<(ShadowReservation, usize)>,
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
-    let mut reservations = reservation.into_iter().collect::<Vec<_>>();
+    let buffer_bytes = reservation.as_ref().map_or(0, |(_, bytes)| *bytes);
+    let mut reservations = reservation
+        .into_iter()
+        .map(|(reservation, _)| reservation)
+        .collect::<Vec<_>>();
     let mut save = None;
     let mut ledger = ledger;
     if let Some(ledger) = ledger.as_deref_mut() {
-        match ledger.take_save() {
+        match ledger.take_save(end.deadline) {
             Some((taken, reservation)) => {
                 counts.ledger_save_shards = taken.shards() as u64;
                 counts.ledger_save_bytes = taken.bytes() as u64;
                 reservations.push(reservation);
                 save = Some(taken);
             }
+            None if Instant::now() >= end.deadline => counts.ledger_save_late = 1,
             None => counts.ledger_save_refused = u64::from(ledger.dirty_shards() > 0),
         }
+        counts.ledger_save_oversized = ledger.oversized_shards;
     }
+    counts.ledger_loads_refused = store::loads_refused();
     counts.jsonl_queued = rows.len() as u64 + 1;
     let job = WriteJob {
         support_dir: end.support_dir.to_path_buf(),
@@ -1615,6 +1675,7 @@ fn hand_off(
             now: end.now,
             rows,
             coverage,
+            buffer_bytes,
         },
         memos,
         save,
@@ -1627,17 +1688,45 @@ fn hand_off(
     if let Err(job) = outcome {
         counts.batch_dropped = 1;
         counts.family_memos_withheld += job.memos.len() as u64;
+        owe_coverage(end.support_dir, end.now);
     }
 }
 
+/// The walked ledger state counts per support directory, and when.
+static STATE_COUNTS: Mutex<
+    BTreeMap<PathBuf, (Instant, claude_request_ledger::ClaudeLedgerStateCounts)>,
+> = Mutex::new(BTreeMap::new());
+
 /// The page's log line (its counts, the tail's, the rows', the scope's and
-/// the state of the index's records and the ledger).
+/// the state of the index's records and the ledger). The record walks are
+/// refreshed at most once a minute; the totals are current. `elapsed_us` is
+/// taken after every phase under the lock but the line's own write.
 fn emit(
     end: &PageEnd<'_>,
     ledger: Option<&ClaudeLedger>,
     index: &ScanIndex,
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
+    let census = &index.claude_request_census;
+    let cached = STATE_COUNTS.lock().ok().and_then(|cache| {
+        cache
+            .get(end.support_dir)
+            .filter(|(at, _)| at.elapsed() < STATE_COUNTS_REFRESH)
+            .map(|(_, state)| *state)
+    });
+    let state = match cached {
+        Some(mut state) => {
+            claude_request_ledger::refresh_state_totals(&mut state, census, ledger);
+            state
+        }
+        None => {
+            let state = claude_request_ledger::ledger_state_counts(census, ledger);
+            if let (Some(_), Ok(mut cache)) = (ledger, STATE_COUNTS.lock()) {
+                cache.insert(end.support_dir.to_path_buf(), (Instant::now(), state));
+            }
+            state
+        }
+    };
     counts.elapsed_us = end.started.elapsed().as_micros() as u64;
     emit_line(&ShadowLine {
         counting: CLAUDE_REQUEST_COUNTING,
@@ -1646,7 +1735,7 @@ fn emit(
         tail: &end.tail,
         rows: &end.rows,
         scope: &end.scope,
-        ledger: &claude_request_ledger::ledger_state_counts(&index.claude_request_census, ledger),
+        ledger: &state,
     });
 }
 
@@ -1662,6 +1751,7 @@ fn apply_results(
         counts.jsonl_truncated += result.jsonl.truncated;
         counts.jsonl_sealed += result.jsonl.sealed;
         counts.jsonl_failed += result.jsonl.failed;
+        counts.jsonl_owed_written += result.jsonl.owed_written;
         if !result.jsonl.published {
             counts.family_memos_withheld += result.memos.len() as u64;
             continue;
@@ -1697,7 +1787,7 @@ fn note_message_record(
     let Some(record) = index
         .claude_request_census
         .get(key)
-        .filter(|record| fingerprint_matches(record, fingerprint))
+        .filter(|record| fingerprint_matches(record, fingerprint) && record.retired().is_none())
     else {
         return;
     };
@@ -1811,35 +1901,6 @@ fn union_revision(members: &BTreeSet<String>) -> [u8; 32] {
     digest.finalize().into()
 }
 
-/// Digest of what a family's rows say today (day, totals, every slice).
-fn rows_digest(now: u64, body: &ClaudeRequestBody, complete: bool) -> u64 {
-    let mut digest = Sha256::new();
-    digest.update(b"claude_request_money_rows:v1\0");
-    digest.update((now / 86_400).to_be_bytes());
-    digest.update([u8::from(complete), u8::from(body.unbuilt)]);
-    for totals in [
-        &body.old,
-        &body.new,
-        &body.removed,
-        &body.held,
-        &body.immature,
-    ] {
-        digest.update(totals.tokens.to_be_bytes());
-        digest.update(totals.requests.to_be_bytes());
-    }
-    digest.update((body.members_built as u64).to_be_bytes());
-    digest.update((body.members_total as u64).to_be_bytes());
-    for (key, (old, new)) in &body.grains {
-        let encoded = format!("{key:?}|{old:?}|{new:?}");
-        digest.update((encoded.len() as u64).to_be_bytes());
-        digest.update(encoded.as_bytes());
-    }
-    let digest = digest.finalize();
-    let mut prefix = [0_u8; 8];
-    prefix.copy_from_slice(&digest[..8]);
-    u64::from_be_bytes(prefix).max(1)
-}
-
 /// Drop family memos no page rebuilt within the retention window.
 fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64) -> u64 {
     let cutoff = now.saturating_sub(FAMILY_MEMO_RETENTION_SECONDS);
@@ -1867,15 +1928,39 @@ fn day_stamp(unix: u64) -> Option<String> {
     ))
 }
 
-/// The last coverage flag written per (support dir, day) in this process:
-/// a coverage row is written when it changes (and once per day file).
-static LAST_COVERAGE: Mutex<BTreeMap<PathBuf, (String, bool)>> = Mutex::new(BTreeMap::new());
+/// False coverage rows owed per support directory: day -> the earliest
+/// page that owes it (a dropped batch, or one whose rows were not written).
+static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>> = Mutex::new(BTreeMap::new());
+
+/// The page at `observed_unix` did not reach its day's file: the next batch
+/// writes a false coverage row there.
+fn owe_coverage(support_dir: &Path, observed_unix: u64) {
+    let (Some(day), Ok(mut owed)) = (day_stamp(observed_unix), COVERAGE_OWED.lock()) else {
+        return;
+    };
+    let slot = owed
+        .entry(support_dir.to_path_buf())
+        .or_default()
+        .entry(day)
+        .or_insert(observed_unix);
+    *slot = (*slot).min(observed_unix);
+}
+
+fn take_owed_coverage(support_dir: &Path) -> BTreeMap<String, u64> {
+    COVERAGE_OWED
+        .lock()
+        .ok()
+        .and_then(|mut owed| owed.remove(support_dir))
+        .unwrap_or_default()
+}
 
 /// One page's rows for today's JSONL file (written by the writer).
 pub(crate) struct JsonlBatch {
     now: u64,
     rows: Vec<String>,
     coverage: CoverageRow,
+    /// The admitted stream buffer (0: unbuffered).
+    buffer_bytes: usize,
 }
 
 /// What the writer did with one batch's rows.
@@ -1885,106 +1970,138 @@ pub(crate) struct JsonlOutcome {
     pub(crate) truncated: u64,
     pub(crate) sealed: u64,
     pub(crate) failed: u64,
+    /// False coverage rows written for earlier batches.
+    pub(crate) owed_written: u64,
     /// Every row and the coverage row were written.
     pub(crate) published: bool,
 }
 
-/// Append a batch's rows and its coverage row to the day's capped file and
-/// drop own files older than the retention window. When the day's cap would
-/// be passed, the file is sealed with a false coverage row (`truncated`)
-/// and takes nothing more that day. Failures are counted, never raised.
-/// Runs on the writer thread only.
+/// The file's last byte is not a newline (an earlier write stopped mid-row).
+fn ends_mid_line(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let mut last = [0_u8; 1];
+    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+}
+
+/// Append rows to a day's file through a stream buffer of `buffer_bytes`,
+/// first ending a row an earlier failed write left open. False when any
+/// write failed.
+fn append_rows<'a>(
+    path: &Path,
+    buffer_bytes: usize,
+    rows: impl IntoIterator<Item = &'a [u8]>,
+) -> bool {
+    let open_row = ends_mid_line(path);
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return false;
+    };
+    let mut writer = std::io::BufWriter::with_capacity(buffer_bytes, file);
+    let mut written = !open_row || writer.write_all(b"\n").is_ok();
+    for row in rows {
+        written = written && writer.write_all(row).is_ok() && writer.write_all(b"\n").is_ok();
+    }
+    written && writer.flush().is_ok()
+}
+
+/// Append a batch's rows and its coverage row to the day's capped file
+/// (streamed from the batch's own rows: no second copy), the false coverage
+/// rows earlier batches owe their days, and drop own files older than the
+/// retention window. When the day's cap would be passed, the file is sealed
+/// with a false coverage row (`truncated`) and takes nothing more that day.
+/// A batch not written owes its day a false row. Failures are counted,
+/// never raised. Runs on the writer thread only.
 fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
-    let Some(today) = day_stamp(now) else {
+    let dir = support_dir.join("diagnostics");
+    let owed = take_owed_coverage(support_dir);
+    let Some(today) = day_stamp(now).filter(|_| std::fs::create_dir_all(&dir).is_ok()) else {
         outcome.failed += 1;
+        for (_, observed) in owed {
+            owe_coverage(support_dir, observed);
+        }
+        owe_coverage(support_dir, now);
         return outcome;
     };
-    let dir = support_dir.join("diagnostics");
-    if std::fs::create_dir_all(&dir).is_err() {
-        outcome.failed += 1;
-        return outcome;
+    let day_path = |day: &str| dir.join(format!("{JSONL_PREFIX}{day}.jsonl"));
+    let sealed_path = |day: &str| dir.join(format!(".{JSONL_PREFIX}{day}.sealed"));
+    let mut owed_today = None;
+    for (day, observed) in owed {
+        if day == today {
+            owed_today = Some(observed);
+            continue;
+        }
+        // A sealed day is already false.
+        if sealed_path(&day).exists() {
+            continue;
+        }
+        let row = serde_json::to_string(&CoverageRow::owed(observed)).unwrap_or_default();
+        if append_rows(&day_path(&day), 0, [row.as_bytes()]) {
+            outcome.owed_written += 1;
+        } else {
+            outcome.failed += 1;
+            owe_coverage(support_dir, observed);
+        }
     }
-    let path = dir.join(format!("{JSONL_PREFIX}{today}.jsonl"));
-    let mut size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
-    let sealed_marker = dir.join(format!(".{JSONL_PREFIX}{today}.sealed"));
-    if sealed_marker.exists() {
+    let path = day_path(&today);
+    if sealed_path(&today).exists() {
         outcome.truncated += batch.rows.len() as u64;
         return outcome;
     }
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
-    let mut buffer = Vec::new();
+    let mut size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
+    let owed_row =
+        owed_today.and_then(|observed| serde_json::to_string(&CoverageRow::owed(observed)).ok());
+    let coverage_row = serde_json::to_string(&batch.coverage).unwrap_or_default();
+    // What fits under the day's cap, in order: the owed row, the rows, the
+    // page's coverage row. The first that does not fit seals the day.
     let mut sealed = false;
-    for row in &batch.rows {
-        let bytes = row.len() as u64 + 1;
-        if size + bytes > room {
-            outcome.truncated += 1;
+    let mut fits = |bytes: usize| {
+        let bytes = bytes as u64 + 1;
+        if sealed || size + bytes > room {
             sealed = true;
-            continue;
+            return false;
         }
         size += bytes;
-        buffer.extend_from_slice(row.as_bytes());
-        buffer.push(b'\n');
-        outcome.rows += 1;
-    }
-    let coverage = if sealed {
-        outcome.sealed = 1;
-        CoverageRow {
-            row: "coverage",
-            v: JSONL_VERSION,
-            observed_unix: now,
-            coverage_complete: false,
-            families: 0,
-            families_incomplete: 0,
-            refused: false,
-            truncated: true,
-            telemetry_sweep_complete: false,
-            rows_unavailable_roots: 0,
-        }
-    } else {
-        batch.coverage.clone()
+        true
     };
-    let flag = coverage.coverage_complete;
-    let changed = LAST_COVERAGE.lock().map_or(true, |last| {
-        last.get(support_dir) != Some(&(today.clone(), flag))
+    let owed_fits = owed_row.as_ref().is_some_and(|row| fits(row.len()));
+    let kept = batch.rows.iter().filter(|row| fits(row.len())).count();
+    let coverage_fits = fits(coverage_row.len());
+    let seal_row = sealed.then(|| {
+        serde_json::to_string(&CoverageRow {
+            truncated: true,
+            dropped: false,
+            ..CoverageRow::owed(now)
+        })
+        .unwrap_or_default()
     });
-    let mut coverage_flag = None;
-    if changed || sealed || !path.exists() {
-        coverage_flag = Some(flag);
-        if let Ok(json) = serde_json::to_string(&coverage) {
-            buffer.extend_from_slice(json.as_bytes());
-            buffer.push(b'\n');
-            outcome.rows += 1;
-        }
-    }
-    let mut written = true;
-    if !buffer.is_empty() {
-        written = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .and_then(|mut file| file.write_all(&buffer))
-            .is_ok();
-        if !written {
-            outcome.failed += 1;
-        }
-    }
-    // The last written coverage flag moves only with a successful write; a
-    // failed one forgets it, so the next batch writes its flag again.
-    if let Ok(mut last) = LAST_COVERAGE.lock() {
-        match (written, coverage_flag) {
-            (true, Some(flag)) => {
-                last.insert(support_dir.to_path_buf(), (today.clone(), flag));
-            }
-            (false, _) => {
-                last.remove(support_dir);
-            }
-            _ => {}
-        }
+    outcome.truncated = (batch.rows.len() - kept) as u64;
+    let rows = owed_row
+        .iter()
+        .filter(|_| owed_fits)
+        .map(String::as_bytes)
+        .chain(batch.rows[..kept].iter().map(String::as_bytes))
+        .chain(coverage_fits.then_some(coverage_row.as_bytes()))
+        .chain(seal_row.as_deref().map(str::as_bytes));
+    let written = append_rows(&path, batch.buffer_bytes, rows);
+    if written {
+        outcome.rows = kept as u64 + u64::from(coverage_fits) + u64::from(sealed);
+        outcome.owed_written += u64::from(owed_fits);
+    } else {
+        outcome.failed += 1;
+        owe_coverage(support_dir, owed_today.unwrap_or(now).min(now));
     }
     if sealed {
-        let _ = std::fs::write(&sealed_marker, b"");
+        outcome.sealed = 1;
+        let _ = std::fs::write(sealed_path(&today), b"");
     }
     outcome.published = written && !sealed;
     if let Some(oldest) = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64)) {
@@ -2018,6 +2135,11 @@ fn prune_jsonl(dir: &Path, oldest: &str) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
+}
+
+#[cfg(test)]
+pub(crate) fn owe_coverage_for_test(support_dir: &Path, observed_unix: u64) {
+    owe_coverage(support_dir, observed_unix);
 }
 
 #[cfg(test)]

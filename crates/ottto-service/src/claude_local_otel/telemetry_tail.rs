@@ -26,10 +26,18 @@
 //! The sweep positions (`sweep:tail`, `sweep:missing`) are ledger records.
 //! `complete_through` is the start time of the last sweep that read every
 //! sidecar without debt; the classifier trusts "no telemetry owner" only for
-//! units older than it. Losing a claim (an audit mismatch, a vanished
-//! sidecar, a rebuilt, tombstoned or refused record) drops that certificate
-//! at once and durably (N1): `complete_through` is zeroed and a fresh sweep
-//! starts, and the ledger writes that change before any data shard.
+//! units older than it. One rule (Sol R3-1): any debt (a file left unread or
+//! short, a subset listing, lost claims from an audit mismatch, a vanished
+//! sidecar, a rebuilt, tombstoned or refused record) zeroes the certificate
+//! at once, and the ledger writes that zero before any data shard. Only the
+//! wrap of a later sweep that saw no debt at all sets it again. Negative
+//! classification and page coverage read that one gate.
+//!
+//! A read during which the file was written (its times moved) commits only
+//! when a second pass over the bytes it read finds them unchanged (R3-5).
+//! Audits are scheduled, not continuous (StateMissing M4): a record is
+//! audited a day after it grew, an idle one on a 30-day sample, a retired
+//! one never, and audits read at most 48 MiB per support directory a day.
 
 use super::{ClaudeLocalOtelEvidence, STORE_DIR};
 use crate::snapshots::claude_request_census::{
@@ -131,8 +139,12 @@ impl Default for ClaudeTelemetryTailBudget {
 pub(crate) const MAX_LINE_BYTES: usize = 256 * 1024;
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 const ANCHOR_BYTES: u64 = 64;
-/// A verified record is audited again after a day (Sol N12).
+/// A record that grew since its last audit is audited again after a day
+/// (Sol N12); an idle one (nothing appended since) on a 30-day sample.
 const AUDIT_INTERVAL_SECONDS: u64 = 86_400;
+const IDLE_AUDIT_INTERVAL_SECONDS: u64 = 30 * 86_400;
+/// Audit bytes read per support directory per day (process memory).
+const AUDIT_BYTES_PER_DAY: u64 = 48 * 1024 * 1024;
 /// The shortest line the reader can keep as a row: a valid row names its
 /// capture revision, session, request, model, clock, a 71-character
 /// evidence fingerprint and every token field (about 390 bytes at least).
@@ -177,9 +189,13 @@ pub(crate) struct ClaudeTelemetryTailCounts {
     pub(crate) priority_files: u64,
     pub(crate) files_selected: u64,
     pub(crate) files_unchanged: u64,
+    /// Unchanged in length but with a new mtime: audited soon.
+    pub(crate) files_touched: u64,
     pub(crate) files_appended: u64,
     pub(crate) files_rebuilt: u64,
     pub(crate) files_raced: u64,
+    /// Reads written to meanwhile whose bytes a second pass confirmed.
+    pub(crate) files_reread_proven: u64,
     pub(crate) files_unreadable: u64,
     pub(crate) files_refused_memory: u64,
     /// The ledger's budgets cannot take the file's growth.
@@ -195,6 +211,8 @@ pub(crate) struct ClaudeTelemetryTailCounts {
     pub(crate) audits_completed: u64,
     pub(crate) audits_raced: u64,
     pub(crate) audit_bytes: u64,
+    /// Audit bytes read today for this support directory (the daily cap).
+    pub(crate) audit_bytes_today: u64,
     pub(crate) audit_mismatches: u64,
     pub(crate) retired_missing: u64,
     /// Claims were lost this page: the telemetry certificate was dropped.
@@ -258,7 +276,7 @@ impl ClaudeTelemetryTail {
         let selected = select_after(&dir, &cursor, budget, work, &mut counts);
         if counts.dir_entry_cap_hit || counts.enumeration_failed {
             // Enumeration saw a subset: this sweep cannot certify every file.
-            sweep.debt = 1;
+            open_debt(&mut sweep);
         }
         let mut finished = selected.len() < budget.max_files;
         for stem in &selected {
@@ -271,7 +289,7 @@ impl ClaudeTelemetryTail {
                 // A file left short of its extent (a partial last line, an
                 // oversized line being skipped) has rows not yet read.
                 FileRead::Done { reached: false } | FileRead::Debt => {
-                    sweep.debt = 1;
+                    open_debt(&mut sweep);
                     cursor.clone_from(stem);
                 }
                 FileRead::Stopped => {
@@ -281,11 +299,10 @@ impl ClaudeTelemetryTail {
                 }
             }
         }
-        // A read above may have dropped the certificate: that restarted the
-        // sweep, which this slice must not overwrite with its old position.
+        // A read above may have dropped the certificate (the ledger's copy is
+        // already zero): this slice keeps its position and carries the debt.
         if counts.certificate_dropped > 0 {
-            (cursor, sweep_start, sweep) = sweep_state(ledger, SWEEP_TAIL_KEY);
-            finished = false;
+            open_debt(&mut sweep);
         }
         if finished {
             counts.sweep_wrapped = true;
@@ -305,43 +322,50 @@ impl ClaudeTelemetryTail {
             audit_step(&dir, ledger, now_unix, work, &mut counts);
         }
         if !work.exhausted() {
-            retire_missing(&dir, ledger, now_unix, budget, work, &mut counts);
+            retire_missing(&dir, ledger, budget, work, &mut counts);
         }
-        counts.sweep_complete_through = sweep_state(ledger, SWEEP_TAIL_KEY).2.complete_through;
+        counts.sweep_complete_through = telemetry_complete_through(ledger);
         counts.budget_stopped = work.stopped;
         (counts, roots)
     }
 }
 
-/// The telemetry sweep's `complete_through` (0: never completed).
+/// The telemetry certificate, the one gate negative classification and page
+/// coverage read: "no telemetry owner" can be trusted for what was written
+/// before this time. 0 while the current sweep has debt or none completed.
 pub(crate) fn telemetry_complete_through(ledger: &ClaudeLedger) -> u64 {
-    sweep_state(ledger, SWEEP_TAIL_KEY).2.complete_through
-}
-
-/// The current sweep has no debt and an earlier one completed: "no
-/// telemetry owner" can be trusted up to `complete_through`.
-pub(crate) fn telemetry_certified(ledger: &ClaudeLedger) -> bool {
     let (_, _, sweep) = sweep_state(ledger, SWEEP_TAIL_KEY);
-    sweep.complete_through > 0 && sweep.debt == 0
+    if sweep.debt == 0 {
+        sweep.complete_through
+    } else {
+        0
+    }
 }
 
-/// The ledger lost telemetry claims: drop the certificate now and durably.
-/// `complete_through` is zeroed and a fresh sweep starts here; the ledger
-/// writes this before any data shard.
-pub(crate) fn drop_certificate(ledger: &mut ClaudeLedger, now_unix: u64) {
-    save_sweep(
-        ledger,
-        SWEEP_TAIL_KEY,
-        "",
-        now_unix,
-        ClaudeLedgerSweep::default(),
-    );
+pub(crate) fn telemetry_certified(ledger: &ClaudeLedger) -> bool {
+    telemetry_complete_through(ledger) > 0
+}
+
+/// Debt in the current sweep: the certificate is zero until a later sweep
+/// wraps without any.
+fn open_debt(sweep: &mut ClaudeLedgerSweep) {
+    sweep.debt = 1;
+    sweep.complete_through = 0;
+}
+
+/// The ledger lost telemetry claims: the certificate is zero now and
+/// durably (the ledger writes the zero before any data shard). The sweep
+/// keeps its position and carries the debt.
+pub(crate) fn drop_certificate(ledger: &mut ClaudeLedger) {
+    let (cursor, start, mut sweep) = sweep_state(ledger, SWEEP_TAIL_KEY);
+    open_debt(&mut sweep);
+    save_sweep(ledger, SWEEP_TAIL_KEY, &cursor, start, sweep);
     ledger.note_meta_debt();
 }
 
-fn lose_claims(ledger: &mut ClaudeLedger, now_unix: u64, counts: &mut ClaudeTelemetryTailCounts) {
+fn lose_claims(ledger: &mut ClaudeLedger, counts: &mut ClaudeTelemetryTailCounts) {
     counts.certificate_dropped += 1;
-    drop_certificate(ledger, now_unix);
+    drop_certificate(ledger);
 }
 
 /// A sweep record's (cursor stem, sweep start, state). The cursor is the
@@ -378,6 +402,13 @@ pub(crate) fn save_sweep(
     }
     debug_assert!(key.starts_with(SWEEP_KEY_PREFIX));
     let record = ClaudeRequestCensusRecord::sweep_record(bytes, start, sweep);
+    let before = ledger.get(key).and_then(ClaudeRequestCensusRecord::sweep);
+    if before.is_some_and(|(_, _, before)| before.complete_through > 0)
+        && sweep.complete_through == 0
+    {
+        // A certificate went to zero: that zero reaches the disk first.
+        ledger.note_meta_debt();
+    }
     if ledger.get(key) != Some(&record) {
         let _ = ledger.insert(key.to_owned(), record);
     }
@@ -530,15 +561,17 @@ impl Stamp {
         }
     }
 
-    /// `after` is the same object, still holds the `kept` bytes read, never
-    /// shrank under the frozen extent and was not rewritten in place: an
-    /// append (it grew) is fine, the same length with new times is not.
-    fn unchanged_through(&self, after: &Self, kept: u64) -> bool {
-        after.identity == self.identity
-            && after.len >= kept
+    /// Whether `after` still shows the object read: None when it is another
+    /// object, holds fewer than the `kept` bytes read, shrank under the
+    /// frozen extent or kept its length with new times (rewritten in place);
+    /// else whether it was written meanwhile (it grew: an append, or a
+    /// rewrite plus an append, which only a second pass can tell apart).
+    fn written_since(&self, after: &Self) -> Option<bool> {
+        let times = after.modified == self.modified && after.changed == self.changed;
+        (after.identity == self.identity
             && after.len >= self.len
-            && (after.len != self.len
-                || (after.modified == self.modified && after.changed == self.changed))
+            && (times || after.len > self.len))
+            .then_some(!times || after.len != self.len)
     }
 }
 
@@ -568,12 +601,63 @@ fn race_point(path: &Path) {
 }
 
 /// The descriptor and the path still show the object `opened` stamped,
-/// holding `kept` bytes, not rewritten in place (Sol N4).
-fn read_held(file: &File, path: &Path, opened: &Stamp, kept: u64) -> Option<fs::Metadata> {
+/// holding `kept` bytes, not rewritten in place (Sol N4), with whether it
+/// was written during the read (Sol R3-5).
+fn read_held(file: &File, path: &Path, opened: &Stamp, kept: u64) -> Option<(fs::Metadata, bool)> {
     let after = file.metadata().ok()?;
     let at_path = fs::symlink_metadata(path).ok()?;
-    (opened.unchanged_through(&Stamp::of(&after), kept) && identity(&at_path) == opened.identity)
-        .then_some(after)
+    let stamp = Stamp::of(&after);
+    let written = opened.written_since(&stamp)?;
+    (stamp.len >= kept && identity(&at_path) == opened.identity).then_some((after, written))
+}
+
+/// A second pass over the bytes a read consumed (`[start, end)`, entered at
+/// `start + skip` like the first): the same lines, the same checksum and
+/// the same stop. Proves a file written during the read kept them.
+fn read_again_matches(
+    file: &mut File,
+    start: u64,
+    skip: u64,
+    end: u64,
+    start_sum: u64,
+    first: &LineScan,
+    work: &mut ClaudeLedgerWork,
+) -> bool {
+    if file.seek(SeekFrom::Start(start + skip)).is_err() {
+        return false;
+    }
+    let range = end - start;
+    // Its own allowance: the pass is bounded by the read it checks.
+    let mut again_work = ClaudeLedgerWork::new(range + 1, 0, Duration::from_millis(250));
+    let mut counting = CountingRead::new((&mut *file).take(range - skip));
+    let again = {
+        let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);
+        let mut oversized = 0;
+        scan_lines(
+            &mut reader,
+            range,
+            start_sum,
+            skip,
+            &mut again_work,
+            &mut oversized,
+            |_| {},
+        )
+    };
+    work.debit(counting.read);
+    // Where each pass left an oversized line (0: on a line boundary). The
+    // second pass runs to the end the first reached, never short of it.
+    let first_skip = match first.stop {
+        LineStop::Skipping { skip } => skip,
+        _ => 0,
+    };
+    let again_skip = match again.stop {
+        LineStop::Skipping { skip } => Some(skip),
+        LineStop::End => Some(0),
+        _ => None,
+    };
+    again.consumed == first.consumed
+        && again.line_sum == first.line_sum
+        && again_skip == Some(first_skip)
 }
 
 /// Open a sidecar for reading; a missing file is `Ok(None)`, anything else
@@ -838,7 +922,7 @@ fn read_file(
                 ledger.remove(&key);
                 counts.retired_missing += 1;
                 if had_claims {
-                    lose_claims(ledger, now_unix, counts);
+                    lose_claims(ledger, counts);
                 }
             }
             return FileRead::Absent;
@@ -879,8 +963,18 @@ fn read_file(
     };
     let start = resume.map_or(0, |state| state.offset);
     let skip = resume.map_or(0, |state| state.skip_bytes);
-    if resume.is_some() && start + skip == extent {
+    if let Some(state) = resume.filter(|_| start + skip == extent) {
         counts.files_unchanged += 1;
+        // Written without growing (its mtime moved): due for an audit a day
+        // after the last one, like a file that grew.
+        let modified = modified_unix(&opened);
+        if modified != state.last_append_unix {
+            counts.files_touched += 1;
+            update_tail(ledger, &key, |tail| {
+                tail.last_append_unix = modified;
+                tail.audited_offset = 0;
+            });
+        }
         return FileRead::Done { reached: skip == 0 };
     }
     if saved_tail.is_some() && resume.is_none() {
@@ -972,11 +1066,34 @@ fn read_file(
     };
     // The object read must still be the one at the path, hold what was
     // consumed and not have been rewritten in place: else nothing commits.
+    // Written meanwhile (it grew), the bytes read must read the same again.
     race_point(&path);
-    let Some(after) = read_held(&file, &path, &stamp, offset + skip_bytes) else {
+    let Some((after, written)) = read_held(&file, &path, &stamp, offset + skip_bytes) else {
         counts.files_raced += 1;
         return FileRead::Debt;
     };
+    if written {
+        let anchored = match resume {
+            Some(state) => anchor_at(&mut file, state.offset, work) == Some(state.anchor),
+            None => true,
+        };
+        let start_sum = resume.map_or(0, |state| state.line_sum);
+        if !anchored
+            || !read_again_matches(
+                &mut file,
+                start,
+                skip,
+                offset + skip_bytes,
+                start_sum,
+                &scan,
+                work,
+            )
+        {
+            counts.files_raced += 1;
+            return FileRead::Debt;
+        }
+        counts.files_reread_proven += 1;
+    }
     let Some(anchor) = anchor_at(&mut file, offset, work) else {
         counts.files_unreadable += 1;
         return FileRead::Debt;
@@ -1010,7 +1127,7 @@ fn read_file(
         && (kept.is_none() || merged.is_none());
     drop(previous);
     if lost_claims {
-        lose_claims(ledger, now_unix, counts);
+        lose_claims(ledger, counts);
     }
     let Some((merged, conflicts)) = merged else {
         // The old facts did not decode: the record is rebuilt from 0.
@@ -1039,8 +1156,10 @@ fn read_file(
         anchor,
         line_sum: scan.line_sum,
         last_append_unix: modified_unix(&after),
-        audited_offset: resume.map_or(0, |state| state.audited_offset),
-        audited_unix: resume.map_or(0, |state| state.audited_unix),
+        // A read from 0 just checked every byte it kept: it counts as an
+        // audit of them, so a fresh record is not reread at once.
+        audited_offset: resume.map_or(offset, |state| state.audited_offset),
+        audited_unix: resume.map_or(now_unix, |state| state.audited_unix),
         missing_sweeps: 0,
         first_event_unix: first_event,
         skip_bytes,
@@ -1053,12 +1172,12 @@ fn read_file(
         ClaudeRequestCensusInsert::Stored => {}
         ClaudeRequestCensusInsert::Tombstone => {
             counts.records_tombstoned += 1;
-            lose_claims(ledger, now_unix, counts);
+            lose_claims(ledger, counts);
             return FileRead::Debt;
         }
         ClaudeRequestCensusInsert::Refused => {
             counts.records_refused += 1;
-            lose_claims(ledger, now_unix, counts);
+            lose_claims(ledger, counts);
             return FileRead::Debt;
         }
     }
@@ -1081,11 +1200,40 @@ fn read_file(
     }
 }
 
+/// Audit bytes read per audited directory today: (day, bytes).
+static AUDIT_TODAY: std::sync::Mutex<BTreeMap<std::path::PathBuf, (u64, u64)>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Audit bytes `dir` may still read today.
+fn audit_room_today(dir: &Path, now_unix: u64) -> u64 {
+    AUDIT_TODAY.lock().map_or(0, |today| match today.get(dir) {
+        Some((day, used)) if *day == now_unix / 86_400 => AUDIT_BYTES_PER_DAY.saturating_sub(*used),
+        _ => AUDIT_BYTES_PER_DAY,
+    })
+}
+
+/// Charge audit bytes read today; returns today's total.
+fn note_audit_bytes(dir: &Path, now_unix: u64, bytes: u64) -> u64 {
+    let Ok(mut today) = AUDIT_TODAY.lock() else {
+        return 0;
+    };
+    let day = now_unix / 86_400;
+    let slot = today.entry(dir.to_path_buf()).or_insert((day, 0));
+    if slot.0 != day {
+        *slot = (day, 0);
+    }
+    slot.1 = slot.1.saturating_add(bytes);
+    slot.1
+}
+
 /// One bounded step of the audit: continue the audit in progress, else start
-/// one on the least recently audited due record. An audit rereads
-/// `[0, target)` across pages and compares the resumable checksum; a mismatch
-/// drops the record (rebuilt from 0 next sweep) and the certificate. A read
-/// the stamps show raced stays pending.
+/// one on the least recently audited due record. Due: a day after its last
+/// audit when bytes were appended since, else 30 days (an idle sidecar is
+/// sampled, not reread daily); a retired record (no claims) never. An audit
+/// rereads `[0, target)` across pages within today's audit bytes and
+/// compares the resumable checksum; a mismatch drops the record (rebuilt
+/// from 0 next sweep) and the certificate. A read the stamps show raced or
+/// written meanwhile stays pending.
 fn audit_step(
     dir: &Path,
     ledger: &mut ClaudeLedger,
@@ -1093,17 +1241,27 @@ fn audit_step(
     work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
 ) {
+    let room_today = audit_room_today(dir, now_unix);
+    counts.audit_bytes_today = AUDIT_BYTES_PER_DAY - room_today;
+    // A slice needs room for one longest line.
+    if room_today <= MAX_LINE_BYTES as u64 + ANCHOR_BYTES {
+        return;
+    }
     let chosen = ledger
         .census()
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
         .filter_map(|(key, record)| {
             let state = record.tail()?;
-            if state.offset == 0 {
+            if state.offset == 0 || record.retired().is_some() {
                 return None;
             }
             let in_progress = state.audit.is_some();
-            let due = state.audited_offset < state.offset
-                || now_unix.saturating_sub(state.audited_unix) >= AUDIT_INTERVAL_SECONDS;
+            let interval = if state.audited_offset < state.offset {
+                AUDIT_INTERVAL_SECONDS
+            } else {
+                IDLE_AUDIT_INTERVAL_SECONDS
+            };
+            let due = now_unix.saturating_sub(state.audited_unix) >= interval;
             (in_progress || due).then_some((!in_progress, state.audited_unix, key))
         })
         .min()
@@ -1153,7 +1311,9 @@ fn audit_step(
         return;
     }
     let range = audit.target_offset - audit.position;
-    let limit = (range - audit.skip_bytes).min(work.bytes_left());
+    let limit = (range - audit.skip_bytes)
+        .min(work.bytes_left())
+        .min(room_today);
     let mut counting = CountingRead::new((&mut file).take(limit));
     let scan = {
         let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);
@@ -1170,9 +1330,14 @@ fn audit_step(
     };
     work.debit(counting.read);
     counts.audit_bytes += counting.read;
+    counts.audit_bytes_today = note_audit_bytes(dir, now_unix, counting.read);
     race_point(&path);
-    if read_held(&file, &path, &stamp, audit.target_offset).is_none() {
-        // Raced: neither a verdict nor progress. It stays pending.
+    if !matches!(
+        read_held(&file, &path, &stamp, audit.target_offset),
+        Some((_, false))
+    ) {
+        // Raced or written meanwhile: neither a verdict nor progress. It
+        // stays pending.
         counts.audits_raced += 1;
         return;
     }
@@ -1210,7 +1375,7 @@ fn audit_step(
         _ => {
             counts.audit_mismatches += 1;
             ledger.remove(&key);
-            lose_claims(ledger, now_unix, counts);
+            lose_claims(ledger, counts);
         }
     }
 }
@@ -1235,7 +1400,6 @@ fn update_tail(
 fn retire_missing(
     dir: &Path,
     ledger: &mut ClaudeLedger,
-    now_unix: u64,
     budget: &ClaudeTelemetryTailBudget,
     work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
@@ -1266,7 +1430,7 @@ fn retire_missing(
                 ledger.remove(&key);
                 counts.retired_missing += 1;
                 if had_claims {
-                    lose_claims(ledger, now_unix, counts);
+                    lose_claims(ledger, counts);
                 }
             }
             _ => {}

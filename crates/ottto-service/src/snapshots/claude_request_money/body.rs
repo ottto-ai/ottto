@@ -357,6 +357,11 @@ pub(crate) fn build_claude_request_body(
         );
     }
     for (member_index, item) in family.items.iter().enumerate() {
+        // Past the page deadline the page is refused: stop building.
+        if ctx.late() {
+            body.unbuilt = true;
+            return body;
+        }
         let member = item.source_session_id.as_str();
         let mut old_rows = BTreeMap::<ClaudeLiveKey, (ClaudeMoneyTokens, u64, Option<u64>)>::new();
         for bucket in &item.usage_buckets {
@@ -665,7 +670,11 @@ pub(crate) fn build_claude_request_body(
                 );
             }
         }
-        for unit in &units {
+        for (position, unit) in units.iter().enumerate() {
+            if position % 1024 == 1023 && ctx.late() {
+                body.unbuilt = true;
+                return body;
+            }
             let conserved = unit.tokens.conserved();
             unit_totals.add(conserved, unit.requests, None);
             let verdict = if now.saturating_sub(unit.clock) < MATURITY_SECONDS {
@@ -879,7 +888,11 @@ fn side_calls(
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
     let own_telemetry = super::super::claude_request_census::telemetry_key(family.root);
-    for row in rows.iter() {
+    for (position, row) in rows.iter().enumerate() {
+        if position % 1024 == 1023 && ctx.late() {
+            body.unbuilt = true;
+            return;
+        }
         let hash = row.request_hash;
         if family_hashes.contains(&hash) {
             continue;

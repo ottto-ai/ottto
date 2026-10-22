@@ -750,9 +750,9 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
 }
 
 /// AutoReview 5: when the JSONL cannot be written, no family memo moves
-/// (the reader never received those rows, so they are neither "unchanged"
-/// next time nor a removal basis). The writer reports the failure to the
-/// next page, which withholds the memos.
+/// (the reader never received those rows, so they are no removal basis).
+/// The writer reports the failure to the next page, which withholds the
+/// memos (one per complete body: only a complete body is a basis).
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_memos_move_only_with_published_rows() {
@@ -777,9 +777,11 @@ fn money_shadow_memos_move_only_with_published_rows() {
     assert!(first.jsonl_queued > 0, "{first:?}");
     let second = page();
     assert!(second.jsonl_failed >= 1, "{second:?}");
-    assert_eq!(second.family_memos_withheld, first.families, "{second:?}");
-    // A memo still in flight is no removal basis: the second page reports
-    // the previous body unpublished, never a delta.
+    assert_eq!(
+        second.family_memos_withheld, first.families_coverage_complete,
+        "{second:?}"
+    );
+    // An unwritten body is no removal basis: never a delta.
     assert_eq!(second.removed_change_available, 0, "{second:?}");
     let memos = money::store::with_ledger_for_test(&fixture.support, |ledger| {
         ledger
@@ -788,6 +790,70 @@ fn money_shadow_memos_move_only_with_published_rows() {
             .count()
     });
     assert_eq!(memos, Some(0));
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Sol R3-3 / R3-6: every page writes its families' rows (no writer-side
+/// "unchanged" skip: the reader keeps each family's latest rows by
+/// `snapshot`, so X, Y, X ends at X whatever the writer's timing) and its
+/// own coverage row; a page whose batch never reached its file (a full
+/// outbox) owes its day a false coverage row, written with the next batch.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-every-page");
+    let page = |now| {
+        let counts = money::shadow_page_at(
+            &fixture.support,
+            &scan.snapshots,
+            &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete,
+            now,
+        );
+        money::store::flush();
+        counts
+    };
+    let first = page(response + 3600);
+    let second = page(response + 3601);
+    assert!(first.families > 0, "{first:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let of = |kind: &str| {
+        rows.iter()
+            .filter(|row| row["row"] == kind)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        of("family").len() as u64,
+        first.families + second.families,
+        "the same rows twice are written twice"
+    );
+    assert_eq!(of("coverage").len(), 2, "one coverage row per page");
+    let snapshots = of("family")
+        .iter()
+        .map(|row| row["snapshot"].as_u64().unwrap())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(snapshots.len(), 2, "each page is its own snapshot");
+
+    // A dropped batch (as a full outbox drops it) owes its day a false row.
+    money::owe_coverage_for_test(&fixture.support, response + 3602);
+    page(response + 3603);
+    let rows = money_jsonl_rows(&fixture.support);
+    let owed = rows
+        .iter()
+        .filter(|row| row["row"] == "coverage" && row["dropped"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(owed[0]["coverage_complete"], false);
+    assert_eq!(owed[0]["observed_unix"], response + 3602);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row["row"] == "coverage" && row["dropped"] == false)
+            .count(),
+        3
+    );
     assert_eq!(money::reserved_for_test(), 0);
 }
 
