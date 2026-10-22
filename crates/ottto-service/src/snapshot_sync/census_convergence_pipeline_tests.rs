@@ -134,7 +134,7 @@ impl PipelineFixture {
             index.prepare_historical_replay(cycle.replay_generation.to_string());
         }
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let committed_index = index.clone();
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
