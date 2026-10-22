@@ -890,3 +890,69 @@ fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
         "the next clean terminal clears it"
     );
 }
+
+/// SOURCE / SI P4: a non-authority cause beside authority debt still marks the
+/// sweep. A RetryPending family is held while the full re-arm window's first
+/// page is shed by the server (503) or loses its ACK; the partial checkpoint
+/// marks the sweep exactly as it does without debt.
+fn retry_pending_debt_beside_an_interrupted_page_still_marks_the_sweep(upload: RearmUpload) {
+    if !c1a_layout_supported("patha_debt_beside_interrupted_page") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture(match upload {
+        RearmUpload::Shed => "patha-debt-beside-shed",
+        RearmUpload::AckLost => "patha-debt-beside-ack-lost",
+        RearmUpload::Accept => unreachable!(),
+    });
+    let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
+    assert!(closing.census_complete);
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
+    index.save(&fixture.index_path).unwrap();
+    c1a_full_rearm_due(&fixture);
+    RearmFixture::append(
+        &fixture.root.join(format!("{REARM_ROOT}.jsonl")),
+        &rearm_transcript_line(REARM_ROOT, None, "req_root_interrupted", 30),
+    );
+    let pages = c1a_generation_with(
+        &fixture,
+        "fix",
+        (8, 10),
+        Some((0, upload, REARM_ROOT)),
+        |_| {},
+    );
+    let (first, last) = (&pages[0], pages.last().expect("terminal page"));
+    assert!(
+        !first.fully_settled,
+        "{upload:?}: the first page was interrupted"
+    );
+    assert!(
+        first
+            .index
+            .claude_authority_record_for_test(REARM_TERMINAL)
+            .is_some_and(|record| !record.terminal),
+        "{upload:?}: the held family keeps its RetryPending record"
+    );
+    assert!(
+        first.index.bounded_sweep_had_unsettled_upload(),
+        "{upload:?}: the interruption marks the sweep beside the debt"
+    );
+    assert!(
+        last.index.bounded_sweep_had_unsettled_upload(),
+        "{upload:?}: the mark holds for the rest of the traversal"
+    );
+    assert!(!last.scan.census_complete, "{upload:?}");
+}
+
+#[test]
+#[serial(source_manifests)]
+fn retry_pending_debt_beside_a_server_shed_still_marks_the_sweep() {
+    retry_pending_debt_beside_an_interrupted_page_still_marks_the_sweep(RearmUpload::Shed);
+}
+
+#[test]
+#[serial(source_manifests)]
+fn retry_pending_debt_beside_a_lost_ack_still_marks_the_sweep() {
+    retry_pending_debt_beside_an_interrupted_page_still_marks_the_sweep(RearmUpload::AckLost);
+}
