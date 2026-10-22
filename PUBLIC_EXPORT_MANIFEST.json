@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 779,
-  "content_sha256": "c75b7c5bacc315b01c3d7a6e9415223385f95c441d55f8df5b4ede3b5b9afdbb",
+  "content_sha256": "7eedf92ba8acae09c4714879ea1e4f453fd6684f99a3de5e0fd7455ec47cbcc8",
   "files": [
     {
       "executable": false,
@@ -34,8 +34,8 @@
       "executable": false,
       "mode": "0644",
       "path": "AGENTS.md",
-      "sha256": "a6d20cc05a79d43c158207a0f9f34a606ef49b9e93ae6f088fcafe550821280d",
-      "size_bytes": 2899
+      "sha256": "1cbe0eb2888b19cc0b47eec38c95027b56856a2302da14f59ef7071372b36338",
+      "size_bytes": 3088
     },
     {
       "executable": false,
