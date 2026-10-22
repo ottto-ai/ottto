@@ -21,17 +21,50 @@
 //! whose recorded writer pid no longer exists, and its identity must be
 //! unchanged immediately before the unlink. Any doubt keeps the file.
 //!
+//! Holding a free lock is not harmless either: every writer takes it
+//! without blocking, so a save that another daemon starts while the sweep
+//! holds it fails. Those writers live only in the `ottto-service`
+//! executable (the `ottto` CLI does not link them, and `snapshot-audit` is
+//! an `ottto-service` process too). So nothing is applied, and no lock is
+//! taken, while any other process of this user runs an executable named
+//! `ottto-service`: the process table is read before the pass applies
+//! anything and again before every lock attempt, and once it shows such a
+//! process, or cannot be read, the rest of the pass applies nothing
+//! (`skipped.other_daemon`). The startup pass runs before this daemon
+//! starts any worker of its own. What remains is a daemon launched between
+//! the last process-table read and the unlink, a window of a few syscalls;
+//! launchd starts one instance per label, so that needs a second, manually
+//! started daemon racing the first one's startup, and even then its save
+//! only fails once and is retried on its next cycle.
+//! The hidden command's `--apply` skips this check and reports
+//! `not_applicable_non_default_dir`: it refuses, by device and inode, every
+//! support directory a daemon of this user can use (the environment's and
+//! the account database's home), so it only ever runs on copies.
+//!
 //! Only `<support>/snapshots/destinations/<64 lowercase hex>/` is visited,
 //! one level deep, through directory descriptors that never follow symlinks.
-//! Canonical checkpoints, lock files, quarantined `*.corrupt.*` copies,
-//! directories and anything else are never removed, and no lock file is ever
-//! created. Startup and the hidden `local-state-sweep` command share this
-//! code; the command's plan mode takes no locks and changes nothing.
+//! The support directory itself is opened one component at a time from `/`,
+//! so a symlink anywhere on its path, or a `.`, `..`, empty or trailing-slash
+//! component, skips the whole pass. Canonical checkpoints, lock files,
+//! quarantined `*.corrupt.*` copies, directories and anything else are never
+//! removed, and no lock file is ever created. Startup and the hidden
+//! `local-state-sweep` command share this code; the command's plan mode
+//! takes no locks and changes nothing.
+//!
+//! The time budget is checked before every directory entry, path component
+//! and candidate, and no directory is fsynced: an unlink lost to a crash is
+//! simply redone at the next startup. A single syscall on a stalled local
+//! filesystem can still block, exactly as the startup recovery hooks that
+//! run just before this pass already block synchronously on the same
+//! support directory (`FilePendingDeviceCredentialStore::load` in
+//! `recover_pending_device_credential_at_startup`, the browser-auth
+//! `read_state`, then `load_or_create_control_token`), so the pass adds no
+//! new kind of startup hang.
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
-use std::ffi::{CStr, CString};
-use std::io::ErrorKind;
+use std::ffi::{CStr, CString, OsStr};
+use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
@@ -46,6 +79,8 @@ const MIN_AGE: Duration = Duration::from_secs(60 * 60);
 const MAX_DIR_ENTRIES: usize = 10_000;
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 const SCHEMA_VERSION: u32 = 1;
+/// The only executable that links the checkpoint writers.
+const DAEMON_EXECUTABLE: &str = ottto_core::OTTTO_SERVICE_BINARY_NAME;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -183,17 +218,33 @@ fn probe_pid(pid: i32) -> PidState {
     }
 }
 
+/// Whether another `ottto-service` process of this user may be running.
+/// An error means the process table could not be read completely.
+type DaemonProbe = Box<dyn Fn() -> std::io::Result<bool>>;
+
+enum OtherDaemonCheck {
+    /// Probe before applying anything and again before every lock attempt.
+    Probe(DaemonProbe),
+    /// The hidden command on a directory that `--apply` already proved is
+    /// not a default support directory, which is the only one a daemon uses.
+    NotApplicable,
+}
+
 struct Policy {
     now: SystemTime,
     min_age: Duration,
     own_pid: i32,
     uid: u32,
     probe: fn(i32) -> PidState,
+    other_daemon: OtherDaemonCheck,
     max_entries: usize,
     time_budget: Duration,
     /// Runs after the lock is taken and before the final identity check.
     #[cfg(test)]
     before_recheck: Option<RecheckHook>,
+    /// Treats the budget as spent after this many deadline checks.
+    #[cfg(test)]
+    expire_after_checks: Option<usize>,
 }
 
 #[cfg(test)]
@@ -207,13 +258,205 @@ impl Policy {
             own_pid: i32::try_from(std::process::id()).unwrap_or(0),
             uid: unsafe { libc::getuid() },
             probe: probe_pid,
+            other_daemon: OtherDaemonCheck::Probe(Box::new(other_daemon_running)),
             max_entries: MAX_DIR_ENTRIES,
             time_budget: TIME_BUDGET,
             #[cfg(test)]
             before_recheck: None,
+            #[cfg(test)]
+            expire_after_checks: None,
         }
     }
 }
+
+fn is_daemon_name(name: &[u8]) -> bool {
+    name == DAEMON_EXECUTABLE.as_bytes()
+}
+
+fn is_daemon_path(path: &Path) -> bool {
+    path.file_name()
+        .is_some_and(|name| is_daemon_name(name.as_bytes()))
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+mod process_table {
+    use std::mem::{size_of, MaybeUninit};
+
+    /// `PROC_PIDT_SHORTBSDINFO` and `struct proc_bsdshortinfo` from
+    /// `<sys/proc_info.h>`. Unlike the full BSD info, the kernel serves it
+    /// for every process, so a process of another user never reads as an
+    /// error.
+    const PROC_PIDT_SHORTBSDINFO: libc::c_int = 13;
+
+    #[repr(C)]
+    #[allow(dead_code)] // Mirrors the C layout; only some fields are read.
+    struct ShortBsdInfo {
+        pid: u32,
+        ppid: u32,
+        pgid: u32,
+        status: u32,
+        comm: [u8; 16],
+        flags: u32,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+        ruid: libc::uid_t,
+        rgid: libc::gid_t,
+        svuid: libc::uid_t,
+        svgid: libc::gid_t,
+        rfu: u32,
+    }
+
+    fn all_pids() -> std::io::Result<Vec<libc::pid_t>> {
+        for _ in 0..4 {
+            let estimate = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+            if estimate <= 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let capacity = estimate as usize + 256;
+            let mut pids = vec![0 as libc::pid_t; capacity];
+            let bytes = libc::c_int::try_from(capacity * size_of::<libc::pid_t>())
+                .map_err(std::io::Error::other)?;
+            let count = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+            if count < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // A full buffer may have been truncated; ask again.
+            if (count as usize) < capacity {
+                pids.truncate(count as usize);
+                return Ok(pids);
+            }
+        }
+        Err(std::io::Error::other("process table kept growing"))
+    }
+
+    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+        let own = std::process::id();
+        let uid = unsafe { libc::getuid() };
+        for pid in all_pids()? {
+            if pid <= 0 || pid as u32 == own {
+                continue;
+            }
+            let mut info = MaybeUninit::<ShortBsdInfo>::zeroed();
+            let size = size_of::<ShortBsdInfo>() as libc::c_int;
+            let filled = unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    PROC_PIDT_SHORTBSDINFO,
+                    0,
+                    info.as_mut_ptr().cast(),
+                    size,
+                )
+            };
+            if filled <= 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    // Exited since the listing.
+                    continue;
+                }
+                return Err(error);
+            }
+            if filled != size {
+                return Err(std::io::Error::other("short process info"));
+            }
+            let info = unsafe { info.assume_init() };
+            if info.uid != uid && info.ruid != uid {
+                continue;
+            }
+            // `comm` is the executed file's name, cut at 16 bytes, which is
+            // longer than the daemon's name.
+            let comm = info.comm.split(|byte| *byte == 0).next().unwrap_or(&[]);
+            if super::is_daemon_name(comm)
+                || pid_path(pid).is_some_and(|path| super::is_daemon_path(&path))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn pid_path(pid: libc::pid_t) -> Option<std::path::PathBuf> {
+        use std::os::unix::ffi::OsStrExt;
+        let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+        let length =
+            unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+        let length = usize::try_from(length).ok().filter(|length| *length > 0)?;
+        buffer.truncate(length);
+        Some(std::ffi::OsStr::from_bytes(&buffer).into())
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+mod process_table {
+    use std::io::ErrorKind;
+
+    fn gone(error: &std::io::Error) -> bool {
+        error.kind() == ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    }
+
+    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+        let own = std::process::id();
+        let uid = unsafe { libc::getuid() };
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            if pid == own {
+                continue;
+            }
+            let dir = entry.path();
+            let status = match std::fs::read_to_string(dir.join("status")) {
+                Ok(status) => status,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let ids = status
+                .lines()
+                .find_map(|line| line.strip_prefix("Uid:"))
+                .ok_or_else(|| std::io::Error::other("process status without Uid"))?;
+            // Real and effective uid.
+            if !ids
+                .split_whitespace()
+                .take(2)
+                .any(|id| id.parse::<u32>().ok() == Some(uid))
+            {
+                continue;
+            }
+            let comm = match std::fs::read(dir.join("comm")) {
+                Ok(comm) => comm,
+                Err(error) if gone(&error) => continue,
+                Err(error) => return Err(error),
+            };
+            let comm = comm.strip_suffix(b"\n").unwrap_or(&comm);
+            let exe = std::fs::read_link(dir.join("exe")).ok().map(|exe| {
+                let exe = exe.to_string_lossy().into_owned();
+                std::path::PathBuf::from(exe.strip_suffix(" (deleted)").unwrap_or(&exe))
+            });
+            if super::is_daemon_name(comm) || exe.is_some_and(|exe| super::is_daemon_path(&exe)) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+#[cfg(not(any(
+    target_os = "macos",
+    target_os = "ios",
+    target_os = "linux",
+    target_os = "android"
+)))]
+mod process_table {
+    pub(super) fn other_daemon_running() -> std::io::Result<bool> {
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
+}
+
+use process_table::other_daemon_running;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
@@ -232,6 +475,7 @@ enum SkipReason {
     Changed,
     UnsafeEntry,
     TooManyEntries,
+    OtherDaemon,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -243,6 +487,7 @@ struct SkipCounts {
     changed: u64,
     unsafe_entry: u64,
     too_many_entries: u64,
+    other_daemon: u64,
 }
 
 impl SkipCounts {
@@ -255,6 +500,7 @@ impl SkipCounts {
             SkipReason::Changed => &mut self.changed,
             SkipReason::UnsafeEntry => &mut self.unsafe_entry,
             SkipReason::TooManyEntries => &mut self.too_many_entries,
+            SkipReason::OtherDaemon => &mut self.other_daemon,
         };
         *count += 1;
     }
@@ -267,6 +513,7 @@ impl SkipCounts {
             + self.changed
             + self.unsafe_entry
             + self.too_many_entries
+            + self.other_daemon
     }
 }
 
@@ -277,6 +524,26 @@ enum EntryOutcome {
     WouldRemove,
     Skipped,
     Error,
+}
+
+/// What the pass knows about other daemons. Anything but `clear` or
+/// `not_applicable_non_default_dir` means nothing was applied after it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum OtherDaemonState {
+    /// Plan mode, which takes no locks.
+    #[default]
+    NotChecked,
+    Clear,
+    Present,
+    ProbeFailed,
+    NotApplicableNonDefaultDir,
+}
+
+impl OtherDaemonState {
+    fn blocks_apply(self) -> bool {
+        matches!(self, Self::Present | Self::ProbeFailed)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -311,6 +578,7 @@ struct SweepReport {
     skipped: SkipCounts,
     errors: u64,
     time_budget_exhausted: bool,
+    other_daemon_check: OtherDaemonState,
     entries: Vec<EntryReport>,
 }
 
@@ -326,6 +594,7 @@ impl SweepReport {
             skipped: &'a SkipCounts,
             errors: u64,
             time_budget_exhausted: bool,
+            other_daemon_check: OtherDaemonState,
         }
         if self.removed == 0
             && self.skipped.total() == 0
@@ -342,6 +611,7 @@ impl SweepReport {
             skipped: &self.skipped,
             errors: self.errors,
             time_budget_exhausted: self.time_budget_exhausted,
+            other_daemon_check: self.other_daemon_check,
         })
         .ok()
     }
@@ -453,11 +723,15 @@ enum Listing {
     Names(Vec<String>),
     TooMany,
     Failed,
+    OutOfTime,
 }
 
 /// Every UTF-8 entry name of `dir`, sorted; at most `cap` entries in total.
-fn list_dir(dir: &OwnedFd, cap: usize) -> Listing {
-    let duplicate = unsafe { libc::dup(dir.as_raw_fd()) };
+/// `out_of_time` is asked before every entry.
+fn list_dir(dir: &OwnedFd, cap: usize, out_of_time: &mut dyn FnMut() -> bool) -> Listing {
+    // `fdopendir` owns and closes its descriptor, so give it a copy, which
+    // must not leak into a child that a running thread spawns meanwhile.
+    let duplicate = unsafe { libc::fcntl(dir.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
     if duplicate < 0 {
         return Listing::Failed;
     }
@@ -471,6 +745,9 @@ fn list_dir(dir: &OwnedFd, cap: usize) -> Listing {
     let mut names = Vec::new();
     let mut seen = 0_usize;
     let listing = loop {
+        if out_of_time() {
+            break Listing::OutOfTime;
+        }
         clear_errno();
         let entry = unsafe { libc::readdir(stream) };
         if entry.is_null() {
@@ -530,14 +807,44 @@ struct Sweep<'a> {
     started: Instant,
     record_entries: bool,
     report: SweepReport,
+    #[cfg(test)]
+    deadline_checks: usize,
 }
 
 impl Sweep<'_> {
     fn out_of_time(&mut self) -> bool {
+        #[cfg(test)]
+        {
+            self.deadline_checks += 1;
+            if self
+                .policy
+                .expire_after_checks
+                .is_some_and(|checks| self.deadline_checks > checks)
+            {
+                self.report.time_budget_exhausted = true;
+            }
+        }
         if self.started.elapsed() > self.policy.time_budget {
             self.report.time_budget_exhausted = true;
         }
         self.report.time_budget_exhausted
+    }
+
+    /// Reads the process table unless an earlier read already stopped the
+    /// pass from applying. Returns whether applying must stop.
+    fn other_daemon_may_run(&mut self) -> bool {
+        if self.report.other_daemon_check.blocks_apply() {
+            return true;
+        }
+        self.report.other_daemon_check = match &self.policy.other_daemon {
+            OtherDaemonCheck::NotApplicable => OtherDaemonState::NotApplicableNonDefaultDir,
+            OtherDaemonCheck::Probe(probe) => match probe() {
+                Ok(false) => OtherDaemonState::Clear,
+                Ok(true) => OtherDaemonState::Present,
+                Err(_) => OtherDaemonState::ProbeFailed,
+            },
+        };
+        self.report.other_daemon_check.blocks_apply()
     }
 
     fn record(&mut self, path: String, bytes: u64, verdict: &Verdict, lock: LockState) {
@@ -585,11 +892,11 @@ impl Sweep<'_> {
     }
 
     fn run(&mut self, support_dir: &Path) {
-        let Ok(path) = CString::new(support_dir.as_os_str().as_bytes()) else {
-            self.record(".".to_string(), 0, &Verdict::Error, LockState::NotChecked);
-            return;
-        };
-        let Some(support) = self.open_directory(libc::AT_FDCWD, &path, ".".to_string()) else {
+        if self.mode == Mode::Apply {
+            // The result sticks; candidates count as `other_daemon` below.
+            self.other_daemon_may_run();
+        }
+        let Some(support) = self.open_support(support_dir) else {
             return;
         };
         let Some(snapshots) =
@@ -624,6 +931,71 @@ impl Sweep<'_> {
                 self.sweep_destination(&destination, &relative);
             }
         }
+    }
+
+    /// Opens the absolute `support_dir` one component at a time from `/`,
+    /// none of which may be a symlink, and requires the last to be a safe
+    /// directory. Spellings that a kernel lookup would normalize (`.`,
+    /// `..`, empty components, a trailing slash) are refused, not resolved.
+    fn open_support(&mut self, support_dir: &Path) -> Option<OwnedFd> {
+        let unsafe_root = |sweep: &mut Self| {
+            sweep.record(
+                ".".to_string(),
+                0,
+                &Verdict::Skip(SkipReason::UnsafeEntry),
+                LockState::NotChecked,
+            );
+            None
+        };
+        let Some(relative) = support_dir.as_os_str().as_bytes().strip_prefix(b"/") else {
+            return unsafe_root(self);
+        };
+        let mut components = Vec::new();
+        for component in relative.split(|byte| *byte == b'/') {
+            match CString::new(component) {
+                Ok(name) if !matches!(component, b"" | b"." | b"..") => components.push(name),
+                _ => return unsafe_root(self),
+            }
+        }
+        let Some((last, ancestors)) = components.split_last() else {
+            return unsafe_root(self);
+        };
+        let mut parent = match open_at(libc::AT_FDCWD, c"/", libc::O_RDONLY | libc::O_DIRECTORY) {
+            Ok(root) => root,
+            Err(_) => {
+                self.record(".".to_string(), 0, &Verdict::Error, LockState::NotChecked);
+                return None;
+            }
+        };
+        for name in ancestors {
+            if self.out_of_time() {
+                return None;
+            }
+            parent = match open_at(
+                parent.as_raw_fd(),
+                name,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            ) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == ErrorKind::NotFound => return None,
+                Err(error)
+                    if matches!(
+                        error.raw_os_error(),
+                        Some(libc::ELOOP) | Some(libc::ENOTDIR)
+                    ) =>
+                {
+                    return unsafe_root(self)
+                }
+                Err(_) => {
+                    self.record(".".to_string(), 0, &Verdict::Error, LockState::NotChecked);
+                    return None;
+                }
+            };
+        }
+        if self.out_of_time() {
+            return None;
+        }
+        self.open_directory(parent.as_raw_fd(), last, ".".to_string())
     }
 
     /// Opens `name` under `parent` as a real directory owned by this user
@@ -697,8 +1069,11 @@ impl Sweep<'_> {
     }
 
     fn list(&mut self, directory: &OwnedFd, relative: &str) -> Option<Vec<String>> {
-        match list_dir(directory, self.policy.max_entries) {
+        let cap = self.policy.max_entries;
+        match list_dir(directory, cap, &mut || self.out_of_time()) {
             Listing::Names(names) => Some(names),
+            // Already recorded as `time_budget_exhausted`.
+            Listing::OutOfTime => None,
             Listing::TooMany => {
                 self.record(
                     relative.to_string(),
@@ -724,7 +1099,6 @@ impl Sweep<'_> {
         let Some(names) = self.list(directory, relative) else {
             return;
         };
-        let mut removed_any = false;
         for name in names {
             if self.out_of_time() {
                 break;
@@ -733,7 +1107,6 @@ impl Sweep<'_> {
                 continue;
             };
             let (verdict, bytes, lock) = self.consider(directory.as_raw_fd(), &name, &artifact);
-            removed_any |= matches!(verdict, Verdict::Removed);
             self.record_artifact(
                 format!("{relative}/{name}"),
                 Some(artifact.kind),
@@ -741,9 +1114,6 @@ impl Sweep<'_> {
                 &verdict,
                 lock,
             );
-        }
-        if removed_any && unsafe { libc::fsync(directory.as_raw_fd()) } != 0 {
-            self.report.errors += 1;
         }
     }
 
@@ -787,6 +1157,9 @@ impl Sweep<'_> {
         }
         if self.mode == Mode::Plan {
             return not_checked(Verdict::WouldRemove, bytes);
+        }
+        if self.other_daemon_may_run() {
+            return not_checked(Verdict::Skip(SkipReason::OtherDaemon), bytes);
         }
         let _lock = match self.lock(dir, &lock_name, &lock_identity) {
             Ok(lock) => lock,
@@ -894,6 +1267,8 @@ fn sweep(support_dir: &Path, mode: Mode, policy: &Policy, record_entries: bool) 
         started: Instant::now(),
         record_entries,
         report: SweepReport::default(),
+        #[cfg(test)]
+        deadline_checks: 0,
     };
     sweep.run(support_dir);
     sweep.report
@@ -904,30 +1279,86 @@ fn sweep(support_dir: &Path, mode: Mode, policy: &Policy, record_entries: bool) 
 /// content-free line only when it removed, skipped or failed something.
 pub fn sweep_local_state_at_startup() {
     let support_dir = ottto_core::default_support_dir();
-    let report =
-        std::panic::catch_unwind(|| sweep(&support_dir, Mode::Apply, &Policy::production(), false))
-            .unwrap_or_else(|_| SweepReport {
-                errors: 1,
-                ..SweepReport::default()
-            });
+    let report = startup_report(&support_dir, Policy::production);
     if let Some(line) = report.log_line("startup") {
         eprintln!("ottto-service: local_state_sweep {line}");
     }
 }
 
-/// Directories the hidden command must never apply to: the daemon cleans
-/// its own support directory at startup.
-fn protected_support_dirs() -> Vec<PathBuf> {
-    let mut directories = vec![ottto_core::default_support_dir()];
-    if let Ok(home) = std::env::var("HOME") {
-        directories.push(
-            PathBuf::from(home)
-                .join("Library")
-                .join("Application Support")
-                .join("Ottto"),
-        );
+/// The startup pass always checks for other daemons: `policy` must come
+/// with a process-table probe.
+fn startup_report(support_dir: &Path, policy: impl FnOnce() -> Policy) -> SweepReport {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let policy = policy();
+        if !matches!(policy.other_daemon, OtherDaemonCheck::Probe(_)) {
+            return SweepReport {
+                errors: 1,
+                ..SweepReport::default()
+            };
+        }
+        sweep(support_dir, Mode::Apply, &policy, false)
+    }))
+    .unwrap_or_else(|_| SweepReport {
+        errors: 1,
+        ..SweepReport::default()
+    })
+}
+
+/// Directories the hidden command must never apply to: every spelling of
+/// the support directory a daemon of this user could be using, which the
+/// daemon cleans itself at startup.
+fn protected_support_dirs() -> Result<Vec<PathBuf>> {
+    let under_home = |home: &Path| {
+        home.join("Library")
+            .join("Application Support")
+            .join("Ottto")
+    };
+    let mut directories = vec![
+        ottto_core::default_support_dir(),
+        std::env::temp_dir().join("Ottto"),
+    ];
+    if let Some(home) = std::env::var_os("HOME") {
+        directories.push(under_home(Path::new(&home)));
     }
-    directories
+    // HOME can be overridden; the account database cannot.
+    let home = account_home().context("look up this account's home directory")?;
+    directories.push(under_home(&home));
+    Ok(directories)
+}
+
+/// This uid's home directory from the account database (`getpwuid_r`).
+fn account_home() -> Result<PathBuf> {
+    let mut buffer_len = 4096_usize;
+    loop {
+        let mut buffer = vec![0 as libc::c_char; buffer_len];
+        let mut entry = std::mem::MaybeUninit::<libc::passwd>::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                entry.as_mut_ptr(),
+                buffer.as_mut_ptr(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if status == libc::ERANGE && buffer_len < 1 << 20 {
+            buffer_len *= 2;
+            continue;
+        }
+        if status != 0 || found.is_null() {
+            return Err(anyhow!("no account entry for this uid"));
+        }
+        let directory = unsafe { (*found).pw_dir };
+        if directory.is_null() {
+            return Err(anyhow!("account entry without a home directory"));
+        }
+        let home = unsafe { CStr::from_ptr(directory) }.to_bytes();
+        if home.is_empty() {
+            return Err(anyhow!("account entry without a home directory"));
+        }
+        return Ok(PathBuf::from(OsStr::from_bytes(home)));
+    }
 }
 
 /// Refuses when `support_dir` (or its snapshot folders) is the same
@@ -965,13 +1396,52 @@ fn refuse_protected(support_dir: &Path, protected: &[PathBuf]) -> Result<()> {
 /// writes nothing; `--apply` uses the startup guards and refuses the real
 /// support directory.
 pub fn run_local_state_sweep_command(support_dir: &Path, apply: bool, json: bool) -> Result<()> {
+    let protected = if apply {
+        protected_support_dirs()?
+    } else {
+        Vec::new()
+    };
+    let stdout = std::io::stdout();
+    local_state_sweep_command(
+        support_dir,
+        apply,
+        json,
+        &protected,
+        Policy::production(),
+        &mut stdout.lock(),
+    )
+}
+
+fn local_state_sweep_command(
+    support_dir: &Path,
+    apply: bool,
+    json: bool,
+    protected: &[PathBuf],
+    policy: Policy,
+    out: &mut dyn Write,
+) -> Result<()> {
+    // The walk needs an absolute path. It is not normalized or
+    // canonicalized, so a symlink or an odd spelling still skips the pass.
+    let support_dir = if support_dir.is_absolute() {
+        support_dir.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .context("resolve --support-dir")?
+            .join(support_dir)
+    };
     let mode = if apply {
-        refuse_protected(support_dir, &protected_support_dirs())?;
+        refuse_protected(&support_dir, protected)?;
         Mode::Apply
     } else {
         Mode::Plan
     };
-    let report = sweep(support_dir, mode, &Policy::production(), true);
+    // `--apply` was just refused for every support directory a daemon of
+    // this user can use, so no daemon contends for these locks.
+    let policy = Policy {
+        other_daemon: OtherDaemonCheck::NotApplicable,
+        ..policy
+    };
+    let report = sweep(&support_dir, mode, &policy, true);
     if json {
         #[derive(Serialize)]
         struct Output<'a> {
@@ -985,10 +1455,11 @@ pub fn run_local_state_sweep_command(support_dir: &Path, apply: bool, json: bool
             mode: if apply { "apply" } else { "plan" },
             report: &report,
         };
-        println!(
+        writeln!(
+            out,
             "{}",
             serde_json::to_string_pretty(&output).context("encode local state sweep report")?
-        );
+        )?;
     } else {
         for entry in &report.entries {
             let reason = entry
@@ -996,20 +1467,26 @@ pub fn run_local_state_sweep_command(support_dir: &Path, apply: bool, json: bool
                 .and_then(|reason| serde_json::to_value(reason).ok())
                 .and_then(|value| value.as_str().map(str::to_string))
                 .unwrap_or_default();
-            println!(
+            writeln!(
+                out,
                 "{:?} {} {} {reason}",
                 entry.outcome, entry.bytes, entry.path
-            );
+            )?;
         }
-        println!(
-            "removed {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}",
+        let other_daemon_check = serde_json::to_value(report.other_daemon_check)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_default();
+        writeln!(
+            out,
+            "removed {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}, other daemon check {other_daemon_check}",
             report.removed,
             report.bytes_removed,
             report.candidates,
             report.candidate_bytes,
             report.skipped.total(),
             report.errors
-        );
+        )?;
     }
     Ok(())
 }

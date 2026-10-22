@@ -14,7 +14,10 @@ const PROGRESS: &str = "codex-scan-index-v3-upload-progress";
 const TERMINAL: &str = "pi-terminal-status-v1";
 
 struct Fixture {
-    scratch: ScratchDir,
+    _scratch: ScratchDir,
+    /// The scratch directory's real path: the sweep refuses a support path
+    /// through a symlink, and `$TMPDIR` is under one on macOS.
+    root: PathBuf,
     support: PathBuf,
     dest: PathBuf,
 }
@@ -40,9 +43,11 @@ fn support_tree(scratch: &Path, name: &str) -> (PathBuf, PathBuf) {
 
 fn fixture() -> Fixture {
     let scratch = ScratchDir::new("local-state-sweep");
-    let (support, dest) = support_tree(&scratch, "support");
+    let root = fs::canonicalize(&*scratch).expect("real scratch path");
+    let (support, dest) = support_tree(&root, "support");
     Fixture {
-        scratch,
+        _scratch: scratch,
+        root,
         support,
         dest,
     }
@@ -64,11 +69,23 @@ fn plant_orphan(dest: &Path, base: &str) -> PathBuf {
     orphan
 }
 
+fn daemon_probe(probe: impl Fn() -> std::io::Result<bool> + 'static) -> OtherDaemonCheck {
+    OtherDaemonCheck::Probe(Box::new(probe))
+}
+
+/// Production rules, except that no other daemon is running.
+fn now() -> Policy {
+    Policy {
+        other_daemon: daemon_probe(|| Ok(false)),
+        ..Policy::production()
+    }
+}
+
 /// Two hours from now, so freshly written fixtures are past the one-hour age.
 fn later() -> Policy {
     Policy {
         now: SystemTime::now() + Duration::from_secs(2 * 60 * 60),
-        ..Policy::production()
+        ..now()
     }
 }
 
@@ -84,6 +101,20 @@ fn names_and_locks_only() -> Policy {
 
 fn apply(support: &Path, policy: &Policy) -> SweepReport {
     sweep(support, Mode::Apply, policy, true)
+}
+
+/// Whether a fresh descriptor could take `path`'s lock right now; it lets
+/// go again at once.
+fn lock_is_free(path: &Path) -> bool {
+    let file = fs::File::open(path).expect("open lock");
+    let free = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+    if !free {
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EWOULDBLOCK)
+        );
+    }
+    free
 }
 
 fn hold_lock(path: &Path) -> fs::File {
@@ -413,7 +444,7 @@ fn temp_younger_than_an_hour_is_kept() {
     let f = fixture();
     let orphan = plant_orphan(&f.dest, INDEX);
 
-    let report = apply(&f.support, &Policy::production());
+    let report = apply(&f.support, &now());
 
     assert_eq!(report.removed, 0);
     assert_eq!(report.skipped.recent, 1);
@@ -476,19 +507,19 @@ fn missing_lock_file_keeps_the_temp_and_creates_no_lock() {
 #[test]
 fn symlinks_are_never_followed() {
     let f = fixture();
-    let (outside, outside_dest) = support_tree(&f.scratch, "outside");
+    let (outside, outside_dest) = support_tree(&f.root, "outside");
     let outside_orphan = plant_orphan(&outside_dest, INDEX);
     let outside_snapshots = outside.join("snapshots");
     let outside_destinations = outside_snapshots.join("destinations");
 
     // Symlinked support directory.
-    let linked_support = f.scratch.join("linked-support");
+    let linked_support = f.root.join("linked-support");
     symlink(&outside, &linked_support).unwrap();
     // Symlinked snapshots, destinations and destination directories.
-    let linked_snapshots = f.scratch.join("linked-snapshots");
+    let linked_snapshots = f.root.join("linked-snapshots");
     private_dir(&linked_snapshots);
     symlink(&outside_snapshots, linked_snapshots.join("snapshots")).unwrap();
-    let linked_destinations = f.scratch.join("linked-destinations");
+    let linked_destinations = f.root.join("linked-destinations");
     private_dir(&linked_destinations);
     private_dir(&linked_destinations.join("snapshots"));
     symlink(
@@ -496,7 +527,7 @@ fn symlinks_are_never_followed() {
         linked_destinations.join("snapshots").join("destinations"),
     )
     .unwrap();
-    let linked_destination = f.scratch.join("linked-destination");
+    let linked_destination = f.root.join("linked-destination");
     private_dir(&linked_destination);
     private_dir(&linked_destination.join("snapshots"));
     private_dir(&linked_destination.join("snapshots").join("destinations"));
@@ -521,7 +552,7 @@ fn symlinks_are_never_followed() {
     }
 
     // A temp name that is a symlink to an old outside file.
-    let victim = f.scratch.join("victim");
+    let victim = f.root.join("victim");
     write(&victim, b"victim");
     write(&f.dest.join(format!("{INDEX}.lock")), b"");
     let linked_temp = f.dest.join(pid_temp(INDEX, DEAD_PID));
@@ -533,7 +564,7 @@ fn symlinks_are_never_followed() {
         .join("destinations")
         .join(OTHER_DESTINATION);
     private_dir(&other_dest);
-    let outside_lock = f.scratch.join("outside.lock");
+    let outside_lock = f.root.join("outside.lock");
     write(&outside_lock, b"");
     symlink(&outside_lock, other_dest.join(format!("{INDEX}.lock"))).unwrap();
     let guarded = other_dest.join(pid_temp(INDEX, DEAD_PID));
@@ -556,7 +587,7 @@ fn symlinks_are_never_followed() {
 fn hardlinked_temp_is_kept() {
     let f = fixture();
     let orphan = plant_orphan(&f.dest, INDEX);
-    let other_name = f.scratch.join("other-name");
+    let other_name = f.root.join("other-name");
     fs::hard_link(&orphan, &other_name).unwrap();
 
     let report = apply(&f.support, &later());
@@ -742,12 +773,19 @@ fn apply_refuses_the_protected_support_directory() {
     let protected = vec![f.support.clone()];
     assert!(refuse_protected(&f.support, &protected).is_err());
     assert!(refuse_protected(&f.support.join("snapshots").join(".."), &protected).is_err());
-    let alias = f.scratch.join("alias");
+    let alias = f.root.join("alias");
     symlink(&f.support, &alias).unwrap();
     assert!(refuse_protected(&alias, &protected).is_err());
-    let (mirror, _) = support_tree(&f.scratch, "mirror");
+    let (mirror, _) = support_tree(&f.root, "mirror");
     assert!(refuse_protected(&mirror, &protected).is_ok());
-    assert!(protected_support_dirs().contains(&ottto_core::default_support_dir()));
+    let protected = protected_support_dirs().expect("protected directories");
+    assert!(protected.contains(&ottto_core::default_support_dir()));
+    let account = account_home()
+        .expect("account home")
+        .join("Library")
+        .join("Application Support")
+        .join("Ottto");
+    assert!(protected.contains(&account));
 }
 
 #[test]
@@ -835,10 +873,389 @@ fn each_artifact_uses_its_own_base_lock() {
 #[test]
 fn production_policy_is_conservative() {
     let policy = Policy::production();
+    assert!(matches!(policy.other_daemon, OtherDaemonCheck::Probe(_)));
     assert_eq!(policy.min_age, Duration::from_secs(60 * 60));
     assert_eq!(policy.max_entries, 10_000);
     assert_eq!(policy.own_pid, std::process::id() as i32);
     assert_eq!(policy.uid, unsafe { libc::getuid() });
     assert_eq!((policy.probe)(std::process::id() as i32), PidState::Alive);
     assert_eq!((policy.probe)(DEAD_PID), PidState::Dead);
+}
+
+/// Old orphans of dead writers for the three sources, each under its own
+/// existing base lock. Returns `(orphan, lock)` pairs.
+fn plant_three_orphans(dest: &Path) -> Vec<(PathBuf, PathBuf)> {
+    SOURCES
+        .iter()
+        .map(|source| {
+            let base = format!("{source}-scan-index-v3");
+            (plant_orphan(dest, &base), dest.join(format!("{base}.lock")))
+        })
+        .collect()
+}
+
+#[test]
+fn another_daemon_running_applies_nothing_and_takes_no_lock() {
+    let f = fixture();
+    let planted = plant_three_orphans(&f.dest);
+    let locks: Vec<PathBuf> = planted.iter().map(|(_, lock)| lock.clone()).collect();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let probe_calls = calls.clone();
+    let policy = Policy {
+        other_daemon: daemon_probe(move || {
+            probe_calls.set(probe_calls.get() + 1);
+            for lock in &locks {
+                assert!(lock_is_free(lock), "{}", lock.display());
+            }
+            Ok(true)
+        }),
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.skipped.other_daemon, 3);
+    assert_eq!(report.skipped.total(), 3);
+    assert_eq!(report.other_daemon_check, OtherDaemonState::Present);
+    assert!(report
+        .entries
+        .iter()
+        .all(|entry| entry.lock == LockState::NotChecked));
+    // Read once before applying; the answer holds for the whole pass.
+    assert_eq!(calls.get(), 1);
+    for (orphan, lock) in &planted {
+        assert!(orphan.exists());
+        assert!(lock_is_free(lock));
+    }
+    let line = report.log_line("startup").expect("line when skipped");
+    assert!(line.contains("\"other_daemon\":3"), "{line}");
+    assert!(
+        line.contains("\"other_daemon_check\":\"present\""),
+        "{line}"
+    );
+}
+
+#[test]
+fn unreadable_process_table_applies_nothing() {
+    let f = fixture();
+    let planted = plant_three_orphans(&f.dest);
+    let policy = Policy {
+        other_daemon: daemon_probe(|| Err(std::io::Error::other("no process table"))),
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed, 0);
+    assert_eq!(report.skipped.other_daemon, 3);
+    assert_eq!(report.other_daemon_check, OtherDaemonState::ProbeFailed);
+    for (orphan, lock) in &planted {
+        assert!(orphan.exists());
+        assert!(lock_is_free(lock));
+    }
+}
+
+#[test]
+fn daemon_seen_before_a_later_lock_stops_the_rest_of_the_pass() {
+    let f = fixture();
+    let first = plant_orphan(&f.dest, INDEX);
+    let other_dest = f
+        .support
+        .join("snapshots")
+        .join("destinations")
+        .join(OTHER_DESTINATION);
+    private_dir(&other_dest);
+    let second = plant_orphan(&other_dest, INDEX);
+    let third = plant_orphan(&other_dest, PROGRESS);
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let probe_calls = calls.clone();
+    let policy = Policy {
+        // Clear before applying and before the first lock, then a daemon.
+        other_daemon: daemon_probe(move || {
+            probe_calls.set(probe_calls.get() + 1);
+            Ok(probe_calls.get() > 2)
+        }),
+        ..names_and_locks_only()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed, 1);
+    assert!(!first.exists());
+    assert_eq!(report.skipped.other_daemon, 2);
+    assert!(second.exists() && third.exists());
+    assert_eq!(report.other_daemon_check, OtherDaemonState::Present);
+    assert_eq!(calls.get(), 3);
+}
+
+#[test]
+fn pass_holds_one_lock_at_a_time_and_releases_all_of_them() {
+    let f = fixture();
+    let planted = plant_three_orphans(&f.dest);
+    let dest = f.dest.clone();
+    let checked = std::rc::Rc::new(std::cell::Cell::new(0));
+    let hook_checked = checked.clone();
+    let policy = Policy {
+        before_recheck: Some(Box::new(move |name: &str| {
+            let held = parse_artifact(name).expect("artifact").base;
+            for source in SOURCES {
+                let base = format!("{source}-scan-index-v3");
+                let free = lock_is_free(&dest.join(format!("{base}.lock")));
+                assert_eq!(free, base != held, "{base} while removing {name}");
+            }
+            hook_checked.set(hook_checked.get() + 1);
+        })),
+        ..later()
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed, 3);
+    assert_eq!(checked.get(), 3);
+    assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
+    for (orphan, lock) in &planted {
+        assert!(!orphan.exists());
+        assert!(lock_is_free(lock));
+    }
+    // A real save after the pass takes the same lock without contention.
+    let path = f.dest.join(format!("{INDEX}.json"));
+    let mut index = ScanIndex::default();
+    index.save(&path).expect("save after the pass");
+    index.save(&path).expect("second save after the pass");
+    assert_eq!(ScanIndex::load(&path).expect("load").generation, 2);
+}
+
+#[test]
+fn support_paths_through_symlinks_or_odd_spellings_are_refused() {
+    let f = fixture();
+    let parent = f.root.join("parent");
+    private_dir(&parent);
+    let (support, dest) = support_tree(&parent, "support");
+    let orphan = plant_orphan(&dest, INDEX);
+    let alias = f.root.join("alias");
+    symlink(&parent, &alias).unwrap();
+    let spelled = |path: String| PathBuf::from(path);
+
+    for refused in [
+        // A symlink above the support directory.
+        alias.join("support"),
+        // Final `.`, trailing slash, `..` and empty components.
+        alias.join("support").join("."),
+        support.join("."),
+        spelled(format!("{}/", support.display())),
+        spelled(format!("{}/", alias.join("support").display())),
+        support.join("snapshots").join(".."),
+        parent.join("..").join("parent").join("support"),
+        spelled(format!("{}//support", parent.display())),
+        // Relative.
+        PathBuf::from("support"),
+    ] {
+        let report = apply(&refused, &names_and_locks_only());
+        assert_eq!(report.removed, 0, "{}", refused.display());
+        assert_eq!(report.skipped.unsafe_entry, 1, "{}", refused.display());
+        assert_eq!(report.entries[0].path, ".", "{}", refused.display());
+        assert!(orphan.exists(), "{}", refused.display());
+    }
+
+    // The same tree through its real path.
+    assert_eq!(apply(&support, &names_and_locks_only()).removed, 1);
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn directory_listing_stops_at_the_deadline() {
+    let f = fixture();
+    for name in ["a", "b", "c", "d", "e"] {
+        write(&f.dest.join(name), b"");
+    }
+    let dest = open_at(
+        libc::AT_FDCWD,
+        &CString::new(f.dest.as_os_str().as_bytes()).unwrap(),
+        libc::O_RDONLY | libc::O_DIRECTORY,
+    )
+    .unwrap();
+    let mut checks = 0;
+    let listing = list_dir(&dest, 100, &mut || {
+        checks += 1;
+        checks > 2
+    });
+    assert!(matches!(listing, Listing::OutOfTime));
+    assert_eq!(checks, 3);
+    // The copy it read through closes with its stream, and the original
+    // descriptor is still usable from the start.
+    assert!(matches!(
+        list_dir(&dest, 100, &mut || false),
+        Listing::Names(names) if names.len() == 5
+    ));
+}
+
+#[test]
+fn deadline_at_any_point_stops_the_pass_with_every_lock_released() {
+    let mut previous_removed = 0;
+    let mut stopped_between_removals = false;
+    for checks in 0.. {
+        assert!(checks < 1_000, "the pass never finished");
+        let f = fixture();
+        let planted = plant_three_orphans(&f.dest);
+        let policy = Policy {
+            expire_after_checks: Some(checks),
+            ..names_and_locks_only()
+        };
+
+        let report = apply(&f.support, &policy);
+
+        for (_, lock) in &planted {
+            assert!(lock_is_free(lock), "after {checks} checks");
+        }
+        let left = planted.iter().filter(|(orphan, _)| orphan.exists()).count() as u64;
+        assert_eq!(left, 3 - report.removed, "after {checks} checks");
+        assert!(report.removed >= previous_removed, "after {checks} checks");
+        previous_removed = report.removed;
+        if !report.time_budget_exhausted {
+            assert_eq!(report.removed, 3);
+            break;
+        }
+        // It may also run out after the last removal, before the
+        // remaining names; what matters is that it stops between two.
+        stopped_between_removals |= (1..3).contains(&report.removed);
+    }
+    assert!(stopped_between_removals);
+}
+
+#[test]
+fn command_refuses_protected_directories_before_touching_anything() {
+    let f = fixture();
+    let orphan = plant_orphan(&f.dest, INDEX);
+    let mut out = Vec::new();
+
+    let refused = local_state_sweep_command(
+        &f.support,
+        true,
+        true,
+        &[f.support.join("snapshots").join("..")],
+        later(),
+        &mut out,
+    );
+
+    assert!(refused.is_err());
+    assert!(out.is_empty());
+    assert!(orphan.exists());
+    assert!(lock_is_free(&f.dest.join(format!("{INDEX}.lock"))));
+}
+
+#[test]
+fn command_apply_on_a_non_default_directory_skips_the_daemon_check() {
+    let f = fixture();
+    let orphan = plant_orphan(&f.dest, INDEX);
+    let policy = || Policy {
+        other_daemon: daemon_probe(|| panic!("the command must not read the process table")),
+        ..later()
+    };
+    let run = |apply: bool| {
+        let mut out = Vec::new();
+        local_state_sweep_command(&f.support, apply, true, &[], policy(), &mut out)
+            .expect("command");
+        serde_json::from_slice::<serde_json::Value>(&out).expect("json output")
+    };
+
+    let plan = run(false);
+    assert_eq!(plan["mode"], "plan");
+    assert_eq!(plan["other_daemon_check"], "not_checked");
+    assert_eq!(plan["candidates"], 1);
+    assert!(orphan.exists());
+
+    let applied = run(true);
+    assert_eq!(applied["mode"], "apply");
+    assert_eq!(
+        applied["other_daemon_check"],
+        "not_applicable_non_default_dir"
+    );
+    assert_eq!(applied["removed"], 1);
+    assert_eq!(applied["skipped"]["other_daemon"], 0);
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn startup_pass_always_reads_the_process_table() {
+    let f = fixture();
+    let orphan = plant_orphan(&f.dest, INDEX);
+
+    let report = startup_report(&f.support, || Policy {
+        other_daemon: daemon_probe(|| Ok(true)),
+        ..later()
+    });
+    assert_eq!((report.removed, report.skipped.other_daemon), (0, 1));
+    assert!(report.entries.is_empty(), "startup records no entries");
+
+    let report = startup_report(&f.support, || Policy {
+        other_daemon: OtherDaemonCheck::NotApplicable,
+        ..later()
+    });
+    assert_eq!((report.removed, report.errors), (0, 1));
+    assert!(orphan.exists());
+
+    let report = startup_report(&f.support, later);
+    assert_eq!(report.removed, 1);
+    assert!(!orphan.exists());
+}
+
+#[test]
+fn daemon_executable_names_match_exactly() {
+    assert!(is_daemon_name(b"ottto-service"));
+    assert!(is_daemon_path(Path::new(
+        "/Applications/Ottto.app/Contents/Helpers/ottto-service"
+    )));
+    assert!(is_daemon_path(Path::new("/opt/bin/ottto-service")));
+    let others: [&[u8]; 5] = [
+        b"ottto",
+        b"ottto-service-old",
+        b"ottto-servic",
+        b"Ottto-Service",
+        b"",
+    ];
+    for other in others {
+        assert!(!is_daemon_name(other));
+    }
+    assert!(!is_daemon_path(Path::new("/opt/ottto-service/ottto")));
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[test]
+fn process_table_shows_another_daemon_executable() {
+    assert!(other_daemon_running().is_ok(), "process table readable");
+    let scratch = ScratchDir::new("local-state-sweep-daemon");
+    let stand_in = scratch.join(DAEMON_EXECUTABLE);
+    let test_binary = std::env::current_exe().expect("test binary");
+    if fs::hard_link(&test_binary, &stand_in).is_err() {
+        fs::copy(&test_binary, &stand_in).expect("copy test binary");
+    }
+    let _child = Child(
+        std::process::Command::new(&stand_in)
+            .args([
+                "local_state_sweep::tests::other_daemon_stand_in",
+                "--exact",
+                "--ignored",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stand-in"),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !other_daemon_running().expect("process table readable") {
+        assert!(Instant::now() < deadline, "stand-in never seen");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Run only by `process_table_shows_another_daemon_executable`, under the
+/// daemon's executable name, until its stdin closes.
+#[test]
+#[ignore = "stand-in process for another test"]
+fn other_daemon_stand_in() {
+    let _ = std::io::Read::read_to_end(&mut std::io::stdin(), &mut Vec::new());
 }
