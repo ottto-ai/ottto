@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 767,
-  "content_sha256": "6b0f4f5c52cbfd7facf8b7aa3ae85bec4f3e4f893348d3f5dcbffc3ccc379cb8",
+  "content_sha256": "212dac388b79848854785dd7b1c3291c394418f79425c2f8973a01914a5fbe8c",
   "files": [
     {
       "executable": false,
@@ -1784,8 +1784,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
-      "sha256": "53eecc3c359e8985100d7a125cb4a477faac4ac5e434a2bc8d6afb650cd8fe29",
-      "size_bytes": 41005
+      "sha256": "d1d5a4432094d56e08dbc0778138d9236ef72b2bc03c17a00e528807b789343a",
+      "size_bytes": 41007
     },
     {
       "executable": false,

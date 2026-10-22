@@ -862,9 +862,9 @@ fn fe_claude_sp11_pi_has_no_in_page_sampled_read() {
 }
 
 /// SOURCE, s below the last committed size (GREEN): the last page committed
-/// a file ending in an unterminated row (size C). The file is re-selected at
-/// size C and, during its in-page `Full`, the row is completed and more rows
-/// are appended. The last newline at or below frozen (= C) is the row's start,
+/// a file ending in a complete but unterminated row (size C, main's
+/// trailing-line rule). The file is re-selected at size C and, during its
+/// in-page `Full`, the row's newline and more rows are appended. The last newline at or below frozen (= C) is the row's start,
 /// below C, so FE must publish nothing (never a weaker body): one refusal, no
 /// copy, and the committed entry stands.
 #[test]
@@ -876,8 +876,7 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
     let path = fixture.file.0.clone();
     append_raw(&path, &row_bytes(CLAUDE, 0..4));
     let last = row_bytes(CLAUDE, 4..5);
-    let (head, rest) = last.split_at(last.len() / 2);
-    append_raw(&path, head);
+    append_raw(&path, &last[..last.len() - 1]);
     let committed = len(&path);
     let key = local_index_key(&path);
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -889,7 +888,7 @@ fn fe_claude_source_s_below_last_committed_size_publishes_nothing() {
     );
     cache.clear();
     touch(&path);
-    let mut completion = rest.to_vec();
+    let mut completion = b"\n".to_vec();
     completion.extend(row_bytes(CLAUDE, 5..7));
     let append_path = path.clone();
     let (index, full, seen, read) =
