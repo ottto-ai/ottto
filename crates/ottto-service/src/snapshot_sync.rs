@@ -7229,6 +7229,43 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
         .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
 }
 
+/// Test-only stand-in for the in-place resend clock: it records every wait
+/// instead of sleeping and may override how long a failed POST took.
+#[cfg(test)]
+struct InplaceRetryTestClock {
+    // Read by the in-place resend clock in the follow-up commit.
+    #[allow(dead_code)]
+    failed_after: Option<Duration>,
+    waits: Vec<Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPLACE_RETRY_TEST_CLOCK: std::cell::RefCell<Option<InplaceRetryTestClock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with this thread's in-place resend clock replaced. Returns the
+/// result and every wait the uploader asked for, in order.
+#[cfg(test)]
+fn with_inplace_retry_test_clock<R>(
+    failed_after: Option<Duration>,
+    body: impl FnOnce() -> R,
+) -> (R, Vec<Duration>) {
+    INPLACE_RETRY_TEST_CLOCK.with(|clock| {
+        *clock.borrow_mut() = Some(InplaceRetryTestClock {
+            failed_after,
+            waits: Vec::new(),
+        });
+    });
+    let result = body();
+    let waits = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow_mut().take())
+        .map(|clock| clock.waits)
+        .unwrap_or_default();
+    (result, waits)
+}
+
 /// Upload changed snapshots in bounded pages while durably checkpointing every
 /// accepted page. Item-specific validation failures are bisected so one poison
 /// snapshot cannot replay or block its valid siblings; pages that exceed the
@@ -13406,6 +13443,10 @@ mod tests {
         }
         assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
         reset_for_test();
+    }
+
+    mod inplace_retry_tests {
+        include!("snapshot_sync/inplace_retry_tests.rs");
     }
 
     #[test]
