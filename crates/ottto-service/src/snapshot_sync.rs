@@ -22704,8 +22704,11 @@ mod request_owned_retry_tests {
         let future = current_unix_seconds() + 3600;
         let record = p.quarantined_fingerprints.get_mut(&held).unwrap();
         let hold = record.hold.as_mut().unwrap();
-        hold.first_held_unix = future;
-        hold.day_start_unix = future;
+        // A re-hold advances its retry anchor while the original/day clocks
+        // remain older than the corrected wall clock.
+        hold.first_held_unix = future - 7200;
+        hold.day_start_unix = future - 7200;
+        hold.stage = 1;
         hold.retries_in_day = 6;
         record.retry_after_unix_seconds = hold.retry_after(&held, future);
         p.save(&path).unwrap();

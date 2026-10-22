@@ -3592,14 +3592,13 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
                     {
                         return false;
                     }
-                    // Keep the existing bounded rollback tolerance. A hold
-                    // written just before a clock correction is not corrupt
-                    // and must not discard unrelated destination custody.
-                    // Preserve counters/timestamps: rollback grants no retries.
-                    let held_now = now.max(hold.first_held_unix).max(hold.day_start_unix);
-                    let base = hold.base_seconds(held_now);
-                    base.saturating_add(base / 4)
-                        .saturating_add(held_now.saturating_sub(now))
+                    // A retry/re-hold reanchors the deadline without moving
+                    // first-held/day clocks. Allow a bounded rollback from
+                    // that unrecorded anchor, including the refused 30-day
+                    // cadence boundary. Preserve all allowance counters.
+                    let rollback = SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2);
+                    let base = hold.base_seconds(now.saturating_add(rollback));
+                    base.saturating_add(base / 4).saturating_add(rollback)
                 }
                 None => SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
             };
@@ -42822,6 +42821,43 @@ mod tests {
                     original_now - 1
                 ));
             }
+        }
+    }
+
+    #[test]
+    fn reheld_deadlines_survive_rollback_with_older_first_and_day_clocks() {
+        let first = 4_000_000_u64;
+        for (kind, stage, last_retry, rollback) in [
+            (SnapshotHoldKind::Held, 1, first + 3600, 1800),
+            (SnapshotHoldKind::Held, 2, first + 12 * 3600, 3600),
+            (SnapshotHoldKind::Refused, 0, first + 30 * 86400 + 1, 2),
+        ] {
+            let hold = SnapshotHoldRetry {
+                kind,
+                stage,
+                first_held_unix: first,
+                day_start_unix: last_retry - 3600,
+                retries_in_day: 6,
+            };
+            let record = SnapshotQuarantineRecord {
+                witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                retry_after_unix_seconds: hold.retry_after("reheld", last_retry),
+                upload_body_witness: Some("a".repeat(64)),
+                failed_reconstruction_count: 1,
+                disposition: SnapshotQuarantineDisposition::RetryPending,
+                hold: Some(hold),
+                version_skew_attempts: 0,
+            };
+            assert!(snapshot_quarantine_deadline_is_bounded_at(
+                &record,
+                last_retry - rollback
+            ));
+            assert!(!record
+                .hold
+                .as_ref()
+                .unwrap()
+                .allowance(last_retry - rollback));
+            assert_eq!(record.hold.as_ref().unwrap().first_held_unix, first);
         }
     }
 
