@@ -150,7 +150,12 @@ alarm and the accessor are tested without a 250,000-request fixture.
   are measured. First, peak and last then cover only the activity since the
   file's birth. "First" is the first prompt after the copy or restore; for a
   restore that is not the session's original first prompt. Peak can be
-  under-counted; nothing is ever over-counted from copied records. The file
+  under-counted; nothing is ever over-counted from copied records.
+  Exception: a compaction whose boundary is in copied history but whose
+  summary was written after the session's own first request can count once
+  (an over-count of at most one per such compaction; test
+  `compaction_pairs_across_the_copy_line_count_once` case 2). Token and
+  prompt-size numbers are unaffected. The file
   withholds only when every response predates the birth (`all_copied`). Where
   the original file is also present (the same session id in two files), the
   whole-tuple `multi_file` withhold wins. These files are counted locally as

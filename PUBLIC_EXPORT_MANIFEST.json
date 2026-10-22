@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 766,
-  "content_sha256": "46fb2d7733caaef5c9423ac2b094b640beacebbb95d4c507cbf9ab0367bf4fc6",
+  "content_sha256": "ff05a46eff7cc6d17455ea8559963ca47d4bbeee888af083ed7fd6b969924644",
   "files": [
     {
       "executable": false,
@@ -3541,8 +3541,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-claude-context-file-birth.md",
-      "sha256": "ce4b3a8024387cfc4e3413d368e7efcdfaa64afdadebafd72b813f77b7b1a7cc",
-      "size_bytes": 15492
+      "sha256": "aa5908280b82846356a09d22bdf08be454f9dfef124775f37359021a080c082b",
+      "size_bytes": 15807
     },
     {
       "executable": false,
@@ -5365,7 +5365,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T09:10:04+00:00",
+  "generated_at": "2026-10-22T09:12:43+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 767,
   "public_roots": [
@@ -5404,5 +5404,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "265f073ee180f2fb2d7f952cd01288f676b47926"
+  "source_commit": "e1e7761e69bcc213b56b09ca3e9a5c2e172e599a"
 }
