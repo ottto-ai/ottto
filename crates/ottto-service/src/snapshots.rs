@@ -31938,12 +31938,16 @@ impl ScanIndex {
     /// still-present parent together with its unverified audit marker.
     /// Only the page merge calls this, and only for keys the scanner settled
     /// as such a removal; `remove_file_entry` keeps audit debt for every
-    /// other caller. Codex-protected entries are never retired here. It
-    /// releases nothing beyond the entry's own marker (N3): the key's snapshot
-    /// fingerprints stay, so its accepted, quarantined and correction state
-    /// is kept until its own settlement rule, and its account hold stays
-    /// recorded until a complete census drops it. Returns false, retiring
-    /// nothing, for an entry without audit debt.
+    /// other caller. Codex-protected entries are never retired here. The
+    /// key's snapshot fingerprints and account hold stay, because each
+    /// removal path ends in the state main already reaches for the same key:
+    /// main's reconciliation keeps an audit-debt entry and its fingerprints
+    /// forever, so this path drops only the entry and its marker, while a
+    /// vanished entry without audit debt goes through `remove_file_entry`,
+    /// which drops its fingerprints and hold just as main's reconciliation
+    /// does at the next healthy terminal. The hold is later dropped by a
+    /// complete census. Returns false, retiring nothing, for an entry
+    /// without audit debt.
     fn retire_vanished_claude_audit_debt_entry(&mut self, key: &str) -> bool {
         if !self.files.get(key).is_some_and(|entry| {
             entry.has_unverified_source() && !entry.codex_history_is_protected()

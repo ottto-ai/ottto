@@ -880,9 +880,11 @@ mod tests {
         assert!(!removal
             .files
             .contains_key(&local_index_key(&fixture.member_path)));
-        if let Some(record) = removal.claude_usage_authority_quarantine.get(FORCED_ROOT) {
-            assert!(record.failed_reconstruction_count <= failures_before.saturating_add(1));
-        }
+        let record = removal
+            .claude_usage_authority_quarantine
+            .get(FORCED_ROOT)
+            .expect("the family root is still present, so its quarantine record is kept");
+        assert!(record.failed_reconstruction_count <= failures_before.saturating_add(1));
     }
 
     /// SOURCE N1: the request-census (D1) record of a member retired as a
@@ -922,6 +924,164 @@ mod tests {
             .get(&second_key)
             .is_none());
         assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
+    }
+
+    /// The audit-debt path (SOURCE N2) also drops the member's request-census
+    /// (D1) record with its entry and counts both retirements, while the
+    /// member's snapshot fingerprints stay (N3).
+    #[test]
+    fn claude_vanished_audit_debt_member_drops_its_request_census_record_and_counts_it() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-debt-request-census");
+        let first = "a1111111-1111-4111-8111-111111111111";
+        let second = "b2222222-2222-4222-8222-222222222222";
+        let first_path = dir.join(format!("{first}.jsonl"));
+        let second_path = dir.join(format!("{second}.jsonl"));
+        let second_key = local_index_key(&second_path);
+        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+        let mut index = ScanIndex::default();
+        assert!(
+            claude_generation(&mut index, &dir, NOW, 1, &[])
+                .last()
+                .unwrap()
+                .census_complete
+        );
+        // The next generation walks both and selects only the first.
+        claude_page(&mut index, &dir, LATER, 1, &[]);
+        assert!(index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .any(|pending| pending.path == second_path && pending.census_member));
+        assert!(
+            index
+                .claude_request_census_for_test()
+                .get(&second_key)
+                .is_some(),
+            "precondition: the real parse recorded the member's census"
+        );
+        let entry = index.files.get_mut(&second_key).unwrap();
+        entry.scan_identity_version = Some(format!(
+            "{}:4000000000",
+            super::super::sampled_audit::UNVERIFIED_IDENTITY
+        ));
+        assert!(entry.has_unverified_source());
+        let fingerprints_before = index.file_snapshot_fingerprints.get(&second_key).cloned();
+        fs::remove_file(&second_path).unwrap();
+        let ((pages, sites), vanished) = observe_vanished(|| {
+            observe_sites(|| claude_generation(&mut index, &dir, LATER, 1, &[]))
+        });
+        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+        expected_sites[1][Site::CandidateWalk.index()] = [0, 1];
+        assert_eq!(sites, expected_sites);
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        assert!(
+            !index.files.contains_key(&second_key),
+            "the entry and its marker are gone"
+        );
+        assert!(index
+            .claude_request_census_for_test()
+            .get(&second_key)
+            .is_none());
+        assert_eq!(vanished, [[0; VANISHED], [1, 1], [0; VANISHED]]);
+        assert_eq!(
+            index.file_snapshot_fingerprints.get(&second_key),
+            fingerprints_before.as_ref()
+        );
+        assert!(index.files.contains_key(&local_index_key(&first_path)));
+    }
+
+    /// D11 through the real pipeline: an indexed Claude file is in the frozen
+    /// selection and is deleted beneath its present parent before the page's
+    /// safe open. The page merge retires its entry and its request-census
+    /// record (counted), the generation finishes healthy, and the next one is
+    /// quiet.
+    #[test]
+    fn claude_selected_member_deleted_before_open_retires_through_the_page_merge() {
+        let dir = crate::test_scratch::ScratchDir::new("absence-open-pipeline");
+        let first = "a1111111-1111-4111-8111-111111111111";
+        let second = "b2222222-2222-4222-8222-222222222222";
+        let first_path = dir.join(format!("{first}.jsonl"));
+        let second_path = dir.join(format!("{second}.jsonl"));
+        let second_key = local_index_key(&second_path);
+        fs::write(&first_path, claude_line(first, "request-first")).unwrap();
+        fs::write(&second_path, claude_line(second, "request-second")).unwrap();
+        let mut index = ScanIndex::default();
+        assert!(
+            claude_generation(&mut index, &dir, NOW, 10, &[])
+                .last()
+                .unwrap()
+                .census_complete
+        );
+        assert!(index.traversal.is_none());
+        assert!(index.files.contains_key(&second_key));
+        assert!(
+            index
+                .claude_request_census_for_test()
+                .get(&second_key)
+                .is_some(),
+            "precondition: the real parse recorded the member's census"
+        );
+        let state = OwnedSourceScan::new(
+            SnapshotSource::ClaudeCode,
+            &[dir.to_path_buf()],
+            index,
+            LATER,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        );
+        assert!(
+            state
+                .identified_candidates
+                .iter()
+                .any(|candidate| candidate.path == second_path),
+            "precondition: the frozen selection holds the member"
+        );
+        fs::remove_file(&second_path).unwrap(); // after frozen selection, before safe open
+        let ((((mut index, pages), events), sites), vanished) = observe_vanished(|| {
+            observe_sites(|| {
+                observe(|| {
+                    let (mut index, scan) = finish(state);
+                    let mut pages = vec![scan];
+                    if index.traversal.is_some() {
+                        pages.extend(claude_generation(&mut index, &dir, LATER, 10, &[]));
+                    }
+                    (index, pages)
+                })
+            })
+        });
+        let mut expected_sites = [[[0; OUTCOMES]; SITES]; 3];
+        expected_sites[1][Site::Open.index()] = [0, 1];
+        assert_eq!(sites, expected_sites);
+        assert_eq!(events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
+        assert_eq!(vanished, [[0; VANISHED], [0, 1], [0; VANISHED]]);
+        assert!(
+            pages.iter().all(|page| page.disappeared_file_count == 0),
+            "a member deleted before its open beneath its present parent is not loss"
+        );
+        assert!(pages.last().unwrap().census_complete);
+        assert!(index.traversal.is_none(), "the generation retired healthy");
+        assert!(!index.files.contains_key(&second_key));
+        assert!(index
+            .claude_request_census_for_test()
+            .get(&second_key)
+            .is_none());
+        assert!(index.files.contains_key(&local_index_key(&first_path)));
+
+        let ((pages, events), sites) =
+            observe_sites(|| observe(|| claude_generation(&mut index, &dir, RETRY, 10, &[])));
+        assert_eq!(sites, [[[0; OUTCOMES]; SITES]; 3]);
+        assert_eq!(events, [[0; 4]; 3]);
+        assert!(pages.iter().all(|page| page.disappeared_file_count == 0));
+        assert!(pages.last().unwrap().census_complete);
+        assert!(index.traversal.is_none(), "the next generation is quiet");
     }
 
     /// Control: a single-file rename. The old path, deleted after the walk
@@ -1039,6 +1199,12 @@ mod tests {
     #[test]
     fn claude_absence_below_inaccessible_parent_stays_metadata_red() {
         use std::os::unix::fs::PermissionsExt;
+        assert_ne!(
+            // SAFETY: geteuid() is always-successful and has no preconditions.
+            unsafe { libc::geteuid() },
+            0,
+            "this test blocks the parent with chmod 000, which root reads through; run it as a non-root user"
+        );
         let dir = crate::test_scratch::ScratchDir::new("absence-parent-eacces");
         let project = dir.join("project");
         fs::create_dir(&project).unwrap();
