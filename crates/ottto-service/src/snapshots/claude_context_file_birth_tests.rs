@@ -1993,6 +1993,76 @@ fn session_start_split_follows_the_scalar_classification() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The per-file start verdict reads the folded item, so it matches the start
+/// the snapshot uploads: a fresh root and a subagent file keep a measured
+/// start, a copied opening keeps the version only.
+#[test]
+fn start_verdict_matches_the_folded_session_start() {
+    let dir = temp_dir("claude-file-birth-start-verdict");
+    let now = OffsetDateTime::now_utc();
+    let fresh = "e1000000-0000-4000-8000-000000000001";
+    let copied = "e1000000-0000-4000-8000-000000000002";
+    let agent = "a4d1585d310070d0e";
+    let child_dir = dir.join(ROOT).join("subagents");
+    fs::create_dir_all(&child_dir).expect("create subagent dir");
+    let child = child_dir.join(format!("agent-{agent}.jsonl"));
+    fs::write(
+        &child,
+        subagent_assistant(ROOT, agent, "req_s1", &stamp(now, -30)),
+    )
+    .expect("write subagent fixture");
+    let (fresh_path, fresh_item) = root_session(
+        &dir,
+        fresh,
+        &[
+            assistant(fresh, "req_f1", &stamp(now, -30), 100),
+            assistant(fresh, "req_f2", &stamp(now, -29), 300),
+        ],
+    );
+    let (copied_path, copied_item) = root_session(
+        &dir,
+        copied,
+        &[
+            assistant(copied, "req_c0", &stamp(now, COPIED), 900_000),
+            assistant(copied, "req_c1", &stamp(now, -30), 100),
+            assistant(copied, "req_c2", &stamp(now, -29), 300),
+        ],
+    );
+    let cases = [
+        ("fresh root", fresh_path, fresh_item, StartVerdict::Measured),
+        // Measured before the fold; the fold keeps the version only.
+        (
+            "copied opening",
+            copied_path,
+            copied_item,
+            StartVerdict::NotMeasured,
+        ),
+        (
+            "subagent",
+            child.clone(),
+            parse(&child, now),
+            StartVerdict::Measured,
+        ),
+    ];
+    for (label, path, parsed, expected) in cases {
+        assert_eq!(
+            session_start_verdict(&parsed),
+            StartVerdict::Measured,
+            "{label}: parsed"
+        );
+        let mut items = vec![parsed];
+        let mut index = indexed(&[&path], true);
+        fold(&mut items, &no_reports(), &mut index, true);
+        assert_eq!(
+            session_start::uploaded_start_verdict(&items[0]),
+            expected,
+            "{label}: uploaded body"
+        );
+        assert_eq!(session_start_verdict(&items[0]), expected, "{label}");
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
 /// One native read: reuse `old` when the reader accepts it, retain, finish.
 fn native_read(
     path: &Path,
