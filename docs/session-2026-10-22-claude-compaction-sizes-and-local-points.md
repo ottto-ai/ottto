@@ -91,8 +91,10 @@ stable sort by sequence.
   not grow its entries or copy it again.
 - Retained state: the trigger byte and the two id-less flags sit in
   `ClaudeCompactionObservation`'s existing padding (at most 120 bytes, pinned);
-  no new per-session vector. Marking costs one scan of the compaction
-  observations per id-less response, the same shape as the existing
-  `compaction_before` check per response.
+  no new per-session vector. Id-less marking uses `partition_point` on the
+  non-decreasing response-count cuts, then visits only the matching cuts
+  (the response sequence and its saturating successor). Repeated cuts are
+  all marked; out-of-order marker timestamps do not affect the search.
+  The existing `compaction_before` check per response is unchanged.
 - Upload: about 84 bytes per Claude event; outside the content hash, semantic
   fingerprint, envelope component hashes, revision v2 input and body witness.

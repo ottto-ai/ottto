@@ -14574,15 +14574,24 @@ impl SnapshotAccumulator {
                 // An id-less response is never a compaction size. Mark the
                 // compaction it sits just before or just after for the fold's
                 // local counters; the sizes themselves are unchanged.
-                for index in 0..self.claude_compaction_observations.len() {
-                    let cut = self.claude_compaction_observations[index].response_count_before;
-                    if cut != response.sequence.saturating_add(1) && cut != response.sequence {
-                        continue;
-                    }
-                    if let Some(mut observation) =
-                        self.claude_compaction_observations.get_mut(index)
+                // Parse order makes response_count_before non-decreasing,
+                // even when marker timestamps repeat or arrive out of order.
+                let first = self
+                    .claude_compaction_observations
+                    .partition_point(|observation| {
+                        observation.response_count_before < response.sequence
+                    });
+                let next = response.sequence.saturating_add(1);
+                let end = self
+                    .claude_compaction_observations
+                    .partition_point(|observation| observation.response_count_before <= next);
+                for index in first..end {
+                    if let Some(observation) = self
+                        .claude_compaction_observations
+                        .get_mut(index)
+                        .as_deref_mut()
                     {
-                        if cut == response.sequence {
+                        if observation.response_count_before == response.sequence {
                             observation.id_less_after = true;
                         } else {
                             observation.id_less_before = true;

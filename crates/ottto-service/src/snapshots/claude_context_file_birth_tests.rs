@@ -2680,6 +2680,51 @@ fn id_less_neighbours_of_a_compaction_are_counted_locally() {
 }
 
 #[test]
+fn id_less_neighbours_mark_every_matching_cut_only() {
+    let dir = temp_dir("claude-file-birth-id-less-repeated-cuts");
+    let now = OffsetDateTime::now_utc();
+    let (_, parsed) = root_session(
+        &dir,
+        ROOT,
+        &[
+            boundary(ROOT, &stamp(now, -40), 200, 50),
+            assistant(ROOT, "req_a1", &stamp(now, -39), 100),
+            assistant(ROOT, "req_a2", &stamp(now, -38), 120),
+            boundary(ROOT, &stamp(now, -37), 160, 50),
+            id_less_assistant(ROOT, &stamp(now, -36), 150),
+            boundary(ROOT, &stamp(now, -34), 160, 50),
+            // Same cut, out-of-order timestamp: both markers must be marked.
+            boundary(ROOT, &stamp(now, -35), 160, 50),
+            assistant(ROOT, "req_a3", &stamp(now, -33), 200),
+            assistant(ROOT, "req_a4", &stamp(now, -32), 220),
+            boundary(ROOT, &stamp(now, -31), 250, 50),
+        ],
+    );
+    let flags = parsed
+        .claude_context_curve_boundaries
+        .iter()
+        .map(|observation| {
+            (
+                observation.response_count_before,
+                observation.id_less_before,
+                observation.id_less_after,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        flags,
+        vec![
+            (0, false, false),
+            (2, false, true),
+            (3, true, false),
+            (3, true, false),
+            (5, false, false),
+        ]
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn folded_sizes_and_points_leave_every_identity_unchanged() {
     let dir = temp_dir("claude-file-birth-sizes-identity");
     let now = OffsetDateTime::now_utc();
