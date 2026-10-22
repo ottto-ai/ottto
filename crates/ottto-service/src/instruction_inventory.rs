@@ -213,7 +213,7 @@ fn collect_files(
     match nested_agents_paths(toplevel, &mut reasons) {
         Some(nested) => {
             let mut chain_checked = BTreeSet::new();
-            for agents in nested {
+            'nested: for agents in nested {
                 if Instant::now() >= deadline {
                     reasons.insert(PartialReason::TimeBudget);
                     break;
@@ -231,6 +231,10 @@ fn collect_files(
                     if !chain_checked.insert(dir.to_path_buf()) {
                         break;
                     }
+                    if Instant::now() >= deadline {
+                        reasons.insert(PartialReason::TimeBudget);
+                        break 'nested;
+                    }
                     for name in CHAIN_CLAUDE_FILES {
                         let relative = format!("{}/{name}", dir.to_string_lossy());
                         stat_into(toplevel, relative, &mut found, &mut reasons);
@@ -247,16 +251,16 @@ fn collect_files(
         .iter()
         .filter_map(|name| found.remove_entry(*name))
         .collect();
-    let ordered = roots
-        .into_iter()
-        .chain(found)
-        .map(|(relative_path, file_bytes)| InstructionInventoryEntry {
-            observed_at_start: observed
-                .contains(&canonical_or_self(&toplevel.join(&relative_path))),
-            relative_path,
-            file_bytes,
-        });
-    let entries = capped_entries(ordered, &mut reasons);
+    let root_count = roots.len();
+    let is_observed =
+        |relative: &str| observed.contains(&canonical_or_self(&toplevel.join(relative)));
+    let entries = capped_entries(
+        roots.into_iter().chain(found),
+        root_count,
+        is_observed,
+        deadline,
+        &mut reasons,
+    );
     InstructionInventoryFiles {
         complete: reasons.is_empty(),
         partial_reasons: reasons.into_iter().collect(),
@@ -264,18 +268,32 @@ fn collect_files(
     }
 }
 
-/// Keeps entries in order until the 200-entry or 8 KiB block cap.
+/// Keeps entries in order until the 200-entry or 8 KiB block cap. Each
+/// observed check resolves symlinks, so the deadline applies after the root
+/// files, which always stay.
 fn capped_entries(
-    ordered: impl Iterator<Item = InstructionInventoryEntry>,
+    ordered: impl Iterator<Item = (String, u64)>,
+    root_count: usize,
+    is_observed: impl Fn(&str) -> bool,
+    deadline: Instant,
     reasons: &mut BTreeSet<PartialReason>,
 ) -> Vec<InstructionInventoryEntry> {
     let mut entries = Vec::new();
     let mut block_bytes = NON_ENTRY_RESERVE_BYTES;
-    for entry in ordered {
+    for (relative_path, file_bytes) in ordered {
         if entries.len() == MAX_ENTRIES {
             reasons.insert(PartialReason::FileCap);
             break;
         }
+        if entries.len() >= root_count && Instant::now() >= deadline {
+            reasons.insert(PartialReason::TimeBudget);
+            break;
+        }
+        let entry = InstructionInventoryEntry {
+            observed_at_start: is_observed(&relative_path),
+            relative_path,
+            file_bytes,
+        };
         let entry_bytes = serde_json::to_vec(&entry).map_or(usize::MAX, |bytes| bytes.len() + 1);
         if block_bytes.saturating_add(entry_bytes) > MAX_BLOCK_BYTES {
             reasons.insert(PartialReason::SizeCap);
@@ -576,10 +594,23 @@ mod tests {
             late.partial_reasons,
             reasons.into_iter().collect::<Vec<_>>()
         );
-        assert!(late
+        let names: Vec<_> = late
             .entries
             .iter()
-            .all(|entry| !entry.relative_path.contains('/')));
+            .map(|entry| entry.relative_path.as_str())
+            .collect();
+        assert_eq!(names, ["AGENTS.md", "CLAUDE.local.md", "CLAUDE.md"]);
+        // The deadline also stops the observed checks after the root files.
+        let mut reasons = BTreeSet::new();
+        let past = Instant::now() - Duration::from_secs(1);
+        let listed = [("CLAUDE.md", 1), ("a/AGENTS.md", 1), ("b/AGENTS.md", 1)]
+            .map(|(path, bytes)| (path.to_string(), bytes));
+        let kept = capped_entries(listed.into_iter(), 1, |_| true, past, &mut reasons);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(
+            reasons.into_iter().collect::<Vec<_>>(),
+            [PartialReason::TimeBudget]
+        );
         for dir in [plain, repo] {
             fs::remove_dir_all(dir).unwrap();
         }
@@ -621,16 +652,8 @@ mod tests {
             found.insert(format!("{index:03}{}", &long[3..]), u64::MAX >> 11);
         }
         let mut reasons = BTreeSet::new();
-        let kept = capped_entries(
-            found
-                .into_iter()
-                .map(|(relative_path, file_bytes)| InstructionInventoryEntry {
-                    relative_path,
-                    file_bytes,
-                    observed_at_start: false,
-                }),
-            &mut reasons,
-        );
+        let far = Instant::now() + Duration::from_secs(60);
+        let kept = capped_entries(found.into_iter(), 0, |_| false, far, &mut reasons);
         assert_eq!(
             reasons.into_iter().collect::<Vec<_>>(),
             vec![PartialReason::SizeCap]
