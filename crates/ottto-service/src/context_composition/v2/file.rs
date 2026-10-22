@@ -315,7 +315,8 @@ fn head_scan(
 ) -> std::io::Result<u64> {
     let file = File::open(path)?;
     let len = file.metadata()?.len();
-    let mut reader = LineReader::with_guard(file, 0, len.min(HEAD_BYTES), false, HEAD_LINE_GUARD)?;
+    let mut reader =
+        LineReader::with_buffer(file, 0, len.min(HEAD_BYTES), false, HEAD_LINE_GUARD, 8192)?;
     let mut lines = 0usize;
     while lines < HEAD_LINES {
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {

@@ -3538,3 +3538,24 @@ fn codex_agent_message_closes_request_one_across_checkpoints() {
     assert!(tokens(Part::Other) > 0);
     env.cleanup();
 }
+
+#[test]
+fn identity_and_scope_probes_do_not_prefetch_large_tool_output() {
+    let env = Env::new("composition-bounded-head-prefetch");
+    let path = env.root.join("p/s.jsonl");
+    write_records(
+        &path,
+        &[
+            json!({"type":"user","sessionId":"s","isSidechain":false,"cwd":env.cwd(),"message":{"content":"start"}}),
+            json!({"type":"user","message":{"content":"x".repeat(2 * 1024 * 1024)}}),
+        ],
+    );
+    super::checkpoint::IO_BYTES.with(|io| io.set((0, 0)));
+    let (cwds, _) = super::file::head_cwds(&path, Instant::now() + Duration::from_secs(5)).unwrap();
+    assert_eq!(cwds, vec![env.cwd()]);
+    let (state, _) = new_parse_state(Source::Claude, &path, 0);
+    assert_eq!(&*state.session, "s");
+    let read = super::checkpoint::IO_BYTES.with(|io| io.get().0);
+    assert!(read <= 2 * 8192, "head probes read {read} bytes");
+    env.cleanup();
+}

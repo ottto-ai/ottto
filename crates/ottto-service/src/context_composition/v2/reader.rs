@@ -51,17 +51,29 @@ impl LineReader {
     }
 
     pub(super) fn with_guard(
-        mut file: File,
+        file: File,
         offset: u64,
         end: u64,
         skipping: bool,
         max_line: usize,
     ) -> std::io::Result<Self> {
+        Self::with_buffer(file, offset, end, skipping, max_line, READ_BUFFER_BYTES)
+    }
+
+    /// Small head probes should not prefetch the daily reader's large buffer.
+    pub(super) fn with_buffer(
+        mut file: File,
+        offset: u64,
+        end: u64,
+        skipping: bool,
+        max_line: usize,
+        capacity: usize,
+    ) -> std::io::Result<Self> {
         file.seek(SeekFrom::Start(offset))?;
         #[cfg(test)]
         let file = ReaderFile(file);
         Ok(Self {
-            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
+            reader: BufReader::with_capacity(capacity, file),
             pos: offset,
             end: end.max(offset),
             line: Vec::new(),
@@ -82,7 +94,7 @@ impl LineReader {
 
     /// Bytes held for the current line (for memory accounting).
     pub(super) fn buffer_bytes(&self) -> usize {
-        self.line.capacity() + READ_BUFFER_BYTES
+        self.line.capacity() + self.reader.capacity()
     }
 
     /// The next event, or `None` when no complete line remains before the
