@@ -5146,11 +5146,19 @@ pub fn finalize_scan_after_policy_with_body_witness(
                     &body_witness(snapshot),
                 )
         });
+        let locally_empty_money = source == SnapshotSource::ClaudeCode
+            && pending.effective_upload_body_witness_revision == 3
+            && pending.parsed_snapshot_count == 0
+            && final_fingerprints.is_empty()
+            && pending.previous_snapshot_fingerprint.is_none()
+            && pending.previous_upload_body_witness.is_none()
+            && claude_index_path_family_member(Path::new(&pending.index_key))
+                .is_some_and(|(root, _)| !index.claude_reemission_exclusions.protected_root(&root));
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
             if pending.effective_upload_body_witness_revision != 0
-                && pending.effective_upload_body_witness_revision != 3
+                && (pending.effective_upload_body_witness_revision != 3 || locally_empty_money)
                 && !index
                     .effective_upload_body_witness_revision_excluded_source_files
                     .contains(&pending.source_file_fingerprint)
