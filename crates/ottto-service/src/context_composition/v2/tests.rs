@@ -4270,3 +4270,49 @@ fn each_shard_is_hashed_once_however_many_files_change() {
     assert_eq!(read, fs::metadata(&shard).unwrap().len());
     env.cleanup();
 }
+
+#[test]
+fn fallback_catch_up_survives_a_crash_before_the_pins_write() {
+    let env = Env::new("composition-v2-catch-up-crash");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    write_records(&a, &as_session(claude_turn(&cwd, day, 1), "sa"));
+    env.run(Source::Claude, now, None);
+    // `b` is first counted by the generation that later goes bad.
+    let later = day + time::Duration::days(1);
+    let b = env.root.join("p/b.jsonl");
+    write_records(&b, &as_session(claude_turn(&cwd, later, 2), "sb"));
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    fs::write(manifest_of(&env, &cwd), b"{not json").unwrap();
+
+    // The fallback commits without budget for `b`, then the run crashes.
+    let more = as_session(claude_turn(&cwd, day, 3), "sa");
+    append_records(&a, &more);
+    harvest::tests::set_crash_after(Some(1));
+    let stats = env.run_with(
+        Source::Claude,
+        now + time::Duration::days(2),
+        None,
+        0,
+        &mut FolderResolver::default(),
+    );
+    harvest::tests::set_crash_after(None);
+    assert_eq!(
+        (
+            stats.state_fallbacks,
+            stats.scopes_committed,
+            stats.repair_waiting
+        ),
+        (1, 1, 1)
+    );
+
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(stats.bytes_repair, fs::metadata(&b).unwrap().len());
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&a, &b])
+    );
+    env.cleanup();
+}

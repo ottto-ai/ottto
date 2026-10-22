@@ -819,6 +819,12 @@ fn rebuild_pins(
             continue;
         };
         for (key, checkpoint) in &scope.files {
+            // Stale pins ahead of a committed checkpoint: a fallback commit
+            // whose pins write was lost. What they had counted is repair.
+            let repair_to = index.files.get(key).and_then(|old| {
+                old.repair_to
+                    .max((old.start > checkpoint.offset).then_some(old.start))
+            });
             index.files.insert(
                 key.clone(),
                 Pin {
@@ -839,10 +845,21 @@ fn rebuild_pins(
                     head: checkpoint.head,
                     tail: checkpoint.tail,
                     origin: checkpoint.origin,
-                    repair_to: None,
+                    repair_to,
                 },
             );
             rebuilt += 1;
+        }
+        // A pinned file the committed generation does not hold was not
+        // caught up by that fallback: it reads from where it started.
+        for (key, pin) in index.files.iter_mut() {
+            if pin.scope.as_deref() == Some(scope_id.as_str())
+                && !pin.done
+                && !pin.quarantined
+                && !scope.files.contains_key(key)
+            {
+                follow_kept(pin, None);
+            }
         }
         if !scope.info.workspace_path.is_empty() {
             index
