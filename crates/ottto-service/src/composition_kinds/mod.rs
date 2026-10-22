@@ -854,10 +854,16 @@ const MAX_GIT_POINTER_BYTES: u64 = 4096;
 /// folder in a main checkout; in a linked worktree or submodule `.git` is a
 /// file naming the checkout's own git folder (`gitdir: ...`), whose
 /// `commondir` file, when present, names the shared one. `None` when the
-/// folder is not a git folder (no `HEAD`).
+/// folder is not a git folder as git itself checks it: `HEAD` in the git
+/// folder, `objects` and `refs` in the shared one.
 fn repository_hash(root: &Path) -> Option<String> {
+    /// A pointer file's text. Only a regular file is opened, so a FIFO or a
+    /// device in its place never blocks the reader.
     fn read_small(path: &Path) -> Option<String> {
         use std::io::Read as _;
+        if !path.is_file() {
+            return None;
+        }
         let mut text = String::new();
         std::fs::File::open(path)
             .ok()?
@@ -871,7 +877,8 @@ fn repository_hash(root: &Path) -> Option<String> {
         dot_git
     } else {
         let text = read_small(&dot_git)?;
-        let target = text.lines().next()?.strip_prefix("gitdir:")?.trim();
+        // git reads `gitdir: ` with its space.
+        let target = text.lines().next()?.strip_prefix("gitdir: ")?.trim();
         if target.is_empty() {
             return None;
         }
@@ -884,6 +891,9 @@ fn repository_hash(root: &Path) -> Option<String> {
         Some(text) if !text.trim().is_empty() => git_dir.join(text.trim()),
         _ => git_dir,
     };
+    if !common_dir.join("objects").is_dir() || !common_dir.join("refs").is_dir() {
+        return None;
+    }
     let common_dir = common_dir.canonicalize().unwrap_or(common_dir);
     Some(crate::context_footprint::sha256_hex(&[common_dir
         .to_string_lossy()
