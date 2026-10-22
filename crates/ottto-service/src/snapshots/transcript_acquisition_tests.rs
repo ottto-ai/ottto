@@ -273,6 +273,37 @@ fn sampled_native_progressive_claude_response_and_codex_cumulative_reset() {
     }
 }
 #[test]
+fn sampled_native_claude_compaction_pairs_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "uuid":"tail-boundary", "parentUuid":null,
+        "compactMetadata":{"trigger":"auto","preTokens":900000}}));
+    let (retained, _, _, _) = acquire(&fixture, source, None, 100);
+    assert!(retained.is_some());
+    // The summary arrives in a later pass, 5 s from its boundary, so only the
+    // parent chain carried in the cached accumulator can pair it.
+    fixture.append(
+        &json!({"type":"attachment", "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:05.001Z", "uuid":"tail-attachment",
+        "parentUuid":"tail-boundary"}),
+    );
+    fixture.append(&json!({"type":"user", "isCompactSummary":true,
+        "isVisibleInTranscriptOnly":true, "sessionId":"native-tail-fixture",
+        "timestamp":"2026-10-07T10:30:00Z", "uuid":"tail-summary",
+        "parentUuid":"tail-attachment",
+        "message":{"role":"user","content":"Synthetic summary"}}));
+    let (_, mode, _, body) = acquire(&fixture, source, retained, 101);
+    assert_eq!(mode, ReadMode::Tail);
+    assert_eq!(body[0]["compaction_count"], json!(1));
+    assert_eq!(body, oracle(&fixture, source));
+}
+#[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
         return;

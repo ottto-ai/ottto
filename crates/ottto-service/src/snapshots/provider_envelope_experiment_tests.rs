@@ -46,6 +46,7 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             ownership_incomplete_file_count: 0,
             zero_snapshot_usage_evidence: false,
             dropped_usage_record_count: 0,
+            claude_compaction_unlinked_parent_count: 0,
             terminal_line_loss_count: 0,
             state_only_blocked_session_ids: BTreeSet::new(),
             codex_parent_session_ref: None,
