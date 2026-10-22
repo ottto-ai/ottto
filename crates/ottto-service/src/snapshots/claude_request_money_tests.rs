@@ -3,20 +3,30 @@
 // telemetry tail reader. Fixtures are synthetic and content-free.
 use super::*;
 use crate::claude_local_otel::telemetry_tail::{
-    reset_cursors_for_test, ClaudeTelemetryTail, ClaudeTelemetryTailBudget,
+    telemetry_complete_through, ClaudeLedgerWork, ClaudeTelemetryTail, ClaudeTelemetryTailBudget,
+    MAX_LINE_BYTES,
 };
 use crate::snapshots::claude_request_census::{
     claude_census_disjointness_complete, claude_census_member_status, claude_request_hash,
-    is_ledger_key, telemetry_key, ClaudeCensusMemberStatus, ClaudeRequestBirth,
-    ClaudeRequestCensus, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
-    ClaudeRequestCensusShape, ClaudeTelemetryTailState, MAX_CLAUDE_REQUEST_CENSUS_HASHES,
-    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES, TELEMETRY_KEY_PREFIX,
+    is_ledger_key, telemetry_key, ClaudeCensusMemberStatus, ClaudeFamilyMemo, ClaudeLedgerSweep,
+    ClaudeRequestBirth, ClaudeRequestCensus, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+    ClaudeRequestCensusShape, ClaudeTelemetryAudit, ClaudeTelemetryTailState,
+    MAX_CLAUDE_REQUEST_CENSUS_HASHES, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
+    TELEMETRY_KEY_PREFIX,
+};
+use crate::snapshots::claude_request_ledger::{
+    ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeRemovedBy,
+    ClaudeRequestVerdict, ClaudeUndecidedBy,
+};
+use crate::snapshots::claude_request_money::rows::{
+    clear_row_cache_for_test, reconstruct_rows, ClaudeRowCounts, Reconstructed,
 };
 use crate::snapshots::claude_request_money::{
     claude_cache_creation, claude_response_conflict_order, parse_usd_micros_for_test,
     CacheCreation, ClaudeMoneyTokens,
 };
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 use std::path::PathBuf;
 
 const MONEY_WINDOW: &str = "2026-08-02T09:00:00Z";
@@ -148,27 +158,71 @@ fn money_conflict_order_is_total() {
     use std::cmp::Ordering::*;
     // Larger conserved total wins.
     assert_eq!(
-        claude_response_conflict_order((&tokens(10, 5), 9, "z"), (&tokens(1, 5), 1, "a")),
+        claude_response_conflict_order((&tokens(10, 5), 9, 9), (&tokens(1, 5), 1, 1)),
         Less
     );
     // Same total: larger output wins.
     assert_eq!(
-        claude_response_conflict_order((&tokens(5, 10), 9, "z"), (&tokens(10, 5), 1, "a")),
+        claude_response_conflict_order((&tokens(5, 10), 9, 9), (&tokens(10, 5), 1, 1)),
         Less
     );
-    // Same usage: smaller message hash, then smaller fingerprint.
+    // Same usage: smaller message hash, then smaller response fingerprint.
     assert_eq!(
-        claude_response_conflict_order((&tokens(5, 5), 1, "z"), (&tokens(5, 5), 2, "a")),
+        claude_response_conflict_order((&tokens(5, 5), 1, 9), (&tokens(5, 5), 2, 1)),
         Less
     );
     assert_eq!(
-        claude_response_conflict_order((&tokens(5, 5), 1, "b"), (&tokens(5, 5), 1, "a")),
+        claude_response_conflict_order((&tokens(5, 5), 1, 2), (&tokens(5, 5), 1, 1)),
         Greater
     );
     assert_eq!(
-        claude_response_conflict_order((&tokens(5, 5), 1, "a"), (&tokens(5, 5), 1, "a")),
+        claude_response_conflict_order((&tokens(5, 5), 1, 1), (&tokens(5, 5), 1, 1)),
         Equal
     );
+}
+
+/// Finding 5: equal-usage responses under one key pick the same winner in
+/// every arrival order, by real message identity and response fingerprint.
+#[test]
+fn money_conflict_winner_is_independent_of_arrival_order() {
+    use crate::snapshots::claude_request_money::{
+        claude_message_hash, claude_model_hash, claude_response_fingerprint,
+    };
+    let usage = ClaudeMoneyTokens {
+        input: 7,
+        output: 7,
+        ..ClaudeMoneyTokens::default()
+    };
+    let responses = ["msg_b", "msg_a", "msg_c"]
+        .iter()
+        .enumerate()
+        .map(|(clock, message)| {
+            let message = claude_message_hash(message);
+            let fingerprint = claude_response_fingerprint(
+                &usage,
+                Some(claude_model_hash("claude-haiku-4-5")),
+                clock as u64,
+                message,
+            );
+            (message, fingerprint)
+        })
+        .collect::<Vec<_>>();
+    let winner = |order: &[usize]| {
+        order
+            .iter()
+            .map(|index| responses[*index])
+            .min_by(|left, right| {
+                claude_response_conflict_order((&usage, left.0, left.1), (&usage, right.0, right.1))
+            })
+            .unwrap()
+    };
+    let first = winner(&[0, 1, 2]);
+    for order in [[0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]] {
+        assert_eq!(winner(&order), first, "{order:?}");
+    }
+    // Same message and usage but another clock: a different response.
+    let other = claude_response_fingerprint(&usage, None, 99, first.0);
+    assert_ne!(other, first.1);
 }
 
 #[test]
@@ -216,30 +270,28 @@ fn money_birth_is_carried_only_for_the_same_object() {
         Some(replaced)
     );
     assert_eq!(census.carried_birth_for_test(key, None), None);
-    // #588 restore / failed finish: the stub keeps the birth for the same
-    // object only, and every reader skips it.
-    census.remove_keeping_birth_for_test(key);
-    let stub = format!("birth:{key}");
-    assert!(census.record_for_test(key).is_none());
-    assert!(is_ledger_key(&stub));
-    assert!(census.record_for_test(&stub).is_some());
+    // #588 restore / failed finish: the record is replaced IN PLACE by a
+    // stub (no new key) that keeps the birth for the same object only; every
+    // reader skips it.
+    let totals = census.totals_for_test();
+    census.invalidate_keeping_birth_for_test(key);
+    assert!(census.get(key).is_none());
+    assert!(census.record_for_test(key).unwrap().is_birth_stub_for_test());
+    assert_eq!(census.len_for_test(), 0);
+    assert!(census.totals_for_test().0 < totals.0, "the hashes are freed");
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
     assert_eq!(
         census.carried_birth_for_test(key, Some(reread)),
         Some(first)
     );
-    assert!(
-        census.record_for_test(&stub).is_none(),
-        "the stub is consumed"
-    );
-    census.insert_for_test(
-        key,
-        money_record('a', vec![1]).with_birth_for_test(Some(first)),
-    );
-    census.remove_keeping_birth_for_test(key);
     assert_eq!(
         census.carried_birth_for_test(key, Some(replaced)),
         Some(replaced)
     );
+    // A record without birth is simply removed.
+    census.insert_for_test(key, money_record('a', vec![1]));
+    census.invalidate_keeping_birth_for_test(key);
+    assert!(census.record_for_test(key).is_none());
 }
 
 /// The `otel:` namespace cannot collide with a file key, and D1's join,
@@ -277,9 +329,18 @@ fn money_ledger_records_are_invisible_to_d1() {
             window,
         ),
     );
+    let stub_key = "/money/projects/-repo/stub.jsonl";
+    index.claude_request_census_mut_for_test().insert_for_test(
+        stub_key,
+        money_record('b', vec![3]).with_birth_for_test(Some(ClaudeRequestBirth {
+            unix_seconds: 1,
+            device: 1,
+            inode: 1,
+        })),
+    );
     index
         .claude_request_census_mut_for_test()
-        .insert_for_test(&format!("birth:{key}"), money_record('b', vec![]));
+        .invalidate_keeping_birth_for_test(stub_key);
     assert_eq!(
         (
             claude_census_disjointness_complete(&index, MONEY_WINDOW, true),
@@ -299,46 +360,62 @@ fn money_ledger_records_are_invisible_to_d1() {
     // The terminal prune keeps telemetry records and the indexed key's stub.
     let census = index.claude_request_census_for_test();
     assert!(census.record_for_test(&otel).is_some());
-    assert!(census.record_for_test(&format!("birth:{key}")).is_some());
+    assert!(
+        census.record_for_test(stub_key).is_none(),
+        "an unindexed stub is pruned"
+    );
 }
 
-/// Transcript retirement: 35 days after its last modification a settled
+/// Transcript retirement (finding 10): 35 days after the modification time
+/// the RECORD carries (its parse's mtime, not the index entry's), a clean
 /// record drops its hashes and keeps their count, through save and load.
 #[test]
 fn money_transcript_records_retire_after_35_days() {
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let mut index = ScanIndex::default();
-    for (name, age_days, seed) in [("old", 36, 'a'), ("young", 34, 'b'), ("dirty", 40, 'c')] {
+    // (name, record mtime age, entry mtime age, seed, record seed)
+    for (name, record_age, entry_age, seed, record_seed) in [
+        ("old", Some(36), 1, 'a', 'a'),
+        ("young", Some(34), 40, 'b', 'b'),
+        ("dirty", Some(40), 40, 'c', 'd'),
+        ("unknown", None, 40, 'e', 'e'),
+    ] {
         let key = format!("/money/projects/{name}.jsonl");
         let mut entry = manifest_index_entry(Some("body"));
         entry.source_file_fingerprint = money_fingerprint(seed);
-        entry.modified_unix_seconds = window - age_days * 86_400;
+        // The entry's mtime is deliberately the opposite of the record's.
+        entry.modified_unix_seconds = window - entry_age * 86_400;
         index.files.insert(key.clone(), entry);
-        // "dirty": the record is not at the entry's fingerprint.
-        let record_seed = if name == "dirty" { 'd' } else { seed };
-        index
-            .claude_request_census_mut_for_test()
-            .insert_for_test(&key, money_record(record_seed, vec![1, 2, 3]));
+        index.claude_request_census_mut_for_test().insert_for_test(
+            &key,
+            money_record(record_seed, vec![1, 2, 3])
+                .with_modified_for_test(record_age.map(|age: u64| window - age * 86_400)),
+        );
     }
     let keys = index.files.keys().cloned().collect::<BTreeSet<_>>();
+    let (aged_before, _) = crate::snapshots::claude_request_census::transcript_retirements();
     crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
         &mut index,
         &keys,
         &BTreeSet::new(),
         MONEY_WINDOW,
     );
-    let census = money_census_round_trip(index.claude_request_census_for_test());
+    let (aged_after, _) = crate::snapshots::claude_request_census::transcript_retirements();
+    assert!(aged_after > aged_before);
+    let census = index.claude_request_census_for_test();
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
+    let census = money_census_round_trip(census);
     let old = census.record_for_test("/money/projects/old.jsonl").unwrap();
     assert_eq!(old.retired_for_test(), Some(3));
     assert!(old.request_hashes_for_test().is_empty());
-    for name in ["young", "dirty"] {
+    for name in ["young", "dirty", "unknown"] {
         let record = census
             .record_for_test(&format!("/money/projects/{name}.jsonl"))
             .unwrap();
         assert_eq!(record.retired_for_test(), None, "{name}");
         assert_eq!(record.request_hashes_for_test(), &[1, 2, 3], "{name}");
     }
-    assert_eq!(census.hash_total_for_test(), 6);
+    assert_eq!(census.hash_total_for_test(), 9);
 }
 
 /// Every new field round-trips; the serialized total charged at insert is
@@ -365,6 +442,15 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
         audited_offset: 450,
         audited_unix: 1_700_000_050,
         missing_sweeps: 0,
+        first_event_unix: 1_699_999_000,
+        skip_bytes: 12,
+        audit: Some(ClaudeTelemetryAudit {
+            target_offset: 900,
+            target_sum: 5,
+            position: 300,
+            partial_sum: 3,
+            skip_bytes: 7,
+        }),
     };
     let otel = telemetry_key("root");
     census.insert_for_test(
@@ -374,6 +460,36 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let mut retired = money_record('b', vec![8, 9]);
     retired.retire();
     census.insert_for_test("/money/projects/b.jsonl", retired);
+    census.insert_for_test(
+        "/money/projects/c.jsonl",
+        money_record('c', vec![4])
+            .with_modified_for_test(Some(1_700_000_200))
+            .with_message_hashes_for_test(Some(vec![6, 7])),
+    );
+    census.insert_for_test(
+        "sweep:tail",
+        ClaudeRequestCensusRecord::sweep_record(
+            [9; 32],
+            1_700_000_300,
+            ClaudeLedgerSweep {
+                complete_through: 1_700_000_000,
+                debt: 1,
+            },
+        ),
+    );
+    census.insert_for_test(
+        "fam:x",
+        ClaudeRequestCensusRecord::family_record(
+            [8; 32],
+            1_700_000_400,
+            ClaudeFamilyMemo {
+                removed_requests: 3,
+                removed_tokens: 900,
+                rows_digest: 17,
+            },
+        ),
+    );
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
     assert_eq!(
         census.serialized_total_for_test(),
         census.exact_serialized_len_for_test().saturating_sub(1),
@@ -390,6 +506,14 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
             .retired_for_test(),
         Some(2)
     );
+    let sweep = loaded.record_for_test("sweep:tail").unwrap().sweep().unwrap();
+    assert_eq!((*sweep.0, sweep.1, sweep.2.debt), ([9; 32], 1_700_000_300, 1));
+    let memo = loaded.record_for_test("fam:x").unwrap().family_memo().unwrap();
+    assert_eq!((memo.1.removed_tokens, memo.1.rows_digest), (900, 17));
+    let modified = loaded.record_for_test("/money/projects/c.jsonl").unwrap();
+    assert_eq!(modified.modified(), Some(1_700_000_200));
+    assert_eq!(modified.message_hashes(), Some(&[6_u64, 7][..]));
+    assert_eq!(loaded.totals_for_test(), loaded.recounted_for_test());
 }
 
 /// Hostile new fields drop one record each, never the index.
@@ -450,6 +574,10 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     with("r-float", "r", serde_json::json!(1.5));
     with("ur-only", "ur", serde_json::json!(3));
     with("to-only", "to", serde_json::json!(3));
+    with("audit-without-tail", "xa", serde_json::json!(3));
+    with("sweep-partial", "sk", serde_json::json!(1));
+    with("family-partial", "fr", serde_json::json!(1));
+    with("m-string", "m", serde_json::json!("1"));
     // h and b together are one field twice.
     with("h-and-b", "h", serde_json::json!(format!("{:016x}", 1)));
     for (name, record) in cases {
@@ -490,11 +618,20 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
         ("tv", 11),
         ("tw2", 1),
         ("tm", 0),
+        ("te", 0),
+        ("tk", 0),
     ] {
         tail[field] = serde_json::json!(value);
     }
     assert_eq!(money_decode_one(tail.clone()), None, "audited past offset");
     tail["tv"] = serde_json::json!(10);
+    assert!(money_decode_one(tail.clone()).is_some());
+    // An audit past the record's offset is malformed.
+    for (field, value) in [("xa", 11), ("xs", 0), ("xp", 0), ("xq", 0), ("xk", 0)] {
+        tail[field] = serde_json::json!(value);
+    }
+    assert_eq!(money_decode_one(tail.clone()), None, "audit target past offset");
+    tail["xa"] = serde_json::json!(10);
     assert!(money_decode_one(tail).is_some());
 }
 
@@ -589,6 +726,10 @@ fn money_api_line(session: &str, request: &str, observed_at: &str) -> String {
     serde_json::to_string(&row).unwrap() + "\n"
 }
 
+fn money_work(bytes: u64) -> ClaudeLedgerWork {
+    ClaudeLedgerWork::new(bytes, 1024, Duration::from_secs(30))
+}
+
 struct MoneyTail {
     _scratch: crate::test_scratch::ScratchDir,
     support: PathBuf,
@@ -601,7 +742,6 @@ impl MoneyTail {
         let support = scratch.join("support");
         let dir = support.join("local-otel/claude-code-effort");
         std::fs::create_dir_all(&dir).unwrap();
-        reset_cursors_for_test(&support);
         Self {
             _scratch: scratch,
             support,
@@ -627,21 +767,26 @@ impl MoneyTail {
         census: &mut ClaudeRequestCensus,
         budget: &ClaudeTelemetryTailBudget,
     ) -> crate::claude_local_otel::telemetry_tail::ClaudeTelemetryTailCounts {
-        self.advance_at(census, budget, 1_800_000_000)
+        self.advance_with(census, budget, 1_800_000_000, &mut money_work(16 << 20))
     }
-    fn advance_at(
+    fn advance_with(
         &self,
         census: &mut ClaudeRequestCensus,
         budget: &ClaudeTelemetryTailBudget,
         now: u64,
+        work: &mut ClaudeLedgerWork,
     ) -> crate::claude_local_otel::telemetry_tail::ClaudeTelemetryTailCounts {
-        ClaudeTelemetryTail::advance(&self.support, census, now, budget)
+        let counts = ClaudeTelemetryTail::advance(&self.support, census, now, budget, work);
+        // Moving hashes in and out never leaves the budget totals behind.
+        assert_eq!(census.totals_for_test(), census.recounted_for_test());
+        counts
     }
 }
 
 /// Tail custody: complete lines only, resume at the saved offset, foreign
-/// rows refused, a byte budget resumes inside a file, a rewrite that keeps
-/// identity and length is caught by the audit, a missing sidecar retires.
+/// rows refused, the shared byte budget resumes inside a file, a rewrite that
+/// keeps identity and length is caught by the audit, a missing sidecar
+/// retires, and a clean full sweep advances `complete_through`.
 #[test]
 fn money_telemetry_tail_reads_only_complete_appended_lines() {
     let tail = MoneyTail::new("money-tail");
@@ -654,10 +799,16 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
     let mut census = ClaudeRequestCensus::default();
     let counts = tail.advance(&mut census, &budget);
     assert_eq!((counts.rows_valid, counts.rows_refused), (1, 1));
+    assert!(counts.sweep_wrapped && !counts.sweep_debt);
+    assert_eq!(telemetry_complete_through(&census), 1_800_000_000);
     let record = census.get(&key).expect("telemetry record").clone();
     assert_eq!(record.request_hashes(), &[claude_request_hash("req_1")]);
     let len = std::fs::metadata(tail.path(session)).unwrap().len();
     assert_eq!(record.tail().unwrap().offset, len);
+    assert_eq!(
+        record.tail().unwrap().first_event_unix,
+        crate::snapshots::rfc3339_unix_seconds(t).unwrap()
+    );
 
     // A partial line is not consumed until its newline arrives.
     let line = money_api_line(session, "req_2", t);
@@ -677,19 +828,22 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         expected.as_slice()
     );
 
-    // The byte budget stops inside the file and the next page resumes there.
+    // The shared byte budget (the anchor check plus one line) stops inside
+    // the file; the next page resumes there and the sweep does not wrap.
     for number in 3..6 {
         tail.append(
             session,
             &money_api_line(session, &format!("req_{number}"), t),
         );
     }
-    let small = ClaudeTelemetryTailBudget {
-        max_bytes: line.len() as u64,
-        ..budget
-    };
-    let counts = tail.advance(&mut census, &small);
+    let counts = tail.advance_with(
+        &mut census,
+        &budget,
+        1_800_000_000,
+        &mut money_work(64 + line.len() as u64),
+    );
     assert!(counts.budget_stopped);
+    assert!(!counts.sweep_wrapped);
     assert_eq!(counts.rows_valid, 1);
     let counts = tail.advance(&mut census, &budget);
     assert_eq!(counts.rows_valid, 2);
@@ -709,7 +863,12 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         .unwrap();
     let counts = tail.advance(&mut census, &budget);
     assert_eq!(counts.audit_mismatches, 0, "audited today already");
-    let counts = tail.advance_at(&mut census, &budget, 1_800_000_000 + 86_400);
+    let counts = tail.advance_with(
+        &mut census,
+        &budget,
+        1_800_000_000 + 86_400,
+        &mut money_work(16 << 20),
+    );
     assert_eq!(counts.audit_mismatches, 1);
     assert!(census.get(&key).is_none(), "a mismatched record is dropped");
     let counts = tail.advance(&mut census, &budget);
@@ -733,8 +892,69 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
     assert!(census.get(&key).is_none());
 }
 
+/// Finding 9: an oversized line is skipped across pages (its progress
+/// saved), never pinning or excluding the file; the audit of a long file
+/// resumes across pages instead of being skipped.
+#[test]
+fn money_telemetry_tail_skips_oversized_lines_and_resumes_audits() {
+    let tail = MoneyTail::new("money-tail-oversized");
+    let budget = ClaudeTelemetryTailBudget::default();
+    let session = "b2222222-2222-4222-8222-222222222222";
+    let key = telemetry_key(session);
+    let t = "2026-08-02T07:00:00Z";
+    tail.append(session, &("x".repeat(3 * MAX_LINE_BYTES) + "\n"));
+    tail.append(session, &money_api_line(session, "req_after", t));
+    let mut census = ClaudeRequestCensus::default();
+    let mut pages = 0;
+    let mut oversized = 0;
+    while census
+        .get(&key)
+        .is_none_or(|record| record.request_hashes().is_empty())
+    {
+        pages += 1;
+        assert!(pages < 12, "the oversized line pinned the file");
+        let counts = tail.advance_with(
+            &mut census,
+            &budget,
+            1_800_000_000,
+            &mut money_work(MAX_LINE_BYTES as u64 + 4096),
+        );
+        oversized += counts.lines_oversized;
+    }
+    assert!(pages >= 3, "{pages}");
+    assert_eq!(oversized, 1);
+    assert_eq!(
+        census.get(&key).unwrap().request_hashes(),
+        &[claude_request_hash("req_after")]
+    );
+    // Finish any audit the reads above started, then the next day's audit
+    // rereads 0..offset in slices, resuming across pages.
+    tail.advance(&mut census, &budget);
+    let day = 1_800_000_000 + 86_400;
+    let mut started = 0;
+    let mut completed = 0;
+    for _ in 0..12 {
+        let counts = tail.advance_with(
+            &mut census,
+            &budget,
+            day,
+            &mut money_work(MAX_LINE_BYTES as u64 + 32 * 1024),
+        );
+        started += counts.audits_started;
+        completed += counts.audits_completed;
+        assert_eq!(counts.audit_mismatches, 0);
+        if completed > 0 {
+            break;
+        }
+    }
+    assert_eq!((started, completed), (1, 1));
+    let state = *census.get(&key).unwrap().tail().unwrap();
+    assert_eq!(state.audited_offset, state.offset);
+    assert!(state.audit.is_none());
+}
+
 /// Fair enumeration: with a one-file budget, every sidecar is reached in
-/// turn and the sweep wraps.
+/// turn, the sweep wraps, and an unreadable entry leaves sweep debt.
 #[test]
 fn money_telemetry_tail_enumeration_is_fair_and_bounded() {
     let tail = MoneyTail::new("money-tail-fair");
@@ -753,15 +973,19 @@ fn money_telemetry_tail_enumeration_is_fair_and_bounded() {
     };
     let mut census = ClaudeRequestCensus::default();
     let mut wrapped = false;
-    for _ in 0..5 {
+    let mut debt = false;
+    for _ in 0..6 {
         let counts = tail.advance(&mut census, &budget);
         assert!(counts.files_selected <= 1);
         wrapped |= counts.sweep_wrapped;
+        debt |= counts.sweep_debt;
     }
     for session in sessions {
         assert!(census.get(&telemetry_key(session)).is_some(), "{session}");
     }
     assert!(wrapped);
+    assert!(debt, "the unreadable entry is debt");
+    assert_eq!(telemetry_complete_through(&census), 0);
 }
 
 /// Telemetry pressure retirement starts only at 90% of the hash budget.
@@ -804,44 +1028,255 @@ fn money_telemetry_retires_only_under_pressure() {
             .retired_for_test(),
         Some(quarter as u64)
     );
+    assert_eq!(census.totals_for_test(), census.recounted_for_test());
 }
 
-/// The shadow's reread never reads past its admitted length: a file that
-/// grew past it, or a short one with a torn line, yields no rows at all.
+/// Finding 9: a root's API sidecar far over 256 KiB is reconstructed across
+/// pages from its saved offset under a small shared budget; it is
+/// unavailable (never "no rows") until complete, then has every row.
 #[test]
-fn money_reread_is_bounded_by_its_admitted_length() {
-    let tail = MoneyTail::new("money-reread-bound");
-    let session = "reread-session";
-    tail.append(
-        session,
-        &money_api_line(session, "req_1", "2026-08-02T07:00:00Z"),
-    );
-    let len = std::fs::metadata(tail.path(session)).unwrap().len();
-    let rows =
-        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, session, len + 1)
-            .expect("the admitted file reads");
-    assert_eq!(rows.len(), 1);
-    // Grew after its admission stat: refused before any read.
-    tail.append(
-        session,
-        &money_api_line(session, "req_2", "2026-08-02T07:00:01Z"),
-    );
-    assert!(
-        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, session, len + 1)
-            .is_none()
-    );
-    // A torn last line is not fully healthy.
-    let grown = std::fs::metadata(tail.path(session)).unwrap().len();
-    tail.append(session, "{\"truncated");
-    assert!(crate::claude_local_otel::load_claude_api_rows_within(
+fn money_rows_reconstruct_long_sidecars_across_pages() {
+    let tail = MoneyTail::new("money-rows-long");
+    let session = "c3333333-3333-4333-8333-333333333333";
+    let mut text = String::new();
+    let mut count = 0;
+    while text.len() < 3 * MAX_LINE_BYTES {
+        text.push_str(&money_api_line(
+            session,
+            &format!("req_{count}"),
+            "2026-08-02T07:00:00Z",
+        ));
+        count += 1;
+    }
+    tail.append(session, &text);
+    let mut census = ClaudeRequestCensus::default();
+    let mut pages = 0;
+    let rows = loop {
+        pages += 1;
+        assert!(pages < 20, "never completed");
+        let mut counts = ClaudeRowCounts::default();
+        let mut admit = |_: usize| true;
+        let mut out = reconstruct_rows(
+            &tail.support,
+            &[session],
+            &mut census,
+            &mut money_work(128 * 1024),
+            &mut admit,
+            &mut counts,
+        );
+        match out.remove(session).unwrap() {
+            Reconstructed::Complete(rows) => break rows,
+            Reconstructed::Unavailable => assert_eq!(counts.roots_partial, 1),
+        }
+    };
+    assert!(pages >= 6, "{pages}");
+    assert_eq!(rows.len(), count);
+    // An absent sidecar is complete with no rows.
+    let mut admit = |_: usize| true;
+    let out = reconstruct_rows(
         &tail.support,
-        session,
-        grown + 64
-    )
-    .is_none());
-    // Missing is not "no rows" here either: there is nothing to admit.
-    assert!(
-        crate::claude_local_otel::load_claude_api_rows_within(&tail.support, "absent", 1024)
-            .is_none()
+        &["absent-root"],
+        &mut census,
+        &mut money_work(1024),
+        &mut admit,
+        &mut ClaudeRowCounts::default(),
+    );
+    assert!(matches!(out.get("absent-root"), Some(Reconstructed::Complete(rows)) if rows.is_empty()));
+    clear_row_cache_for_test(&tail.support);
+}
+
+/// Ledger fixture: one project group with root A (and its subagent x) and
+/// root B, every record current at its entry.
+struct MoneyLedger {
+    index: ScanIndex,
+    a: String,
+    ax: String,
+    b: String,
+}
+
+fn money_hashes(ids: &[&str]) -> Vec<u64> {
+    let mut hashes = ids.iter().map(|id| claude_request_hash(id)).collect::<Vec<_>>();
+    hashes.sort_unstable();
+    hashes
+}
+
+impl MoneyLedger {
+    fn new(a: &[&str], ax: &[&str], b: &[&str]) -> Self {
+        let mut index = ScanIndex::default();
+        let keys = [
+            ("/m/projects/-repo/A.jsonl", 'a', a),
+            ("/m/projects/-repo/A/subagents/agent-x.jsonl", 'b', ax),
+            ("/m/projects/-repo/B.jsonl", 'c', b),
+        ];
+        for (key, seed, ids) in keys {
+            let mut entry = manifest_index_entry(Some("body"));
+            entry.source_file_fingerprint = money_fingerprint(seed);
+            index.files.insert(key.to_owned(), entry);
+            index.claude_request_census_mut_for_test().insert_for_test(
+                key,
+                money_record(seed, money_hashes(ids)).with_message_hashes_for_test(Some(Vec::new())),
+            );
+        }
+        Self {
+            index,
+            a: keys[0].0.to_owned(),
+            ax: keys[1].0.to_owned(),
+            b: keys[2].0.to_owned(),
+        }
+    }
+
+    fn claim(&mut self, root: &str, ids: &[&str], first_event: u64) {
+        let tail = ClaudeTelemetryTailState {
+            first_event_unix: first_event,
+            ..ClaudeTelemetryTailState::default()
+        };
+        self.index.claude_request_census_mut_for_test().insert_for_test(
+            &telemetry_key(root),
+            ClaudeRequestCensusRecord::telemetry(money_hashes(ids), tail, 1),
+        );
+    }
+
+    fn classify(
+        &self,
+        id: &str,
+        own_key: &str,
+        own_root: &str,
+        traces: &BTreeMap<String, BTreeMap<u64, String>>,
+    ) -> ClaudeRequestVerdict {
+        let hash = claude_request_hash(id);
+        let census = self.index.claude_request_census_for_test();
+        let holders = crate::snapshots::claude_request_ledger::scan_holders(census, &[hash], &[]);
+        let scope = ClaudeLedgerScope::build(
+            &self.index,
+            &BTreeSet::from(["-repo"]),
+            &BTreeSet::from(["A", "B"]),
+        );
+        let first_event = census
+            .records()
+            .filter_map(|(key, record)| Some((key.clone(), record.tail()?.first_event_unix)))
+            .collect::<BTreeMap<_, _>>();
+        let claims = BTreeMap::new();
+        let ctx = ClaudeClassifyContext {
+            index: &self.index,
+            holders: &holders,
+            scope: &scope,
+            page_claims: &claims,
+            first_event: &first_event,
+            trace: traces,
+            telemetry_complete_through: 2_000_000_000,
+        };
+        ctx.classify_request(hash, 1_000, own_key, own_root)
+    }
+}
+
+/// Finding 4: two telemetry owners -> one deterministic untagged winner
+/// (earliest first telemetry event, then root) and explicit losers; an
+/// unknown first event is undecided, never a guess.
+#[test]
+fn money_two_telemetry_owners_pick_the_earliest_first_event() {
+    let mut ledger = MoneyLedger::new(&["req_two"], &[], &["req_two"]);
+    ledger.claim("A", &["req_two"], 200);
+    ledger.claim("B", &["req_two"], 100);
+    let none = BTreeMap::new();
+    assert_eq!(
+        ledger.classify("req_two", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Counted(ClaudeCountedBy::TwoOwnerWinner)
+    );
+    assert_eq!(
+        ledger.classify("req_two", &ledger.a, "A", &none),
+        ClaudeRequestVerdict::Removed(ClaudeRemovedBy::TwoOwnerLoser)
+    );
+    // Equal first events: the smaller telemetry key wins, the same way for
+    // both sides.
+    ledger.claim("A", &["req_two"], 100);
+    let a = ledger.classify("req_two", &ledger.a, "A", &none);
+    let b = ledger.classify("req_two", &ledger.b, "B", &none);
+    let winners = [a, b]
+        .iter()
+        .filter(|verdict| {
+            **verdict == ClaudeRequestVerdict::Counted(ClaudeCountedBy::TwoOwnerWinner)
+        })
+        .count();
+    assert_eq!(winners, 1, "{a:?} {b:?}");
+    ledger.claim("A", &["req_two"], 0);
+    assert_eq!(
+        ledger.classify("req_two", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::TelemetryOrder)
+    );
+}
+
+/// Finding 4: in-family holders follow the trace-named member; without the
+/// trace they are undecided.
+#[test]
+fn money_in_family_holders_follow_the_trace_named_member() {
+    let mut ledger = MoneyLedger::new(&["req_side"], &["req_side"], &[]);
+    ledger.claim("A", &["req_side"], 100);
+    let traces = BTreeMap::from([(
+        "A".to_owned(),
+        BTreeMap::from([(claude_request_hash("req_side"), "A_agent-x".to_owned())]),
+    )]);
+    assert_eq!(
+        ledger.classify("req_side", &ledger.ax, "A", &traces),
+        ClaudeRequestVerdict::Counted(ClaudeCountedBy::PolicyOwned)
+    );
+    assert_eq!(
+        ledger.classify("req_side", &ledger.a, "A", &traces),
+        ClaudeRequestVerdict::Removed(ClaudeRemovedBy::Copy)
+    );
+    assert_eq!(
+        ledger.classify("req_side", &ledger.a, "A", &BTreeMap::new()),
+        ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::TraceUnavailable)
+    );
+}
+
+/// Finding 3: a negative claim needs explicit scoped completeness: a lost
+/// record (built before, no record) or a stale one in the group blocks
+/// "no other holder".
+#[test]
+fn money_scope_debt_blocks_negative_membership_claims() {
+    let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
+    let none = BTreeMap::new();
+    assert_eq!(
+        ledger.classify("req_own", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned)
+    );
+    // A stale record in the group (its file changed since it was recorded).
+    ledger
+        .index
+        .files
+        .get_mut(&ledger.a)
+        .unwrap()
+        .source_file_fingerprint = money_fingerprint('z');
+    assert_eq!(
+        ledger.classify("req_own", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
+    );
+    ledger
+        .index
+        .files
+        .get_mut(&ledger.a)
+        .unwrap()
+        .source_file_fingerprint = money_fingerprint('a');
+    // A lost record: built before, no record now.
+    let a = ledger.a.clone();
+    ledger
+        .index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(&a);
+    assert_eq!(
+        ledger.classify("req_own", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
+    );
+    // A brand-new file (never built) does not block.
+    let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
+    let mut entry = manifest_index_entry(None);
+    entry.source_file_fingerprint = money_fingerprint('n');
+    ledger
+        .index
+        .files
+        .insert("/m/projects/-repo/N.jsonl".to_owned(), entry);
+    assert_eq!(
+        ledger.classify("req_own", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned)
     );
 }

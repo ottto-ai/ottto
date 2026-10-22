@@ -3340,7 +3340,6 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         usage_accounting_contract: item.usage_accounting_contract.clone(),
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
-        claude_request_residue: Vec::new(),
         cache_observations: item.cache_observations.clone(),
         cache_observations_state: None,
         cache_base_head_etag: None,
@@ -7095,6 +7094,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &scan_result.snapshots,
         index,
         &api_report,
+        &trace_report,
         scan_result.census_complete,
     );
     Ok((disposition, census_withheld, stats))

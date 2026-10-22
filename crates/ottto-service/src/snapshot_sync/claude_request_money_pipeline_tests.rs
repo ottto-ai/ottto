@@ -1,8 +1,9 @@
 // P1 per-request Claude money, shadow only, through the real caller: the
 // `PipelineFixture` page stages run `apply_claude_local_evidence_to_scan`,
-// which runs the shadow. The shadow changes no page decision; its family rows
-// conserve the live totals; its refusal and reader-failure paths never fail a
-// page. Fixtures are synthetic.
+// which runs the shadow. The shadow changes no page decision and no live
+// item; its B1 rows (grain, family, coverage) are internally consistent; its
+// refusal and reader-failure paths never fail a page and never claim
+// coverage. Fixtures are synthetic.
 
 use super::*;
 use crate::snapshots::claude_request_money as money;
@@ -44,7 +45,14 @@ struct MoneyPipelineArm {
     /// Non-ledger census records: relative key -> request hashes.
     census: BTreeMap<String, Vec<u64>>,
     lines: Vec<serde_json::Value>,
+    /// Every JSONL row (grain, family and coverage).
     rows: Vec<serde_json::Value>,
+}
+
+impl MoneyPipelineArm {
+    fn of(&self, kind: &str) -> Vec<&serde_json::Value> {
+        self.rows.iter().filter(|row| row["row"] == kind).collect()
+    }
 }
 
 fn money_api_line(session: &str, request: &str, sequence: u64, tokens: u64) -> String {
@@ -198,64 +206,99 @@ fn money_count(lines: &[serde_json::Value], name: &str) -> u64 {
         .sum()
 }
 
-/// Every built family conserves the live totals: old + reported side calls =
-/// new + removed + held + immature, in tokens and in requests.
-fn money_assert_conserved(arm: &MoneyPipelineArm) {
-    assert!(!arm.rows.is_empty(), "the shadow writes family rows");
+fn money_grain_tokens(side: &serde_json::Value) -> i128 {
+    [
+        "input_tokens",
+        "output_tokens",
+        "cache_read_tokens",
+        "cache_creation_5m_tokens",
+        "cache_creation_1h_tokens",
+        "unattributed_total_tokens",
+    ]
+    .iter()
+    .map(|name| i128::from(side[*name].as_u64().expect("token component")))
+    .sum()
+}
+
+/// The B1 reader's view: every family row's new minus old equals the sum of
+/// its snapshot's grain rows (new minus old), in tokens and in requests, so
+/// one reader prices the window from the grains alone. Ids are hashed.
+fn money_assert_rows_consistent(arm: &MoneyPipelineArm) {
+    let families = arm.of("family");
+    assert!(!families.is_empty(), "the shadow writes family rows");
     let mut built = 0;
-    for row in &arm.rows {
-        assert_eq!(row["counting"], "claude_request_counting:v1", "{row}");
-        assert_eq!(row["family"].as_str().map(str::len), Some(16), "{row}");
-        let (old_tokens, old_requests) = money_totals(row, "old");
-        let (new_tokens, new_requests) = money_totals(row, "new");
+    for family in &families {
+        assert_eq!(family["counting"], "claude_request_counting:v1", "{family}");
+        assert_eq!(family["v"], 2, "{family}");
+        assert_eq!(family["family"].as_str().map(str::len), Some(16), "{family}");
+        let (old_tokens, old_requests) = money_totals(family, "old");
+        let (new_tokens, new_requests) = money_totals(family, "new");
         assert_eq!(
-            row["removed_change"].as_i64(),
+            family["net_token_change"].as_i64(),
             Some(new_tokens as i64 - old_tokens as i64),
-            "{row}"
+            "{family}"
         );
-        if row["category"] == "unbuilt" {
-            assert_eq!(row["coverage_complete"].as_bool(), Some(false), "{row}");
+        assert!(
+            family["removed_change"].is_null()
+                == family["removed_change_unavailable"].is_string(),
+            "{family}"
+        );
+        if family["category"] == "unbuilt" {
+            assert_eq!(family["coverage_complete"], false, "{family}");
             continue;
         }
         built += 1;
-        let reported = &row["by_origin"]["telemetry_reported"];
-        let (reported_tokens, reported_requests) = (
-            reported["tokens"].as_u64().unwrap_or(0),
-            reported["requests"].as_u64().unwrap_or(0),
-        );
-        let parts = ["removed", "held", "immature"]
+        let (tokens, requests) = arm
+            .of("grain")
             .iter()
-            .map(|part| money_totals(row, part))
-            .fold((new_tokens, new_requests), |sum, part| {
-                (sum.0 + part.0, sum.1 + part.1)
+            .filter(|grain| {
+                grain["family"] == family["family"] && grain["snapshot"] == family["snapshot"]
+            })
+            .fold((0_i128, 0_i128), |sum, grain| {
+                (
+                    sum.0 + money_grain_tokens(&grain["new"]) - money_grain_tokens(&grain["old"]),
+                    sum.1 + i128::from(grain["new"]["requests"].as_u64().unwrap())
+                        - i128::from(grain["old"]["requests"].as_u64().unwrap()),
+                )
             });
         assert_eq!(
+            (tokens, requests),
             (
-                old_tokens + reported_tokens,
-                old_requests + reported_requests
+                i128::from(new_tokens) - i128::from(old_tokens),
+                i128::from(new_requests) - i128::from(old_requests)
             ),
-            parts,
-            "conservation: {row}"
+            "grains explain the family: {family}"
         );
     }
-    assert!(
-        built > 0,
-        "the builder builds ordinary families: {:?}",
-        arm.rows
-    );
+    assert!(built > 0, "the builder builds ordinary families: {:?}", arm.rows);
+    for grain in arm.of("grain") {
+        assert_eq!(grain["session"].as_str().map(str::len), Some(16), "{grain}");
+        assert!(grain["hour"].as_str().is_some_and(|hour| hour.ends_with(":00:00Z")), "{grain}");
+        assert!(grain["selector"].is_object(), "{grain}");
+        assert!(grain["category"].is_string(), "{grain}");
+    }
+    assert!(!arm.of("coverage").is_empty(), "every day has a coverage row");
     assert_eq!(money_count(&arm.lines, "certificate_mismatch"), 0);
-    assert_eq!(
-        money_count(&arm.lines, "residue_tokens"),
-        0,
-        "{:?}",
-        arm.lines
-    );
+    // Hashed ids only.
+    let joined = arm
+        .rows
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<String>();
+    for raw in PIPELINE_SESSIONS
+        .iter()
+        .chain([&MONEY_PIPELINE_COPY])
+        .copied()
+        .chain(["req_1_1", MONEY_PIPELINE_SIDE_CALL])
+    {
+        assert!(!joined.contains(raw), "raw id {raw} in the JSONL");
+    }
 }
 
 /// Zero behavior change through the real caller: with identical sidecars
 /// and transcripts, the page facts (bodies, uploads, holds, settlement,
 /// census decisions) and the non-ledger census records are identical with
-/// the shadow on and off. The shadow's only writes are its own `otel:`
+/// the shadow on and off. The shadow's only writes are its own ledger
 /// records, its log line and its JSONL.
 #[test]
 #[serial(source_manifests)]
@@ -281,10 +324,11 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
     for line in &on.lines {
         assert_eq!(line["counting"], "claude_request_counting:v1");
         assert_eq!(line["counts"]["refused_budget"], 0, "{line}");
+        assert_eq!(line["counts"]["ledger_unfunded"], 0, "{line}");
         assert!(line["ledger"]["census_serialized_bytes"].is_u64(), "{line}");
-        assert!(line["ledger"]["transcript_u_known"].is_u64(), "{line}");
+        assert!(line["scope"]["lost"].is_u64(), "{line}");
     }
-    money_assert_conserved(&on);
+    money_assert_rows_consistent(&on);
     // The copy is removed from the copy's family: the source family's API
     // row proves the owner, so the copy leaves and the money stays once.
     assert!(
@@ -294,9 +338,9 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
     );
     let copy_family = money::hashed_id_for_test(MONEY_PIPELINE_COPY);
     let copy_row = on
-        .rows
-        .iter()
-        .find(|row| row["family"] == copy_family.as_str())
+        .of("family")
+        .into_iter()
+        .rfind(|row| row["family"] == copy_family.as_str())
         .expect("the copy's family row");
     assert_eq!(
         money_totals(copy_row, "removed"),
@@ -304,37 +348,122 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
         "{copy_row}"
     );
     assert_eq!(money_totals(copy_row, "new").0, 0, "{copy_row}");
-    // A matched row is a witness of its transcript unit (Sol N1): it adds
-    // no unit, so the matched units are among the counted ones.
+    assert!(on.of("grain").iter().any(|grain| {
+        grain["family"] == copy_family.as_str() && grain["category"] == "copies_removed"
+    }));
+    // A matched transcript unit keeps its own reported cost: an own-cost
+    // grain whose new side carries the row's cost_usd.
     assert!(
         money_count(&on.lines, "units_matched") >= 1,
         "{:?}",
         on.lines
     );
-    assert!(
-        money_count(&on.lines, "units_matched") + money_count(&on.lines, "units_matched_unpriced")
-            <= money_count(&on.lines, "units_counted")
-    );
+    assert!(on.of("grain").iter().any(|grain| {
+        grain["category"] == "own_cost"
+            && grain["request_usage_origin"] == "telemetry_matched"
+            && grain["new"]["cost_usd"] == "0.000100"
+    }));
+    // The proven side call keeps its own cost, once.
     assert!(
         money_count(&on.lines, "side_calls") >= 1,
         "the telemetry-only request is a side call: {:?}",
         on.lines
     );
-    // The JSONL carries hashed ids only.
-    let joined = on
-        .rows
+    let side_calls = on
+        .of("grain")
+        .into_iter()
+        .filter(|grain| grain["category"] == "side_call_added")
+        .collect::<Vec<_>>();
+    let latest = side_calls
         .iter()
-        .map(serde_json::Value::to_string)
-        .collect::<String>();
-    for raw in PIPELINE_SESSIONS
+        .map(|grain| grain["snapshot"].as_u64().unwrap())
+        .max();
+    let latest = side_calls
         .iter()
-        .chain([&MONEY_PIPELINE_COPY])
-        .copied()
-        .chain(["req_1_1", MONEY_PIPELINE_SIDE_CALL])
-    {
-        assert!(!joined.contains(raw), "raw id {raw} in the JSONL");
-    }
+        .filter(|grain| grain["snapshot"].as_u64() == latest)
+        .collect::<Vec<_>>();
+    assert_eq!(latest.len(), 1, "{side_calls:?}");
+    assert_eq!(latest[0]["request_usage_origin"], "telemetry_reported");
+    assert_eq!(latest[0]["new"]["cost_usd"], "0.000100");
+    assert_eq!(latest[0]["new"]["requests"], 1);
     assert_eq!(money::reserved_for_test(), 0, "admission is released");
+    assert_eq!(money::capture::capture_reserved(), 0, "captures are taken");
+}
+
+/// Finding 8: arming the shadow changes no live item and no live
+/// reservation. The same corpus scanned unarmed and armed yields identical
+/// items whose completed heap bound is identical (so every live reservation
+/// boundary, tight or not, admits or refuses them identically); the capture
+/// is held in its own budget outside the items and freed by the shadow.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_capture_never_enters_live_items_or_reservations() {
+    let fixture = PipelineFixture::new("money-shadow-zero-live");
+    money_write_corpus(
+        &fixture,
+        MoneyCorpus {
+            shadow: true,
+            copies_and_rows: true,
+            broken_sidecar: false,
+        },
+    );
+    let scan = |index: &mut ScanIndex| {
+        crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&fixture.root),
+            index,
+            "2026-08-02T08:00:00Z",
+            183,
+            16,
+            true,
+        )
+        .expect("scan synthetic Claude root")
+    };
+    let baseline_reserved = money::capture::capture_reserved();
+    let mut unarmed_index = ScanIndex::default();
+    let unarmed = scan(&mut unarmed_index);
+    assert_eq!(money::capture::capture_reserved(), baseline_reserved);
+    money::enable_shadow_for_test(&fixture.support);
+    let mut armed_index = ScanIndex::default();
+    let armed = scan(&mut armed_index);
+    assert!(
+        money::capture::capture_reserved() > baseline_reserved,
+        "the armed parse captured, in its own budget"
+    );
+    assert_eq!(armed.snapshots.len(), unarmed.snapshots.len());
+    for (armed, unarmed) in armed.snapshots.iter().zip(&unarmed.snapshots) {
+        assert_eq!(
+            serde_json::to_value(armed).unwrap(),
+            serde_json::to_value(unarmed).unwrap()
+        );
+        let exact = crate::heap_layout_bound::completed_bound(unarmed, usize::MAX);
+        assert_eq!(
+            crate::heap_layout_bound::completed_bound(armed, usize::MAX),
+            exact
+        );
+        if let Some(exact) = exact {
+            for limit in [exact, exact - 1] {
+                assert_eq!(
+                    crate::heap_layout_bound::completed_bound(armed, limit),
+                    crate::heap_layout_bound::completed_bound(unarmed, limit),
+                    "at the tight boundary {limit}"
+                );
+            }
+        }
+    }
+    assert_eq!(armed.census_complete, unarmed.census_complete);
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    money::shadow_page_at(
+        &fixture.support,
+        &armed.snapshots,
+        &mut armed_index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        armed.census_complete,
+        response + 3600,
+    );
+    assert_eq!(money::capture::capture_reserved(), baseline_reserved);
+    assert_eq!(money::reserved_for_test(), 0);
 }
 
 /// A sidecar that cannot be read (a directory in its place) never fails the
@@ -366,19 +495,24 @@ fn money_shadow_reader_failure_is_never_complete_and_changes_nothing() {
     );
     let copy_family = money::hashed_id_for_test(MONEY_PIPELINE_COPY);
     let copy_rows = on
-        .rows
-        .iter()
+        .of("family")
+        .into_iter()
         .filter(|row| row["family"] == copy_family.as_str())
         .collect::<Vec<_>>();
     assert!(!copy_rows.is_empty());
     assert!(copy_rows
         .iter()
         .all(|row| row["coverage_complete"] == false));
-    money_assert_conserved(&on);
+    assert!(on
+        .of("coverage")
+        .iter()
+        .all(|row| row["coverage_complete"] == false));
+    money_assert_rows_consistent(&on);
 }
 
 /// Admission refusal: with the shadow's whole memory ceiling held, every page
-/// logs one refused line, writes no family row, and changes nothing.
+/// logs one refused line, writes no family or grain row, marks the day
+/// incomplete, and changes nothing.
 #[test]
 #[serial(source_manifests)]
 #[serial(claude_request_money_shadow)]
@@ -409,15 +543,20 @@ fn money_shadow_refusal_logs_and_changes_nothing() {
         .lines
         .iter()
         .all(|line| line["counts"]["refused_budget"] == 1 && line["counts"]["families"] == 0));
-    assert!(on.rows.is_empty(), "a refused page writes no family row");
+    assert!(on.of("family").is_empty() && on.of("grain").is_empty());
+    let coverage = on.of("coverage");
+    assert!(!coverage.is_empty());
+    assert!(coverage
+        .iter()
+        .all(|row| row["coverage_complete"] == false && row["refused"] == true));
+    // The refused pages' captures were still taken and freed.
+    assert_eq!(money::capture::capture_reserved(), 0);
 }
 
-/// Immature units (younger than the maturity window) are neither counted nor
-/// removed; at a later clock the same page counts them. Both conserve.
-#[test]
-#[serial(claude_request_money_shadow)]
-fn money_shadow_holds_immature_units_until_they_mature() {
-    let fixture = PipelineFixture::new("money-shadow-immature");
+/// One armed scan of a fresh fixture, for direct `shadow_page_at` calls.
+fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots::SourceScanResult) {
+    let fixture = PipelineFixture::new(name);
+    money::enable_shadow_for_test(&fixture.support);
     let mut index = ScanIndex::default();
     let scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
@@ -429,50 +568,90 @@ fn money_shadow_holds_immature_units_until_they_mature() {
         true,
     )
     .expect("scan synthetic Claude root");
+    (fixture, index, scan)
+}
+
+/// Immature units (younger than the maturity window) are neither counted nor
+/// removed and their live slices leave the new body as `immature`; at a
+/// later clock the same corpus counts them all and equals the live body.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_holds_immature_units_until_they_mature() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let none = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    let no_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    let units = PIPELINE_SESSIONS.len() as u64;
+    let (fixture, mut index, scan) = money_armed_scan("money-shadow-immature");
     let young = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
         &mut index,
-        &report,
+        &none,
+        &no_trace,
         scan.census_complete,
         response + 30,
     );
-    let units = PIPELINE_SESSIONS.len() as u64;
     assert_eq!(young.units_immature, units, "{young:?}");
     assert_eq!(young.units_counted, 0, "{young:?}");
     assert_eq!(
         young.tokens_immature,
         units * MONEY_PIPELINE_RESPONSE_TOKENS
     );
-    assert_eq!(young.tokens_new, 0, "{young:?}");
-    assert_eq!(
-        young.tokens_old,
-        young.tokens_new + young.tokens_removed + young.tokens_held + young.tokens_immature
-    );
+    assert_eq!(young.tokens_new, young.tokens_old - young.tokens_immature, "{young:?}");
+    let (fixture, mut index, scan) = money_armed_scan("money-shadow-mature");
     let mature = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
         &mut index,
-        &report,
+        &none,
+        &no_trace,
         scan.census_complete,
         response + 3600,
     );
     assert_eq!(mature.units_immature, 0, "{mature:?}");
-    assert_eq!(
-        mature.units_counted
-            + mature.units_removed
-            + mature.units_undecided
-            + mature.units_two_owner,
-        units,
-        "{mature:?}"
-    );
-    assert_eq!(
-        mature.tokens_old,
-        mature.tokens_new + mature.tokens_removed + mature.tokens_held + mature.tokens_immature
-    );
+    assert_eq!(mature.units_counted, units, "{mature:?}");
+    assert_eq!(mature.units_undecided, 0, "{mature:?}");
+    assert_eq!(mature.tokens_new, mature.tokens_old, "{mature:?}");
+    assert_eq!(mature.families_equal, mature.families, "{mature:?}");
     assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Finding 2: the removal delta is bound to the previous complete body of
+/// the same union; with no previous body it is unavailable, never zero.
+#[test]
+#[serial(source_manifests)]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_removed_change_is_bound_to_the_previous_body() {
+    let on = money_pipeline_arm(
+        "money-shadow-removed-change",
+        MoneyCorpus {
+            shadow: true,
+            copies_and_rows: true,
+            broken_sidecar: false,
+        },
+    );
+    let copy_family = money::hashed_id_for_test(MONEY_PIPELINE_COPY);
+    let rows = on
+        .of("family")
+        .into_iter()
+        .filter(|row| row["family"] == copy_family.as_str())
+        .collect::<Vec<_>>();
+    assert!(!rows.is_empty());
+    let first = rows[0];
+    if first["coverage_complete"] == true {
+        assert!(first["removed_change"].is_null(), "{first}");
+        assert_eq!(first["removed_change_unavailable"], "no_previous_body");
+    }
+    for row in rows.iter().skip(1) {
+        if row["coverage_complete"] == true && !row["removed_change"].is_null() {
+            assert_eq!(row["removed_change_basis"], "previous_shadow", "{row}");
+            assert_eq!(row["removed_change"]["requests"], 0, "{row}");
+            assert_eq!(row["removed_change"]["tokens"], 0, "{row}");
+        }
+    }
+    assert!(money_count(&on.lines, "removed_change_available")
+        + money_count(&on.lines, "removed_change_unavailable")
+        >= rows.len() as u64);
 }
 
 /// SI parity: on a corpus with no copied request and no side call, the shadow
@@ -491,11 +670,16 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
             broken_sidecar: false,
         },
     );
-    money_assert_conserved(&plain);
-    for row in plain.rows.iter().filter(|row| row["category"] != "unbuilt") {
+    money_assert_rows_consistent(&plain);
+    for row in plain
+        .of("family")
+        .into_iter()
+        .filter(|row| row["category"] != "unbuilt")
+    {
         assert_eq!(row["category"], "equal", "{row}");
         assert_eq!(money_totals(row, "new"), money_totals(row, "old"), "{row}");
     }
+    assert!(plain.of("grain").is_empty(), "{:?}", plain.of("grain"));
     assert_eq!(money_count(&plain.lines, "side_calls"), 0);
     assert_eq!(money_count(&plain.lines, "units_removed"), 0);
 
@@ -507,12 +691,12 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
             broken_sidecar: false,
         },
     );
-    money_assert_conserved(&differing);
+    money_assert_rows_consistent(&differing);
     let copy_family = money::hashed_id_for_test(MONEY_PIPELINE_COPY);
     let side_family = money::hashed_id_for_test(PIPELINE_SESSIONS[1]);
     for row in differing
-        .rows
-        .iter()
+        .of("family")
+        .into_iter()
         .filter(|row| row["category"] != "unbuilt")
     {
         let (old, _) = money_totals(row, "old");

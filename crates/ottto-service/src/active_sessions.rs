@@ -2742,7 +2742,6 @@ mod tests {
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),
             claude_usage_occurrences: std::collections::BTreeMap::new(),
-            claude_request_residue: Vec::new(),
             cache_observations: None,
             cache_observations_state: None,
             cache_base_head_etag: None,

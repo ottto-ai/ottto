@@ -930,29 +930,6 @@ fn decode_api_sidecar(
     support_dir: &Path,
     session_id: &str,
 ) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
-    decode_api_sidecar_within(support_dir, session_id, MAX_EVIDENCE_FILE_BYTES)
-}
-
-/// One root's strict API rows, read only when the whole file is shorter than
-/// `max_bytes` and stays the same file and length through the read (the
-/// money shadow's admitted reread). None when missing, larger, changed or not
-/// fully healthy; the read never passes `max_bytes`.
-pub(crate) fn load_claude_api_rows_within(
-    support_dir: &Path,
-    session_id: &str,
-    max_bytes: u64,
-) -> Option<Vec<ClaudeLocalOtelEvidence>> {
-    let (rows, witness) = decode_api_sidecar_within(support_dir, session_id, max_bytes).ok()?;
-    (witness.generation.is_some() && witness.health.is_complete()).then_some(rows)
-}
-
-/// `decode_api_sidecar` with its read bound: a file of `limit` bytes or more
-/// is oversized and never read past `limit`.
-fn decode_api_sidecar_within(
-    support_dir: &Path,
-    session_id: &str,
-    limit: u64,
-) -> Result<(Vec<ClaudeLocalOtelEvidence>, ApiReadWitness)> {
     let path = evidence_path(support_dir, session_id);
     let mut health = ClaudeLocalOtelLoadHealth::default();
     let empty = |health| {
@@ -979,7 +956,7 @@ fn decode_api_sidecar_within(
     if !metadata.is_file() {
         anyhow::bail!("Claude effort evidence is not a regular file");
     }
-    if metadata.len() >= limit {
+    if metadata.len() >= MAX_EVIDENCE_FILE_BYTES {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1010,13 +987,13 @@ fn decode_api_sidecar_within(
     if !opened.is_file() {
         anyhow::bail!("opened Claude effort evidence is not a regular file");
     }
-    if opened.len() >= limit {
+    if opened.len() >= MAX_EVIDENCE_FILE_BYTES {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
     let before_opened = api_file_generation(&opened);
     // A concurrent writer must not defeat the existing per-file read bound.
-    let mut reader = BufReader::new((&file).take(limit));
+    let mut reader = BufReader::new((&file).take(MAX_EVIDENCE_FILE_BYTES));
     let (rows, bytes) = decode_api_rows(&mut reader, session_id, &mut health);
     #[cfg(test)]
     API_AFTER_READ.with(|hook| {
@@ -1024,7 +1001,7 @@ fn decode_api_sidecar_within(
             hook(&path);
         }
     });
-    if bytes >= limit {
+    if bytes >= MAX_EVIDENCE_FILE_BYTES {
         health.oversized_files += 1;
         return Ok(empty(health));
     }
@@ -1720,18 +1697,6 @@ fn append_evidence_bytes(
         "Claude local evidence reached its byte limit; strict proof unavailable"
     );
     Ok(())
-}
-
-/// Size of a root's API sidecar, None when it is absent or not a file. Used
-/// only to bound the P1 money shadow's reread before it reads.
-/// The API sidecar's length: None when it does not exist, `u64::MAX` when it
-/// exists but cannot be read as a regular file (never "no rows").
-pub(crate) fn claude_api_sidecar_len(support_dir: &Path, session_id: &str) -> Option<u64> {
-    match fs::symlink_metadata(evidence_path(support_dir, session_id)) {
-        Ok(metadata) if metadata.is_file() => Some(metadata.len()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        _ => Some(u64::MAX),
-    }
 }
 
 fn evidence_path(support_dir: &Path, session_id: &str) -> PathBuf {
