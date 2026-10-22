@@ -231,6 +231,17 @@ pub(crate) fn claude_reemission_list_missing() {
         &EmptyCounts {},
     );
 }
+/// Local alarm: the one-time Claude history re-read latched its stop until
+/// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
+/// hourly as a reminder. Counts and hashed root refs only; no wire event.
+pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Serialize) {
+    let stage = if reminder {
+        "claude_reemission_stop_latched_reminder"
+    } else {
+        "claude_reemission_stop_latched"
+    };
+    traversal_point(stage, "claude_code", counts);
+}
 fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,

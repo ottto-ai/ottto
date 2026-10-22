@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 768,
-  "content_sha256": "2a02eead532ce134e6318d6be4d028ec5f0306a290ab4b9119f87c0a587cfdc4",
+  "content_sha256": "e8c0be0f64be61a102b5368dfd21fc118ae42be9d3af0a435a7e9d4ac28a35ab",
   "files": [
     {
       "executable": false,
@@ -1119,8 +1119,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics.rs",
-      "sha256": "cd1f763fe399a504a851f80cf4cfc4b3c4409a4e15dde1cb214bd9af2df09648",
-      "size_bytes": 52666
+      "sha256": "501ef7a9adf65e66eb9d0967b0a5f3efae0b723dcc19425a7d953bc717007499",
+      "size_bytes": 53176
     },
     {
       "executable": false,
@@ -1434,8 +1434,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "377c46cdc75ac621eecfdeb569ec8f9e7e2e2010423ea5c85b1a1dabcea45974",
-      "size_bytes": 3114535
+      "sha256": "17d4b6e8b1f734a0fa9553f3b715c03fd2c568d7542e103e8ceece1a7a5213e5",
+      "size_bytes": 3117915
     },
     {
       "executable": false,
@@ -1490,15 +1490,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth.rs",
-      "sha256": "e81a9383f42597daec574fd22542f5fb755d887ad361e2d3e501ed22915598ed",
-      "size_bytes": 40063
+      "sha256": "1dcb6cccedc978ebcf14af3ad70da8a557d975886fb30d98c0f9e409cbe7acb0",
+      "size_bytes": 40309
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth_tests.rs",
-      "sha256": "6f6e00b8348786b986d930a4290eb5ad862de95aae7c0e689e2382e92fb6f0be",
-      "size_bytes": 82720
+      "sha256": "2aa02cdb411de0fa7a16764722dd97e9ed1d94d3c0fd0083f7ff7f83cf0058b0",
+      "size_bytes": 86235
     },
     {
       "executable": false,
@@ -3548,8 +3548,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-21-claude-context-backfill-adoption.md",
-      "sha256": "469cd55bd5c75e5d2f3a38823d34c2f221d27736cec4e01fd725bd39fa69aba3",
-      "size_bytes": 12016
+      "sha256": "f0376b0a7c01304fe622a1d5773494e076e46a4fc83d783eb95c09f9683658a9",
+      "size_bytes": 14019
     },
     {
       "executable": false,
@@ -5379,7 +5379,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T10:50:15+00:00",
+  "generated_at": "2026-10-22T12:14:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 769,
   "public_roots": [
@@ -5418,5 +5418,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3fda6c08594fbf56c10e705de9eb169e7bbb86c6"
+  "source_commit": "a6e5d5c3a40c5eff6ca7ffaadb15eb42992422d0"
 }

@@ -2121,26 +2121,38 @@ fn tail_and_full_read_select_the_same_first_request() {
     let _ = fs::remove_dir_all(dir);
 }
 
-/// #677 stop rule (SOURCE Amendment 7): while the last Claude fold withheld
-/// scalars for a resource limit, the one-time re-read takes no adoption-only
-/// file; a clean fold resumes it. Both cases: a root over the evidence bound
-/// (the merged seam) and a full remembered-veto table.
+/// #677 stop latch (SOURCE Amendments 7 and 10): the first Claude fold that
+/// withholds for a resource limit stops the one-time re-read until the daemon
+/// restarts; a later clean fold does not resume it. The evidence-bound trigger
+/// uses the merged seam; the full remembered-veto table triggers it too.
 #[test]
-fn claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit() {
+fn claude_backfill_stop_latches_until_restart() {
     let dir = temp_dir("claude-file-birth-backfill-stop");
     let now = OffsetDateTime::now_utc();
     let files = five_request_roots(&dir, now, &[ROOT, SECOND]);
     let paths = [files[0].0.as_path()];
     let rows = own_rows(&[ROOT], &[]);
+    let is_stop_alarm = |record: &serde_json::Value| {
+        record["stage"]
+            .as_str()
+            .is_some_and(|stage| stage.starts_with("claude_reemission_stop_latched"))
+    };
     let fold_pass = || {
         let mut items = vec![files[0].1.clone()];
         let mut index = indexed(&paths, true);
-        fold_with_bound(
-            &mut items,
-            &rows,
-            &mut index,
-            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
-        )
+        let (disposition, records) = crate::local_resource_diagnostics::capture(|| {
+            fold_with_bound(
+                &mut items,
+                &rows,
+                &mut index,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            )
+        });
+        let alarms = records
+            .into_iter()
+            .filter(is_stop_alarm)
+            .collect::<Vec<_>>();
+        (disposition, alarms)
     };
     let (home, transcripts, backfill) =
         claude_context_backfill_fixture("claude-file-birth-backfill-stop-history", 1);
@@ -2152,27 +2164,49 @@ fn claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit() {
         scan.scanned_file_count
     };
 
-    assert!(!fold_pass().context_file_birth.resource_withheld());
-    assert!(!claude_context_resource_withheld());
+    let (clean, alarms) = fold_pass();
+    assert!(!clean.context_file_birth.resource_withheld());
+    assert!(alarms.is_empty());
+    assert!(!claude_reemission_stop_latched());
     assert_eq!(adoption_page(), 2, "the root and its subagent adopt");
 
     // Evidence bound: the seam puts ROOT's five requests over a bound of 4.
-    let withheld = claude_context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
+    let (withheld, alarms) =
+        claude_context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
     assert_eq!(
         withheld.posture_admission(ROOT),
         Some("withheld_evidence_bound")
     );
     assert!(withheld.context_file_birth.resource_withheld());
-    assert!(claude_context_resource_withheld());
-    assert_eq!(adoption_page(), 0, "budget 0 while the last fold withheld");
+    assert!(claude_reemission_stop_latched());
+    assert_eq!(alarms.len(), 1, "one alarm when the latch sets");
+    assert_eq!(alarms[0]["stage"], "claude_reemission_stop_latched");
+    assert_eq!(alarms[0]["source"], "claude_code");
+    let counts = &alarms[0]["counts"];
+    assert_eq!(counts["withheld_evidence_bound_session_count"], 1);
+    assert_eq!(counts["remembered_veto_overflowed"], false);
+    assert_eq!(counts["withheld_folds"], 1);
+    assert_eq!(counts["over_bound_root_count"], 1);
+    let root_ref = format!("{:x}", Sha256::digest(ROOT.as_bytes()))[..16].to_string();
+    assert_eq!(counts["over_bound_root_refs"], json!([root_ref]));
+    assert!(!alarms[0].to_string().contains(ROOT), "no raw id");
+    assert_eq!(adoption_page(), 0, "budget 0 once latched");
 
-    // The next clean fold resumes adoption.
-    assert!(!fold_pass().context_file_birth.resource_withheld());
-    assert!(!claude_context_resource_withheld());
+    // A clean fold keeps the stop and does not repeat the alarm.
+    let (clean, alarms) = fold_pass();
+    assert!(!clean.context_file_birth.resource_withheld());
+    assert!(alarms.is_empty(), "no repeat within the hour");
+    assert!(claude_reemission_stop_latched());
+    assert_eq!(adoption_page(), 0, "a clean fold does not resume");
+    assert_eq!(claude_reemission_stop_withheld_folds(), 1);
+
+    // A restart is the only reset.
+    restart_claude_reemission_stop_for_test();
+    assert!(!claude_reemission_stop_latched());
     assert_eq!(adoption_page(), 2);
 
-    // A full remembered-veto table is a resource withhold too: a capacity-1
-    // table that already holds another file overflows on the next veto.
+    // A full remembered-veto table latches it too: a capacity-1 table that
+    // already holds another file overflows on the next veto.
     let item = files[0].1.clone();
     let mut memory = claude_context_file_birth::ClaudeRememberedTripwire::new(1);
     memory.remember(&files[1].1);
@@ -2198,10 +2232,58 @@ fn claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit() {
     assert_eq!(verdict, ClaudeFileBirthVerdict::Tripwire);
     assert!(counts.remembered_veto_overflowed);
     assert_eq!(counts.total.withheld_evidence_bound_session_count, 0);
-    record_claude_context_resource_withheld(&counts);
-    assert!(claude_context_resource_withheld());
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        note_claude_reemission_stop(&counts, tripwire.over_bound_roots())
+    });
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["counts"]["remembered_veto_overflowed"], true);
+    assert_eq!(alarms[0]["counts"]["over_bound_root_count"], 0);
+    assert!(claude_reemission_stop_latched());
     assert_eq!(adoption_page(), 0, "veto overflow stops adoption");
-    record_claude_context_resource_withheld(&ClaudeContextFileBirthCounts::default());
-    assert_eq!(adoption_page(), 2);
+    note_claude_reemission_stop(&ClaudeContextFileBirthCounts::default(), &BTreeSet::new());
+    assert_eq!(adoption_page(), 0);
     let _ = (fs::remove_dir_all(dir), fs::remove_dir_all(home));
+}
+
+/// While latched, the alarm repeats at most once an hour, whatever the folds.
+#[test]
+fn claude_backfill_stop_reminder_is_at_most_hourly() {
+    let withheld = ClaudeContextFileBirthCounts {
+        remembered_veto_overflowed: true,
+        ..Default::default()
+    };
+    let clean = ClaudeContextFileBirthCounts::default();
+    let roots = BTreeSet::new();
+    let start = std::time::Instant::now();
+    let stages = |counts: &ClaudeContextFileBirthCounts, minutes: u64| {
+        let ((), records) = crate::local_resource_diagnostics::capture(|| {
+            note_claude_reemission_stop_at(
+                counts,
+                &roots,
+                start + std::time::Duration::from_secs(minutes * 60),
+            )
+        });
+        records
+            .iter()
+            .map(|record| record["stage"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(stages(&clean, 0).is_empty(), "a clean fold never latches");
+    assert_eq!(stages(&withheld, 1), ["claude_reemission_stop_latched"]);
+    assert!(stages(&withheld, 2).is_empty());
+    assert!(stages(&clean, 60).is_empty(), "59 minutes since the alarm");
+    assert_eq!(
+        stages(&clean, 61),
+        ["claude_reemission_stop_latched_reminder"]
+    );
+    assert!(stages(&withheld, 90).is_empty());
+    assert_eq!(
+        stages(&clean, 121),
+        ["claude_reemission_stop_latched_reminder"]
+    );
+    assert_eq!(claude_reemission_stop_withheld_folds(), 3);
+    assert!(claude_reemission_stop_latched());
+    restart_claude_reemission_stop_for_test();
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(claude_reemission_stop_withheld_folds(), 0);
 }

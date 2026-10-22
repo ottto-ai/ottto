@@ -6145,7 +6145,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         }
     }
     claude_context_file_birth::alarm_first_resource_withhold(&context_file_birth);
-    record_claude_context_resource_withheld(&context_file_birth);
+    note_claude_reemission_stop(&context_file_birth, file_birth_tripwire.over_bound_roots());
 
     let owned_start_reparse_ids = index
         .claude_owned_start_census
@@ -19560,12 +19560,12 @@ impl OwnedSourceScan {
                         || body_witness_adoption_excluded > 0
                         || body_witness_adoption_held_no_list > 0
                         || index.claude_reemission_exclusions.pauses_adoption()
-                        || claude_context_resource_withheld())
+                        || claude_reemission_stop_latched())
                 {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -19579,11 +19579,12 @@ impl OwnedSourceScan {
                         body_witness_adoption_held_no_list,
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
                         index.claude_reemission_exclusions.state().as_str(),
-                        if claude_context_resource_withheld() {
+                        if claude_reemission_stop_latched() {
                             "evidence_bound_withheld"
                         } else {
                             "none"
-                        }
+                        },
+                        claude_reemission_stop_withheld_folds()
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -20173,14 +20174,16 @@ impl OwnedSourceScan {
             // re-emission list names is skipped the same way without using the
             // budget; an unreadable or vanished list defers every such file.
             // Before the list was ever installed, a file born before the
-            // cutoff (the index keeps no first-indexed time) is held. While
-            // the last Claude fold withheld for a resource limit, the budget
-            // is 0 (the Amendment 7 stop rule).
+            // cutoff (the index keeps no first-indexed time) is held. Once a
+            // Claude fold has withheld for a resource limit, the budget is 0
+            // until the daemon restarts (SOURCE Amendments 7 and 10).
             if decision == CandidateDecision::Parse
                 && !comparison_target
                 && parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                 && index.candidate_requires_only_body_witness_adoption(&candidate)
             {
+                let adoption_paused = index.claude_reemission_exclusions.pauses_adoption()
+                    || (source == SnapshotSource::ClaudeCode && claude_reemission_stop_latched());
                 if index.claude_reemission_excluded(&candidate) {
                     body_witness_adoption_excluded += 1;
                     decision = CandidateDecision::Skip;
@@ -20195,8 +20198,7 @@ impl OwnedSourceScan {
                 {
                     body_witness_adoption_held_no_list += 1;
                     decision = CandidateDecision::Skip;
-                } else if !index.claude_reemission_exclusions.pauses_adoption()
-                    && !(source == SnapshotSource::ClaudeCode && claude_context_resource_withheld())
+                } else if !adoption_paused
                     && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
                     && (body_witness_adoption_only_parses == 0
                         || body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes)
@@ -29702,45 +29704,143 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
     value
 }
 
-// SOURCE Amendment 7 stop rule. Every Claude fold records whether it withheld
-// context scalars for a resource limit (a family over its evidence bound, or a
-// full remembered-veto table). While the last fold did, Claude adoption takes
-// no adoption-only file (budget 0, reason `evidence_bound_withheld`); a clean
-// fold resumes it. Process-local, like the fold's alarm latch: after a restart
-// the first page runs before its fold re-arms the stop, so at most one page
-// (the file and byte caps above) is read.
-#[cfg(not(test))]
-static CLAUDE_CONTEXT_RESOURCE_WITHHELD: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+// SOURCE Amendments 7 and 10: the stop latch of the one-time Claude re-read.
+// The first Claude fold whose counts report `resource_withheld()` (a family
+// over its evidence bound, or a full remembered-veto table) latches the stop:
+// Claude adoption then takes no adoption-only file (budget 0, reason
+// `evidence_bound_withheld`) until the daemon restarts. A later clean fold
+// does not clear it; a restart is the human reset. In memory only, process-wide
+// across Claude destinations. One local alarm when it sets, at most one
+// reminder an hour while it holds.
+#[derive(Debug)]
+struct ClaudeReemissionStop {
+    latched: bool,
+    /// Folds in this process that withheld for a resource limit.
+    withheld_folds: u64,
+    last_alarm: Option<std::time::Instant>,
+}
 
-// Tests share one process, so each test thread keeps its own flag.
-#[cfg(test)]
-thread_local! {
-    static CLAUDE_CONTEXT_RESOURCE_WITHHELD: std::cell::Cell<bool> =
-        const { std::cell::Cell::new(false) };
+impl ClaudeReemissionStop {
+    const fn new() -> Self {
+        Self {
+            latched: false,
+            withheld_folds: 0,
+            last_alarm: None,
+        }
+    }
+}
+
+const CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(60 * 60);
+/// At most this many hashed root refs per alarm line; the count is exact.
+const CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS: usize = 16;
+
+#[derive(Serialize)]
+struct ClaudeReemissionStopAlarm {
+    withheld_evidence_bound_session_count: usize,
+    remembered_veto_overflowed: bool,
+    withheld_folds: u64,
+    over_bound_root_count: usize,
+    /// First 16 hex of the SHA-256 of each root id, the list's digest form.
+    over_bound_root_refs: Vec<String>,
 }
 
 #[cfg(not(test))]
-fn record_claude_context_resource_withheld(counts: &ClaudeContextFileBirthCounts) {
-    CLAUDE_CONTEXT_RESOURCE_WITHHELD.store(
-        counts.resource_withheld(),
-        std::sync::atomic::Ordering::Relaxed,
+static CLAUDE_REEMISSION_STOP: Mutex<ClaudeReemissionStop> =
+    Mutex::new(ClaudeReemissionStop::new());
+
+// Tests share one process, so each test thread keeps its own latch.
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_REEMISSION_STOP: std::cell::RefCell<ClaudeReemissionStop> =
+        const { std::cell::RefCell::new(ClaudeReemissionStop::new()) };
+}
+
+#[cfg(not(test))]
+fn with_claude_reemission_stop<T>(body: impl FnOnce(&mut ClaudeReemissionStop) -> T) -> T {
+    body(
+        &mut CLAUDE_REEMISSION_STOP
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[cfg(test)]
+fn with_claude_reemission_stop<T>(body: impl FnOnce(&mut ClaudeReemissionStop) -> T) -> T {
+    CLAUDE_REEMISSION_STOP.with(|stop| body(&mut stop.borrow_mut()))
+}
+
+/// Called after every Claude fold with that fold's counts.
+fn note_claude_reemission_stop(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+) {
+    note_claude_reemission_stop_at(counts, over_bound_roots, std::time::Instant::now());
+}
+
+fn note_claude_reemission_stop_at(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+    now: std::time::Instant,
+) {
+    let withheld = counts.resource_withheld();
+    let alarm = with_claude_reemission_stop(|stop| {
+        if withheld {
+            stop.withheld_folds = stop.withheld_folds.saturating_add(1);
+        }
+        let reminder = if stop.latched {
+            let due = match stop.last_alarm {
+                Some(last) => {
+                    now.saturating_duration_since(last) >= CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL
+                }
+                None => true,
+            };
+            if !due {
+                return None;
+            }
+            true
+        } else if withheld {
+            stop.latched = true;
+            false
+        } else {
+            return None;
+        };
+        stop.last_alarm = Some(now);
+        Some((reminder, stop.withheld_folds))
+    });
+    let Some((reminder, withheld_folds)) = alarm else {
+        return;
+    };
+    crate::local_resource_diagnostics::claude_reemission_stop_latched(
+        reminder,
+        &ClaudeReemissionStopAlarm {
+            withheld_evidence_bound_session_count: counts
+                .total
+                .withheld_evidence_bound_session_count,
+            remembered_veto_overflowed: counts.remembered_veto_overflowed,
+            withheld_folds,
+            over_bound_root_count: over_bound_roots.len(),
+            over_bound_root_refs: over_bound_roots
+                .iter()
+                .take(CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS)
+                .map(|root| format!("{:x}", Sha256::digest(root.as_bytes()))[..16].to_string())
+                .collect(),
+        },
     );
 }
 
-#[cfg(test)]
-fn record_claude_context_resource_withheld(counts: &ClaudeContextFileBirthCounts) {
-    CLAUDE_CONTEXT_RESOURCE_WITHHELD.with(|flag| flag.set(counts.resource_withheld()));
+fn claude_reemission_stop_latched() -> bool {
+    with_claude_reemission_stop(|stop| stop.latched)
 }
 
-#[cfg(not(test))]
-fn claude_context_resource_withheld() -> bool {
-    CLAUDE_CONTEXT_RESOURCE_WITHHELD.load(std::sync::atomic::Ordering::Relaxed)
+fn claude_reemission_stop_withheld_folds() -> u64 {
+    with_claude_reemission_stop(|stop| stop.withheld_folds)
 }
 
+/// Test seam: a daemon restart, the only reset of the latch.
 #[cfg(test)]
-fn claude_context_resource_withheld() -> bool {
-    CLAUDE_CONTEXT_RESOURCE_WITHHELD.with(std::cell::Cell::get)
+fn restart_claude_reemission_stop_for_test() {
+    with_claude_reemission_stop(|stop| *stop = ClaudeReemissionStop::new());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -38,16 +38,25 @@ generation, so no body identity, progress generation or census state is reset.
   counts as 0). A newer stored revision, as after a downgrade, is never
   re-read. Codex and Pi keep the exact comparison. Runtime-only flag set by
   `prepare_sync_source` for Claude; no index format change.
-- Stop rule (SOURCE Amendment 7, after #678): every Claude fold records
-  `ClaudeContextFileBirthCounts::resource_withheld()` (a family over its
-  evidence bound, or a full remembered-veto table). While the last fold's value
-  is true, Claude adoption takes no adoption-only file (budget 0, every such
-  file deferred) and the log line reports
-  `body_witness_adoption_stop=evidence_bound_withheld` (otherwise `none`). The
-  next clean fold resumes. The flag is process-local, like the fold's alarm
-  latch, and process-wide across Claude destinations: after a restart the first
-  page runs before its fold re-arms the stop, so at most one page (the file and
-  byte caps above) is read.
+- Stop latch (SOURCE Amendments 7 and 10, after #678): the first Claude fold
+  whose `ClaudeContextFileBirthCounts::resource_withheld()` is true (a family
+  over its evidence bound, or a full remembered-veto table) latches the stop.
+  From then on Claude adoption takes no adoption-only file (budget 0, every
+  such file deferred) and the log line reports
+  `body_witness_adoption_stop=evidence_bound_withheld` (otherwise `none`) and
+  `body_witness_adoption_stop_withheld_folds=<n>` (folds in this process that
+  withheld for a resource limit). A later clean fold does NOT clear it; only a
+  daemon restart does (the human reset). The latch is in memory only and
+  process-wide across Claude destinations; it is not persisted, so after a
+  restart the first page runs before its fold can latch again (at most one
+  page, under the file and byte caps above).
+- Local alarm: one `ottto-service: local_resources` record with stage
+  `claude_reemission_stop_latched` when the latch sets, and at most one
+  `claude_reemission_stop_latched_reminder` an hour while it holds. Counts
+  only: the evidence-bound withheld count, the veto-overflow flag, the
+  withheld-fold counter, the over-bound root count and at most 16 hashed root
+  refs (first 16 hex of the SHA-256 of the root id, the list's digest form).
+  No id, path or content; nothing new on the wire.
 
 Authority-quarantined Claude families are unaffected: the quarantine gate runs
 before the adoption gate, so a held family keeps its own bounded retry and is
@@ -156,6 +165,25 @@ the server are unchanged.
   marker plus pacing and the exclusion list for files discovered as new; that
   is a separate decision. A listed file that ages out of the window before its
   line is removed is also not re-read.
+- Atomic install: the list must be installed whole (write a temporary file,
+  then rename). A short but well-formed list, such as a partly written one that
+  ends on a line boundary, cannot be detected and is used as written.
+- The `.seen` marker is written without fsync of the file or its directory. A
+  marker lost to a crash is written again on the next read while the list file
+  is present; if the list file is also gone, the state falls back to
+  `not_installed`, which holds old history (the safe direction).
+- An index rebuild or a re-pair re-reads files through the ordinary `NewFile`
+  path, which this list does not gate (pre-existing behaviour). The runbook
+  treats an index rebuild or re-pair during the backfill as a stop signal.
+
+## Manual brakes (runbook)
+
+The latch does not replace the runbook's brakes:
+- `chmod 000` on the list file: the list becomes unreadable and adoption
+  pauses (`body_witness_adoption_list=unreadable`).
+- `launchctl bootout` of the daemon: full stop. Only with owner B's go. A
+  restart also clears the stop latch, so restart only after the cause of a
+  `claude_reemission_stop_latched` alarm has been looked at.
 
 ## Tests (CI)
 
@@ -183,6 +211,9 @@ the server are unchanged.
   its bound, stack digests match the full-id digest)
 - `claude_context_backfill_compares_revisions_monotonically` (stored 3 with
   active 2 is not re-read; stored 1 with active 2 is re-read once)
-- `claude_context_file_birth_tests::claude_backfill_stops_while_the_last_fold_withheld_for_a_resource_limit`
-  (evidence bound through `with_claude_evidence_bound_for_test`, and a full
-  remembered-veto table, each stop adoption; a clean fold resumes it)
+- `claude_context_file_birth_tests::claude_backfill_stop_latches_until_restart`
+  (evidence bound through `with_claude_evidence_bound_for_test` latches the
+  stop with one alarm carrying the hashed root ref; a following clean fold
+  keeps budget 0 and repeats no alarm; a simulated restart clears it; a full
+  remembered-veto table latches it too)
+- `claude_context_file_birth_tests::claude_backfill_stop_reminder_is_at_most_hourly`
