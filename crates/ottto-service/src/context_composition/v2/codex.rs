@@ -94,14 +94,22 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
                 CopiedMode::UntilTrigger
             };
         return HeadIdentity {
-            session,
+            session: crate::snapshots::snapshot_source_session_id(
+                crate::snapshots::SnapshotSource::Codex,
+                path,
+                session,
+            ),
             copied,
             agent_author: is_subagent || thread_source == Some("agent_created_thread"),
             cwd: meta.cwd.str().map(Cow::into_owned),
         };
     }
     HeadIdentity {
-        session: basename_stem(path),
+        session: crate::snapshots::snapshot_source_session_id(
+            crate::snapshots::SnapshotSource::Codex,
+            path,
+            basename_stem(path),
+        ),
         copied: CopiedMode::Own,
         agent_author: false,
         cwd: None,

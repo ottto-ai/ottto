@@ -8844,7 +8844,7 @@ fn snapshot_destination_scoped_index_path(
         .join(file_name)
 }
 
-fn snapshot_upload_destination_namespace(
+pub(crate) fn snapshot_upload_destination_namespace(
     device: &LocalDeviceBinding,
     device_secret: &str,
 ) -> String {

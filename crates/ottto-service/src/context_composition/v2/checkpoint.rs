@@ -264,7 +264,8 @@ pub(super) struct Index {
     pub(super) schema: u32,
     /// When this agent's state started (the install run), unix seconds.
     pub(super) created: i64,
-    /// Start of the previous run, unix seconds: files born later are new.
+    /// Saved discovery boundary, unix seconds: files born later are new.
+    /// Held at the earliest deferred opening birth until that file is read.
     pub(super) last_scan_started: Option<i64>,
     pub(super) files: BTreeMap<String, Pin>,
     /// Folder -> scope id: folders resolved by a read, and the linked
@@ -532,6 +533,9 @@ pub(super) struct ParseState {
     /// The first model response closed request 1. Old checkpoints infer this
     /// from their saved response/call state instead of re-reading history.
     pub(super) request1_closed: bool,
+    /// Latest final snapshot verdict, refreshed without reading transcripts.
+    pub(super) start_measured: bool,
+    pub(super) compactions: crate::snapshots::CompositionCompactions,
     pub(super) cwd: Option<Box<str>>,
 }
 
@@ -585,7 +589,7 @@ impl ParseState {
     }
 
     pub(super) fn accounted_bytes(&self) -> usize {
-        64 + self.open.len() * 48 + self.open_calls.len() * 160
+        64 + self.open.len() * 48 + self.open_calls.len() * 160 + self.compactions.accounted_bytes()
     }
 }
 
@@ -629,6 +633,8 @@ pub(super) struct StoredParse {
     min_ts: Option<i64>,
     has_rendered: bool,
     request1_closed: bool,
+    #[serde(skip_serializing_if = "crate::snapshots::CompositionCompactions::is_empty")]
+    compactions: crate::snapshots::CompositionCompactions,
     cwd: Option<String>,
 }
 
@@ -661,7 +667,8 @@ impl StoredParse {
 
     /// Bytes held in memory, approximately.
     pub(super) fn accounted_bytes(&self) -> usize {
-        160 + self.session.len()
+        160 + self.compactions.accounted_bytes()
+            + self.session.len()
             + self.cwd.as_ref().map_or(0, String::len)
             + self.open.len() * 40
             + self
@@ -750,6 +757,7 @@ impl StoredParse {
             min_ts: state.min_ts,
             has_rendered: state.has_rendered,
             request1_closed: state.request1_closed,
+            compactions: state.compactions.clone(),
             cwd: state.cwd.as_deref().map(str::to_string),
         }
     }
@@ -819,6 +827,8 @@ impl StoredParse {
             min_ts: self.min_ts,
             has_rendered: self.has_rendered,
             request1_closed,
+            start_measured: false,
+            compactions: self.compactions,
             cwd: self.cwd.map(Into::into),
         })
     }
