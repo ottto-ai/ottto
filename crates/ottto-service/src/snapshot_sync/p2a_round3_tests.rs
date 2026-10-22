@@ -696,6 +696,65 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
             } else {
                 saved.insert_retry_pending_claude_authority_for_test(IDENTITY_PIPELINE_ROOT);
             }
+            // A distinct persisted upload-v1 record must survive alongside
+            // the family authority record, even when the page is quiet.
+            let protected_fp = saved
+                .current_snapshot_fingerprints()
+                .into_iter()
+                .next()
+                .unwrap();
+            let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+            let progress_path = snapshot_upload_progress_path(&control.index_path);
+            let mut progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &namespace,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            let offers = control.offers();
+            let offered = offers
+                .iter()
+                .rev()
+                .find(|item| item["snapshot_fingerprint"] == protected_fp)
+                .unwrap();
+            // The file checkpoint has a SET witness, whereas upload custody
+            // binds the exact entity body. Hash only the wire evidence leaves.
+            assert!(offered.get("context_curve").is_none());
+            assert!(offered.get("cache_observations").is_none());
+            let payload = [
+                "session_account_evidence",
+                "tool_usage",
+                "tool_usage_truncated",
+            ]
+            .into_iter()
+            .filter_map(|key| {
+                offered
+                    .get(key)
+                    .map(|value| (key.to_owned(), value.clone()))
+            })
+            .collect::<serde_json::Map<_, _>>();
+            let witness = format!(
+                "{:x}",
+                Sha256::digest(
+                    crate::canonical_json::canonicalize(&serde_json::Value::Object(payload))
+                        .unwrap()
+                )
+            );
+            progress.quarantine_retryable_body(&protected_fp, &witness);
+            let record = progress
+                .quarantined_fingerprints
+                .get_mut(&protected_fp)
+                .unwrap();
+            record.retry_after_unix_seconds = current_unix_seconds() + 86400;
+            if terminal {
+                record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+            }
+            assert!(
+                record.hold.is_none(),
+                "this is v1 custody, not a money server hold"
+            );
+            progress.save(&progress_path).unwrap();
+            saved.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
             saved.save(&control.index_path).unwrap();
             let _live = live.then(|| money::LiveForTest::new(&control.support));
             control.restart();
@@ -713,6 +772,18 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                     .is_some(),
                 "v1 quarantine stays retained"
             );
+            let retained = SnapshotUploadProgress::load(
+                &progress_path,
+                &namespace,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            assert!(retained
+                .quarantined_fingerprints
+                .contains_key(&protected_fp));
+            assert!(saved
+                .quarantined_snapshot_fingerprints
+                .contains_key(&protected_fp));
             let statuses = control.server.terminal.lock().unwrap();
             let status = statuses.last().unwrap();
             if terminal {
@@ -734,6 +805,66 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 "ownership":status["last_ownership_incomplete_file_count"],
                 "terminal_ownership":status["last_terminal_ownership_incomplete_file_count"],
                 "settled":status["last_census_residue_settled"]}));
+            drop(statuses);
+            if live {
+                let sibling = "8e64da31-2912-4136-b77a-209b87f7ed25";
+                let text = std::fs::read_to_string(control.transcript())
+                    .unwrap()
+                    .replace(IDENTITY_PIPELINE_ROOT, sibling)
+                    .replace("req_1", "req_sibling_1")
+                    .replace("req_2", "req_sibling_2");
+                std::fs::write(
+                    control
+                        .transcript()
+                        .with_file_name(format!("{sibling}.jsonl")),
+                    text,
+                )
+                .unwrap();
+                let before = control.offers().len();
+                let (parsed, _) = control.cycle();
+                assert!(parsed > 0, "unprotected sibling must actually parse");
+                let offers = control.offers();
+                let new = &offers[before..];
+                assert!(
+                    new.iter().any(|item| item["source_session_id"] == sibling
+                        && item["usage_accounting_contract"] == money::REQUEST_OWNED_CONTRACT),
+                    "unprotected sibling must POST its literal: {new:?}"
+                );
+                assert!(new
+                    .iter()
+                    .all(|item| item["source_session_id"] != IDENTITY_PIPELINE_ROOT));
+                let saved = control.saved();
+                assert!(saved
+                    .claude_authority_record_for_test(IDENTITY_PIPELINE_ROOT)
+                    .is_some());
+                assert!(saved
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(&protected_fp));
+                let retained = SnapshotUploadProgress::load(
+                    &progress_path,
+                    &namespace,
+                    snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                )
+                .unwrap();
+                assert!(retained
+                    .quarantined_fingerprints
+                    .contains_key(&protected_fp));
+                let statuses = control.server.terminal.lock().unwrap();
+                let status = statuses.last().unwrap();
+                if terminal {
+                    assert!(
+                        status["last_snapshot_unproven_terminal_count"]
+                            .as_u64()
+                            .unwrap()
+                            > 0
+                    );
+                } else {
+                    assert_eq!(
+                        status["last_census_complete"], false,
+                        "sibling cannot erase protected veto"
+                    );
+                }
+            }
         }
         assert_eq!(
             receipts[0], receipts[1],

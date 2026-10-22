@@ -4384,6 +4384,178 @@ fn stage_money_watch(
     true
 }
 
+const SYNTHETIC_COLLECTOR: &str = "claude_api_synthetic";
+fn synthetic(item: &SnapshotItem) -> bool {
+    item.provenance.collector == SYNTHETIC_COLLECTOR
+}
+
+/// Bounded telemetry-only carriers share the literal builder and normal ACK
+/// ledger. Ever-indexed roots live in the separately admitted tolerant ledger;
+/// deleted transcripts must never turn into telemetry-only replacements.
+pub(crate) fn append_synthetic_sessions(
+    support: &Path,
+    scan: &mut super::SourceScanResult,
+    index: &ScanIndex,
+) -> Option<ShadowReservation> {
+    if !request_owned_live(support) || !scan.census_complete {
+        return None;
+    }
+    let funds = ShadowReservation::admit(64 * 8192 + index.files.len().saturating_mul(256))?;
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support) else {
+        return None;
+    };
+    apply_results(
+        support,
+        &mut ledger,
+        &mut ClaudeRequestMoneyShadowCounts::default(),
+    );
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Some((root, _)) = logical_family_member(index, key) {
+            let key = store::money_key("ever:", &root);
+            if ledger.get(&key).is_none()
+                && !ledger.put_money(key, ClaudeRequestCensusRecord::money_debt([0; 32], 0))
+            {
+                return None;
+            }
+        }
+    }
+    if !store::checkpoint(support, &mut ledger) || ledger.load_damaged {
+        return None;
+    }
+    let mut roots = Vec::new();
+    for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        if Instant::now() >= deadline {
+            return None;
+        }
+        let Some(header) = record
+            .facts()
+            .and_then(facts::ClaudeFacts::open)
+            .map(|facts| facts.header)
+        else {
+            continue;
+        };
+        let root = header.session;
+        if root.is_empty()
+            || root.len() > 128
+            || ledger.get(&store::money_key("ever:", &root)).is_some()
+            || index.claude_reemission_exclusions.protected_root(&root)
+            || scan
+                .snapshots
+                .iter()
+                .any(|item| claude_snapshot_family_root_ref(item) == root)
+        {
+            continue;
+        }
+        if key.as_str() > ledger.synthetic_cursor.as_str() {
+            roots.push((key.clone(), root));
+        }
+        if roots.len() == 64 {
+            break;
+        }
+    }
+    if let Some((key, _)) = roots.last() {
+        ledger.synthetic_cursor = key.clone();
+    } else {
+        ledger.synthetic_cursor.clear();
+    }
+    for (_, root) in roots {
+        scan.snapshots
+            .push(synthetic_carrier(&root, &scan.census_window_end));
+    }
+    Some(funds)
+}
+
+fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
+    SnapshotItem {
+        request_evidence: Vec::new(),
+        request_identity_refusals: 0,
+        claude_org_markers: None,
+        claude_account_withheld_reason: None,
+        source_session_id: root.to_owned(),
+        snapshot_fingerprint: String::new(),
+        status: "final".to_string(),
+        input_tokens: 0,
+        output_tokens: 0,
+        cache_read_tokens: 0,
+        cache_creation_5m_tokens: 0,
+        cache_creation_1h_tokens: 0,
+        reasoning_output_tokens: 0,
+        unattributed_total_tokens: 0,
+        request_count: 0,
+        removed_request_count: None,
+        removed_usage: None,
+        telemetry_owned_complete: None,
+        usage_accounting_contract: None,
+        session_account_evidence: None,
+        claude_usage_request_ids: BTreeSet::new(),
+        claude_usage_occurrences: BTreeMap::new(),
+        cache_observations: None,
+        cache_observations_state: None,
+        cache_base_head_etag: None,
+        cache_requests: Vec::new(),
+        cache_requests_complete: true,
+        avg_duration_ms: None,
+        avg_time_to_first_token_ms: None,
+        max_duration_ms: None,
+        max_time_to_first_token_ms: None,
+        peak_context_fill_tokens: None,
+        first_turn_context_tokens: None,
+        last_turn_context_tokens: None,
+        compaction_count: None,
+        compaction_timestamps: Vec::new(),
+        compaction_events: Vec::new(),
+        local_context_points: Vec::new(),
+        compaction_total_pre_tokens: None,
+        compaction_total_post_tokens: None,
+        compaction_total_cumulative_dropped_tokens: None,
+        compaction_total_duration_ms: None,
+        context_curve: None,
+        claude_context_curve_boundaries: Vec::new(),
+        claude_context_curve_identity_complete: false,
+        claude_context_curve_request_index_complete: false,
+        claude_context_curve_owned_start_proven: false,
+        claude_file_birth: Default::default(),
+        activity_summary: None,
+        tool_usage: None,
+        tool_usage_truncated: false,
+        session_start: None,
+        model_usage: Vec::new(),
+        usage_buckets: Vec::new(),
+        cost: None,
+        session_display_name: None,
+        session_display_name_source: None,
+        source_started_at: None,
+        source_ended_at: None,
+        source_last_activity_at: None,
+        collected_at: collected_at.to_owned(),
+        workspace_hash: None,
+        workspace_display_label: None,
+        workspace_label_source: None,
+        repository_hash: None,
+        repository_label: None,
+        repository_label_source: None,
+        repository_identity_source: None,
+        workspace_kind: None,
+        source_file_fingerprint: None,
+        session_artifacts: Vec::new(),
+        provenance: SnapshotProvenance {
+            collector: "claude_api_synthetic".to_string(),
+            source_file_count: 0,
+            input_token_scope: None,
+            state_total_tokens: None,
+            state_archived: None,
+        },
+        // Telemetry carries no transcript launcher provenance.
+        origin: None,
+        originator: None,
+        attribution_facts: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod scheduling_reconciliation_tests {
     use super::super::claude_request_census::ClaudeTelemetryTailState;
@@ -4641,174 +4813,59 @@ mod scheduling_reconciliation_tests {
             0
         );
     }
-}
 
-const SYNTHETIC_COLLECTOR: &str = "claude_api_synthetic";
-fn synthetic(item: &SnapshotItem) -> bool {
-    item.provenance.collector == SYNTHETIC_COLLECTOR
-}
-
-/// Bounded telemetry-only carriers share the literal builder and normal ACK
-/// ledger. Ever-indexed roots live in the separately admitted tolerant ledger;
-/// deleted transcripts must never turn into telemetry-only replacements.
-pub(crate) fn append_synthetic_sessions(
-    support: &Path,
-    scan: &mut super::SourceScanResult,
-    index: &ScanIndex,
-) -> Option<ShadowReservation> {
-    if !request_owned_live(support) || !scan.census_complete {
-        return None;
-    }
-    let funds = ShadowReservation::admit(64 * 8192 + index.files.len().saturating_mul(256))?;
-    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support) else {
-        return None;
-    };
-    apply_results(
-        support,
-        &mut ledger,
-        &mut ClaudeRequestMoneyShadowCounts::default(),
-    );
-    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
-    for key in index.files.keys() {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        if let Some((root, _)) = logical_family_member(index, key) {
-            let key = store::money_key("ever:", &root);
-            if ledger.get(&key).is_none()
-                && !ledger.put_money(key, ClaudeRequestCensusRecord::money_debt([0; 32], 0))
-            {
-                return None;
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn offer_ceiling_refuses_new_body_and_preserves_owed_debt() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-offer-ceiling");
+        let _live = LiveForTest::new(&scratch);
+        store::reload_for_test(&scratch).unwrap();
+        let mut index = ScanIndex::default();
+        let key = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.source_file_fingerprint = Some("01".repeat(32));
+        item.snapshot_fingerprint = "03".repeat(32);
+        item.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+        index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({
+            "size_bytes":1, "modified_unix_seconds":1,
+            "source_file_fingerprint":item.source_file_fingerprint, "last_snapshot_fingerprint":null
+        })).unwrap());
+        let dirty = store::money_key("dirty:", &key);
+        let offer_prefix = format!("{}:", store::money_key("offer:", &key));
+        store::with_ledger_for_test(&scratch, |ledger| {
+            ledger.insert(
+                dirty.clone(),
+                ClaudeRequestCensusRecord::money_debt([9; 32], 0),
+            );
+            for n in 0..MAX_MONEY_OFFERS_PER_FILE {
+                ledger.insert(
+                    format!("{offer_prefix}{n:064x}"),
+                    ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+                );
             }
-        }
-    }
-    if !store::checkpoint(support, &mut ledger) || ledger.load_damaged {
-        return None;
-    }
-    let mut roots = Vec::new();
-    for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
-        if Instant::now() >= deadline {
-            return None;
-        }
-        let Some(header) = record
-            .facts()
-            .and_then(facts::ClaudeFacts::open)
-            .map(|facts| facts.header)
-        else {
-            continue;
-        };
-        let root = header.session;
-        if root.is_empty()
-            || root.len() > 128
-            || ledger.get(&store::money_key("ever:", &root)).is_some()
-            || index.claude_reemission_exclusions.protected_root(&root)
-            || scan
-                .snapshots
-                .iter()
-                .any(|item| claude_snapshot_family_root_ref(item) == root)
-        {
-            continue;
-        }
-        if key.as_str() > ledger.synthetic_cursor.as_str() {
-            roots.push((key.clone(), root));
-        }
-        if roots.len() == 64 {
-            break;
-        }
-    }
-    if let Some((key, _)) = roots.last() {
-        ledger.synthetic_cursor = key.clone();
-    } else {
-        ledger.synthetic_cursor.clear();
-    }
-    for (_, root) in roots {
-        scan.snapshots
-            .push(synthetic_carrier(&root, &scan.census_window_end));
-    }
-    Some(funds)
-}
-
-fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
-    SnapshotItem {
-        request_evidence: Vec::new(),
-        request_identity_refusals: 0,
-        claude_org_markers: None,
-        claude_account_withheld_reason: None,
-        source_session_id: root.to_owned(),
-        snapshot_fingerprint: String::new(),
-        status: "final".to_string(),
-        input_tokens: 0,
-        output_tokens: 0,
-        cache_read_tokens: 0,
-        cache_creation_5m_tokens: 0,
-        cache_creation_1h_tokens: 0,
-        reasoning_output_tokens: 0,
-        unattributed_total_tokens: 0,
-        request_count: 0,
-        removed_request_count: None,
-        removed_usage: None,
-        telemetry_owned_complete: None,
-        usage_accounting_contract: None,
-        session_account_evidence: None,
-        claude_usage_request_ids: BTreeSet::new(),
-        claude_usage_occurrences: BTreeMap::new(),
-        cache_observations: None,
-        cache_observations_state: None,
-        cache_base_head_etag: None,
-        cache_requests: Vec::new(),
-        cache_requests_complete: true,
-        avg_duration_ms: None,
-        avg_time_to_first_token_ms: None,
-        max_duration_ms: None,
-        max_time_to_first_token_ms: None,
-        peak_context_fill_tokens: None,
-        first_turn_context_tokens: None,
-        last_turn_context_tokens: None,
-        compaction_count: None,
-        compaction_timestamps: Vec::new(),
-        compaction_total_pre_tokens: None,
-        compaction_total_post_tokens: None,
-        compaction_total_cumulative_dropped_tokens: None,
-        compaction_total_duration_ms: None,
-        context_curve: None,
-        claude_context_curve_boundaries: Vec::new(),
-        claude_context_curve_identity_complete: false,
-        claude_context_curve_request_index_complete: false,
-        claude_context_curve_owned_start_proven: false,
-        claude_file_birth: Default::default(),
-        activity_summary: None,
-        tool_usage: None,
-        tool_usage_truncated: false,
-        session_start: None,
-        model_usage: Vec::new(),
-        usage_buckets: Vec::new(),
-        cost: None,
-        session_display_name: None,
-        session_display_name_source: None,
-        source_started_at: None,
-        source_ended_at: None,
-        source_last_activity_at: None,
-        collected_at: collected_at.to_owned(),
-        workspace_hash: None,
-        workspace_display_label: None,
-        workspace_label_source: None,
-        repository_hash: None,
-        repository_label: None,
-        repository_label_source: None,
-        repository_identity_source: None,
-        workspace_kind: None,
-        source_file_fingerprint: None,
-        session_artifacts: Vec::new(),
-        provenance: SnapshotProvenance {
-            collector: "claude_api_synthetic".to_string(),
-            source_file_count: 0,
-            input_token_scope: None,
-            state_total_tokens: None,
-            state_archived: None,
-        },
-        // Telemetry carries no transcript launcher provenance.
-        origin: None,
-        originator: None,
-        attribution_facts: Vec::new(),
+            assert!(store::checkpoint_for_test(&scratch, ledger));
+        })
+        .unwrap();
+        assert!(!prepare_money_offers(
+            &scratch,
+            &index,
+            &[item],
+            &BTreeSet::new()
+        ));
+        store::with_ledger_for_test(&scratch, |ledger| {
+            assert_eq!(ledger.get(&dirty).unwrap().money_revision(), [9; 32]);
+            assert_eq!(
+                ledger.census().records_with_prefix(&offer_prefix).count(),
+                MAX_MONEY_OFFERS_PER_FILE
+            );
+            assert!(store::checkpoint_for_test(&scratch, ledger));
+        })
+        .unwrap();
+        let reloaded = store::load_for_test(&scratch);
+        assert_eq!(reloaded.get(&dirty).unwrap().money_revision(), [9; 32]);
+        assert_eq!(
+            reloaded.census().records_with_prefix(&offer_prefix).count(),
+            MAX_MONEY_OFFERS_PER_FILE
+        );
     }
 }
