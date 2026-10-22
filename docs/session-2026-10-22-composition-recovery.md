@@ -7,8 +7,10 @@ restart never substitutes a newer cutoff for files still waiting to be read.
 Scope commits retain the previous manifest, totals, and checkpoint shards until
 a replacement is verified. Unusable state falls back to that generation and
 charges only its missing delta to the repair allowance. Without usable prior
-state, the scope or damaged shard's files are quarantined and counted. No scope
-is rebuilt from transcripts. Sibling checkpoints keep their identities and open
+state, the scope or damaged shard's files are quarantined and counted. Scope
+quarantine is marked durably before moving state aside, independently of the
+index. Orphaned generation files establish that a missing manifest belongs to
+an existing scope. No scope is rebuilt from transcripts. Sibling checkpoints keep their identities and open
 residency. Unknown kind or part identifiers in any checkpoint field restart only
 that checkpoint at its end, preserving its aggregated history.
 

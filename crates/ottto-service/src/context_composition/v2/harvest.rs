@@ -1418,6 +1418,14 @@ fn process_scope(
     names: &mut GitRootCache,
     stats: &mut SourceStats,
 ) -> Option<Scope> {
+    if scope_quarantine_marker(&run.state_dir, source, scope_id).is_file()
+        && index
+            .quarantined_scopes
+            .insert(scope_id.to_string(), window.today)
+            .is_none()
+    {
+        stats.scopes_quarantined += 1;
+    }
     if index.quarantined_scopes.contains_key(scope_id) {
         // Set aside: never read, rebuilt or uploaded again.
         return None;
@@ -1434,7 +1442,9 @@ fn process_scope(
             identity: Default::default(),
             common_dir: None,
         });
-    let known = index.scope_generations.contains_key(scope_id) || prev_path(&path).is_file();
+    let known = index.scope_generations.contains_key(scope_id)
+        || prev_path(&path).is_file()
+        || highest_generation(&path) > 0;
     let loaded = match load_scope(&path, source, scope_id) {
         // A scope the pins know but whose state is gone is bad state too.
         Ok(None) if known => Err(()),
@@ -1920,12 +1930,24 @@ fn quarantine_scope(
         scope_file_stem(source, scope_id),
         run.now.unix_timestamp()
     );
-    if set_aside(&run.state_dir, &label, &scope_files(path)).is_err() {
+    // Persist the stop decision independently of the index, before moving
+    // the last state artifacts out of the scope directory.
+    let marked = write_json(
+        &scope_quarantine_marker(&run.state_dir, source, scope_id),
+        &today,
+    );
+    if marked.is_err() || set_aside(&run.state_dir, &label, &scope_files(path)).is_err() {
         stats.scopes_failed += 1;
     }
     index.quarantined_scopes.insert(scope_id.to_string(), today);
     index.scope_generations.remove(scope_id);
     stats.scopes_quarantined += 1;
+}
+
+fn scope_quarantine_marker(state_dir: &Path, source: Source, scope_id: &str) -> PathBuf {
+    state_dir
+        .join("quarantined-scopes")
+        .join(format!("{}.json", scope_file_stem(source, scope_id)))
 }
 
 enum Outcome {
@@ -2211,7 +2233,11 @@ fn upload_other_scopes(
     stats: &mut SourceStats,
 ) {
     for (scope_id, generation) in &index.scope_generations {
-        if done.contains(scope_id) || scope_retired(index, scope_id, window.today) {
+        if done.contains(scope_id)
+            || scope_retired(index, scope_id, window.today)
+            || index.quarantined_scopes.contains_key(scope_id)
+            || scope_quarantine_marker(&run.state_dir, source, scope_id).is_file()
+        {
             continue;
         }
         let ack_path = super::upload::ack_path(&run.state_dir, source, scope_id);

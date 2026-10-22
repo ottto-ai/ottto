@@ -4511,3 +4511,104 @@ fn lost_index_with_bad_current_state_charges_recovered_tails_to_repair() {
     assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
     env.cleanup();
 }
+
+#[test]
+fn missing_manifest_and_index_never_turn_orphaned_state_into_a_fresh_scope() {
+    let env = Env::new("composition-v2-orphaned-scope");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&cwd, now.date(), 1));
+    harvest::tests::set_crash_after(Some(1));
+    env.run(Source::Claude, now, None);
+    harvest::tests::set_crash_after(None);
+    assert!(!harvest::index_path(&env.state, Source::Claude).exists());
+    fs::remove_file(manifest_of(&env, &cwd)).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(
+        (
+            stats.scopes_quarantined,
+            stats.files_read,
+            stats.bytes_new,
+            stats.bytes_repair
+        ),
+        (1, 0, 0, 0)
+    );
+    assert!(super::scope::scope_files(&manifest_of(&env, &cwd)).is_empty());
+
+    // Losing the index again must not erase the committed quarantine.
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    append_records(&path, &claude_turn(&cwd, now.date(), 2));
+    let mut capture = Capture::default();
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(2),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (stats.files_read, stats.bytes_new, stats.bytes_repair),
+        (0, 0, 0)
+    );
+    assert!(capture.payloads.is_empty());
+    // Initial rediscovery starts the old file dormant; its next append
+    // resolves the scope and must still honor the independent marker.
+    append_records(&path, &claude_turn(&cwd, now.date(), 3));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(3),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (stats.files_read, stats.bytes_new, stats.bytes_repair),
+        (0, 0, 0)
+    );
+    assert!(capture.payloads.is_empty());
+    assert!(read_index(&env.state, Source::Claude)
+        .quarantined_scopes
+        .contains_key(&sha256_hex(&[cwd.as_str()])));
+    env.cleanup();
+}
+
+#[test]
+fn durable_scope_quarantine_stops_uploads_before_state_is_moved() {
+    let env = Env::new("composition-v2-quarantine-before-move");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&cwd, now.date(), 1));
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    assert_eq!(capture.payloads.len(), 1);
+    // Emulate a crash after the stop marker is synced but before the
+    // manifest and shards are moved, with the old index still on disk.
+    let marker = env.state.join("quarantined-scopes").join(format!(
+        "{}-{}.json",
+        Source::Claude.label(),
+        sha256_hex(&[cwd.as_str()])
+    ));
+    super::checkpoint::write_json(&marker, &day_of(now.date())).unwrap();
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(8),
+        Some(&mut capture),
+    );
+    assert_eq!((stats.uploaded, stats.files_read), (0, 0));
+    assert_eq!(capture.payloads.len(), 1);
+    append_records(&path, &claude_turn(&cwd, now.date(), 2));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(9),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (
+            stats.uploaded,
+            stats.files_read,
+            stats.bytes_new,
+            stats.bytes_repair
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(capture.payloads.len(), 1);
+    env.cleanup();
+}
