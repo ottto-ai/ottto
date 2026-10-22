@@ -112,6 +112,10 @@ impl PaidReservation {
     pub(crate) fn recovery_bytes_for_test(&self) -> usize {
         self.recovery
     }
+    #[cfg(test)]
+    pub(crate) fn remaining_for_test(&self) -> Option<usize> {
+        self.remaining
+    }
     pub(crate) fn retire_speculation(&mut self) {
         // Call only after speculative temporaries are gone and actual owned
         // storage was reconciled. Never release protected recovery capacity.
