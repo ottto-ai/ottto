@@ -11,7 +11,7 @@
 //!   browser by server name, never by tool name (browser servers have a tool
 //!   called `computer`).
 
-use super::shell::{classify_shell, join_to, ShellClass, ShellSegment};
+use super::shell::{classify_shell, is_script_flag, join_to, ShellClass, ShellSegment, SHELLS};
 use super::{
     is_memory_path, Author, CallClass, CallShare, ContentLabel, InnerItem, Kind, LineCtx, Part,
     Request1, SkipReason, ToolKey, Verdict,
@@ -515,16 +515,22 @@ fn codex_shell_call(input: &str, cwd: Option<&Path>) -> Vec<CallShare> {
     shell_shares(&classify_shell(&command, workdir.or(cwd)))
 }
 
-/// `["bash", "-lc", "script"]` -> `script`; any other array becomes one
-/// command whose words are quoted, so an argument keeps its boundaries
-/// (`["cat", "my notes.md"]`) and never reads as shell syntax.
+/// `["bash", "-lc", "script", ...]` -> `script` (a shell executable and its
+/// script flag); any other array becomes one command whose words are quoted,
+/// so an argument keeps its boundaries (`["cat", "my notes.md"]`) and never
+/// reads as shell syntax (`["python", "-c", "..."]` is not a shell script).
 pub(super) fn command_words_script(words: &[Value]) -> String {
     let words: Vec<&str> = words.iter().filter_map(Value::as_str).collect();
-    match words.as_slice() {
-        [.., flag, script] if flag.starts_with('-') && flag.ends_with('c') && words.len() >= 3 => {
-            (*script).to_string()
-        }
-        words => words
+    let shell = words
+        .first()
+        .is_some_and(|program| SHELLS.contains(&program.rsplit('/').next().unwrap_or(program)));
+    let script = shell
+        .then(|| words.iter().position(|word| is_script_flag(word)))
+        .flatten()
+        .and_then(|flag| words.get(flag + 1));
+    match script {
+        Some(script) => (*script).to_string(),
+        None => words
             .iter()
             .map(|word| shell_quote(word))
             .collect::<Vec<_>>()

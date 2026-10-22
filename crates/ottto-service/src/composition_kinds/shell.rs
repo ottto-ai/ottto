@@ -33,6 +33,14 @@ pub(crate) fn shell_path_tokens(command: &str) -> impl Iterator<Item = &str> {
         .take(MAX_SHELL_PATH_TOKENS)
 }
 
+/// A shell's "run this script" flag: `-c` alone or combined (`-lc`, `-ec`).
+pub(crate) fn is_script_flag(word: &str) -> bool {
+    word.len() > 1
+        && word.starts_with('-')
+        && word[1..].chars().all(|ch| ch.is_ascii_alphabetic())
+        && word.contains('c')
+}
+
 /// True when a shell command may change its working directory, so its
 /// relative paths cannot be shown to be inside the session's checkout.
 pub(crate) fn shell_changes_directory(command: &str) -> bool {
@@ -728,7 +736,7 @@ fn program_name(text: &str) -> &str {
     text.rsplit('/').next().unwrap_or(text)
 }
 
-const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
+pub(crate) const SHELLS: [&str; 6] = ["sh", "bash", "zsh", "dash", "ksh", "fish"];
 const SILENT: [&str; 31] = [
     "cd", "pushd", "popd", "export", "set", "unset", "source", ".", "alias", "unalias", "true",
     "false", ":", "shopt", "trap", "wait", "sleep", "exit", "return", "umask", "ulimit", "mkdir",
@@ -1015,12 +1023,7 @@ fn eval_words(
     }
     if SHELLS.contains(&program) {
         // `bash -lc 'script'`: classify the script itself.
-        let flag = args.iter().position(|word| {
-            word.text.starts_with('-')
-                && word.text.len() > 1
-                && word.text[1..].chars().all(|ch| ch.is_ascii_alphabetic())
-                && word.text.contains('c')
-        });
+        let flag = args.iter().position(|word| is_script_flag(&word.text));
         if let Some(flag) = flag {
             if depth >= MAX_NESTING {
                 return Stage::Class(ShellClass::Other, Vec::new());

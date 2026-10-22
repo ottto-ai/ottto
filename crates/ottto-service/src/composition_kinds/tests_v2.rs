@@ -1393,6 +1393,18 @@ fn command_arrays_give_their_script() {
             "cat a.md && ls",
         ),
         (json!(["bash", "-c", "x"]), "x"),
+        (
+            json!(["/usr/bin/env", "bash", "-c", "x"]),
+            "/usr/bin/env bash -c x",
+        ),
+        (json!(["bash", "-euc", "cat a.md", "arg0"]), "cat a.md"),
+        // Only a shell's `-c` takes a script.
+        (json!(["head", "-c", "10"]), "head -c 10"),
+        (
+            json!(["python", "-c", "cat a.md; git status"]),
+            "python -c 'cat a.md; git status'",
+        ),
+        (json!(["bash", "run.sh"]), "bash run.sh"),
         (json!(["cat", "a.md"]), "cat a.md"),
         (json!(["cat", "my notes.md"]), "cat 'my notes.md'"),
         (json!(["cat", "a; git status"]), "cat 'a; git status'"),
