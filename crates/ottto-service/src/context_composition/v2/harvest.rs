@@ -940,8 +940,11 @@ fn read_file(
             let mut contribution = StoredContribution::default();
             if let Some(old) = existing {
                 if mode == Mode::Full {
-                    // Replace this file's earlier share.
-                    if let Some(old) = old.contribution.into_share() {
+                    // Replace this file's earlier share (of the days still
+                    // in the window; older days stay in all-history totals).
+                    let mut old_share = old.contribution;
+                    old_share.prune(window.floor);
+                    if let Some(old) = old_share.into_share() {
                         scope.agg.subtract(&old, generation);
                     }
                 } else {

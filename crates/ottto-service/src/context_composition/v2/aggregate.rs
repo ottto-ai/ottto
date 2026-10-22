@@ -581,10 +581,10 @@ impl Aggregate {
                     self.day_tools.remove(&day_key);
                 }
             }
+            // The all-history entry stays (even at zero): it holds the
+            // tool's distinct-session count.
             if let Some(totals) = self.all_tools.get_mut(tool) {
-                if totals.take(*calls, *tokens) {
-                    self.all_tools.remove(tool);
-                }
+                totals.take(*calls, *tokens);
             }
         }
         if let Some(totals) = share

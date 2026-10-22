@@ -437,6 +437,9 @@ fn build_tools(scope: &Scope, window: Window) -> Vec<ToolRow> {
         });
     rows.extend(top_tools(period_rows));
     let all_rows = agg.all_tools.iter().filter_map(|(tool, totals)| {
+        if totals.calls == 0 && totals.tokens == 0 {
+            return None;
+        }
         tool_row(
             tool,
             totals.kind?,

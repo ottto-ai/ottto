@@ -1022,7 +1022,8 @@ fn assert_same_totals(actual: &Aggregate, expected: &Aggregate) {
                 .collect::<BTreeMap<_, _>>(),
             agg.all_tools
                 .iter()
-                .map(|(key, totals)| (key.clone(), (totals.calls, totals.tokens)))
+                .filter(|(_, totals)| totals.calls > 0 || totals.tokens > 0)
+                .map(|(key, totals)| (key.clone(), (totals.calls, totals.tokens, totals.sessions)))
                 .collect::<BTreeMap<_, _>>(),
         )
     };
@@ -1101,6 +1102,36 @@ fn rewritten_files_are_read_again_within_the_budget() {
         (Some(0), Some(0))
     );
     assert!(row("harness_attachments").is_some());
+    env.cleanup();
+}
+
+#[test]
+fn full_re_read_keeps_history_past_the_window() {
+    let env = Env::new("composition-v2-rewrite-history");
+    let now = base_now();
+    let today = now.date();
+    let oldest = today - time::Duration::days(i64::from(KEEP_DAYS - 1));
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    let mut records = claude_turn(&cwd, oldest, 1);
+    records.extend(claude_turn(&cwd, today, 2));
+    write_records(&path, &records);
+    env.run(Source::Claude, now, None);
+    let tokens = |agg: &Aggregate| {
+        agg.all_parts
+            .values()
+            .map(|bucket| bucket.tokens)
+            .sum::<u64>()
+    };
+    let first = tokens(&env.scope(Source::Claude).agg);
+
+    // The next day the oldest day left the window; the file is rewritten
+    // with one turn of today. The oldest day's share stays in the
+    // all-history totals.
+    write_records(&path, &claude_turn(&cwd, today, 3));
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
+    assert_eq!(tokens(&env.scope(Source::Claude).agg), first);
     env.cleanup();
 }
 
