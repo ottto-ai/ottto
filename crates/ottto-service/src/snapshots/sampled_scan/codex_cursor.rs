@@ -484,8 +484,8 @@ impl SealedPrefix {
     }
 }
 
-/// The identity `finish` may accept for a cursor job's grown object. Only
-/// `finish_job` sets it (in the reader's `sealed_prefix` slot).
+/// The identity `finish` may accept for a grown object. `finish_job` or the
+/// in-page grown route sets it in the reader's `sealed_prefix` slot.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum FinishGrant {
     /// A passed prefix certificate (S12): `Certified` only.
@@ -508,6 +508,13 @@ impl HeapLayoutBound for FinishGrant {
 }
 
 impl FinishGrant {
+    /// C1, shared with Stage2-pre: callers must first pass the held-FD
+    /// sealed-prefix certificate. This grants finish identity only; it does
+    /// not grant a checkpoint, audit credit, proof or admission.
+    pub(in crate::snapshots) fn certified(dev: u64, ino: u64, extent: u64) -> Self {
+        Self::Certified(SealedPrefix { dev, ino, extent })
+    }
+
     /// Revalidated at finalization against the held FD (`file`). The lossy
     /// grant also requires the selected `path` to still name the held object
     /// and the covered samples to re-read unchanged (no replacement, shrink
@@ -1651,13 +1658,8 @@ pub(in crate::snapshots) fn finish_job(
     });
     if result.is_ok() && !eof_applied {
         // A passed certificate grants `finish` a grown object (S12).
-        job.parser.reader.sealed_prefix = frozen_end.map(|extent| {
-            FinishGrant::Certified(SealedPrefix {
-                dev: meta.stamp_open.dev,
-                ino: meta.stamp_open.ino,
-                extent,
-            })
-        });
+        job.parser.reader.sealed_prefix = frozen_end
+            .map(|extent| FinishGrant::certified(meta.stamp_open.dev, meta.stamp_open.ino, extent));
     } else if let Some(identity) = lossy_identity {
         // An uncertified job grants it only through ruling 2's proof,
         // revalidated in `finish`; otherwise it keeps main's strict finish
@@ -1943,11 +1945,7 @@ pub(in crate::snapshots) fn arm_group_member(
 /// The live member's legacy baseline (P2) reads the job's frozen prefix:
 /// it may finish a grown same object, like the job's own certificate.
 pub(in crate::snapshots) fn frozen_grant(meta: &JobMeta, extent: u64) -> FinishGrant {
-    FinishGrant::Certified(SealedPrefix {
-        dev: meta.stamp_open.dev,
-        ino: meta.stamp_open.ino,
-        extent,
-    })
+    FinishGrant::certified(meta.stamp_open.dev, meta.stamp_open.ino, extent)
 }
 
 /// The live member's grant after `finish_job` certified a group job.

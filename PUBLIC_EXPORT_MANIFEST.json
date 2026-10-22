@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 782,
-  "content_sha256": "a9092133e3b5cab20167088a70387de27a9f78c3046b8c9afdf079673e30fcf9",
+  "candidate_file_count": 783,
+  "content_sha256": "51e09983b45eaede1a2d9ba499a50014a492de658200bbb789551508a0b90df8",
   "files": [
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "528171b230b37c0f6d22d55087a5e5a04095daa9b3609a29cb764107d3f8759a",
-      "size_bytes": 3126638
+      "sha256": "d9fbc13ecbcfedeadb0c76ec6ee15515dc1d37a0ec3ae4fd3055dbb70706d176",
+      "size_bytes": 3137803
     },
     {
       "executable": false,
@@ -1826,8 +1826,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "9a5452107f9e257b5aeea1aff576c56204e809667c078fe841ef692a9d49c983",
-      "size_bytes": 192980
+      "sha256": "fda24c4f8078c52232241629214356a05b0f22c74dec0f0055e30e580fb32898",
+      "size_bytes": 193198
     },
     {
       "executable": false,
@@ -1868,15 +1868,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests.rs",
-      "sha256": "f8d828e248458e99ddcfd29156beac7d16af52339c05ca32b74867b314052327",
-      "size_bytes": 12379
+      "sha256": "ff86b8732c569b0ff6f290b9dc2392a378d798f17dfde31e7a08e0dc650e25db",
+      "size_bytes": 12324
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
-      "sha256": "a2d6ce75b101f722068afb9624e06b5c2d6b619f46fd11197035287f8fc287c4",
-      "size_bytes": 41978
+      "sha256": "8628d904a38e0a8981967e50eaca4a447b31a49c8081096e4a380379e087e3d5",
+      "size_bytes": 51086
     },
     {
       "executable": false,
@@ -3701,6 +3701,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-22-claude-frozen-extent.md",
+      "sha256": "94c780d1f4e69da52791560a35f44924e431d6119373cb8adcbb8610dce2b2c7",
+      "size_bytes": 3221
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-22-composition-kinds-v2.md",
       "sha256": "c272cd0b45e4ca8eb800a4c64c89ad9c323ddb01f1f5e2ae1f7291360f248891",
       "size_bytes": 4745
@@ -5479,7 +5486,7 @@
   ],
   "generated_at": "2026-10-22T19:20:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 783,
+  "output_file_count": 784,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

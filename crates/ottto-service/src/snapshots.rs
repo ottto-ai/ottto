@@ -5568,6 +5568,25 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
 
+    // SOURCE FE1: an unverified prefix/tail is observation only. API rows
+    // beyond it may be auxiliary calls, so unequal request sets do NOT fence
+    // proof. Explicitly exclude these roots from fresh and reconstructed
+    // proofs, witnesses, owned-start/2c and design-E/posture admission.
+    let uncertified_roots = index
+        .claude_request_census
+        .records()
+        .filter(|(_, record)| record.unverified_or_twin())
+        .map(|(key, _)| key)
+        .chain(
+            index
+                .files
+                .iter()
+                .filter(|(_, entry)| entry.has_unverified_source())
+                .map(|(key, _)| key),
+        )
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .map(|(root, _)| root)
+        .collect::<BTreeSet<_>>();
     let complete_families = if census_complete {
         complete_claude_usage_family_members(index)
     } else {
@@ -5608,6 +5627,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             legacy_request_owners.as_ref(),
         );
         for (root_session_id, members) in &complete_families {
+            if uncertified_roots.contains(root_session_id) {
+                continue;
+            }
             let Some(base_pending) = index.claude_usage_family_pending.get(root_session_id) else {
                 continue;
             };
@@ -5661,7 +5683,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .claude_usage_family_witnesses
             .iter()
             .filter(|(root_session_id, _)| {
-                item_roots.contains(*root_session_id) && !proven.contains_key(*root_session_id)
+                item_roots.contains(*root_session_id)
+                    && !uncertified_roots.contains(*root_session_id)
+                    && !proven.contains_key(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
                 reconstruct_claude_usage_family(
@@ -5701,7 +5725,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         reconstructed = index
             .claude_usage_family_witnesses
             .iter()
-            .filter(|(root_session_id, _)| item_roots.contains(*root_session_id))
+            .filter(|(root_session_id, _)| {
+                item_roots.contains(*root_session_id)
+                    && !uncertified_roots.contains(*root_session_id)
+            })
             .filter_map(|(root_session_id, witness)| {
                 reconstruct_claude_usage_family(
                     root_session_id,
@@ -5855,6 +5882,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 let (root_session_id, _) = complete_families
                     .iter()
                     .find(|(_, members)| members.contains(source_session_id))?;
+                if uncertified_roots.contains(root_session_id) {
+                    return None;
+                }
                 let pending = index.claude_usage_family_pending.get(root_session_id)?;
                 if pending.invalid || pending.census_window_end != census_window_end {
                     return None;
@@ -5917,7 +5947,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             || item.usage_accounting_contract.as_deref()
                 == Some("session_exclusive_reported_usage:v1");
         let explicit_owned_start = item.claude_context_curve_owned_start_proven;
-        let posture_owned = (explicit_owned_start || provider_owned_start) && !unresolved_duplicate;
+        let source_certified = !uncertified_roots.contains(&root_session_id);
+        let posture_owned = source_certified
+            && (explicit_owned_start || provider_owned_start)
+            && !unresolved_duplicate;
         if posture_owned {
             context_file_birth.record_proof(item);
             #[cfg(test)]
@@ -5925,6 +5958,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 item.source_session_id.clone(),
                 ClaudePostureAdmission::Strict,
             );
+        } else if !source_certified {
+            clear_claude_context_posture(item);
         } else {
             // Cache observations and the curve below still read the strict
             // `posture_owned`: only the scalar tuple and session start move.
@@ -6056,7 +6091,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             0,
         ));
         let owned_start_census_verified = claude_owned_start_was_census_verified(item, index);
-        if !(census_complete || owned_start_census_verified)
+        if !source_certified
+            || !(census_complete || owned_start_census_verified)
             || !item.claude_context_curve_identity_complete
             || !item.claude_context_curve_request_index_complete
         {
@@ -18214,6 +18250,31 @@ impl OwnedSourceScan {
                         hook(&active);
                     }
                 });
+                // H2c/E1: retain native trailing-line behavior at a genuine
+                // unchanged EOF. A grown read keeps this fragment withheld.
+                if source == SnapshotSource::ClaudeCode
+                    && active.cursor.is_none()
+                    && active.parser.reader.sealed_fragment()
+                    && active
+                        .parser
+                        .reader
+                        .acquisition
+                        .as_ref()
+                        .is_some_and(|plan| {
+                            plan.start_offset()
+                                .checked_add(active.parser.reader.consumed_bytes())
+                                == Some(plan.frozen_length())
+                                && active
+                                    .parser
+                                    .reader
+                                    .reader
+                                    .get_ref()
+                                    .metadata()
+                                    .is_ok_and(|held| held.len() == plan.frozen_length())
+                        })
+                {
+                    active.parser.apply_sealed_fragment();
+                }
                 if active.cursor.is_some() && active.group.is_none() {
                     // E1 before the protected-tier gate below (R1-H1). A group
                     // job applies it to its live member in `member_eof`, before
@@ -18656,39 +18717,87 @@ impl OwnedSourceScan {
                             index,
                         )
                     });
-                    let mut current_path = candidate.clone();
-                    if let Some(cause) = sampled_revalidation_cause(
-                        current_scope.as_ref() == Some(&acquisition.scope),
-                        || {
-                            drop(open_candidate_file(source, &mut current_path)?);
-                            Ok(current_path.opened_object_identity
-                                == candidate.opened_object_identity)
-                        },
-                    ) {
-                        if source == SnapshotSource::ClaudeCode {
-                            claude_request_census::invalidate_claude_request_census(
-                                index,
+                    // H3c: a passed certificate permits native finish of
+                    // this prefix only. Discard its checkpoint: no cache copy,
+                    // audit credit or source verification can follow it.
+                    let prefix = current_scope
+                        .as_ref()
+                        .filter(|scope| *scope == &acquisition.scope)
+                        .filter(|_| {
+                            acquisition.audit_due.is_some()
+                                && sampling.as_ref().is_some_and(|context| {
+                                    context.audit_metadata_supported
+                                        && (context.audit_slots > 0
+                                            || index
+                                                .files
+                                                .get(&acquisition.key)
+                                                .is_some_and(ScanIndexEntry::has_unverified_source))
+                                })
+                        })
+                        .and_then(|scope| {
+                            parser.commit_claude_grown_prefix(
                                 &candidate.path,
-                            );
+                                scope,
+                                index
+                                    .files
+                                    .get(&acquisition.key)
+                                    .map_or(0, |entry| entry.size_bytes),
+                            )
+                        });
+                    if let Some(prefix) = prefix {
+                        match prefix {
+                            Ok(grant) => parser.reader.sealed_prefix = Some(grant),
+                            Err(refusal) => {
+                                claude_request_census::invalidate_claude_request_census(
+                                    index,
+                                    &candidate.path,
+                                );
+                                let cause = match refusal {
+                                    crate::transcript_acquisition::PrefixRefusal::AuditDue => {
+                                        UnreadableCause::Reduction
+                                    }
+                                    _ => UnreadableCause::ScopeObject,
+                                };
+                                census.record_unreadable(cause, 1);
+                                pending!();
+                            }
                         }
-                        census.record_unreadable(cause, 1);
-                        pending!();
-                    }
-                    match parser.retain_reduction(
-                        &acquisition.scope,
-                        sampled_scan::now_seconds(),
-                        if cache_compatible { copy_budget } else { 0 },
-                    ) {
-                        Ok(completed) => completed,
-                        Err(_) => {
+                        None
+                    } else {
+                        let mut current_path = candidate.clone();
+                        if let Some(cause) = sampled_revalidation_cause(
+                            current_scope.as_ref() == Some(&acquisition.scope),
+                            || {
+                                drop(open_candidate_file(source, &mut current_path)?);
+                                Ok(current_path.opened_object_identity
+                                    == candidate.opened_object_identity)
+                            },
+                        ) {
                             if source == SnapshotSource::ClaudeCode {
                                 claude_request_census::invalidate_claude_request_census(
                                     index,
                                     &candidate.path,
                                 );
                             }
-                            census.record_unreadable(UnreadableCause::Reduction, 1);
+                            census.record_unreadable(cause, 1);
                             pending!();
+                        }
+                        match parser.retain_reduction(
+                            &acquisition.scope,
+                            sampled_scan::now_seconds(),
+                            if cache_compatible { copy_budget } else { 0 },
+                        ) {
+                            Ok(completed) => completed,
+                            Err(_) => {
+                                if source == SnapshotSource::ClaudeCode {
+                                    claude_request_census::invalidate_claude_request_census(
+                                        index,
+                                        &candidate.path,
+                                    );
+                                }
+                                census.record_unreadable(UnreadableCause::Reduction, 1);
+                                pending!();
+                            }
                         }
                     }
                 } else {
@@ -18733,6 +18842,8 @@ impl OwnedSourceScan {
                 } else {
                     Vec::new()
                 };
+                let claude_grown_prefix =
+                    source == SnapshotSource::ClaudeCode && parser.reader.sealed_prefix.is_some();
                 let parsed_file = parser.finish(
                     &candidate.opened_object_identity,
                     &candidate.path,
@@ -18870,6 +18981,15 @@ impl OwnedSourceScan {
                 codex_parent_resolution_retry_required |=
                     parsed_file.codex_parent_resolution_pending;
                 let parse_complete = parsed_file.complete();
+                // Claude response conflicts may be discovered only by native
+                // finalization. A prefix cannot publish that late loss: it
+                // would have neither a committed audit marker nor necessarily
+                // a D1 record when the record budget is exhausted.
+                if claude_grown_prefix && !parse_complete {
+                    claude_request_census::invalidate_claude_request_census(index, &candidate.path);
+                    census.record_unreadable(UnreadableCause::ScopeObject, 1);
+                    pending!();
+                }
                 if !aliases.is_empty() && !parse_complete {
                     // Joining authorizes a complete replacement only. Native
                     // ownership/parser loss cannot publish a partial union body.
@@ -20872,6 +20992,22 @@ impl OwnedSourceScan {
                                 pending!();
                             }
                         };
+                        // H1c: the plan uses absolute offsets; the reader's
+                        // extent is relative to its Full/Tail start.
+                        if source == SnapshotSource::ClaudeCode
+                            && allow_sample
+                            && matches!(
+                                mode,
+                                crate::transcript_acquisition::ReadMode::Full(_)
+                                    | crate::transcript_acquisition::ReadMode::Tail
+                            )
+                        {
+                            if let Some(plan) = parser.reader.acquisition.as_ref() {
+                                parser
+                                    .reader
+                                    .set_extent_limit(plan.frozen_length() - plan.start_offset());
+                            }
+                        }
                         // Restore does not restore/extend an exact-prefix pricing receipt.
                         // Any new priority contribution below forces a real full replay.
                         if source == SnapshotSource::Codex {
@@ -20881,7 +21017,23 @@ impl OwnedSourceScan {
                             .reader
                             .acquisition
                             .as_ref()
-                            .and_then(|plan| plan.metrics().audit_due);
+                            .and_then(|plan| plan.metrics().audit_due)
+                            .or_else(|| {
+                                // A grown Full without an older obligation
+                                // still owes a quiet audit. Prepare its bound
+                                // now, never from the discarded checkpoint.
+                                (source == SnapshotSource::ClaudeCode
+                                    && allow_sample
+                                    && matches!(
+                                        mode,
+                                        crate::transcript_acquisition::ReadMode::Full(_)
+                                    ))
+                                .then(|| {
+                                    sampled_scan::now_seconds().saturating_add(
+                                        crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+                                    )
+                                })
+                            });
                         planned_mode = Some((mode, audit_due));
                         file_sampling = Some(sampled_scan::Active {
                             key,
@@ -21960,7 +22112,77 @@ impl OwnedJsonlParser {
         self.with_line_sink(|_| {}, |_, sink| sink(value))
     }
 
-    /// E1: at a genuine unchanged EOF (proved by the cursor caller), apply a
+    /// FE1: certify a complete traversal of a grown Claude frozen extent.
+    /// The checkpoint is deliberately dropped. The existing audit obligation
+    /// remains prepared; FE2's sample-preserving rewrite residual is bounded
+    /// by the quiet Full audit and its sampled_audit_comparison diagnostics.
+    fn commit_claude_grown_prefix(
+        &mut self,
+        path: &Path,
+        scope: &crate::transcript_acquisition::Scope,
+        last_committed_size: u64,
+    ) -> Option<
+        std::result::Result<
+            sampled_scan::codex_cursor::FinishGrant,
+            crate::transcript_acquisition::PrefixRefusal,
+        >,
+    > {
+        use crate::transcript_acquisition::{FullReason, PrefixRefusal, ReadMode};
+        let plan = self.reader.acquisition.as_ref()?;
+        let frozen = plan.frozen_length();
+        let start = plan.start_offset();
+        let consumed = start.checked_add(self.reader.consumed_bytes())?;
+        let held = self.reader.reader.get_ref().metadata().ok()?;
+        if self.source != SnapshotSource::ClaudeCode
+            // Only H1c-admitted reads may take H3c. Forced/comparison and
+            // other ineligible native reads retain strict completion.
+            || self.reader.extent_limit != Some(frozen.checked_sub(start)?)
+            || !matches!(plan.mode(), ReadMode::Full(_) | ReadMode::Tail)
+            || held.len() <= frozen
+            || consumed != frozen
+            || !self.reader.finished
+            || self.reader.failure.is_some()
+            // E1 already applied an unterminated row: it lies beyond the
+            // sealed newline, so later growth must keep strict identity.
+            || (!self.reader.sealed_fragment()
+                && self.reader.consumed_bytes() != self.reader.last_complete_line_end())
+            || self.reader.lossy_prefix()
+            || !sampled_jsonl::loss_free_source_report(
+                &self.reader.report,
+                self.recognized_usage_drop_count,
+                self.accumulator.dropped_usage_record_count,
+            )
+        {
+            return None;
+        }
+        // A committed unterminated row may extend beyond the last newline.
+        // Never replace it with a weaker complete-row prefix.
+        if start.checked_add(self.reader.last_complete_line_end())? < last_committed_size {
+            return Some(Err(PrefixRefusal::Invalidated(
+                FullReason::InvalidCheckpoint,
+            )));
+        }
+        let path_same_object = fs::symlink_metadata(path)
+            .is_ok_and(|current| metadata_describes_same_file(&held, &current));
+        let plan = self.reader.acquisition.take().expect("checked acquisition");
+        let now = sampled_scan::now_seconds();
+        Some(
+            plan.commit_sealed_prefix(
+                self.reader.reader.get_mut(),
+                path_same_object,
+                scope,
+                now,
+                now,
+                false,
+                consumed,
+            )
+            .map(|_discarded_checkpoint| {
+                sampled_scan::codex_cursor::FinishGrant::certified(held.dev(), held.ino(), frozen)
+            }),
+        )
+    }
+
+    /// E1: at a genuine unchanged EOF (proved by the caller), apply a
     /// withheld final record through the same line sink as every other line.
     fn apply_sealed_fragment(&mut self) -> bool {
         self.with_line_sink(|_| {}, |reader, sink| reader.apply_sealed_fragment(sink))
@@ -22036,7 +22258,8 @@ impl OwnedJsonlParser {
         } = self;
         let mut reader = bounded.reader;
         let report = bounded.report;
-        // Present only for a cursor job whose prefix certificate passed (S12)
+        // Present for a cursor job or Claude in-page read whose prefix
+        // certificate passed (S12/FE1)
         // or whose lossy job holds ruling 2's same-object identity proof.
         let sealed_prefix = bounded.sealed_prefix;
         // A cursor read withheld an unterminated final record (N2).
@@ -22685,7 +22908,8 @@ struct BoundedJsonlReader<R> {
     /// taken from the capped prefix when the skip first paused and `buf`
     /// was cleared then (E4), so a pause never holds the 16 MiB prefix.
     skipping: Option<EarlySalvage>,
-    /// Resumable reads only: never consume past this frozen extent.
+    /// Resumable reads and sampled in-page Claude Full/Tail reads: never
+    /// consume past this reader-relative frozen extent.
     extent_limit: Option<u64>,
     /// Physical bytes consumed from `reader`, including skipped bytes.
     consumed: u64,
@@ -22698,7 +22922,7 @@ struct BoundedJsonlReader<R> {
     /// genuine unchanged EOF can apply them with main's trailing-line rule
     /// (E1).
     sealed_fragment: Option<(bool, Option<EarlySalvage>)>,
-    /// Set only by a cursor job's `finish_job`: the identity `finish` may
+    /// Set by `finish_job` or the in-page grown route: the identity `finish` may
     /// accept for a grown object. `Certified` after its prefix certificate
     /// passed (S12); `LossySameObject` (ruling 2) is not a sealed-prefix
     /// certificate and permits only an uncertified publication.

@@ -9,7 +9,7 @@
 //! their doc comment (the D1 "acquisition exceeds stable source" failure,
 //! recorded as `OpenRead`, or `ScopeObject` at revalidation). Tests marked
 //! GREEN assert main's behavior, which FE must keep, and pass on main.
-//! Production code is unchanged; the only seam is #670's `with_after_reader_eof`.
+//! Uses the EOF fixture seam from #670; production FE lives in snapshots.rs.
 //!
 //! SOURCE conditions pinned here (qualified YES, d680b524):
 //! - publish only when `s` is at least the last committed size;
@@ -18,8 +18,8 @@
 //! - FE2: the sample-preserving-rewrite residual is accepted (SP-5 residual).
 //!
 //! Not added: #660 side reads (SP-11; #660 is not on main). Stage2-pre's
-//! `sp11_claude_in_page_tail_with_append_keeps_main_failure` pins the Claude
-//! D1 failure that FE replaces; the FE production change updates it.
+//! former `sp11_claude_in_page_tail_with_append_keeps_main_failure` now
+//! asserts the FE prefix publication.
 use super::*;
 use crate::claude_local_otel::{ClaudeLocalOtelLoadReport, ClaudeTraceOwnershipLoadReport};
 use crate::snapshots::claude_request_census::claude_request_hash;
@@ -682,7 +682,7 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
     regrown.extend(row_bytes(CLAUDE, 60..62));
     let frozen_body = full_body(&base.fixture, CLAUDE);
     let path = base.path.clone();
-    let ((_, tail, seen), at_eof) = with_eof_hook(
+    let ((mut index, tail, seen), at_eof) = with_eof_hook(
         &base.path,
         move |_| {
             truncate(&path, edited_row as u64);
@@ -704,6 +704,32 @@ fn fe_claude_sp5_residual_sample_preserving_rewrite_after_read_is_accepted() {
         content(production_body(CLAUDE, tail)),
         content(frozen_body),
         "SP-5 residual (Claude): the bytes read before the edit are published"
+    );
+    // FE2: even a grown Full that had no previous debt must retain a
+    // deadline. The quiet audit sees the interior rewrite and counts it.
+    assert!(index.files[&base.key].unverified_deadline().is_some());
+    index
+        .files
+        .get_mut(&base.key)
+        .unwrap()
+        .set_unverified_deadline(0);
+    let ((_, next, audit), diagnostics) = crate::local_resource_diagnostics::capture(|| {
+        plain(&base.fixture, CLAUDE, index, &base.cache)
+    });
+    assert_eq!(audit.full_reasons[AUDIT_DUE], 1, "FE2: quiet Full audit");
+    assert_eq!(audit.unreadable, 0, "FE2: audit completes");
+    assert_eq!(
+        content(production_body(CLAUDE, next)),
+        content(full_body(&base.fixture, CLAUDE)),
+        "FE2: audit repairs the body"
+    );
+    assert!(
+        diagnostics
+            .iter()
+            .any(|row| row["stage"] == "sampled_audit_comparison"
+                && row["counts"]["semantic_comparison_available"] == true
+                && row["counts"]["semantic_changed"] == true),
+        "FE2: audit mismatch counted"
     );
 }
 
@@ -1168,4 +1194,222 @@ fn fe_claude_unverified_source_api_rows_beyond_prefix_cannot_mint_v1() {
         "SOURCE explicit guard: API rows beyond an unverified prefix cannot mint v1"
     );
     assert!(!index.claude_usage_family_witnesses.contains_key(SESSION));
+}
+
+/// Restart/record-budget fallback: the durable prepared audit marker fences
+/// proof even when no D1 source record is available for the prefix.
+#[test]
+fn fe_claude_prefix_without_d1_record_still_cannot_mint_v1() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    assert_eq!(grown.seen.unreadable, 0);
+    assert!(grown.index.files[&grown.base.key].has_unverified_source());
+    grown
+        .index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(&grown.base.key);
+    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
+    assert!(!grown
+        .index
+        .claude_usage_family_witnesses
+        .contains_key(SESSION));
+}
+
+/// A previously proven family cannot reconstruct v1 from an unverified
+/// prefix on an incomplete page, even with unchanged API/trace evidence.
+#[test]
+fn fe_claude_unverified_source_cannot_reconstruct_a_saved_family_witness() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (fixture, mut index, mut result) = quiescent();
+    assert!(mints_v1(&mut index, &result, 0..9));
+    let previous_witness = index.claude_usage_family_witnesses[SESSION].clone();
+    let key = local_index_key(&fixture.file.0);
+    let record = index
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone()
+        .with_unverified_for_test(true);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    result.census_complete = false;
+    assert!(!mints_v1(&mut index, &result, 0..9));
+    assert_eq!(
+        index.claude_usage_family_witnesses.get(SESSION),
+        Some(&previous_witness),
+        "the historical witness stays for demotion/hold accounting, never backs this prefix"
+    );
+}
+
+/// Both explicit owned-start and file-birth posture admission stay closed
+/// for a prefix. Usage remains present on the ordinary unproven path.
+#[test]
+fn fe_claude_prefix_cannot_admit_explicit_or_file_birth_posture() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for explicit in [false, true] {
+        let mut grown = grown_full();
+        assert_eq!(grown.seen.unreadable, 0);
+        for item in &mut grown.result.snapshots {
+            item.claude_context_curve_owned_start_proven = explicit;
+            item.peak_context_fill_tokens = Some(1234);
+        }
+        assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
+        let (api, trace) = reports(0..9);
+        let disposition = apply_claude_reported_usage_to_scan_with_identity(
+            &mut grown.result,
+            &api,
+            &trace,
+            &mut grown.index,
+            None,
+        );
+        assert!(!grown.result.snapshots.is_empty());
+        assert!(grown.result.snapshots.iter().all(|item| {
+            item.usage_accounting_contract.is_none() && item.peak_context_fill_tokens.is_none()
+        }));
+        assert!(disposition.posture_admission(SESSION).is_none());
+    }
+}
+
+/// Review F1: growth after genuine-EOF E1 must not certify the row E1
+/// applied outside the last newline. No new reader/acquisition state needed.
+#[test]
+fn fe_claude_growth_after_e1_applied_fragment_keeps_strict_identity() {
+    let fixture = Fixture::new(CLAUDE);
+    let mut bytes = row_bytes(CLAUDE, 0..2);
+    assert_eq!(bytes.pop(), Some(b'\n'));
+    append_raw(&fixture.0, &bytes);
+    let (mut parser, _, scope) = native_parser(&fixture, CLAUDE);
+    parser
+        .prepare_acquisition(None, &scope, None, sampled_scan::now_seconds())
+        .unwrap();
+    let frozen = parser.reader.acquisition.as_ref().unwrap().frozen_length();
+    parser.reader.set_extent_limit(frozen);
+    while !parser.step().unwrap() {}
+    assert!(parser.reader.sealed_fragment());
+    assert!(parser.apply_sealed_fragment());
+    assert!(parser.reader.last_complete_line_end() < parser.reader.consumed_bytes());
+    append_raw(&fixture.0, b"\n");
+    append_raw(&fixture.0, &row_bytes(CLAUDE, 2..3));
+    assert!(
+        parser
+            .commit_claude_grown_prefix(&fixture.0, &scope, 0)
+            .is_none(),
+        "E1-applied bytes beyond the seal cannot get a grown grant"
+    );
+}
+
+/// Review F2: exhausted/unsupported audit metadata retains strict Full
+/// behavior, creates no new marker and cannot disable reuse source-wide.
+#[test]
+fn fe_claude_full_without_audit_capacity_keeps_main_failure_and_marker_count() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for supported in [false, true] {
+        let base = baseline(CLAUDE, 4, 2);
+        base.cache.clear();
+        let mut read = None;
+        let (index, result, seen) = page(&base.fixture, CLAUDE, base.index, &base.cache, |scan| {
+            if let Some(context) = scan.sampling.as_mut() {
+                context.audit_metadata_supported = supported;
+                context.audit_slots = 0;
+            }
+            if read.is_none() {
+                if let Some(opened) = opened(scan) {
+                    assert!(is_full(opened.mode));
+                    assert_eq!(
+                        opened.extent_limit, None,
+                        "no optional frozen read without capacity"
+                    );
+                    append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
+                    read = Some(opened);
+                }
+            }
+        });
+        assert!(read.is_some());
+        assert_refused(
+            &base.cache,
+            &base.key,
+            &result,
+            &seen,
+            OPEN_READ,
+            "FE capacity",
+        );
+        assert!(!index
+            .files
+            .values()
+            .any(ScanIndexEntry::has_unverified_source));
+    }
+}
+
+/// Source loss may be discovered by response resolution only at finish,
+/// after H3c's reader/report check. Refuse the grown body rather than publish
+/// without an indexed audit marker (even if the D1 record cannot be stored).
+#[test]
+fn fe_claude_finalizer_only_response_loss_refuses_the_grown_prefix() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    let mut conflict = row(CLAUDE, 5);
+    conflict["message"]["usage"]["input_tokens"] = json!(999);
+    conflict["message"]["usage"]["output_tokens"] = json!(0);
+    let mut reducer = SnapshotAccumulator::new(CLAUDE);
+    apply_claude_code_line(&row(CLAUDE, 5), &mut reducer);
+    apply_claude_code_line(&conflict, &mut reducer);
+    assert_eq!(
+        reducer.dropped_usage_record_count, 0,
+        "no loss before finalization"
+    );
+    reducer.finalize_claude_responses();
+    assert!(
+        reducer.dropped_usage_record_count > 0,
+        "incomparable usage loses at finalization"
+    );
+    let mut bytes = serde_json::to_vec(&conflict).unwrap();
+    bytes.push(b'\n');
+    append_raw(&base.path, &bytes);
+    let path = base.path.clone();
+    let (_, result, seen, _) = page_injecting(
+        &base.fixture,
+        CLAUDE,
+        base.index,
+        &base.cache,
+        is_full,
+        |_| append_raw(&path, &row_bytes(CLAUDE, 6..9)),
+    );
+    assert_refused(
+        &base.cache,
+        &base.key,
+        &result,
+        &seen,
+        SCOPE_OBJECT,
+        "FE finalizer loss",
+    );
+}
+
+/// An ineligible Full still has a ReadPlan, but H1c never froze its reader.
+/// Growth after its native EOF must not enter the optional prefix route.
+#[test]
+fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
+    let fixture = Fixture::new(CLAUDE);
+    append_raw(&fixture.0, &row_bytes(CLAUDE, 0..2));
+    let (mut parser, _, scope) = native_parser(&fixture, CLAUDE);
+    parser
+        .prepare_acquisition(None, &scope, None, sampled_scan::now_seconds())
+        .unwrap();
+    while !parser.step().unwrap() {}
+    assert_eq!(parser.reader.extent_limit, None);
+    append_raw(&fixture.0, &row_bytes(CLAUDE, 2..3));
+    assert!(parser
+        .commit_claude_grown_prefix(&fixture.0, &scope, 0)
+        .is_none());
 }

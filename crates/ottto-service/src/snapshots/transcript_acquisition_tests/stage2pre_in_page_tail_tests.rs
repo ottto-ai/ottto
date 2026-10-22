@@ -352,11 +352,11 @@ fn assert_refused(
     assert!(result.snapshots.is_empty(), "{id}: nothing published");
 }
 
-/// SP-11 (PARITY): Claude is out of scope. Its in-page Tail with an append
-/// after the open step keeps main's D1 failure (`OpenRead`) and drops the
-/// copy; nothing is published.
+/// SP-11, updated for FE: Claude's in-page Tail with an append publishes
+/// its sealed prefix uncertified and drops the copy. Codex Stage2-pre is
+/// independent; FE changes the formerly pinned Claude D1 failure.
 #[test]
-fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
+fn sp11_claude_in_page_tail_with_append_publishes_uncertified_prefix() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -372,7 +372,12 @@ fn sp11_claude_in_page_tail_with_append_keeps_main_failure() {
         is_tail,
         |_| append_raw(&path, &appended),
     );
-    assert_refused(&base.cache, &base.key, &tail, &seen, OPEN_READ, "SP-11");
+    assert_eq!(seen.unreadable, 0, "SP-11 FE: causes={:?}", seen.causes);
+    assert!(!tail.snapshots.is_empty(), "SP-11 FE: prefix published");
+    assert!(
+        base.cache.retained_checkpoint(&base.key).is_none(),
+        "SP-11 FE: no copy"
+    );
 }
 
 mod fe_claude_in_page_read_tests;
