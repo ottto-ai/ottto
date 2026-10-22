@@ -284,7 +284,9 @@ fn census_pre_hold_bodies(
             reset_owed_members = correction.1.len();
         }
     }
-    index.activate_effective_upload_body_witness_revision(EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION);
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        SnapshotSource::ClaudeCode,
+    ));
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&fixture.root),

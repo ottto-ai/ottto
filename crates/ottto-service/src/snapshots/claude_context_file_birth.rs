@@ -451,6 +451,12 @@ impl ClaudeTelemetryTripwire {
         }
     }
 
+    /// Family roots over their own evidence bound this fold. Read-only, for
+    /// #677's local stop alarm (hashed there; never logged raw).
+    pub(super) fn over_bound_roots(&self) -> &BTreeSet<String> {
+        &self.over_bound_roots
+    }
+
     /// `None` when this page could not judge the item (fail closed);
     /// otherwise `None` on a contradiction, else whether telemetry reported
     /// every kept request under its root.
