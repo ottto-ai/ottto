@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 776,
-  "content_sha256": "266898676b22ae2f1ffb7e673b367b23a4c37a502c2fc7d6288fd5987941cc9f",
+  "content_sha256": "9df9f50e1c165065013f1fbd03434fa8f6805d0192fec04a0b726741298d5dc5",
   "files": [
     {
       "executable": false,
@@ -1350,8 +1350,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_money_pipeline_tests.rs",
-      "sha256": "e5b7db7a0f18d2d6d6a9296e89686d604b6d55631ef278216339d8ab87ce97cb",
-      "size_bytes": 53039
+      "sha256": "00c72d603f1a2ff9abb7150e6a673ce7fac8c10cfa5d3920d0e7a4c47e560167",
+      "size_bytes": 53097
     },
     {
       "executable": false,

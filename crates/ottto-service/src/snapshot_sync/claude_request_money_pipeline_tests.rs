@@ -609,6 +609,7 @@ fn money_shadow_batch_admits_long_models_in_full() {
     const LONG: usize = 64 * 1024;
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
     let long_model = format!("claude-haiku-4-5-{}", "x".repeat(LONG));
+    // Fixture names of one length: the grain keys hold their paths.
     let page = |name: &str, model: &str, hold: usize| {
         let fixture = PipelineFixture::new(name);
         money_write_corpus(
@@ -654,8 +655,8 @@ fn money_shadow_batch_admits_long_models_in_full() {
         assert_eq!(money::reserved_for_test(), 0, "every admission is refunded");
         (counts, money_jsonl_rows(&fixture.support))
     };
-    let (short, _) = page("money-shadow-model-short", "claude-haiku-4-5", 0);
-    let (long, rows) = page("money-shadow-model-long", &long_model, 0);
+    let (short, _) = page("money-shadow-model-1", "claude-haiku-4-5", 0);
+    let (long, rows) = page("money-shadow-model-2", &long_model, 0);
     assert_eq!(short.refused_budget, 0, "{short:?}");
     assert_eq!(long.refused_budget, 0, "{long:?}");
     assert!(
@@ -670,7 +671,7 @@ fn money_shadow_batch_admits_long_models_in_full() {
         short.admitted_peak_bytes
     );
     let hold = money::SHADOW_MEMORY_CEILING_BYTES - long.admitted_peak_bytes as usize + 1;
-    let (refused, rows) = page("money-shadow-model-tight", &long_model, hold);
+    let (refused, rows) = page("money-shadow-model-3", &long_model, hold);
     assert_eq!(refused.refused_budget, 1, "{refused:?}");
     assert_eq!(refused.coverage_complete, 0, "{refused:?}");
     assert!(rows.iter().all(|row| row["row"] == "coverage"), "{rows:?}");
