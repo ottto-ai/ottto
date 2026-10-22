@@ -66,6 +66,14 @@ fn reference(item: &SnapshotItem) -> SnapshotEntityRef {
 }
 
 fn response(items: &[SnapshotItem], rejected: usize) -> SnapshotBatchResponse {
+    response_with_reason(items, rejected, "usage_accounting_authority_downgrade")
+}
+
+fn response_with_reason(
+    items: &[SnapshotItem],
+    rejected: usize,
+    reason: &str,
+) -> SnapshotBatchResponse {
     let mut refs = items[..items.len() - rejected]
         .iter()
         .map(reference)
@@ -91,7 +99,7 @@ fn response(items: &[SnapshotItem], rejected: usize) -> SnapshotBatchResponse {
             .map(|item| SnapshotEntityRejection {
                 source_session_id: item.source_session_id.clone(),
                 snapshot_fingerprint: item.snapshot_fingerprint.clone(),
-                reason: "usage_accounting_authority_downgrade".into(),
+                reason: reason.into(),
                 detail: "not logged".into(),
                 permanent: true,
                 occurrence_count: 1,
@@ -440,13 +448,8 @@ fn h359_permanent_exact_body_survives_retirement_epoch_restart_and_premature_tim
     std::fs::remove_dir_all(dir).unwrap();
 }
 
-#[test]
-#[serial_test::serial(client_report)]
-fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
-    let _guard = SNAPSHOT_SYNC_LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+/// Refuse every body of a two-item page with `reason` through the real upload.
+fn h359_all_rejected(reason: &str) -> (SnapshotUploadProgress, ResumableUploadResult, u64) {
     let items = items(2);
     let mut ledger = progress();
     let mut accepted = 0;
@@ -458,7 +461,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
         |i| i.snapshot_fingerprint.as_str(),
         snapshot_upload_body_witness,
         |batch| {
-            let ack = response(&batch, 2);
+            let ack = response_with_reason(&batch, 2, reason);
             ack.validate_entity_ack(&request(batch))?;
             Ok(ack)
         },
@@ -468,6 +471,19 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
     assert_eq!(outcome, ResumableUploadResult::Rejected { count: 2 });
     assert_eq!(accepted, 0);
     assert!(ledger.accepted_fingerprints.is_empty());
+    (ledger, outcome, accepted)
+}
+
+/// A non-dominated refusal pins the error path through the production
+/// chooser; the dominated twin is below.
+#[test]
+#[serial_test::serial(client_report)]
+fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success_clock() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ledger, outcome, accepted) = h359_all_rejected("invalid");
     let now = Instant::now();
     let mut cadence = SourceCadence::new(CadenceConfig::cost_first(SNAPSHOT_SYNC_INTERVAL));
     for _ in 0..8 {
@@ -487,7 +503,7 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
             machine_id: "synthetic",
             scan_started_at: "2026-10-12T00:00:00Z",
             counts: SyncCounts::default(),
-            state: deferred_entity_state(true),
+            state: refused_entity_state(true, PermanentRefusalCounts::of(&ledger), true),
         },
         true,
     )
@@ -497,6 +513,35 @@ fn h359_all_rejected_is_finished_transport_with_incomplete_health_and_no_success
     assert_eq!(
         status.last_error_code.as_deref(),
         Some("backend_validation_error")
+    );
+}
+
+/// Twin of the test above: the same all-refused page with a dominated reason
+/// goes through the settled-residue chooser instead of the error path.
+#[test]
+#[serial_test::serial(client_report)]
+fn h359_all_dominated_rejected_reports_the_settled_residue_state() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (ledger, _, _) = h359_all_rejected(DOMINATED_DOWNGRADE);
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 2
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        None
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, false)),
+        Some("backend_validation_error"),
+        "an unsettled cycle keeps the error path"
     );
 }
 
@@ -1792,7 +1837,7 @@ fn dominated_permanent_refusals_are_not_a_backend_validation_error() {
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_DOWNGRADE, 286);
     refuse(&mut ledger, DOMINATED_STALE, 23);
-    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    let refusals = PermanentRefusalCounts::of(&ledger);
     assert_eq!(
         refusals,
         PermanentRefusalCounts {
@@ -1820,7 +1865,7 @@ fn a_non_dominated_permanent_refusal_keeps_backend_validation_error() {
         let mut ledger = progress();
         refuse(&mut ledger, DOMINATED_DOWNGRADE, 1);
         refuse(&mut ledger, other, 1);
-        let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+        let refusals = PermanentRefusalCounts::of(&ledger);
         assert_eq!(
             refusals,
             PermanentRefusalCounts {
@@ -1867,7 +1912,7 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
         true,
     );
     assert!(!settlement.fully_settled);
-    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    let refusals = PermanentRefusalCounts::of(&ledger);
     assert_eq!(
         reported_code(refused_entity_state(
             true,
@@ -1883,11 +1928,47 @@ fn dominated_refusals_beside_a_local_hold_keep_unsettled_behavior() {
 fn retryable_deferrals_stay_server_error_beside_dominated_refusals() {
     let mut ledger = progress();
     refuse(&mut ledger, DOMINATED_STALE, 3);
-    let refusals = PermanentRefusalCounts::of(ledger.permanent_rejections.values());
+    let refusals = PermanentRefusalCounts::of(&ledger);
     for settled in [true, false] {
         assert_eq!(
             reported_code(refused_entity_state(false, refusals, settled)),
             Some("server_error")
         );
     }
+}
+
+/// F1: a newer body of a refused entity with a retryable conflict owes its own
+/// outcome. The older dominated refusal is no longer the entity's terminal
+/// record, so it cannot make the cycle a settled success.
+#[test]
+fn a_pending_newer_body_unbinds_its_dominated_refusal() {
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    ledger.quarantine_retryable_body(&format!("{:064x}", 0), "newer-body-0");
+    let refusals = PermanentRefusalCounts::of(&ledger);
+    assert_eq!(
+        refusals,
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 1
+        }
+    );
+    assert_eq!(
+        reported_code(refused_entity_state(true, refusals, true)),
+        Some("backend_validation_error")
+    );
+    assert!(ledger.accepted_fingerprints.is_empty(), "never an ACK");
+
+    // A refused body whose entity left the census keeps a terminal record for
+    // that same body, so it still counts as dominated.
+    let mut ledger = progress();
+    refuse(&mut ledger, DOMINATED_DOWNGRADE, 2);
+    ledger.retain_current_quarantines(&BTreeSet::new());
+    assert_eq!(
+        PermanentRefusalCounts::of(&ledger),
+        PermanentRefusalCounts {
+            total: 2,
+            dominated: 2
+        }
+    );
 }

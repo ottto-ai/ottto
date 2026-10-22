@@ -468,6 +468,155 @@ fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
     );
 }
 
+/// F1: body A is refused as dominated, then a newer body B of the same entity
+/// gets a retryable conflict. A conflict finish leaves exactly one durable
+/// fact for B: the index-owned `RetryPending(B)` quarantine beside the
+/// permanent refusal of A. This fixture cannot vary only witness-bound
+/// evidence, so that record is installed with the production retry deadline.
+/// While B is pending, quiet cycles must not report a settled success.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "permanent_finish_pending_newer_body: supported_positive=UNEXECUTED layout_supported=false").unwrap();
+        return;
+    }
+    let fixture = IdentityPipelineHome::new();
+    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join("pending-newer-body-support");
+    let secrets = fixture.base.join("pending-newer-body-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = FinishServer::new(FinishOutcome::Dominated {
+        reason: "usage_accounting_authority_downgrade",
+        admit_residue: true,
+    });
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "pending-newer-body-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    write_native_bootstrap_sidecars(&fixture, &support);
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    for cycle in 0..3 {
+        cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("real due native preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete);
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        });
+        assert!(result.is_ok(), "cycle {cycle}: {result:?}");
+        let fingerprint = {
+            let offered = server.offered.lock().unwrap();
+            assert_eq!(offered.len(), 1, "cycle {cycle}: no body is offered again");
+            offered[0]["snapshot_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &snapshot_upload_destination_namespace(&device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert!(
+            progress.permanent_rejections.contains_key(&fingerprint),
+            "cycle {cycle}: the refusal of body A is retained"
+        );
+        let mut saved = ScanIndex::load(&index_path).unwrap();
+        assert!(!saved.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        let terminal = server.terminal.lock().unwrap();
+        assert_eq!(terminal.len(), cycle + 1);
+        if cycle == 0 {
+            assert_eq!(terminal[cycle]["last_error_code"], "census_residue");
+            let record = saved
+                .quarantined_snapshot_fingerprints
+                .get_mut(&fingerprint)
+                .unwrap();
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            record.upload_body_witness = Some("b".repeat(64));
+            record.failed_reconstruction_count = 1;
+            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            record.retry_after_unix_seconds = quarantine_retry_after(&fingerprint);
+            saved.save(&index_path).unwrap();
+        } else {
+            assert_eq!(
+                saved.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+                SnapshotQuarantineDisposition::RetryPending,
+                "cycle {cycle}: body B is still pending"
+            );
+            assert_eq!(
+                terminal[cycle]["last_error_code"], "backend_validation_error",
+                "cycle {cycle}: a refusal of an older body cannot settle a pending newer body"
+            );
+        }
+        writeln!(
+            std::io::stderr().lock(),
+            "permanent_finish_pending_newer_body: cycle={cycle} code={}",
+            terminal[cycle]["last_error_code"]
+        )
+        .unwrap();
+    }
+}
+
 // Same real finish fixture; the new tests own only a test-thread observer.
 pub(crate) mod prior_index_lifetime_tests {
     include!("prior_index_lifetime_tests.rs");

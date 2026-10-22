@@ -2514,9 +2514,10 @@ struct PermanentRefusalCounts {
 }
 
 impl PermanentRefusalCounts {
-    fn of<'a>(refusals: impl IntoIterator<Item = &'a PermanentSnapshotRejection>) -> Self {
-        refusals
-            .into_iter()
+    fn of(progress: &SnapshotUploadProgress) -> Self {
+        progress
+            .permanent_rejections
+            .values()
             .fold(Self::default(), |mut counts, refusal| {
                 counts.total += 1;
                 if refusal.reason.is_dominated() {
@@ -5890,8 +5891,7 @@ fn finish_sync_source(
     }
     // The whole ledger, before the current-entity prune below: a refusal from
     // this page that is not current still keeps its reported reason.
-    let permanent_refusals =
-        PermanentRefusalCounts::of(upload_progress.permanent_rejections.values());
+    let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
