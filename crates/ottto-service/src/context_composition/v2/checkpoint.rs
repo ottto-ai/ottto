@@ -205,6 +205,37 @@ pub(super) struct RunRecord {
     /// Full-read bytes spent on `repair_day`.
     pub(super) repair_day: Day,
     pub(super) repair_used: u64,
+    /// Audit bytes spent on `audit_day`.
+    pub(super) audit_day: Day,
+    pub(super) audit_used: u64,
+    /// Per agent: the copy key audited last; the next audit starts after it,
+    /// so every eligible file is sampled in turn.
+    pub(super) audit_after: BTreeMap<String, String>,
+    /// Per agent: the full-read backlog at its last run and how many runs in
+    /// a row it grew.
+    pub(super) backlog: BTreeMap<String, Backlog>,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Backlog {
+    pub(super) day: Day,
+    pub(super) bytes: u64,
+    pub(super) growth_days: u32,
+}
+
+impl Backlog {
+    /// Record `bytes` waiting at the end of the run on `day`; a second run
+    /// on the same day replaces that day's figure.
+    pub(super) fn record(&mut self, day: Day, bytes: u64) -> u32 {
+        if day != self.day {
+            let grew = bytes > 0 && bytes > self.bytes;
+            self.growth_days = if grew { self.growth_days + 1 } else { 0 };
+            self.day = day;
+        }
+        self.bytes = bytes;
+        self.growth_days
+    }
 }
 
 /// Modification time as (seconds, nanoseconds) since the epoch.
@@ -537,6 +568,9 @@ pub(super) struct ParseState {
     pub(super) request1_closed: bool,
     /// Latest final snapshot verdict, refreshed without reading transcripts.
     pub(super) start_measured: bool,
+    /// The verdict request 1's lines were first counted under, so an audit
+    /// re-read counts them the same way after the verdict changed.
+    pub(super) request1_start_measured: Option<bool>,
     pub(super) compactions: crate::snapshots::CompositionCompactions,
     pub(super) cwd: Option<Box<str>>,
 }
@@ -635,6 +669,8 @@ pub(super) struct StoredParse {
     min_ts: Option<i64>,
     has_rendered: bool,
     request1_closed: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request1_start_measured: Option<bool>,
     #[serde(skip_serializing_if = "crate::snapshots::CompositionCompactions::is_empty")]
     compactions: crate::snapshots::CompositionCompactions,
     cwd: Option<String>,
@@ -652,6 +688,13 @@ impl StoredParse {
             copied: self.copied,
             ..ParseState::default()
         }
+    }
+
+    /// The start verdict request 1 was counted under, once request 1 has
+    /// closed (`None` while it is open or when unknown).
+    pub(super) fn request1_verdict(&self) -> Option<bool> {
+        let closed = self.request1_closed || self.last_assistant.is_some() || self.call_seq > 0;
+        self.request1_start_measured.filter(|_| closed)
     }
 
     fn ids_known(&self) -> bool {
@@ -759,6 +802,7 @@ impl StoredParse {
             min_ts: state.min_ts,
             has_rendered: state.has_rendered,
             request1_closed: state.request1_closed,
+            request1_start_measured: state.request1_start_measured,
             compactions: state.compactions.clone(),
             cwd: state.cwd.as_deref().map(str::to_string),
         }
@@ -830,6 +874,7 @@ impl StoredParse {
             has_rendered: self.has_rendered,
             request1_closed,
             start_measured: false,
+            request1_start_measured: self.request1_start_measured,
             compactions: self.compactions,
             cwd: self.cwd.map(Into::into),
         })

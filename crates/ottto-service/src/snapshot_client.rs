@@ -2593,6 +2593,56 @@ impl SnapshotApiClient {
         }
     }
 
+    /// The composition upload from its serialized body, so the bytes the
+    /// run counts are the bytes sent (the same body `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context composition: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
+        }
+    }
+
     pub fn upload_local_health_heartbeat(
         &self,
         relay_token: &str,

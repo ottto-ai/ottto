@@ -49,6 +49,8 @@ pub(super) struct LineStats {
     /// Codex `web_search_end` events inside an open call: the call's output
     /// holds the search, so it counts once, there.
     pub(super) web_search_in_call: u64,
+    /// Lines with no timestamp: they count on the day they are read.
+    pub(super) undated: u64,
 }
 
 /// How the file paths a transcript names become the names kept in state:

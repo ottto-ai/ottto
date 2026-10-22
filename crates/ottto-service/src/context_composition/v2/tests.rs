@@ -23,7 +23,7 @@ use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Sourc
 use super::harvest::{begin_run, run_source, Run, SourceStats};
 use super::reader::{LineEvent, LineReader};
 use super::scope::{load_scope, scope_path, ScopeInfo, ScopeResolver};
-use super::upload::{UploadTarget, Uploader};
+use super::upload::{UploadReceipt, UploadTarget, Uploader};
 use super::*;
 use crate::composition_kinds::{GitRootCache, Kind, KindsVersion};
 use crate::context_footprint::sha256_hex;
@@ -848,12 +848,12 @@ struct Capture {
 }
 
 impl Uploader for Capture {
-    fn upload(&mut self, request: &Value) -> anyhow::Result<()> {
+    fn upload(&mut self, request: &Value) -> anyhow::Result<UploadReceipt> {
         if self.fail {
             anyhow::bail!("offline");
         }
         self.payloads.push(request.clone());
-        Ok(())
+        Ok(UploadReceipt::default())
     }
 }
 
@@ -914,6 +914,7 @@ impl Env {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left,
+            audit: Default::default(),
         };
         let target = capture.map(|capture| UploadTarget {
             uploader: capture as &mut dyn Uploader,
@@ -1599,6 +1600,7 @@ fn scope_key_is_stable_across_worktrees() {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
+            audit: Default::default(),
         };
         run_source(
             &mut run,
@@ -2286,6 +2288,7 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
             deadline: Instant::now() + Duration::from_secs(120),
             resolver: &mut resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
+            audit: Default::default(),
         };
         run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
     };
@@ -4312,3 +4315,6 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
 
 #[path = "tests/a34.rs"]
 mod a34;
+
+#[path = "tests/a2.rs"]
+mod a2;
