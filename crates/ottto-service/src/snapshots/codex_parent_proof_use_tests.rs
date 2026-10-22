@@ -1157,35 +1157,32 @@ fn a_run_steps_only_while_one_more_line_fits_its_room() {
     write_values(&parent, &parent_values());
     let child = rollout(&root, CHILD);
     write_values(&child, &child_values());
+    // Owner note 4 (r79): the strict worst case of a fresh walk `W` with
+    // buffers `B`, through one more line: `W + (W - B) + MAX_JSONL_LINE_BYTES`.
     let walk = |job: &mut CodexProofReaders| {
         job.shrink_buffers();
-        crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap()
+        let walked = crate::heap_layout_bound::bound(&*job, usize::MAX).unwrap();
+        walked + (walked - job.buffers()) + MAX_JSONL_LINE_BYTES
     };
 
     let mut job = job_of(&parent, &[&child]);
-    let walked = walk(&mut job);
+    let worst = walk(&mut job);
     let mut budget = u64::MAX;
-    assert_eq!(
-        job.run(&mut budget, walked + MAX_JSONL_LINE_BYTES - 1),
-        CodexProofRun::Memory
-    );
+    assert_eq!(job.run(&mut budget, worst - 1), CodexProofRun::Memory);
     assert_eq!((budget, job.consumed), (u64::MAX, 0), "nothing read");
     // One step, then a room one byte short of the next line.
     let mut budget = codex_proof_step_reserve();
     assert_eq!(job.run(&mut budget, usize::MAX), CodexProofRun::Budget);
     let consumed = job.consumed;
     assert!(consumed > 0);
-    let walked = walk(&mut job);
+    let worst = walk(&mut job);
     let mut budget = u64::MAX;
-    assert_eq!(
-        job.run(&mut budget, walked + MAX_JSONL_LINE_BYTES - 1),
-        CodexProofRun::Memory
-    );
+    assert_eq!(job.run(&mut budget, worst - 1), CodexProofRun::Memory);
     assert_eq!((budget, job.consumed), (u64::MAX, consumed));
 
     // The in-run peak stays within the checked room.
     let mut job = job_of(&parent, &[&child]);
-    let room = walk(&mut job) + MAX_JSONL_LINE_BYTES + (1 << 20);
+    let room = walk(&mut job) + (1 << 20);
     proof_run_peak();
     let mut budget = u64::MAX;
     assert_eq!(job.run(&mut budget, room), CodexProofRun::Done);
@@ -1314,6 +1311,7 @@ fn hook_pass() -> CodexSidePass {
             first_in_process: false,
         },
         index_path: PathBuf::from(HOOK_INDEX),
+        kind: CodexPageKind::Ordinary,
     }
 }
 
@@ -1663,4 +1661,159 @@ fn a_lineage_held_parent_is_refused_before_its_read_and_owes_nothing() {
         !scene.index.codex_parent_prefix_proofs.contains_key(&p_key),
         "no lineage owe"
     );
+}
+
+/// Stage 1 interface (parent r79): the four continuation exclusions are
+/// predicates of the pass's kind. A continuation page gets no G7 charge, no
+/// side due, no proof hook and no sweep whatever its gate; an ordinary page
+/// gets the hook and the sweep always, and G7 and side due only while its
+/// gate is open (the ordinary save outage).
+#[test]
+fn the_stage1_gates_exclude_a_continuation_page_whatever_its_gate() {
+    for kind in [CodexPageKind::Ordinary, CodexPageKind::Continuation] {
+        for side_allowed in [true, false] {
+            let pass = CodexSidePass {
+                kind,
+                gate: sampled_scan::side_ledger::GateOpen {
+                    side_allowed,
+                    first_in_process: false,
+                },
+                ..hook_pass()
+            };
+            let ordinary = kind == CodexPageKind::Ordinary;
+            assert_eq!(
+                (
+                    pass.side_charge_allowed(),
+                    pass.side_due_allowed(),
+                    pass.proof_hook_allowed(),
+                    pass.sweep_allowed(),
+                ),
+                (
+                    ordinary && side_allowed,
+                    ordinary && side_allowed,
+                    ordinary,
+                    ordinary,
+                ),
+                "{kind:?} {side_allowed}"
+            );
+        }
+    }
+}
+
+/// Stage 1 (parent r79): a continuation page runs no part of the hook, a
+/// held (`Mine`) job included: nothing is read or stepped, the job stays
+/// suspended with the same charge, no entry is recorded and the sweep
+/// mutates nothing (an orphan record stays). The next ordinary page sweeps
+/// the orphan and finishes the job. (The ordinary save outage, where a held
+/// job steps fd-only and suspends, is `a_closed_side_gate_...`.)
+#[test]
+fn a_continuation_page_steps_no_held_job_and_sweeps_nothing() {
+    let mut scene = Scene::owed("hook-continuation");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
+    scene.hook(&cache, &mut page);
+    let held = cache.proof_suspended_for_test().expect("held");
+    let owed = scene.owed_entry();
+    let orphan = "/nonexistent/u1a2a-orphan-rollout.jsonl".to_owned();
+    let record = scene.index.codex_parent_side[&local_index_key(&scene.parent)].clone();
+    scene.index.codex_parent_side.insert(orphan.clone(), record);
+    let side = serde_json::to_value(&scene.index.codex_parent_side).unwrap();
+    let cursor = scene.index.codex_parent_side_cursor.clone();
+    let continuation = CodexSidePass {
+        kind: CodexPageKind::Continuation,
+        ..hook_pass()
+    };
+    for _ in 0..3 {
+        let mut page = PageBudget::default();
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(spent(&page), 0, "nothing read");
+        assert_eq!(cache.proof_suspended_for_test(), Some(held.clone()));
+        assert_eq!(scene.owed_entry(), owed);
+        assert_eq!(
+            serde_json::to_value(&scene.index.codex_parent_side).unwrap(),
+            side,
+            "not swept"
+        );
+        assert_eq!(scene.index.codex_parent_side_cursor, cursor);
+    }
+    scene.hook(&cache, &mut PageBudget::default());
+    assert!(!scene.index.codex_parent_side.contains_key(&orphan));
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}
+
+/// Owner note 3 (r79): main's retirement of a suspended job (here its copy
+/// step's) keeps the job's entries for its index's next hook, which backs
+/// each off (`MemoryRefused` + `Backoff`). Repeated retirements therefore
+/// pace the restarts: one per backoff, none inside it, never proven.
+#[test]
+fn main_retirements_pace_the_restarts() {
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-retired");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut at = sampled_scan::now_seconds();
+    for attempt in 1..=3 {
+        let mut page = page_with(leftover);
+        scene.hook_in(&cache, &hook_pass(), &mut page, at);
+        assert!(spent(&page) > SIDE_FENCE_READ_BYTES, "restarted: P read");
+        assert!(cache.proof_suspended_for_test().is_some());
+        cache.retire_proof_over_room(0);
+        assert_eq!(cache.proof_suspended_for_test(), None);
+        for _ in 0..3 {
+            let mut page = PageBudget::default();
+            scene.hook_in(&cache, &hook_pass(), &mut page, at);
+            assert_eq!(spent(&page), 0, "inside the backoff: nothing");
+        }
+        let owed = scene.owed_entry();
+        assert_eq!(
+            (owed.attempts, owed.outcome, &owed.wake),
+            (
+                attempt,
+                ProofOutcome::MemoryRefused as u8,
+                &ProofWake::Backoff
+            )
+        );
+        assert!(owed.not_before_unix_seconds > at);
+        at = owed.not_before_unix_seconds + 1;
+    }
+}
+
+/// R2-B3 (r79): a page that cannot finish (invalid census) and cannot
+/// suspend (no room) backs the job off; further pages at the same time,
+/// invalid or valid, read nothing, and nothing is proven.
+#[test]
+fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let now = sampled_scan::now_seconds();
+    let mut scene = Scene::owed("hook-invalid-refused");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut page = page_with(codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES);
+    scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    assert!(cache.proof_suspended_for_test().is_some());
+    let traversal = scene.index.traversal.take();
+    let mut page = PageBudget::default();
+    sampled_scan::codex_cursor::with_test_state_budget(0, || {
+        scene.hook_in(&cache, &hook_pass(), &mut page, now);
+    });
+    assert!(spent(&page) > 0, "the held job ran to P's end");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    let owed = scene.owed_entry();
+    assert_eq!(
+        (owed.attempts, owed.outcome, &owed.wake),
+        (1, ProofOutcome::MemoryRefused as u8, &ProofWake::Backoff)
+    );
+    for valid in [false, true, false, true] {
+        scene.index.traversal = if valid { traversal.clone() } else { None };
+        let mut page = PageBudget::default();
+        scene.hook_in(&cache, &hook_pass(), &mut page, now);
+        assert_eq!(spent(&page), 0, "valid {valid}");
+        assert_eq!(scene.owed_entry(), owed);
+    }
 }

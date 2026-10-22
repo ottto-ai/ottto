@@ -8888,6 +8888,52 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
     });
 }
 
+/// R2-B3 (r79): main's view is no allocation authority. A suspended proof
+/// larger than the room main's copy leaves (`remaining - budget`) is
+/// retired at the copy-budget step, before the copy is allocated (counted;
+/// its entries wait for its index's hook, taken once); the budget is
+/// unchanged. A proof that fits beside the copy keeps its slot.
+#[test]
+fn a_proof_over_the_copys_room_is_retired_before_the_copy() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let context = main_context(&cache);
+    let budget = || super::super::copy_budget_step(Some(&context), None, false);
+    let (without, measured) = budget();
+    let remaining = STATE_BYTES - measured.resident.unwrap();
+    assert_eq!(without, remaining / 2);
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", remaining - without + 4096);
+    assert!(proof_charge(&job) > remaining - without);
+    assert!(suspend(&cache, job), "fits the free room alone");
+    let ((with, _), counts) = observe(budget);
+    assert_eq!(with, without, "the budget is unchanged");
+    assert_eq!(cache.proof_suspended_for_test(), None, "retired first");
+    assert_eq!(proof_drops(counts), 1);
+    let scope = Scope("ns-a".to_owned());
+    let index = std::path::Path::new("/idx/a.json");
+    assert_eq!(
+        cache
+            .take_retired_proof_entries(&scope, index, "inc-1")
+            .len(),
+        1
+    );
+    assert!(cache
+        .take_retired_proof_entries(&scope, index, "inc-1")
+        .is_empty());
+    // Beside the copy: kept.
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 4096)
+    ));
+    let ((with, _), counts) = observe(budget);
+    assert_eq!(with, without);
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+}
+
 // ---------------------------------------------------------------------------
 // U1a-2a D6(e): M1's release to fit measures main's cursor state (no
 // suspended proof) and retires the proof first, under the same locks.

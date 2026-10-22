@@ -979,18 +979,26 @@ fn the_side_sweep_refreshes_live_state_and_prunes_only_stale_unreferenced_reques
     index.codex_parent_proof_wrap_epoch = 13;
     assert_eq!(index.sweep_codex_parent_side(true, None).requests_pruned, 1);
     // R2-M3: a charged stale request with no record to carry its pacing is
-    // kept, as is a worn one; with P's same-object record it is pruned and
-    // the record takes `{not_before, attempts_floor: 6}` (max-merged).
+    // kept, as is a worn one or one whose need the record does not cover
+    // (r79); with P's same-object record covering it, it is pruned and the
+    // record takes `{not_before, attempts_floor: 6}` (max-merged).
     let charged = epoch_request(live, 1);
     assert!(charged.attempts > 0);
-    for (with_record, attempts, pruned) in [
-        (false, charged.attempts, false),
-        (true, SIDE_REQUEST_EVICT_ATTEMPTS, false),
-        (true, charged.attempts, true),
+    for (with_record, attempts, needed, pruned) in [
+        (false, charged.attempts, charged.needed_extent, false),
+        (
+            true,
+            SIDE_REQUEST_EVICT_ATTEMPTS,
+            charged.needed_extent,
+            false,
+        ),
+        (true, charged.attempts, 4097, false),
+        (true, charged.attempts, charged.needed_extent, true),
     ] {
         let mut index = swept_index(10);
         let request = SideRequest {
             attempts,
+            needed_extent: needed,
             ..charged
         };
         index
@@ -1129,10 +1137,12 @@ fn the_side_sweep_drops_orphans_under_a_valid_census_and_wraps_its_cursor() {
 }
 
 /// D6(b) custody: an unsaved charge (an in-flight read) keeps its request;
-/// once a selected save proves it, the prune removes the request and ends
-/// its ledger key. A failed later save cannot bring the request back (the
-/// hydrate honors `Gone`), and a restart loads only the saved, charged
-/// pacing, never a fresh budget, which the next sweep prunes again.
+/// once a selected save proves it, the prune moves its pacing onto P's
+/// covering record and turns the key `Removed` with the stub, as the cure
+/// does (R2-M3, r79). A failed later save cannot bring the request back:
+/// the hydrate restores the merged pace from the stub (never less) and
+/// drops the request. A restart loads only the saved, charged pacing,
+/// never a fresh budget, which the next sweep prunes again.
 #[test]
 fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1177,12 +1187,24 @@ fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
     note_codex_side_pass_saved(&cache, &path, true, mark);
     assert_eq!(index.sweep_codex_parent_side(true, side).requests_pruned, 1);
     assert!(index.codex_parent_side_requests.is_empty());
-    assert_eq!(cache.side_ledger().get(&key).unwrap().tag, LedgerTag::Gone);
-    // The next save fails: disk still has the request; the hydrate drops it.
+    let pace = Some(SidePace {
+        not_before_unix_seconds: charged.not_before_unix_seconds,
+        attempts_floor: SIDE_REQUEST_EVICT_ATTEMPTS - 1,
+    });
+    assert_eq!(index.codex_parent_side[SWEPT].pace, pace);
+    let stub = cache.side_ledger().get(&key).copied().unwrap();
+    assert_eq!(
+        (stub.tag, stub.stub_not_before),
+        (LedgerTag::Removed, charged.not_before_unix_seconds)
+    );
+    // The next save fails: disk still has the request and the record
+    // without the pace; the hydrate restores the pace and drops it.
     let mut reloaded = ScanIndex::load(&path).unwrap();
     assert!(reloaded.codex_parent_side_requests.contains_key(SWEPT));
+    assert_eq!(reloaded.codex_parent_side[SWEPT].pace, None);
     begin_codex_side_pass(&cache, &path, &mut reloaded);
     assert!(reloaded.codex_parent_side_requests.is_empty());
+    assert_eq!(reloaded.codex_parent_side[SWEPT].pace, pace);
     // A restart: only the saved pacing (never attempts 0), pruned again.
     let restarted_cache = sampled_scan::SharedCache::default();
     let mut restarted = ScanIndex::load(&path).unwrap();
@@ -1195,4 +1217,45 @@ fn the_request_epoch_prune_keeps_unsaved_charges_and_never_resurrects_budget() {
             .requests_pruned,
         1
     );
+}
+
+/// R2-M3 (r79), the uncharged branch: a stale request no read was charged to
+/// carries no pacing, so its saved key just ends (`Gone`) and P's record,
+/// if any, keeps its pace.
+#[test]
+fn the_epoch_prune_ends_an_uncharged_key() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use sampled_scan::side_ledger::{parent_of, LedgerEntry, LedgerKey, LedgerTag};
+    let cache = sampled_scan::SharedCache::default();
+    let path = temp_path("epoch-prune-uncharged");
+    let uncharged = uncharged_request(1);
+    let mut index = swept_index(4);
+    index
+        .codex_parent_side_requests
+        .insert(SWEPT.into(), uncharged);
+    index
+        .codex_parent_side
+        .insert(SWEPT.into(), same_object_record(4));
+    index.save(&path).unwrap();
+    let mut index = ScanIndex::load(&path).unwrap();
+    let pass = begin_codex_side_pass(&cache, &path, &mut index);
+    let key = LedgerKey {
+        ns: pass.ns,
+        p: parent_of(SWEPT),
+        dev: uncharged.dev_ino.0,
+        ino: uncharged.dev_ino.1,
+    };
+    assert!(cache
+        .side_ledger()
+        .charge(key, LedgerEntry::of_request(&uncharged), 1_792_540_900)
+        .is_ok());
+    let mark = codex_side_save_mark(&cache, &path);
+    note_codex_side_pass_saved(&cache, &path, true, mark);
+    let sweep = index.sweep_codex_parent_side(true, Some((&cache, pass.ns)));
+    assert_eq!(sweep.requests_pruned, 1);
+    assert!(index.codex_parent_side_requests.is_empty());
+    assert_eq!(index.codex_parent_side[SWEPT].pace, None);
+    assert_eq!(cache.side_ledger().get(&key).unwrap().tag, LedgerTag::Gone);
 }

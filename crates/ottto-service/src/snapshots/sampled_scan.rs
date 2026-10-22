@@ -660,13 +660,18 @@ pub(super) fn copy_budget_step(
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
         return (0, StepMeasure::default());
     };
-    // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
-    // optional proof work never shrinks a copy budget; the admission and
-    // the insert retire the proof where its room is needed.
+    // U1a-2a (R2-B3, r79): main's view, any suspended proof charged as
+    // none, so optional proof work never shrinks a copy budget; it is no
+    // allocation authority either: before main's copy is allocated, a
+    // proof larger than the room the copy leaves is retired (`proof +
+    // copy <= room`), as the admission and the insert retire it.
     let resident = codex_cursor::bound_for_main(context, STATE_BYTES);
     let remaining = resident.and_then(|resident| STATE_BYTES.checked_sub(resident));
     let Some(active) = active else {
         let budget = remaining.map_or(0, |remaining| remaining / 2);
+        context
+            .cache
+            .retire_proof_over_room(remaining.map_or(0, |remaining| remaining - budget));
         return (
             budget,
             StepMeasure {
@@ -741,18 +746,15 @@ pub(super) fn copy_budget_step(
             )
         }
     };
-    // R2-B3: a suspended proof never holds bytes this step spends.
-    if let Some(room) = remaining
+    // R2-B3 (r79): a suspended proof never holds bytes this step spends;
+    // it is retired before the copy is allocated.
+    let room = remaining
         .zip(used)
-        .map(|(remaining, used)| remaining.saturating_sub(used))
-    {
-        context.cache.retire_proof_over_room(room);
-    }
-    let budget = remaining
-        .zip(used)
-        .and_then(|(remaining, used)| remaining.checked_sub(used))
-        .map(|remaining| remaining / 2)
-        .unwrap_or(0);
+        .and_then(|(remaining, used)| remaining.checked_sub(used));
+    let budget = room.map_or(0, |room| room / 2);
+    context
+        .cache
+        .retire_proof_over_room(room.map_or(0, |room| room - budget));
     (
         budget,
         StepMeasure {

@@ -2426,17 +2426,55 @@ pub(in crate::snapshots) struct SideSweep {
 /// (the destination index file), its outage gate, and that index file's
 /// path (the proof holder's binding, s row 31).
 ///
-/// TODO(U1a-2a G7 / side due / rows 31–32; `stage1/c14c15-answer.md` §2):
-/// Stage 1 continuation pages are exclusions for the side due and G7 (due
-/// only when `gate.side_allowed` and the page is not a continuation), the
-/// row 31 proof hook (no visit, start or finish; R2-M1 already gates them on
-/// `gate.side_allowed`) and the row 32 sweep. The continuation hook is the
-/// Stage 1 lease's, not added here.
+/// Stage 1 interface (`stage1/c14c15-answer.md` §2; parent r79): the four
+/// continuation exclusions are predicates of the pass's `kind`, so the
+/// Stage 1 lease only sets `CodexPageKind::Continuation`: no G7 charge, no
+/// side due, no row 31 proof hook (not even a held job's step or suspend)
+/// and no row 32 sweep. The ordinary save outage (`gate.side_allowed`
+/// false) is separate: no side due or G7, no proof visit, start or finish,
+/// but a held job may step fd-only and suspend, and the sweep runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct CodexSidePass {
     pub(in crate::snapshots) ns: u128,
     pub(in crate::snapshots) gate: sampled_scan::side_ledger::GateOpen,
     pub(in crate::snapshots) index_path: PathBuf,
+    pub(in crate::snapshots) kind: CodexPageKind,
+}
+impl CodexSidePass {
+    fn ordinary(&self) -> bool {
+        self.kind == CodexPageKind::Ordinary
+    }
+
+    /// G7 (row 15): a side read may be charged.
+    pub(in crate::snapshots) fn side_charge_allowed(&self) -> bool {
+        self.ordinary() && self.gate.side_allowed
+    }
+
+    /// Rows 5, 9: a side request may be due (or tombstoned by its due check).
+    pub(in crate::snapshots) fn side_due_allowed(&self) -> bool {
+        self.ordinary() && self.gate.side_allowed
+    }
+
+    /// Row 31: the proof hook may run at all (a held job's step or suspend
+    /// included).
+    pub(in crate::snapshots) fn proof_hook_allowed(&self) -> bool {
+        self.ordinary()
+    }
+
+    /// Row 32: the side sweep may mutate side state.
+    pub(in crate::snapshots) fn sweep_allowed(&self) -> bool {
+        self.ordinary()
+    }
+}
+
+/// U1a-2a (Stage 1 interface, parent r79): which page a Codex pass serves.
+/// Production builds only `Ordinary` until the Stage 1 lease adds
+/// continuation pages.
+#[cfg_attr(not(test), allow(dead_code))] // `Continuation` is Stage 1's
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum CodexPageKind {
+    Ordinary,
+    Continuation,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for CodexSidePass {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
@@ -2472,6 +2510,7 @@ pub(crate) fn begin_codex_side_pass(
         ns,
         gate,
         index_path: index_path.to_path_buf(),
+        kind: CodexPageKind::Ordinary,
     }
 }
 
@@ -16828,39 +16867,45 @@ impl CodexProofReaders {
         })
     }
 
-    /// R2-B1: whether the readers' charge and one more line fit `room`
-    /// (`run`). The estimate is not a strict bound: an accumulator that
-    /// regrows can add more than the bytes that caused it, for at most
-    /// `CHARGE_REFRESH_BYTES` of input (as main's E3), and a buffer's
-    /// doubling growth inside one line is covered by the line's own
-    /// `MAX_JSONL_LINE_BYTES` and the headroom `proof_room` keeps.
+    /// R2-B1, owner note 4 (r79): whether the readers' worst case through
+    /// one more line fits `room` (`run`), strictly. From a walk `W` (with
+    /// buffer capacity `B`) and `s` bytes consumed since (`s <
+    /// CHARGE_REFRESH_BYTES`), the readers hold at most
+    /// `W + (W - B) + 2s + ΔB` before the next line, and that line adds at
+    /// most `MAX_JSONL_LINE_BYTES`: E3's premise (retained growth is at
+    /// most the bytes consumed, at most doubled by a container's
+    /// doubling), plus one doubling of every walked non-buffer container,
+    /// plus the buffers' measured growth. The bound is charged whole here,
+    /// fresh walks included (`s = 0`), so a step never runs past
+    /// `room + MAX_JSONL_LINE_BYTES`; a miss re-walks, then shrinks the
+    /// buffers and re-walks.
     fn step_fits(&mut self, walk: &mut Option<ProofWalk>, room: usize) -> bool {
-        let fits = |charge: usize| {
-            charge
+        let buffers = self.buffers();
+        let worst = |walk: ProofWalk, since: usize, buffers: usize| {
+            walk.charge
+                .checked_add(walk.charge.saturating_sub(walk.buffers))?
+                .checked_add(since.checked_mul(2)?)?
+                .checked_add(buffers.saturating_sub(walk.buffers))?
                 .checked_add(MAX_JSONL_LINE_BYTES)
-                .is_some_and(|need| need <= room)
         };
+        let fits = |need: Option<usize>| need.is_some_and(|need| need <= room);
         let estimate = walk.and_then(|walk| {
             let since = self.consumed.checked_sub(walk.consumed)?;
             if since >= sampled_scan::codex_cursor::CHARGE_REFRESH_BYTES {
                 return None;
             }
-            Some(
-                walk.charge
-                    .saturating_add(usize::try_from(since).ok()?)
-                    .saturating_add(self.buffers().saturating_sub(walk.buffers)),
-            )
+            worst(walk, usize::try_from(since).ok()?, buffers)
         });
-        if estimate.is_some_and(fits) {
+        if fits(estimate) {
             return true;
         }
         *walk = self.walk();
-        if walk.is_some_and(|walk| fits(walk.charge)) {
+        if fits(walk.and_then(|walk| worst(walk, 0, walk.buffers))) {
             return true;
         }
         self.shrink_buffers();
         *walk = self.walk();
-        walk.is_some_and(|walk| fits(walk.charge))
+        fits(walk.and_then(|walk| worst(walk, 0, walk.buffers)))
     }
 
     fn step_child(&mut self, at: usize, next: u64, budget: &mut u64) {
@@ -17651,10 +17696,12 @@ impl ScanIndex {
     ///   clock and never prunes. A `Live` request that is unreferenced,
     ///   more than 2 wraps stale and holds no unproven ledger charge
     ///   (`prunable`: active and in-flight charges stay) is removed, its
-    ///   key ledger `Gone`, only where no pacing is lost (R2-M3): it never
-    ///   charged an attempt, or a same-object record takes its pacing as
-    ///   the stub first (`pace = max(existing, {not_before, 6})`, as a cure
-    ///   keeps it), so a re-reference re-arms at 6 attempts, never fewer.
+    ///   only where no pacing is lost (R2-M3, r79): it never charged an
+    ///   attempt (its key ends `Gone`), or P's same-object record covers its
+    ///   need and takes its pacing first, in the cure's custody: `pace =
+    ///   max(existing, {not_before, 6})` and the key turns `Removed` with
+    ///   the stub, so a failed save is restored by C14's covering-record
+    ///   hydrate and a re-reference re-arms at 6 attempts, never fewer.
     ///   Otherwise it is kept. Tombstones are not epoch-pruned (rev 15 §5;
     ///   saved ones leave the ledger by C14 (a), and they leave the index by
     ///   a cure, the orphan sweep or replay), so no pacing of an unchanged
@@ -17671,6 +17718,7 @@ impl ScanIndex {
         census_valid: bool,
         side: Option<(&sampled_scan::SharedCache, u128)>,
     ) -> SideSweep {
+        use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
         use std::ops::Bound::{Excluded, Unbounded};
         let mut sweep = SideSweep::default();
         let lower = self
@@ -17734,13 +17782,14 @@ impl ScanIndex {
                 }
                 _ => None,
             };
-            // R2-M3: no pacing is lost (an attempt was charged and no
-            // same-object record can carry it): keep the request.
+            // R2-M3 (r79): no pacing is lost. A charged request goes only
+            // as the cure removes one: onto P's same-object record covering
+            // its need, whose pace keeps it; otherwise it is kept.
             let prune_request = prune_request.filter(|request| {
-                let record_keeps_pacing = self
-                    .codex_parent_side
-                    .get(&key)
-                    .is_some_and(|record| record.parsed.dev_ino() == request.dev_ino);
+                let record_keeps_pacing = self.codex_parent_side.get(&key).is_some_and(|record| {
+                    record.parsed.dev_ino() == request.dev_ino
+                        && record.seal.sealed_offset() >= request.needed_extent
+                });
                 request.attempts == 0
                     || (record_keeps_pacing && request.attempts < SIDE_REQUEST_EVICT_ATTEMPTS)
             });
@@ -17758,7 +17807,13 @@ impl ScanIndex {
                         cache.side_ledger().prunable(&ledger_key)
                     });
                 if prunable {
-                    if attempts > 0 {
+                    // The same custody as the cure: the record's pace takes
+                    // `max(existing, stub)` and the key turns `Removed` with
+                    // the stub, so a failed save is restored by C14's
+                    // covering-record hydrate and a saved one prunes (b).
+                    // Uncharged: the key's generation ends.
+                    let carried = attempts > 0;
+                    if carried {
                         if let Some(record) = self.codex_parent_side.get_mut(&key) {
                             record.pace = Some(SidePace::merged(
                                 record.pace,
@@ -17771,7 +17826,20 @@ impl ScanIndex {
                     }
                     self.codex_parent_side_requests.remove(&key);
                     if let Some(((cache, _), ledger_key)) = side.zip(ledger_key) {
-                        cache.side_ledger().end_key(&ledger_key);
+                        let mut ledger = cache.side_ledger();
+                        match ledger.get(&ledger_key).copied() {
+                            Some(entry) if carried => {
+                                ledger.write_existing(
+                                    &ledger_key,
+                                    LedgerEntry {
+                                        tag: LedgerTag::Removed,
+                                        stub_not_before: not_before_unix_seconds,
+                                        ..entry
+                                    },
+                                );
+                            }
+                            _ => ledger.end_key(&ledger_key),
+                        }
                     }
                     sweep.requests_pruned += 1;
                 }
@@ -19098,10 +19166,8 @@ impl ScanIndex {
     /// other false term counts `side_not_due`. `terms` is evaluated only
     /// when P has a `Live` view.
     ///
-    /// TODO(U1a-2a; `stage1/c14c15-answer.md` §2): a Stage 1 continuation
-    /// page must not be a side due, run the row 31 proof hook's visit, start
-    /// or finish, or the row 32 sweep (`CodexSidePass`). That hook is the
-    /// Stage 1 lease's and is not added here.
+    /// A continuation page (`CodexSidePass::side_due_allowed`, Stage 1) is
+    /// never due and writes nothing.
     pub(in crate::snapshots) fn codex_parent_side_request_due(
         &mut self,
         p_key: &str,
@@ -19112,6 +19178,9 @@ impl ScanIndex {
         terms: impl FnOnce() -> SideDueTerms,
     ) -> bool {
         use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        if !pass.ordinary() {
+            return false;
+        }
         let side = Some((cache, pass.ns));
         let entry =
             side_ledger_entry(side, p_key, at.dev_ino).filter(|e| e.state_extent <= at.size);
@@ -19135,7 +19204,7 @@ impl ScanIndex {
             count(Event::RequestTombstoned);
             return false;
         }
-        let due = pass.gate.side_allowed
+        let due = pass.side_due_allowed()
             && request.not_before_unix_seconds <= now
             && at.size >= request.needed_extent
             // 2a: singleton only.
@@ -19158,7 +19227,9 @@ impl ScanIndex {
     /// ctime now, written to the ledger (the only creator; the caller's
     /// namespace is never evicted) and then to the index. A refused charge
     /// (ledger full, layout unsupported) writes nothing and is not due.
-    /// Returns the charged attempts.
+    /// Returns the charged attempts. A pass that may not charge
+    /// (`CodexSidePass::side_charge_allowed`: a continuation page or the
+    /// save outage) charges nothing.
     pub(in crate::snapshots) fn charge_codex_parent_side_read(
         &mut self,
         p_key: &str,
@@ -19168,6 +19239,9 @@ impl ScanIndex {
         pass: &CodexSidePass,
     ) -> Option<u8> {
         use crate::local_resource_diagnostics::codex_side_lifecycle::{record as count, Event};
+        if !pass.side_charge_allowed() {
+            return None;
+        }
         let side = Some((cache, pass.ns));
         let loaded_attempts = self
             .codex_parent_side_requests

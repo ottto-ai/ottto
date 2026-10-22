@@ -725,6 +725,47 @@ pub(in crate::snapshots) struct ProofJob {
 crate::heap_layout_bound::fields!(ProofJob; namespace, index_path, incarnation, entries,
     next_row_end, touched_page, readers);
 
+/// U1a-2a (owner note 3, parent r79): what a suspended job that was retired
+/// (main's admission, insert, release or copy step, or another index's
+/// stale take) leaves for its own index's next hook: its entries, which
+/// that hook backs off (`take_retired_proof_entries`). The readers are
+/// freed at the retirement. At most `RETIRED_PROOFS` wait; a later one
+/// replaces the oldest. Charged in the cursor state's bound.
+pub(in crate::snapshots) struct RetiredProof {
+    namespace: String,
+    index_path: PathBuf,
+    incarnation: String,
+    entries: Vec<(String, u64)>,
+}
+crate::heap_layout_bound::fields!(RetiredProof; namespace, index_path, incarnation, entries);
+
+/// The most retired jobs waiting for their index's hook.
+const RETIRED_PROOFS: usize = 4;
+
+/// Retire the suspended job, if any (under the cursor lock; its readers are
+/// freed here, and a `ProofJob` drop takes no lock), keeping its entries
+/// for its index's next hook. The caller counts the drop's cause.
+fn retire_holder(cursor: &mut CursorState) {
+    if let ProofHolder::Suspended { job, .. } = std::mem::take(&mut cursor.proof) {
+        let ProofJob {
+            namespace,
+            index_path,
+            incarnation,
+            entries,
+            ..
+        } = *job;
+        if cursor.proof_retired.len() >= RETIRED_PROOFS {
+            cursor.proof_retired.remove(0);
+        }
+        cursor.proof_retired.push(RetiredProof {
+            namespace,
+            index_path,
+            incarnation,
+            entries,
+        });
+    }
+}
+
 /// U1a-2a (cc row 1): the one suspended proof job, process-wide. A running
 /// job is out of the holder, in the step's `ProofLease` (charged 0 here);
 /// `Suspended` is charged its walked bound, measured once at suspend.
@@ -964,7 +1005,7 @@ fn retire_suspended_proof_over(
         })
         .is_some();
     if !fits {
-        cursor.proof = ProofHolder::None;
+        retire_holder(cursor);
     }
     !fits
 }
@@ -1386,6 +1427,9 @@ pub(in crate::snapshots) struct CursorState {
     parent_restarts: ParentRestarts,
     /// U1a-2a (cc row 1): the one suspended proof job, never in `slot`.
     proof: ProofHolder,
+    /// U1a-2a (owner note 3, r79): retired jobs' entries, for their index's
+    /// next hook (≤ `RETIRED_PROOFS`).
+    proof_retired: Vec<RetiredProof>,
     /// U1a-2a (cc row 1): proof batches' rotation (the `Rotation` shape;
     /// its page follows `rotation.page`).
     proof_rotation: Rotation,
@@ -1416,6 +1460,7 @@ impl Default for CursorState {
             parents: BTreeMap::new(),
             parent_restarts: ParentRestarts::default(),
             proof: ProofHolder::None,
+            proof_retired: Vec::new(),
             proof_rotation: Rotation::default(),
             proof_due: None,
         }
@@ -1443,6 +1488,7 @@ impl HeapLayoutBound for CursorState {
             parents,
             parent_restarts,
             proof,
+            proof_retired,
             proof_rotation,
             proof_due,
         } = self;
@@ -1471,6 +1517,7 @@ impl HeapLayoutBound for CursorState {
         parent_restarts.heap_bound(c)?;
         // U1a-2a: a suspended proof is charged its walked bound.
         proof.heap_bound(c)?;
+        proof_retired.heap_bound(c)?;
         proof_rotation.heap_bound(c)?;
         proof_due.heap_bound(c)
     }
@@ -2897,16 +2944,20 @@ impl SharedCache {
         self.with_cursor(|cursor| drop_suspended_proof_over(retained, cursor, 0, budget));
     }
 
-    /// U1a-2a (R2-B3): main's copy-budget step left `room` bytes free in
-    /// main's view (`bound_for_main`). A suspended proof larger than that is
-    /// spending bytes main now uses, so it is retired here (retained, then
-    /// cursor; the box is freed under them), counted `side_proof_drops`.
-    /// Otherwise nothing is locked beyond one `try_lock` read.
-    pub(super) fn retire_proof_over_room(&self, room: usize) {
-        let over = self
-            .cursor
-            .try_lock()
-            .is_ok_and(|cursor| cursor.proof.charge() > room);
+    /// U1a-2a (R2-B3, r79): main's copy-budget step, before it allocates its
+    /// copy, leaves `room` bytes beside that copy in main's view
+    /// (`bound_for_main`). A suspended proof larger than that would spend
+    /// bytes main is about to use, so it is retired here (retained, then
+    /// cursor; the readers are freed under them, the entries kept for the
+    /// index's next hook), counted `side_proof_drops`. Otherwise nothing is
+    /// locked beyond one `try_lock` read; a cursor busy elsewhere is decided
+    /// under the locks, never skipped.
+    pub(in crate::snapshots) fn retire_proof_over_room(&self, room: usize) {
+        let over = match self.cursor.try_lock() {
+            Ok(cursor) => cursor.proof.charge() > room,
+            Err(std::sync::TryLockError::WouldBlock) => true,
+            Err(std::sync::TryLockError::Poisoned(_)) => false,
+        };
         if !over {
             return;
         }
@@ -2915,7 +2966,7 @@ impl SharedCache {
         };
         self.with_cursor(|cursor| {
             if cursor.proof.charge() > room {
-                cursor.proof = ProofHolder::None;
+                retire_holder(cursor);
                 record_proof_drop();
             }
         });
@@ -2995,7 +3046,7 @@ impl SharedCache {
             if !own && live {
                 return Claim::Busy;
             }
-            cursor.proof = ProofHolder::None;
+            retire_holder(cursor);
             Claim::Free { dropped: true }
         });
         match claim {
@@ -3008,6 +3059,32 @@ impl SharedCache {
             }
             Some(Claim::Busy) | None => ProofTake::Busy,
         }
+    }
+
+    /// U1a-2a (owner note 3, r79): the entries of every retired job of index
+    /// (`namespace`, `index_path`, `incarnation`), taken out; a retired job
+    /// of the same index under another incarnation is discarded (its
+    /// entries no longer match).
+    pub(in crate::snapshots) fn take_retired_proof_entries(
+        &self,
+        namespace: &Scope,
+        index_path: &Path,
+        incarnation: &str,
+    ) -> Vec<(String, u64)> {
+        self.with_cursor(|cursor| {
+            let mut taken = Vec::new();
+            cursor.proof_retired.retain_mut(|retired| {
+                if retired.namespace != namespace.0 || retired.index_path != index_path {
+                    return true;
+                }
+                if retired.incarnation == incarnation {
+                    taken.append(&mut retired.entries);
+                }
+                false
+            });
+            taken
+        })
+        .unwrap_or_default()
     }
 
     /// U1a-2a (cc row 8, rev 10 §6.1): `namespace`'s proof hook ran on this

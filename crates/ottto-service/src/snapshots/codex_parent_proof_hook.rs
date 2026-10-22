@@ -102,6 +102,11 @@ pub(super) fn codex_parent_proof_step(
     page: &mut PageBudget,
     now: u64,
 ) {
+    // Stage 1 (parent r79): a continuation page runs no part of the hook,
+    // not even a held job's step or suspend.
+    if !pass.proof_hook_allowed() {
+        return;
+    }
     let side = Some((&*context.cache, pass.ns));
     let census_valid = identities.census_valid();
     // R2-M1: a pass the side gate closes (the outage after a failed save;
@@ -109,7 +114,9 @@ pub(super) fn codex_parent_proof_step(
     // held job only steps fd-only and suspends.
     let side_allowed = pass.gate.side_allowed;
     // Step 1: prune first, metadata only, whatever the holder or budget.
-    index.sweep_codex_parent_side(census_valid, side);
+    if pass.sweep_allowed() {
+        index.sweep_codex_parent_side(census_valid, side);
+    }
     // A job never binds to an unminted index (row 35). Only proof work
     // adopts the incarnation (its first binding use).
     let incarnation = if index.codex_parent_prefix_proofs.is_empty() {
@@ -119,6 +126,25 @@ pub(super) fn codex_parent_proof_step(
     };
     if incarnation.is_empty() {
         return;
+    }
+    // Owner note 3 (r79): a job of this index that main retired (or another
+    // index dropped) while suspended backs every entry off before the visit,
+    // so main's retirements pace restarts instead of repeating them.
+    for (key, seq) in
+        context
+            .cache
+            .take_retired_proof_entries(&context.namespace, &pass.index_path, &incarnation)
+    {
+        index.finish_codex_parent_proof_entry(
+            &key,
+            seq,
+            &incarnation,
+            ProofFinish::Attempt {
+                outcome: ProofOutcome::MemoryRefused,
+                wake: ProofWake::Backoff,
+            },
+            now,
+        );
     }
     let reserve = codex_proof_step_reserve();
     let mut lease =

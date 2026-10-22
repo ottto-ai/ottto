@@ -83,6 +83,7 @@ fn pass(side_allowed: bool) -> CodexSidePass {
             first_in_process: false,
         },
         index_path: PathBuf::from(INDEX_PATH),
+        kind: CodexPageKind::Ordinary,
     }
 }
 
@@ -395,6 +396,7 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
             first_in_process: true,
         },
         index_path: PathBuf::from(INDEX_PATH),
+        kind: CodexPageKind::Ordinary,
     };
     let (attempts, counts) =
         observe(|| index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &first));
@@ -435,6 +437,77 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
     );
     assert_eq!(index.codex_parent_side_requests[&fixture.key()], lossy);
     assert!(ledger_entry(&fresh, &fixture).is_none());
+}
+
+/// Stage 1 (parent r79): a continuation page is never side-due and never
+/// charges G7, whatever its gate: a worn request is not tombstoned by its
+/// due check (no write, no count) and a due one is not charged (no ledger
+/// entry). The same request on an ordinary page is the control.
+#[test]
+fn a_continuation_page_is_never_due_and_charges_nothing() {
+    let fixture = Root::new(1, b"");
+    let at = fixture.at();
+    let cache = sampled_scan::SharedCache::default();
+    let continuation = CodexSidePass {
+        kind: CodexPageKind::Continuation,
+        ..pass(true)
+    };
+    let mut worn = request_for(&fixture, at.size);
+    worn.attempts = SIDE_REQUEST_EVICT_ATTEMPTS;
+    let mut index = ScanIndex::default();
+    index.codex_parent_side_requests.insert(fixture.key(), worn);
+    let (due, counts) = observe(|| {
+        index.codex_parent_side_request_due(
+            &fixture.key(),
+            at,
+            1_000,
+            &cache,
+            &continuation,
+            || -> SideDueTerms { unreachable!("a continuation reads no due terms") },
+        )
+    });
+    assert!(!due);
+    assert_eq!(counts, Counts::default(), "nothing counted");
+    assert_eq!(index.codex_parent_side_requests[&fixture.key()], worn);
+    assert!(ledger_entry(&cache, &fixture).is_none());
+    // G7: a request the ordinary page would charge.
+    let request = request_for(&fixture, at.size);
+    index
+        .codex_parent_side_requests
+        .insert(fixture.key(), request);
+    assert_eq!(
+        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &continuation),
+        None
+    );
+    assert_eq!(index.codex_parent_side_requests[&fixture.key()], request);
+    assert!(ledger_entry(&cache, &fixture).is_none());
+    // The control: an ordinary page charges it, and tombstones the worn one.
+    assert_eq!(
+        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
+        Some(1)
+    );
+    assert!(ledger_entry(&cache, &fixture).is_some());
+    let mut worn_index = ScanIndex::default();
+    worn_index
+        .codex_parent_side_requests
+        .insert(fixture.key(), worn);
+    let fresh = sampled_scan::SharedCache::default();
+    let (due, counts) = observe(|| {
+        worn_index.codex_parent_side_request_due(
+            &fixture.key(),
+            at,
+            1_000,
+            &fresh,
+            &pass(true),
+            || -> SideDueTerms { unreachable!("a worn request is not due") },
+        )
+    });
+    assert!(!due);
+    assert_eq!(counts.side_requests_tombstoned, 1);
+    assert_eq!(
+        worn_index.codex_parent_side_requests[&fixture.key()].state,
+        SideRequestState::Evicted
+    );
 }
 
 #[test]

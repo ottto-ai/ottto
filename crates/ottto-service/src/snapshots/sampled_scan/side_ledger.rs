@@ -701,9 +701,10 @@ impl SideLedger {
             .map(|(key, _)| *key)
             .collect::<std::collections::BTreeSet<_>>();
         self.prune(ns, |key, entry| {
-            // (c) P left the index.
+            // (c) P left the index, and a successful selected save holds
+            // that (R2-L7, r79): an unsaved charge keeps its custody.
             let Some(p_key) = keys.get(&key.p) else {
-                return wanted.contains(&key.p);
+                return wanted.contains(&key.p) && covered.contains(key);
             };
             let record = records.get(p_key);
             // (c) the saved record is for another object.
@@ -1215,6 +1216,37 @@ mod tests {
         let mut quiet = SideLedger::default();
         quiet.begin_index_pass(ns, 100, &mut index);
         assert_eq!(index.codex_parent_side_requests, before);
+    }
+
+    /// R2-L7 (r79): P's leaving the index prunes its entry only once a
+    /// successful selected save holds it; an unsaved charge keeps custody.
+    #[test]
+    fn p_left_the_index_prunes_only_saved_charges() {
+        let ns = 13;
+        let left = LedgerKey {
+            ns,
+            p: parent_of("/left"),
+            dev: 1,
+            ino: 7,
+        };
+        let mut index = crate::snapshots::ScanIndex::default();
+        index.files.insert("/other".into(), file_entry());
+        let mut ledger = SideLedger::default();
+        ledger.begin_pass(ns, 50);
+        let charged = stamped(
+            &mut ledger,
+            LedgerEntry {
+                attempts: 3,
+                ..entry()
+            },
+        );
+        ledger.entries.insert(left, charged);
+        ledger.begin_index_pass(ns, 100, &mut index);
+        assert_eq!(ledger.get(&left), Some(&charged), "unsaved: kept");
+        let mark = ledger.save_mark(ns);
+        ledger.note_saved(ns, 110, false, mark);
+        ledger.begin_index_pass(ns, 200, &mut index);
+        assert_eq!(ledger.get(&left), None, "saved: pruned");
     }
 
     /// `entry` as the ledger's next write would stamp it.

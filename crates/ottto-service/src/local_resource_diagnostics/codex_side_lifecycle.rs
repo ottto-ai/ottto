@@ -53,7 +53,10 @@ counters! {
     side_not_due: NotDue,
     // Ledger housekeeping: a lossless eviction or a replaced gate slot.
     side_ledger_evictions: LedgerEviction,
-    // A proof item was dropped or a proof page was skipped (not counting
+    // A proof item was dropped or a proof page was skipped: a page whose due
+    // proof work never reached the hook, a page with no leftover for one step, a memory-refused step, a refused suspend, a
+    // suspended proof retired by main (admission, insert, copy step) or by
+    // another index's take, a held lease dropped unfinished (not counting
     // `side_proof_release_drops`).
     side_proof_drops: ProofDrop,
     // M1's release to fit retired a suspended proof before evicting any
