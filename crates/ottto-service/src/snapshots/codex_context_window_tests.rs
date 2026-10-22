@@ -363,6 +363,10 @@ fn codex_fork_child_windows_come_from_owned_records_only() {
     assert_eq!(pairs(&bare), [(Some(100), None); 3]);
 }
 
+/// Wire-shape guard only: no Claude or Pi parser writes the windows today, so
+/// this pins that their uploads carry none of the keys (even when a record
+/// happens to hold a `model_context_window`). It does not reach finish's
+/// Codex-only emit guard.
 #[test]
 fn claude_and_pi_emit_no_window_fields() {
     let claude = TempJsonl::new(
