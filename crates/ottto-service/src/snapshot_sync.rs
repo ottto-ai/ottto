@@ -2505,6 +2505,137 @@ fn deferred_entity_state(permanent: bool) -> CollectorState<'static> {
     }
 }
 
+/// Current permanent refusals in the upload ledger. Content-free: counts only.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct PermanentRefusalCounts {
+    total: usize,
+    /// Refusals the backend already dominates with an accepted record.
+    dominated: usize,
+}
+
+impl PermanentRefusalCounts {
+    /// A refusal counts as dominated only while its quarantine record is still
+    /// the terminal record for the same refused body. A newer body of that
+    /// entity with a pending outcome, such as a retryable conflict, owes its
+    /// own result, so the older refusal then counts as other.
+    fn of(progress: &SnapshotUploadProgress) -> Self {
+        progress.permanent_rejections.iter().fold(
+            Self::default(),
+            |mut counts, (fingerprint, refusal)| {
+                counts.total += 1;
+                if Self::is_dominated(progress, fingerprint, refusal) {
+                    counts.dominated += 1;
+                }
+                counts
+            },
+        )
+    }
+
+    /// Dominated refusals whose reason is an authority downgrade. That guard
+    /// has refused real growth before, so the local log keeps their own count.
+    fn authority_downgrades(progress: &SnapshotUploadProgress) -> usize {
+        progress
+            .permanent_rejections
+            .iter()
+            .filter(|(fingerprint, refusal)| {
+                refusal.reason
+                    == crate::upload_receipts::RejectedUsageReason::UsageAccountingAuthorityDowngrade
+                    && Self::is_dominated(progress, fingerprint, refusal)
+            })
+            .count()
+    }
+
+    fn is_dominated(
+        progress: &SnapshotUploadProgress,
+        fingerprint: &str,
+        refusal: &PermanentSnapshotRejection,
+    ) -> bool {
+        refusal.reason.is_dominated()
+            && progress
+                .quarantined_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    matches!(
+                        record.disposition,
+                        SnapshotQuarantineDisposition::UnprovenTerminal
+                            | SnapshotQuarantineDisposition::SupersededTerminal
+                    ) && record.upload_body_witness.as_deref()
+                        == Some(refusal.body_witness.as_str())
+                })
+    }
+}
+
+/// Last retained-refusal log line per source. A quiet cycle that re-discloses
+/// the same list does not log it again.
+static SOURCE_REFUSAL_LOGS: OnceLock<Mutex<BTreeMap<&'static str, RefusalLogLine>>> =
+    OnceLock::new();
+
+/// Retained refusal counts, the authority-downgrade share of the dominated
+/// ones, and whether they were reported as settled residue.
+type RefusalLogLine = (PermanentRefusalCounts, usize, bool);
+
+/// Content-free, local-only: counts of the refusals retained this cycle, with
+/// the dominated ones split by reason, and whether the cycle reported them as
+/// settled residue. Logs on change only; each refusal is also logged with its
+/// reason when it arrives.
+fn log_retained_permanent_refusals(
+    source: SnapshotSource,
+    retained: PermanentRefusalCounts,
+    authority_downgrades: usize,
+    settled_residue: bool,
+) {
+    let line = (retained, authority_downgrades, settled_residue);
+    let changed = match SOURCE_REFUSAL_LOGS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+    {
+        Ok(mut logged) => logged.insert(source.api_slug(), line) != Some(line),
+        Err(_) => true,
+    };
+    if !changed || retained.dominated == 0 {
+        return;
+    }
+    eprintln!(
+        "local snapshot sync retains {} dominated ({} usage_accounting_authority_downgrade, {} \
+         accepted_log_stale_older_upload) and {} other permanent refusal(s) for {}{}",
+        retained.dominated,
+        authority_downgrades,
+        retained.dominated - authority_downgrades,
+        retained.total - retained.dominated,
+        source.api_slug(),
+        if settled_residue {
+            "; reported as settled residue the backend already owns"
+        } else {
+            ""
+        }
+    );
+}
+
+/// Terminal state for a cycle that ends with deferred or refused entities.
+///
+/// A settled cycle whose every retained permanent refusal is dominated lost
+/// no usage the backend does not already own. It reports `Success`: each
+/// refused body is still bound to, and disclosed through, its terminal
+/// quarantine record, so the receipt builder names it as settled
+/// `census_residue` under the backend's admission and in the legacy shape
+/// otherwise. No refused body becomes accepted. Any other refusal, a hold, a
+/// conflict, or a refusal whose entity has a pending newer body is unchanged.
+fn refused_entity_state(
+    permanent: bool,
+    refusals: PermanentRefusalCounts,
+    upload_fully_settled: bool,
+) -> CollectorState<'static> {
+    if permanent
+        && upload_fully_settled
+        && refusals.total > 0
+        && refusals.dominated == refusals.total
+    {
+        CollectorState::Success
+    } else {
+        deferred_entity_state(permanent)
+    }
+}
+
 #[derive(Debug)]
 enum CollectorState<'a> {
     Success,
@@ -5842,6 +5973,9 @@ fn finish_sync_source(
         deferred_entity_count = Some(retained_permanent);
         resolved_permanent_rejections = true;
     }
+    // The whole ledger, before the current-entity prune below: a refusal from
+    // this page that is not current still keeps its reported reason.
+    let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
     settle_context_curve_replay_state(
         &mut index,
@@ -5972,9 +6106,25 @@ fn finish_sync_source(
     upload_progress
         .permanent_rejections
         .retain(|fingerprint, _| current_entities.contains(fingerprint));
+    // Before `finish_cycle` retires this cycle's quarantine records.
+    let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
+    let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
+        let state = refused_entity_state(
+            resolved_permanent_rejections,
+            permanent_refusals,
+            upload_fully_settled,
+        );
+        if resolved_permanent_rejections {
+            log_retained_permanent_refusals(
+                source,
+                retained_refusals,
+                retained_downgrades,
+                matches!(state, CollectorState::Success),
+            );
+        }
         // The uploader drained its frozen, scan-capped queue before returning
         // `Deferred`, and the index above now owns both accepted siblings and
         // entity quarantine. Surface the conflict only after those
@@ -5998,7 +6148,7 @@ fn finish_sync_source(
                 scan_started_at: terminal_scan_started_at,
                 counts: SyncCounts::from_scan_result(&scan_result, accepted, receipt_window_days)
                     .with_snapshot_terminal_counts(&index),
-                state: deferred_entity_state(resolved_permanent_rejections),
+                state,
             },
             scan_result.codex_counting_v2.as_deref(),
         );
@@ -18804,6 +18954,9 @@ mod tests {
         include!("snapshot_sync/p12_pipeline_original_tests.rs");
         mod proof_rearm_idempotence_pipeline_tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
+            mod stale_family_carry_pipeline_tests {
+                include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
+            }
         }
     }
 
