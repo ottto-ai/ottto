@@ -885,7 +885,7 @@ impl MoneyTail {
 
 /// Every shard of `ledger` written to `support` (the writer's crash order).
 fn money_save_all(support: &Path, ledger: &mut ClaudeLedger) {
-    let mut failed = BTreeSet::new();
+    let mut failed = store::WriterState::default();
     for _ in 0..1024 {
         match store::save_page_for_test(support, ledger, &mut failed) {
             Some((_, _, 0)) => {}
@@ -933,6 +933,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
     tail.append(session, head);
     let counts = tail.advance(&mut ledger, &budget);
     assert_eq!(counts.rows_valid, 0);
+    assert!(counts.sweep_debt, "a partial last line is not read yet");
     assert_eq!(ledger.get(&key).unwrap().tail().unwrap().offset, len);
     tail.append(session, rest);
     let counts = tail.advance(&mut ledger, &budget);
@@ -1245,6 +1246,21 @@ fn money_rows_converge_by_tailing_long_sidecars() {
         &["absent-root"],
     );
     assert_eq!(roots["absent-root"], ClaudeRootTelemetry::Absent);
+
+    // A page root whose sidecar is gone loses its saved claims at once.
+    std::fs::remove_file(tail.path(session)).unwrap();
+    let (counts, roots) = tail.page(
+        &mut ledger,
+        &budget,
+        1_800_000_000,
+        &mut money_work(1 << 20),
+        &[session],
+    );
+    assert_eq!(roots[session], ClaudeRootTelemetry::Absent);
+    assert_eq!(counts.retired_missing, 1, "{counts:?}");
+    assert!(counts.certificate_dropped >= 1, "{counts:?}");
+    assert!(ledger.get(&key).is_none());
+    assert_eq!(telemetry_complete_through(&ledger), 0);
 }
 
 /// Sol N4: a read whose object was replaced, or rewritten in place, between
@@ -1388,7 +1404,7 @@ fn money_lost_claims_are_durable_debt() {
         debt: 0,
     };
     save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_000, certified);
-    let mut failed = BTreeSet::new();
+    let mut failed = store::WriterState::default();
     assert_eq!(
         store::save_page_for_test(&support, &mut ledger, &mut failed),
         Some((257, false, 0)),
@@ -1438,6 +1454,71 @@ fn money_lost_claims_are_durable_debt() {
     assert!(!loaded.load_damaged);
     assert!(loaded.get(&otel).is_none());
     assert_eq!(telemetry_complete_through(&loaded), 1_800_000_100);
+}
+
+/// AutoReview (round 2): a debt-carrying meta that failed to write is a
+/// barrier for the writer, not only for its own batch: a batch queued
+/// before the failure came back writes no data shard either, so the disk
+/// never holds a deletion under the old certificate.
+#[test]
+fn money_failed_debt_meta_blocks_later_batches() {
+    use crate::claude_local_otel::telemetry_tail::{drop_certificate, save_sweep};
+    let scratch = crate::test_scratch::ScratchDir::new("money-ledger-debt-barrier");
+    let support = scratch.join("support");
+    let mut ledger = ClaudeLedger::new_for_test();
+    let otel = telemetry_key("root");
+    let record = |count| {
+        ClaudeRequestCensusRecord::telemetry(
+            (1..=count).collect(),
+            money_facts("root", count as usize),
+            ClaudeTelemetryTailState::default(),
+            1,
+        )
+    };
+    let _ = ledger.insert(otel.clone(), record(2));
+    let certified = ClaudeLedgerSweep {
+        complete_through: 1_799_000_000,
+        debt: 0,
+    };
+    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_000, certified);
+    money_save_all(&support, &mut ledger);
+
+    // The meta cannot be written; the claims go and the certificate with them.
+    let meta = store::shard_path_for_test(&support, "sweep:tail").with_extension("json.tmp");
+    std::fs::create_dir_all(meta.join("blocked")).unwrap();
+    ledger.remove(&otel);
+    drop_certificate(&mut ledger, 1_800_000_100);
+    let first = store::take_save_for_test(&mut ledger).expect("the debt batch");
+    // A later change, queued before the first batch's result comes back.
+    let other = (0..)
+        .map(|number| telemetry_key(&format!("other-{number}")))
+        .find(|key| store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel))
+        .unwrap();
+    let _ = ledger.insert(other.clone(), record(1));
+    let second = store::take_save_for_test(&mut ledger).expect("the later batch");
+    let mut state = store::WriterState::default();
+    let (unwritten, meta_unwritten) = store::write_save_for_test(&support, &first, &mut state);
+    assert_eq!((unwritten.len(), meta_unwritten), (1, Some(true)));
+    let (unwritten, _) = store::write_save_for_test(&support, &second, &mut state);
+    assert_eq!(unwritten.len(), 1, "the barrier holds the later batch");
+    let loaded = store::load_for_test(&support);
+    assert!(loaded.get(&otel).is_some(), "nothing was deleted on disk");
+    assert!(loaded.get(&other).is_none());
+    assert_eq!(telemetry_complete_through(&loaded), 1_799_000_000);
+
+    // Once the meta can be written, the debt lands first, then the shards.
+    std::fs::remove_dir_all(&meta).unwrap();
+    store::restore_for_test(&mut ledger, &[&first, &second]);
+    let mut failed = state;
+    for _ in 0..8 {
+        if store::save_page_for_test(&support, &mut ledger, &mut failed).is_none() {
+            break;
+        }
+    }
+    let loaded = store::load_for_test(&support);
+    assert!(loaded.get(&otel).is_none());
+    assert!(loaded.get(&other).is_some());
+    assert_eq!(telemetry_complete_through(&loaded), 0);
 }
 
 /// A missing or corrupt ledger shard at load is damage (the page drops the
@@ -1783,6 +1864,22 @@ fn money_scope_debt_blocks_negative_membership_claims() {
         .index
         .claude_request_census_mut_for_test()
         .invalidate_keeping_birth_for_test(&a);
+    assert_eq!(
+        ledger.classify("req_own", &ledger.b, "B", &none),
+        ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
+    );
+    // A retained record of a member the index no longer lists (residue):
+    // its ids are no holder, so it blocks too.
+    let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
+    ledger.index.claude_request_census_mut_for_test().insert_for_test(
+        "/m/projects/-repo/R.jsonl",
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &money_fingerprint('d'),
+            7,
+            ClaudeRequestCensusShape::Lossy,
+            vec![1],
+        ),
+    );
     assert_eq!(
         ledger.classify("req_own", &ledger.b, "B", &none),
         ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
@@ -2211,7 +2308,7 @@ fn money_m4_sized_ledger_and_page_are_measured() {
 
     // The whole ledger saved, then loaded (a restart).
     let started = Instant::now();
-    let mut failed = BTreeSet::new();
+    let mut failed = store::WriterState::default();
     let mut save_pages = 0;
     while let Some((_, _, unwritten)) =
         store::save_page_for_test(&support, &mut ledger, &mut failed)

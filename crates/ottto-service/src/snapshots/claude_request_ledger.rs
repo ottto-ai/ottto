@@ -344,6 +344,13 @@ struct FileDebt(ClaudeScopeDebt);
 fn file_debt(index: &ScanIndex, ledger: &ClaudeRequestCensus, key: &str) -> FileDebt {
     let mut debt = ClaudeScopeDebt::default();
     let Some(entry) = index.files.get(key) else {
+        // A census record of an unindexed member (residue) is never a
+        // current holder: its ids are unknown, unless it is retired.
+        match index.claude_request_census.get(key) {
+            Some(record) if record.over_budget() => debt.over_budget = 1,
+            Some(record) if record.retired().is_none() => debt.stale = 1,
+            _ => {}
+        }
         return FileDebt(debt);
     };
     match index.claude_request_census.get(key) {
@@ -409,7 +416,15 @@ impl ClaudeLedgerScope {
         deadline: Instant,
     ) -> Option<Self> {
         let mut scope = Self::default();
-        for key in index.files.keys() {
+        // Every indexed file, and every retained census record of a member
+        // the index no longer lists (residue): its ids are no holder, so it
+        // must count against the completeness it would otherwise break.
+        let residue = index
+            .claude_request_census
+            .records()
+            .map(|(key, _)| key)
+            .filter(|key| !index.files.contains_key(*key));
+        for key in index.files.keys().chain(residue) {
             if Instant::now() >= deadline {
                 return None;
             }

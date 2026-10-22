@@ -967,8 +967,11 @@ pub(crate) fn shadow_page_at(
         .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES))
         .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
         .saturating_add(claude_request_ledger::scope_bound(
-            index.files.len(),
-            key_bytes,
+            index
+                .files
+                .len()
+                .saturating_add(index.claude_request_census.record_count()),
+            key_bytes.saturating_mul(2),
         ))
         .saturating_add(roots.len().saturating_mul(FAMILY_BYTES))
         .saturating_add(index.files.len().saturating_mul(64))
@@ -1509,12 +1512,12 @@ pub(crate) fn shadow_page_at(
     let batch = ShadowReservation::admit(line_bytes);
     counts.admitted_peak_bytes = budget.granted().saturating_add(line_bytes) as u64;
     drop(budget);
-    let (lines, memos, reservation) = match batch {
-        Some(reservation) => (lines, memos, Some(reservation)),
-        None => {
-            counts.refused_budget = 1;
-            (Vec::new(), Vec::new(), None)
-        }
+    let Some(reservation) = batch else {
+        // The rows cannot be handed over: a refused page (a false coverage
+        // row, no memo moves), never a complete one without its rows.
+        counts.refused_budget = 1;
+        counts.coverage_complete = 0;
+        return refuse(&end, Some(ledger), index, roots.len(), counts);
     };
     hand_off(
         &end,
@@ -1522,7 +1525,7 @@ pub(crate) fn shadow_page_at(
         lines,
         coverage,
         memos,
-        reservation,
+        Some(reservation),
         &mut counts,
     );
     emit(&end, Some(&*ledger), index, &mut counts);

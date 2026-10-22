@@ -13,6 +13,8 @@
 //! is written before any data shard of its batch; a meta change that
 //! advances a sweep is written only after every data shard is on disk. So a
 //! saved `complete_through` never covers a record the disk does not hold.
+//! A debt meta that fails to write holds back every later data shard of
+//! its directory, from any batch, until one lands.
 //! A missing or corrupt shard at load is debt, never a silent loss.
 //!
 //! One writer thread does every file write of the shadow (diagnostics JSONL
@@ -467,9 +469,10 @@ pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec
 }
 
 fn run_writer(receiver: Receiver<Job>) {
-    // Shards whose last write failed, per support directory: no sweep
-    // advance is written over them.
-    let mut failed = BTreeMap::<PathBuf, BTreeSet<usize>>::new();
+    // Per support directory: shards whose last write failed (no sweep
+    // advance is written over them), and whether a debt-carrying meta failed
+    // (no data shard is written until one lands).
+    let mut failed = BTreeMap::<PathBuf, WriterState>::new();
     while let Ok(job) = receiver.recv() {
         match job {
             Job::Load(support_dir) => {
@@ -504,7 +507,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
         .is_ok()
 }
 
-fn write(job: WriteJob, failed: &mut BTreeSet<usize>) -> (PathBuf, WriteResult) {
+/// What the writer remembers of one directory's failed writes.
+#[derive(Debug, Default)]
+pub(crate) struct WriterState {
+    failed: BTreeSet<usize>,
+    /// A meta carrying debt failed: until one lands, no data shard (and no
+    /// meta advance) is written, whichever batch it comes in.
+    debt_unwritten: bool,
+}
+
+fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
     let WriteJob {
         support_dir,
         jsonl,
@@ -533,7 +545,7 @@ fn write(job: WriteJob, failed: &mut BTreeSet<usize>) -> (PathBuf, WriteResult) 
 fn write_save(
     dir: &Path,
     save: &ClaudeLedgerSave,
-    failed: &mut BTreeSet<usize>,
+    state: &mut WriterState,
 ) -> (Vec<usize>, Option<bool>) {
     let mut unwritten = Vec::new();
     let mut meta_unwritten = None;
@@ -542,18 +554,23 @@ fn write_save(
         if blocked || !write_atomic(&shard_path(dir, META), meta) {
             blocked = true;
             meta_unwritten = Some(save.meta_debt);
+            state.debt_unwritten |= save.meta_debt;
+        } else {
+            state.debt_unwritten = false;
         }
     }
+    // An earlier batch's debt is not on disk yet: nothing goes before it.
+    blocked |= state.debt_unwritten;
     for (shard, bytes) in &save.shards {
         if !blocked && write_atomic(&shard_path(dir, *shard), bytes) {
-            failed.remove(shard);
+            state.failed.remove(shard);
         } else {
-            failed.insert(*shard);
+            state.failed.insert(*shard);
             unwritten.push(*shard);
         }
     }
     if let Some(meta) = &save.meta_last {
-        if blocked || !failed.is_empty() || !write_atomic(&shard_path(dir, META), meta) {
+        if blocked || !state.failed.is_empty() || !write_atomic(&shard_path(dir, META), meta) {
             meta_unwritten = Some(false);
         }
     }
@@ -668,13 +685,13 @@ impl ClaudeLedger {
 }
 
 /// One page's bounded save of `ledger`, written synchronously (the writer's
-/// crash order); `failed` is the directory's failed-shard memory. Returns
+/// crash order); `failed` is the writer's memory of the directory. Returns
 /// (shards in the save, the meta went first, shards not written).
 #[cfg(test)]
 pub(crate) fn save_page_for_test(
     support_dir: &Path,
     ledger: &mut ClaudeLedger,
-    failed: &mut BTreeSet<usize>,
+    failed: &mut WriterState,
 ) -> Option<(usize, bool, usize)> {
     let (save, _reservation) = ledger.take_save()?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
@@ -690,4 +707,34 @@ pub(crate) fn load_for_test(support_dir: &Path) -> ClaudeLedger {
 #[cfg(test)]
 pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
     shard_path(&support_dir.join(LEDGER_DIR), shard_of(key))
+}
+
+#[cfg(test)]
+pub(crate) fn take_save_for_test(ledger: &mut ClaudeLedger) -> Option<ClaudeLedgerSave> {
+    ledger.take_save().map(|(save, _reservation)| save)
+}
+
+#[cfg(test)]
+pub(crate) fn write_save_for_test(
+    support_dir: &Path,
+    save: &ClaudeLedgerSave,
+    state: &mut WriterState,
+) -> (Vec<usize>, Option<bool>) {
+    write_save(&support_dir.join(LEDGER_DIR), save, state)
+}
+
+/// The ledger takes back saves that did not reach the disk (as the writer's
+/// results would report them).
+#[cfg(test)]
+pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedgerSave]) {
+    for save in saves {
+        let shards = save
+            .shards
+            .iter()
+            .map(|(shard, _)| *shard)
+            .collect::<Vec<_>>();
+        let meta =
+            (save.meta_first.is_some() || save.meta_last.is_some()).then_some(save.meta_debt);
+        ledger.restore(&shards, meta, &[]);
+    }
 }
