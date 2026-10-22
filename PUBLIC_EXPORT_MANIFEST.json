@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 792,
-  "content_sha256": "1d09ad5e56444308f6c59f698202008ac6f1ade9d092b542bd851aed700b9762",
+  "content_sha256": "11218fed2c5fcd54f6842d0c2cc603e1a3ddc0698faef906b3b150de04a0072e",
   "files": [
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/audit.rs",
-      "sha256": "2cc5fe5a94cc4d13e11571bacbd0e90d34a666e741b68cad28ed4f1bf299b53f",
-      "size_bytes": 5996
+      "sha256": "1ccbfbc5fe2ba6247ac398c0321cb47fbb2d3a2db8d067e293e30c8e5eb1cc1b",
+      "size_bytes": 6376
     },
     {
       "executable": false,
@@ -1056,8 +1056,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "5eb43b422c96a75ffda60ec0cf33744c106a8468e29f6081fe9dd5117f2d6d89",
-      "size_bytes": 98205
+      "sha256": "9628826b6b8ee881ac1144d565cc949d5db32572f5f0d0cfd3419eb30207facd",
+      "size_bytes": 98385
     },
     {
       "executable": false,
@@ -1098,8 +1098,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests/a2.rs",
-      "sha256": "559fc5842943d3eaeb4b00803b31970064cdaf04120d358f850255fc7b695cb2",
-      "size_bytes": 28992
+      "sha256": "d6e739f7a56bebf1d387568e145713154c102e2f8e0a6332dba1f9a589447853",
+      "size_bytes": 30534
     },
     {
       "executable": false,
@@ -3758,8 +3758,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-run-health-audit.md",
-      "sha256": "d92ef8b81478537aed94a7aa12905e5f74da0e81a7ad5cd1d87b122ca46bf1ba",
-      "size_bytes": 3976
+      "sha256": "ff7acab9fe289e1c4852898d60fdd6b0a9bfe69aaab337d959392fbf8e0bacaf",
+      "size_bytes": 4205
     },
     {
       "executable": false,
@@ -5547,7 +5547,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T15:31:26+00:00",
+  "generated_at": "2026-10-22T15:53:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 793,
   "public_roots": [
@@ -5586,5 +5586,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f0ac31171c90725ba178326c32bead3daa7fe994"
+  "source_commit": "5be560c55dfe3681749a7e57f793eb4aee80a111"
 }
