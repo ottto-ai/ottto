@@ -2357,3 +2357,146 @@ fn claude_backfill_stop_reminder_is_at_most_hourly() {
     assert!(!claude_reemission_stop_latched());
     assert_eq!(claude_reemission_stop_withheld_folds(), 0);
 }
+
+/// Exercise the daemon's real load boundary, including quarantine, rather
+/// than directly setting the stop. NewFile reads still run while adoption of
+/// a different destination's existing history is stopped process-wide.
+#[test]
+fn claude_backfill_index_rebuild_load_latches_until_restart() {
+    for kind in ["absent", "corrupt", "empty"] {
+        for missing_list in [false, true] {
+            restart_claude_reemission_stop_for_test();
+            let (home, root, baseline) =
+                claude_context_backfill_fixture("claude-index-rebuild-stop", 1);
+            let support = home.join("support");
+            let list = ReemissionExclusions::path(&support);
+            fs::create_dir_all(list.parent().unwrap()).unwrap();
+            fs::write(&list, "").unwrap();
+            assert_eq!(
+                ReemissionExclusions::load(&support).state(),
+                ListState::Installed
+            );
+            if missing_list {
+                fs::remove_file(&list).unwrap();
+            }
+            let path = home.join("rebuild-index.json");
+            match kind {
+                "corrupt" => fs::write(&path, "{truncated").unwrap(),
+                "empty" => {
+                    fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap()
+                }
+                _ => {}
+            }
+            let (loaded, alarms) = crate::local_resource_diagnostics::capture(|| {
+                ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &support)
+                    .unwrap()
+            });
+            let mut loaded = loaded;
+            assert!(loaded.files.is_empty());
+            assert_eq!(loaded.generation, 0);
+            if kind == "corrupt" {
+                assert!(!path.exists(), "the corrupt file was quarantined");
+                assert!(fs::read_dir(&home).unwrap().flatten().any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rebuild-index.corrupt.")));
+            }
+            assert!(claude_reemission_stop_latched());
+            assert_eq!(claude_reemission_stop_reason(), "index_rebuild_withheld");
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0]["stage"], "claude_reemission_stop_latched");
+            assert_eq!(alarms[0]["counts"]["cause"], "index_rebuild");
+            assert_eq!(alarms[0]["counts"]["withheld_folds"], 0);
+            assert_eq!(alarms[0]["counts"]["over_bound_root_refs"], json!([]));
+            let new_files =
+                claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+            assert_eq!(new_files.scanned_file_count, 2, "NewFile is unchanged");
+            let mut adoption = baseline.clone();
+            assert_eq!(
+                claude_context_backfill_scan(&root, &mut adoption, MAX_BACKFILL_FILES_PER_SOURCE)
+                    .scanned_file_count,
+                0,
+                "adoption in another destination is stopped"
+            );
+            let clean = ClaudeContextFileBirthCounts::default();
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                note_claude_reemission_stop(&clean, &BTreeSet::new());
+                ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &support)
+                    .unwrap();
+            });
+            assert!(
+                alarms.is_empty(),
+                "clean folds and loads do not repeat the alarm"
+            );
+            assert_eq!(claude_reemission_stop_reason(), "index_rebuild_withheld");
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                note_claude_reemission_stop_at(
+                    &clean,
+                    &BTreeSet::new(),
+                    std::time::Instant::now() + CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL,
+                );
+            });
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(
+                alarms[0]["stage"],
+                "claude_reemission_stop_latched_reminder"
+            );
+            assert_eq!(alarms[0]["counts"]["cause"], "index_rebuild");
+            restart_claude_reemission_stop_for_test();
+            assert_eq!(claude_reemission_stop_reason(), "none");
+            let mut adoption = baseline;
+            assert_eq!(
+                claude_context_backfill_scan(&root, &mut adoption, MAX_BACKFILL_FILES_PER_SOURCE)
+                    .scanned_file_count,
+                2,
+                "restart resets adoption; a still-empty load will latch again"
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+}
+
+#[test]
+fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
+    let home = temp_dir("claude-index-rebuild-not-active");
+    for corrupt in [false, true] {
+        let path = home.join("scan-index.json");
+        if corrupt {
+            fs::write(&path, "{truncated").unwrap();
+        }
+        ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+        assert_eq!(claude_reemission_stop_reason(), "none");
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
+    let (home, _, mut baseline) =
+        claude_context_backfill_fixture("claude-index-rebuild-source-guard", 1);
+    let marker = ReemissionExclusions::seen_marker_path(&home);
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(marker, "").unwrap();
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let path = home.join("other-index.json");
+        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+        fs::write(&path, "{truncated").unwrap();
+        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+    }
+    // Both conditions matter: a populated generation-0 index and an empty
+    // saved index with a nonzero generation must not be treated as fresh.
+    let path = home.join("existing-index.json");
+    baseline.generation = 0;
+    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    assert!(!claude_reemission_stop_latched());
+    baseline.files.clear();
+    baseline.generation = 1;
+    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    assert!(!claude_reemission_stop_latched());
+    let _ = fs::remove_dir_all(home);
+}

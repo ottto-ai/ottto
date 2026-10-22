@@ -43,7 +43,8 @@ generation, so no body identity, progress generation or census state is reset.
   over its evidence bound, or a full remembered-veto table) latches the stop.
   From then on Claude adoption takes no adoption-only file (budget 0, every
   such file deferred) and the log line reports
-  `body_witness_adoption_stop=evidence_bound_withheld` (otherwise `none`) and
+  `body_witness_adoption_stop=evidence_bound_withheld` or
+  `index_rebuild_withheld` (otherwise `none`) and
   `body_witness_adoption_stop_withheld_folds=<n>` (folds in this process that
   withheld for a resource limit). A later clean fold does NOT clear it; only a
   daemon restart does (the human reset). The latch is in memory only and
@@ -120,7 +121,7 @@ rather than run with a partial closure.
   `body_witness_adoption_held_no_list=<n>`,
   `body_witness_adoption_exclusions_invalid=<0|1>` and
   `body_witness_adoption_list=<not_installed|installed|missing_after_install|unreadable|marker_unwritable|closure_overflow>`,
-  and `body_witness_adoption_stop=<none|evidence_bound_withheld>`.
+  and `body_witness_adoption_stop=<none|evidence_bound_withheld|index_rebuild_withheld>`.
   No id, digest or path is logged.
 
 ## Release rule
@@ -172,9 +173,22 @@ the server are unchanged.
   marker lost to a crash is written again on the next read while the list file
   is present; if the list file is also gone, the state falls back to
   `not_installed`, which holds old history (the safe direction).
-- An index rebuild or a re-pair re-reads files through the ordinary `NewFile`
-  path, which this list does not gate (pre-existing behaviour). The runbook
-  treats an index rebuild or re-pair during the backfill as a stop signal.
+- An index quarantine, rebuild or re-pair automatically sets the same
+  in-memory stop latch when Claude loads an empty generation-0 index and the
+  exclusion `.seen` marker exists. This check runs before replay preparation
+  can advance the generation. The marker alone means active: there is no cheap
+  durable adoption-complete flag, so the stop can also latch after adoption
+  has finished. Without the marker, a fresh index does not set this latch.
+  The census reason is `body_witness_adoption_stop=index_rebuild_withheld`;
+  the local `claude_reemission_stop_latched` alarm and hourly reminder carry
+  `counts.cause=index_rebuild`. The first cause stays until restart, and clean
+  folds do not reset it. Only adoption stops: ordinary `NewFile` reads proceed
+  and the exclusion list still does not gate them (pre-existing behaviour).
+  A restart clears the latch; loading a still-empty index with the marker
+  present sets it again. The manual full-stop brake below remains available.
+- Release coupling: this guard must ship in the same release as #677
+  (`72a63255`) and #694's index-load containment. Containing one unbound
+  authority record keeps the index and does not trigger this rebuild latch.
 
 ## Manual brakes (runbook)
 
@@ -187,6 +201,16 @@ The latch does not replace the runbook's brakes:
 
 ## Tests (CI)
 
+- `claude_backfill_index_rebuild_load_latches_until_restart`: real corrupt,
+  absent and serialized empty index loads, installed and missing-after-install
+  lists, local alarm/cause and reminder, adoption stop, NewFile reads, restart.
+- `claude_backfill_index_load_without_seen_marker_does_not_latch`: absent and
+  corrupt loads before activation do not latch.
+- `claude_backfill_index_load_preserves_other_sources_and_existing_indexes`:
+  Codex/Pi unchanged; populated or nonzero-generation indexes do not latch.
+- `contained_unbound_authority_record_does_not_latch_claude_reemission_stop`:
+  #694's per-record containment keeps the index and does not latch, even with
+  the `.seen` marker present.
 - `claude_context_backfill_selects_every_root_and_subagent_once`
 - `claude_context_backfill_resumes_after_restart_without_rereading_settled_files`
 - `claude_context_backfill_leaves_codex_and_pi_unselected` (Codex adoption is

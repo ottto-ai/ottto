@@ -4746,7 +4746,7 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
