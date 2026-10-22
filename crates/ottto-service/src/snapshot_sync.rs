@@ -85,9 +85,11 @@ const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
 // A short, explicitly transient batch failure is resent in place rather than
 // abandoning the page and marking the bounded sweep unsettled: a 429/503 whose
 // Retry-After is at most 5 s (cursor allocation and shared-lock timeouts send
-// 1 s) or a fast 500/502. The wait holds the sync lock, so each upload call
-// gets at most two resends and 10 s of waiting. A failure slower than 15 s is
-// overload and is never resent; the 60 s identity deferral keeps its backoff.
+// 1 s) or a fast 500/502. The wait holds the sync lock, so each source page
+// gets at most two resends and 10 s of waiting, shared by its cache-head
+// bootstrap stages and its main upload. A failure that took 15 s or longer is
+// overload and is never resent; the identity deferral, recognized by its code,
+// keeps its backoff whatever its Retry-After.
 const SNAPSHOT_INPLACE_RETRY_LIMIT: usize = 2;
 const SNAPSHOT_INPLACE_RETRY_MAX_WAIT: Duration = Duration::from_secs(5);
 const SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(10);
@@ -110,13 +112,37 @@ pub(crate) fn status_test_scan_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Bootstrap only through existing ordinary authority followed by an exact
-/// CAS repeat. Both settlements share the normal atomic ACK progress seam.
+/// Bootstrap a fresh source page's cache heads under its own in-place resend
+/// budget.
+#[cfg(test)]
 fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     ordinary_bootstrap: bool,
+    upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    bootstrap_cache_heads_with_budget(
+        probes,
+        poison_scope,
+        progress,
+        ordinary_bootstrap,
+        &mut InplaceRetryBudget::default(),
+        upload,
+        persist,
+    )
+}
+
+/// Bootstrap only through existing ordinary authority followed by an exact
+/// CAS repeat. Both settlements share the normal atomic ACK progress seam and
+/// the source page's in-place resend budget.
+fn bootstrap_cache_heads_with_budget(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    ordinary_bootstrap: bool,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
         bool,
@@ -152,6 +178,7 @@ fn bootstrap_cache_heads(
             snapshot_upload_body_witness,
             |item| Some(item.source_session_id.as_str()),
             |_| false,
+            inplace_retry,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
@@ -5451,6 +5478,10 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    // One in-place resend budget for the whole source page: both bootstrap
+    // stages and the main upload draw on it, so the page never waits more
+    // than two resends and 10 s under the sync lock.
+    let mut inplace_retry = InplaceRetryBudget::default();
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only
         // the existing typed, content-free cause and the fixed failing role.
@@ -5469,11 +5500,12 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
             ordinary_bootstrap,
+            &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -5521,6 +5553,7 @@ fn finish_sync_source(
         snapshot_upload_body_witness,
         |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+        &mut inplace_retry,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -7292,6 +7325,12 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
 /// wait is never earlier than the server's own `Retry-After`.
 fn transient_inplace_retry_wait(error: &anyhow::Error) -> Option<(u16, Duration)> {
     let (status, base) = if let Some(shed) = error.downcast_ref::<UploadShed>() {
+        // The identity deferral waits on the identity, not on this request:
+        // excluded by its code before any admission, even with a short
+        // Retry-After.
+        if shed.is_original_identity_unavailable() {
+            return None;
+        }
         // No Retry-After keeps the jittered ladder; a long one is not worth
         // holding the sync lock for.
         let retry_after = shed
@@ -7309,7 +7348,8 @@ fn transient_inplace_retry_wait(error: &anyhow::Error) -> Option<(u16, Duration)
     Some((status, wait))
 }
 
-/// In-place resends spent by one upload call, across all of its pages.
+/// In-place resends spent by one source page: every batch of its cache-head
+/// bootstrap stages and of its main upload draws on the same budget.
 #[derive(Default)]
 struct InplaceRetryBudget {
     resends: usize,
@@ -7319,7 +7359,7 @@ struct InplaceRetryBudget {
 impl InplaceRetryBudget {
     fn admit(&self, error: &anyhow::Error, failed_after: Duration) -> Option<(u16, Duration)> {
         if self.resends >= SNAPSHOT_INPLACE_RETRY_LIMIT
-            || failed_after > SNAPSHOT_INPLACE_RETRY_FAST_FAILURE
+            || failed_after >= SNAPSHOT_INPLACE_RETRY_FAST_FAILURE
         {
             return None;
         }
@@ -7449,6 +7489,7 @@ where
         body_witness,
         |_| None,
         |_| false,
+        &mut InplaceRetryBudget::default(),
         upload,
         persist,
     )
@@ -7687,6 +7728,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     body_witness: BodyWitness,
     session_id: SessionId,
     batch_class: BatchClass,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -7821,7 +7863,6 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
-    let mut inplace_retry = InplaceRetryBudget::default();
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -7958,8 +7999,8 @@ where
                 inplace_retry.waited += wait;
                 eprintln!(
                     "local snapshot upload transient status={status} for {poison_scope}; \
-                     retrying the batch in place after {} ms (resend {}/{SNAPSHOT_INPLACE_RETRY_LIMIT}; \
-                     {} of {} ms in-place wait budget held under the sync lock)",
+                     retrying the batch in place after {} ms (source page resend {}/{SNAPSHOT_INPLACE_RETRY_LIMIT}; \
+                     {} of {} ms source page in-place wait budget held under the sync lock)",
                     wait.as_millis(),
                     inplace_retry.resends,
                     inplace_retry.waited.as_millis(),
@@ -10866,6 +10907,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |_| Ok(()),
@@ -13797,6 +13839,7 @@ mod tests {
                     Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     }))
                 }
             },
@@ -20653,6 +20696,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |state| state.save(&path),

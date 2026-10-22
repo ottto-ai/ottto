@@ -1348,6 +1348,7 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
                 "shed" => Err(anyhow::Error::new(UploadShed {
                     status: 429,
                     retry_after: None,
+                    code: None,
                 })),
                 _ => Ok(SnapshotBatchResponse {
                     accepted: 0,
@@ -1980,6 +1981,7 @@ fn short_shed() -> anyhow::Error {
     anyhow::Error::new(UploadShed {
         status: 503,
         retry_after: Some(Duration::from_secs(1)),
+        code: None,
     })
 }
 
@@ -2040,4 +2042,106 @@ fn inplace_retry_budget_spans_both_bootstrap_stages() {
     assert_eq!(waits.len(), 2);
     assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
     assert!(ledger.accepted_cache_heads.is_empty(), "no head is minted");
+}
+
+/// The source page's three stages as `finish_sync_source` runs them: ordinary
+/// bootstrap, its CAS repeat and the cache-bearing delivery, all drawing on
+/// one in-place budget. `sheds` gives the short sheds each stage meets before
+/// it succeeds. Returns the calls per stage (0, 1, 2), the waits, the
+/// delivery outcome and the ledger.
+fn shared_budget_source_page(
+    sheds: [usize; 3],
+) -> (
+    Vec<usize>,
+    Vec<Duration>,
+    Result<ResumableUploadResult>,
+    SnapshotUploadProgress,
+) {
+    let probes = items(2);
+    let mut snapshots = probes.clone();
+    for item in &mut snapshots {
+        item.cache_observations = Some(crate::snapshots::cache_observations::CacheObservations {
+            schema_version: 1,
+            operations: Vec::new(),
+            coverage: "complete".into(),
+            omitted_observation_count: None,
+        });
+    }
+    let mut ledger = progress();
+    let mut calls = Vec::new();
+    let (delivery, waits) = with_inplace_retry_test_clock(None, || {
+        let mut inplace_retry = InplaceRetryBudget::default();
+        bootstrap_cache_heads_with_budget(
+            &probes,
+            "inplace-source-page",
+            &mut ledger,
+            true,
+            &mut inplace_retry,
+            |batch, enforce_head_cas| {
+                let stage = usize::from(enforce_head_cas);
+                calls.push(stage);
+                if calls.iter().filter(|seen| **seen == stage).count() <= sheds[stage] {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, enforce_head_cas)
+            },
+            |_| Ok(()),
+        )?;
+        apply_bootstrapped_cache_heads(&mut snapshots, &ledger)?;
+        let mut accepted = 0;
+        upload_resumable_batches_with_body_witness_partitioned(
+            &snapshots,
+            "inplace-source-page",
+            &mut ledger,
+            &mut accepted,
+            |item| item.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |item| Some(item.source_session_id.as_str()),
+            |_| false,
+            &mut inplace_retry,
+            |batch| {
+                calls.push(2);
+                if calls.iter().filter(|seen| **seen == 2).count() <= sheds[2] {
+                    return Err(short_shed());
+                }
+                stage_ack(batch, true)
+            },
+            |_| Ok(()),
+        )
+    });
+    (calls, waits, delivery, ledger)
+}
+
+/// Ordinary bootstrap, CAS repeat and cache-bearing delivery of one source
+/// page share two resends and 10 s of waiting. With one short shed in each
+/// stage, the first two are resent and the delivery's shed stands, so the
+/// page waits twice, never three or six times.
+#[test]
+#[serial_test::serial(client_report)]
+fn inplace_retry_budget_spans_bootstrap_and_cache_bearing_delivery() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 1, 1]);
+    assert_eq!(calls, [0, 0, 1, 1, 2]);
+    assert_eq!(waits.len(), 2, "two resends for the whole source page");
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert_eq!(
+        delivery.unwrap(),
+        ResumableUploadResult::Shed {
+            retry_after: Some(Duration::from_secs(1))
+        },
+        "the delivery shed keeps today's backoff"
+    );
+    assert_eq!(ledger.accepted_cache_heads.len(), 2, "bootstrap settled");
+
+    // Within the budget, sheds spread over the bootstrap and the delivery are
+    // all recovered and the page settles as a first-try success would.
+    let (calls, waits, delivery, ledger) = shared_budget_source_page([1, 0, 1]);
+    assert_eq!(calls, [0, 0, 1, 2, 2]);
+    assert_eq!(waits.len(), 2);
+    assert!(waits.iter().sum::<Duration>() <= Duration::from_secs(10));
+    assert_eq!(delivery.unwrap(), ResumableUploadResult::Completed);
+    assert_eq!(ledger.accepted_cache_heads.len(), 2);
 }

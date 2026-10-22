@@ -9,6 +9,7 @@ fn shed(retry_after_seconds: Option<u64>) -> anyhow::Error {
     anyhow::Error::new(UploadShed {
         status: 503,
         retry_after: retry_after_seconds.map(Duration::from_secs),
+        code: None,
     })
 }
 
@@ -77,6 +78,7 @@ fn short_retry_after_shed_is_retried_in_place_and_settles() {
             0 => Err(anyhow::Error::new(UploadShed {
                 status,
                 retry_after: Some(Duration::from_secs(retry_after)),
+                code: None,
             })),
             _ => Ok(accepted_batch(batch.len())),
         });
@@ -552,12 +554,13 @@ impl Drop for EnvelopeShedServer {
 
 /// Drive the real batch loop whose every POST goes through the real
 /// `SnapshotApiClient` to a loopback endpoint that always sheds with `code`.
-/// Returns the driver's view and the POSTs the endpoint received.
+/// Returns the driver's view, the POSTs the endpoint received during the
+/// drive, and the typed shed of one further direct client POST.
 fn drive_through_client(
     status: u16,
     retry_after_seconds: u64,
     code: &'static str,
-) -> (Driven, usize) {
+) -> (Driven, usize, UploadShed) {
     let server = EnvelopeShedServer::new(status, retry_after_seconds, code);
     let client = SnapshotApiClient::new(server.url.clone());
     let request = SnapshotBatchRequest {
@@ -573,7 +576,13 @@ fn drive_through_client(
         client.upload_batch("synthetic-inplace-token", &request, false)
     });
     let received = server.posts.load(std::sync::atomic::Ordering::SeqCst);
-    (driven, received)
+    let shed = client
+        .upload_batch("synthetic-inplace-token", &request, false)
+        .unwrap_err()
+        .downcast_ref::<UploadShed>()
+        .copied()
+        .expect("the client keeps the shed typed");
+    (driven, received, shed)
 }
 
 /// The identity deferral is recognized by its fixed body code and never
@@ -583,8 +592,19 @@ fn drive_through_client(
 #[serial(client_report)]
 fn identity_shed_code_is_never_retried_in_place_through_the_client() {
     for retry_after in [1, 5, 60] {
-        let (driven, received) =
+        let (driven, received, shed) =
             drive_through_client(503, retry_after, "snapshot_original_identity_unavailable");
+        assert_eq!(
+            shed.code,
+            Some(crate::snapshot_client::UploadShedCode::OriginalIdentityUnavailable)
+        );
+        assert!(shed.is_original_identity_unavailable());
+        assert_eq!(
+            shed.code
+                .map(crate::snapshot_client::UploadShedCode::as_str),
+            Some(crate::snapshot_client::SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE)
+        );
+        assert_eq!(shed.retry_after, Some(Duration::from_secs(retry_after)));
         assert_eq!(
             driven.result.unwrap(),
             ResumableUploadResult::Shed {
@@ -612,7 +632,8 @@ fn cursor_and_lock_shed_codes_are_retried_in_place_through_the_client() {
         "accept_discovery_shared_lock_timeout",
         "accepted_log_head_conflict",
     ] {
-        let (driven, received) = drive_through_client(503, 1, code);
+        let (driven, received, shed) = drive_through_client(503, 1, code);
+        assert_eq!(shed.code, None, "{code} is not a recognized code");
         assert_eq!(
             driven.result.unwrap(),
             ResumableUploadResult::Shed {
