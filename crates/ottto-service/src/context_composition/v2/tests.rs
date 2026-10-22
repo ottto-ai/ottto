@@ -28,7 +28,7 @@ use super::*;
 use crate::composition_kinds::Kind;
 use crate::context_footprint::sha256_hex;
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -636,7 +636,7 @@ fn codex_inner_items_wait_with_their_open_call() {
     let len = fs::metadata(&path).unwrap().len();
     let mut state = new_parse_state(Source::Codex, &path, 0);
     let mut reading = Reading::default();
-    let mut contribution = Contribution::new();
+    let mut contribution = Contribution::default();
     let mut out = LineSink {
         sink: Sink {
             agg: &mut reading.agg,
@@ -981,6 +981,61 @@ fn crash_before_scope_commit_never_double_counts() {
     env.cleanup();
 }
 
+/// A Claude turn that reads `file`.
+fn claude_read_turn(cwd: &str, day: Date, n: u32, file: &str) -> Vec<Value> {
+    vec![
+        json!({"type":"assistant","uuid":format!("rd-{n}"),"sessionId":"s1","cwd":cwd,"timestamp":ts(day, n),
+            "message":{"id":format!("rm{n}"),"content":[{"type":"tool_use","id":format!("r{n}"),"name":"Read","input":{"file_path":file}}]}}),
+        json!({"type":"user","uuid":format!("rr-{n}"),"sessionId":"s1","cwd":cwd,"timestamp":ts(day, n),
+            "message":{"content":[{"type":"tool_result","tool_use_id":format!("r{n}"),"content":format!("contents of {file} {n}")}]}}),
+    ]
+}
+
+/// Every total a full re-read replaces exactly (latest-access times,
+/// session start times and distinct-session counts are not replaced).
+fn assert_same_totals(actual: &Aggregate, expected: &Aggregate) {
+    assert_eq!(v2_rows(actual), v2_rows(expected), "daily rows");
+    assert_eq!(actual.day_parts, expected.day_parts, "day parts");
+    assert_eq!(actual.all_parts, expected.all_parts, "all parts");
+    let files = |map: &BTreeMap<(Day, super::aggregate::FileKey), super::aggregate::FileTotals>| {
+        map.iter()
+            .map(|(key, totals)| (key.clone(), (totals.events, totals.tokens)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(
+        files(&actual.day_files),
+        files(&expected.day_files),
+        "day files"
+    );
+    let all_files = |agg: &Aggregate| {
+        agg.all_files
+            .iter()
+            .map(|(key, totals)| (key.clone(), (totals.events, totals.tokens)))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(all_files(actual), all_files(expected), "all files");
+    let tools = |agg: &Aggregate| {
+        (
+            agg.day_tools
+                .iter()
+                .map(|(key, totals)| (key.clone(), (totals.calls, totals.tokens)))
+                .collect::<BTreeMap<_, _>>(),
+            agg.all_tools
+                .iter()
+                .map(|(key, totals)| (key.clone(), (totals.calls, totals.tokens)))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    };
+    assert_eq!(tools(actual), tools(expected), "tools");
+    let sessions = |agg: &Aggregate| {
+        agg.sessions
+            .iter()
+            .map(|(id, totals)| (id.clone(), totals.days.clone()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    assert_eq!(sessions(actual), sessions(expected), "sessions");
+}
+
 #[test]
 fn rewritten_files_are_read_again_within_the_budget() {
     let env = Env::new("composition-v2-rewrite");
@@ -988,12 +1043,17 @@ fn rewritten_files_are_read_again_within_the_budget() {
     let day = now.date();
     let cwd = env.cwd();
     let path = env.root.join("p/s.jsonl");
-    write_records(&path, &claude_turn(&cwd, day, 1));
-    env.run(Source::Claude, now, None);
+    let mut records = claude_turn(&cwd, day, 1);
+    records.extend(claude_read_turn(&cwd, day, 2, "/w/src/a.rs"));
+    write_records(&path, &records);
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
 
-    // Same size, different bytes (and a new inode via rename).
+    // Different bytes, a new inode (via rename), other files and tools.
     let replacement = env.root.join("p/s.tmp");
-    write_records(&replacement, &claude_turn(&cwd, day, 7));
+    let mut records = claude_turn(&cwd, day, 7);
+    records.extend(claude_read_turn(&cwd, day, 8, "/w/src/b.rs"));
+    write_records(&replacement, &records);
     fs::rename(&replacement, &path).unwrap();
     // Over budget: waits, counted, nothing read.
     let stats = env.run_with(
@@ -1009,15 +1069,57 @@ fn rewritten_files_are_read_again_within_the_budget() {
     assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
     let mut whole = Reading::default();
     whole.read(Source::Claude, &path, 1, &[]);
-    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), v2_rows(&whole.agg));
+    assert_same_totals(&env.scope(Source::Claude).agg, &whole.agg);
 
-    // A shrink is a rewrite too.
-    write_records(&path, &claude_turn(&cwd, day, 8)[..1]);
-    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    // A shrink is a rewrite too. The kinds it no longer holds go up as
+    // zero rows, replacing the earlier upload.
+    write_records(&path, &claude_turn(&cwd, day, 9)[..1]);
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(3),
+        Some(&mut capture),
+    );
     assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
     let mut whole = Reading::default();
     whole.read(Source::Claude, &path, 1, &[]);
-    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), v2_rows(&whole.agg));
+    assert_same_totals(&env.scope(Source::Claude).agg, &whole.agg);
+    let last = capture.payloads.last().unwrap();
+    let row = |kind: &str| {
+        last["daily_aggregates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["category"] == kind)
+            .cloned()
+    };
+    let shell = row("shell_output").expect("zero row for the emptied kind");
+    assert_eq!(
+        (
+            shell["events"].as_u64(),
+            shell["tokens_entered_est"].as_u64()
+        ),
+        (Some(0), Some(0))
+    );
+    assert!(row("harness_attachments").is_some());
+    env.cleanup();
+}
+
+#[test]
+fn failed_read_drops_the_scope_update() {
+    let env = Env::new("composition-v2-failed-read");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&cwd, day, 1));
+    env.run(Source::Claude, now, None);
+    append_records(&path, &claude_turn(&cwd, day, 2));
+    harvest::tests::set_fail_read(true);
+    let stats = env.run(Source::Claude, now + time::Duration::hours(1), None);
+    harvest::tests::set_fail_read(false);
+    assert_eq!((stats.scopes_failed, stats.scopes_committed), (1, 0));
+    env.run(Source::Claude, now + time::Duration::hours(2), None);
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
     env.cleanup();
 }
 
@@ -1126,6 +1228,47 @@ fn bad_state_reads_again_and_never_fails() {
     // A bad run record never blocks a run.
     fs::write(env.state.join("run.json"), b"\x00").unwrap();
     assert!(begin_run(&env.state, now).unwrap().is_some());
+    env.cleanup();
+}
+
+#[test]
+fn rebuilt_scope_uploads_every_rebuilt_day() {
+    let env = Env::new("composition-v2-rebuilt-upload");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&cwd, day, 1));
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    let later = day + time::Duration::days(1);
+    write_records(&env.root.join("p/s2.jsonl"), &claude_turn(&cwd, later, 2));
+    env.run(
+        Source::Claude,
+        now + time::Duration::days(1),
+        Some(&mut capture),
+    );
+    assert_eq!(capture.payloads.len(), 2);
+
+    // The rebuilt scope counts generations from the start again; the old
+    // acknowledgment must not hide its days.
+    let scope_id = sha256_hex(&[cwd.as_str()]);
+    fs::write(scope_path(&env.state, Source::Claude, &scope_id), b"{}").unwrap();
+    append_records(&path, &claude_turn(&cwd, day, 3));
+    env.run(
+        Source::Claude,
+        now + time::Duration::days(2),
+        Some(&mut capture),
+    );
+    assert_eq!(capture.payloads.len(), 3);
+    let ymd = |date: Date| super::super::measure::date_ymd(date);
+    let dates: BTreeSet<String> = capture.payloads[2]["daily_aggregates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["date"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(dates, BTreeSet::from([ymd(day), ymd(later)]));
     env.cleanup();
 }
 

@@ -12,7 +12,7 @@
 //! never lets one file count in two scopes; the scope state stays the truth
 //! for offsets.
 
-use super::aggregate::{Day, Slot};
+use super::aggregate::{Day, Slot, StoredContribution};
 use super::scope::ScopeInfo;
 use super::STATE_SCHEMA;
 use crate::composition_kinds::{CallClass, Kind, Part, ToolKey};
@@ -174,9 +174,9 @@ pub(super) struct Checkpoint {
     pub(super) parser_version: String,
     pub(super) status: Status,
     pub(super) parse: StoredParse,
-    /// This file's share of the daily rows.
+    /// This file's share of the scope totals.
     #[serde(default)]
-    pub(super) contribution: Vec<(Day, String, [u64; 4])>,
+    pub(super) contribution: StoredContribution,
     pub(super) last_seen: Day,
 }
 

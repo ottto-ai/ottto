@@ -268,9 +268,9 @@ pub(super) fn build_request(
     let daily_aggregates: Vec<DailyRow> = agg
         .days
         .iter()
-        .filter(|((day, _), bucket)| {
-            changed_days.contains(day) && (bucket.events > 0 || bucket.residency > 0)
-        })
+        // Zero rows (left by a full re-read) are sent too: they replace
+        // the server's earlier values for that day and kind.
+        .filter(|((day, _), _)| changed_days.contains(day))
         .map(|((day, kind), bucket)| DailyRow {
             date: ymd(*day),
             category: kind.as_str().to_string(),

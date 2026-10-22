@@ -258,6 +258,13 @@ impl FileTotals {
         }
     }
 
+    /// Remove a share; true when nothing is left.
+    fn take(&mut self, events: u64, tokens: u64) -> bool {
+        self.events = self.events.saturating_sub(events);
+        self.tokens = self.tokens.saturating_sub(tokens);
+        self.events == 0 && self.tokens == 0
+    }
+
     fn merge(&mut self, other: &FileTotals) {
         self.events += other.events;
         self.tokens += other.tokens;
@@ -275,6 +282,15 @@ pub(super) struct ToolTotals {
     pub(super) sessions: u64,
     /// The kind of the tool's latest call.
     pub(super) kind: Option<Kind>,
+}
+
+impl ToolTotals {
+    /// Remove a share; true when nothing is left.
+    fn take(&mut self, calls: u64, tokens: u64) -> bool {
+        self.calls = self.calls.saturating_sub(calls);
+        self.tokens = self.tokens.saturating_sub(tokens);
+        self.calls == 0 && self.tokens == 0
+    }
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -303,8 +319,22 @@ pub(super) struct Aggregate {
     pub(super) day_generation: BTreeMap<Day, u64>,
 }
 
-/// One file's own share of the daily rows, so a full re-read can replace it.
-pub(super) type Contribution = BTreeMap<(Day, Kind), Bucket>;
+/// One file's own share of the scope totals, so a full re-read can replace
+/// it: daily rows (from the parts), parts, files, tools and session tokens
+/// for the days of the daily-row window. Latest-access times, distinct
+/// session counts and all-history totals of days past the window stay as
+/// they were.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct Contribution {
+    pub(super) parts: BTreeMap<(Day, Slot), Bucket>,
+    /// (events, tokens) per day and file.
+    pub(super) files: BTreeMap<(Day, FileKey), (u64, u64)>,
+    /// (calls, tokens) per day and tool.
+    pub(super) tools: BTreeMap<(Day, Box<str>), (u64, u64)>,
+    /// The file's session (fixed from its first lines) and its tokens.
+    pub(super) session: Option<Box<str>>,
+    pub(super) sessions: BTreeMap<(Day, Kind), u64>,
+}
 
 /// Days a run may write: `[floor, today]`; the 30-day maps start at
 /// `period_floor`.
@@ -385,9 +415,24 @@ impl Sink<'_> {
             }
             self.agg
                 .all_files
-                .entry(key)
+                .entry(key.clone())
                 .or_default()
                 .add(item.tokens, item.ts);
+            let share = self.contribution.files.entry((item.day, key)).or_default();
+            share.0 += 1;
+            share.1 += item.tokens;
+        }
+        let share = &mut self.contribution;
+        if share
+            .session
+            .as_deref()
+            .map_or(true, |own| own == item.session)
+        {
+            share.session.get_or_insert_with(|| item.session.into());
+            *share
+                .sessions
+                .entry((item.day, item.slot.kind))
+                .or_default() += item.tokens;
         }
         *self
             .agg
@@ -421,7 +466,8 @@ impl Sink<'_> {
             .or_default()
             .add(bucket);
         self.contribution
-            .entry((day, slot.kind))
+            .parts
+            .entry((day, slot.clone()))
             .or_default()
             .add(bucket);
         if day >= self.window.period_floor {
@@ -453,6 +499,13 @@ impl Sink<'_> {
             return;
         }
         let calls = u64::from(call);
+        let share = self
+            .contribution
+            .tools
+            .entry((day, tool.into()))
+            .or_default();
+        share.0 += calls;
+        share.1 += tokens;
         if day >= self.window.period_floor {
             let entry = self.agg.day_tools.entry((day, tool.into())).or_default();
             entry.calls += calls;
@@ -485,15 +538,76 @@ pub(super) fn session_hash(session: &str) -> u64 {
 }
 
 impl Aggregate {
-    /// Remove a file's earlier contribution before it is read again.
-    pub(super) fn subtract(&mut self, contribution: &Contribution, generation: u64) {
-        for ((day, kind), bucket) in contribution {
-            if let Some(row) = self.days.get_mut(&(*day, *kind)) {
+    /// Remove a file's earlier contribution before it is read again. Daily
+    /// rows that reach zero are kept (as zeros), so the changed-days upload
+    /// sends them and the server's earlier values are replaced.
+    pub(super) fn subtract(&mut self, share: &Contribution, generation: u64) {
+        for ((day, slot), bucket) in &share.parts {
+            if let Some(row) = self.days.get_mut(&(*day, slot.kind)) {
+                row.subtract(bucket);
+                self.day_generation.insert(*day, generation);
+            }
+            let key = (*day, slot.clone());
+            if let Some(row) = self.day_parts.get_mut(&key) {
                 row.subtract(bucket);
                 if row.is_zero() {
-                    self.days.remove(&(*day, *kind));
+                    self.day_parts.remove(&key);
                 }
-                self.day_generation.insert(*day, generation);
+            }
+            if let Some(row) = self.all_parts.get_mut(slot) {
+                row.subtract(bucket);
+                if row.is_zero() {
+                    self.all_parts.remove(slot);
+                }
+            }
+        }
+        for ((day, key), (events, tokens)) in &share.files {
+            let day_key = (*day, key.clone());
+            if let Some(totals) = self.day_files.get_mut(&day_key) {
+                if totals.take(*events, *tokens) {
+                    self.day_files.remove(&day_key);
+                }
+            }
+            if let Some(totals) = self.all_files.get_mut(key) {
+                if totals.take(*events, *tokens) {
+                    self.all_files.remove(key);
+                }
+            }
+        }
+        for ((day, tool), (calls, tokens)) in &share.tools {
+            let day_key = (*day, tool.clone());
+            if let Some(totals) = self.day_tools.get_mut(&day_key) {
+                if totals.take(*calls, *tokens) {
+                    self.day_tools.remove(&day_key);
+                }
+            }
+            if let Some(totals) = self.all_tools.get_mut(tool) {
+                if totals.take(*calls, *tokens) {
+                    self.all_tools.remove(tool);
+                }
+            }
+        }
+        if let Some(totals) = share
+            .session
+            .as_deref()
+            .and_then(|session| self.sessions.get_mut(session))
+        {
+            for ((day, kind), tokens) in &share.sessions {
+                if let Some(kinds) = totals.days.get_mut(day) {
+                    if let Some(value) = kinds.get_mut(kind) {
+                        *value = value.saturating_sub(*tokens);
+                        if *value == 0 {
+                            kinds.remove(kind);
+                        }
+                    }
+                    if kinds.is_empty() {
+                        totals.days.remove(day);
+                    }
+                }
+            }
+            if totals.days.is_empty() {
+                self.sessions
+                    .remove(share.session.as_deref().unwrap_or_default());
             }
         }
     }
@@ -819,18 +933,99 @@ impl StoredAggregate {
     }
 }
 
-/// Stored form of a file's contribution.
-pub(super) fn store_contribution(contribution: &Contribution) -> Vec<(Day, String, [u64; 4])> {
-    contribution
-        .iter()
-        .map(|((day, kind), bucket)| (*day, kind.as_str().to_string(), bucket.as_array()))
-        .collect()
+/// Stored form of a file's contribution (wire ids).
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct StoredContribution {
+    parts: Vec<DayPartRow>,
+    files: Vec<(Day, String, String, String, u64, u64)>,
+    tools: Vec<(Day, String, u64, u64)>,
+    session: Option<String>,
+    sessions: Vec<(Day, String, u64)>,
 }
 
-pub(super) fn load_contribution(rows: Vec<(Day, String, [u64; 4])>) -> Option<Contribution> {
-    rows.into_iter()
-        .map(|(day, kind, values)| Some(((day, kind_from_str(&kind)?), Bucket::from_array(values))))
-        .collect()
+impl StoredContribution {
+    pub(super) fn from_share(share: &Contribution) -> Self {
+        Self {
+            parts: share
+                .parts
+                .iter()
+                .map(|((day, slot), bucket)| {
+                    (
+                        *day,
+                        slot.kind.as_str().to_string(),
+                        slot.part.as_str().to_string(),
+                        slot.server.as_deref().map(str::to_string),
+                        bucket.as_array(),
+                    )
+                })
+                .collect(),
+            files: share
+                .files
+                .iter()
+                .map(|((day, key), (events, tokens))| {
+                    (
+                        *day,
+                        key.path.to_string(),
+                        key.kind.as_str().to_string(),
+                        key.part.as_str().to_string(),
+                        *events,
+                        *tokens,
+                    )
+                })
+                .collect(),
+            tools: share
+                .tools
+                .iter()
+                .map(|((day, tool), (calls, tokens))| (*day, tool.to_string(), *calls, *tokens))
+                .collect(),
+            session: share.session.as_deref().map(str::to_string),
+            sessions: share
+                .sessions
+                .iter()
+                .map(|((day, kind), tokens)| (*day, kind.as_str().to_string(), *tokens))
+                .collect(),
+        }
+    }
+
+    /// None when a stored id is unknown.
+    pub(super) fn into_share(self) -> Option<Contribution> {
+        let mut share = Contribution {
+            session: self.session.map(Into::into),
+            ..Contribution::default()
+        };
+        for (day, kind, part, server, values) in self.parts {
+            let slot = Slot {
+                kind: kind_from_str(&kind)?,
+                part: part_from_str(&part)?,
+                server: server.map(Into::into),
+            };
+            share.parts.insert((day, slot), Bucket::from_array(values));
+        }
+        for (day, path, kind, part, events, tokens) in self.files {
+            let key = FileKey {
+                path: path.into(),
+                kind: kind_from_str(&kind)?,
+                part: part_from_str(&part)?,
+            };
+            share.files.insert((day, key), (events, tokens));
+        }
+        for (day, tool, calls, tokens) in self.tools {
+            share.tools.insert((day, tool.into()), (calls, tokens));
+        }
+        for (day, kind, tokens) in self.sessions {
+            share.sessions.insert((day, kind_from_str(&kind)?), tokens);
+        }
+        Some(share)
+    }
+
+    /// Drop days before `floor` (their daily rows are gone).
+    pub(super) fn prune(&mut self, floor: Day) {
+        self.parts.retain(|row| row.0 >= floor);
+        self.files.retain(|row| row.0 >= floor);
+        self.tools.retain(|row| row.0 >= floor);
+        self.sessions.retain(|row| row.0 >= floor);
+    }
 }
 
 /// Merge file totals across days (for the 30-day file values).

@@ -19,7 +19,7 @@ use super::super::harvest::{
     agent_source_label, destination_identity, local_harvest_disabled, org_disabled_marker_path,
     read_marker, write_marker,
 };
-use super::aggregate::{day_of, load_contribution, store_contribution, Window};
+use super::aggregate::{day_of, StoredContribution, Window};
 use super::checkpoint::{
     birth_secs, file_identity, fingerprints, fingerprints_match, read_json, stamp, write_json,
     Checkpoint, Index, Pin, RunRecord, Stamp, Status, StoredParse,
@@ -698,7 +698,10 @@ fn process_scope(
     };
     let mut scope = match loaded {
         Ok(Some(scope)) => scope,
-        Ok(None) => Scope::new(scope_id, info),
+        Ok(None) => {
+            forget_upload(&run.state_dir, source, scope_id);
+            Scope::new(scope_id, info)
+        }
         Err(()) => {
             // Bad state: read the scope's files again from their start,
             // within the budget, newest first; the rest wait.
@@ -720,6 +723,7 @@ fn process_scope(
                     items.push(Work { key, found, mode });
                 }
             }
+            forget_upload(&run.state_dir, source, scope_id);
             Scope::new(scope_id, info)
         }
     };
@@ -766,15 +770,21 @@ fn process_scope(
             generation,
             stats,
         ) {
-            Some(Outcome::Read(checkpoint)) => {
+            Ok(Some(Outcome::Read(checkpoint))) => {
                 read_files.push((item.key, *checkpoint));
             }
-            Some(Outcome::Waiting) => {
+            Ok(Some(Outcome::Waiting)) => {
                 if let Some(pin) = index.files.get_mut(&item.key) {
                     pin.waiting = true;
                 }
             }
-            None => {}
+            Ok(None) => {}
+            Err(ReadFailed) => {
+                // Totals changed without a checkpoint: drop the whole scope
+                // update; its files are read again from the last commit.
+                stats.scopes_failed += 1;
+                return None;
+            }
         }
         if let Some(ownership) = ownership.as_ref() {
             stats.peak_accounted_bytes = stats
@@ -799,9 +809,7 @@ fn process_scope(
             {
                 checkpoint.last_seen = today;
             }
-            checkpoint
-                .contribution
-                .retain(|(day, _, _)| *day >= window.floor);
+            checkpoint.contribution.prune(window.floor);
         }
         keep
     });
@@ -865,6 +873,10 @@ enum Outcome {
     Waiting,
 }
 
+/// A read failed after it changed the scope's totals: the scope must not
+/// commit this run (its files are read again from their last commit).
+struct ReadFailed;
+
 #[allow(clippy::too_many_arguments)]
 fn read_file(
     run: &mut Run,
@@ -876,9 +888,13 @@ fn read_file(
     window: Window,
     generation: u64,
     stats: &mut SourceStats,
-) -> Option<Outcome> {
-    let file = File::open(&item.found.path).ok()?;
-    let metadata = file.metadata().ok()?;
+) -> Result<Option<Outcome>, ReadFailed> {
+    let opened = File::open(&item.found.path)
+        .and_then(|file| Ok((file.metadata()?, file.try_clone()?, file)));
+    let Ok((metadata, reader_file, file)) = opened else {
+        stats.scan_errors += 1;
+        return Ok(None);
+    };
     let size = metadata.len();
     let identity = file_identity(&metadata);
     let file_stamp = stamp(&metadata);
@@ -887,8 +903,8 @@ fn read_file(
     if mode == Mode::Forward {
         if let Some(checkpoint) = &existing {
             if checkpoint.status == Status::Done {
-                scope.files.insert(item.key.clone(), existing?);
-                return None;
+                scope.files.insert(item.key.clone(), checkpoint.clone());
+                return Ok(None);
             }
             let rewritten = size < checkpoint.offset
                 || !fingerprints_match(&file, checkpoint)
@@ -896,8 +912,8 @@ fn read_file(
             if rewritten {
                 mode = grant(run, stats, size);
                 if mode == Mode::Forward {
-                    scope.files.insert(item.key.clone(), existing?);
-                    return Some(Outcome::Waiting);
+                    scope.files.insert(item.key.clone(), checkpoint.clone());
+                    return Ok(Some(Outcome::Waiting));
                 }
             }
         }
@@ -910,7 +926,9 @@ fn read_file(
         .map_or(item.found.birth, |checkpoint| checkpoint.created);
     let (mut checkpoint, mut state) = match (mode, existing) {
         (Mode::Forward, Some(checkpoint)) => {
-            let state = checkpoint.parse.clone().into_state()?;
+            // Checked above: a checkpoint whose state does not load is
+            // read again in full.
+            let state = checkpoint.parse.clone().into_state().ok_or(ReadFailed)?;
             (checkpoint, state)
         }
         (mode, existing) => {
@@ -919,11 +937,11 @@ fn read_file(
                 Mode::RestartAtEnd => size,
                 Mode::Forward => pin_start.min(size),
             };
-            let mut contribution = Vec::new();
+            let mut contribution = StoredContribution::default();
             if let Some(old) = existing {
                 if mode == Mode::Full {
                     // Replace this file's earlier share.
-                    if let Some(old) = load_contribution(old.contribution) {
+                    if let Some(old) = old.contribution.into_share() {
                         scope.agg.subtract(&old, generation);
                     }
                 } else {
@@ -957,9 +975,9 @@ fn read_file(
             )
         }
     };
-    let mut contribution =
-        load_contribution(std::mem::take(&mut checkpoint.contribution)).unwrap_or_default();
-    let reader_file = file.try_clone().ok()?;
+    let mut contribution = std::mem::take(&mut checkpoint.contribution)
+        .into_share()
+        .unwrap_or_default();
     let mut out = LineSink {
         sink: super::aggregate::Sink {
             agg: &mut scope.agg,
@@ -985,10 +1003,14 @@ fn read_file(
         Ok(end) => end,
         Err(_) => {
             stats.scan_errors += 1;
-            return None;
+            return Err(ReadFailed);
         }
     };
     out.sink.session_start(&state.session, state.min_ts);
+    #[cfg(test)]
+    if tests::fail_read() {
+        return Err(ReadFailed);
+    }
     stats.files_read += 1;
     if mode == Mode::Full {
         stats.bytes_repair += end.bytes;
@@ -1000,7 +1022,10 @@ fn read_file(
         .peak_accounted_bytes
         .max(end.buffer_bytes + state.accounted_bytes() + scope.agg.accounted_bytes());
     state.open.retain(|(day, _, _)| *day >= window.floor);
-    let (head, tail) = fingerprints(&file, end.offset).ok()?;
+    let (head, tail) = fingerprints(&file, end.offset).map_err(|_| {
+        stats.scan_errors += 1;
+        ReadFailed
+    })?;
     checkpoint.offset = end.offset;
     checkpoint.skipping = end.skipping;
     checkpoint.head = head;
@@ -1012,8 +1037,14 @@ fn read_file(
     checkpoint.path = item.found.path.to_string_lossy().into_owned();
     checkpoint.last_seen = window.today;
     checkpoint.parse = StoredParse::from_state(&state);
-    checkpoint.contribution = store_contribution(&contribution);
-    Some(Outcome::Read(Box::new(checkpoint)))
+    checkpoint.contribution = StoredContribution::from_share(&contribution);
+    Ok(Some(Outcome::Read(Box::new(checkpoint))))
+}
+
+/// A rebuilt scope starts its generations again: drop the upload
+/// acknowledgment so every rebuilt day is sent.
+fn forget_upload(state_dir: &Path, source: Source, scope_id: &str) {
+    let _ = fs::remove_file(super::upload::ack_path(state_dir, source, scope_id));
 }
 
 fn count_upload(outcome: UploadOutcome, stats: &mut SourceStats) {
@@ -1067,6 +1098,16 @@ pub(super) mod tests {
 
     thread_local! {
         static FAIL_SCOPE_COMMIT: Cell<bool> = const { Cell::new(false) };
+        static FAIL_READ: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Simulate a read error after some lines were counted.
+    pub(in super::super) fn set_fail_read(fail: bool) {
+        FAIL_READ.with(|cell| cell.set(fail));
+    }
+
+    pub(super) fn fail_read() -> bool {
+        FAIL_READ.with(Cell::get)
     }
 
     /// Simulate a crash between the ownership log write and the scope commit.
