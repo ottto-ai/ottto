@@ -9129,6 +9129,10 @@ mod tests {
             upsert_agent_status_snapshot(&mut state, snapshot);
             let health = state.sources.first_mut().expect("source health");
             health.collector = Some(ottto_protocol::LocalCollectorHealth {
+                held_for_review_count: None,
+                not_applied_after_review_count: None,
+                adoption_state: None,
+                protected_list_state: None,
                 state: ottto_protocol::LocalCollectorState::Warm,
                 last_scan_started_at: Some("2026-05-05T10:19:00Z".to_string()),
                 last_scan_finished_at: Some("2026-05-05T10:19:30Z".to_string()),
@@ -9427,3 +9431,8 @@ mod owned_heap;
 #[cfg(test)]
 mod retry_allocation_probe;
 mod retry_retention_bound;
+
+/// Finish queued request-money writes before an orderly service exit.
+pub fn flush_request_money_on_shutdown() {
+    snapshots::claude_request_money::flush_on_shutdown();
+}

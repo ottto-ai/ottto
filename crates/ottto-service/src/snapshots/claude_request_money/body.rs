@@ -743,10 +743,6 @@ pub(crate) fn build_claude_request_body(
         for (key, row) in row_copies {
             counts.reported_row_copies += 1;
             body.removed.add(row.tokens.conserved(), 1, None);
-            body.entities
-                .get_mut(member)
-                .expect("member")
-                .partition(&row.tokens, 1, 1);
             body.slice(
                 ClaudeGrainKey {
                     member: member.to_owned(),
@@ -1041,177 +1037,205 @@ fn side_calls(
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
     let own_telemetry = super::super::claude_request_census::telemetry_key(family.root);
+    let member_hashes = family
+        .items
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.as_str(),
+                item.claude_usage_occurrences
+                    .keys()
+                    .map(|id| claude_request_hash(id))
+                    .collect::<BTreeSet<_>>(),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     for (position, row) in rows.iter().enumerate() {
         if position % 1024 == 1023 && ctx.late() {
             body.unbuilt = true;
             return;
         }
         let hash = row.request_hash;
-        if family_hashes.contains(&hash) {
-            continue;
-        }
-        let live = reported_side_calls.get(&hash);
-        let live_member = live.map(|(index, _)| family.items[*index].source_session_id.as_str());
-        let conserved = row.tokens.conserved();
-        let absent_holder = ctx.holders.has_transcript_holder_in(hash, family.root);
-        if absent_holder && live.is_none() {
-            // An indexed member not on this page holds it: that member's
-            // transcript unit, not a side call (built with that member).
-            counts.side_calls_held_by_absent_member += 1;
-            continue;
-        }
-        body.units.add(conserved, 1, None);
-        let origin = if row.cost_micros.is_some() {
-            ClaudeRequestUsageOrigin::TelemetryReported
-        } else {
-            ClaudeRequestUsageOrigin::TelemetryUnpriced
-        };
-        let leave = |body: &mut ClaudeRequestBody, category| {
-            if let (Some((_, key)), Some(member)) = (live, live_member) {
-                body.slice(
-                    ClaudeGrainKey {
-                        member: member.to_owned(),
-                        owner: String::new(),
-                        live: key.clone(),
-                        origin: Some(origin),
-                        category,
-                    },
-                    Some((&row.tokens, 1, row.cost_micros)),
-                    None,
-                );
-            }
-        };
-        if row.clock == 0 || now.saturating_sub(row.clock) < MATURITY_SECONDS {
-            counts.side_calls_immature += 1;
-            body.immature.add(conserved, 1, None);
-            leave(body, ClaudeGrainCategory::Immature);
-            continue;
-        }
-        if absent_holder {
-            // The live (reported) body carries a copy of a request a member
-            // not on this page holds as a transcript unit: the new body
-            // counts that unit, so this copy leaves.
-            counts.side_calls_held_by_absent_member += 1;
-            body.removed.add(conserved, 1, None);
-            leave(body, ClaudeGrainCategory::CopiesRemoved);
-            continue;
-        }
-        if !ctx.scope.family_complete(family.root) {
-            counts.note_undecided(ClaudeUndecidedBy::Scope);
-            body.held_reasons.insert(ClaudeUndecidedBy::Scope);
-            body.held.add(conserved, 1, None);
-            leave(body, ClaudeGrainCategory::Held);
-            continue;
-        }
-        let mut claimants = ctx.telemetry_claimants(hash);
-        if !claimants.contains(&own_telemetry.as_str()) {
-            claimants.push(own_telemetry.as_str());
-            claimants.sort_unstable();
-        }
-        if claimants.len() >= 2 {
-            match ctx.two_owner_winner(&claimants) {
-                Some(winner) if winner == own_telemetry => {
-                    counts.side_calls_two_owner_won += 1;
-                }
-                Some(_) => {
-                    counts.side_calls_two_owner_lost += 1;
-                    body.removed.add(conserved, 1, None);
-                    leave(body, ClaudeGrainCategory::TwoOwner);
-                    continue;
-                }
-                None => {
-                    counts.note_undecided(ClaudeUndecidedBy::TelemetryOrder);
-                    body.held_reasons.insert(ClaudeUndecidedBy::TelemetryOrder);
-                    body.held.add(conserved, 1, None);
-                    leave(body, ClaudeGrainCategory::Held);
-                    continue;
-                }
-            }
-        }
-        counts.side_calls += 1;
-        if row.cost_micros.is_none() {
-            counts.side_calls_unpriced += 1;
-        }
-        // The trace-named member when its file exists, else the root.
         let named = family
             .trace
             .and_then(|trace| trace.get(&hash))
             .filter(|member| family.indexed_members.contains(member.as_str()))
             .map(String::as_str);
-        let member = match named {
-            Some(member) => member,
-            None => {
-                // No trace, no trace row for it, or a member with no file:
-                // the root stands in, and the member is unknown.
-                counts.side_call_member_unknown += 1;
-                family.root
+        let target = named.unwrap_or(family.root);
+        // A member's transcript and its matching API row are one evidence
+        // unit. Root-only/trace-only API evidence is a separate removed unit
+        // when the contribution belongs to a different member.
+        let recipients = member_hashes
+            .iter()
+            .filter(|(member, hashes)| {
+                (**member == family.root || named == Some(**member)) && !hashes.contains(&hash)
+            })
+            .map(|(member, _)| *member)
+            .collect::<Vec<_>>();
+        if family_hashes.contains(&hash) {
+            for member in recipients {
+                body.entities
+                    .get_mut(member)
+                    .expect("page member")
+                    .partition(&row.tokens, 1, 1);
             }
+            continue;
+        }
+        let live = reported_side_calls.get(&hash);
+        let live_member = live.map(|(index, _)| family.items[*index].source_session_id.as_str());
+        let origin = if row.cost_micros.is_some() {
+            ClaudeRequestUsageOrigin::TelemetryReported
+        } else {
+            ClaudeRequestUsageOrigin::TelemetryUnpriced
         };
-        if let Some(entity) = body.entities.get_mut(member) {
-            if let Some(key) = reported_live_key(&row, None) {
-                if row.cost_micros.is_none()
-                    && row.tokens.unattributed > 0
-                    && !super::UNPRICED_UNATTRIBUTED_ALLOWED
-                {
-                    entity.partition(&row.tokens, 1, 2);
-                } else {
-                    entity.partition(&row.tokens, 1, 0);
+        let absent_holder = ctx.holders.has_transcript_holder_in(hash, family.root);
+        let mut claimants = ctx.telemetry_claimants(hash);
+        if !claimants.contains(&own_telemetry.as_str()) {
+            claimants.push(own_telemetry.as_str());
+            claimants.sort_unstable();
+        }
+        let two_owner = claimants.len() >= 2;
+        let mut reason = None;
+        let (part, category) = if absent_holder {
+            counts.side_calls_held_by_absent_member += 1;
+            (1, ClaudeGrainCategory::CopiesRemoved)
+        } else if row.clock == 0 || now.saturating_sub(row.clock) < MATURITY_SECONDS {
+            counts.side_calls_immature += 1;
+            (3, ClaudeGrainCategory::Immature)
+        } else if !ctx.scope.family_complete(family.root) {
+            reason = Some(ClaudeUndecidedBy::Scope);
+            (2, ClaudeGrainCategory::Held)
+        } else if two_owner {
+            match ctx.two_owner_winner(&claimants) {
+                Some(winner) if winner == own_telemetry => {
+                    counts.side_calls_two_owner_won += 1;
+                    (0, ClaudeGrainCategory::SideCallAdded)
+                }
+                Some(_) => {
+                    counts.side_calls_two_owner_lost += 1;
+                    (1, ClaudeGrainCategory::TwoOwner)
+                }
+                None => {
+                    reason = Some(ClaudeUndecidedBy::TelemetryOrder);
+                    (2, ClaudeGrainCategory::Held)
+                }
+            }
+        } else {
+            (0, ClaudeGrainCategory::SideCallAdded)
+        };
+        let key = reported_live_key(&row, None);
+        for member in recipients {
+            let entity = body.entities.get_mut(member).expect("page member");
+            let assigned_part = if part == 0 && member != target {
+                1
+            } else {
+                part
+            };
+            let assigned_part = if assigned_part == 0
+                && row.cost_micros.is_none()
+                && row.tokens.unattributed > 0
+                && !super::UNPRICED_UNATTRIBUTED_ALLOWED
+            {
+                2
+            } else {
+                assigned_part
+            };
+            entity.partition(&row.tokens, 1, assigned_part);
+            if assigned_part == 3 {
+                let due = row.clock.saturating_add(MATURITY_SECONDS);
+                entity.due_unix = Some(entity.due_unix.map_or(due, |old| old.min(due)));
+            }
+            if assigned_part == 0 {
+                if let Some(key) = &key {
                     entity.count(key.clone(), Some(origin), &row.tokens, 1, row.cost_micros);
                     entity.counted.push(ClaudeCountedContribution {
-                        key,
+                        key: key.clone(),
                         origin: Some(origin),
                         tokens: row.tokens,
                         requests: 1,
                         cost: row.cost_micros,
                         request: Some(hash),
                         clock: row.clock,
-                        by: if claimants.len() < 2 {
-                            ClaudeCountedBy::TelemetryProven
-                        } else {
+                        by: if two_owner {
                             ClaudeCountedBy::TwoOwnerWinner
+                        } else {
+                            ClaudeCountedBy::TelemetryProven
                         },
                     });
-                    entity.telemetry_owned_complete &= claimants.len() < 2;
+                    entity.telemetry_owned_complete &= !two_owner;
+                } else {
+                    entity.held = true;
                 }
-            } else {
-                entity.held = true;
             }
         }
-        if let Some(previous) = live_member.filter(|previous| *previous != member) {
-            body.entities
-                .entry(previous.to_owned())
-                .or_default()
-                .partition(&row.tokens, 1, 1);
+        // P1's old side is the row the existing reported rebuild carried.
+        // An absent member's transcript is not a shadow side-call addition.
+        if absent_holder && live.is_none() {
+            continue;
         }
-        if live_member == Some(member) {
+        let conserved = row.tokens.conserved();
+        body.units.add(conserved, 1, None);
+        if let Some(reason) = reason {
+            counts.note_undecided(reason);
+            body.held_reasons.insert(reason);
+        }
+        match part {
+            1 => body.removed.add(conserved, 1, None),
+            2 => body.held.add(conserved, 1, None),
+            3 => body.immature.add(conserved, 1, None),
+            _ => {
+                counts.side_calls += 1;
+                counts.side_calls_unpriced += u64::from(row.cost_micros.is_none());
+                counts.side_call_member_unknown += u64::from(named.is_none());
+            }
+        }
+        if part == 0 && live_member == Some(target) {
             counts.side_calls_in_live_body += 1;
             continue;
         }
-        let Some(key) = reported_live_key(&row, None) else {
-            // No live row to add it at: the body cannot be built.
-            counts.side_calls_unkeyed += 1;
-            body.unbuilt = true;
-            continue;
-        };
-        if live.is_some() {
-            counts.side_calls_moved += 1;
-            body.removed.add(conserved, 1, None);
-            leave(body, ClaudeGrainCategory::Transfer);
-        }
-        body.slice(
-            ClaudeGrainKey {
-                member: member.to_owned(),
-                owner: member.to_owned(),
-                live: key,
-                origin: Some(origin),
-                category: if live.is_some() {
-                    ClaudeGrainCategory::Transfer
-                } else {
-                    ClaudeGrainCategory::SideCallAdded
+        if let (Some((_, live_key)), Some(member)) = (live, live_member) {
+            let category = if part == 0 {
+                ClaudeGrainCategory::Transfer
+            } else {
+                category
+            };
+            body.slice(
+                ClaudeGrainKey {
+                    member: member.into(),
+                    owner: String::new(),
+                    live: live_key.clone(),
+                    origin: Some(origin),
+                    category,
                 },
-            },
-            None,
-            Some((&row.tokens, 1, row.cost_micros)),
-        );
+                Some((&row.tokens, 1, row.cost_micros)),
+                None,
+            );
+            if part == 0 {
+                counts.side_calls_moved += 1;
+                body.removed.add(conserved, 1, None);
+            }
+        }
+        if part == 0 {
+            let Some(key) = key else {
+                counts.side_calls_unkeyed += 1;
+                body.unbuilt = true;
+                continue;
+            };
+            body.slice(
+                ClaudeGrainKey {
+                    member: target.into(),
+                    owner: target.into(),
+                    live: key,
+                    origin: Some(origin),
+                    category: if live.is_some() {
+                        ClaudeGrainCategory::Transfer
+                    } else {
+                        ClaudeGrainCategory::SideCallAdded
+                    },
+                },
+                None,
+                Some((&row.tokens, 1, row.cost_micros)),
+            );
+        }
     }
 }

@@ -2236,6 +2236,15 @@ pub enum LocalCollectorState {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LocalCollectorHealth {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub held_for_review_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_applied_after_review_count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub adoption_state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protected_list_state: Option<String>,
+
     pub state: LocalCollectorState,
     pub last_scan_started_at: Option<Rfc3339Timestamp>,
     pub last_scan_finished_at: Option<Rfc3339Timestamp>,

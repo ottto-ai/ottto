@@ -103,6 +103,12 @@ pub(crate) fn request_owned_live(support_dir: &Path) -> bool {
 #[cfg(test)]
 static LIVE_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
+/// Flush already queued ledger/output work on an orderly service exit.
+/// Abrupt termination is recovered by persisted debt; no signal handler does I/O.
+pub fn flush_on_shutdown() {
+    store::flush();
+}
+
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
 const JSONL_VERSION: u8 = 2;
@@ -1399,7 +1405,8 @@ fn build_page_at(
     end.tail = tail;
     end.tail.certificate_dropped += dropped;
     counts.telemetry_retired_pressure =
-        claude_request_ledger::retire_telemetry_under_pressure(ledger);
+        claude_request_ledger::retire_idle_telemetry(ledger, index, now)
+            + claude_request_ledger::retire_telemetry_under_pressure(ledger);
     if counts.telemetry_retired_pressure > 0 {
         drop_certificate(ledger);
         end.tail.certificate_dropped += 1;

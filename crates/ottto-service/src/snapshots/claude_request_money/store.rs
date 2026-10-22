@@ -208,7 +208,7 @@ impl ClaudeLedger {
         &mut self,
         deadline: Instant,
     ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || writer().is_none() {
             return None;
         }
         let mut selected = vec![false; DATA_SHARDS];
@@ -396,7 +396,6 @@ pub(crate) struct WriteResult {
 enum Job {
     Load(PathBuf),
     Write(Box<WriteJob>),
-    #[cfg(test)]
     Flush(SyncSender<()>),
 }
 
@@ -408,7 +407,11 @@ enum Slot {
 
 static LEDGERS: Mutex<BTreeMap<PathBuf, Slot>> = Mutex::new(BTreeMap::new());
 static RESULTS: Mutex<BTreeMap<PathBuf, Vec<WriteResult>>> = Mutex::new(BTreeMap::new());
-static WRITER: OnceLock<Option<Mutex<SyncSender<Job>>>> = OnceLock::new();
+struct Writer {
+    sender: Mutex<SyncSender<Job>>,
+    thread: std::thread::JoinHandle<()>,
+}
+static WRITER: OnceLock<Option<Writer>> = OnceLock::new();
 
 fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
     WRITER
@@ -418,9 +421,14 @@ fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
                 .name("claude-money-shadow-writer".to_owned())
                 .spawn(move || run_writer(receiver))
                 .ok()
-                .map(|_| Mutex::new(sender))
+                .map(|thread| Writer {
+                    sender: Mutex::new(sender),
+                    thread,
+                })
         })
         .as_ref()
+        .filter(|writer| !writer.thread.is_finished())
+        .map(|writer| &writer.sender)
 }
 
 /// Admitted bytes of the batches handed to the writer and not yet written.
@@ -505,6 +513,9 @@ pub(crate) enum ClaudeLedgerAcquire {
 /// empty (every shard dirty, so the first save writes them all); a saved one
 /// is loaded by the writer while pages skip.
 pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
+    if writer().is_none() {
+        return ClaudeLedgerAcquire::Unavailable;
+    }
     let Ok(mut ledgers) = LEDGERS.lock() else {
         return ClaudeLedgerAcquire::Unavailable;
     };
@@ -619,7 +630,6 @@ fn run_writer(receiver: Receiver<Job>) {
                     results.entry(support_dir).or_default().push(result);
                 }
             }
-            #[cfg(test)]
             Job::Flush(done) => {
                 let _ = done.send(());
             }
@@ -635,6 +645,16 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     });
     written
         .and_then(|()| std::fs::rename(&staged, path))
+        // Persist the name before any data shard can replace a zero meta.
+        .and_then(|()| {
+            std::fs::File::open(path.parent().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "ledger file has no parent",
+                )
+            })?)?
+            .sync_all()
+        })
         .is_ok()
 }
 
@@ -806,10 +826,14 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
 }
 
 /// Wait until the writer has done everything handed to it so far.
-#[cfg(test)]
 pub(crate) fn flush() {
     let (done, wait) = sync_channel(1);
-    let Some(sender) = writer() else {
+    let Some(sender) = WRITER
+        .get()
+        .and_then(Option::as_ref)
+        .filter(|writer| !writer.thread.is_finished())
+        .map(|writer| &writer.sender)
+    else {
         return;
     };
     let sent = sender
@@ -817,7 +841,7 @@ pub(crate) fn flush() {
         .ok()
         .is_some_and(|sender| sender.send(Job::Flush(done)).is_ok());
     if sent {
-        let _ = wait.recv();
+        let _ = wait.recv_timeout(Duration::from_secs(5));
     }
 }
 

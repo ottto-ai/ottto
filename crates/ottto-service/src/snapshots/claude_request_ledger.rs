@@ -955,6 +955,32 @@ fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
             >= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES * percent
 }
 
+/// Remove idle telemetry with no indexed transcript. It cannot establish a
+/// permanent ownership claim after the transcript retention window has passed.
+pub(crate) fn retire_idle_telemetry(ledger: &mut ClaudeLedger, index: &ScanIndex, now: u64) -> u64 {
+    let roots = index
+        .files
+        .keys()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)).map(|(root, _)| root))
+        .collect::<BTreeSet<_>>();
+    let keys = ledger
+        .census()
+        .records_with_prefix(TELEMETRY_KEY_PREFIX)
+        .filter_map(|(key, record)| {
+            let tail = record.tail()?;
+            if now.saturating_sub(tail.last_append_unix) <= 35 * 86_400 {
+                return None;
+            }
+            let facts = super::claude_request_money::facts::ClaudeFacts::open(record.facts()?)?;
+            (!roots.contains(&facts.header.session)).then(|| key.clone())
+        })
+        .collect::<Vec<_>>();
+    for key in &keys {
+        ledger.remove(key);
+    }
+    keys.len() as u64
+}
+
 /// Telemetry retirement under budget pressure only: at 90% of the ledger's
 /// hash or serialized budget, retire the telemetry records with the oldest
 /// last append until both are under 80%. A retired telemetry record keeps
@@ -984,10 +1010,21 @@ pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 
         if !pressure(ledger, PRESSURE_TARGET_PERCENT) {
             break;
         }
+        let before = (
+            ledger.census().hash_total(),
+            ledger.census().serialized_total(),
+        );
         if let Some(mut record) = ledger.take(&key) {
             record.retire();
             let _ = ledger.insert(key, record);
             retired += 1;
+        }
+        let after = (
+            ledger.census().hash_total(),
+            ledger.census().serialized_total(),
+        );
+        if after.0 >= before.0 && after.1 >= before.1 {
+            break;
         }
     }
     retired
