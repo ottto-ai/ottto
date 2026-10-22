@@ -34,11 +34,16 @@ re-sent: a new `after` arrives together with the request that also moves usage.
 Idle sessions and later corrections are not re-sent, by design. There is no
 cutover: a resumed session also gets sizes for its earlier compactions.
 
-State: one 16-byte size pair per marker. These pairs sit in a vector aligned
-with the accumulator's `compaction_timestamps` and are bounded at finish with
-them. The type exposes only `note_marker`, `note_counted_request` and
-`into_events`, so a swap to a bounded map keyed by `at` stays local to
-`snapshots/compaction_events.rs`.
+State: a sorted vector keyed by the exact `at` string, retaining only the
+newest 64 distinct timestamps while parsing. Duplicates keep the first marker;
+timestamps below the current cutoff can never return because the cutoff only
+increases. Eviction happens before insertion, and bounded `reserve_exact`
+growth keeps capacity at most 64 even for cloned tail state. A counted
+non-zero request fills every retained pending `after`, regardless of timestamp
+order. A flag skips this scan when no marker is pending. Finish moves only
+these at-most-64 events; it neither builds all-marker events nor clones the
+existing timestamp vector. The existing `compaction_count` and timestamp
+accumulator and their wire semantics are unchanged.
 
 Claude Code leaves the list empty in this change. Its events will be built by
 the ownership fold, never in `finish()`.
@@ -76,14 +81,19 @@ rewritten each scan; a row leaves it with its session.
 
 ## Weight
 
-- Per Codex accumulator: two empty vectors (48 bytes). It grows by 16 bytes
-  per compaction marker and by at most 512 bytes of points (64 x 8; the
-  vector's capacity never exceeds 64).
+- Per Codex accumulator: two vector headers plus a pending flag (56 bytes
+  including alignment). Size state owns at most 64 entries of 40 bytes each
+  (a string header plus a 16-byte size pair), plus the capacities of their
+  timestamp strings: 3,840 heap bytes for 64 ordinary 20-byte timestamps.
+  Actual capacity, including string allocations, is charged. No new timestamp
+  length limit is imposed; the general bound is 2,560 bytes plus the capacities
+  of at most 64 retained strings. Points add at most 512 bytes (64 x 8).
 - Per `SnapshotItem`: two empty vectors (48 bytes).
-- Per Codex line: a `compacted` marker pushes 16 bytes. A positive
-  `token_count` record parses its timestamp once and updates or appends one
-  8-byte point. A counted record checks the newest size pair. Every other line
-  costs nothing.
+- Per Codex line: a `compacted` marker searches at most 64 sorted keys and
+  inserts/evicts only when admitted. A positive `token_count` record parses its
+  timestamp once and updates or appends one 8-byte point. A counted non-zero
+  request fills at most 64 pending size entries, only when a marker has been
+  admitted since the last fill. Every other line costs nothing here.
 - Status: a point is about 20 bytes of compact JSON (`[1792576800,250000]`)
   instead of about 46 bytes as an object, and the daemon formats no timestamps
   for it. Compaction events on `ActiveSession` stay objects (about 74 bytes
@@ -97,8 +107,9 @@ rewritten each scan; a row leaves it with its session.
 ## Tests
 
 - `snapshots/compaction_events.rs`: shared `after`, the 64 bound matching
-  `bounded_compaction_timestamps` with duplicate and out-of-order markers, and
-  the wire shape.
+  `bounded_compaction_timestamps` over 10,000 duplicate/out-of-order markers
+  and a cloned continuation, capacity bounded throughout and output equal to
+  the old finish-time result, and the wire shape.
 - `snapshots/local_context_points.rs`: the pinned first point, slot overwrite,
   big changes, skips, the out-of-order clamp, halving on overflow, the vector
   capacity bound across cloned tail state, and the 75-minute gate.

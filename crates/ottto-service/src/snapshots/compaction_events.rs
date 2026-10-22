@@ -55,59 +55,80 @@ struct CodexCompactionSize {
     after: Option<NonZeroU64>,
 }
 
-/// Sizes for each Codex `compacted` marker, index-aligned with the
-/// accumulator's `compaction_timestamps`: exactly one entry is noted with each
-/// timestamp pushed there, so entry `i` belongs to timestamp `i`. Bounded at
-/// finish together with the timestamps. Every entry is 16 bytes and owns no
-/// heap. Callers see only `note_marker`, `note_counted_request` and
-/// `into_events`, so a swap to a bounded map keyed by `at` stays local.
+/// Sizes for the newest distinct Codex marker timestamps, sorted by the same
+/// string order as `bounded_compaction_timestamps`. Pruned during parsing:
+/// both length and vector capacity stay at most `MAX_COMPACTION_TIMESTAMPS`.
+/// The existing count and timestamp accumulator are independent and unchanged.
 #[derive(Debug, Clone, Default)]
 pub(super) struct CodexCompactionSizes {
-    entries: Vec<CodexCompactionSize>,
+    entries: Vec<(String, CodexCompactionSize)>,
+    pending_after: bool,
 }
 
 impl CodexCompactionSizes {
-    /// A marker was recorded at `at`; `before` is the session's last owned
-    /// request size at that moment. `_at` is reserved for a possible keyed-map
-    /// implementation; the current vector uses timestamp index alignment.
-    pub(super) fn note_marker(&mut self, _at: &str, before: Option<u64>) {
-        self.entries.push(CodexCompactionSize {
-            before: before.and_then(NonZeroU64::new),
-            after: None,
-        });
+    /// Keep the first marker at each timestamp. Once a timestamp falls below
+    /// the newest-64 cutoff it can never return: that cutoff only increases.
+    pub(super) fn note_marker(&mut self, at: &str, before: Option<u64>) {
+        let Err(mut index) = self
+            .entries
+            .binary_search_by(|(timestamp, _)| timestamp.as_str().cmp(at))
+        else {
+            return;
+        };
+        if self.entries.len() == MAX_COMPACTION_TIMESTAMPS {
+            if index == 0 {
+                return;
+            }
+            self.entries.remove(0);
+            index -= 1;
+        }
+        if self.entries.len() == self.entries.capacity() {
+            // Cloning retained state can leave an odd capacity. Plain Vec
+            // growth could then overshoot the cap even though length cannot.
+            let target = (self.entries.capacity() * 2).clamp(4, MAX_COMPACTION_TIMESTAMPS);
+            self.entries.reserve_exact(target - self.entries.len());
+        }
+        self.entries.insert(
+            index,
+            (
+                at.to_owned(),
+                CodexCompactionSize {
+                    before: before.and_then(NonZeroU64::new),
+                    after: None,
+                },
+            ),
+        );
+        self.pending_after = true;
     }
 
-    /// A counted (non-duplicate) request saw `context_tokens`. Every marker
-    /// still waiting for its next request takes it; zero-size requests are
-    /// skipped. Waiting markers are always the newest ones, so the backward
-    /// walk stops at the first filled entry (amortized O(1)).
+    /// Every retained marker still waiting takes the next counted non-zero
+    /// request. Timestamp order need not be parse order, so check every entry
+    /// (at most 64), only when a marker has been admitted since the last fill.
     pub(super) fn note_counted_request(&mut self, context_tokens: u64) {
+        if !self.pending_after {
+            return;
+        }
         let Some(context_tokens) = NonZeroU64::new(context_tokens) else {
             return;
         };
-        for entry in self.entries.iter_mut().rev() {
-            if entry.after.is_some() {
-                break;
-            }
-            entry.after = Some(context_tokens);
+        for (_, entry) in &mut self.entries {
+            entry.after.get_or_insert(context_tokens);
         }
+        self.pending_after = false;
     }
 
-    /// Pairs each size with the timestamp noted beside it, then bounds the
-    /// list exactly as the timestamps are bounded.
-    pub(super) fn into_events(self, timestamps: Vec<String>) -> Vec<SnapshotCompactionEvent> {
-        debug_assert_eq!(timestamps.len(), self.entries.len());
-        let events = timestamps
+    /// Already sorted, distinct and bounded: allocate only the surviving
+    /// events, moving their keys rather than cloning the timestamp accumulator.
+    pub(super) fn into_events(self) -> Vec<SnapshotCompactionEvent> {
+        self.entries
             .into_iter()
-            .zip(self.entries)
             .map(|(at, size)| SnapshotCompactionEvent {
                 at,
                 before: size.before.map(NonZeroU64::get),
                 after: size.after.map(NonZeroU64::get),
                 trigger: None,
             })
-            .collect();
-        bounded_compaction_events(events)
+            .collect()
     }
 }
 
@@ -117,8 +138,12 @@ impl crate::heap_layout_bound::HeapLayoutBound for CodexCompactionSizes {
         c.add(
             self.entries
                 .capacity()
-                .checked_mul(std::mem::size_of::<CodexCompactionSize>())?,
-        )
+                .checked_mul(std::mem::size_of::<(String, CodexCompactionSize)>())?,
+        )?;
+        for (at, _) in &self.entries {
+            c.add(at.capacity())?;
+        }
+        Some(())
     }
 }
 
@@ -147,7 +172,7 @@ mod tests {
         sizes.note_counted_request(61_000);
         sizes.note_marker(&at(3), Some(61_000));
         sizes.note_marker(&at(4), None);
-        let events = sizes.into_events(vec![at(1), at(2), at(3), at(4)]);
+        let events = sizes.into_events();
         let pairs = events
             .iter()
             .map(|event| (event.before, event.after))
@@ -166,27 +191,79 @@ mod tests {
 
     #[test]
     fn bounded_events_match_bounded_timestamps() {
-        // 70 markers, two sharing one timestamp and two out of order.
-        let mut timestamps = (0..70).map(at).collect::<Vec<_>>();
-        timestamps[40] = at(39);
-        timestamps.swap(10, 11);
+        // The old finish-time algorithm is the oracle: keep every marker,
+        // fill the waiting parse-order suffix, then stable-sort/dedup/truncate.
+        // Most of these 10,000 markers are duplicates and out of order; the
+        // final new key intentionally stays pending at end of input.
+        let mut old_events: Vec<SnapshotCompactionEvent> = Vec::new();
+        let mut timestamps = Vec::new();
         let mut sizes = CodexCompactionSizes::default();
-        for (index, timestamp) in timestamps.iter().enumerate() {
-            sizes.note_marker(timestamp, Some(1_000 + index as u64));
+        let mut tail: Option<CodexCompactionSizes> = None;
+        for index in 0..10_000 {
+            let timestamp = at(if index == 9_999 {
+                300
+            } else {
+                index * 37 % 257
+            });
+            let before = (index % 13 != 0).then_some(1_000 + index as u64);
+            timestamps.push(timestamp.clone());
+            old_events.push(SnapshotCompactionEvent {
+                at: timestamp.clone(),
+                before,
+                after: None,
+                trigger: None,
+            });
+            sizes.note_marker(&timestamp, before);
+            if let Some(tail) = tail.as_mut() {
+                tail.note_marker(&timestamp, before);
+            }
+            // Zero requests leave pending markers alone; the first positive
+            // request fills them, later requests must never overwrite it.
+            let request = if index % 17 == 0 {
+                Some(50_000 + index as u64)
+            } else if index % 7 == 0 {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(request) = request {
+                sizes.note_counted_request(request);
+                if let Some(tail) = tail.as_mut() {
+                    tail.note_counted_request(request);
+                }
+                if request > 0 {
+                    for event in old_events.iter_mut().rev() {
+                        if event.after.is_some() {
+                            break;
+                        }
+                        event.after = Some(request);
+                    }
+                }
+            }
+            // Resume while some entries are pending, with clone capacity 33
+            // rather than a power of two. Continue through eviction and dedup.
+            if index == 32 {
+                tail = Some(sizes.clone());
+            }
+            for state in std::iter::once(&sizes).chain(tail.iter()) {
+                assert!(state.entries.len() <= MAX_COMPACTION_TIMESTAMPS);
+                assert!(state.entries.capacity() <= MAX_COMPACTION_TIMESTAMPS);
+                assert!(state.entries.windows(2).all(|pair| pair[0].0 < pair[1].0));
+            }
         }
-        let events = sizes.into_events(timestamps.clone());
-        let bounded = bounded_compaction_timestamps(timestamps);
+        let events = sizes.into_events();
+        assert_eq!(events, tail.unwrap().into_events());
+        assert_eq!(events, bounded_compaction_events(old_events));
         assert_eq!(events.len(), MAX_COMPACTION_TIMESTAMPS);
         assert_eq!(
             events
                 .iter()
                 .map(|event| event.at.clone())
                 .collect::<Vec<_>>(),
-            bounded
+            bounded_compaction_timestamps(timestamps)
         );
-        // The duplicate keeps the first marker in parse order (index 39).
-        let duplicate = events.iter().find(|event| event.at == at(39)).unwrap();
-        assert_eq!(duplicate.before, Some(1_039));
+        assert_eq!(events.last().unwrap().at, at(300));
+        assert_eq!(events.last().unwrap().after, None);
     }
 
     #[test]

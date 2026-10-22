@@ -14572,7 +14572,7 @@ impl SnapshotAccumulator {
             } else {
                 let timestamps = self.compaction_timestamps.into_vec();
                 let events = if self.source == SnapshotSource::Codex {
-                    self.codex_compaction_sizes.into_events(timestamps.clone())
+                    self.codex_compaction_sizes.into_events()
                 } else {
                     Vec::new()
                 };
