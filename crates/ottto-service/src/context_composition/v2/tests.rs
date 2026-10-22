@@ -3445,3 +3445,96 @@ fn committed_manifest_recovers_a_crash_before_the_single_pins_write() {
     assert_eq!(env.scope(Source::Claude).agg, expected);
     env.cleanup();
 }
+
+#[test]
+fn absent_first_run_pins_recover_committed_scopes_without_transcript_reads() {
+    let env = Env::new("composition-first-pins-crash");
+    let now = base_now();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    // No uploader: committed totals still need their first successful upload.
+    env.run(Source::Claude, now, None);
+    let expected = env.scope(Source::Claude).agg;
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    let mut capture = Capture::default();
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(3),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.bytes_head,
+            stats.bad_state
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(stats.pins_rebuilt, 1);
+    assert_eq!(capture.payloads.len(), 1);
+    assert_eq!(env.scope(Source::Claude).agg, expected);
+    env.cleanup();
+}
+
+#[test]
+fn manifest_generation_recovers_pins_even_with_older_manifest_timestamp() {
+    let env = Env::new("composition-generation-recovery");
+    let now = base_now();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    env.run(Source::Claude, now, None);
+    let pins = harvest::index_path(&env.state, Source::Claude);
+    let old = fs::read(&pins).unwrap();
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    env.run(Source::Claude, now + time::Duration::days(1), None);
+    let expected = env.scope(Source::Claude).agg;
+    // Timestamp-based recovery would skip the completed scope here.
+    fs::write(&pins, old).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.pins_rebuilt),
+        (0, 0, 1)
+    );
+    assert_eq!(env.scope(Source::Claude).agg, expected);
+    env.cleanup();
+}
+
+#[test]
+fn codex_agent_message_closes_request_one_across_checkpoints() {
+    let env = Env::new("composition-codex-response-boundary");
+    let now = base_now();
+    let path = env.root.join("rollout-test.jsonl");
+    write_records(
+        &path,
+        &[
+            json!({"timestamp":ts(now.date(),1),"type":"session_meta","payload":{"id":"s","cwd":env.cwd()}}),
+            json!({"timestamp":ts(now.date(),2),"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"first request"}]}}),
+            json!({"timestamp":ts(now.date(),3),"type":"response_item","payload":{"type":"agent_message","content":[]}}),
+        ],
+    );
+    env.run(Source::Codex, now, None);
+    append_records(
+        &path,
+        &[
+            json!({"timestamp":ts(now.date(),4),"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"next request"}]}}),
+            json!({"timestamp":ts(now.date(),5),"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"later rules"}]}}),
+        ],
+    );
+    env.run(Source::Codex, now + time::Duration::days(1), None);
+    let scope = env.scope(Source::Codex);
+    let tokens = |part| {
+        scope
+            .agg
+            .all_parts
+            .iter()
+            .filter(|(slot, _)| slot.part == part)
+            .map(|(_, bucket)| bucket.tokens)
+            .sum::<u64>()
+    };
+    use crate::composition_kinds::Part;
+    assert_eq!(tokens(Part::StartNotMeasured), tokens_for("first request"));
+    assert!(tokens(Part::ByYou) > 0);
+    assert!(tokens(Part::Other) > 0);
+    env.cleanup();
+}

@@ -116,7 +116,10 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         if let Ok(row) = serde_json::from_slice::<Value>(line) {
             let mut parser = crate::codex_prelude_footprint::CodexPreludeParser::matching_only(0);
             parser.observe(&row);
-            state.request1_closed = parser.prelude().input_closed;
+            state.request1_closed = parser.prelude().input_closed
+                // Older rollouts use this response form, also supported by
+                // the composition request/residency handler below.
+                || (row["type"] == "response_item" && row["payload"]["type"] == "agent_message");
         }
     }
     if codex_never_counted(line) {

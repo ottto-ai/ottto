@@ -636,7 +636,7 @@ fn rebuild_pins(
     source: Source,
     index: &mut Index,
     today: Day,
-    newer_than: Option<std::time::SystemTime>,
+    only_uncommitted: bool,
 ) -> u64 {
     let Ok(entries) = fs::read_dir(state_dir.join("scopes")) else {
         return 0;
@@ -654,13 +654,17 @@ fn rebuild_pins(
         else {
             continue;
         };
-        if newer_than.is_some_and(|cut| {
-            entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .is_ok_and(|modified| modified <= cut)
-        }) {
-            continue;
+        if only_uncommitted {
+            #[derive(serde::Deserialize)]
+            struct Generation {
+                generation: u64,
+            }
+            let Ok(Some(saved)) = read_json::<Generation>(&entry.path()) else {
+                continue;
+            };
+            if index.scope_generations.get(&scope_id) == Some(&saved.generation) {
+                continue;
+            }
         }
         let Ok(Some(mut scope)) = load_scope(&entry.path(), source, &scope_id) else {
             continue;
@@ -755,23 +759,30 @@ fn run_source_inner(
     let window = Window::ending(today);
     let now_secs = run.now.unix_timestamp();
     let path = index_path(&run.state_dir, source);
-    let (mut index, first_run) = match read_json::<Index>(&path) {
+    let (mut index, mut first_run) = match read_json::<Index>(&path) {
         Ok(Some(index)) if index.schema == STATE_SCHEMA => (index, false),
         Ok(None) => (Index::new(now_secs), true),
         _ => {
             stats.bad_state += 1;
             let mut index = Index::new(now_secs);
             index.last_scan_started = Some(now_secs);
-            stats.pins_rebuilt = rebuild_pins(&run.state_dir, source, &mut index, today, None);
+            stats.pins_rebuilt = rebuild_pins(&run.state_dir, source, &mut index, today, false);
             (index, false)
         }
     };
-    // A manifest committed after the single pins write is a completed scope
-    // from an interrupted run. Recover offsets and first-sight assignments
-    // from state only; never re-read transcript bytes.
-    if let Ok(modified) = fs::metadata(&path).and_then(|m| m.modified()) {
-        stats.pins_rebuilt +=
-            rebuild_pins(&run.state_dir, source, &mut index, today, Some(modified));
+    // A first run can commit a scope before its only pins write. Recover
+    // those manifests even when the pins file has never existed.
+    if first_run {
+        let recovered = rebuild_pins(&run.state_dir, source, &mut index, today, false);
+        if recovered > 0 {
+            stats.pins_rebuilt += recovered;
+            first_run = false;
+            index.last_scan_started = Some(now_secs);
+        }
+    } else {
+        // Generation comparison also works on filesystems whose timestamps
+        // cannot distinguish the manifest commit from the previous pins write.
+        stats.pins_rebuilt += rebuild_pins(&run.state_dir, source, &mut index, today, true);
     }
     let previous_scan = index.last_scan_started;
     index.last_scan_started = Some(now_secs);

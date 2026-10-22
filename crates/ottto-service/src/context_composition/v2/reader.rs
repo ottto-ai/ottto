@@ -15,12 +15,6 @@ type ReaderFile = File;
 #[cfg(test)]
 struct ReaderFile(File);
 #[cfg(test)]
-impl From<File> for ReaderFile {
-    fn from(file: File) -> Self {
-        Self(file)
-    }
-}
-#[cfg(test)]
 impl Read for ReaderFile {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         let read = self.0.read(buffer)?;
@@ -64,8 +58,10 @@ impl LineReader {
         max_line: usize,
     ) -> std::io::Result<Self> {
         file.seek(SeekFrom::Start(offset))?;
+        #[cfg(test)]
+        let file = ReaderFile(file);
         Ok(Self {
-            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file.into()),
+            reader: BufReader::with_capacity(READ_BUFFER_BYTES, file),
             pos: offset,
             end: end.max(offset),
             line: Vec::new(),

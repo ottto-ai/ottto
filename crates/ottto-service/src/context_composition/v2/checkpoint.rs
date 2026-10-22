@@ -133,6 +133,8 @@ pub(super) fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Opt
             use std::io::{Read, Seek};
             let mut magic = [0; 4];
             let size = file.read(&mut magic).map_err(|_| ())?;
+            #[cfg(test)]
+            record_read(size as u64);
             file.rewind().map_err(|_| ())?;
             if size == 4 && magic == [0x28, 0xb5, 0x2f, 0xfd] {
                 let decoder = zstd::stream::read::Decoder::new(file).map_err(|_| ())?;
