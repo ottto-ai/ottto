@@ -906,6 +906,7 @@ impl Env {
         let mut run = Run {
             start_verdicts: crate::snapshots::start_verdict_store::load(
                 &self.root,
+                "synthetic-destination",
                 now.unix_timestamp(),
             ),
             state_dir: self.state.clone(),
@@ -4075,7 +4076,7 @@ fn composition_lock_fixture() {
     };
     let dir = PathBuf::from(dir);
     if let Some(parent_ready) = std::env::var_os("COMPOSITION_LOCK_PARENT") {
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "context_composition::v2::tests::composition_lock_fixture",
@@ -4088,6 +4089,9 @@ fn composition_lock_fixture() {
             .unwrap();
         fs::write(parent_ready, child.id().to_string()).unwrap();
         std::thread::sleep(Duration::from_secs(60));
+        // The parent-death test kills this process before this point. If it
+        // survives, reap its child rather than leave fixture cleanup to init.
+        child.wait().unwrap();
         return;
     }
     let Some(_lock) = harvest::lock_state(&dir).unwrap() else {

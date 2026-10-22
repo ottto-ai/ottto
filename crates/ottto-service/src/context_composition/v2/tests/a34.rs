@@ -126,7 +126,13 @@ fn record_request(
     request: &SnapshotBatchRequest,
     now: i64,
 ) -> std::io::Result<u64> {
-    snapshots::start_verdict_store::record(support, &request.source, &request.snapshots, now)
+    snapshots::start_verdict_store::record(
+        support,
+        "synthetic-destination",
+        &request.source,
+        &request.snapshots,
+        now,
+    )
 }
 
 #[test]
@@ -144,7 +150,10 @@ fn final_verdict_bridge_both_ways_missing_and_expired_are_unmeasured() {
     let request = verdict_request(Source::Claude, &path, true);
     let source = "claude-code";
     let id = &request.snapshots[0].source_session_id;
-    let get = |when| snapshots::start_verdict_store::load(&env.root, when).get(source, id, when);
+    let get = |when| {
+        snapshots::start_verdict_store::load(&env.root, "synthetic-destination", when)
+            .get(source, id, when)
+    };
     assert_eq!(get(now.unix_timestamp()), StartVerdict::NotMeasured);
     let bytes = record_request(&env.root, &request, now.unix_timestamp()).unwrap();
     assert!(bytes > 0);
@@ -163,11 +172,12 @@ fn final_verdict_bridge_both_ways_missing_and_expired_are_unmeasured() {
         StartVerdict::NotMeasured
     );
     assert_eq!(
-        snapshots::start_verdict_store::load(&env.root, now.unix_timestamp() + 2).get(
-            source,
-            "missing",
+        snapshots::start_verdict_store::load(
+            &env.root,
+            "synthetic-destination",
             now.unix_timestamp() + 2
-        ),
+        )
+        .get(source, "missing", now.unix_timestamp() + 2),
         StartVerdict::NotMeasured
     );
     eprintln!("verdict fixture: first_record_bytes={bytes}; unchanged_record_bytes=0");

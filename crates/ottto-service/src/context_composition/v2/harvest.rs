@@ -372,9 +372,15 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
     let enabled = crate::snapshot_sync::enabled_snapshot_sources(&device);
     let destination = destination_identity(&device, &machine_id, &api_base_url);
     let mut resolver = GitScopeResolver;
+    let start_destination = crate::snapshots::start_verdict_store::destination(
+        &crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &device_secret),
+        &api_base_url,
+        &machine_id,
+    );
     let mut run = Run {
         start_verdicts: crate::snapshots::start_verdict_store::load(
             support_dir,
+            &start_destination,
             now.unix_timestamp(),
         ),
         state_dir: dir.clone(),

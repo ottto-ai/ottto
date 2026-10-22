@@ -2051,6 +2051,14 @@ impl SnapshotApiClient {
         let Some(support) = self.receipt_state_dir.as_deref() else {
             return;
         };
+        let Some(namespace) = self.receipt_destination_namespace.as_deref() else {
+            return;
+        };
+        let destination = crate::snapshots::start_verdict_store::destination(
+            namespace,
+            &self.api_base_url,
+            &request.machine_id,
+        );
         if response.disabled
             || response
                 .validate_entity_ack_with_head_cas(request, enforce_head_cas)
@@ -2081,6 +2089,7 @@ impl SnapshotApiClient {
         });
         match crate::snapshots::start_verdict_store::record(
             support,
+            &destination,
             &request.source,
             items,
             time::OffsetDateTime::now_utc().unix_timestamp(),
@@ -4104,11 +4113,17 @@ mod tests {
             upload_policy: Default::default(),
             client_report: crate::client_report::ClientReport::empty(),
         };
-        let client =
-            SnapshotApiClient::new("https://example.invalid").with_receipt_state_dir(&support);
+        let client = SnapshotApiClient::new("https://example.invalid")
+            .with_receipt_state_dir(&support)
+            .with_receipt_destination_namespace("synthetic-namespace".into());
         let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let id = &request.snapshots[0].source_session_id;
-        let get = || start_verdict_store::load(&support, now).get("codex", id, now);
+        let destination = start_verdict_store::destination(
+            "synthetic-namespace",
+            "https://example.invalid",
+            &request.machine_id,
+        );
+        let get = || start_verdict_store::load(&support, &destination, now).get("codex", id, now);
         let mut conflict = entity_ack(0, vec![]);
         conflict.conflict_entities.push(entity_ref(
             id,
