@@ -838,7 +838,8 @@ fn rebuild_pins(
                     quarantined: false,
                     head: checkpoint.head,
                     tail: checkpoint.tail,
-                    origin: None,
+                    origin: checkpoint.origin,
+                    repair_to: None,
                 },
             );
             rebuilt += 1;
@@ -1030,6 +1031,7 @@ fn run_source_inner(
                         head: Default::default(),
                         tail: Default::default(),
                         origin: Some(start),
+                        repair_to: None,
                     },
                 );
                 start < file.size
@@ -1506,73 +1508,69 @@ fn process_scope(
     let mut removed = Vec::new();
     let mut added = Vec::new();
     let mut updates = Vec::new();
-    for (id, mut items) in groups {
+    let mut groups = groups.into_iter();
+    for (id, mut items) in groups.by_ref() {
         if stats.cut || Instant::now() >= run.deadline {
             stats.cut = true;
+            if base == Base::Fallback {
+                follow_kept_shard(
+                    run, source, scope_id, &mut scope, &path, id, &items, &damaged, index, stats,
+                );
+            }
             break;
         }
         let legacy = legacy_groups.remove(&id);
         let migrating = legacy.is_some();
         scope.files = legacy.unwrap_or_default();
         if damaged.contains(&id) || scope.load_shard(&path, id).is_err() {
-            // No kept generation holds this shard. Its files are set aside
-            // (counted), never re-read and never moved on from an empty
-            // checkpoint; files first scoped now still read.
-            stats.bad_state += 1;
-            scope.files.clear();
-            if let Some(file) = scope.drop_shard(&path, id) {
-                let label = format!(
-                    "{}-s{id:03}-{}",
-                    scope_file_stem(source, scope_id),
-                    run.now.unix_timestamp()
-                );
-                let _ = set_aside(&run.state_dir, &label, &[file]);
-            }
-            let fresh: BTreeSet<String> = items
-                .iter()
-                .filter(|item| item.fresh)
-                .map(|item| item.key.clone())
-                .collect();
-            for (key, pin) in index.files.iter_mut() {
-                if pin.scope.as_deref() == Some(scope_id)
-                    && shard_id(key) == id
-                    && !pin.done
-                    && !pin.quarantined
-                    && !fresh.contains(key)
-                {
-                    pin.quarantined = true;
-                    stats.files_quarantined += 1;
-                }
-            }
-            items.retain(|item| fresh.contains(&item.key));
+            items = quarantine_shard(
+                run, source, scope_id, &mut scope, &path, id, items, index, stats,
+            );
         }
         if base == Base::Fallback {
-            items.retain_mut(|item| {
-                if item.mode != Mode::Forward {
-                    return true;
+            // Whatever happens to the reads, the pins now follow the kept
+            // generation, so nothing it is behind on is ever skipped.
+            for item in &items {
+                if let Some(pin) = index.files.get_mut(&item.key) {
+                    follow_kept(pin, scope.files.get(&item.key));
                 }
-                let Some(pin) = index.files.get(&item.key) else {
-                    return !item.catch_up_only;
-                };
-                let from = scope.files.get(&item.key).map_or_else(
-                    || pin.origin.unwrap_or(pin.start),
-                    |checkpoint| checkpoint.offset,
-                );
-                let behind = pin.start.min(item.found.size).saturating_sub(from);
-                if behind == 0 {
-                    return !item.catch_up_only;
-                }
-                if behind <= run.repair_left {
-                    run.repair_left -= behind;
-                    item.catch_up = behind;
-                } else {
-                    // Counted; its earlier totals stay as committed.
-                    stats.repair_restarted += 1;
-                    item.mode = Mode::RestartAtEnd;
-                }
-                true
-            });
+            }
         }
+        // Bytes a failed generation had counted are read again within the
+        // repair budget, or wait for a later day's.
+        items.retain_mut(|item| {
+            if item.mode != Mode::Forward {
+                return true;
+            }
+            let Some(pin) = index.files.get(&item.key) else {
+                return !item.catch_up_only;
+            };
+            let from = scope
+                .files
+                .get(&item.key)
+                .map_or(pin.start, |checkpoint| checkpoint.offset);
+            let behind = pin
+                .repair_to
+                .map_or(0, |to| to.min(item.found.size).saturating_sub(from));
+            if behind == 0 {
+                return !item.catch_up_only;
+            }
+            if behind > REPAIR_BYTES_PER_DAY {
+                // More than a whole day's budget: counted, and its earlier
+                // totals stay as committed.
+                stats.repair_restarted += 1;
+                item.mode = Mode::RestartAtEnd;
+                return true;
+            }
+            if behind <= run.repair_left {
+                run.repair_left -= behind;
+                item.catch_up = behind;
+                return true;
+            }
+            stats.repair_waiting += 1;
+            stats.repair_waiting_bytes += behind;
+            false
+        });
         if items.is_empty() && !migrating {
             // Nothing to read or move: the shard keeps its reference.
             scope.files.clear();
@@ -1598,15 +1596,11 @@ fn process_scope(
                 stats.cut = true;
                 break;
             }
-            // After a fallback, a file the previous generation never held
-            // reads from where its first read started.
-            let Some((start, first_seen)) = index.files.get(&item.key).map(|pin| {
-                let start = match base {
-                    Base::Fallback => pin.origin.unwrap_or(pin.start),
-                    _ => pin.start,
-                };
-                (start, pin.first_seen)
-            }) else {
+            let Some((start, first_seen)) = index
+                .files
+                .get(&item.key)
+                .map(|pin| (pin.start, pin.first_seen))
+            else {
                 continue;
             };
             match read_file(
@@ -1694,6 +1688,7 @@ fn process_scope(
                 pin.tail = checkpoint.tail;
                 pin.waiting = false;
                 pin.failures = 0;
+                pin.repair_to = pin.repair_to.filter(|to| *to > checkpoint.offset);
                 updates.push((key, pin));
             }
         }
@@ -1705,6 +1700,16 @@ fn process_scope(
             }
         }
         scope.files.clear();
+    }
+    // A cut fallback commits the kept generation for shards it did not
+    // reach: their pins follow it too, so the next run reads what it is
+    // behind on.
+    if base == Base::Fallback {
+        for (id, items) in groups {
+            follow_kept_shard(
+                run, source, scope_id, &mut scope, &path, id, &items, &damaged, index, stats,
+            );
+        }
     }
     update_members(&mut scope.file_sessions, removed, added, window.floor);
     scope.agg.prune(window);
@@ -1749,6 +1754,102 @@ fn process_scope(
         .scope_generations
         .insert(scope_id.to_string(), scope.generation);
     Some(scope)
+}
+
+/// After a fallback: point a pin at what the kept generation holds for it
+/// (its checkpoint, else where its first read started), remembering how far
+/// the failed generation had counted.
+fn follow_kept(pin: &mut Pin, kept: Option<&Checkpoint>) {
+    let from = kept.map_or_else(|| pin.origin.unwrap_or(pin.start), |kept| kept.offset);
+    if pin.start <= from {
+        return;
+    }
+    pin.repair_to = Some(pin.repair_to.unwrap_or(0).max(pin.start));
+    pin.start = from;
+    (pin.head, pin.tail) = kept.map_or_else(Default::default, |kept| (kept.head, kept.tail));
+}
+
+/// `follow_kept` for the files of a shard a cut fallback did not process.
+#[allow(clippy::too_many_arguments)]
+fn follow_kept_shard(
+    run: &Run,
+    source: Source,
+    scope_id: &str,
+    scope: &mut Scope,
+    path: &Path,
+    id: u16,
+    items: &[Work],
+    damaged: &BTreeSet<u16>,
+    index: &mut Index,
+    stats: &mut SourceStats,
+) {
+    scope.files.clear();
+    if damaged.contains(&id) || scope.load_shard(path, id).is_err() {
+        quarantine_shard(
+            run,
+            source,
+            scope_id,
+            scope,
+            path,
+            id,
+            Vec::new(),
+            index,
+            stats,
+        );
+        return;
+    }
+    for item in items {
+        if let Some(pin) = index.files.get_mut(&item.key) {
+            follow_kept(pin, scope.files.get(&item.key));
+        }
+    }
+    scope.files.clear();
+}
+
+/// No kept generation holds this shard: stop referencing it and set its
+/// file aside. The files it held are set aside too (counted per file): never
+/// re-read, never moved on from an empty checkpoint, their pins kept. Returns
+/// the items still to read: files first scoped in this run.
+#[allow(clippy::too_many_arguments)]
+fn quarantine_shard(
+    run: &Run,
+    source: Source,
+    scope_id: &str,
+    scope: &mut Scope,
+    path: &Path,
+    id: u16,
+    mut items: Vec<Work>,
+    index: &mut Index,
+    stats: &mut SourceStats,
+) -> Vec<Work> {
+    stats.bad_state += 1;
+    scope.files.clear();
+    if let Some(file) = scope.drop_shard(path, id) {
+        let label = format!(
+            "{}-s{id:03}-{}",
+            scope_file_stem(source, scope_id),
+            run.now.unix_timestamp()
+        );
+        let _ = set_aside(&run.state_dir, &label, &[file]);
+    }
+    let fresh: BTreeSet<String> = items
+        .iter()
+        .filter(|item| item.fresh)
+        .map(|item| item.key.clone())
+        .collect();
+    for (key, pin) in index.files.iter_mut() {
+        if pin.scope.as_deref() == Some(scope_id)
+            && shard_id(key) == id
+            && !pin.done
+            && !pin.quarantined
+            && !fresh.contains(key)
+        {
+            pin.quarantined = true;
+            stats.files_quarantined += 1;
+        }
+    }
+    items.retain(|item| fresh.contains(&item.key));
+    items
 }
 
 /// Unusable state and no good earlier generation: move the scope's files
@@ -1897,6 +1998,12 @@ fn read_file(
                 Mode::RestartAtEnd => size,
                 Mode::Forward => pin_start.min(size),
             };
+            // Where this file's counting started, kept with the checkpoint.
+            let origin = match (mode, &existing) {
+                (Mode::Full, _) => Some(0),
+                (_, Some(old)) => old.origin,
+                (_, None) => Some(offset),
+            };
             let mut contribution = StoredContribution::default();
             if let Some(old) = existing {
                 if mode == Mode::Full {
@@ -1935,6 +2042,7 @@ fn read_file(
                     contribution,
                     last_seen: window.today,
                     cold,
+                    origin,
                 },
                 state,
             )

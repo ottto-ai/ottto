@@ -508,7 +508,11 @@ impl Scope {
         ids: impl IntoIterator<Item = u16>,
     ) -> BTreeSet<u16> {
         let mut damaged = BTreeSet::new();
+        let ids: BTreeSet<u16> = ids.into_iter().collect();
         for id in ids {
+            if self.verified.contains(&id) {
+                continue;
+            }
             let Some(reference) = self.shards.get(&id) else {
                 continue;
             };

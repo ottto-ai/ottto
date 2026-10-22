@@ -250,6 +250,11 @@ pub(super) struct Pin {
     /// a file that generation never held from here.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) origin: Option<u64>,
+    /// Bytes before this offset were counted by a generation that could not
+    /// be used: reading them again is charged to the repair budget, and
+    /// waits for budget rather than being skipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) repair_to: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -359,6 +364,10 @@ pub(super) struct Checkpoint {
     /// `compact`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) cold: Option<Cold>,
+    /// Where the file's first read started, kept so pins rebuilt from this
+    /// checkpoint still know it (see `Pin::origin`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) origin: Option<u64>,
 }
 
 /// A file unchanged this long is cold.
