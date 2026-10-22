@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 792,
-  "content_sha256": "1472367ff0f881f69f5789475b6906ae902d1ccb8d4a286305a9e95ba886aef7",
+  "content_sha256": "15e6fc1f0c8f2bf2c8cbeab846951c577e80629affd50b1f096d7a0a7274111b",
   "files": [
     {
       "executable": false,
@@ -1021,8 +1021,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/checkpoint.rs",
-      "sha256": "c74e7e55e173c577f4ac04f2b2bf07df7f0afa4919c8187438cc2a7136af5b54",
-      "size_bytes": 36596
+      "sha256": "44a775379d78892b7946ff2232482f074551c012f0b8e016fa0ec45cd0eb2994",
+      "size_bytes": 37438
     },
     {
       "executable": false,
@@ -1056,15 +1056,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "38436bf6d6f8a249c59f06759daf51485bf98af2b710b0eb49da5243ee045777",
-      "size_bytes": 96706
+      "sha256": "5eb43b422c96a75ffda60ec0cf33744c106a8468e29f6081fe9dd5117f2d6d89",
+      "size_bytes": 98205
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/health.rs",
-      "sha256": "025e051dee92e1b8fff6d7d047133d556ec7166068ccbdc56a5ebd7e34848d3c",
-      "size_bytes": 9105
+      "sha256": "3222a1aad1ce07b940b1fab0d2bd601197f9348118ffec0cafaea4efe2be7ba5",
+      "size_bytes": 9779
     },
     {
       "executable": false,
@@ -1098,8 +1098,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests/a2.rs",
-      "sha256": "5ed021609703bcee5b4bc2e7af56a57fadd5cafeee94c975abef009b6c9b011c",
-      "size_bytes": 24644
+      "sha256": "559fc5842943d3eaeb4b00803b31970064cdaf04120d358f850255fc7b695cb2",
+      "size_bytes": 28992
     },
     {
       "executable": false,
@@ -3758,8 +3758,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-composition-run-health-audit.md",
-      "sha256": "fb64f5e1d9ade1fec8db3fb9a2b9a3accf15acc663fed06d83a1b38774a8bcb7",
-      "size_bytes": 3534
+      "sha256": "96d88ccba4708eca610f5ecd1ff933cb92f0c3f948055eacae9d6fc86f9a6435",
+      "size_bytes": 3968
     },
     {
       "executable": false,
@@ -5547,7 +5547,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T14:54:02+00:00",
+  "generated_at": "2026-10-22T15:29:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 793,
   "public_roots": [
@@ -5586,5 +5586,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3d274bf5daedd19813f351ddb364ad9af6f1e64d"
+  "source_commit": "3dfd53b6ebb224fed2eabeec4759a58299a03a55"
 }
