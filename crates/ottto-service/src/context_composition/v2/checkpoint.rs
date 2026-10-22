@@ -316,19 +316,16 @@ pub(super) struct Index {
     pub(super) quarantined_scopes: BTreeMap<String, Day>,
 }
 
-/// The first run's discovery, saved before any scope commits, so a crash
-/// part way through the first run resumes with the same cutoff and starting
-/// offsets instead of treating uncommitted files as found later.
+/// Witness that the first run happened, saved before any scope commits.
+/// Only its presence is read: with it, missing pins are an agent reset
+/// (forward-only, counted), never another installation. Fields written by
+/// earlier builds are ignored.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub(super) struct InstallRecord {
     pub(super) schema: u32,
-    /// The first run's start (unix seconds): files born later are new.
+    /// The run's start (unix seconds).
     pub(super) cutoff: i64,
-    /// Starting offset of each file the first run found.
-    pub(super) starts: BTreeMap<String, u64>,
-    /// Files live at install, read from their start within the repair budget.
-    pub(super) live: std::collections::BTreeSet<String>,
 }
 
 pub(super) fn install_path(dir: &Path, source_label: &str) -> std::path::PathBuf {

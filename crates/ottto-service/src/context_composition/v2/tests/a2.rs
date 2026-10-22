@@ -98,6 +98,39 @@ fn audit_rereads_a_whole_file_and_keeps_matching_numbers() {
 }
 
 #[test]
+fn audit_samples_files_created_after_install_and_recovers_their_pins() {
+    let env = Env::new("composition-a2-audit-new-file");
+    let now = base_now();
+    env.run(Source::Claude, now, None);
+
+    let next = now + time::Duration::days(1);
+    let path = whole_file(&env, "new", next);
+    let size = fs::metadata(&path).unwrap().len();
+    // Commit the new file, but stop before its pin is saved. Recovery must
+    // keep its whole-file origin so it can be audited without counting twice.
+    harvest::tests::set_crash_after(Some(1));
+    let first = env.run(Source::Claude, next, None);
+    harvest::tests::set_crash_after(None);
+    assert_eq!((first.bytes_new, first.bytes_repair), (size, 0));
+    assert_eq!(first.scopes_committed, 1);
+    let before = env.scope(Source::Claude);
+    assert_eq!(before.files.values().next().unwrap().origin, Some(0));
+
+    let mut audit = full_budget();
+    let stats = env.run_audited(Source::Claude, next + time::Duration::hours(1), &mut audit);
+    assert_eq!(stats.pins_rebuilt, 1);
+    assert_eq!((stats.audit_files, stats.bytes_audit), (1, size));
+    assert_eq!((stats.audit_differences, stats.audit_skipped), (0, 0));
+    assert_eq!((stats.bytes_new, stats.bytes_repair), (0, 0));
+    assert_eq!(stats.scopes_committed, 0);
+    let after = env.scope(Source::Claude);
+    assert_eq!(after.generation, before.generation);
+    assert_eq!(after.agg.days, before.agg.days);
+    assert_eq!(audit.left, AUDIT_BYTES_PER_DAY - size);
+    env.cleanup();
+}
+
+#[test]
 fn audit_difference_replaces_the_file_share_and_counts_it() {
     let env = Env::new("composition-a2-audit-replace");
     let control = Env::new("composition-a2-audit-control");

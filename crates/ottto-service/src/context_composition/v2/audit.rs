@@ -13,8 +13,10 @@
 //! ids this build does not know would differ for reasons that are not
 //! faults. Picks rotate through the pins in key order from where the last
 //! audit stopped (kept in the run record), so every eligible file is
-//! sampled in turn. This is the only zero-offset read besides the first run
-//! and the budgeted rewrite repair; its bytes are counted on their own.
+//! sampled in turn. Besides live-at-install work and budgeted rewrite repair,
+//! this is the only repeat read from offset zero. Newly created files are read
+//! from their start once, then become audit candidates too. Audit bytes are
+//! counted on their own.
 
 use super::aggregate::{Bucket, Contribution, Day};
 use super::checkpoint::{file_identity, stamp, Checkpoint, Index, Pin, Status, COLD_AFTER_SECS};
