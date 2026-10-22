@@ -39,7 +39,10 @@ use super::checkpoint::{
     prefix_matches, read_json, stamp, write_json, write_packed, Checkpoint, Index, InstallRecord,
     Pin, RunRecord, Stamp, Status, StoredParse, COLD_AFTER_SECS,
 };
-use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
+use super::file::{
+    head_cwds, new_parse_state, new_parse_state_before, read_lines, LineSink, LineStats, Names,
+    Source,
+};
 use super::health::{HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::scope::{
     checkpoint_members, highest_generation, linked_worktrees, load_scope, resolved_missing,
@@ -640,7 +643,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -651,6 +654,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.quarantined,
         stats.new_files,
         stats.dormant_found,
+        stats.verdict_deferred,
         lines.lines,
         lines.prefix_skipped,
         lines.classifier_skipped,
@@ -857,6 +861,8 @@ pub(super) struct SourceStats {
     pub(super) quarantined: u64,
     pub(super) new_files: u64,
     pub(super) dormant_found: u64,
+    /// Fresh openings left unread while their snapshot verdict is pending.
+    pub(super) verdict_deferred: u64,
     pub(super) moved: u64,
     /// A larger copy holding the same read bytes took over a pin.
     pub(super) switched: u64,
@@ -1286,10 +1292,9 @@ fn run_source_inner(
     } else if valid {
         stats.pins_rebuilt = reconcile_pins(run, source, &mut index, today, &mut stats);
     }
-    // The start of the last scan whose pins were saved. A file born at or
-    // after it did not exist then, so none of its bytes can have been
-    // counted from these pins; a checkpoint a later crashed run committed
-    // for it is adopted by reconciliation or read on from its offset.
+    // The last saved discovery boundary, held at a deferred opening's birth
+    // until it can be read. Files born at or after it are new bytes unless
+    // pins or crash-recovered checkpoints already account for them.
     let previous_scan = index.last_scan_started.filter(|_| valid);
     index.last_scan_started = Some(now_secs);
 
@@ -1330,6 +1335,7 @@ fn run_source_inner(
         // Duplicate entries were counted while streaming the walk.
         present.insert(key, chosen);
     }
+    let mut pending_openings = false;
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
@@ -1342,6 +1348,25 @@ fn run_source_inner(
                     .zip(previous_scan)
                     .is_some_and(|(born, last)| born >= last);
                 let new = live || born_later;
+                if new && !agent_reset {
+                    let pending = opening_verdict_pending(run, source, file, &mut stats);
+                    if pending != Some(false) {
+                        // No pin or checkpoint is created. Preserve new-byte
+                        // eligibility for the next daily run, even at install;
+                        // it reads Forward from zero without a repair grant.
+                        index.last_scan_started = Some(
+                            index
+                                .last_scan_started
+                                .unwrap_or(now_secs)
+                                .min(file.born.unwrap()),
+                        );
+                        pending_openings = true;
+                        if pending == Some(true) {
+                            stats.verdict_deferred += 1;
+                        }
+                        continue;
+                    }
+                }
                 let start = if new { 0 } else { file.size };
                 let waiting = live;
                 if !new {
@@ -1693,7 +1718,7 @@ fn run_source_inner(
         }
     }
     stats.name_lookups_skipped = names.skipped();
-    tidy_index(&mut index, today);
+    tidy_index(&mut index, today, pending_openings);
     for (key, pin) in index
         .files
         .iter()
@@ -1797,7 +1822,7 @@ fn known_scope(index: &Index, cwd: &str) -> Option<String> {
 /// End of a run: note the scopes pins still name, and drop folder entries
 /// nothing needs any more (their scope has no pins, or the folder is gone
 /// and no file waits to be scoped).
-fn tidy_index(index: &mut Index, today: Day) {
+fn tidy_index(index: &mut Index, today: Day, pending_openings: bool) {
     let Index {
         files,
         cwd_scopes,
@@ -1819,6 +1844,11 @@ fn tidy_index(index: &mut Index, today: Day) {
     }
     for scope in &pinned {
         scope_last_pinned.insert((*scope).to_string(), today);
+    }
+    // Deferred openings have no pins yet. Retain cached worktree mappings
+    // until they can be scoped, including worktrees deleted before reading.
+    if pending_openings {
+        return;
     }
     cwd_scopes.retain(|folder, scope| {
         pinned.contains(scope.as_str()) && (waiting_for_scope || Path::new(folder).is_dir())
@@ -1847,6 +1877,42 @@ fn grant(run: &mut Run, stats: &mut SourceStats, size: u64) -> Mode {
     stats.repair_waiting += 1;
     stats.repair_waiting_bytes += size;
     Mode::Forward
+}
+
+/// Wait only before an opening is first classified. A missing verdict may
+/// delay it for less than six hours from birth, never from its last deferral.
+/// Once counted, later verdict transitions do not reconcile contributions:
+/// the reader moves forward and never rereads history for a verdict change.
+fn opening_verdict_pending(
+    run: &Run,
+    source: Source,
+    file: &Found,
+    stats: &mut SourceStats,
+) -> Option<bool> {
+    let now = run.now.unix_timestamp();
+    if !file
+        .born
+        .is_some_and(|born| born <= now && now - born < 6 * 3600)
+    {
+        return Some(false);
+    }
+    let (state, bytes) = match new_parse_state_before(source, &file.path, run.deadline) {
+        Ok(head) => head,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                stats.cut = true;
+            } else {
+                stats.scan_errors += 1;
+            }
+            return None;
+        }
+    };
+    stats.bytes_head += bytes;
+    Some(
+        run.start_verdicts
+            .lookup(source.label(), &state.session, now)
+            .is_none(),
+    )
 }
 
 /// Failed reads in a row that quarantine a file.

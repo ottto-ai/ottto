@@ -18,7 +18,26 @@ cap and 92-day retention. Unchanged verdicts append zero bytes. Pruning occurs
 on the next snapshot upload after expiry or reaching a cap. The snapshot client
 logs appended and compacted bytes; transcript contents and source session ids are absent
 from the log. Relay authority, endpoint and machine changes select a different
-namespace. Missing, expired or invalid entries are unmeasured.
+namespace. Missing, expired or invalid entries supply no verdict.
+
+Before first classifying an opening, a file born less than six hours before
+scan start waits if its verdict is absent. A bounded identity-head read checks
+the verdict, but no composition lines are processed and no pin or checkpoint
+is created. The metrics line counts it as `verdict_deferred`. The saved
+discovery boundary stays at the earliest deferred birth, so the next daily run
+reads the whole file forward from zero as new bytes, without a repair grant.
+At six hours or older, a missing verdict is `NotMeasured`; the wait is bounded
+by birth time and cannot renew indefinitely. Unknown or future birth times do
+not authorize this wait. Explicit measured and unmeasured verdicts do not wait.
+Late days are resent by changed-days uploads when that path is enabled.
+Cached folder mappings survive while openings wait, including worktrees removed
+before their first read. Identity probes obey the run deadline; an interrupted
+probe preserves new-byte eligibility without claiming a missing verdict.
+
+Verdict transitions do not reconcile previously classified contributions.
+The reader remains forward-only: it does not reread old transcript bytes to
+remove an opening after a later measured verdict or restore an opening after
+a later clear.
 
 For a measured start, composition skips opening input until the first response.
 For an unmeasured start, including a missing entry, it counts that input under

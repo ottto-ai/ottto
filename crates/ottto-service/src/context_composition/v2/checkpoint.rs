@@ -295,7 +295,8 @@ pub(super) struct Index {
     pub(super) schema: u32,
     /// When this agent's state started (the install run), unix seconds.
     pub(super) created: i64,
-    /// Start of the previous run, unix seconds: files born later are new.
+    /// Saved discovery boundary, unix seconds: files born later are new.
+    /// Held at the earliest deferred opening birth until that file is read.
     pub(super) last_scan_started: Option<i64>,
     pub(super) files: BTreeMap<String, Pin>,
     /// Folder -> scope id: folders resolved by a read, and the linked
