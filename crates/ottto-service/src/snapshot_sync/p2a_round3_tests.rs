@@ -2100,3 +2100,75 @@ fn p2a_preboxing_memory_refusal_releases_finish_then_collects_ordinary() {
         ordinary["snapshot_fingerprint"].as_str().unwrap()
     ));
 }
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_reset() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for reason in ["disabled source", "credential exit", "account reset"] {
+        let control = P2aControl::new(FinishOutcome::Accept);
+        let _live = money::LiveForTest::new(&control.support);
+        let mut cancelled = false;
+        let result = control.cycle_changing(|attempt| {
+            if attempt != 1 {
+                return;
+            }
+            assert!(money_resume::pending_for_test(&control.support));
+            let reserved = money::reserved_for_test();
+            money_resume::cancel_owner(&test_daemon("unrelated-owner"));
+            assert!(money_resume::pending_for_test(&control.support), "another daemon cannot cancel this owner");
+            match reason {
+                "account reset" => {
+                    control
+                        .daemon
+                        .reset_account_for_authorized_client()
+                        .unwrap();
+                }
+                "disabled source" => {
+                    let mut cycle = money_resume::CycleScope::new(&control.daemon);
+                    cycle.keep_claude(false);
+                }
+                "credential exit" => {
+                    drop(money_resume::CycleScope::new(&control.daemon));
+                }
+                _ => unreachable!(),
+            }
+            cancelled = true;
+            assert!(!money_resume::pending_for_test(&control.support));
+            assert!(
+                money::reserved_for_test() < reserved,
+                "{reason} releases the actual retained graph"
+            );
+            money::store::with_ledger_for_test(&control.support, |ledger| {
+                assert!(
+                    ledger
+                        .census()
+                        .records_with_prefix("dirty:")
+                        .next()
+                        .is_some(),
+                    "cancellation preserves scheduling custody"
+                );
+            })
+            .unwrap();
+            // Let the fixture driver finish a new ordinary scan after proving
+            // cancellation, rather than preparing another live continuation.
+            std::fs::write(control.support.join("claude-request-owned-live.off"), b"").unwrap();
+        });
+        assert!(cancelled, "exercise a real parked finish");
+        result.unwrap();
+        assert!(!money_resume::pending_for_test(&control.support));
+        assert!(
+            control
+                .offers()
+                .iter()
+                .all(|item| item["usage_accounting_contract"] != money::REQUEST_OWNED_CONTRACT),
+            "cancelled literal cannot POST"
+        );
+    }
+}
