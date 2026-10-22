@@ -458,7 +458,8 @@ fn claude_duplicate_fence_reopens_only_after_full_coverage() {
     let _ = fs::remove_dir_all(root);
 }
 
-// Only a bound terminal demotion of this exact revision, or a durably
+// Only a bound authority demotion of this exact revision (terminal, or, since
+// the path-(a) bridge, RetryPending without a correction grant), or a durably
 // disclosed account deferral, stops blocking traversal progress.
 #[test]
 fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
@@ -487,7 +488,26 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
         &revision,
         ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
     );
-    assert!(!claude_terminal_authority_hold_is_bound(&held, &retry));
+    // FLIPS on the pre-bridge head: RetryPending was always progress-blocking.
+    assert!(claude_terminal_authority_hold_is_bound(&held, &retry));
+
+    // A correction grant keeps a RetryPending hold blocking.
+    let mut retry_correction = retry.clone();
+    {
+        let record = retry_correction
+            .claude_usage_authority_quarantine
+            .get_mut(&family_root)
+            .expect("RetryPending record");
+        record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string();
+        record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+            proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+            owed_member_ids: BTreeSet::from([held.source_session_id.clone()]),
+        });
+    }
+    assert!(!claude_terminal_authority_hold_is_bound(
+        &held,
+        &retry_correction
+    ));
 
     let mut other_revision = ScanIndex::default();
     bind_authority_quarantine(
@@ -524,11 +544,13 @@ fn claude_progress_blocking_holds_exclude_only_non_progressing_revisions() {
     demoted
         .quarantined_source_session_ids
         .insert(held.source_session_id.clone());
-    assert!(demoted
-        .progress_blocking_held_fingerprints(&snapshots, &terminal, true)
-        .is_empty());
+    for settled in [&terminal, &retry] {
+        assert!(demoted
+            .progress_blocking_held_fingerprints(&snapshots, settled, true)
+            .is_empty());
+    }
     for blocking in [
-        &retry,
+        &retry_correction,
         &other_revision,
         &unbound_witness,
         &ScanIndex::default(),
