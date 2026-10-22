@@ -308,11 +308,14 @@ fn attachment(
     if has_rendered {
         state.has_rendered = true;
     }
+    // An instructions attachment's first `files[]` type, or a queued
+    // command's `commandMode` (a typed prompt or a background report).
     let file_type = att
         .get("files")
         .and_then(Value::as_array)
         .and_then(|files| files.first())
         .and_then(|file| file.get("type"))
+        .or_else(|| att.get("commandMode"))
         .and_then(Value::as_str);
     let facts = ClaudeAttachment {
         att_type,

@@ -1803,6 +1803,8 @@ fn results_split_over_their_shares_and_tools() {
     // A nested instruction file is a file read; a mentioned one is not.
     assert!(files.contains("/w/sub/CLAUDE.md"));
     assert!(tokens("by_you") > 0 && tokens("web") > 0 && tokens("reminders") > 0);
+    // A queued background report is not a prompt.
+    assert!(tokens("background_reports") > 0);
     // One call per tool.
     let tools: BTreeMap<&str, (u64, u64)> = reading
         .agg
@@ -2384,6 +2386,8 @@ fn every_family(cwd: &str, day: Date) -> (Vec<Value>, Vec<Value>) {
             "attachment":{"type":"nested_memory","filename":format!("{cwd}/sub/CLAUDE.md"),"content":"NESTED"}}),
         json!({"type":"user","uuid":"u1","sessionId":"s1","cwd":cwd,"timestamp":at(4),
             "message":{"role":"user","content":"please look at the code"}}),
+        json!({"type":"attachment","uuid":"a4","sessionId":"s1","cwd":cwd,"timestamp":at(4),
+            "attachment":{"type":"queued_command","commandMode":"task-notification","prompt":"<task-notification>done</task-notification>"}}),
         json!({"type":"assistant","uuid":"as1","sessionId":"s1","cwd":cwd,"timestamp":at(5),
             "message":{"id":"m1","content":[
                 {"type":"tool_use","id":"t1","name":"Read","input":{"file_path":format!("{cwd}/src/a.rs")}},
