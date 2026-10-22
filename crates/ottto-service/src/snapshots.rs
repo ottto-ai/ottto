@@ -69451,6 +69451,8 @@ mod tests {
         let mut index = ScanIndex::default();
         let mut entry = manifest_index_entry(Some("old-entity"));
         entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        // A family hold binds a well-formed source revision.
+        entry.source_file_fingerprint = "a".repeat(64);
         index.files.insert(key.clone(), entry.clone());
         index
             .file_snapshot_fingerprints
