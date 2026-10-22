@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 779,
-  "content_sha256": "151907c0efb828e4703f6127b124b2d6bb5988cddcd2a8ed04a6c8f88ebcc378",
+  "content_sha256": "6b1cf981f2886ea0078daeac03e9b3bddcc31cfdcd2cf7a44bccce6e5d8f9994",
   "files": [
     {
       "executable": false,
@@ -1014,8 +1014,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/checkpoint.rs",
-      "sha256": "ff907fee14e18fb0f964226ec019e79c6a8bbbd917edc76c82269e45fd60e85b",
-      "size_bytes": 30097
+      "sha256": "65ea654be6894ffbc30e368ef3e17c58297488a2b0e8e8d2399b3f62e2810c16",
+      "size_bytes": 30160
     },
     {
       "executable": false,
@@ -1028,8 +1028,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/codex.rs",
-      "sha256": "68728f7251d8e9fc72f3d36bce0b5af01591f8c636d59cc0148963deefaab143",
-      "size_bytes": 21864
+      "sha256": "f93d694e0854a032591808df44bcce024a338982fd2f70b38ac66381c2d16601",
+      "size_bytes": 22105
     },
     {
       "executable": false,
@@ -1049,8 +1049,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/harvest.rs",
-      "sha256": "77b75acf121ac945d8e6eb3fcc53fcc95cf0601ed7241c89f2b4e0d3903b403e",
-      "size_bytes": 62891
+      "sha256": "21181dcaac5987f8755f1d278924355b21821aa443e2262023480991d79a2718",
+      "size_bytes": 63327
     },
     {
       "executable": false,
@@ -1063,8 +1063,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/reader.rs",
-      "sha256": "2f864615ba77e808fba4aa6aaa69e39af7d474a9ee99759d0d05ed9ec201c99b",
-      "size_bytes": 4801
+      "sha256": "19f869307aa02dd3aedf033bf6305aa774f2d154d753cd7cf5bdb1e06235dd79",
+      "size_bytes": 4745
     },
     {
       "executable": false,
@@ -1077,8 +1077,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests.rs",
-      "sha256": "4783292c4394b6fdd1d6de243898f80086a8450f2d8de011377ef70d98e631ea",
-      "size_bytes": 131584
+      "sha256": "03369154b39651e2eebbafc58b52cfda9eea26ac0a3c3a288f5cd11ba8f775be",
+      "size_bytes": 135286
     },
     {
       "executable": false,
@@ -5456,7 +5456,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-22T07:37:57+00:00",
+  "generated_at": "2026-10-22T07:46:05+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 780,
   "public_roots": [
@@ -5495,5 +5495,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "41c95f4867e5cdc4b4ee45f2e2981f34119e1367"
+  "source_commit": "b94ad594c04884f36581417a4134a4fe7d9914ea"
 }
