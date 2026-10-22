@@ -413,7 +413,12 @@ pub(crate) fn build_claude_request_body(
         // Units: the kept request-id responses, then the captured ones.
         let mut units = Vec::with_capacity(item.claude_usage_occurrences.len());
         let mut placement_missing = false;
-        for (request_id, occurrence) in &item.claude_usage_occurrences {
+        for (position, (request_id, occurrence)) in item.claude_usage_occurrences.iter().enumerate()
+        {
+            if position % 1024 == 1023 && ctx.late() {
+                body.unbuilt = true;
+                return body;
+            }
             // Zero usage: the live path adds no row and there is no money.
             if occurrence.usage.is_zero() {
                 continue;
@@ -462,7 +467,11 @@ pub(crate) fn build_claude_request_body(
             });
         }
         let mut displaced = Vec::new();
-        for captured in capture.units() {
+        for (position, captured) in capture.units().iter().enumerate() {
+            if position % 1024 == 1023 && ctx.late() {
+                body.unbuilt = true;
+                return body;
+            }
             if captured.tokens.conserved() == 0 && captured.tokens.reasoning == 0 {
                 continue;
             }
@@ -520,7 +529,11 @@ pub(crate) fn build_claude_request_body(
                 .keys()
                 .map(|request_id| claude_request_hash(request_id))
                 .collect::<BTreeSet<_>>();
-            for row in rows.iter() {
+            for (position, row) in rows.iter().enumerate() {
+                if position % 1024 == 1023 && ctx.late() {
+                    body.unbuilt = true;
+                    return body;
+                }
                 if trace_owner(row.request_hash) != member || own.contains(&row.request_hash) {
                     continue;
                 }

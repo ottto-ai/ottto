@@ -259,6 +259,19 @@ pub(crate) struct ClaudeTelemetryTailState {
     pub(crate) audit: Option<ClaudeTelemetryAudit>,
 }
 
+/// Resident bytes of one record beyond its payload (key, hashes, facts):
+/// its map node share, its ledger fields' box and its hash buffer's `Arc`
+/// counts (the terms `resident_bytes` charges).
+pub(crate) const RECORD_RESIDENT_OVERHEAD_BYTES: usize =
+    (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3 / 2
+        + std::mem::size_of::<ClaudeLedgerFields>()
+        + 2 * std::mem::size_of::<usize>();
+
+/// The smallest serialized entry, `"":{"v":0,"fp":"<64 hex>","w":0,"s":"exact"}`
+/// and its separator, rounded down: a census of N serialized bytes holds at
+/// most N / this many records.
+pub(crate) const MIN_ENTRY_SERIALIZED_BYTES: usize = 96;
+
 /// One shared hash buffer: the slice and the `Arc` counts.
 fn shared_hashes_bytes(hashes: &Option<Arc<[u64]>>) -> usize {
     hashes.as_ref().map_or(0, |hashes| {
@@ -676,6 +689,11 @@ impl ClaudeRequestCensus {
 
     pub(crate) fn hash_total(&self) -> usize {
         self.hash_total
+    }
+
+    /// Records held (birth stubs included).
+    pub(crate) fn record_count(&self) -> usize {
+        self.records.len()
     }
 
     pub(crate) fn serialized_total(&self) -> usize {

@@ -2005,6 +2005,7 @@ impl MoneyLedger {
             trace: traces,
             telemetry_complete_through: 2_000_000_000,
             deadline,
+            unbuilt_older: std::cell::Cell::new(0),
         };
         ctx.classify_request(hash, 1_000, own_key, own_root)
     }
@@ -2233,6 +2234,7 @@ fn money_message_only_copies_pick_one_owner() {
         trace: &empty_traces,
         telemetry_complete_through: 2_000_000_000,
         deadline,
+        unbuilt_older: std::cell::Cell::new(0),
     };
     let verdicts = keys.map(|key| ctx.classify_message(message, key));
     assert!(
@@ -2243,6 +2245,30 @@ fn money_message_only_copies_pick_one_owner() {
         verdicts.contains(&ClaudeRequestVerdict::Removed(ClaudeRemovedBy::Copy)),
         "{verdicts:?}"
     );
+    assert_eq!(ctx.unbuilt_older.get(), 0, "no unbuilt file in the group");
+
+    // SOURCE (count only): an indexed, never-built file of the same group
+    // with an unknown birth would hold both T-empty verdicts; they stay.
+    let mut unbuilt = index.clone();
+    unbuilt.files.insert(
+        "/m/projects/-repo/R.jsonl".to_owned(),
+        manifest_index_entry(None),
+    );
+    let scope = ClaudeLedgerScope::build(
+        &unbuilt,
+        &ledger,
+        &BTreeSet::from(["-repo"]),
+        &BTreeSet::new(),
+        deadline,
+    )
+    .expect("scope");
+    let ctx = ClaudeClassifyContext {
+        scope: &scope,
+        unbuilt_older: std::cell::Cell::new(0),
+        ..ctx
+    };
+    assert_eq!(keys.map(|key| ctx.classify_message(message, key)), verdicts);
+    assert_eq!(ctx.unbuilt_older.get(), 2);
 }
 
 /// The holder scan admits its memory as it grows and stops at the deadline.
@@ -2573,6 +2599,8 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     let census = ledger.census();
     let ledger_bytes = census.exact_serialized_len_for_test();
     let ledger_resident = census.resident_bytes();
+    // The structural resident bound (records, overhead, payload) holds.
+    assert!(ledger_resident <= store::LEDGER_RESIDENT_BOUND_BYTES);
     let facts_rows = SIDECARS as u64 * SIDECAR_ROWS;
     let facts_bytes = census
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
@@ -2629,7 +2657,8 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     eprintln!(
         "MONEY_M4 index_records={} index_hashes={} index_census_serialized_bytes={index_bytes} \
          ledger_records={} ledger_hashes={} ledger_serialized_bytes={ledger_bytes} \
-         ledger_resident_bytes={ledger_resident} facts_rows={facts_rows} \
+         ledger_resident_bytes={ledger_resident} ledger_resident_bound_bytes={} \
+         record_overhead_bytes={} facts_rows={facts_rows} \
          facts_body_bytes_per_row={:.1} telemetry_serialized_bytes_per_row={:.1} \
          build_ms={build_ms} save_pages={save_pages} save_ms={save_ms} load_ms={load_ms} \
          page_admission_bytes={} page_admitted_peak_bytes={} page_elapsed_us={} \
@@ -2638,6 +2667,8 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         index_census.hash_total_for_test(),
         census_len(&support),
         census_hashes(&support),
+        store::LEDGER_RESIDENT_BOUND_BYTES,
+        crate::snapshots::claude_request_census::RECORD_RESIDENT_OVERHEAD_BYTES,
         facts_bytes as f64 / facts_rows as f64,
         telemetry_serialized as f64 / facts_rows as f64,
         counts.admission_bytes,

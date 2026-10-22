@@ -21,22 +21,31 @@
 //! A missing or corrupt shard at load is debt, never a silent loss.
 //!
 //! One writer thread does every file write of the shadow (diagnostics JSONL
-//! and ledger shards) and the ledger load, outside `SNAPSHOT_SYNC_LOCK`. Its
-//! outbox is bounded; each batch carries the admission of its own buffers,
-//! and the load admits each shard's bytes and decoded records before
+//! rows, serialized there, and ledger shards) and the ledger load, outside
+//! `SNAPSHOT_SYNC_LOCK`. Its outbox is bounded in batches and in admitted
+//! bytes; each batch carries the admission of its own buffers (released
+//! when it is written, dropped or refused), and the load admits each
+//! shard's bytes and a structural bound of its decoded records before
 //! reading it (Sol R3-4). A full outbox drops the batch (counted; its shards
-//! stay dirty and its memos never move). Results come back to the next page.
+//! stay dirty, its memos never move and its day owes a false coverage row).
+//! Results come back to the next page.
+//!
+//! Resident bound (daemon parent): at most `LEDGER_MAX_RECORDS` records,
+//! each `RECORD_RESIDENT_OVERHEAD_BYTES` beyond its payload, and a payload
+//! (keys, hashes, facts) held in at most twice its serialized bytes, which
+//! the census budget caps: `LEDGER_RESIDENT_BOUND_BYTES`.
 
 use super::super::claude_request_census::{
     decode_ledger_shard, ClaudeLedgerSweep, ClaudeRequestCensus, ClaudeRequestCensusInsert,
-    ClaudeRequestCensusRecord, SWEEP_KEY_PREFIX,
+    ClaudeRequestCensusRecord, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
+    MIN_ENTRY_SERIALIZED_BYTES, RECORD_RESIDENT_OVERHEAD_BYTES, SWEEP_KEY_PREFIX,
 };
 use super::{ClaudeFamilyMemo, JsonlBatch, JsonlOutcome, ShadowReservation};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -48,18 +57,34 @@ const META: usize = DATA_SHARDS;
 const SHARDS: usize = DATA_SHARDS + 1;
 /// Batches waiting for the writer.
 const OUTBOX: usize = 4;
+/// Admitted bytes of the batches waiting for (or in) the writer: a batch
+/// that would pass it is dropped like one that finds the outbox full.
+pub(crate) const OUTBOX_MAX_BYTES: usize = 32 * 1024 * 1024;
+/// Records one ledger holds; a new key past it is refused (debt where it
+/// carries claims), so the resident bound holds.
+pub(crate) const LEDGER_MAX_RECORDS: usize = 65_536;
+/// What one support directory's ledger can hold resident, at most.
+pub(crate) const LEDGER_RESIDENT_BOUND_BYTES: usize = LEDGER_MAX_RECORDS
+    * RECORD_RESIDENT_OVERHEAD_BYTES
+    + 2 * MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES;
 /// Dirty shard bytes one page serializes. A shard larger than this is never
 /// one page's work: it stays dirty (counted) and no certificate is written
 /// over it; the load refuses a file larger than this as damage.
 const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
-/// Records serialized between two deadline checks.
-const SAVE_DEADLINE_STRIDE: usize = 1024;
 /// The load waits this long, in steps, for each shard's admission; then it
 /// gives up (nothing is lost: the next page asks for the load again).
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
 const LOAD_ADMIT_WAIT: Duration = Duration::from_millis(20);
-/// Admission per byte of a shard file: its raw bytes and its decoded records.
-const LOAD_BYTES_FACTOR: usize = 3;
+
+/// The admission of loading a shard file of `len` bytes: the raw bytes, one
+/// record's raw value while it decodes, the decoded payload (hashes, facts
+/// and keys, each at most twice its serialized bytes) and every record's
+/// overhead, for as many records as the bytes can hold.
+fn load_charge(len: usize) -> usize {
+    let records = (len / MIN_ENTRY_SERIALIZED_BYTES + 1).min(LEDGER_MAX_RECORDS);
+    len.saturating_mul(4)
+        .saturating_add(records.saturating_mul(RECORD_RESIDENT_OVERHEAD_BYTES))
+}
 
 fn shard_of(key: &str) -> usize {
     if key.starts_with(SWEEP_KEY_PREFIX) {
@@ -131,6 +156,9 @@ impl ClaudeLedger {
         key: String,
         record: ClaudeRequestCensusRecord,
     ) -> ClaudeRequestCensusInsert {
+        if self.census.record_count() >= LEDGER_MAX_RECORDS && self.census.get(&key).is_none() {
+            return ClaudeRequestCensusInsert::Refused;
+        }
         let shard = shard_of(&key);
         let before = self.census.serialized_total();
         let outcome = self.census.insert(key, record);
@@ -173,7 +201,9 @@ impl ClaudeLedger {
     /// meta (every certificate 0) rides first when a certificate went to
     /// zero; the current meta rides last only when no data shard stays
     /// dirty. None when nothing is dirty, its buffers are not admitted or the
-    /// page deadline passes while serializing (everything stays dirty).
+    /// page deadline passes while serializing (everything stays dirty). The
+    /// deadline is checked before every record, so the walk stops within one
+    /// record's serialization of it (at most `SAVE_BYTES_PER_PAGE`).
     pub(crate) fn take_save(
         &mut self,
         deadline: Instant,
@@ -223,10 +253,8 @@ impl ClaudeLedger {
             }
         }
         if !buffers.is_empty() {
-            for (position, (key, record)) in self.census.records().enumerate() {
-                if position % SAVE_DEADLINE_STRIDE == SAVE_DEADLINE_STRIDE - 1
-                    && Instant::now() >= deadline
-                {
+            for (key, record) in self.census.records() {
+                if Instant::now() >= deadline {
                     return None;
                 }
                 if key.starts_with(SWEEP_KEY_PREFIX) {
@@ -240,6 +268,9 @@ impl ClaudeLedger {
         let mut zero = zero_first.then(|| open(self.shard_bytes[META]));
         let mut current = meta_last.then(|| open(self.shard_bytes[META]));
         for (key, record) in self.census.records_with_prefix(SWEEP_KEY_PREFIX) {
+            if Instant::now() >= deadline {
+                return None;
+            }
             if let Some(buffer) = current.as_mut() {
                 push_entry(buffer, key, record);
             }
@@ -392,6 +423,25 @@ fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
         .as_ref()
 }
 
+/// Admitted bytes of the batches handed to the writer and not yet written.
+static QUEUED_BYTES: AtomicUsize = AtomicUsize::new(0);
+
+impl WriteJob {
+    /// What the batch holds admitted while it waits and is written.
+    fn queued_bytes(&self) -> usize {
+        self.reservations.iter().map(ShadowReservation::bytes).sum()
+    }
+}
+
+impl Job {
+    fn queued_bytes(&self) -> usize {
+        match self {
+            Self::Write(job) => job.queued_bytes(),
+            _ => 0,
+        }
+    }
+}
+
 fn submit(job: Job) -> Result<(), Job> {
     let Some(sender) = writer() else {
         return Err(job);
@@ -399,8 +449,20 @@ fn submit(job: Job) -> Result<(), Job> {
     let Ok(sender) = sender.lock() else {
         return Err(job);
     };
-    sender.try_send(job).map_err(|error| match error {
-        TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+    let bytes = job.queued_bytes();
+    let queued = QUEUED_BYTES.fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+        queued
+            .checked_add(bytes)
+            .filter(|total| *total <= OUTBOX_MAX_BYTES)
+    });
+    if queued.is_err() {
+        return Err(job);
+    }
+    sender.try_send(job).map_err(|error| {
+        QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
+        match error {
+            TrySendError::Full(job) | TrySendError::Disconnected(job) => job,
+        }
     })
 }
 
@@ -549,8 +611,10 @@ fn run_writer(receiver: Receiver<Job>) {
                 }
             }
             Job::Write(job) => {
+                let bytes = job.queued_bytes();
                 let failed = failed.entry(job.support_dir.clone()).or_default();
                 let (support_dir, result) = write(*job, failed);
+                QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
                 if let Ok(mut results) = RESULTS.lock() {
                     results.entry(support_dir).or_default().push(result);
                 }
@@ -691,9 +755,7 @@ fn load(support_dir: &Path) -> Option<ClaudeLedger> {
                 continue;
             }
             Ok((file, len)) => {
-                _admitted = Some(admit_waiting(
-                    (len as usize).saturating_mul(LOAD_BYTES_FACTOR),
-                )?);
+                _admitted = Some(admit_waiting(load_charge(len as usize))?);
                 let mut bytes = Vec::with_capacity(len as usize);
                 match file.take(limit + 1).read_to_end(&mut bytes) {
                     Ok(_) if bytes.len() as u64 <= limit => bytes,
@@ -765,6 +827,16 @@ pub(crate) fn forget_for_test(support_dir: &Path) {
     if let Ok(mut results) = RESULTS.lock() {
         results.remove(support_dir);
     }
+}
+
+/// A restart that reloads the saved ledger before the next page (the page
+/// then runs on it rather than being refused while it loads). Returns its
+/// record count.
+#[cfg(test)]
+pub(crate) fn reload_for_test(support_dir: &Path) -> Option<usize> {
+    forget_for_test(support_dir);
+    drop(acquire(support_dir));
+    with_ledger_for_test(support_dir, |ledger| ledger.census().record_count())
 }
 
 /// Run `read` over the ledger of `support_dir` (after the writer is idle).

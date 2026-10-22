@@ -469,6 +469,45 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     money::capture::purge_scope_for_test(&fixture.support);
     assert_eq!(money::capture::capture_reserved(), baseline_reserved);
     assert_eq!(money::reserved_for_test(), 0);
+
+    // Sol R4-3: the kill switch stops capture too. The page that sees it
+    // drops the waiting captures, and a parse while it is off captures
+    // nothing; once it is gone the next page turns capture back on.
+    let off = fixture.support.join("claude-request-money-shadow.off");
+    let page = || {
+        money::shadow_page(
+            &fixture.support,
+            &armed.snapshots,
+            &armed_index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            armed.census_complete,
+        );
+        money::store::flush();
+    };
+    std::fs::write(&off, b"").unwrap();
+    let _ = scan(&mut ScanIndex::default());
+    assert!(money::capture::capture_reserved() > baseline_reserved);
+    page();
+    assert_eq!(
+        money::capture::capture_reserved(),
+        baseline_reserved,
+        "the page that sees the switch drops the waiting captures"
+    );
+    let _ = scan(&mut ScanIndex::default());
+    assert_eq!(
+        money::capture::capture_reserved(),
+        baseline_reserved,
+        "a parse while the shadow is off captures nothing"
+    );
+    std::fs::remove_file(&off).unwrap();
+    page();
+    let _ = scan(&mut ScanIndex::default());
+    assert!(money::capture::capture_reserved() > baseline_reserved);
+    money::capture::purge_scope_for_test(&fixture.support);
+    assert_eq!(money::capture::capture_reserved(), baseline_reserved);
+    assert_eq!(money::reserved_for_test(), 0);
+    let _ = money::take_shadow_lines_for_test();
 }
 
 /// A sidecar that cannot be read (a directory in its place) never fails the
@@ -837,9 +876,13 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(snapshots.len(), 2, "each page is its own snapshot");
 
-    // A dropped batch (as a full outbox drops it) owes its day a false row.
+    // A dropped batch (as a full outbox drops it) owes its day a false row,
+    // and the debt survives a restart (Sol R3-6: its marker file).
     money::owe_coverage_for_test(&fixture.support, response + 3602);
+    money::forget_owed_coverage_for_test(&fixture.support);
+    assert_eq!(money_owed_markers(&fixture.support), 1);
     page(response + 3603);
+    assert_eq!(money_owed_markers(&fixture.support), 0, "a written debt is settled");
     let rows = money_jsonl_rows(&fixture.support);
     let owed = rows
         .iter()
@@ -854,6 +897,130 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
             .count(),
         3
     );
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Owed-coverage markers in the support directory's diagnostics.
+fn money_owed_markers(support: &Path) -> usize {
+    std::fs::read_dir(support.join("diagnostics"))
+        .map(|entries| {
+            entries
+                .flatten()
+                .filter(|entry| entry.file_name().to_string_lossy().ends_with(".owed"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+/// Sol R4-1: a seal is only a seal once its false row is on disk. A day
+/// filled with true rows whose file cannot be written owes its false row
+/// (kept across a restart), and when the file can be written again the next
+/// batch seals the day with it; then the day takes nothing more.
+#[cfg(unix)]
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_seal_needs_its_false_row() {
+    use std::os::unix::fs::PermissionsExt;
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-failed-seal");
+    let page = |now| {
+        let counts = money::shadow_page_at(
+            &fixture.support,
+            &scan.snapshots,
+            &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete,
+            now,
+        );
+        money::store::flush();
+        counts
+    };
+    page(response + 3600);
+    let day = std::fs::read_dir(fixture.support.join("diagnostics"))
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.path())
+        .find(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .expect("the day's file");
+    // Fill the day with true rows to just under its room.
+    let filler = serde_json::json!({"row": "coverage", "v": 2, "coverage_complete": true})
+        .to_string()
+        + "\n";
+    let size = std::fs::metadata(&day).unwrap().len();
+    let fill = (money::jsonl_room_for_test() - size - 64) / filler.len() as u64;
+    let mut file = std::fs::OpenOptions::new().append(true).open(&day).unwrap();
+    file.write_all(filler.repeat(fill as usize).as_bytes()).unwrap();
+    drop(file);
+    let false_rows = |rows: &[serde_json::Value]| {
+        rows.iter()
+            .filter(|row| row["row"] == "coverage" && row["coverage_complete"] == false)
+            .count()
+    };
+    let before = false_rows(&money_jsonl_rows(&fixture.support));
+    std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o444)).unwrap();
+    if std::fs::OpenOptions::new().append(true).open(&day).is_ok() {
+        // Permissions do not bind this user: nothing to show.
+        std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o644)).unwrap();
+        return;
+    }
+    let unwritten = std::fs::read(&day).unwrap();
+    page(response + 3601);
+    assert_eq!(std::fs::read(&day).unwrap(), unwritten, "nothing reached the file");
+    assert_eq!(money_owed_markers(&fixture.support), 1, "the false row is owed");
+    // A restart, then the file can be written again.
+    money::forget_owed_coverage_for_test(&fixture.support);
+    std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let failed = page(response + 3602);
+    assert!(failed.jsonl_failed >= 1, "{failed:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    assert!(false_rows(&rows) > before, "the seal's false row is on disk");
+    assert!(rows
+        .iter()
+        .any(|row| row["row"] == "coverage" && row["truncated"] == true));
+    assert_eq!(money_owed_markers(&fixture.support), 0);
+    let sealed = std::fs::read(&day).unwrap();
+    let after = page(response + 3603);
+    assert_eq!(after.jsonl_sealed, 1, "{after:?}");
+    assert_eq!(std::fs::read(&day).unwrap(), sealed, "a sealed day takes nothing more");
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Sol R4-2: rows are serialized by the writer, and a page that is late at
+/// the hand-off publishes only a refused coverage row: no family, grain or
+/// memo of its families.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_late_page_publishes_only_refused_coverage() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-late-hand-off");
+    money::set_page_fault_for_test(money::PageFault::LateAtHandOff);
+    let counts = money::shadow_page_at(
+        &fixture.support,
+        &scan.snapshots,
+        &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        scan.census_complete,
+        response + 3600,
+    );
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::store::flush();
+    assert!(counts.families > 0, "{counts:?}");
+    assert_eq!(counts.refused_deadline, 1, "{counts:?}");
+    assert_eq!(counts.coverage_complete, 0, "{counts:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    assert!(rows.iter().all(|row| row["row"] == "coverage"), "{rows:?}");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["refused"], true);
+    assert_eq!(rows[0]["coverage_complete"], false);
+    let memos = money::store::with_ledger_for_test(&fixture.support, |ledger| {
+        ledger
+            .census()
+            .records_with_prefix(crate::snapshots::claude_request_census::FAMILY_KEY_PREFIX)
+            .count()
+    });
+    assert_eq!(memos, Some(0));
     assert_eq!(money::reserved_for_test(), 0);
 }
 
