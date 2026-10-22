@@ -876,13 +876,12 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
         .collect::<std::collections::BTreeSet<_>>();
     assert_eq!(snapshots.len(), 2, "each page is its own snapshot");
 
-    // A dropped batch (as a full outbox drops it) owes its day a false row,
-    // and the debt survives a restart (Sol R3-6: its marker file).
-    money::owe_coverage_for_test(&fixture.support, response + 3602);
-    money::forget_owed_coverage_for_test(&fixture.support);
-    assert_eq!(money_owed_markers(&fixture.support), 1);
+    // A dropped batch (as a full outbox drops it) owes its day a false row:
+    // latched in memory (no file I/O on the page's thread), and written by
+    // the writer's next batch.
+    money::owe_coverage_for_test(&fixture.support, response + 3602, false);
+    assert_eq!(money_owed_markers(&fixture.support), 0);
     page(response + 3603);
-    assert_eq!(money_owed_markers(&fixture.support), 0, "a written debt is settled");
     let rows = money_jsonl_rows(&fixture.support);
     let owed = rows
         .iter()
@@ -897,6 +896,18 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
             .count(),
         3
     );
+    // A debt of a failed write survives a restart (Sol R3-6: its marker).
+    money::owe_coverage_for_test(&fixture.support, response + 3604, true);
+    money::forget_owed_coverage_for_test(&fixture.support);
+    assert_eq!(money_owed_markers(&fixture.support), 1);
+    page(response + 3605);
+    assert_eq!(money_owed_markers(&fixture.support), 0, "a written debt is settled");
+    let owed = money_jsonl_rows(&fixture.support)
+        .into_iter()
+        .filter(|row| row["row"] == "coverage" && row["dropped"] == true)
+        .map(|row| row["observed_unix"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(owed, [response + 3602, response + 3604]);
     assert_eq!(money::reserved_for_test(), 0);
 }
 

@@ -1789,7 +1789,7 @@ fn hand_off(
     if let Err(job) = outcome {
         counts.batch_dropped = 1;
         counts.family_memos_withheld += job.memos.len() as u64;
-        owe_coverage(end.support_dir, end.now);
+        owe_coverage(end.support_dir, end.now, false);
     }
 }
 
@@ -2035,8 +2035,10 @@ fn day_stamp(unix: u64) -> Option<String> {
 
 /// False coverage rows owed per support directory: day -> the earliest
 /// page that owes it (a dropped batch, or one whose rows were not written).
-/// Each debt is also a marker file in the day's directory (Sol R3-6), so a
-/// restart keeps it: the writer reads the markers back with every batch.
+/// A debt of a write that failed is also a marker file in the day's
+/// directory (Sol R3-6), so a restart keeps it: the writer reads the markers
+/// back with every batch. A dropped batch's debt is latched in memory only
+/// (no file I/O under the sync lock); the writer's next batch writes it.
 static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>> = Mutex::new(BTreeMap::new());
 
 fn day_path(dir: &Path, day: &str) -> PathBuf {
@@ -2050,15 +2052,16 @@ fn owed_path(dir: &Path, day: &str) -> PathBuf {
 }
 
 /// The page at `observed_unix` did not reach its day's file: the next batch
-/// writes a false coverage row there. The marker is a few bytes, written
-/// once per owing day (a later debt of the same day keeps it).
-fn owe_coverage(support_dir: &Path, observed_unix: u64) {
+/// writes a false coverage row there. `durable` (the writer thread only)
+/// also writes the day's marker, a few bytes, once per owing day (a later
+/// debt of the same day keeps it).
+fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
     let Some(day) = day_stamp(observed_unix) else {
         return;
     };
     let dir = support_dir.join("diagnostics");
     let marker = owed_path(&dir, &day);
-    if !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
+    if durable && !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
         let _ = std::fs::write(&marker, observed_unix.to_string());
     }
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
@@ -2256,19 +2259,20 @@ fn serialized_len<T: Serialize>(value: &T) -> u64 {
 /// Append a batch's rows and its coverage row to the day's capped file
 /// (serialized here, from the batch's families), the false coverage rows
 /// earlier batches owe their days, and drop own files older than the
-/// retention window. When the day's cap would be passed, the day is sealed
-/// with a false coverage row (`truncated`) and takes nothing more that day.
-/// Past `room` there are only false coverage rows, so a file larger than
-/// `room` is sealed and its false row is on disk; a seal or debt that does
-/// not reach the file stays owed (Sol R4-1). Failures are counted, never
-/// raised. Runs on the writer thread only.
+/// retention window. A batch whose rows would pass the day's `room` is
+/// truncated there and writes a false coverage row (`truncated`, the seal):
+/// the day is incomplete from then on, whatever follows. Ordinary rows never
+/// pass `room`; past it go only false coverage rows, so a file larger than
+/// `room` takes no more ordinary rows and the file stays under its cap. A
+/// seal or debt that does not reach the file stays owed (Sol R4-1).
+/// Failures are counted, never raised. Runs on the writer thread only.
 fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
     let dir = support_dir.join("diagnostics");
     let Some(today) = day_stamp(now).filter(|_| std::fs::create_dir_all(&dir).is_ok()) else {
         outcome.failed += 1;
-        owe_coverage(support_dir, now);
+        owe_coverage(support_dir, now, true);
         return outcome;
     };
     let oldest = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64));
@@ -2285,14 +2289,14 @@ fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
             settle_owed(&dir, &day);
         } else {
             outcome.failed += 1;
-            owe_coverage(support_dir, observed);
+            owe_coverage(support_dir, observed, true);
         }
     }
     let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>();
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
     if file.size > room {
-        // Sealed: nothing more today but a debt's false row.
+        // Full: nothing more today but a debt's false row.
         outcome.truncated = rows;
         if let Some(observed) = owed_today {
             if file.push_false(&CoverageRow::owed(observed)) && file.finish() {
@@ -2300,7 +2304,7 @@ fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
                 settle_owed(&dir, &today);
             } else {
                 outcome.failed += 1;
-                owe_coverage(support_dir, observed);
+                owe_coverage(support_dir, observed, true);
             }
         }
         return outcome;
@@ -2335,15 +2339,15 @@ fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
         }
     } else {
         outcome.failed += 1;
-        owe_coverage(support_dir, owed_today.unwrap_or(now).min(now));
+        owe_coverage(support_dir, owed_today.unwrap_or(now).min(now), true);
     }
     outcome.published = written && !sealed;
     outcome
 }
 
 #[cfg(test)]
-pub(crate) fn owe_coverage_for_test(support_dir: &Path, observed_unix: u64) {
-    owe_coverage(support_dir, observed_unix);
+pub(crate) fn owe_coverage_for_test(support_dir: &Path, observed_unix: u64, durable: bool) {
+    owe_coverage(support_dir, observed_unix, durable);
 }
 
 /// A restart: the process's owed-coverage latch is gone (the markers stay).
