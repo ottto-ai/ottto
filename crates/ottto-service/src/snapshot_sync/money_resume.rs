@@ -37,7 +37,7 @@ pub(crate) fn immediate<T>(future: impl Future<Output = T>) -> Option<T> {
     }
 }
 
-pub(super) async fn until(mut ready: impl FnMut() -> bool) {
+pub(crate) async fn until(mut ready: impl FnMut() -> bool) {
     std::future::poll_fn(|_| {
         if ready() {
             Poll::Ready(())
@@ -357,6 +357,33 @@ pub(super) fn forget_for_test(support_dir: &Path) {
     {
         slot.take();
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_IMMEDIATE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(super) fn set_before_immediate_for_test(hook: impl FnOnce() + 'static) {
+    BEFORE_IMMEDIATE.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+}
+#[cfg(test)]
+pub(super) fn before_immediate_for_test() {
+    if let Some(hook) = BEFORE_IMMEDIATE.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn drive_for_test<T>(future: impl Future<Output = T>) -> T {
+    let mut future = std::pin::pin!(future);
+    for _ in 0..128 {
+        if let Some(value) = immediate(future.as_mut()) {
+            return value;
+        }
+        crate::snapshots::claude_request_money::store::flush();
+    }
+    panic!("same admitted checkpoint continuation did not converge")
 }
 
 #[cfg(test)]

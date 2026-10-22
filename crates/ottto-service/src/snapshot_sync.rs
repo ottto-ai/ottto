@@ -5983,6 +5983,8 @@ fn finish_sync_source(
             daemon,
         );
     }
+    #[cfg(test)]
+    money_resume::before_immediate_for_test();
     money_resume::immediate(finish_sync_source_resume(
         preparation,
         index,
@@ -5999,7 +6001,10 @@ fn finish_sync_source(
         retry,
         None,
     ))
-    .expect("gate-off finish has no asynchronous custody barrier")
+    .unwrap_or(Err(crate::source_rotation::LocalRefusal(
+        "request money scheduling checkpoint pending",
+    )
+    .into()))
 }
 
 fn source_money_resume(source: SnapshotSource, support_dir: &Path) -> bool {
@@ -8213,7 +8218,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
-    money_resume::immediate(try_apply_claude_local_evidence_to_scan_resume(
+    let future = try_apply_claude_local_evidence_to_scan_resume(
         support_dir,
         scan_result,
         index,
@@ -8222,10 +8227,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         comparison,
         lease,
         None,
-    ))
-    .unwrap_or(Err(crate::source_rotation::LocalRefusal(
-        "request money scheduling checkpoint pending",
-    )))
+    );
+    #[cfg(test)]
+    {
+        money_resume::drive_for_test(future)
+    }
+    #[cfg(not(test))]
+    {
+        money_resume::immediate(future).unwrap_or(Err(crate::source_rotation::LocalRefusal(
+            "request money scheduling checkpoint pending",
+        )))
+    }
 }
 
 #[allow(clippy::too_many_arguments)] // Shared evidence, comparison and one moving custody admission.

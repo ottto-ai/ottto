@@ -36884,6 +36884,21 @@ impl ScanIndex {
         );
     }
 
+    /// A quiet RetryPending record must bind the actual retained revision;
+    /// the older helper intentionally uses a different synthetic revision.
+    #[cfg(test)]
+    pub(crate) fn insert_bound_retry_pending_claude_authority_for_test(
+        &mut self,
+        root: &str,
+        revision: &str,
+    ) {
+        self.insert_claude_authority_for_test(
+            root,
+            revision,
+            ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+        );
+    }
+
     /// A well-formed UnprovenTerminal family quarantine bound to a retained
     /// synthetic witness whose only member is the root itself, recording
     /// `revision` as that member's held source revision.

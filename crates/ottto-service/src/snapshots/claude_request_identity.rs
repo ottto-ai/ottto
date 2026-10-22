@@ -2029,12 +2029,11 @@ pub(crate) fn request_owned_grouping(
                 ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
                 ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
             };
-            super::insert_selector_raw(
-                &mut selector,
-                "request_usage_origin",
-                "claude_api_request",
-                &serde_json::Value::String(name.into()),
-            );
+            // This origin is a trusted literal enum, outside the legacy
+            // selector allowlist; preserve it for exact emitted-row identity.
+            selector
+                .context
+                .insert("request_usage_origin".into(), name.into());
         }
         let (mut row, mut context, _) = super::build_row_identity(
             &contribution.key.1,

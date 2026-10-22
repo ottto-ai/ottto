@@ -2328,7 +2328,7 @@ pub(crate) fn live_page(
     groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
 ) -> BTreeSet<String> {
     let mut output = PageBodies::default();
-    let _ = crate::snapshot_sync::money_resume::immediate(guarded_resume(build_page_at(
+    let _ = crate::snapshot_sync::money_resume::drive_for_test(guarded_resume(build_page_at(
         support_dir,
         snapshots,
         index,
@@ -2353,32 +2353,9 @@ pub(crate) fn live_page_for_test(
     identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
     groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
 ) -> BTreeSet<String> {
-    let original = snapshots.clone();
-    for _ in 0..24 {
-        let held = live_page(
-            support, snapshots, index, api, trace, complete, identity, groupings,
-        );
-        if !checkpoint_pending(support) {
-            return held;
-        }
-        store::flush();
-        *snapshots = original.clone();
-        for item in &original {
-            if let Some(fp) = item.source_file_fingerprint.as_deref() {
-                for (key, entry) in &index.files {
-                    if entry.source_file_fingerprint == fp {
-                        let _ = super::parse_claude_code_jsonl_file(
-                            Path::new(key),
-                            &item.collected_at,
-                            fp.to_owned(),
-                        )
-                        .expect("retry parses fresh evidence/capture");
-                    }
-                }
-            }
-        }
-    }
-    panic!("writer receipt did not converge")
+    live_page(
+        support, snapshots, index, api, trace, complete, identity, groupings,
+    )
 }
 
 /// A page whose shadow does not take its captures: they are dropped by the
@@ -3049,6 +3026,8 @@ fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
     if file.size > room {
+        // Only the durable false seal crosses the ordinary-row room bound.
+        outcome.sealed = 1;
         // Full: nothing more today but a debt's false row.
         outcome.truncated = rows;
         if let Some(observed) = owed_today {

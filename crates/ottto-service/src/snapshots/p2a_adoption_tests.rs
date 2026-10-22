@@ -95,6 +95,8 @@ fn p2a_adoption_strict_bytes_floor_and_covering_ack_partial_rollback() {
     index.stamp_request_money_acks(&scan.snapshots, &accepted, &covering);
     let mut partial = index.committable_subset(&previous, &accepted, &BTreeMap::new());
     let path = home.join("partial.json");
+    let prior_path = home.join("scan-index.json");
+    fs::copy(&prior_path, &path).unwrap();
     partial.save(&path).unwrap();
     let partial = ScanIndex::load(&path).unwrap();
     assert_eq!(
@@ -151,6 +153,7 @@ fn p2a_adoption_strict_bytes_floor_and_covering_ack_partial_rollback() {
     assert!(floor.claude_money_files.len() < floor.files.len());
     let census = serde_json::to_value(&floor.claude_request_census).unwrap();
     let floor_path = home.join("floor-reload.json");
+    fs::copy(home.join("scan-index.json"), &floor_path).unwrap();
     floor.save(&floor_path).unwrap();
     let mut reloaded = ScanIndex::load(&floor_path).unwrap();
     assert!(reloaded
@@ -178,10 +181,18 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
     let _live = money::LiveForTest::new(&support);
     let scan = p2a_scan(&root, &support, &mut index);
     for state in [1, 2, 3, 6] {
-        money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| state);
+        crate::snapshot_sync::money_resume::drive_for_test(
+            crate::snapshot_sync::money_resume::until(|| {
+                money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| state)
+            }),
+        );
         money::store::reload_for_test(&support).unwrap();
         assert!(money::adoption_paused(&support, &index), "state {state}");
-        money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| 4);
+        crate::snapshot_sync::money_resume::drive_for_test(
+            crate::snapshot_sync::money_resume::until(|| {
+                money::note_adoption_outcomes(&support, &index, &scan.snapshots, |_| 4)
+            }),
+        );
         money::store::reload_for_test(&support).unwrap();
         assert!(
             !money::adoption_paused(&support, &index),
@@ -192,6 +203,10 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
     money::store::reload_for_test(&support).unwrap();
     assert!(money::adoption_paused(&support, &index));
     money::note_route_pause(&support, &index, false);
+    money::store::with_ledger_for_test(&support, |ledger| {
+        assert!(money::store::checkpoint_for_test(&support, ledger))
+    })
+    .unwrap();
     assert!(!money::adoption_paused(&support, &index));
 
     let mut literal = scan.snapshots.clone();
@@ -1174,6 +1189,50 @@ fn p2a_empty_files_settle_locally_once_without_stamping_stripped_or_prior_bodies
         p2a_scan(&root, &support, &mut reloaded).scanned_file_count,
         0,
         "unchanged confirmed empty files must not consume adoption reads again"
+    );
+    // A normal parsed sibling makes the optional selection map persist. The
+    // decoder must still preserve the independent confirmed-empty settlement.
+    let sibling_id = "aaaaaaaa-bbbb-4ccc-8ddd-000000000124";
+    fs::write(
+        root.join(format!("{sibling_id}.jsonl")),
+        format!(
+            "{}\n",
+            json!({
+                "timestamp":"2026-08-23T18:20:00Z", "type":"assistant", "sessionId":sibling_id,
+                "requestId":"empty-sibling-request", "message":{"id":"empty-sibling-message",
+                    "model":"claude-haiku-4-5", "usage":{"input_tokens":10,"output_tokens":1}}
+            })
+        ),
+    )
+    .unwrap();
+    let sibling = p2a_scan(&root, &support, &mut reloaded);
+    assert_eq!(sibling.snapshots.len(), 1);
+    let item = &sibling.snapshots[0];
+    let (sibling_key, revision) = reloaded
+        .files
+        .iter()
+        .find(|(_, entry)| {
+            item.source_file_fingerprint.as_deref() == Some(&entry.source_file_fingerprint)
+        })
+        .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+        .unwrap();
+    money::record_logical_member(&mut reloaded, &sibling_key, &revision, item);
+    assert!(!reloaded.claude_money_files.is_empty());
+    let census = reloaded.claude_request_census.get(&key).cloned();
+    reloaded.save(&saved).unwrap();
+    let mut mixed = ScanIndex::load(&saved).unwrap();
+    assert_eq!(
+        mixed.files[&key].effective_upload_body_witness_revision, 3,
+        "a populated sibling's selection must not downgrade empty local settlement"
+    );
+    assert_eq!(mixed.claude_request_census.get(&key), census.as_ref());
+    let following = p2a_scan(&root, &support, &mut mixed);
+    assert!(
+        following
+            .pending_finalization
+            .iter()
+            .all(|pending| pending.index_key != key),
+        "pending real sibling adoption cannot re-arm the unchanged empty member"
     );
     let _ = fs::remove_dir_all(home);
 }
