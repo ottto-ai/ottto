@@ -183,6 +183,8 @@ fn money_pipeline_arm(name: &str, corpus: MoneyCorpus) -> MoneyPipelineArm {
             last = Some(page.index);
         }
     }
+    // The shadow's rows are written by its writer, after each page.
+    money::store::flush();
     MoneyPipelineArm {
         facts,
         census: money_census(&fixture, &last.expect("pages")),
@@ -324,7 +326,6 @@ fn money_shadow_changes_no_page_decision_through_the_real_caller() {
     for line in &on.lines {
         assert_eq!(line["counting"], "claude_request_counting:v1");
         assert_eq!(line["counts"]["refused_budget"], 0, "{line}");
-        assert_eq!(line["counts"]["ledger_unfunded"], 0, "{line}");
         assert!(line["ledger"]["census_serialized_bytes"].is_u64(), "{line}");
         assert!(line["scope"]["lost"].is_u64(), "{line}");
     }
@@ -455,7 +456,7 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
     money::shadow_page_at(
         &fixture.support,
         &armed.snapshots,
-        &mut armed_index,
+        &armed_index,
         &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
         &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
         armed.census_complete,
@@ -581,11 +582,11 @@ fn money_shadow_holds_immature_units_until_they_mature() {
     let none = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let no_trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
     let units = PIPELINE_SESSIONS.len() as u64;
-    let (fixture, mut index, scan) = money_armed_scan("money-shadow-immature");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-immature");
     let young = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
-        &mut index,
+        &index,
         &none,
         &no_trace,
         scan.census_complete,
@@ -598,11 +599,11 @@ fn money_shadow_holds_immature_units_until_they_mature() {
         units * MONEY_PIPELINE_RESPONSE_TOKENS
     );
     assert_eq!(young.tokens_new, young.tokens_old - young.tokens_immature, "{young:?}");
-    let (fixture, mut index, scan) = money_armed_scan("money-shadow-mature");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-mature");
     let mature = money::shadow_page_at(
         &fixture.support,
         &scan.snapshots,
-        &mut index,
+        &index,
         &none,
         &no_trace,
         scan.census_complete,
@@ -747,27 +748,165 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
 
 /// AutoReview 5: when the JSONL cannot be written, no family memo moves
 /// (the reader never received those rows, so they are neither "unchanged"
-/// next time nor a removal basis), and the page is not coverage complete.
+/// next time nor a removal basis). The writer reports the failure to the
+/// next page, which withholds the memos.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_memos_move_only_with_published_rows() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
-    let (fixture, mut index, scan) = money_armed_scan("money-shadow-unpublished");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-unpublished");
     std::fs::write(fixture.support.join("diagnostics"), b"not a directory").unwrap();
-    let counts = money::shadow_page_at(
-        &fixture.support,
-        &scan.snapshots,
-        &mut index,
-        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
-        scan.census_complete,
-        response + 3600,
+    let page = || {
+        let counts = money::shadow_page_at(
+            &fixture.support,
+            &scan.snapshots,
+            &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete,
+            response + 3600,
+        );
+        money::store::flush();
+        counts
+    };
+    let first = page();
+    assert!(first.families > 0, "{first:?}");
+    assert!(first.jsonl_queued > 0, "{first:?}");
+    let second = page();
+    assert!(second.jsonl_failed >= 1, "{second:?}");
+    assert_eq!(second.family_memos_withheld, first.families, "{second:?}");
+    // A memo still in flight is no removal basis: the second page reports
+    // the previous body unpublished, never a delta.
+    assert_eq!(second.removed_change_available, 0, "{second:?}");
+    let memos = money::store::with_ledger_for_test(&fixture.support, |ledger| {
+        ledger
+            .census()
+            .records_with_prefix(crate::snapshots::claude_request_census::FAMILY_KEY_PREFIX)
+            .count()
+    });
+    assert_eq!(memos, Some(0));
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Finding 8, whole cycle: from one saved state (a populated ledger saved
+/// to disk and reloaded), the same cycle run unarmed, armed, and armed with
+/// every ledger save failing saves the same index bytes at every page and
+/// makes the same page decisions. The shadow holds the index immutably and
+/// keeps its ledger in its own store, so the index and every live allowance
+/// derived from it are the same armed or not.
+#[test]
+#[serial(source_manifests)]
+#[serial(claude_request_money_shadow)]
+fn money_armed_cycle_saves_the_baseline_index() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("money-shadow-whole-cycle");
+    money_write_corpus(
+        &fixture,
+        MoneyCorpus {
+            shadow: true,
+            copies_and_rows: true,
+            broken_sidecar: false,
+        },
     );
-    assert!(counts.jsonl_failed >= 1, "{counts:?}");
-    assert_eq!(counts.family_memos_withheld, counts.families, "{counts:?}");
-    assert_eq!(counts.coverage_complete, 0);
-    assert!(!index
-        .claude_request_census_for_test()
-        .records()
-        .any(|(key, _)| key.starts_with(crate::snapshots::claude_request_census::FAMILY_KEY_PREFIX)));
+    // Populate the ledger with an armed cycle, then save it and forget it.
+    money::enable_shadow_for_test(&fixture.support);
+    fixture.traversal(8, &MONEY_PIPELINE_CYCLE);
+    money::store::forget_for_test(&fixture.support);
+    let ledger_dir = fixture.support.join(money::store::LEDGER_DIR);
+    assert!(ledger_dir.join("meta.json").is_file(), "the ledger was saved");
+    fixture.append(PIPELINE_SESSIONS[2], "req_2_2");
+    let saved = money_files(&fixture.base);
+    let cycle = |armed: bool, ledger_fails: bool| {
+        money_restore_files(&fixture.base, &saved);
+        money::store::forget_for_test(&fixture.support);
+        if armed {
+            money::enable_shadow_for_test(&fixture.support);
+        } else {
+            money::disable_shadow_for_test(&fixture.support);
+        }
+        if ledger_fails {
+            for name in std::fs::read_dir(&ledger_dir).unwrap().flatten() {
+                let staged = name.path().with_extension("json.tmp");
+                std::fs::create_dir_all(staged.join("blocked")).unwrap();
+            }
+        }
+        let _ = money::take_shadow_lines_for_test();
+        let pages = fixture.traversal(9, &MONEY_PIPELINE_CYCLE);
+        money::store::flush();
+        let lines = money::take_shadow_lines_for_test();
+        let pages = pages
+            .iter()
+            .map(|page| {
+                (
+                    census_parity_page_facts(&fixture, page),
+                    serde_json::to_vec(&page.index).unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        (pages, std::fs::read(&fixture.index_path).unwrap(), lines)
+    };
+    let (baseline, baseline_index, quiet) = cycle(false, false);
+    assert!(quiet.is_empty());
+    let (armed, armed_index, lines) = cycle(true, false);
+    assert_eq!(armed.len(), baseline.len());
+    for (number, (armed, baseline)) in armed.iter().zip(&baseline).enumerate() {
+        assert_eq!(armed.0, baseline.0, "page {number}: the same decisions");
+        assert!(armed.1 == baseline.1, "page {number}: the same index bytes");
+    }
+    assert!(armed_index == baseline_index, "the same saved index");
+    // The armed cycle ran on the reloaded ledger.
+    assert_eq!(lines[0]["counts"]["ledger_loading"], 1, "{}", lines[0]);
+    assert!(
+        lines
+            .iter()
+            .any(|line| line["ledger"]["telemetry_records"].as_u64() > Some(0)),
+        "{lines:?}"
+    );
+    let (failing, failing_index, lines) = cycle(true, true);
+    assert_eq!(failing.len(), baseline.len());
+    for (number, (failing, baseline)) in failing.iter().zip(&baseline).enumerate() {
+        assert_eq!(failing.0, baseline.0, "page {number}: the same decisions");
+        assert!(failing.1 == baseline.1, "page {number}: the same index bytes");
+    }
+    assert!(failing_index == baseline_index, "the same saved index");
+    assert!(!lines.is_empty());
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
+/// Every file under `dir`: relative path -> bytes.
+fn money_files(dir: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+    let mut files = BTreeMap::new();
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(next) = pending.pop() {
+        for entry in std::fs::read_dir(&next).unwrap().flatten() {
+            let path = entry.path();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path.strip_prefix(dir).unwrap().to_path_buf();
+                files.insert(relative, std::fs::read(&path).unwrap());
+            }
+        }
+    }
+    files
+}
+
+/// Put `dir`'s files back to `saved`: a changed file is rewritten in place
+/// (its identity kept), a new one removed, a missing one recreated.
+fn money_restore_files(dir: &Path, saved: &BTreeMap<PathBuf, Vec<u8>>) {
+    let now = money_files(dir);
+    for (relative, bytes) in &now {
+        match saved.get(relative) {
+            Some(old) if old == bytes => {}
+            Some(old) => std::fs::write(dir.join(relative), old).unwrap(),
+            None => std::fs::remove_file(dir.join(relative)).unwrap(),
+        }
+    }
+    for (relative, bytes) in saved {
+        if !now.contains_key(relative) {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+    }
 }

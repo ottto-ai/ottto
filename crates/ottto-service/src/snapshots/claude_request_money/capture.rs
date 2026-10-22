@@ -314,7 +314,7 @@ impl ClaudeResponseCapture {
         &self.units
     }
 
-    /// Sorted unique message-only hashes (the census record's `mh`).
+    /// Sorted unique message-only hashes (the ledger's `mh:` record).
     pub(crate) fn message_only_hashes(&self) -> Vec<u64> {
         let mut hashes = self
             .units
@@ -394,18 +394,6 @@ pub(crate) fn purge_before(scope: &Path, before: Instant) -> u64 {
     let len = store.len();
     store.retain(|(entry_scope, _), entry| entry_scope != scope || entry.deposited >= before);
     (len - store.len()) as u64
-}
-
-/// The census `mh` of the parse at `index_key`: None (unknown) unless its
-/// capture is present, of this revision and complete.
-pub(crate) fn capture_message_hashes(index_key: &str, fingerprint: &str) -> Option<Vec<u64>> {
-    let store = STORE.lock().ok()?;
-    let entry = store
-        .iter()
-        .find(|((_, key), _)| key == index_key)
-        .map(|(_, entry)| entry)?;
-    (entry.fingerprint == fingerprint && !entry.capture.refused)
-        .then(|| entry.capture.message_only_hashes())
 }
 
 #[cfg(test)]

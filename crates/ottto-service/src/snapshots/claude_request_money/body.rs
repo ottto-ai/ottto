@@ -116,7 +116,7 @@ fn live_key_of_capture(row: &CapturedRow) -> ClaudeLiveKey {
 /// occurrence it matched (None for a side call): exactly its selector,
 /// speed, effort, model and clock rule.
 pub(crate) fn reported_live_key(
-    row: &ClaudeApiRow,
+    row: &ClaudeApiRow<'_>,
     occurrence: Option<&super::super::ClaudeTranscriptUsageOccurrence>,
 ) -> Option<ClaudeLiveKey> {
     let mut selector = occurrence
@@ -131,7 +131,7 @@ pub(crate) fn reported_live_key(
         );
     }
     let reported_effort = CLAUDE_EFFORT_TIERS
-        .contains(&&*row.effort)
+        .contains(&row.effort)
         .then(|| row.effort.to_string());
     let effort = occurrence
         .and_then(|occurrence| occurrence.reasoning_effort.clone())
@@ -142,12 +142,12 @@ pub(crate) fn reported_live_key(
                 .model
                 .clone()
                 .unwrap_or_else(|| row.model.to_string()),
-            occurrence
-                .timestamp
-                .clone()
-                .unwrap_or_else(|| row.observed_at.to_string()),
+            match &occurrence.timestamp {
+                Some(timestamp) => timestamp.clone(),
+                None => row.observed_at()?,
+            },
         ),
-        None => (row.model.to_string(), row.observed_at.to_string()),
+        None => (row.model.to_string(), row.observed_at()?),
     };
     let (bucket_start, _) = activity_bucket_from_timestamp(&timestamp)?;
     let (row_key, mut context, _) = build_row_identity(&model, &selector, effort.as_deref());
@@ -427,7 +427,7 @@ pub(crate) fn build_claude_request_body(
                 .map(live_key_of_capture);
             let (live, live_cost) = if reported {
                 match rows.get(hash).filter(|_| trace_owner(hash) == member) {
-                    Some(row) => match reported_live_key(row, Some(occurrence)) {
+                    Some(row) => match reported_live_key(&row, Some(occurrence)) {
                         Some(key) => (Some(key), row.cost_micros),
                         None => {
                             placement_missing = true;
@@ -519,7 +519,7 @@ pub(crate) fn build_claude_request_body(
                 if trace_owner(row.request_hash) != member || own.contains(&row.request_hash) {
                     continue;
                 }
-                let Some(key) = reported_live_key(row, None) else {
+                let Some(key) = reported_live_key(&row, None) else {
                     placement_missing = true;
                     continue;
                 };
@@ -539,15 +539,21 @@ pub(crate) fn build_claude_request_body(
             continue;
         }
         // Conflicts under one `R` key: the order's winner stays a unit; the
-        // live body (non-reported) carries both.
+        // live body (non-reported) carries both. Units by request hash, once.
+        let position = units
+            .iter()
+            .enumerate()
+            .filter_map(|(position, unit)| match unit.kind {
+                UnitKind::Request(hash) => Some((hash, position)),
+                _ => None,
+            })
+            .collect::<BTreeMap<_, _>>();
         let mut losers = Vec::new();
         for loser in displaced {
             let UnitKind::Request(hash) = loser.kind else {
                 continue;
             };
-            let kept = units
-                .iter_mut()
-                .find(|unit| unit.kind == UnitKind::Request(hash));
+            let kept = position.get(&hash).map(|position| &mut units[*position]);
             let loser = match kept {
                 Some(kept)
                     if claude_response_conflict_order(
@@ -830,7 +836,7 @@ fn counted_slice(
     let same_tokens = row.tokens.input == unit.tokens.input
         && row.tokens.output == unit.tokens.output
         && row.tokens.cache_read == unit.tokens.cache_read
-        && row.cache_creation
+        && row.cache_creation()
             == unit
                 .tokens
                 .cache_5m
@@ -969,9 +975,9 @@ fn side_calls(
         let member = match named {
             Some(member) => member,
             None => {
-                if family.trace.and_then(|trace| trace.get(&hash)).is_some() {
-                    counts.side_call_member_unknown += 1;
-                }
+                // No trace, no trace row for it, or a member with no file:
+                // the root stands in, and the member is unknown.
+                counts.side_call_member_unknown += 1;
                 family.root
             }
         };
@@ -979,7 +985,7 @@ fn side_calls(
             counts.side_calls_in_live_body += 1;
             continue;
         }
-        let Some(key) = reported_live_key(row, None) else {
+        let Some(key) = reported_live_key(&row, None) else {
             // No live row to add it at: the body cannot be built.
             counts.side_calls_unkeyed += 1;
             body.unbuilt = true;
