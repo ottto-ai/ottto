@@ -1777,6 +1777,18 @@ fn money_audits_skip_idle_sidecars() {
     assert_eq!(at(start + 30 * day + 10, &mut ledger).audits_started, 0);
     let counts = at(start + 31 * day, &mut ledger);
     assert_eq!(counts.audits_started, 1, "grown: a day later: {counts:?}");
+
+    // A retired record is skipped only while it has no claims: one that
+    // gains claims from a later append is audited again.
+    let key = telemetry_key(session);
+    let mut record = ledger.take(&key).unwrap();
+    record.retire();
+    let _ = ledger.insert(key.clone(), record);
+    tail.append(session, &money_api_line(session, "req_3", t));
+    at(start + 31 * day + 10, &mut ledger);
+    let record = ledger.get(&key).unwrap();
+    assert!(record.retired().is_some() && !record.request_hashes().is_empty());
+    assert_eq!(at(start + 33 * day, &mut ledger).audits_started, 1);
 }
 
 /// A missing or corrupt ledger shard at load is damage (the page drops the

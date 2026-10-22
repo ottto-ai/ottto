@@ -1475,6 +1475,10 @@ pub(crate) fn shadow_page_at(
             (false, _) => (None, None, Some("body_incomplete")),
             (true, None) => (None, None, Some("no_previous_body")),
             (true, Some((revision, _))) if revision != union => (None, None, Some("union_changed")),
+            // An earlier build's marker of an incomplete first body.
+            (true, Some((_, memo))) if memo.removed_requests == u64::MAX => {
+                (None, None, Some("no_previous_body"))
+            }
             (true, Some((_, memo))) => (
                 Some(SignedRequestsTokens {
                     requests: i128::from(body.removed.requests) - i128::from(memo.removed_requests),
