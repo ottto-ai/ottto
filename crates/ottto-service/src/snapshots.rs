@@ -2572,6 +2572,11 @@ pub struct SnapshotQuarantineRecord {
     pub disposition: SnapshotQuarantineDisposition,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hold: Option<SnapshotHoldRetry>,
+    #[serde(default, skip_serializing_if = "request_money_zero_u8")]
+    pub version_skew_attempts: u8,
+}
+fn request_money_zero_u8(value: &u8) -> bool {
+    *value == 0
 }
 
 /// Retry state for an exact body held by the server. Kept beside the existing
@@ -2664,6 +2669,7 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         .unwrap_or_default();
     SnapshotQuarantineRecord {
         hold: None,
+        version_skew_attempts: 0,
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
@@ -2685,6 +2691,9 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
     // Anything further out is corrupt state or evidence the wall clock moved
     // backwards. In either case local state must never become a permanent
     // authority that fences a repaired backend forever.
+    if record.version_skew_attempts > 5 {
+        return false;
+    }
     match record.disposition {
         SnapshotQuarantineDisposition::RetryPending => {
             let max_delay = match &record.hold {
@@ -30917,6 +30926,7 @@ impl ScanIndex {
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
                     hold: None,
+                    version_skew_attempts: 0,
 
                     witness: witness.clone(),
                     retry_after_unix_seconds: 0,
@@ -35848,6 +35858,7 @@ mod tests {
         let original_now = 1_000_000;
         let record = SnapshotQuarantineRecord {
             hold: None,
+            version_skew_attempts: 0,
 
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: original_now
@@ -37105,6 +37116,7 @@ mod tests {
                 fingerprint,
                 SnapshotQuarantineRecord {
                     hold: None,
+                    version_skew_attempts: 0,
 
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
@@ -37878,6 +37890,7 @@ mod tests {
             fingerprint.clone(),
             SnapshotQuarantineRecord {
                 hold: None,
+                version_skew_attempts: 0,
 
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
@@ -70535,7 +70548,7 @@ crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash,
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
-crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition, hold);
+crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition, hold, version_skew_attempts);
 crate::heap_layout_bound::fields!(SnapshotHoldRetry; kind, stage, first_held_unix, day_start_unix, retries_in_day);
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotHoldKind {
     fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {

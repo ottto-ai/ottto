@@ -2192,6 +2192,18 @@ pub fn refresh_canonical_local_health(status: &mut DaemonStatus) {
 /// Project canonical health from daemon state, where `started_at` is the
 /// process start instant recorded once at construction.
 pub fn refresh_canonical_local_health_with_started_at(status: &mut DaemonStatus, started_at: &str) {
+    if let Some(money) = snapshot_sync::request_money_menu_status() {
+        for source in &mut status.sources {
+            if source.source == SourceKind::ClaudeCode {
+                if let Some(collector) = &mut source.collector {
+                    collector.held_for_review_count = Some(money.held);
+                    collector.not_applied_after_review_count = Some(money.refused);
+                    collector.adoption_state = Some(money.adoption.clone());
+                    collector.protected_list_state = Some(money.protected.clone());
+                }
+            }
+        }
+    }
     let observed_at = status.generated_at.clone();
     let projection_revision = next_status_projection_revision(status);
     let runtime_event = LocalHealthEventV1 {

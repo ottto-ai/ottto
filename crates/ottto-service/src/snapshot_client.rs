@@ -4698,3 +4698,30 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
     gzip_snapshot_batch(body, true)
 }
+
+#[cfg(test)]
+mod request_owned_ack_tests {
+    use super::*;
+    #[test]
+    fn nonpermanent_ack_is_accepted_only_for_the_two_review_reasons() {
+        let fingerprint = "a".repeat(64);
+        for reason in [
+            "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review",
+            "claude_request_owned_usage_contract_mismatch",
+            "other",
+        ] {
+            let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+                "accepted": 0, "sessions_reconciled": 0, "session_ids": [], "disabled": false, "disabled_reason": null,
+                "rejected_entities": [{"source_session_id":"session", "snapshot_fingerprint":fingerprint, "reason": reason, "detail":"", "permanent":false}]
+            })).unwrap();
+            let valid =
+                response.validate_entity_ack_identities([("session", fingerprint.as_str())]);
+            assert_eq!(
+                valid.is_ok(),
+                reason.starts_with("usage_decrease_"),
+                "{reason}: {valid:?}"
+            );
+        }
+    }
+}

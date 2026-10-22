@@ -142,3 +142,104 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         super::super::snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
     true
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::snapshots::claude_request_money::body::{ClaudeGrainSide, ClaudeRequestUsageOrigin};
+
+    #[test]
+    fn literal_emission_preserves_attribution_and_costs_only_own_priced_grains() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        let facts = serde_json::to_value(&item.attribution_facts).unwrap();
+        let mut entity = ClaudeEntityBody::default();
+        for (model, origin, cost, tokens) in [
+            ("transcript", None, None, 10),
+            (
+                "matched",
+                Some(ClaudeRequestUsageOrigin::TelemetryMatched),
+                Some(125),
+                20,
+            ),
+            (
+                "reported",
+                Some(ClaudeRequestUsageOrigin::TelemetryReported),
+                Some(250),
+                30,
+            ),
+            (
+                "unpriced",
+                Some(ClaudeRequestUsageOrigin::TelemetryUnpriced),
+                None,
+                40,
+            ),
+        ] {
+            entity.grains.insert(
+                (
+                    ("2026-08-02T09:00:00Z".into(), model.into(), BTreeMap::new()),
+                    origin,
+                ),
+                ClaudeGrainSide {
+                    tokens: ClaudeMoneyTokens {
+                        input: tokens,
+                        ..Default::default()
+                    },
+                    requests: 1,
+                    cost_micros: cost.unwrap_or(0),
+                    unpriced: u64::from(cost.is_none()),
+                    contributions: 1,
+                },
+            );
+        }
+        entity.telemetry_owned_complete = false;
+        assert!(apply(&mut item, &entity));
+        assert_eq!(
+            item.usage_accounting_contract.as_deref(),
+            Some(REQUEST_OWNED_CONTRACT)
+        );
+        assert_eq!(item.request_count, 4);
+        assert_eq!(item.input_tokens, 100);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.000375")
+        );
+        assert_eq!(item.removed_request_count, Some(0));
+        assert_eq!(item.removed_usage, Some(ClaudeRemovedUsage::default()));
+        assert_eq!(item.telemetry_owned_complete, Some(false));
+        assert_eq!(
+            serde_json::to_value(&item.attribution_facts).unwrap(),
+            facts
+        );
+        for row in item.model_usage.iter().chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        ) {
+            if row.model == "unpriced" {
+                assert!(row.cost_usd.is_none());
+                assert_eq!(
+                    row.selector_context
+                        .get("request_usage_origin")
+                        .map(String::as_str),
+                    Some("telemetry_unpriced")
+                );
+                assert_eq!(
+                    row.selector_sources
+                        .get("request_usage_origin")
+                        .map(String::as_str),
+                    Some("claude_api_request")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn uncertified_entity_cannot_mutate_existing_body() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        let before = serde_json::to_vec(&item).unwrap();
+        let mut entity = ClaudeEntityBody::default();
+        entity.certificate_ok = false;
+        assert!(!apply(&mut item, &entity));
+        assert_eq!(serde_json::to_vec(&item).unwrap(), before);
+    }
+}

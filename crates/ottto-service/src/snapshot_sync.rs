@@ -1108,6 +1108,7 @@ impl SnapshotUploadProgress {
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
                 hold: None,
+                version_skew_attempts: 0,
 
                 witness,
                 retry_after_unix_seconds: if disposition
@@ -2360,6 +2361,18 @@ enum DisclosedLoss {
     Unsettled,
 }
 
+#[derive(Clone)]
+pub(crate) struct RequestMoneyMenuStatus {
+    pub(crate) held: u64,
+    pub(crate) refused: u64,
+    pub(crate) adoption: String,
+    pub(crate) protected: String,
+}
+static REQUEST_MONEY_MENU: Mutex<Option<RequestMoneyMenuStatus>> = Mutex::new(None);
+pub(crate) fn request_money_menu_status() -> Option<RequestMoneyMenuStatus> {
+    REQUEST_MONEY_MENU.lock().ok()?.clone()
+}
+
 impl SyncCounts {
     /// Loss a later traversal can still change. Mirrors
     /// `ScanTraversalCounts::has_retryable_problems` on the receipt's own
@@ -2474,6 +2487,40 @@ impl SyncCounts {
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
+        if index
+            .active_quarantine_witness
+            .as_ref()
+            .is_some_and(|witness| {
+                witness.parser_version == SnapshotSource::ClaudeCode.parser_version()
+            })
+        {
+            let mut held = 0;
+            let mut refused = 0;
+            for record in index
+                .quarantined_snapshot_fingerprints
+                .values()
+                .filter(|record| record.disposition == SnapshotQuarantineDisposition::RetryPending)
+            {
+                match record.hold.as_ref().map(|hold| hold.kind) {
+                    Some(SnapshotHoldKind::Held) => held += 1,
+                    Some(SnapshotHoldKind::Refused) => refused += 1,
+                    None => (),
+                }
+            }
+            if let Ok(mut status) = REQUEST_MONEY_MENU.lock() {
+                *status = Some(RequestMoneyMenuStatus {
+                    held,
+                    refused,
+                    adoption: if index.active_effective_upload_body_witness_revision == 3 {
+                        "running"
+                    } else {
+                        "off"
+                    }
+                    .into(),
+                    protected: index.claude_reemission_exclusions.state().as_str().into(),
+                });
+            }
+        }
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
         // Mirror #389's disclosed-loss convention: terminal unproven entities
@@ -7098,8 +7145,29 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             identity_evidence.as_ref(),
             &mut groupings,
         );
+        let mut holds = holds;
+        for item in &scan_result.snapshots {
+            if item.usage_accounting_contract.as_deref()
+                != Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                && disposition
+                    .quarantined_source_session_ids
+                    .contains(&item.source_session_id)
+            {
+                holds.insert(item.source_session_id.clone());
+            }
+        }
         disposition.request_owned(holds);
         disposition.request_groupings = groupings;
+        let unoffered = scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                item.usage_accounting_contract.as_deref()
+                    != Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+            })
+            .filter_map(|item| item.source_file_fingerprint.clone())
+            .collect();
+        index.exclude_effective_upload_body_witness_revision_for_source_files(&unoffered);
     }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
@@ -7915,14 +7983,23 @@ where
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
             }
             Err(error) if is_literal_version_skew(&error) => {
+                let mut retry_after = 1_800;
                 for index in &indices {
                     let fp = fingerprint(&items[*index]);
+                    let attempts = progress
+                        .quarantined_fingerprints
+                        .get(fp)
+                        .map_or(1, |record| record.version_skew_attempts.saturating_add(1))
+                        .min(5);
                     progress.quarantine_retryable_body(fp, &body_witness(&items[*index]));
-                    progress
+                    let record = progress
                         .quarantined_fingerprints
                         .get_mut(fp)
-                        .expect("retry inserted")
-                        .retry_after_unix_seconds = current_unix_seconds().saturating_add(30 * 60);
+                        .expect("retry inserted");
+                    record.version_skew_attempts = attempts;
+                    let delay = (1_800_u64 << (attempts - 1)).min(21_600);
+                    record.retry_after_unix_seconds = current_unix_seconds().saturating_add(delay);
+                    retry_after = retry_after.max(delay);
                 }
                 persist(progress).map_err(|_| {
                     anyhow::Error::new(SnapshotLocalStateRejected {
@@ -7934,7 +8011,7 @@ where
                     indices.len()
                 );
                 return Ok(ResumableUploadResult::Shed {
-                    retry_after: Some(Duration::from_secs(30 * 60)),
+                    retry_after: Some(Duration::from_secs(retry_after)),
                 });
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
@@ -14820,6 +14897,7 @@ mod tests {
             fingerprint,
             SnapshotQuarantineRecord {
                 hold: None,
+                version_skew_attempts: 0,
 
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
@@ -15476,6 +15554,7 @@ mod tests {
                 format!("{value:064x}"),
                 SnapshotQuarantineRecord {
                     hold: None,
+                    version_skew_attempts: 0,
 
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
