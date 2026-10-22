@@ -9,8 +9,8 @@ a replacement is verified. Unusable state falls back to that generation and
 charges only its missing delta to the repair allowance. Without usable prior
 state, the scope or damaged shard's files are quarantined and counted. Scope
 quarantine is marked durably before moving state aside, independently of the
-index. Orphaned generation files establish that a missing manifest belongs to
-an existing scope. No scope is rebuilt from transcripts. Sibling checkpoints keep their identities and open
+index. A receipt saved after the first verified commit distinguishes missing
+committed manifests from partial first-scope writes that remain pending. No scope is rebuilt from transcripts. Sibling checkpoints keep their identities and open
 residency. Unknown kind or part identifiers in any checkpoint field restart only
 that checkpoint at its end, preserving its aggregated history.
 

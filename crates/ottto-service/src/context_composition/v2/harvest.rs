@@ -1444,7 +1444,7 @@ fn process_scope(
         });
     let known = index.scope_generations.contains_key(scope_id)
         || prev_path(&path).is_file()
-        || highest_generation(&path) > 0;
+        || path.with_extension("committed").is_file();
     let loaded = match load_scope(&path, source, scope_id) {
         // A scope the pins know but whose state is gone is bad state too.
         Ok(None) if known => Err(()),
@@ -1797,6 +1797,19 @@ fn process_scope(
         // falls back to the kept generation.
         stats.scopes_failed += 1;
         return None;
+    }
+    // A first committed scope remains distinguishable from uncommitted
+    // shard writes if both its manifest and index are later lost. Write this
+    // receipt once, after verification; partial first scopes stay pending.
+    let committed = path.with_extension("committed");
+    if !committed.is_file() {
+        match write_json(&committed, &scope.generation) {
+            Ok(bytes) => stats.state_bytes += bytes,
+            Err(_) => {
+                stats.scopes_failed += 1;
+                return None;
+            }
+        }
     }
     stats.scopes_committed += 1;
     scope.clean_shards(&path, &kept);

@@ -4612,3 +4612,20 @@ fn durable_scope_quarantine_stops_uploads_before_state_is_moved() {
     assert_eq!(capture.payloads.len(), 1);
     env.cleanup();
 }
+
+#[test]
+fn uncommitted_first_scope_shards_remain_pending() {
+    let env = Env::new("composition-v2-uncommitted-first-shards");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    harvest::tests::set_fail_scope_commit(true);
+    let stats = env.run(Source::Claude, now, None);
+    harvest::tests::set_fail_scope_commit(false);
+    assert_eq!(stats.scopes_committed, 0);
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!((stats.scopes_quarantined, stats.scopes_committed), (0, 1));
+    assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
+    env.cleanup();
+}
