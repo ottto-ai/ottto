@@ -1372,6 +1372,14 @@ fn whole_rows(path: &Path) -> Rows {
     v2_rows(&whole.agg)
 }
 
+fn whole_rows_of(paths: &[&Path]) -> Rows {
+    let mut whole = Reading::default();
+    for (n, path) in paths.iter().enumerate() {
+        whole.read(Source::Claude, path, n as u32 + 1, &[]);
+    }
+    v2_rows(&whole.agg)
+}
+
 /// A second folder (its own scope under `FolderResolver`).
 fn other_workspace(env: &Env) -> String {
     let dir = env.root.parent().unwrap().join("other");
@@ -1438,6 +1446,164 @@ fn damage_scope_state(manifest: &Path, damage: &str) {
 }
 
 #[test]
+fn reset_scope_uploads_again_and_then_reads_new_files_forward_only() {
+    let env = Env::new("composition-v2-reset-upload");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let path = env.root.join("p/s.jsonl");
+    write_records(&path, &claude_turn(&cwd, day, 1));
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    // A session started after install is read from its start.
+    let later = day + time::Duration::days(1);
+    let s2 = env.root.join("p/s2.jsonl");
+    write_records(&s2, &claude_turn(&cwd, later, 2));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(1),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.checkpoint_restarts
+        ),
+        (fs::metadata(&s2).unwrap().len(), 0, 0)
+    );
+    assert_eq!(capture.payloads.len(), 2);
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&path, &s2])
+    );
+
+    // Damaged state: quarantined (no upload that day), then reset at the
+    // files' current ends. The acknowledged upload is sent again, marked
+    // with the reset date, and no history is read again.
+    let scope_id = sha256_hex(&[cwd.as_str()]);
+    fs::write(scope_path(&env.state, Source::Claude, &scope_id), b"{}").unwrap();
+    append_records(&path, &claude_turn(&cwd, day, 3));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(2),
+        Some(&mut capture),
+    );
+    assert_eq!(stats.scopes_quarantined, 1);
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    assert_eq!(capture.payloads.len(), 2);
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(3),
+        Some(&mut capture),
+    );
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    assert_eq!(capture.payloads.len(), 3);
+    let ymd = |date: Date| super::super::measure::date_ymd(date);
+    let reset_at = ymd((now + time::Duration::days(2)).date());
+    assert_eq!(capture.payloads[2]["history_reset_at"], reset_at);
+
+    // After the reset a new session is read in full again, and only its
+    // day is sent.
+    let next = day + time::Duration::days(4);
+    let s3 = env.root.join("p/s3.jsonl");
+    write_records(&s3, &claude_turn(&cwd, next, 4));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(4),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.checkpoint_restarts
+        ),
+        (fs::metadata(&s3).unwrap().len(), 0, 0)
+    );
+    assert_eq!(capture.payloads.len(), 4);
+    assert_eq!(capture.payloads[3]["history_reset_at"], reset_at);
+    let dates: BTreeSet<String> = capture.payloads[3]["daily_aggregates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|row| row["date"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(dates, BTreeSet::from([ymd(next)]));
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&s3));
+    env.cleanup();
+}
+
+#[test]
+fn file_created_after_install_is_read_in_full_and_once_after_a_crash() {
+    let env = Env::new("composition-v2-new-after-install");
+    let now = base_now();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    write_records(&a, &claude_turn(&cwd, now.date(), 1));
+    env.run(Source::Claude, now, None);
+
+    let day2 = now + time::Duration::days(1);
+    let b = env.root.join("p/b.jsonl");
+    write_records(&b, &claude_turn(&cwd, day2.date(), 2));
+    let stats = env.run(Source::Claude, day2, None);
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.checkpoint_restarts,
+            stats.dormant_found
+        ),
+        (fs::metadata(&b).unwrap().len(), 0, 0, 0)
+    );
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&a, &b])
+    );
+
+    // The run that first reads a new file commits its scope, then stops
+    // before saving its pins.
+    let day3 = now + time::Duration::days(2);
+    let c = env.root.join("p/c.jsonl");
+    write_records(&c, &claude_turn(&cwd, day3.date(), 3));
+    harvest::tests::set_crash_after(Some(1));
+    let stats = env.run(Source::Claude, day3, None);
+    harvest::tests::set_crash_after(None);
+    assert_eq!(stats.scopes_committed, 1);
+    assert_eq!(stats.bytes_new, fs::metadata(&c).unwrap().len());
+    let counted = v2_rows(&env.scope(Source::Claude).agg);
+    assert_eq!(counted, whole_rows_of(&[&a, &b, &c]));
+    // The committed checkpoint wins over the missing pin: nothing is read
+    // twice, and nothing restarts.
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.checkpoint_restarts
+        ),
+        (0, 0, 0)
+    );
+    assert_eq!(v2_rows(&env.scope(Source::Claude).agg), counted);
+    let more = claude_turn(&cwd, (now + time::Duration::days(4)).date(), 4);
+    append_records(&c, &more);
+    let stats = env.run(Source::Claude, now + time::Duration::days(4), None);
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.checkpoint_restarts
+        ),
+        (body(&more).len() as u64, 0, 0)
+    );
+    assert_eq!(
+        v2_rows(&env.scope(Source::Claude).agg),
+        whole_rows_of(&[&a, &b, &c])
+    );
+    env.cleanup();
+}
+
+#[test]
 fn changed_days_upload() {
     let env = Env::new("composition-v2-upload");
     let now = base_now();
@@ -1445,8 +1611,6 @@ fn changed_days_upload() {
     let cwd = env.cwd();
     let path = env.root.join("p/s.jsonl");
     write_records(&path, &claude_turn(&cwd, day, 1));
-    write_records(&env.root.join("p/s2.jsonl"), &[]);
-    write_records(&env.root.join("p/s3.jsonl"), &[]);
     let mut capture = Capture::default();
     env.run(Source::Claude, now, Some(&mut capture));
     assert_eq!(capture.payloads.len(), 1);
@@ -1978,12 +2142,6 @@ fn idle_checkpoints_go_cold_and_a_cold_rewrite_restarts_at_its_end() {
     let mut records = claude_turn(&cwd, day, 1);
     records.extend(claude_read_turn(&cwd, day, 2, &file));
     write_records(&idle, &records);
-    let same_shard = (0..10_000)
-        .map(|n| format!("other{n}.jsonl"))
-        .find(|key| super::scope::shard_id(key) == super::scope::shard_id("idle.jsonl"))
-        .unwrap();
-    let other = env.root.join("p").join(same_shard);
-    write_records(&other, &[]);
     env.run(Source::Claude, now, None);
     let first = env.scope(Source::Claude);
     assert!(first
@@ -2002,6 +2160,11 @@ fn idle_checkpoints_go_cold_and_a_cold_rewrite_restarts_at_its_end() {
     // file unchanged for over two days) goes cold: its totals stay, its
     // share is dropped, and it still counts as a session that read the file.
     let later = now + time::Duration::days(13);
+    let same_shard = (0..10_000)
+        .map(|n| format!("other{n}.jsonl"))
+        .find(|key| super::scope::shard_id(key) == super::scope::shard_id("idle.jsonl"))
+        .unwrap();
+    let other = env.root.join("p").join(same_shard);
     write_records(
         &other,
         &as_session(claude_read_turn(&cwd, later.date(), 3, &file), "s2"),
@@ -2282,7 +2445,6 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
         };
         run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
     };
-    write_records(&root.join("p/task.jsonl"), &[]);
     run(now);
     // Between two daily runs: a worktree is created, used and removed; an
     // hourly wake sees it while it exists.
@@ -2311,7 +2473,7 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     );
     let stats = run(next);
     assert_eq!((stats.unscoped, stats.scan_errors), (0, 0));
-    assert!(stats.bytes_new + stats.bytes_repair > 0);
+    assert!(stats.bytes_new > 0);
     let index = read_index(&state, Source::Claude);
     assert_eq!(index.scope_info.len(), 1);
     let scope_id = index.files["main.jsonl"].scope.clone().unwrap();
@@ -2381,8 +2543,6 @@ fn resume_of_a_dormant_file_adds_residency_only_to_copied_days() {
         .unwrap()
         .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600))
         .unwrap();
-    let resumed = env.root.join("p/resumed.jsonl");
-    write_records(&resumed, &[]);
     let stats = env.run(Source::Claude, now, None);
     assert_eq!(
         stats.bytes_new + stats.bytes_repair,
@@ -2391,6 +2551,7 @@ fn resume_of_a_dormant_file_adds_residency_only_to_copied_days() {
     );
     // A resume after install copies the old records (same ids and times).
     let next = now + time::Duration::days(1);
+    let resumed = env.root.join("p/resumed.jsonl");
     let mut records = claude_turn(&cwd, old_day, 1);
     records.extend(claude_turn(&cwd, next.date(), 2));
     write_records(&resumed, &records);
@@ -2431,16 +2592,6 @@ fn failed_scoping_is_retried_and_unscoped_files_wait_for_a_change() {
         &env.root.join("p/a.jsonl"),
         &claude_turn(&cwd, now.date(), 1),
     );
-    for name in ["b", "nowhere"] {
-        let path = env.root.join(format!("p/{name}.jsonl"));
-        write_records(&path, &[]);
-        File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_modified(std::time::SystemTime::now() - Duration::from_secs(40 * 24 * 3600))
-            .unwrap();
-    }
     env.run(Source::Claude, now, None);
     // A new file in another folder whose scoping fails once.
     let other = env.workspace.join("other");
@@ -3361,7 +3512,7 @@ fn tokens_of(paths: &[&Path], records: &[Value]) -> u64 {
 }
 
 #[test]
-fn unmodified_shard_is_verified_but_not_rewritten() {
+fn unmodified_shard_is_not_rewritten() {
     let env = Env::new("composition-untouched-shard");
     let now = base_now();
     let a = env.root.join("p/a.jsonl");
@@ -3385,6 +3536,43 @@ fn unmodified_shard_is_verified_but_not_rewritten() {
     assert_eq!(stats.bad_state, 0);
     assert_eq!(fs::read(&shard).unwrap(), saved);
     assert_eq!(fs::metadata(&shard).unwrap().modified().unwrap(), modified);
+    env.cleanup();
+}
+
+/// Only the shards a run reads are checked. Damage in an untouched shard
+/// is found when a read first loads it, before anything is read.
+#[test]
+fn damaged_untouched_shard_is_found_when_first_loaded() {
+    let env = Env::new("composition-untouched-shard-damage");
+    let now = base_now();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    assert_ne!(
+        super::scope::shard_id("a.jsonl"),
+        super::scope::shard_id("b.jsonl")
+    );
+    for path in [&a, &b] {
+        write_records(path, &claude_turn(&env.cwd(), now.date(), 1));
+    }
+    env.run(Source::Claude, now, None);
+    let manifest = manifest_of(&env, &env.cwd());
+    damage_shard(&manifest, "a.jsonl", "truncated");
+    let more = claude_turn(&env.cwd(), now.date(), 2);
+    append_records(&b, &more);
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.bad_state, 0);
+    assert_eq!(stats.bytes_new, body(&more).len() as u64);
+    append_records(&a, &claude_turn(&env.cwd(), now.date(), 3));
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (
+            stats.bad_state,
+            stats.scopes_quarantined,
+            stats.files_quarantined
+        ),
+        (1, 1, 2)
+    );
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
     env.cleanup();
 }
 
@@ -3893,7 +4081,6 @@ fn bad_unchanged_scope_on_due_upload_is_quarantined_and_counted() {
         "missing_totals",
         "malformed_totals",
         "unknown_totals_id",
-        "missing_shard",
     ] {
         let env = Env::new(&format!("composition-upload-reset-{damage}"));
         let now = base_now();
@@ -3902,11 +4089,7 @@ fn bad_unchanged_scope_on_due_upload_is_quarantined_and_counted() {
         let mut capture = Capture::default();
         env.run(Source::Claude, now, Some(&mut capture));
         let manifest = manifest_of(&env, &env.cwd());
-        if damage == "missing_shard" {
-            damage_shard(&manifest, "a.jsonl", "missing");
-        } else {
-            damage_scope_state(&manifest, damage);
-        }
+        damage_scope_state(&manifest, damage);
         let stats = env.run(
             Source::Claude,
             now + time::Duration::days(8),
@@ -3925,6 +4108,71 @@ fn bad_unchanged_scope_on_due_upload_is_quarantined_and_counted() {
         assert_eq!(capture.payloads.len(), 1);
         env.cleanup();
     }
+}
+
+/// A due upload is built from the totals alone (their hash is checked); a
+/// damaged shard is found and counted when a read first loads it.
+#[test]
+fn due_upload_sends_verified_totals_and_shard_damage_waits_for_a_read() {
+    let env = Env::new("composition-upload-shard-damage");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    let mut capture = Capture::default();
+    env.run(Source::Claude, now, Some(&mut capture));
+    let manifest = manifest_of(&env, &env.cwd());
+    damage_shard(&manifest, "a.jsonl", "missing");
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(8),
+        Some(&mut capture),
+    );
+    assert_eq!((stats.bad_state, stats.uploaded), (0, 1));
+    assert_eq!(capture.payloads.len(), 2);
+    append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
+    let stats = env.run(
+        Source::Claude,
+        now + time::Duration::days(9),
+        Some(&mut capture),
+    );
+    assert_eq!(
+        (
+            stats.bad_state,
+            stats.scopes_quarantined,
+            stats.files_quarantined
+        ),
+        (1, 1, 1)
+    );
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    env.cleanup();
+}
+
+#[test]
+fn reset_scope_whose_files_are_gone_commits_empty() {
+    let env = Env::new("composition-reset-gone");
+    let now = base_now();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&env.cwd(), now.date(), 1));
+    env.run(Source::Claude, now, None);
+    let manifest = manifest_of(&env, &env.cwd());
+    damage_scope_state(&manifest, "bad_manifest");
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(stats.scopes_quarantined, 1);
+    fs::remove_file(&path).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(stats.scopes_committed, 1);
+    let index = read_index(&env.state, Source::Claude);
+    assert!(index.quarantined_scopes.is_empty());
+    let scope = env.scope(Source::Claude);
+    assert_eq!(
+        scope.history_reset_at,
+        Some(day_of((now + time::Duration::days(1)).date()))
+    );
+    assert_eq!(total_tokens(&scope.agg), 0);
+    // Applied: later runs neither count nor commit the reset again.
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!((stats.scopes_quarantined, stats.scopes_committed), (0, 0));
+    env.cleanup();
 }
 
 #[test]
@@ -3977,6 +4225,14 @@ fn lost_or_bad_index_resets_the_agent_even_with_a_damaged_scope() {
     }
 }
 
+/// Pins lost from a valid index, for files that existed when its last scan
+/// started. Test runs use clocks days behind the files' real birth times,
+/// so the scan start is moved past them.
+fn lose_pins_of_files_seen_by_the_last_scan(index: &mut Index) {
+    index.files.clear();
+    index.last_scan_started = Some(OffsetDateTime::now_utc().unix_timestamp() + 1);
+}
+
 #[test]
 fn missing_pin_never_authorizes_history_reads() {
     let env = Env::new("composition-missing-pin");
@@ -3988,7 +4244,7 @@ fn missing_pin_never_authorizes_history_reads() {
     let mut index = read_index(&env.state, Source::Claude);
     append_records(&a, &claude_turn(&env.cwd(), now.date(), 2));
     let before = total_tokens(&env.scope(Source::Claude).agg);
-    index.files.clear();
+    lose_pins_of_files_seen_by_the_last_scan(&mut index);
     super::checkpoint::write_json(&path, &index).unwrap();
     let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
     assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
@@ -4013,7 +4269,7 @@ fn missing_pin_never_authorizes_history_reads() {
 
 #[test]
 fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
-    for phase in ["input", "work", "protocol", "crash"] {
+    for phase in ["input", "work", "protocol", "crash", "locked"] {
         let dir = scratch(&format!("composition-worker-{phase}"));
         let pid_file = dir.join("pid");
         let mut command = std::process::Command::new("/bin/sh");
@@ -4023,6 +4279,9 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
                 "input" => "echo $$ > \"$1\"; exec sleep 60",
                 "work" => "echo $$ > \"$1\"; cat >/dev/null; exec sleep 60",
                 "protocol" => "echo $$ > \"$1\"; cat >/dev/null; echo malformed",
+                // Lock busy: exits before reading its input, so the large
+                // write fails; the exit status still decides.
+                "locked" => "echo $$ > \"$1\"; exit 75",
                 _ => "echo $$ > \"$1\"; exit 7",
             })
             .arg("fixture")
@@ -4032,10 +4291,10 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
             &"x".repeat(1024 * 1024),
             Duration::from_millis(250),
         );
-        let expected = if ["input", "work"].contains(&phase) {
-            harvest::WorkerError::Timeout
-        } else {
-            harvest::WorkerError::Failed
+        let expected = match phase {
+            "input" | "work" => harvest::WorkerError::Timeout,
+            "locked" => harvest::WorkerError::Locked,
+            _ => harvest::WorkerError::Failed,
         };
         assert_eq!(
             result.unwrap_err().downcast_ref::<harvest::WorkerError>(),
@@ -4046,6 +4305,14 @@ fn worker_timeout_covers_blocked_stdin_and_work_and_reaps() {
             .trim()
             .parse()
             .unwrap();
+        // The worker is reaped by its own thread, never by the caller:
+        // once gone, it is not left as a zombie.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        // SAFETY: kill with signal 0 only probes the fixture pid.
+        while unsafe { libc::kill(pid, 0) } == 0 {
+            assert!(Instant::now() < deadline, "{phase}: worker not reaped");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let mut status = 0;
         // SAFETY: waitpid and kill receive a fixture pid and a valid status pointer.
         assert_eq!(
@@ -4069,6 +4336,9 @@ fn composition_lock_fixture() {
     };
     let dir = PathBuf::from(dir);
     if let Some(parent_ready) = std::env::var_os("COMPOSITION_LOCK_PARENT") {
+        // This parent is killed on purpose: its orphaned child is the
+        // worker under test.
+        #[allow(clippy::zombie_processes)]
         let child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -4087,6 +4357,10 @@ fn composition_lock_fixture() {
     let Some(_lock) = harvest::lock_state(&dir).unwrap() else {
         std::process::exit(75);
     };
+    if let Some(ms) = std::env::var_os("COMPOSITION_LOCK_WATCHDOG_MS") {
+        let ms = ms.to_str().unwrap().parse().unwrap();
+        harvest::start_watchdog(Duration::from_millis(ms));
+    }
     fs::write(dir.join("held"), std::process::id().to_string()).unwrap();
     std::thread::sleep(Duration::from_secs(60));
 }
@@ -4134,6 +4408,36 @@ fn worker_lock_excludes_a_second_process_and_survives_parent_death() {
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(10));
     }
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn hung_orphaned_worker_exits_at_its_cap_and_frees_the_lock() {
+    let dir = scratch("composition-worker-watchdog");
+    let started = Instant::now();
+    let mut worker = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "context_composition::v2::tests::composition_lock_fixture",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("COMPOSITION_LOCK_DIR", &dir)
+        .env("COMPOSITION_LOCK_WATCHDOG_MS", "2000")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !dir.join("held").exists() {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(harvest::lock_state(&dir).unwrap().is_none());
+    // The fixture would sleep for a minute; its watchdog stops it first.
+    let status = worker.wait().unwrap();
+    assert_eq!(status.code(), Some(harvest::WORKER_WATCHDOG_EXIT));
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert!(harvest::lock_state(&dir).unwrap().is_some());
     fs::remove_dir_all(dir).unwrap();
 }
 
@@ -4281,7 +4585,7 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
     env.run(Source::Claude, now, None);
     let before = total_tokens(&env.scope(Source::Claude).agg);
     let mut index = read_index(&env.state, Source::Claude);
-    index.files.clear();
+    lose_pins_of_files_seen_by_the_last_scan(&mut index);
     super::checkpoint::write_json(&harvest::index_path(&env.state, Source::Claude), &index)
         .unwrap();
     env.run(Source::Claude, now + time::Duration::days(1), None);

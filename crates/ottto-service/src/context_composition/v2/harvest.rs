@@ -12,10 +12,13 @@
 //!
 //! First run (no pins yet) is forward-only: files modified in the last
 //! `LIVE_AT_INSTALL` are read once from their start within the repair
-//! budget; every other file starts at its current size. That discovery is
-//! saved before any scope commits, so a crashed first run resumes it. Later,
-//! a file with no pin starts at its current size; missing pins never
-//! authorize another initial read.
+//! budget; every other file starts at its current size. An install record is
+//! saved before any scope commits. If the first run stops before its pins
+//! are saved, the next run finds the record without pins and resets the
+//! agent forward-only (counted): the history live at install is then never
+//! measured. Later, a file with no pin that was born after the last saved
+//! scan started is new and read from its start; any other file with no pin
+//! (or no known birth time) starts at its current size, counted.
 //!
 //! Bad state is quarantined and counted. On a later run its files restart
 //! at their current ends; no prior generation or transcript history is replayed.
@@ -131,6 +134,15 @@ pub(super) fn write_worker_reply(reply: &impl Serialize) -> Result<()> {
     Ok(())
 }
 
+/// The whole parent/worker exchange is bounded by the scan cap plus a
+/// margin. The worker enforces the same cap on itself, so a worker whose
+/// parent died still exits and frees the state lock.
+pub(super) const WORKER_CAP: std::time::Duration =
+    std::time::Duration::from_secs(RUN_WALL_CAP.as_secs() + 5 * 60);
+
+/// Exit status of a worker stopped by its own watchdog.
+pub(super) const WORKER_WATCHDOG_EXIT: i32 = 70;
+
 /// Wait for process exit before returning any hourly metadata. System malloc
 /// can retain free pages even after thread exit and pressure relief; process
 /// teardown releases those pages without changing the daemon's allocator.
@@ -138,11 +150,7 @@ pub(super) fn run_worker_process<I: Serialize, O: DeserializeOwned>(
     command: &mut Command,
     input: &I,
 ) -> Result<O> {
-    run_worker_process_timeout(
-        command,
-        input,
-        RUN_WALL_CAP + std::time::Duration::from_secs(5 * 60),
-    )
+    run_worker_process_timeout(command, input, WORKER_CAP)
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -158,12 +166,19 @@ impl std::fmt::Display for WorkerError {
 }
 impl std::error::Error for WorkerError {}
 
+enum WorkerEvent {
+    Wrote(std::io::Result<()>),
+    Output(std::io::Result<Vec<u8>>),
+    Exited(std::io::Result<std::process::ExitStatus>),
+}
+
 pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
     command: &mut Command,
     input: &I,
     timeout: std::time::Duration,
 ) -> Result<O> {
     use std::io::{Read, Write};
+    use std::sync::mpsc::RecvTimeoutError;
     let deadline = Instant::now() + timeout;
     let bytes = serde_json::to_vec(input)?;
     #[cfg(unix)]
@@ -175,6 +190,7 @@ pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
+    let pid = child.id();
     let mut stdin = child.stdin.take().expect("piped worker input");
     let stdout = child.stdout.take().expect("piped worker output");
     let (send, recv) = std::sync::mpsc::channel();
@@ -182,8 +198,9 @@ pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
     let writer = std::thread::spawn(move || {
         let result = stdin.write_all(&bytes);
         drop(stdin);
-        let _ = send_input.send(result.map(|()| None));
+        let _ = send_input.send(WorkerEvent::Wrote(result));
     });
+    let send_output = send.clone();
     let reader = std::thread::spawn(move || {
         let mut bytes = Vec::new();
         let result = stdout.take(16 * 1024 * 1024 + 1).read_to_end(&mut bytes);
@@ -191,37 +208,33 @@ pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
             if bytes.len() > 16 * 1024 * 1024 {
                 Err(std::io::Error::other("worker reply too large"))
             } else {
-                Ok(Some(bytes))
+                Ok(bytes)
             }
         });
-        let _ = send.send(result);
+        let _ = send_output.send(WorkerEvent::Output(result));
+    });
+    // The only thread that waits for the worker: a kill never leaves the
+    // scheduler blocked on a process stuck in the file system.
+    let reaper = std::thread::spawn(move || {
+        let _ = send.send(WorkerEvent::Exited(child.wait()));
     });
     let exchange = (|| -> Result<O> {
-        let mut status = None;
-        let mut output = None;
-        let mut wrote = false;
+        let mut status: Option<std::process::ExitStatus> = None;
+        let mut wrote: Option<std::io::Result<()>> = None;
+        let mut output: Option<std::io::Result<Vec<u8>>> = None;
         loop {
-            if Instant::now() >= deadline {
-                return Err(WorkerError::Timeout.into());
-            }
-            while let Ok(result) = recv.try_recv() {
-                match result.map_err(|_| WorkerError::Failed)? {
-                    Some(bytes) => output = Some(bytes),
-                    None => wrote = true,
-                }
-            }
-            if status.is_none() {
-                status = child.try_wait()?;
-            }
-            if let Some(status) = status {
+            // The exit status decides first: a worker that found the lock
+            // busy exits before reading its input, so the write may fail.
+            if let Some(status) = &status {
                 if status.code() == Some(75) {
                     return Err(WorkerError::Locked.into());
                 }
                 if !status.success() {
                     return Err(WorkerError::Failed.into());
                 }
-                if wrote {
-                    if let Some(bytes) = &output {
+                match (&wrote, &output) {
+                    (Some(Err(_)), _) | (_, Some(Err(_))) => return Err(WorkerError::Failed.into()),
+                    (Some(Ok(())), Some(Ok(bytes))) => {
                         let reply = bytes
                             .split(|b| *b == b'\n')
                             .rev()
@@ -230,27 +243,51 @@ pub(super) fn run_worker_process_timeout<I: Serialize, O: DeserializeOwned>(
                         return serde_json::from_slice(reply)
                             .map_err(|_| WorkerError::Failed.into());
                     }
+                    _ => {}
                 }
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            let left = deadline.saturating_duration_since(Instant::now());
+            match recv.recv_timeout(left) {
+                Ok(WorkerEvent::Wrote(result)) => wrote = Some(result),
+                Ok(WorkerEvent::Output(result)) => output = Some(result),
+                Ok(WorkerEvent::Exited(result)) => {
+                    status = Some(result.map_err(|_| WorkerError::Failed)?)
+                }
+                Err(RecvTimeoutError::Timeout) => return Err(WorkerError::Timeout.into()),
+                Err(RecvTimeoutError::Disconnected) => return Err(WorkerError::Failed.into()),
+            }
         }
     })();
+    if exchange.is_ok() {
+        let _ = writer.join();
+        let _ = reader.join();
+        let _ = reaper.join();
+        return exchange;
+    }
     // Kill the private process group as well: a child holding a pipe must
-    // not keep either I/O thread alive after timeout or protocol failure.
+    // not keep either I/O thread alive. The reaper thread collects the
+    // worker; none of these threads is joined here.
     #[cfg(unix)]
-    if exchange.is_err() {
-        // SAFETY: this child was started in its own process group.
-        unsafe {
-            libc::kill(-(child.id() as i32), libc::SIGKILL);
-        }
+    // SAFETY: this child was started in its own process group.
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
     }
-    if exchange.is_err() {
-        let _ = child.kill();
-    }
-    let _ = child.wait();
-    let _ = writer.join();
-    let _ = reader.join();
+    #[cfg(not(unix))]
+    let _ = pid;
+    drop((writer, reader, reaper));
     exchange
+}
+
+/// Stop this worker after `cap` even when its scan is stuck, so an orphaned
+/// worker cannot hold the state lock forever.
+pub(super) fn start_watchdog(cap: std::time::Duration) {
+    let _ = std::thread::Builder::new()
+        .name("ottto-context-composition-watchdog".to_string())
+        .spawn(move || {
+            std::thread::sleep(cap);
+            eprintln!("context_composition_v2_metrics source=worker worker_watchdog=1");
+            std::process::exit(WORKER_WATCHDOG_EXIT);
+        });
 }
 
 /// The OS releases this exclusive lease even if the parent or worker dies.
@@ -294,6 +331,7 @@ pub fn run_context_composition_worker() -> Result<()> {
         eprintln!("context_composition_v2_metrics source=worker worker_lock_busy=1");
         std::process::exit(75);
     };
+    start_watchdog(WORKER_CAP);
     let mut worktrees: WorktreeCache = serde_json::from_reader(std::io::stdin().lock())?;
     let home = crate::snapshot_sync::home_dir()?;
     if !local_harvest_disabled(&support_dir) {
@@ -717,9 +755,10 @@ struct Found {
     identity: (u64, u64),
     size: u64,
     stamp: Stamp,
-    /// Birth time, else modification time: decides whether a file is new.
+    /// Birth time, else modification time: orders a scope's reads.
     birth: i64,
-    /// Birth time where the file system records one.
+    /// Birth time where the file system records one: decides whether a
+    /// file with no pin is new.
     born: Option<i64>,
 }
 
@@ -926,25 +965,52 @@ fn reconcile_pins(
             continue;
         }
         for (key, checkpoint) in scope.files {
-            if let Some(pin) = index.files.get_mut(&key) {
-                pin.scope = Some(scope_id.clone());
-                // Even an equal offset can be an old checkpoint retained
-                // after a failed reset. Only a successful reset read and
-                // its final index write clear this conservative decision.
-                if pin.restart_at_end {
-                    continue;
-                }
-                pin.dev = checkpoint.dev;
-                pin.ino = checkpoint.ino;
-                pin.path = checkpoint.path.clone();
-                pin.start = checkpoint.offset;
-                pin.size = checkpoint.size;
-                pin.mtime = checkpoint.mtime;
-                pin.head = checkpoint.head;
-                pin.tail = checkpoint.tail;
-                pin.waiting = false;
+            let Some(pin) = index.files.get_mut(&key) else {
+                // Committed by a run that stopped before saving its pins:
+                // reading goes on from the checkpoint, in this scope.
+                index.files.insert(
+                    key,
+                    Pin {
+                        path: checkpoint.path.clone(),
+                        dev: checkpoint.dev,
+                        ino: checkpoint.ino,
+                        scope: Some(scope_id.clone()),
+                        start: checkpoint.offset,
+                        size: checkpoint.size,
+                        mtime: checkpoint.mtime,
+                        waiting: false,
+                        done: checkpoint.status == Status::Done,
+                        last_seen: checkpoint.last_seen,
+                        first_seen: checkpoint.created,
+                        unscoped: false,
+                        failures: 0,
+                        quarantined: false,
+                        restart_at_end: false,
+                        head: checkpoint.head,
+                        tail: checkpoint.tail,
+                        origin: checkpoint.origin,
+                    },
+                );
                 rebuilt += 1;
+                continue;
+            };
+            pin.scope = Some(scope_id.clone());
+            // Even an equal offset can be an old checkpoint retained
+            // after a failed reset. Only a successful reset read and
+            // its final index write clear this conservative decision.
+            if pin.restart_at_end {
+                continue;
             }
+            pin.dev = checkpoint.dev;
+            pin.ino = checkpoint.ino;
+            pin.path = checkpoint.path.clone();
+            pin.start = checkpoint.offset;
+            pin.size = checkpoint.size;
+            pin.mtime = checkpoint.mtime;
+            pin.head = checkpoint.head;
+            pin.tail = checkpoint.tail;
+            pin.waiting = false;
+            rebuilt += 1;
         }
         if !scope.info.workspace_path.is_empty() {
             index
@@ -1045,7 +1111,6 @@ fn run_source_inner(
             &InstallRecord {
                 schema: STATE_SCHEMA,
                 cutoff: now_secs,
-                ..Default::default()
             },
         )
         .is_err()
@@ -1056,6 +1121,11 @@ fn run_source_inner(
     } else if valid {
         stats.pins_rebuilt = reconcile_pins(run, source, &mut index, today, &mut stats);
     }
+    // The start of the last scan whose pins were saved. A file born at or
+    // after it did not exist then, so none of its bytes can have been
+    // counted from these pins; a checkpoint a later crashed run committed
+    // for it is adopted by reconciliation or read on from its offset.
+    let previous_scan = index.last_scan_started.filter(|_| valid);
     index.last_scan_started = Some(now_secs);
 
     // Discovery: pick one copy per key and decide what needs reading.
@@ -1097,9 +1167,17 @@ fn run_source_inner(
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
-                let new = first_run && now_secs - file.stamp.0 <= LIVE_AT_INSTALL.as_secs() as i64;
+                // Live at install: read once from its start within the
+                // repair budget. Born after the last saved scan: new bytes.
+                // An unknown birth time is never taken as new.
+                let live = first_run && now_secs - file.stamp.0 <= LIVE_AT_INSTALL.as_secs() as i64;
+                let born_later = file
+                    .born
+                    .zip(previous_scan)
+                    .is_some_and(|(born, last)| born >= last);
+                let new = live || born_later;
                 let start = if new { 0 } else { file.size };
-                let waiting = new;
+                let waiting = live;
                 if !new {
                     stats.dormant_found += 1;
                     if !first_run && !agent_reset {
@@ -1124,7 +1202,7 @@ fn run_source_inner(
                         unscoped: false,
                         failures: 0,
                         quarantined: false,
-                        restart_at_end: !first_run,
+                        restart_at_end: !first_run && !new,
                         head: Default::default(),
                         tail: Default::default(),
                         origin: Some(start),
@@ -1179,22 +1257,12 @@ fn run_source_inner(
         }
     }
     if first_run {
-        // Saved before any scope can commit: a crash later in this run
-        // resumes from this discovery instead of the restart time.
+        // Saved before any scope can commit. Only its presence is used: a
+        // crash before this run saves its pins becomes an agent reset, never
+        // a second installation.
         let record = InstallRecord {
             schema: STATE_SCHEMA,
             cutoff: now_secs,
-            starts: index
-                .files
-                .iter()
-                .map(|(key, pin)| (key.clone(), pin.start))
-                .collect(),
-            live: index
-                .files
-                .iter()
-                .filter(|(_, pin)| pin.waiting)
-                .map(|(key, _)| key.clone())
-                .collect(),
         };
         if write_packed(&install_file, &record).is_err() {
             // Nothing is read without it; the first run starts again on a
@@ -1302,6 +1370,7 @@ fn run_source_inner(
         }
     }
     let mut reset_prepared = false;
+    let mut resetting = Vec::new();
     for (scope_id, day) in pending {
         let path = scope_path(&run.state_dir, source, &scope_id);
         #[derive(Deserialize)]
@@ -1346,6 +1415,7 @@ fn run_source_inner(
             index.files.get(&item.key).and_then(|p| p.scope.as_deref()) != Some(&scope_id)
         });
         reset_prepared = true;
+        resetting.push(scope_id.clone());
         for (key, pin) in &mut index.files {
             if pin.scope.as_deref() != Some(&scope_id) {
                 continue;
@@ -1403,6 +1473,11 @@ fn run_source_inner(
             .and_then(|pin| pin.scope.clone())
             .unwrap_or_default();
         by_scope.entry(scope).or_default().push(item);
+    }
+    // A reset scope whose files are all gone still commits (empty), so its
+    // reset is applied and never stays pending.
+    for scope in resetting {
+        by_scope.entry(scope).or_default();
     }
     let mut order: Vec<(Stamp, String)> = by_scope
         .iter()
@@ -1638,17 +1713,7 @@ fn process_scope(
         let known = index.scope_generations.contains_key(scope_id)
             || path.with_extension("committed").exists();
         match load_scope(&path, source, scope_id) {
-            Ok(Some(mut scope)) => {
-                if !scope
-                    .verify_shards(&path, scope.shards.keys().copied().collect::<Vec<_>>())
-                    .is_empty()
-                {
-                    stats.bad_state += 1;
-                    quarantine_scope(run, source, scope_id, &path, index, today, stats);
-                    return None;
-                }
-                scope
-            }
+            Ok(Some(scope)) => scope,
             Ok(None) if !known => {
                 forget_upload(&run.state_dir, source, scope_id);
                 Scope::new(scope_id, info)
@@ -1674,6 +1739,16 @@ fn process_scope(
         let id = shard_id(&key);
         groups.entry(id).or_default();
         legacy_groups.entry(id).or_default().insert(key, checkpoint);
+    }
+    // The shards read now are checked before anything is read. An untouched
+    // shard keeps its reference; it is checked when it is first loaded.
+    if !scope
+        .verify_shards(&path, groups.keys().copied().collect::<Vec<_>>())
+        .is_empty()
+    {
+        stats.bad_state += 1;
+        quarantine_scope(run, source, scope_id, &path, index, today, stats);
+        return None;
     }
     let mut removed = Vec::new();
     let mut added = Vec::new();
@@ -2000,6 +2075,11 @@ fn read_file(
                 stats.cold_restarted += 1;
                 mode = Mode::RestartAtEnd;
             } else if rewritten {
+                // Repair, not recovery: a file rewritten in place is read
+                // again from its start within the daily repair budget
+                // (counted in `bytes_repair`), and the read replaces the
+                // file's own share. Cold files and reset state never take
+                // this path.
                 mode = grant(run, stats, size);
                 if mode == Mode::Forward {
                     return Ok(Some(Outcome::Waiting));
@@ -2231,19 +2311,11 @@ fn upload_other_scopes(
             continue;
         }
         let path = scope_path(&run.state_dir, source, scope_id);
+        // An upload is built from the totals, whose hash `load_scope`
+        // checks; shards are checked when a read first loads them.
         let loaded = load_scope(&path, source, scope_id);
         let mut scope = match loaded {
-            Ok(Some(mut scope)) => {
-                if !scope
-                    .verify_shards(&path, scope.shards.keys().copied().collect::<Vec<_>>())
-                    .is_empty()
-                {
-                    stats.bad_state += 1;
-                    quarantine_scope(run, source, scope_id, &path, index, window.today, stats);
-                    continue;
-                }
-                scope
-            }
+            Ok(Some(scope)) => scope,
             _ => {
                 stats.bad_state += 1;
                 quarantine_scope(run, source, scope_id, &path, index, window.today, stats);
