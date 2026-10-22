@@ -12,6 +12,8 @@ use sampled_scan::codex_cursor::{Limits, OpenStamp, PageBudget, ProofJob, ProofL
 const CODEX_PROOF_VISIT_KEYS: usize = 64;
 /// The head and at most three later due children of the head's parent.
 const CODEX_PROOF_BATCH: usize = 4;
+// A retired job keeps every entry's `seq` (owner note 3).
+const _: () = assert!(CODEX_PROOF_BATCH <= sampled_scan::codex_cursor::RETIRED_PROOF_ENTRIES);
 
 /// What a visit hands the hook.
 #[derive(Debug, Default)]
@@ -130,21 +132,33 @@ pub(super) fn codex_parent_proof_step(
     // Owner note 3 (r79): a job of this index that main retired (or another
     // index dropped) while suspended backs every entry off before the visit,
     // so main's retirements pace restarts instead of repeating them.
-    for (key, seq) in
+    let retired =
         context
             .cache
-            .take_retired_proof_entries(&context.namespace, &pass.index_path, &incarnation)
-    {
-        index.finish_codex_parent_proof_entry(
-            &key,
-            seq,
-            &incarnation,
-            ProofFinish::Attempt {
-                outcome: ProofOutcome::MemoryRefused,
-                wake: ProofWake::Backoff,
-            },
-            now,
-        );
+            .take_retired_proof_seqs(&context.namespace, &pass.index_path, &incarnation);
+    if !retired.is_empty() {
+        let entries = index
+            .codex_parent_prefix_proofs
+            .iter()
+            .filter_map(|(key, state)| match state {
+                CodexParentProofState::Owed(owed) if retired.contains(&owed.seq) => {
+                    Some((key.clone(), owed.seq))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        for (key, seq) in entries {
+            index.finish_codex_parent_proof_entry(
+                &key,
+                seq,
+                &incarnation,
+                ProofFinish::Attempt {
+                    outcome: ProofOutcome::MemoryRefused,
+                    wake: ProofWake::Backoff,
+                },
+                now,
+            );
+        }
     }
     let reserve = codex_proof_step_reserve();
     let mut lease =
