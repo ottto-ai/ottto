@@ -1413,3 +1413,35 @@ fn fe_claude_full_without_h1c_admission_keeps_strict_completion() {
         .commit_claude_grown_prefix(&fixture.0, &scope, 0)
         .is_none());
 }
+
+/// SOURCE exclusion binds the body revision, not just a physical path's
+/// family name. Missing D1 plus a moved physical key cannot let a saved
+/// logical-family witness reconstruct v1 from the same prefix.
+#[test]
+fn fe_claude_prefix_with_different_physical_key_cannot_reconstruct_v1() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let (_verified_fixture, mut verified, verified_result) = quiescent();
+    assert!(mints_v1(&mut verified, &verified_result, 0..9));
+    let mut grown = grown_full();
+    assert_eq!(grown.seen.unreadable, 0);
+    grown.index.claude_usage_family_witnesses = verified.claude_usage_family_witnesses;
+    let moved_key = local_index_key(&grown.base.path.with_file_name("physical-other.jsonl"));
+    let entry = grown.index.files.remove(&grown.base.key).unwrap();
+    assert!(entry.has_unverified_source());
+    assert_eq!(
+        grown.result.snapshots[0].source_file_fingerprint.as_deref(),
+        Some(entry.source_file_fingerprint.as_str())
+    );
+    grown.index.files.insert(moved_key, entry);
+    grown
+        .index
+        .claude_request_census_mut_for_test()
+        .invalidate_keeping_birth_for_test(&grown.base.key);
+    grown.result.census_complete = false;
+    assert!(
+        !mints_v1(&mut grown.index, &grown.result, 0..9),
+        "SOURCE: physical-key drift cannot bypass prefix exclusion"
+    );
+}

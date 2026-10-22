@@ -5572,7 +5572,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     // beyond it may be auxiliary calls, so unequal request sets do NOT fence
     // proof. Explicitly exclude these roots from fresh and reconstructed
     // proofs, witnesses, owned-start/2c and design-E/posture admission.
-    let uncertified_roots = index
+    // Path membership is not a proof binding: a rediscovered/renamed file
+    // can retain a different logical session id. Bind current bodies by the
+    // exact revision that owns the durable unverified marker as well.
+    let uncertified_revisions = index
+        .files
+        .values()
+        .filter(|entry| entry.has_unverified_source())
+        .map(|entry| entry.source_file_fingerprint.as_str())
+        .filter(|revision| !revision.is_empty())
+        .collect::<BTreeSet<_>>();
+    let mut uncertified_roots = index
         .claude_request_census
         .records()
         .filter(|(_, record)| record.unverified_or_twin())
@@ -5587,6 +5597,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         .filter_map(|key| claude_index_path_family_member(Path::new(key)))
         .map(|(root, _)| root)
         .collect::<BTreeSet<_>>();
+    uncertified_roots.extend(
+        snapshots
+            .iter()
+            .filter(|item| {
+                item.source_file_fingerprint
+                    .as_deref()
+                    .is_some_and(|revision| uncertified_revisions.contains(revision))
+            })
+            .map(claude_snapshot_family_root),
+    );
+    drop(uncertified_revisions);
     let complete_families = if census_complete {
         complete_claude_usage_family_members(index)
     } else {

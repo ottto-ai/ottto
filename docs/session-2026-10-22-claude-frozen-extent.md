@@ -26,7 +26,9 @@ cache/curve admission and both strict and file-birth posture admission. API rows
 assigned by traces may legitimately exceed transcript request sets as auxiliary
 calls, so request-set inequality alone is insufficient. Historical witnesses and
 their demotion/hold accounting remain intact, but cannot authorize the prefix.
-Missing D1 records still fail closed through the durable audit marker.
+Missing D1 records still fail closed through the durable audit marker. The
+marker also binds the emitted source-file fingerprint to its logical family,
+so physical-key drift cannot bypass the reconstruction exclusion.
 
 The certificate accepts the append-only sample-preserving interior-rewrite
 residual. The existing quiet full audit repairs the observed body and emits

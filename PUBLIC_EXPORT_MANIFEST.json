@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 783,
-  "content_sha256": "9c630b9dffe1853abcb548b70372ed005075877301ebf99e9159370a72533052",
+  "content_sha256": "ebe6eefc15e7890665ee3470f0dd09adc30df9f612cb90ef6827c435ca759c2d",
   "files": [
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "aeebe447dbd02668dc54f7f1f239b9cbeff9ab99bece65b40cabf86f733676f4",
-      "size_bytes": 3140220
+      "sha256": "336b07d42c40b8a2dbf47c3e61a901d27888110ab317e445ccd4302d9f1b9ca6",
+      "size_bytes": 3141080
     },
     {
       "executable": false,
@@ -1875,8 +1875,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
-      "sha256": "8628d904a38e0a8981967e50eaca4a447b31a49c8081096e4a380379e087e3d5",
-      "size_bytes": 51086
+      "sha256": "da45ee85f5d6a72f17819243dfbe3a575293ffc776e31605a217958a1fbedbf5",
+      "size_bytes": 52478
     },
     {
       "executable": false,
@@ -3702,8 +3702,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-claude-frozen-extent.md",
-      "sha256": "94c780d1f4e69da52791560a35f44924e431d6119373cb8adcbb8610dce2b2c7",
-      "size_bytes": 3221
+      "sha256": "d0352cd5faca1ea409a014009c525810987803a777ed6e3c4ff898c00620e2a6",
+      "size_bytes": 3368
     },
     {
       "executable": false,
