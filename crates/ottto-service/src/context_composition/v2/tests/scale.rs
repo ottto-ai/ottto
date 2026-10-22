@@ -207,7 +207,13 @@ struct Clock {
 impl Clock {
     /// Unix seconds at the end of fixture day `offset`.
     fn end_of(&self, offset: i64) -> i64 {
-        self.now0 + (offset + 1) * 86_400 - 60
+        // Place mtimes on the actual last UTC day, already settled even
+        // when the simulated next-day wake occurs just after midnight.
+        self.day(offset + 1)
+            .midnight()
+            .assume_utc()
+            .unix_timestamp()
+            - 2 * super::super::super::SETTLE_WINDOW.as_secs() as i64
     }
 
     fn day(&self, offset: i64) -> Date {
@@ -918,6 +924,15 @@ fn run_v1(layout: &Layout, now: OffsetDateTime, baseline: u64) {
                         .iter()
                         .any(|scan| scan.files.iter().any(|(path, _)| *path == daily)),
                     "new daily transcripts must be visible to today's v1 discovery"
+                );
+                let mut eligible: Vec<_> = scans
+                    .iter()
+                    .flat_map(|scan| scan.files.iter().cloned())
+                    .collect();
+                retain_settled_files(&mut eligible, now_system, None);
+                assert!(
+                    eligible.iter().any(|(path, _)| *path == daily),
+                    "new daily transcripts must also be settled for today's v1 scan"
                 );
             }
         }
