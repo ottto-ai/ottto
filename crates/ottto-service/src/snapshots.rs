@@ -18977,6 +18977,8 @@ impl OwnedSourceScan {
                 let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
                 let zero_snapshot_usage_evidence = parsed_file.zero_snapshot_usage_evidence;
                 let dropped_usage_record_count = parsed_file.dropped_usage_record_count;
+                let claude_compaction_unlinked_parent_count =
+                    parsed_file.claude_compaction_unlinked_parent_count;
                 if let Some(context) = sampling
                     .as_ref()
                     .filter(|_| source == SnapshotSource::Codex && aliases.is_empty())
@@ -19414,6 +19416,9 @@ impl OwnedSourceScan {
                 census.dropped_usage_record_count = census
                     .dropped_usage_record_count
                     .saturating_add(dropped_usage_record_count);
+                census.claude_compaction_unlinked_parent_count = census
+                    .claude_compaction_unlinked_parent_count
+                    .saturating_add(claude_compaction_unlinked_parent_count);
                 if let Some(loss) = terminal_loss {
                     census.terminal_over_line_cap_count = census
                         .terminal_over_line_cap_count
@@ -19528,19 +19533,21 @@ impl OwnedSourceScan {
                         .saturating_add(census.terminal_dropped_usage_record_count);
                 }
                 if source == SnapshotSource::ClaudeCode
-                    && census.claude_parse_reasons.iter().any(|count| *count > 0)
+                    && (census.claude_parse_reasons.iter().any(|count| *count > 0)
+                        || census.claude_compaction_unlinked_parent_count > 0)
                 {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
                             .zip(census.claude_parse_reasons)
                             .map(|(name, count)| format!("{name}={count}"))
                             .collect::<Vec<_>>()
-                            .join(" ")
+                            .join(" "),
+                        census.claude_compaction_unlinked_parent_count
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -21542,6 +21549,10 @@ struct ParsedJsonlFile {
     ownership_incomplete_file_count: usize,
     zero_snapshot_usage_evidence: bool,
     dropped_usage_record_count: u64,
+    /// Local diagnostic only: Claude compaction summaries that name a
+    /// `parentUuid` whose chain never reached a boundary (each counts as its
+    /// own event). Counted before ownership filtering.
+    claude_compaction_unlinked_parent_count: usize,
     terminal_line_loss_count: usize,
     /// A rollout whose exclusive ownership could not be proven must not fall
     /// through to the inclusive state_5.sqlite tokens_used snapshot.
@@ -21969,6 +21980,17 @@ impl OwnedJsonlParser {
                 }
             }
         }
+        // A new Claude Code record type inside the boundary-to-summary chain
+        // would surface here first, before counts double on the page.
+        let claude_compaction_unlinked_parent_count = accumulator
+            .claude_compaction_observations
+            .iter()
+            .filter(|observation| {
+                observation.kind == ClaudeCompactionKind::LegacySummary
+                    && observation.has_parent_link
+                    && observation.pair_key.is_none()
+            })
+            .count();
         let snapshots = accumulator.into_items(
             path,
             collected_at,
@@ -21997,6 +22019,7 @@ impl OwnedJsonlParser {
             ownership_incomplete_file_count,
             zero_snapshot_usage_evidence,
             dropped_usage_record_count: recognized_usage_drop_count as u64,
+            claude_compaction_unlinked_parent_count,
             terminal_line_loss_count: report.over_line_cap_count,
             state_only_blocked_session_ids,
             codex_parent_session_ref,
@@ -26145,6 +26168,9 @@ struct ScanCensus {
     /// so the census moved through every scan step stays small; allocated
     /// only once a configured counting parse finishes.
     codex_counting_v2: Option<Box<crate::codex_scan_diagnostics::CountingV2Receipts>>,
+    /// Count-only: parsed Claude compaction summaries on this page whose
+    /// `parentUuid` chain never reached a boundary. Logged, never a decision.
+    claude_compaction_unlinked_parent_count: usize,
 }
 
 /// Preserve the old scope/open/object short-circuit and its one existing open.
@@ -51915,6 +51941,68 @@ mod tests {
     }
 
     #[test]
+    fn claude_code_parser_counts_a_summary_whose_parent_chain_misses_its_boundary() {
+        let path = temp_file("claude-compaction-unlinked-parent");
+        let lines = [
+            "{\"timestamp\":\"2026-10-20T13:00:00Z\",\"sessionId\":\"claude-unlinked\",\"requestId\":\"req_unlinked_1\",\"message\":{\"id\":\"msg_unlinked_1\",\"model\":\"claude-opus-4-8\",\"usage\":{\"input_tokens\":50,\"output_tokens\":5}}}",
+            // Linked through an attachment: one event, not counted.
+            "{\"timestamp\":\"2026-10-20T13:01:01Z\",\"uuid\":\"boundary-linked\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":700000}}",
+            "{\"timestamp\":\"2026-10-20T13:01:01.001Z\",\"uuid\":\"attachment-linked\",\"parentUuid\":\"boundary-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"attachment\"}",
+            "{\"timestamp\":\"2026-10-20T13:01:00Z\",\"uuid\":\"summary-linked\",\"parentUuid\":\"attachment-linked\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // An unknown record type inside the chain breaks the link: the
+            // summary names a parent, stays its own event and is counted.
+            "{\"timestamp\":\"2026-10-20T13:05:01Z\",\"uuid\":\"boundary-broken\",\"parentUuid\":null,\"sessionId\":\"claude-unlinked\",\"type\":\"system\",\"subtype\":\"compact_boundary\",\"compactMetadata\":{\"trigger\":\"auto\",\"preTokens\":500000}}",
+            "{\"timestamp\":\"2026-10-20T13:05:01.001Z\",\"uuid\":\"future-record\",\"parentUuid\":\"boundary-broken\",\"sessionId\":\"claude-unlinked\",\"type\":\"future_record_type\"}",
+            "{\"timestamp\":\"2026-10-20T13:05:00.500Z\",\"uuid\":\"summary-broken\",\"parentUuid\":\"future-record\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+            // A summary with no parent at all is not this counter's case.
+            "{\"timestamp\":\"2026-10-20T13:21:00Z\",\"uuid\":\"summary-parentless\",\"sessionId\":\"claude-unlinked\",\"type\":\"user\",\"isCompactSummary\":true,\"isVisibleInTranscriptOnly\":true,\"message\":{\"role\":\"user\",\"content\":\"summary\"}}",
+        ];
+        fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )
+        .expect("write fixture");
+        let mut file = File::open(&path).expect("open fixture");
+        let identity =
+            opened_object_identity(SnapshotSource::ClaudeCode, &mut file).expect("identify");
+        let parsed = parse_opened_jsonl_file(
+            file,
+            &identity,
+            &path,
+            "2026-10-20T13:30:00Z",
+            "file-fingerprint".to_string(),
+            SnapshotSource::ClaudeCode,
+            apply_claude_code_line,
+            None,
+            Some(&ClaudeTitleMetadata::default()),
+            None,
+            None,
+            true,
+            None,
+            true,
+        )
+        .expect("parse");
+        let _ = fs::remove_file(path);
+
+        assert_eq!(parsed.claude_compaction_unlinked_parent_count, 1);
+        let item = parsed.snapshots.first().expect("snapshot");
+        assert_eq!(item.compaction_count, Some(4));
+        assert_eq!(
+            item.compaction_timestamps,
+            vec![
+                "2026-10-20T13:01:01Z".to_string(),
+                "2026-10-20T13:05:00.500Z".to_string(),
+                "2026-10-20T13:05:01Z".to_string(),
+                "2026-10-20T13:21:00Z".to_string(),
+            ]
+        );
+        assert_eq!(item.compaction_total_pre_tokens, Some(1_200_000));
+    }
+
+    #[test]
     fn claude_code_parser_time_fallback_never_claims_a_linked_summary() {
         let item = parse_claude_compaction_fixture(
             "claude-compaction-unlinked-beside-linked",
@@ -68748,7 +68836,7 @@ crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
-crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count,
+crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
@@ -68759,7 +68847,7 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_p
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, effective_upload_body_witness_revision_excluded_source_files);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
