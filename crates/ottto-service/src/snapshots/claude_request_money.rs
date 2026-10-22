@@ -40,6 +40,7 @@
 
 pub(crate) mod body;
 pub(crate) mod capture;
+mod emit;
 pub(crate) mod facts;
 pub(crate) mod rows;
 pub(crate) mod store;
@@ -77,6 +78,30 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
+
+/// Activation is a separate reviewed change after backend enforcement and parity.
+pub(crate) const REQUEST_OWNED_LIVE_ENABLED: bool = false;
+pub(crate) const UNPRICED_UNATTRIBUTED_ALLOWED: bool = false;
+pub(crate) const REQUEST_OWNED_CONTRACT: &str = "claude_request_owned_usage:v1";
+const LIVE_OFF_FILE: &str = "claude-request-owned-live.off";
+
+pub(crate) fn request_owned_live(support_dir: &Path) -> bool {
+    #[cfg(test)]
+    let enabled = REQUEST_OWNED_LIVE_ENABLED
+        || LIVE_TEST_DIRS
+            .lock()
+            .expect("live test control")
+            .iter()
+            .any(|path| path == support_dir);
+    #[cfg(not(test))]
+    let enabled = REQUEST_OWNED_LIVE_ENABLED;
+    enabled
+        && !SHADOW_PANICKED.load(Ordering::Acquire)
+        && !support_dir.join(LIVE_OFF_FILE).exists()
+        && !support_dir.join(SHADOW_OFF_FILE).exists()
+}
+#[cfg(test)]
+static LIVE_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
 
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";
 /// Row format of the JSONL (B1 reader `claude_money_shadow_report.py`).
@@ -775,6 +800,7 @@ impl ClaudeRequestMoneyShadowCounts {
             ClaudeUndecidedBy::TraceUnavailable => &mut self.undecided_trace_unavailable,
             ClaudeUndecidedBy::StaleHolder => &mut self.undecided_stale_holder,
             ClaudeUndecidedBy::Births => &mut self.undecided_births,
+            ClaudeUndecidedBy::UnbuiltOlder => return,
         };
         *slot += 1;
     }
@@ -1006,6 +1032,7 @@ fn undecided_wire(reason: ClaudeUndecidedBy) -> &'static str {
         ClaudeUndecidedBy::TraceUnavailable => "trace_unavailable",
         ClaudeUndecidedBy::StaleHolder => "stale_holder",
         ClaudeUndecidedBy::Births => "births",
+        ClaudeUndecidedBy::UnbuiltOlder => "unbuilt_older",
     }
 }
 
@@ -1171,6 +1198,35 @@ pub(crate) fn shadow_page_at(
     trace_report: &ClaudeTraceOwnershipLoadReport,
     census_complete: bool,
     now: u64,
+) -> ClaudeRequestMoneyShadowCounts {
+    build_page_at(
+        support_dir,
+        snapshots,
+        index,
+        api_report,
+        trace_report,
+        census_complete,
+        now,
+        &mut PageBodies::default(),
+    )
+}
+
+#[derive(Default)]
+struct PageBodies {
+    entities: BTreeMap<String, body::ClaudeEntityBody>,
+    _reservation: Option<ShadowBudget>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_page_at(
+    support_dir: &Path,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+    api_report: &ClaudeLocalOtelLoadReport,
+    trace_report: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    now: u64,
+    output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
     let deadline = started + PAGE_MAX_ELAPSED;
@@ -1635,11 +1691,12 @@ pub(crate) fn shadow_page_at(
     // rows (the day's cap bounds them); the reader keeps each family's latest
     // by `snapshot`. The rows are serialized by the writer, outside the lock.
     let sweep_complete = telemetry_certified(ledger);
+    let mut built = BTreeMap::new();
     let mut families = Vec::with_capacity(bodies.len());
     let mut memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
     let mut owned_bytes = 0_usize;
-    for (root, body, union, absent_old, absent_old_unknown) in bodies {
+    for (root, mut body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
         tally(&mut counts, &body, complete);
         families_incomplete += u64::from(!complete);
@@ -1709,6 +1766,7 @@ pub(crate) fn shadow_page_at(
             absent_old: (&absent_old).into(),
             absent_old_unknown,
         };
+        built.append(&mut body.entities);
         let rows = FamilyRows {
             row,
             grains: body.grains,
@@ -1756,7 +1814,6 @@ pub(crate) fn shadow_page_at(
     let batch_bytes = owned_bytes.saturating_add(1024 + JSONL_WRITE_BUFFER_BYTES);
     let batch = ShadowReservation::admit(batch_bytes).filter(|_| !faulted(PageFault::BatchRefused));
     counts.admitted_peak_bytes = budget.granted().saturating_add(batch_bytes) as u64;
-    drop(budget);
     let Some(reservation) = batch else {
         // The rows cannot be handed over: a refused page (a false coverage
         // row, no memo moves), never a complete one without its rows.
@@ -1774,7 +1831,78 @@ pub(crate) fn shadow_page_at(
         &mut counts,
     );
     emit(&end, Some(&*ledger), index, &mut counts);
+    output.entities = built;
+    output._reservation = Some(budget);
     counts
+}
+
+/// Build once, publish the P1 comparison, then apply only certified members.
+/// Protected entities keep the existing body; failed builds become local holds.
+pub(crate) fn live_page(
+    support_dir: &Path,
+    snapshots: &mut [SnapshotItem],
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+) -> BTreeSet<String> {
+    let mut output = PageBodies::default();
+    guarded(|| {
+        build_page_at(
+            support_dir,
+            snapshots,
+            index,
+            api,
+            trace,
+            census_complete,
+            now_unix(),
+            &mut output,
+        );
+    });
+    let mut held = BTreeSet::new();
+    for item in snapshots {
+        let member_id = item.source_session_id.clone();
+        let root = claude_snapshot_family_root_ref(item);
+        if index.claude_reemission_exclusions.protected_root(root) {
+            continue;
+        }
+        let birth = index
+            .files
+            .iter()
+            .filter_map(|(key, _)| {
+                let (_, member) = claude_index_path_family_member(Path::new(key))?;
+                (member == item.source_session_id)
+                    .then(|| {
+                        index
+                            .claude_request_census
+                            .get(key)
+                            .and_then(ClaudeRequestCensusRecord::birth)
+                            .map(|birth| birth.unix_seconds)
+                    })
+                    .flatten()
+            })
+            .min();
+        if index.claude_reemission_exclusions.pauses_emission()
+            || index.claude_reemission_exclusions.holds_without_list(birth)
+            || !output
+                .entities
+                .get(&member_id)
+                .is_some_and(|entity| emit::apply(item, entity))
+        {
+            held.insert(item.source_session_id.clone());
+        } else if let (Some(evidence), Some(entity)) =
+            (identity, output.entities.get(&item.source_session_id))
+        {
+            if let Some(grouping) =
+                super::claude_request_identity::request_owned_grouping(item, evidence, entity)
+            {
+                groupings.insert(item.source_session_id.clone(), grouping);
+            }
+        }
+    }
+    held
 }
 
 /// A page whose shadow does not take its captures: they are dropped by the

@@ -189,6 +189,8 @@ fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
 pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
+    /// Closed, content-free overload reason; never retains the server body.
+    pub request_owned_route_unavailable: bool,
 }
 
 impl std::fmt::Display for UploadShed {
@@ -245,6 +247,7 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
 fn shed_from_response(status: u16, response: &ureq::Response) -> UploadShed {
     UploadShed {
         status,
+        request_owned_route_unavailable: false,
         retry_after: response
             .header("Retry-After")
             .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc())),
@@ -711,6 +714,11 @@ impl SnapshotEntityRejection {
                 "occurred_at_utc_normalization_out_of_range"
             }
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            "claude_request_owned_usage_contract_mismatch" => {
+                "claude_request_owned_usage_contract_mismatch"
+            }
+            "usage_decrease_held_for_review" => "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review" => "usage_decrease_refused_after_review",
             _ => "other",
         }
     }
@@ -981,7 +989,12 @@ impl SnapshotBatchResponse {
                 unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent {
+            if !rejection.permanent
+                && !matches!(
+                    rejection.safe_reason(),
+                    "usage_decrease_held_for_review" | "usage_decrease_refused_after_review"
+                )
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(
@@ -1964,7 +1977,7 @@ impl SnapshotApiClient {
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
-                let shed = shed_from_response(code, &response);
+                let mut shed = shed_from_response(code, &response);
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
@@ -1973,6 +1986,20 @@ impl SnapshotApiClient {
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
+                // Inspect only the closed route code after recording header evidence.
+                shed.request_owned_route_unavailable =
+                    serde_json::from_reader::<_, serde_json::Value>(std::io::Read::take(
+                        response.into_reader(),
+                        16 * 1024,
+                    ))
+                    .ok()
+                    .and_then(|body| {
+                        body.pointer("/details/code")
+                            .and_then(|code| code.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                        == Some("request_owned_usage_route_unavailable");
                 Err(anyhow::Error::new(shed))
             }
             // 401/403 means relay authorization failed, not schema drift.

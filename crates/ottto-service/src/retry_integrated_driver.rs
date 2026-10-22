@@ -239,6 +239,8 @@ fn integrated_send(
                                 trace,
                             )?;
                             return Err(anyhow::Error::new(crate::snapshot_client::UploadShed {
+                    request_owned_route_unavailable: false,
+
                                 status: 503,
                                 retry_after: Some(Duration::from_secs(60)),
                             }));

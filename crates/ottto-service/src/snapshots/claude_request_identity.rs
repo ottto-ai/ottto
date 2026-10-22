@@ -1977,6 +1977,108 @@ impl<'s, 'a> RequestSink<'s, 'a> {
     }
 }
 
+/// Counted units supplied by the money builder. Copies, immature and held
+/// units never reach the sink; ambiguous ownership remains explicitly untagged.
+pub(crate) fn request_owned_grouping(
+    item: &SnapshotItem,
+    evidence: &ScanEvidence<'_>,
+    entity: &super::claude_request_money::body::ClaudeEntityBody,
+) -> Option<Grouping> {
+    use super::claude_request_ledger::ClaudeCountedBy;
+    use super::claude_request_money::body::ClaudeRequestUsageOrigin;
+    let mut sink = RequestSink::for_item(evidence, item, bucket_row_count(item))?;
+    let own = item
+        .claude_usage_occurrences
+        .keys()
+        .map(|id| {
+            (
+                super::claude_request_census::claude_request_hash(id),
+                id.as_str(),
+            )
+        })
+        .chain(
+            evidence
+                .requests
+                .keys()
+                .filter(|(root, _)| *root == sink.root)
+                .map(|(_, id)| (super::claude_request_census::claude_request_hash(id), *id)),
+        )
+        .collect::<BTreeMap<_, _>>();
+    for contribution in &entity.counted {
+        let mut selector = SelectorCapture::default();
+        for (name, value) in &contribution.key.2 {
+            super::insert_selector_raw(
+                &mut selector,
+                name,
+                "claude_api_request",
+                &serde_json::Value::String(value.clone()),
+            );
+        }
+        if let Some(origin) = contribution.origin {
+            let name = match origin {
+                ClaudeRequestUsageOrigin::TelemetryMatched => "telemetry_matched",
+                ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
+                ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
+            };
+            super::insert_selector_raw(
+                &mut selector,
+                "request_usage_origin",
+                "claude_api_request",
+                &serde_json::Value::String(name.into()),
+            );
+        }
+        let (row, _, _) = super::build_row_identity(&contribution.key.1, &selector, None);
+        let tokens = contribution.tokens;
+        let usage = UsageTotals {
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            cache_read_tokens: tokens.cache_read,
+            cache_creation_5m_tokens: tokens.cache_5m,
+            cache_creation_1h_tokens: tokens.cache_1h,
+            unattributed_total_tokens: tokens.unattributed,
+            reasoning_output_tokens: tokens.reasoning,
+            request_count: contribution.requests,
+            costs: super::UsageCosts {
+                observed: true,
+                reported: contribution.cost.is_some(),
+                total: contribution.cost.map(|cost| u128::from(cost) * 1_000_000),
+                ..Default::default()
+            },
+        };
+        let id = contribution
+            .request
+            .and_then(|hash| own.get(&hash).copied());
+        let identity = if contribution.by == ClaudeCountedBy::TelemetryProven {
+            match id {
+                Some(id) => classify_ref(
+                    evidence,
+                    &RequestFacts {
+                        root: &sink.root,
+                        source_session_id: &item.source_session_id,
+                        request_id: id,
+                        terminal_unix_seconds: Some(contribution.clock),
+                        event_clock_complete: true,
+                        marker: MarkerVerdict::None,
+                        desktop: sink.desktop,
+                        scan_unix_seconds: sink.scan_unix_seconds,
+                        email_home: None,
+                        session_start_unix_seconds: sink.session_start_unix_seconds,
+                        duplicated_elsewhere: false,
+                    },
+                ),
+                None => IdentityRef::Missing,
+            }
+        } else {
+            IdentityRef::Missing
+        };
+        sink.grouping
+            .add(&contribution.key.0, &row, &usage, identity);
+    }
+    // Literal ownership is never an exclusive transcript-marker proof.
+    sink.grouping.withdraw_transcript_tags();
+    Some(sink.finish())
+}
+
 /// Per-pass counts; local only.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScanOutcome {
@@ -2156,12 +2258,14 @@ fn tag_item(
     ownership: &TranscriptOwnership<'_>,
 ) -> Option<Result<Tagged, Ineligible>> {
     let root = owner_root(item)?;
+    let request_owned = item.usage_accounting_contract.as_deref()
+        == Some(super::claude_request_money::REQUEST_OWNED_CONTRACT);
     let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);
     if !item.claude_context_curve_request_index_complete
         // A reported item also counts telemetry-only requests and excludes a
         // legacy fork's inherited prefix; its rebuild's admitted requests are
         // checked against its grouping below instead.
-        || (!reported_usage && !transcript_requests_counted(item))
+        || (!reported_usage && !request_owned && !transcript_requests_counted(item))
         || item
             .attribution_facts
             .iter()
@@ -2178,7 +2282,9 @@ fn tag_item(
     {
         return None;
     }
-    let mut grouping = if reported_usage {
+    let mut grouping = if request_owned {
+        reported.remove(&item.source_session_id)?
+    } else if reported_usage {
         let grouping = reported.remove(&item.source_session_id)?;
         if !grouping.reported_requests_admissible(item) {
             return None;
@@ -2190,7 +2296,7 @@ fn tag_item(
         transcript_requests(item, |request| sink.add(item, request))?;
         sink.finish()
     };
-    if !ownership.settled {
+    if request_owned || !ownership.settled {
         // An unmarked fork or resume copies its predecessor's lines, markers
         // included, and nothing short of a fully compared pass shows which
         // lines are copies: markers tag nothing this pass.

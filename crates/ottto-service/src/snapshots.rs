@@ -1461,6 +1461,13 @@ pub struct SnapshotItem {
     /// including ambiguous Codex or Claude legacy fork shapes.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage_accounting_contract: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_request_count: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub removed_usage: Option<ClaudeRemovedUsage>,
+    /// True only for bodies counting telemetry-proven requests exclusively.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub telemetry_owned_complete: Option<bool>,
     /// Local-only identities of the Claude API responses whose transcript
     /// usage contributed to this snapshot. Claude Code also emits auxiliary
     /// OTLP requests (for example prompt suggestions) under the same session
@@ -1651,6 +1658,18 @@ pub(crate) const CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS: &str = "multiple_acc
 /// billed request, so the account stays unproven.
 pub(crate) const CLAUDE_ACCOUNT_WITHHELD_INCOMPLETE_REQUEST_EVIDENCE: &str =
     "incomplete_request_evidence";
+
+/// Cumulative usage removed from this entity's evidence, in wire counters.
+#[derive(Debug, Clone, Copy, Default, Serialize, PartialEq, Eq)]
+pub struct ClaudeRemovedUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_creation_5m_tokens: u64,
+    pub cache_creation_1h_tokens: u64,
+    pub unattributed_total_tokens: u64,
+    pub reasoning_output_tokens: u64,
+}
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SnapshotUsageBucket {
@@ -2551,6 +2570,66 @@ pub struct SnapshotQuarantineRecord {
     pub failed_reconstruction_count: u8,
     #[serde(default)]
     pub disposition: SnapshotQuarantineDisposition,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hold: Option<SnapshotHoldRetry>,
+}
+
+/// Retry state for an exact body held by the server. Kept beside the existing
+/// quarantine so restart, projection and ACK retirement share one owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SnapshotHoldKind {
+    Held,
+    Refused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotHoldRetry {
+    pub kind: SnapshotHoldKind,
+    pub stage: u8,
+    pub first_held_unix: u64,
+    pub day_start_unix: u64,
+    pub retries_in_day: u8,
+}
+
+impl SnapshotHoldRetry {
+    pub(crate) fn base_seconds(&self, now: u64) -> u64 {
+        match self.kind {
+            SnapshotHoldKind::Held => match self.stage {
+                0 => 1_800,
+                1 => 7_200,
+                _ => 21_600,
+            },
+            SnapshotHoldKind::Refused
+                if now.saturating_sub(self.first_held_unix) >= 30 * 86_400 =>
+            {
+                7 * 86_400
+            }
+            SnapshotHoldKind::Refused => 86_400,
+        }
+    }
+    pub(crate) fn allowance(&self, now: u64) -> bool {
+        now.saturating_sub(self.day_start_unix) >= 86_400
+            || self.retries_in_day
+                < match self.kind {
+                    SnapshotHoldKind::Held => 6,
+                    SnapshotHoldKind::Refused => 2,
+                }
+    }
+    pub(crate) fn consume(&mut self, now: u64) {
+        if now.saturating_sub(self.day_start_unix) >= 86_400 {
+            self.day_start_unix = now;
+            self.retries_in_day = 0;
+        }
+        self.retries_in_day = self.retries_in_day.saturating_add(1);
+    }
+    pub(crate) fn retry_after(&self, fingerprint: &str, now: u64) -> u64 {
+        let base = self.base_seconds(now);
+        let digest = Sha256::digest(fingerprint.as_bytes());
+        let jitter =
+            u64::from_be_bytes(digest[..8].try_into().expect("eight digest bytes")) % (base / 4);
+        now.saturating_add(base).saturating_add(jitter)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2584,6 +2663,7 @@ pub fn snapshot_quarantine_record(source: SnapshotSource) -> SnapshotQuarantineR
         .map(|duration| duration.as_secs())
         .unwrap_or_default();
     SnapshotQuarantineRecord {
+        hold: None,
         witness: snapshot_quarantine_witness(source),
         retry_after_unix_seconds: now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS),
         upload_body_witness: None,
@@ -2607,9 +2687,23 @@ fn snapshot_quarantine_deadline_is_bounded_at(record: &SnapshotQuarantineRecord,
     // authority that fences a repaired backend forever.
     match record.disposition {
         SnapshotQuarantineDisposition::RetryPending => {
+            let max_delay = match &record.hold {
+                Some(hold) => {
+                    if record.failed_reconstruction_count != 1
+                        || record.upload_body_witness.is_none()
+                        || hold.stage > 2
+                        || hold.first_held_unix > now
+                        || hold.day_start_unix > now
+                    {
+                        return false;
+                    }
+                    let base = hold.base_seconds(now);
+                    base.saturating_add(base / 4)
+                }
+                None => SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
+            };
             record.failed_reconstruction_count < MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
-                && record.retry_after_unix_seconds
-                    <= now.saturating_add(SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2))
+                && record.retry_after_unix_seconds <= now.saturating_add(max_delay)
         }
         SnapshotQuarantineDisposition::UnprovenTerminal => {
             record.failed_reconstruction_count == MAX_SNAPSHOT_RECONSTRUCTION_FAILURES
@@ -2918,6 +3012,13 @@ impl ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
+    pub(crate) fn request_owned(&mut self, holds: BTreeSet<String>) {
+        self.quarantined_source_session_ids = holds;
+        self.quarantined_source_session_ids
+            .extend(self.account_deferred_source_session_ids.iter().cloned());
+        self.transcript_ownership_complete = false;
+        self.request_groupings.clear();
+    }
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
         self.account_deferred_source_session_ids
             .extend(session_ids.iter().cloned());
@@ -9600,6 +9701,19 @@ pub(crate) fn snapshot_semantic_component_hashes(
                 claude_request_identity::semantic_leaf(item),
             );
     }
+    let mut ownership = serde_json::Map::new();
+    if let Some(value) = item.removed_request_count {
+        ownership.insert("removed_request_count".into(), json!(value));
+    }
+    if let Some(value) = item.removed_usage {
+        ownership.insert("removed_usage".into(), json!(value));
+    }
+    if let Some(value) = item.telemetry_owned_complete {
+        ownership.insert("telemetry_owned_complete".into(), json!(value));
+    }
+    if !ownership.is_empty() {
+        usage_accounting["request_ownership"] = Value::Object(ownership);
+    }
     insert("usage_accounting", usage_accounting);
     insert(
         "lifecycle_activity",
@@ -14617,6 +14731,9 @@ impl SnapshotAccumulator {
             reasoning_output_tokens: totals.reasoning_output_tokens,
             unattributed_total_tokens: totals.unattributed_total_tokens,
             request_count: totals.request_count,
+            removed_request_count: None,
+            removed_usage: None,
+            telemetry_owned_complete: None,
             usage_accounting_contract: codex_usage_accounting_proven
                 .then(|| "session_exclusive_reported_usage:v1".to_string()),
             claude_usage_request_ids: self.claude_usage_request_ids,
@@ -21398,6 +21515,9 @@ fn codex_state_only_snapshot(
         reasoning_output_tokens: 0,
         unattributed_total_tokens: thread.tokens_used,
         request_count: 0,
+        removed_request_count: None,
+        removed_usage: None,
+        telemetry_owned_complete: None,
         usage_accounting_contract: None,
         session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
@@ -30796,6 +30916,8 @@ impl ScanIndex {
             self.quarantined_snapshot_fingerprints.insert(
                 fingerprint.clone(),
                 SnapshotQuarantineRecord {
+                    hold: None,
+
                     witness: witness.clone(),
                     retry_after_unix_seconds: 0,
                     upload_body_witness: None,
@@ -35725,6 +35847,8 @@ mod tests {
     fn quarantine_deadline_never_becomes_authoritative_after_clock_rollback() {
         let original_now = 1_000_000;
         let record = SnapshotQuarantineRecord {
+            hold: None,
+
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: original_now
                 + SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2),
@@ -36980,6 +37104,8 @@ mod tests {
             quarantined_snapshot_fingerprints: BTreeMap::from([(
                 fingerprint,
                 SnapshotQuarantineRecord {
+                    hold: None,
+
                     witness: stale_witness,
                     retry_after_unix_seconds: u64::MAX,
                     upload_body_witness: None,
@@ -37751,6 +37877,8 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             fingerprint.clone(),
             SnapshotQuarantineRecord {
+                hold: None,
+
                 witness: snapshot_quarantine_witness(SnapshotSource::Pi),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: None,
@@ -43861,6 +43989,9 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            removed_request_count: None,
+            removed_usage: None,
+            telemetry_owned_complete: None,
             usage_accounting_contract: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
@@ -66765,6 +66896,9 @@ mod tests {
             reasoning_output_tokens: 0,
             unattributed_total_tokens: 0,
             request_count: 1,
+            removed_request_count: None,
+            removed_usage: None,
+            telemetry_owned_complete: None,
             usage_accounting_contract: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
@@ -68208,6 +68342,9 @@ mod tests {
                 reasoning_output_tokens: 0,
                 unattributed_total_tokens: 0,
                 request_count: 1,
+                removed_request_count: None,
+                removed_usage: None,
+                telemetry_owned_complete: None,
                 usage_accounting_contract: None,
                 session_account_evidence: None,
                 claude_usage_request_ids: BTreeSet::new(),
@@ -70392,13 +70529,19 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
 crate::heap_layout_bound::fields!(SnapshotOrigin; thread_source, source, source_subagent, originator, agent_role, entrypoint, is_sidechain, session_kind, used_workflow_orchestration, parent_session_ref);
 crate::heap_layout_bound::fields!(SnapshotProvenance; collector, source_file_count, input_token_scope, state_total_tokens, state_archived);
-crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition);
+crate::heap_layout_bound::fields!(SnapshotQuarantineRecord; witness, retry_after_unix_seconds, upload_body_witness, failed_reconstruction_count, disposition, hold);
+crate::heap_layout_bound::fields!(SnapshotHoldRetry; kind, stage, first_held_unix, day_start_unix, retries_in_day);
+impl crate::heap_layout_bound::HeapLayoutBound for SnapshotHoldKind {
+    fn heap_bound(&self, counter: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        counter.add(0)
+    }
+}
 crate::heap_layout_bound::fields!(SnapshotQuarantineWitness; contract, collector_version, parser_version, scan_identity_version, snapshot_schema_version, entity_ack_contract, item_wire_byte_limit);
 crate::heap_layout_bound::fields!(SnapshotToolUsage; name, count);
 crate::heap_layout_bound::fields!(SnapshotUsageBucket; bucket_start, model_usage, first_activity_at, last_activity_at);
@@ -70734,3 +70877,5 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+
+crate::heap_layout_bound::fields!(ClaudeRemovedUsage; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, unattributed_total_tokens, reasoning_output_tokens);

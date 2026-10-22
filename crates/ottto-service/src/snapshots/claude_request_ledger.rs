@@ -99,6 +99,8 @@ pub(crate) enum ClaudeUndecidedBy {
     StaleHolder,
     /// First-seen births are partly unknown.
     Births,
+    /// An older or unknown-birth unbuilt file in the same project group.
+    UnbuiltOlder,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -622,7 +624,7 @@ impl ClaudeClassifyContext<'_, '_> {
 
     /// Count a T-empty verdict SOURCE's rule would hold: `winner` is the
     /// earliest-born holder that took (or kept) the id.
-    fn note_unbuilt_older(&self, own_key: &str, winner: &str) {
+    fn note_unbuilt_older(&self, own_key: &str, winner: &str) -> bool {
         let birth = self
             .index
             .claude_request_census
@@ -631,7 +633,9 @@ impl ClaudeClassifyContext<'_, '_> {
             .map(|birth| birth.unix_seconds);
         if self.scope.unbuilt_older(own_key, birth) {
             self.unbuilt_older.set(self.unbuilt_older.get() + 1);
+            return true;
         }
+        false
     }
 
     fn telemetry_swept(&self, clock: u64) -> bool {
@@ -755,7 +759,11 @@ impl ClaudeClassifyContext<'_, '_> {
             Ok(winner) => winner,
             Err(reason) => return ClaudeRequestVerdict::Undecided(reason),
         };
-        self.note_unbuilt_older(own_key, winner);
+        if self.note_unbuilt_older(own_key, winner)
+            && self.index.active_effective_upload_body_witness_revision == 3
+        {
+            return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::UnbuiltOlder);
+        }
         if holders.len() == 1 {
             ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned)
         } else if winner == own_key {

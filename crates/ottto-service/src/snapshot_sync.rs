@@ -23,11 +23,11 @@ use crate::snapshots::{
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
-    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SnapshotHoldKind, SnapshotHoldRetry, SnapshotItem, SnapshotQuarantineDisposition,
+    SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
+    SnapshotUploadPolicy, SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -923,48 +923,62 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
-        let retry = self
-            .quarantined_fingerprints
-            .iter()
-            .filter(|(fingerprint, record)| {
-                !self
+        let mut ordinary = Vec::new();
+        let mut holds = Vec::new();
+        for (fingerprint, record) in &self.quarantined_fingerprints {
+            if record.disposition != SnapshotQuarantineDisposition::RetryPending
+                || self
                     .permanent_rejections
-                    .get(*fingerprint)
+                    .get(fingerprint)
                     .is_some_and(|permanent| {
                         record.upload_body_witness.as_deref()
                             == Some(permanent.body_witness.as_str())
                     })
-                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&record.witness != active || record.retry_after_unix_seconds <= now)
-            })
-            .map(|(fingerprint, record)| {
-                (
+            {
+                continue;
+            }
+            if let Some(hold) = &record.hold {
+                // Hold cadence and allowance precede every code-witness bypass.
+                if record.retry_after_unix_seconds <= now && hold.allowance(now) {
+                    holds.push((record.retry_after_unix_seconds, fingerprint.clone()));
+                }
+            } else if &record.witness != active || record.retry_after_unix_seconds <= now {
+                ordinary.push((
                     (&record.witness == active) as u8,
                     record.retry_after_unix_seconds,
                     fingerprint.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>()
+                ));
+            }
+        }
+        ordinary.sort();
+        holds.sort();
+        let ordinary_count = ordinary
+            .len()
+            .min(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - holds.len().min(25));
+        let retry = ordinary
             .into_iter()
-            .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
-            .map(|(_, _, fingerprint)| fingerprint)
+            .take(ordinary_count)
+            .map(|(_, _, fp)| fp)
+            .chain(
+                holds
+                    .into_iter()
+                    .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - ordinary_count)
+                    .map(|(_, fp)| fp),
+            )
             .collect::<BTreeSet<_>>();
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
-                .get(fingerprint)
-                .expect("selected quarantine retry exists")
-                .clone();
-            self.quarantined_fingerprints.insert(
-                fingerprint.clone(),
-                SnapshotQuarantineRecord {
-                    witness: active.clone(),
-                    retry_after_unix_seconds: quarantine_retry_after(fingerprint),
-                    upload_body_witness: record.upload_body_witness,
-                    failed_reconstruction_count: record.failed_reconstruction_count,
-                    disposition: record.disposition,
-                },
-            );
+                .get_mut(fingerprint)
+                .expect("selected retry exists");
+            record.witness = active.clone();
+            record.retry_after_unix_seconds = match &mut record.hold {
+                Some(hold) => {
+                    hold.consume(now);
+                    hold.retry_after(fingerprint, now)
+                }
+                None => quarantine_retry_after(fingerprint),
+            };
         }
         self.active_quarantine_retries = retry;
         !self.active_quarantine_retries.is_empty()
@@ -1093,6 +1107,8 @@ impl SnapshotUploadProgress {
         self.quarantined_fingerprints.insert(
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
+                hold: None,
+
                 witness,
                 retry_after_unix_seconds: if disposition
                     == SnapshotQuarantineDisposition::UnprovenTerminal
@@ -1124,6 +1140,39 @@ impl SnapshotUploadProgress {
                 reason: crate::upload_receipts::RejectedUsageReason::from_wire(reason),
             },
         );
+    }
+
+    fn quarantine_held_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        kind: SnapshotHoldKind,
+    ) {
+        let now = current_unix_seconds();
+        let previous = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
+            .and_then(|record| record.hold.clone())
+            .filter(|hold| hold.kind == kind);
+        let mut hold = previous.clone().unwrap_or(SnapshotHoldRetry {
+            kind,
+            stage: 0,
+            first_held_unix: now,
+            day_start_unix: now,
+            retries_in_day: 0,
+        });
+        if previous.is_some() && kind == SnapshotHoldKind::Held {
+            hold.stage = hold.stage.saturating_add(1).min(2);
+        }
+        self.quarantine_retryable_body(fingerprint, body_witness);
+        self.permanent_rejections.remove(fingerprint);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("record inserted");
+        record.retry_after_unix_seconds = hold.retry_after(fingerprint, now);
+        record.hold = Some(hold);
     }
 
     /// The server answered `unchanged` with an `unchanged_basis`: it did not
@@ -3348,6 +3397,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         reasoning_output_tokens: item.reasoning_output_tokens,
         unattributed_total_tokens: item.unattributed_total_tokens,
         request_count: item.request_count,
+        removed_request_count: item.removed_request_count,
+        removed_usage: item.removed_usage,
+        telemetry_owned_complete: item.telemetry_owned_complete,
         usage_accounting_contract: item.usage_accounting_contract.clone(),
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -4825,9 +4877,15 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(
+        if source == SnapshotSource::ClaudeCode
+            && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+        {
+            3
+        } else {
+            effective_upload_body_witness_revision(source)
+        },
+    );
     if source == SnapshotSource::ClaudeCode {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
@@ -6821,6 +6879,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    let request_owned_live = comparison.is_none()
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
     let observations = match comparison.as_deref_mut() {
@@ -7025,6 +7085,22 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
+
+    if request_owned_live {
+        let mut groupings = BTreeMap::new();
+        let holds = crate::snapshots::claude_request_money::live_page(
+            support_dir,
+            &mut scan_result.snapshots,
+            index,
+            &api_report,
+            &trace_report,
+            census_complete,
+            identity_evidence.as_ref(),
+            &mut groupings,
+        );
+        disposition.request_owned(holds);
+        disposition.request_groupings = groupings;
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
@@ -7103,7 +7179,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .count();
     stats.duplicate_census = disposition.duplicate_census;
     stats.context_file_birth = disposition.context_file_birth.clone();
-    let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    let census_withheld =
+        !request_owned_live && index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
         ..disposition.first_proof_hold
@@ -7119,14 +7196,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
-    crate::snapshots::claude_request_money::shadow_page(
-        support_dir,
-        &scan_result.snapshots,
-        index,
-        &api_report,
-        &trace_report,
-        scan_result.census_complete,
-    );
+    if !request_owned_live {
+        crate::snapshots::claude_request_money::shadow_page(
+            support_dir,
+            &scan_result.snapshots,
+            index,
+            &api_report,
+            &trace_report,
+            scan_result.census_complete,
+        );
+    }
     Ok((disposition, census_withheld, stats))
 }
 
@@ -7276,6 +7355,24 @@ fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadEr
     } else {
         None
     }
+}
+
+fn is_literal_version_skew(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<BatchRejected>()
+        .filter(|error| error.status == 422)
+        .and_then(|error| error.body_excerpt.as_deref())
+        .is_some_and(|body| {
+            [
+                "usage_accounting_contract",
+                "removed_request_count",
+                "removed_usage",
+                "telemetry_owned_complete",
+                "request_usage_origin",
+            ]
+            .iter()
+            .any(|field| body.contains(field))
+        })
 }
 
 fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
@@ -7513,11 +7610,20 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if let Some(rejection) = rejected.get(item_fingerprint) {
-                progress.quarantine_permanent_body(
-                    item_fingerprint,
-                    &body_witness(item),
-                    rejection.safe_reason(),
-                );
+                let hold_kind = match rejection.safe_reason() {
+                    "usage_decrease_held_for_review" => Some(SnapshotHoldKind::Held),
+                    "usage_decrease_refused_after_review" => Some(SnapshotHoldKind::Refused),
+                    _ => None,
+                };
+                if let Some(kind) = hold_kind {
+                    progress.quarantine_held_body(item_fingerprint, &body_witness(item), kind);
+                } else {
+                    progress.quarantine_permanent_body(
+                        item_fingerprint,
+                        &body_witness(item),
+                        rejection.safe_reason(),
+                    );
+                }
             } else if conflicted.contains(item_fingerprint) {
                 progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
             }
@@ -7649,6 +7755,23 @@ where
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let stale_holds = progress
+        .quarantined_fingerprints
+        .iter()
+        .filter(|(fp, record)| {
+            record.hold.is_some()
+                && current_body_witnesses
+                    .get(*fp)
+                    .is_some_and(|body| record.upload_body_witness.as_ref() != Some(body))
+        })
+        .map(|(fp, _)| fp.clone())
+        .collect::<Vec<_>>();
+    for fp in &stale_holds {
+        // Rebind as retryable debt for the new exact body. This prevents an
+        // old index copy from restoring the held status after a failed offer.
+        progress.quarantine_retryable_body(fp, &current_body_witnesses[fp]);
+        progress.active_quarantine_retries.insert(fp.clone());
+    }
     let progress_len_before_prune = progress.accepted_fingerprints.len();
     progress
         .accepted_body_witnesses
@@ -7689,6 +7812,7 @@ where
     }
     if progress.accepted_fingerprints.len() != progress_len_before_prune
         || !permanent_to_restore.is_empty()
+        || !stale_holds.is_empty()
     {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
@@ -7790,6 +7914,29 @@ where
             Ok(SnapshotPageOutcome::Settled { conflicted }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
             }
+            Err(error) if is_literal_version_skew(&error) => {
+                for index in &indices {
+                    let fp = fingerprint(&items[*index]);
+                    progress.quarantine_retryable_body(fp, &body_witness(&items[*index]));
+                    progress
+                        .quarantined_fingerprints
+                        .get_mut(fp)
+                        .expect("retry inserted")
+                        .retry_after_unix_seconds = current_unix_seconds().saturating_add(30 * 60);
+                }
+                persist(progress).map_err(|_| {
+                    anyhow::Error::new(SnapshotLocalStateRejected {
+                        operation: "save request-owned version-skew retry",
+                    })
+                })?;
+                eprintln!(
+                    "local snapshot sync: literal_version_skew={}",
+                    indices.len()
+                );
+                return Ok(ResumableUploadResult::Shed {
+                    retry_after: Some(Duration::from_secs(30 * 60)),
+                });
+            }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
                 // has already proved those bytes cannot fit or satisfy the
@@ -7879,6 +8026,9 @@ where
                     crate::client_report::ClientReportReason::RatelimitBackoff,
                     1,
                 );
+                if shed.request_owned_route_unavailable {
+                    eprintln!("local snapshot sync: request_owned_usage_route_unavailable=1");
+                }
                 // Stop the pass here rather than hammering the remaining pages
                 // at a server that just asked for room. Everything accepted so
                 // far is already checkpointed, so the retry resumes instead of
@@ -10766,6 +10916,8 @@ mod tests {
             snapshot_upload_body_witness,
             |_| {
                 Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
                 }))
@@ -13697,6 +13849,8 @@ mod tests {
                     Ok(accepted_batch(batch.len()))
                 } else {
                     Err(anyhow::Error::new(UploadShed {
+                        request_owned_route_unavailable: false,
+
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                     }))
@@ -14665,6 +14819,8 @@ mod tests {
         corrupt.quarantined_fingerprints.insert(
             fingerprint,
             SnapshotQuarantineRecord {
+                hold: None,
+
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
                 upload_body_witness: None,
@@ -15319,6 +15475,8 @@ mod tests {
             progress.quarantined_fingerprints.insert(
                 format!("{value:064x}"),
                 SnapshotQuarantineRecord {
+                    hold: None,
+
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
                     upload_body_witness: None,
@@ -20552,6 +20710,8 @@ mod tests {
             |items| {
                 assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
                 Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
                 }))
@@ -20717,3 +20877,115 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod request_owned_retry_tests {
+    use super::*;
+
+    fn progress() -> SnapshotUploadProgress {
+        SnapshotUploadProgress::new(
+            "request-owned-tests".into(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+    }
+
+    #[test]
+    fn request_owned_hold_survives_restart_and_obeys_allowance_before_witness_change() {
+        let mut p = progress();
+        p.quarantine_held_body("held", "body", SnapshotHoldKind::Held);
+        assert!(p.permanent_rejections.is_empty());
+        let now = current_unix_seconds();
+        let record = p.quarantined_fingerprints.get_mut("held").unwrap();
+        assert_eq!(record.failed_reconstruction_count, 1);
+        assert!(snapshot_quarantine_deadline_is_bounded(record));
+        record.retry_after_unix_seconds = now - 1;
+        record.hold.as_mut().unwrap().retries_in_day = 6;
+        record.witness.collector_version = "previous".into();
+        let mut restored: SnapshotUploadProgress =
+            serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        restored.active_quarantine_witness = p.active_quarantine_witness.clone();
+        assert!(!restored.prepare_quarantine_retries(&BTreeMap::new()));
+        restored
+            .quarantined_fingerprints
+            .get_mut("held")
+            .unwrap()
+            .hold
+            .as_mut()
+            .unwrap()
+            .day_start_unix = now - 86_400;
+        assert!(restored.prepare_quarantine_retries(&BTreeMap::new()));
+        let hold = restored.quarantined_fingerprints["held"]
+            .hold
+            .as_ref()
+            .unwrap();
+        assert_eq!(hold.retries_in_day, 1);
+        assert_eq!(
+            hold.stage, 0,
+            "leasing does not advance the response cadence"
+        );
+        restored.record_body("held", "body");
+        assert!(restored.quarantined_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn request_owned_hold_slots_preserve_ordinary_retries_and_return_unused_capacity() {
+        let mut p = progress();
+        for n in 0..60 {
+            p.quarantine_held_body(&format!("h-{n:02}"), "body", SnapshotHoldKind::Held);
+        }
+        for n in 0..30 {
+            p.quarantine_retryable_body(&format!("o-{n:02}"), "body");
+        }
+        for record in p.quarantined_fingerprints.values_mut() {
+            record.retry_after_unix_seconds = 0;
+        }
+        assert!(p.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(p.active_quarantine_retries.len(), 50);
+        assert_eq!(
+            p.active_quarantine_retries
+                .iter()
+                .filter(|fp| fp.starts_with("h-"))
+                .count(),
+            25
+        );
+        p.quarantined_fingerprints
+            .retain(|fp, _| fp.starts_with("h-"));
+        for record in p.quarantined_fingerprints.values_mut() {
+            record.retry_after_unix_seconds = 0;
+        }
+        assert!(p.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(p.active_quarantine_retries.len(), 50);
+    }
+
+    #[test]
+    fn request_owned_refusal_stays_retryable_at_seven_days() {
+        let mut p = progress();
+        p.quarantine_held_body("refused", "body", SnapshotHoldKind::Refused);
+        let now = current_unix_seconds();
+        let record = p.quarantined_fingerprints.get_mut("refused").unwrap();
+        let hold = record.hold.as_mut().unwrap();
+        hold.first_held_unix = now - 31 * 86_400;
+        record.retry_after_unix_seconds = hold.retry_after("refused", now);
+        assert!(snapshot_quarantine_deadline_is_bounded(record));
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert!(p.permanent_rejections.is_empty());
+    }
+
+    #[test]
+    fn request_owned_skew_is_classified_before_item_validation() {
+        let error = anyhow::Error::new(BatchRejected {
+            status: 422,
+            body_excerpt: Some("{\"loc\":[\"body\",\"snapshots\",0,\"removed_usage\"]}".into()),
+        });
+        assert!(is_literal_version_skew(&error));
+        assert!(is_item_specific_validation_failure(&error));
+        let unrelated = anyhow::Error::new(BatchRejected {
+            status: 422,
+            body_excerpt: Some("invalid tool_usage".into()),
+        });
+        assert!(!is_literal_version_skew(&unrelated));
+    }
+}
