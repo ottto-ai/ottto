@@ -191,3 +191,21 @@ fn stale_prior_rows_are_retracted_and_upserts_trimmed_instead_of_cleared() {
         assert_eq!(converged, upload(&session("", breaks), None).1, "{breaks}");
     }
 }
+
+#[test]
+fn trimmed_rows_already_accepted_are_not_counted_as_omitted() {
+    let (_, accepted) = upload(&session("", 64), None);
+    let stale = cache_wire_for_requests("s", &session("old_", 10)).unwrap();
+    let prior = cache_state_from_patch(Some(&accepted), &stale);
+    assert_eq!(prior["observations"].as_array().unwrap().len(), 74);
+    // The trim drops cold_54..cold_63, which the server already holds.
+    let (wire, state) = upload(&session("", 65), Some(&prior));
+    assert_eq!(retracted(&wire), 10);
+    assert_eq!(upserted(&wire), colds(0..54));
+    assert_eq!(
+        wire.omitted_observation_count,
+        Some(1),
+        "only cold_64 is missing"
+    );
+    assert_eq!(state, upload(&session("", 65), None).1);
+}

@@ -24111,17 +24111,30 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
             }
         }
     }
-    // Over budget, keep every retraction and drop the last upserts, counting
-    // each one, rather than withholding every row.
+    // Over budget, keep every retraction and drop the last upserts rather than
+    // withholding every row. A dropped row missing from the accepted state is
+    // omitted; an accepted one keeps its earlier version until the next pass.
+    let accepted = prior
+        .and_then(|p| p["observations"].as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["event_id"].as_str())
+        .collect::<BTreeSet<_>>();
     while !wire.validate() {
         let Some(last) = wire.operations.iter().rposition(|operation| {
             matches!(operation, cache_observations::Operation::Upsert { .. })
         }) else {
             break;
         };
-        wire.operations.remove(last);
+        let missing = match wire.operations.remove(last) {
+            cache_observations::Operation::Upsert { observation } => {
+                !accepted.contains(observation.event_id.as_str())
+            }
+            cache_observations::Operation::Retract { .. } => false,
+        };
         wire.coverage = "partial".into();
-        wire.omitted_observation_count = Some(wire.omitted_observation_count.unwrap_or(0) + 1);
+        wire.omitted_observation_count =
+            Some(wire.omitted_observation_count.unwrap_or(0) + u64::from(missing));
     }
     if !wire.validate() {
         wire.operations.clear();
