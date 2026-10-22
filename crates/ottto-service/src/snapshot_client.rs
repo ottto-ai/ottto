@@ -4116,14 +4116,16 @@ mod tests {
         let client = SnapshotApiClient::new("https://example.invalid")
             .with_receipt_state_dir(&support)
             .with_receipt_destination_namespace("synthetic-namespace".into());
-        let now = time::OffsetDateTime::now_utc().unix_timestamp();
         let id = &request.snapshots[0].source_session_id;
         let destination = start_verdict_store::destination(
             "synthetic-namespace",
             "https://example.invalid",
             &request.machine_id,
         );
-        let get = || start_verdict_store::load(&support, &destination, now).get("codex", id, now);
+        let get = || {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            start_verdict_store::load(&support, &destination, now).get("codex", id, now)
+        };
         let mut conflict = entity_ack(0, vec![]);
         conflict.conflict_entities.push(entity_ref(
             id,
