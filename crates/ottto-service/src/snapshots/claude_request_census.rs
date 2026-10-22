@@ -465,6 +465,22 @@ impl ClaudeRequestCensusRecord {
                 .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
     }
 
+    /// Freshness of a ledger holder: `current_for`, or a loss-free
+    /// identity-incomplete record (it has message-only, id-less or displaced
+    /// responses) whose message-only ids are known. Its request and message
+    /// hashes are complete for the ids it has.
+    pub(crate) fn current_holder_for(&self, entry_fingerprint: &str) -> bool {
+        self.current_for(entry_fingerprint)
+            || (self.shape == ClaudeRequestCensusShape::IdentityIncomplete
+                && self.message_hashes.is_some()
+                && self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+                && !self.unverified
+                && !self.twin
+                && self.retired.is_none()
+                && decode_fingerprint(entry_fingerprint)
+                    .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint))
+    }
+
     /// A telemetry record (`otel:` key): exact hashes, a tail position and
     /// its first-seen time in `birth`.
     pub(crate) fn telemetry(

@@ -15,7 +15,8 @@
 //! with the index, so a restart resumes the rotation where it stopped.
 
 use super::super::claude_request_census::{
-    claude_request_hash, ClaudeLedgerSweep, ClaudeRequestCensus, ClaudeRequestCensusRecord,
+    claude_request_hash, telemetry_key, ClaudeLedgerSweep, ClaudeRequestCensus,
+    ClaudeRequestCensusRecord,
 };
 use super::super::validate_claude_api_row;
 use super::{claude_cache_creation, CacheCreation, ClaudeMoneyTokens};
@@ -297,7 +298,15 @@ pub(crate) fn reconstruct_rows(
         let key = (support_dir.to_path_buf(), root.to_owned());
         let mut entry = cache.roots.remove(&key).unwrap_or_default();
         entry.last_used = clock;
-        let outcome = read_root(support_dir, root, &mut entry, &mut cache, work, counts);
+        let outcome = read_root(
+            support_dir,
+            root,
+            &mut entry,
+            &mut cache,
+            census,
+            work,
+            counts,
+        );
         last = digest;
         let result = match outcome {
             RootRead::Absent => {
@@ -373,6 +382,7 @@ fn read_root(
     root: &str,
     entry: &mut CachedRoot,
     cache: &mut RowCache,
+    census: &ClaudeRequestCensus,
     work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeRowCounts,
 ) -> RootRead {
@@ -396,7 +406,20 @@ fn read_root(
         && entry.inode == inode
         && extent >= entry.offset + entry.skip
         && anchor_of(&mut file, entry.offset, work) == Some(entry.anchor);
-    if !same {
+    // The telemetry tail's checksum over the same bytes of the same object
+    // disagrees: an earlier line was rewritten under the cached rows.
+    let rewritten = census
+        .get(&telemetry_key(root))
+        .filter(|record| !record.over_budget())
+        .and_then(|record| record.tail().copied())
+        .is_some_and(|tail| {
+            tail.device == device
+                && tail.inode == inode
+                && tail.offset == entry.offset
+                && tail.skip_bytes == entry.skip
+                && tail.line_sum != entry.line_sum
+        });
+    if !same || rewritten {
         reset(entry);
         entry.device = device;
         entry.inode = inode;
@@ -495,6 +518,25 @@ fn read_root(
         // The budget, a partial last line the writer has not finished, or
         // an oversized line still running: not complete this page.
         RootRead::Partial
+    }
+}
+
+/// Drop every cached reconstruction of the root whose sidecar stem is
+/// `stem` (the telemetry tail saw it replaced or rewritten).
+pub(crate) fn invalidate_rows(stem: &str) {
+    let Ok(mut cache) = ROW_CACHE.lock() else {
+        return;
+    };
+    let keys = cache
+        .roots
+        .keys()
+        .filter(|(_, root)| format!("{:x}", Sha256::digest(root.as_bytes())) == stem)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in keys {
+        if let Some(entry) = cache.roots.remove(&key) {
+            refund(entry.funded);
+        }
     }
 }
 

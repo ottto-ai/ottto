@@ -602,7 +602,7 @@ fn birth_policy<'k>(index: &ScanIndex, holders: &[&'k str]) -> Result<&'k str, C
             .get(*key)
             .zip(index.claude_request_census.get(key))
             .filter(|(entry, record): &(_, &ClaudeRequestCensusRecord)| {
-                record.current_for(&entry.source_file_fingerprint)
+                record.current_holder_for(&entry.source_file_fingerprint)
             })
             .map(|(_, record)| record)
             .ok_or(ClaudeUndecidedBy::StaleHolder)?;

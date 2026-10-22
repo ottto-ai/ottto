@@ -513,6 +513,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) work_stopped: u64,
     pub(crate) telemetry_retired_pressure: u64,
     pub(crate) family_memos_dropped: u64,
+    /// Memos not advanced because the page's rows were not all written.
+    pub(crate) family_memos_withheld: u64,
     pub(crate) removed_change_available: u64,
     pub(crate) removed_change_unavailable: u64,
     pub(crate) jsonl_rows: u64,
@@ -1213,14 +1215,15 @@ pub(crate) fn shadow_page_at(
         let union = union_revision(members);
         bodies.push((root, body, union, absent_old, absent_old_unknown));
     }
+    // The page's borrowed evidence ends here: the ledger records change below.
     let scope_debt = scope.debt;
-    drop(ctx);
     drop(holders);
     drop(scope);
 
     // Rows, memos and the coverage flag.
     let sweep_complete = complete_through > 0 && !tail.sweep_debt;
     let mut lines = Vec::new();
+    let mut pending_memos = Vec::with_capacity(bodies.len());
     let mut families_incomplete = 0_u64;
     for (root, body, union, absent_old, absent_old_unknown) in bodies {
         let complete = body.coverage_complete(census_complete);
@@ -1325,10 +1328,7 @@ pub(crate) fn shadow_page_at(
                 },
             ),
         };
-        let _ = index.claude_request_census.insert(
-            memo_key,
-            ClaudeRequestCensusRecord::family_record(next.0, now, next.1),
-        );
+        pending_memos.push((memo_key, next.0, next.1));
     }
     counts.family_memos_dropped = drop_old_family_memos(&mut index.claude_request_census, now);
     let page_complete = families_incomplete == 0 && census_complete && sweep_complete;
@@ -1344,8 +1344,20 @@ pub(crate) fn shadow_page_at(
         telemetry_sweep_complete: sweep_complete,
         rows_unavailable_roots: counts.rows_unavailable_roots,
     };
-    append_jsonl(support_dir, now, &lines, Some(coverage), &mut counts);
-    counts.coverage_complete = u64::from(page_complete && counts.jsonl_truncated == 0);
+    let published = append_jsonl(support_dir, now, &lines, Some(coverage), &mut counts);
+    // A memo is the reader's basis (unchanged rows, the next removal delta):
+    // it moves only when the rows it describes were written.
+    if published {
+        for (key, revision, memo) in pending_memos {
+            let _ = index.claude_request_census.insert(
+                key,
+                ClaudeRequestCensusRecord::family_record(revision, now, memo),
+            );
+        }
+    } else {
+        counts.family_memos_withheld = pending_memos.len() as u64;
+    }
+    counts.coverage_complete = u64::from(page_complete && published);
     // The ledger's persistent funding follows what it now holds.
     if !fund_ledger(&index.claude_request_census) {
         counts.ledger_unfunded = 1;
@@ -1491,28 +1503,29 @@ static LAST_COVERAGE: Mutex<BTreeMap<PathBuf, (String, bool)>> = Mutex::new(BTre
 /// drop own files older than the retention window. When the day's cap would
 /// be passed, the file is sealed with a false coverage row (`truncated`)
 /// and takes nothing more that day. Failures are counted, never raised.
+/// True when every row and the coverage row were written (published).
 fn append_jsonl(
     support_dir: &Path,
     now: u64,
     rows: &[String],
     coverage: Option<CoverageRow>,
     counts: &mut ClaudeRequestMoneyShadowCounts,
-) {
+) -> bool {
     let Some(today) = day_stamp(now) else {
         counts.jsonl_failed += 1;
-        return;
+        return false;
     };
     let dir = support_dir.join("diagnostics");
     if std::fs::create_dir_all(&dir).is_err() {
         counts.jsonl_failed += 1;
-        return;
+        return false;
     }
     let path = dir.join(format!("{JSONL_PREFIX}{today}.jsonl"));
     let mut size = std::fs::metadata(&path).map_or(0, |metadata| metadata.len());
     let sealed_marker = dir.join(format!(".{JSONL_PREFIX}{today}.sealed"));
     if sealed_marker.exists() {
         counts.jsonl_truncated += rows.len() as u64;
-        return;
+        return false;
     }
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut buffer = Vec::new();
@@ -1546,15 +1559,14 @@ fn append_jsonl(
     } else {
         coverage
     };
+    let mut coverage_flag = None;
     if let Some(coverage) = coverage {
         let flag = coverage.coverage_complete;
-        let changed = LAST_COVERAGE.lock().map_or(true, |mut last| {
-            let key = support_dir.to_path_buf();
-            let fresh = !path.exists() && buffer.is_empty();
-            let previous = last.insert(key, (today.clone(), flag));
-            fresh || previous != Some((today.clone(), flag))
+        let changed = LAST_COVERAGE.lock().map_or(true, |last| {
+            last.get(support_dir) != Some(&(today.clone(), flag))
         });
         if changed || sealed || !path.exists() {
+            coverage_flag = Some(flag);
             if let Ok(json) = serde_json::to_string(&coverage) {
                 buffer.extend_from_slice(json.as_bytes());
                 buffer.push(b'\n');
@@ -1562,23 +1574,35 @@ fn append_jsonl(
             }
         }
     }
+    let mut written = true;
     if !buffer.is_empty() {
-        let written = std::fs::OpenOptions::new()
+        written = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .and_then(|mut file| file.write_all(&buffer));
-        if written.is_err() {
+            .and_then(|mut file| file.write_all(&buffer))
+            .is_ok();
+        if !written {
             counts.jsonl_failed += 1;
         }
+    }
+    // The last written coverage flag moves only with a successful write.
+    if let (true, Some(flag), Ok(mut last)) = (written, coverage_flag, LAST_COVERAGE.lock()) {
+        last.insert(support_dir.to_path_buf(), (today.clone(), flag));
     }
     if sealed {
         let _ = std::fs::write(&sealed_marker, b"");
     }
-    let Some(oldest) = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64)) else {
-        return;
-    };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
+    let published = written && !sealed;
+    if let Some(oldest) = day_stamp(now.saturating_sub((JSONL_RETENTION_DAYS * 86_400) as u64)) {
+        prune_jsonl(&dir, &oldest);
+    }
+    published
+}
+
+/// Drop own day files (and seal markers) older than `oldest`.
+fn prune_jsonl(dir: &Path, oldest: &str) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
@@ -1597,8 +1621,7 @@ fn append_jsonl(
         let Some(day) = day else {
             continue;
         };
-        if day.len() == 8 && day.bytes().all(|byte| byte.is_ascii_digit()) && day < oldest.as_str()
-        {
+        if day.len() == 8 && day.bytes().all(|byte| byte.is_ascii_digit()) && day < oldest {
             let _ = std::fs::remove_file(entry.path());
         }
     }

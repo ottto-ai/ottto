@@ -37,9 +37,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) const REPORTED_CONTRACT: &str = "session_exclusive_reported_usage:v1";
 
-/// `request_usage_origin` of a grain (B1); None is a transcript grain.
+/// `request_usage_origin` of a grain (B1); None is a transcript grain. The
+/// variant names are the reader's wire values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
+#[allow(clippy::enum_variant_names)]
 pub(crate) enum ClaudeRequestUsageOrigin {
     /// A transcript unit with its API row's own `cost_usd`.
     TelemetryMatched,
