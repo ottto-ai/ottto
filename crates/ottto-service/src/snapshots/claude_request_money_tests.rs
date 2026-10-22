@@ -3721,6 +3721,96 @@ mod p2a_conservation {
         // of lifetime conservation against a server's deleted owner's old head.
         assert_eq!(after.entities[B].counted[0].by, ClaudeCountedBy::Owned);
     }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_si_copy_side_second_login_and_idless_keep_distinct_identity_parts() {
+        let mut c = Corpus::new("p2a-si-full-family");
+        let mut idless: serde_json::Value =
+            serde_json::from_str(&line(A, "unused", "unused", H7, 11)).unwrap();
+        idless.as_object_mut().unwrap().remove("requestId");
+        idless["message"].as_object_mut().unwrap().remove("id");
+        c.transcript(
+            A,
+            &(line(A, "r1", "m1", H7, 11) + &idless.to_string() + "\n"),
+            1_700_000_000,
+        );
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "side", H8, 13, 'b', true);
+        c.restart();
+        let a = c.build(A, NOW);
+        let b = c.build(B, NOW);
+        assert_entity(
+            &c,
+            A,
+            &a,
+            &[(H7, 2, 56), (H8, 1, 30)],
+            0,
+            Default::default(),
+            false,
+        );
+        assert_entity(&c, B, &b, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&a, &b], 2);
+        let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+        let mut item = projected_item(&c.items[A], &a.entities[A]);
+        let grouping = identity::request_owned_grouping(&item, &evidence, &a.entities[A]).unwrap();
+        identity::apply_grouped(&mut item, grouping).unwrap();
+        let mut tagged = BTreeMap::<String, u64>::new();
+        let mut untagged = 0;
+        for row in item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+        {
+            if let Some(parts) = &row.identity_parts {
+                for part in parts {
+                    if part.evidence_ref.is_some() {
+                        *tagged
+                            .entry(part.account_identifier_hash.clone().unwrap())
+                            .or_default() += part.request_count;
+                    } else {
+                        untagged += part.request_count;
+                    }
+                }
+            } else if row.evidence_ref.is_some() {
+                *tagged
+                    .entry(row.account_identifier_hash.clone().unwrap())
+                    .or_default() += row.request_count;
+            } else {
+                untagged += row.request_count;
+            }
+        }
+        assert_eq!(
+            tagged,
+            BTreeMap::from([("a".repeat(64), 1), ("b".repeat(64), 1)])
+        );
+        assert_eq!(untagged, 1, "idless never borrows either telemetry login");
+        assert_eq!(item.request_count, 3);
+        // Deliberate differences from the two legacy paths: the copy drops
+        // r1; the unproven root gains its own side call. Existing requests
+        // retain their own checked login, and idless stays untagged.
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_restart_before_maturity_keeps_due_time_and_counts_at_exact_deadline() {
+        let mut c = Corpus::new("p2a-maturity-restart");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        let clock = rfc3339_unix_seconds(H7).unwrap();
+        let young = c.build(A, clock + 59);
+        let entity = &young.entities[A];
+        assert!(!entity.held);
+        assert!(entity.certificate_ok);
+        assert_eq!(sum_entity(entity), (Default::default(), 0));
+        assert_eq!(entity.removed_requests, 0);
+        assert_eq!(entity.removed, Default::default());
+        assert_eq!(entity.due_unix, Some(clock + 60));
+        assert_mac_distinct(&[&young], 0);
+        c.restart();
+        let mature = c.build(A, clock + 60);
+        assert_entity(&c, A, &mature, &[(H7, 1, 28)], 0, Default::default(), false);
+        assert_mac_distinct(&[&mature], 1);
+    }
 }
 
 // Cross-language golden derived from the backend request_ownership_semantic_leaf
