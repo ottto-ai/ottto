@@ -801,7 +801,6 @@ impl SideLedger {
                     .insert(p_key.clone(), request);
             }
         }
-        gate
     }
 }
 
