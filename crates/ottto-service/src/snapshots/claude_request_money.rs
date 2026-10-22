@@ -3440,8 +3440,25 @@ pub(crate) fn settle_money_acks(
         };
         // A selected-state rollback may retain the old body of this same
         // physical file. Its ACK does not settle the newly offered body.
-        if entry.last_snapshot_fingerprint.as_deref() != Some(&item.snapshot_fingerprint)
-            || entry.last_upload_body_witness.as_ref() != bodies.get(&item.snapshot_fingerprint)
+        let Some(body) = bodies.get(&item.snapshot_fingerprint) else {
+            continue;
+        };
+        // The finalizer stores domain-separated SET digests, including for
+        // one logical entity. Compare that same representation for each
+        // primary/secondary checkpoint, never a raw entity/body fingerprint.
+        let singleton_set = |domain: &[u8], value: &str| {
+            let mut digest = Sha256::new();
+            super::update_length_prefixed(&mut digest, domain);
+            super::update_length_prefixed(&mut digest, value.as_bytes());
+            format!("{:x}", digest.finalize())
+        };
+        if entry.last_snapshot_fingerprint.as_ref()
+            != Some(&singleton_set(
+                b"snapshot_file_entity_set:v1",
+                &item.snapshot_fingerprint,
+            ))
+            || entry.last_upload_body_witness.as_ref()
+                != Some(&singleton_set(b"snapshot_file_upload_body_set:v1", body))
         {
             continue;
         }
