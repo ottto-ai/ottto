@@ -193,8 +193,11 @@ struct Policy {
     time_budget: Duration,
     /// Runs after the lock is taken and before the final identity check.
     #[cfg(test)]
-    before_recheck: Option<Box<dyn Fn(&str)>>,
+    before_recheck: Option<RecheckHook>,
 }
+
+#[cfg(test)]
+type RecheckHook = Box<dyn Fn(&str)>;
 
 impl Policy {
     fn production() -> Self {
