@@ -720,9 +720,14 @@ fn real_scale_gate() {
     match phase.as_str() {
         "build" => {
             assert!(!layout.state().exists(), "build into an empty folder");
-            let clock = Clock {
-                now0: OffsetDateTime::now_utc().unix_timestamp(),
-            };
+            // Reuse an explicit fixture clock when recreating transcripts
+            // for a saved daily checkpoint, without replaying earlier scans.
+            let clock: Clock = fs::read(&clock_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+                .unwrap_or(Clock {
+                    now0: OffsetDateTime::now_utc().unix_timestamp(),
+                });
             fs::create_dir_all(&layout.dir).unwrap();
             fs::write(&clock_path, serde_json::to_vec(&clock).unwrap()).unwrap();
             for workspace in [layout.workspace(false), layout.workspace(true)] {

@@ -306,6 +306,8 @@ pub(super) struct RequestV2 {
     pub(super) session_count_window: u64,
     pub(super) session_count_30d: u64,
     pub(super) retention_floor: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) history_reset_at: Option<String>,
     pub(super) upload_mode: &'static str,
 }
 
@@ -481,6 +483,7 @@ pub(super) fn build_request(
         session_count_window,
         session_count_30d,
         retention_floor: ymd(window.floor),
+        history_reset_at: scope.history_reset_at.map(ymd),
         upload_mode: "changed_days",
     };
     (request, dropped)

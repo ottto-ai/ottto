@@ -1,36 +1,40 @@
 # Composition recovery without history replay
 
-The reader persists its initial discovery cutoff and starting offsets before
-committing any scope. An interrupted installation resumes that discovery; a
-restart never substitutes a newer cutoff for files still waiting to be read.
+Only the current committed generation is retained. Manifest-last commits,
+file and parent directory syncs, the install record, bounded full reads, and
+whole-checkpoint identifier validation remain in place. A valid index can
+reconcile a newer manifest after an interrupted final index write.
 
-Scope commits retain the previous manifest, totals, and checkpoint shards until
-a replacement is verified. Unusable state falls back to that generation and
-charges only its missing delta to the repair allowance. Without usable prior
-state, the scope or damaged shard's files are quarantined and counted. Scope
-quarantine is marked durably before moving state aside, independently of the
-index. A receipt saved after the first verified commit distinguishes missing
-committed manifests from partial first-scope writes that remain pending. No scope is rebuilt from transcripts. Sibling checkpoints keep their identities and open
-residency. Unknown kind or part identifiers in any checkpoint field restart only
-that checkpoint at its end, preserving its aggregated history.
+Bad or missing scope manifests, totals, or referenced shards cause a counted
+quarantine. A durable marker precedes moving the scope's state aside. On the
+next daily run every file in that scope restarts at its current end. Its new
+upload includes optional `history_reset_at` (`YYYY-MM-DD`); the server must keep
+existing daily rows. No historical transcript bytes are replayed. Healthy
+scopes remain independent. A durable per-file restart flag survives partial
+resets, absent files, failed opens, and interrupted index writes; only a
+successful EOF checkpoint followed by its index write clears it. Those checkpoints cannot later trigger a
+full reread after a rewrite. Unknown identifiers in a single checkpoint restart
+only that checkpoint, preserving its aggregated history.
 
-Exceptional pins are saved with the scope manifest: pending fallback offsets,
-repair boundaries, and file quarantine decisions survive a crash before the
-single index write. Ordinary checkpoints recover their committed offsets without
-inferring repair debt from a decrease: a shorter offset can be a successful
-rewrite. Temporarily absent files retain pending fallback work. Reads beyond a
-full-read reservation remain for the next run. If both the index and newest
-scope state are unavailable, tails recovered from the previous generation are
-charged to repair through their discovered ends. New state directories are flushed
-into their parents before committing children.
+A missing or invalid index resets the agent's entire v2 state the same way.
+The durable install witness distinguishes an installation from index loss.
+Only the original installation can authorize initial reads from zero within
+the repair allowance. A missing pin always starts at the current end.
 
-The metrics line includes `state_fallbacks`, `scopes_quarantined`,
-`files_quarantined`, and `checkpoint_restarts`. Daily run-health transport will
-need to carry these counters separately from workspace uploads. This change does
-not modify the server or enable the reader's release switch.
+The worker acquires a nonblocking OS-backed exclusive lock before worktree
+mapping or checking the saved run date. The lock lives until process exit and
+survives scheduler death. Atomic writes use unique temporary filenames. The
+parent bounds the entire stdin/write/wait/reply exchange to 35 minutes, kills
+and reaps on timeout or failure, and retains the saved-day rule for later wakes.
 
-Regressions cover interrupted two-scope installation, invalid scope state,
-unknown checkpoint identifiers, missing and truncated active shards, pending
-fallback reads after failed reads or exhausted budgets, lost index writes,
-complete index loss, shorter rewrites, discovery-to-open growth, and directory
-sync ordering. Full workspace validation also runs in public CI.
+Source metrics include `scopes_quarantined`, `files_quarantined`, `agent_resets`,
+and `checkpoint_restarts`. Parent metrics include `worker_timeouts`,
+`worker_failures`, and `worker_lock_busy`. Daily run-health transport needs these
+counters; the server pipeline also needs the optional `history_reset_at` upload
+field. Neither transport integration nor the disabled release switch changes
+here.
+
+Regressions cover corrupt manifests/totals/shards/indexes, unchanged bad state
+on due upload, isolated healthy scopes, forward-only resets, unknown checkpoint
+identifiers, reserved read ends, directory syncs, blocked stdin/work, protocol
+failures, concurrent workers, and orphaned workers retaining their lock.
