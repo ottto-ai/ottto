@@ -1075,9 +1075,17 @@ fn candidate_parse_reasons_name_the_selecting_gate() {
     );
     assert_eq!(
         CandidateParseReason::ForcedFamily as usize,
-        CANDIDATE_PARSE_REASON_COUNT - 1
+        CANDIDATE_PARSE_REASON_COUNT - 2
     );
 
+    assert_eq!(
+        CandidateParseReason::RequestMoneyDue as usize,
+        CANDIDATE_PARSE_REASON_COUNT - 1
+    );
+    assert_eq!(
+        CANDIDATE_PARSE_REASON_NAMES[CandidateParseReason::RequestMoneyDue as usize],
+        "request_money_due"
+    );
     let key = "/opaque/reason.jsonl";
     let mut index = ScanIndex::default();
     index_file(&mut index, key, "source", "reason", "2026-08-02T07:00:00Z");

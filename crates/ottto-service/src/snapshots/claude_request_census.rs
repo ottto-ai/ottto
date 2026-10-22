@@ -1229,6 +1229,13 @@ impl<R: std::io::Read> CensusRead<R> {
             for (key, entry) in &mut index.files {
                 if entry.effective_upload_body_witness_revision >= 3
                     && !index.claude_money_files.contains_key(key)
+                    // A genuinely empty physical file has no logical entity
+                    // selection or ACK. Its ordinary durable empty checkpoint
+                    // is the local revision-3 settlement, just like the floor.
+                    && !(index.confirmed_empty_files.contains(key)
+                        && entry.last_snapshot_fingerprint.is_none()
+                        && entry.last_upload_body_witness.is_none()
+                        && index.file_snapshot_fingerprints.get(key).map_or(true, BTreeSet::is_empty))
                     && !super::money_fingerprints_below_retention_floor(
                         index.file_snapshot_fingerprints.get(key),
                         &index.snapshot_activity_at,
@@ -2342,10 +2349,22 @@ pub(crate) fn record_claude_request_census(
     // content. Path aliases remain distinct census/evidence records; E's
     // per-file posture and account/project refusal are unchanged.
     let logical_owner = match items {
-        [item] if parse.complete && parse.source_verified => (
-            claude_snapshot_family_root_ref(item).to_owned(),
-            item.source_session_id.clone(),
-        ),
+        [item]
+            if index.request_money_live_revision()
+                && parse.complete
+                && parse.source_verified
+                && !index
+                    .claude_reemission_exclusions
+                    .protected_root(&path_owner.0)
+                && !index
+                    .claude_reemission_exclusions
+                    .protected_root(claude_snapshot_family_root_ref(item)) =>
+        {
+            (
+                claude_snapshot_family_root_ref(item).to_owned(),
+                item.source_session_id.clone(),
+            )
+        }
         _ => path_owner,
     };
     let Some(record) = claude_request_census_record(

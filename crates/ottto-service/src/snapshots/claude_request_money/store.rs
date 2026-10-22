@@ -769,8 +769,11 @@ fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) 
         return (
             job.support_dir,
             WriteResult {
-                jsonl: JsonlOutcome::default(),
-                memos: Vec::new(),
+                jsonl: JsonlOutcome {
+                    failed: 1,
+                    ..JsonlOutcome::default()
+                },
+                memos: job.memos,
                 failed_shards,
                 meta_unwritten,
             },
@@ -788,7 +791,10 @@ fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) 
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
         write_save(&support_dir.join(LEDGER_DIR), &save, failed)
     });
-    if jsonl.published && failed_shards.is_empty() && meta_unwritten.is_none() {
+    if (jsonl.published || (jsonl.sealed > 0 && jsonl.failed == 0))
+        && failed_shards.is_empty()
+        && meta_unwritten.is_none()
+    {
         if let Some(intent) = pending_intent {
             let _ = std::fs::remove_file(intent);
         }

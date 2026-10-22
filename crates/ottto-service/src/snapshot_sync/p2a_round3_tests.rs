@@ -725,20 +725,29 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
             )
             .unwrap();
             let mut saved = control.saved();
+            let revision = saved
+                .files
+                .values()
+                .next()
+                .unwrap()
+                .source_file_fingerprint
+                .clone();
+            // This control starts at a settled, matching policy boundary. A
+            // mismatching context/revision is an ordinary reparse control.
+            saved.upload_context_fingerprint = Some(snapshot_upload_context_fingerprint(
+                SnapshotUploadPolicy::default(),
+                None,
+            ));
             if terminal {
-                let revision = saved
-                    .files
-                    .values()
-                    .next()
-                    .unwrap()
-                    .source_file_fingerprint
-                    .clone();
                 saved.insert_unproven_terminal_claude_authority_for_test(
                     IDENTITY_PIPELINE_ROOT,
                     &revision,
                 );
             } else {
-                saved.insert_retry_pending_claude_authority_for_test(IDENTITY_PIPELINE_ROOT);
+                saved.insert_bound_retry_pending_claude_authority_for_test(
+                    IDENTITY_PIPELINE_ROOT,
+                    &revision,
+                );
             }
             // A distinct persisted upload-v1 record must survive alongside
             // the family authority record, even when the page is quiet.
@@ -1732,4 +1741,48 @@ fn p2a_checkpoint_resume_revalidates_selected_state_protection_and_live_gate() {
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision != 3));
     }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_enabling_live_between_finish_entry_and_evidence_yields_without_panicking_or_posting() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let kill = control.support.join("claude-request-owned-live.off");
+    std::fs::write(&kill, b"").unwrap();
+    let toggled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = toggled.clone();
+    money_resume::set_before_immediate_for_test(move || {
+        std::fs::remove_file(kill).unwrap();
+        observed.store(true, std::sync::atomic::Ordering::SeqCst);
+    });
+    let mut refused_turn = false;
+    control
+        .cycle_changing(|attempt| {
+            if attempt == 1 {
+                refused_turn = true;
+                assert!(
+                    control.offers().is_empty(),
+                    "a newly pending immediate finish cannot POST"
+                );
+            }
+        })
+        .unwrap();
+    assert!(toggled.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(
+        refused_turn,
+        "toggle must exercise the Pending -> LocalRefusal boundary"
+    );
+    assert!(
+        !control.offers().is_empty(),
+        "fresh admitted live finish must later make progress"
+    );
 }

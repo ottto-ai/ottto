@@ -2609,6 +2609,9 @@ fn money_rows_follow_audited_rewrites() {
 #[serial_test::serial(claude_request_money_shadow)]
 fn money_m4_sized_ledger_and_page_are_measured() {
     use crate::claude_local_otel::telemetry_tail::save_sweep;
+    // The synthetic half-million-row cold load is intentionally larger than
+    // an ordinary shutdown flush. Require its completion, not a timed guess.
+    let _flush = store::flush_timeout_for_test(Duration::from_secs(60));
     const FILES: usize = 11_500;
     const FILE_HASHES: u64 = 61;
     const SIDECARS: usize = 5_600;
@@ -3578,7 +3581,7 @@ mod p2a_conservation {
         assert_eq!(body.new.cost_micros, 100);
         assert_eq!(
             item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
-            Some("0.000100")
+            Some("0.0001")
         );
         assert_eq!(body.new.requests, item.request_count);
         assert!(body.grains.values().any(|(_, new)| new.cost_micros == 100));
@@ -3589,66 +3592,7 @@ mod p2a_conservation {
     // Emitter/wire behavior is covered separately by the live-page controls.
     fn projected_item(item: &SnapshotItem, entity: &body::ClaudeEntityBody) -> SnapshotItem {
         let mut projected = item.clone();
-        let template = &item.model_usage[0];
-        let mut buckets = BTreeMap::<String, Vec<SnapshotModelUsage>>::new();
-        for ((key, origin), grain) in &entity.grains {
-            let mut row = template.clone();
-            row.model = key.1.clone();
-            row.selector_context = key.2.clone();
-            row.selector_sources.clear();
-            row.reasoning_effort = None;
-            row.auth_mode = None;
-            row.billing_channel = None;
-            row.billing_provider = None;
-            row.gateway_provider = None;
-            row.model_provider = None;
-            row.subscription_product = None;
-            if let Some(origin) = origin {
-                let name = match origin {
-                    body::ClaudeRequestUsageOrigin::TelemetryMatched => "telemetry_matched",
-                    body::ClaudeRequestUsageOrigin::TelemetryReported => "telemetry_reported",
-                    body::ClaudeRequestUsageOrigin::TelemetryUnpriced => "telemetry_unpriced",
-                };
-                row.selector_context
-                    .insert("request_usage_origin".into(), name.into());
-                row.selector_sources
-                    .insert("request_usage_origin".into(), "claude_api_request".into());
-            }
-            let t = grain.tokens;
-            row.input_tokens = t.input;
-            row.output_tokens = t.output;
-            row.cache_read_tokens = t.cache_read;
-            row.cache_creation_5m_tokens = t.cache_5m;
-            row.cache_creation_1h_tokens = t.cache_1h;
-            row.unattributed_total_tokens = t.unattributed;
-            row.reasoning_output_tokens = t.reasoning;
-            row.request_count = grain.requests;
-            row.cost_usd = grain
-                .cost()
-                .map(|v| format!("{}.{:06}", v / 1_000_000, v % 1_000_000));
-            buckets.entry(key.0.clone()).or_default().push(row);
-        }
-        projected.usage_buckets = buckets
-            .into_iter()
-            .map(|(bucket_start, model_usage)| SnapshotUsageBucket {
-                first_activity_at: Some(bucket_start.clone()),
-                last_activity_at: Some(bucket_start.clone()),
-                bucket_start,
-                model_usage,
-            })
-            .collect();
-        rebuild_snapshot_model_usage(&mut projected);
-        let (t, n) = sum_entity(entity);
-        projected.input_tokens = t.input;
-        projected.output_tokens = t.output;
-        projected.cache_read_tokens = t.cache_read;
-        projected.cache_creation_5m_tokens = t.cache_5m;
-        projected.cache_creation_1h_tokens = t.cache_1h;
-        projected.unattributed_total_tokens = t.unattributed;
-        projected.reasoning_output_tokens = t.reasoning;
-        projected.request_count = n;
-        projected.usage_accounting_contract = Some(money::REQUEST_OWNED_CONTRACT.into());
-        projected.telemetry_owned_complete = Some(entity.telemetry_owned_complete);
+        assert!(money::emit_for_test(&mut projected, entity));
         projected
     }
 

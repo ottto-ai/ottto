@@ -232,7 +232,11 @@ fn money_assert_rows_consistent(arm: &MoneyPipelineArm) {
     for family in &families {
         assert_eq!(family["counting"], "claude_request_counting:v1", "{family}");
         assert_eq!(family["v"], 2, "{family}");
-        assert_eq!(family["family"].as_str().map(str::len), Some(16), "{family}");
+        assert_eq!(
+            family["family"].as_str().map(str::len),
+            Some(16),
+            "{family}"
+        );
         let (old_tokens, old_requests) = money_totals(family, "old");
         let (new_tokens, new_requests) = money_totals(family, "new");
         assert_eq!(
@@ -241,8 +245,7 @@ fn money_assert_rows_consistent(arm: &MoneyPipelineArm) {
             "{family}"
         );
         assert!(
-            family["removed_change"].is_null()
-                == family["removed_change_unavailable"].is_string(),
+            family["removed_change"].is_null() == family["removed_change_unavailable"].is_string(),
             "{family}"
         );
         if family["category"] == "unbuilt" {
@@ -272,14 +275,26 @@ fn money_assert_rows_consistent(arm: &MoneyPipelineArm) {
             "grains explain the family: {family}"
         );
     }
-    assert!(built > 0, "the builder builds ordinary families: {:?}", arm.rows);
+    assert!(
+        built > 0,
+        "the builder builds ordinary families: {:?}",
+        arm.rows
+    );
     for grain in arm.of("grain") {
         assert_eq!(grain["session"].as_str().map(str::len), Some(16), "{grain}");
-        assert!(grain["hour"].as_str().is_some_and(|hour| hour.ends_with(":00:00Z")), "{grain}");
+        assert!(
+            grain["hour"]
+                .as_str()
+                .is_some_and(|hour| hour.ends_with(":00:00Z")),
+            "{grain}"
+        );
         assert!(grain["selector"].is_object(), "{grain}");
         assert!(grain["category"].is_string(), "{grain}");
     }
-    assert!(!arm.of("coverage").is_empty(), "every day has a coverage row");
+    assert!(
+        !arm.of("coverage").is_empty(),
+        "every day has a coverage row"
+    );
     assert_eq!(money_count(&arm.lines, "certificate_mismatch"), 0);
     // Hashed ids only.
     let joined = arm
@@ -522,7 +537,11 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
         "a parse while the shadow is off captures nothing"
     );
     page();
-    assert_eq!(off_rows().len(), 1, "later off pages of the day write nothing");
+    assert_eq!(
+        off_rows().len(),
+        1,
+        "later off pages of the day write nothing"
+    );
     std::fs::remove_file(&off).unwrap();
     page();
     let _ = scan(&mut ScanIndex::default());
@@ -764,9 +783,16 @@ fn money_shadow_refusal_logs_and_changes_nothing() {
 }
 
 /// One armed scan of a fresh fixture, for direct `shadow_page_at` calls.
-fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots::SourceScanResult) {
+fn money_armed_scan(
+    name: &str,
+) -> (
+    PipelineFixture,
+    ScanIndex,
+    crate::snapshots::SourceScanResult,
+) {
     let fixture = PipelineFixture::new(name);
     money::enable_shadow_for_test(&fixture.support);
+    money::store::reload_for_test(&fixture.support).unwrap();
     let mut index = ScanIndex::default();
     let scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
@@ -807,7 +833,11 @@ fn money_shadow_holds_immature_units_until_they_mature() {
         young.tokens_immature,
         units * MONEY_PIPELINE_RESPONSE_TOKENS
     );
-    assert_eq!(young.tokens_new, young.tokens_old - young.tokens_immature, "{young:?}");
+    assert_eq!(
+        young.tokens_new,
+        young.tokens_old - young.tokens_immature,
+        "{young:?}"
+    );
     let (fixture, index, scan) = money_armed_scan("money-shadow-mature");
     let mature = money::shadow_page_at(
         &fixture.support,
@@ -860,9 +890,11 @@ fn money_shadow_removed_change_is_bound_to_the_previous_body() {
             assert_eq!(row["removed_change"]["tokens"], 0, "{row}");
         }
     }
-    assert!(money_count(&on.lines, "removed_change_available")
-        + money_count(&on.lines, "removed_change_unavailable")
-        >= rows.len() as u64);
+    assert!(
+        money_count(&on.lines, "removed_change_available")
+            + money_count(&on.lines, "removed_change_unavailable")
+            >= rows.len() as u64
+    );
 }
 
 /// The latest snapshot's grains of each family row.
@@ -932,6 +964,11 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
     let side_family = money::hashed_id_for_test(PIPELINE_SESSIONS[1]);
     let mut copies = 0_i128;
     let mut side_calls = 0_i128;
+    let ordinary = PIPELINE_SESSIONS
+        .iter()
+        .map(|session| money::hashed_id_for_test(session))
+        .collect::<BTreeSet<_>>();
+    let mut selector_moves = BTreeMap::<String, i128>::new();
     for grain in money_latest_grains(&differing) {
         let change = money_grain_tokens(&grain["new"]) - money_grain_tokens(&grain["old"]);
         match grain["category"].as_str().unwrap() {
@@ -946,13 +983,28 @@ fn money_shadow_matches_the_live_body_except_the_deliberate_differences() {
                 side_calls += change;
             }
             // A matched unit's own money: same tokens.
-            "own_cost" => assert_eq!(change, 0, "{grain}"),
+            "legacy_exclusion" if grain["family"] == copy_family.as_str() => {
+                assert!(change <= 0, "a removed copy cannot gain tokens: {grain}");
+                copies += change;
+            }
+            "own_cost" | "legacy_exclusion" => {
+                let family = grain["family"].as_str().unwrap();
+                assert!(
+                    ordinary.contains(family),
+                    "selector migration belongs to an actual original: {grain}"
+                );
+                *selector_moves.entry(family.to_owned()).or_default() += change;
+            }
             category if undecided.contains(&category) => {}
             _ => panic!("an undeclared difference: {grain}"),
         }
     }
     assert_eq!(copies, -i128::from(MONEY_PIPELINE_RESPONSE_TOKENS));
     assert_eq!(side_calls, i128::from(MONEY_PIPELINE_SIDE_CALL_TOKENS));
+    assert!(
+        selector_moves.values().all(|change| *change == 0),
+        "full-body selector/origin moves must conserve every original's tokens: {selector_moves:?}"
+    );
     assert_eq!(MONEY_DELIBERATE_DIFFERENCES.len(), 2);
 }
 
@@ -967,6 +1019,14 @@ fn money_shadow_memos_move_only_with_published_rows() {
     let (fixture, index, scan) = money_armed_scan("money-shadow-unpublished");
     std::fs::write(fixture.support.join("diagnostics"), b"not a directory").unwrap();
     let page = || {
+        for (key, entry) in &index.files {
+            let _ = crate::snapshots::parse_claude_code_jsonl_file(
+                Path::new(key),
+                &scan.census_window_end,
+                entry.source_file_fingerprint.clone(),
+            )
+            .unwrap();
+        }
         let counts = money::shadow_page_at(
             &fixture.support,
             &scan.snapshots,
@@ -1069,7 +1129,11 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
     money::forget_owed_coverage_for_test(&fixture.support);
     assert_eq!(money_owed_markers(&fixture.support), 1);
     page(response + 3605);
-    assert_eq!(money_owed_markers(&fixture.support), 0, "a written debt is settled");
+    assert_eq!(
+        money_owed_markers(&fixture.support),
+        0,
+        "a written debt is settled"
+    );
     let owed = money_jsonl_rows(&fixture.support)
         .into_iter()
         .filter(|row| row["row"] == "coverage" && row["dropped"] == true)
@@ -1103,6 +1167,14 @@ fn money_shadow_seal_needs_its_false_row() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
     let (fixture, index, scan) = money_armed_scan("money-shadow-failed-seal");
     let page = |now| {
+        for (key, entry) in &index.files {
+            let _ = crate::snapshots::parse_claude_code_jsonl_file(
+                Path::new(key),
+                &scan.census_window_end,
+                entry.source_file_fingerprint.clone(),
+            )
+            .unwrap();
+        }
         let counts = money::shadow_page_at(
             &fixture.support,
             &scan.snapshots,
@@ -1120,7 +1192,10 @@ fn money_shadow_seal_needs_its_false_row() {
         .unwrap()
         .flatten()
         .map(|entry| entry.path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .find(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
         .expect("the day's file");
     // Fill the day with true rows to just under its room.
     let filler = serde_json::json!({"row": "coverage", "v": 2, "coverage_complete": true})
@@ -1129,7 +1204,8 @@ fn money_shadow_seal_needs_its_false_row() {
     let size = std::fs::metadata(&day).unwrap().len();
     let fill = (money::jsonl_room_for_test() - size - 64) / filler.len() as u64;
     let mut file = std::fs::OpenOptions::new().append(true).open(&day).unwrap();
-    file.write_all(filler.repeat(fill as usize).as_bytes()).unwrap();
+    file.write_all(filler.repeat(fill as usize).as_bytes())
+        .unwrap();
     drop(file);
     let false_rows = |rows: &[serde_json::Value]| {
         rows.iter()
@@ -1145,15 +1221,26 @@ fn money_shadow_seal_needs_its_false_row() {
     }
     let unwritten = std::fs::read(&day).unwrap();
     page(response + 3601);
-    assert_eq!(std::fs::read(&day).unwrap(), unwritten, "nothing reached the file");
-    assert_eq!(money_owed_markers(&fixture.support), 1, "the false row is owed");
+    assert_eq!(
+        std::fs::read(&day).unwrap(),
+        unwritten,
+        "nothing reached the file"
+    );
+    assert_eq!(
+        money_owed_markers(&fixture.support),
+        1,
+        "the false row is owed"
+    );
     // A restart, then the file can be written again.
     money::forget_owed_coverage_for_test(&fixture.support);
     std::fs::set_permissions(&day, std::fs::Permissions::from_mode(0o644)).unwrap();
     let failed = page(response + 3602);
     assert!(failed.jsonl_failed >= 1, "{failed:?}");
     let rows = money_jsonl_rows(&fixture.support);
-    assert!(false_rows(&rows) > before, "the seal's false row is on disk");
+    assert!(
+        false_rows(&rows) > before,
+        "the seal's false row is on disk"
+    );
     assert!(rows
         .iter()
         .any(|row| row["row"] == "coverage" && row["truncated"] == true));
@@ -1161,7 +1248,11 @@ fn money_shadow_seal_needs_its_false_row() {
     let sealed = std::fs::read(&day).unwrap();
     let after = page(response + 3603);
     assert_eq!(after.jsonl_sealed, 1, "{after:?}");
-    assert_eq!(std::fs::read(&day).unwrap(), sealed, "a sealed day takes nothing more");
+    assert_eq!(
+        std::fs::read(&day).unwrap(),
+        sealed,
+        "a sealed day takes nothing more"
+    );
     assert_eq!(money::reserved_for_test(), 0);
 }
 
@@ -1228,7 +1319,10 @@ fn money_armed_cycle_saves_the_baseline_index() {
     fixture.traversal(8, &MONEY_PIPELINE_CYCLE);
     money::store::forget_for_test(&fixture.support);
     let ledger_dir = fixture.support.join(money::store::LEDGER_DIR);
-    assert!(ledger_dir.join("meta.json").is_file(), "the ledger was saved");
+    assert!(
+        ledger_dir.join("meta.json").is_file(),
+        "the ledger was saved"
+    );
     fixture.append(PIPELINE_SESSIONS[2], "req_2_2");
     let saved = money_files(&fixture.base);
     let cycle = |armed: bool, ledger_fails: bool| {
@@ -1281,7 +1375,10 @@ fn money_armed_cycle_saves_the_baseline_index() {
     assert_eq!(failing.len(), baseline.len());
     for (number, (failing, baseline)) in failing.iter().zip(&baseline).enumerate() {
         assert_eq!(failing.0, baseline.0, "page {number}: the same decisions");
-        assert!(failing.1 == baseline.1, "page {number}: the same index bytes");
+        assert!(
+            failing.1 == baseline.1,
+            "page {number}: the same index bytes"
+        );
     }
     assert!(failing_index == baseline_index, "the same saved index");
     assert!(!lines.is_empty());
@@ -1396,6 +1493,13 @@ fn p2a_literal_503_resends_byte_identical_after_progress_restart() {
         snapshot_quarantine_witness(SnapshotSource::Codex),
     )
     .unwrap();
+    assert!(
+        !progress.quarantined_fingerprints.is_empty(),
+        "route 503 must retain exact retry custody"
+    );
+    for record in progress.quarantined_fingerprints.values_mut() {
+        record.retry_after_unix_seconds = 0;
+    }
     let mut retried = Vec::new();
     upload_resumable_batches_with_body_witness(
         &items,
@@ -1619,7 +1723,13 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
     )
     .unwrap();
     std::fs::create_dir_all(fixture.support.join("snapshots")).unwrap();
-    std::fs::write(fixture.support.join("snapshots/claude_code-reemission-exclusions.txt"), b"").unwrap();
+    std::fs::write(
+        fixture
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+        b"",
+    )
+    .unwrap();
     index.load_claude_reemission_exclusions(&fixture.support);
     money::store::reload_for_test(&fixture.support);
     // The normal page builds from actual multi-file membership, not a test
