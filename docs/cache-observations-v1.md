@@ -32,9 +32,17 @@ unknown counters cannot supply an unexpected-loss baseline.
 The optional `cache_observations` patch uses bounded upsert/retract operations.
 Gate materializes the cumulative current set, so corrections and retractions
 produce self-contained downstream evidence. V1 permits 64 operations and
-128 KiB per patch; cumulative state permits 128 rows and 128 KiB. Overflow
-reports partial coverage and omitted counts while preserving accepted evidence;
-it does not silently evict rows or introduce another uploader.
+128 KiB per patch; cumulative state permits 128 rows and 128 KiB. A session
+with more observations than one patch carries uploads its first observations in
+session order, up to the cap, with partial coverage and an exact
+`omitted_observation_count` for the rest. Appended requests never change which
+observations come first, so later passes add no retractions and the state stays
+within the cap. Because every request was read, such a capped patch retracts
+stale accepted rows like a complete one. When retractions and upserts together
+exceed one patch, every retraction is kept and the last upserts are counted as
+omitted until a later pass. A lossy parse still reports partial coverage with no
+operations and never retracts accepted evidence. No path silently evicts rows or
+introduces another uploader.
 
 Every cache patch declares `snapshot_head_etag:v1` and uses the accepted
 predecessor etag for existing entities. A collector without that token first

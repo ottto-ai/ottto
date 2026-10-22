@@ -27,6 +27,8 @@ use toml_edit::{DocumentMut, Item};
 
 pub(crate) mod cache_observations;
 #[cfg(test)]
+mod cache_overcap_tests;
+#[cfg(test)]
 mod cache_policy_tests;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
@@ -24077,8 +24079,11 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
     let Some(patch) = item.cache_observations.as_ref() else {
         return;
     };
-    // A lossy parse never retracts previously accepted observations.
-    let current = if patch.coverage == "complete" {
+    // A lossy parse never retracts previously accepted observations. A capped
+    // upload read every request: its rows and omitted count are exact, so it
+    // replaces the prior rows like a complete one and the state stays bounded.
+    let exact = patch.coverage == "complete" || patch.omitted_observation_count.is_some();
+    let current = if exact {
         cache_state_from_patch(None, patch)
     } else {
         cache_state_from_patch(prior, patch)
@@ -24090,7 +24095,7 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
         .filter_map(|row| row["event_id"].as_str())
         .collect::<BTreeSet<_>>();
     let mut wire = patch.clone();
-    if patch.coverage == "complete" {
+    if exact {
         for row in prior
             .and_then(|p| p["observations"].as_array())
             .into_iter()
@@ -24105,6 +24110,18 @@ pub(crate) fn prepare_cache_observations(item: &mut SnapshotItem, prior: Option<
                 }
             }
         }
+    }
+    // Over budget, keep every retraction and drop the last upserts, counting
+    // each one, rather than withholding every row.
+    while !wire.validate() {
+        let Some(last) = wire.operations.iter().rposition(|operation| {
+            matches!(operation, cache_observations::Operation::Upsert { .. })
+        }) else {
+            break;
+        };
+        wire.operations.remove(last);
+        wire.coverage = "partial".into();
+        wire.omitted_observation_count = Some(wire.omitted_observation_count.unwrap_or(0) + 1);
     }
     if !wire.validate() {
         wire.operations.clear();
@@ -24142,18 +24159,30 @@ fn cache_wire_for_requests(session: &str, requests: &[OwnedRequest]) -> Option<C
     }
     let (rows, overflow) =
         cache_observations::detect_bounded(session, &unique, cache_observations::MAX_OPERATIONS);
-    let patch = cache_observations::reconcile(&BTreeMap::new(), &rows);
-    let omitted = rows.len() as u64 + overflow;
+    let mut patch = cache_observations::reconcile(&BTreeMap::new(), &rows);
     if overflow == 0 && patch.validate() {
-        Some(patch)
-    } else {
-        Some(CacheObservations {
-            schema_version: 1,
-            operations: Vec::new(),
-            coverage: "partial".into(),
-            omitted_observation_count: Some(omitted),
-        })
+        return Some(patch);
     }
+    // Over the cap, upload the first rows in session order with an exact count
+    // of the rest. Appends never change which rows come first, so a tail pass
+    // adds no retractions and keeps the accepted state within the cap.
+    let position = unique
+        .iter()
+        .enumerate()
+        .map(|(index, request)| (request.slot.request_ref.as_str(), index))
+        .collect::<BTreeMap<_, _>>();
+    patch.operations.sort_by_key(|operation| match operation {
+        cache_observations::Operation::Upsert { observation } => position
+            .get(observation.affected_request_ref.as_str())
+            .copied(),
+        cache_observations::Operation::Retract { .. } => None,
+    });
+    patch.coverage = "partial".into();
+    patch.omitted_observation_count = Some(overflow);
+    while !patch.validate() && patch.operations.pop().is_some() {
+        patch.omitted_observation_count = patch.omitted_observation_count.map(|n| n + 1);
+    }
+    Some(patch)
 }
 
 fn codex_cache_request(value: &Value, accumulator: &SnapshotAccumulator) -> Option<OwnedRequest> {
@@ -69345,9 +69374,12 @@ pub(crate) mod cache_adapter_tests {
             pathological.push(cold);
         }
         let overflow = cache_wire_for_requests("s", &pathological).unwrap();
-        assert!(overflow.operations.is_empty());
+        assert_eq!(
+            overflow.operations.len(),
+            cache_observations::MAX_OPERATIONS
+        );
         assert_eq!(overflow.coverage, "partial");
-        assert_eq!(overflow.omitted_observation_count, Some(65));
+        assert_eq!(overflow.omitted_observation_count, Some(1));
         let patch = cache_wire_for_requests("s", &[warm.clone(), cold]).unwrap();
         let prior = cache_state_from_patch(None, &patch);
         let current = cache_wire_for_requests("s", &[warm]).unwrap();
