@@ -34,9 +34,11 @@
 //! process, or cannot be read completely before the time budget runs out,
 //! the rest of the pass applies nothing (`skipped.other_daemon`). An empty
 //! table, one without this process, or a live process of this user whose
-//! name or executable cannot be read all count as unreadable. The startup
-//! pass runs before this daemon starts any worker of its own. What remains is a daemon launched between
-//! the last process-table read and the unlink, a window of a few syscalls;
+//! name or executable cannot be read all count as unreadable; a process
+//! whose executable was deleted or replaced is known by its kernel name.
+//! The startup pass runs before this daemon starts any worker of its own.
+//! What remains is a daemon launched between the last process-table read
+//! and the unlink, a window of a few syscalls;
 //! launchd starts one instance per label, so that needs a second, manually
 //! started daemon racing the first one's startup, and even then its save
 //! only fails once and is retried on its next cycle.
@@ -413,9 +415,12 @@ mod process_table {
         other_daemon_running_with(&Native, own, unsafe { libc::getuid() }, out_of_time)
     }
 
-    /// Only ESRCH (the process exited since the listing) is ignored; any
-    /// other failure to read a process leaves its identity unknown, which
-    /// fails the whole read.
+    /// A same-user process is another daemon when its kernel name (`comm`)
+    /// or its executable's basename is the daemon's. ESRCH (the process
+    /// exited since the listing) is ignored, and a path lookup's ENOENT (its
+    /// executable was deleted or replaced, as in an upgrade while it runs)
+    /// leaves `comm` as its identity. Any other failure leaves the identity
+    /// unknown, which fails the whole read.
     pub(super) fn other_daemon_running_with(
         api: &dyn Libproc,
         own: libc::pid_t,
@@ -456,7 +461,7 @@ mod process_table {
         Ok(false)
     }
 
-    /// `None` only when the process exited.
+    /// `None` when the process exited or its executable no longer exists.
     fn pid_path(
         api: &dyn Libproc,
         pid: libc::pid_t,
@@ -465,7 +470,7 @@ mod process_table {
         let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
         let length = api.path(pid, &mut buffer);
         if length.value <= 0 {
-            if length.errno == libc::ESRCH {
+            if length.errno == libc::ESRCH || length.errno == libc::ENOENT {
                 return Ok(None);
             }
             return Err(failure(length));
@@ -532,8 +537,9 @@ mod process_table {
             if super::is_daemon_name(comm) {
                 return Ok(true);
             }
-            // An unreadable executable link of a live process of this user
-            // leaves its identity unknown, which fails the whole read.
+            // A deleted or missing executable leaves `comm`, checked above,
+            // as the identity; any other unreadable executable link of a
+            // live process of this user fails the whole read.
             let exe = match std::fs::read_link(dir.join("exe")) {
                 Ok(exe) => exe.to_string_lossy().into_owned(),
                 Err(error) if gone(&error) => continue,

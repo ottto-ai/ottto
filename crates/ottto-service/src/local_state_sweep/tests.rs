@@ -1515,6 +1515,10 @@ mod native_process_table {
 
     /// Nothing applied and every lock free, never taken.
     fn assert_applied_nothing(api: FakeLibproc) {
+        assert_blocked(api, OtherDaemonState::ProbeFailed);
+    }
+
+    fn assert_blocked(api: FakeLibproc, state: OtherDaemonState) {
         let f = fixture();
         let planted = plant_three_orphans(&f.dest);
         let policy = Policy {
@@ -1529,7 +1533,7 @@ mod native_process_table {
 
         let report = apply(&f.support, &policy);
 
-        assert_eq!(report.other_daemon_check, OtherDaemonState::ProbeFailed);
+        assert_eq!(report.other_daemon_check, state);
         assert_eq!(report.removed, 0);
         assert_eq!(report.skipped.other_daemon, 3);
         for (orphan, lock) in &planted {
@@ -1596,12 +1600,13 @@ mod native_process_table {
 
     #[test]
     fn unreadable_process_of_this_user_applies_nothing() {
-        for errno in [libc::EPERM, libc::ENOENT, libc::EINVAL, 0] {
+        for errno in [libc::EPERM, libc::EACCES, libc::EINVAL, 0] {
             let mut path_failed = FakeLibproc::healthy();
             path_failed.paths.insert(STRANGER, Err(errno));
             assert!(path_failed.read().is_err(), "path errno {errno}");
             assert_applied_nothing(path_failed);
-
+        }
+        for errno in [libc::EPERM, libc::ENOENT, libc::EINVAL, 0] {
             let mut info_failed = FakeLibproc::healthy();
             info_failed.info.insert(STRANGER, Err(errno));
             assert!(info_failed.read().is_err(), "info errno {errno}");
@@ -1623,5 +1628,41 @@ mod native_process_table {
         assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
         assert_eq!(report.removed, 3);
         assert!(planted.iter().all(|(orphan, _)| !orphan.exists()));
+    }
+
+    #[test]
+    fn replaced_executable_is_known_by_its_kernel_name() {
+        // An upgrade replaced the old daemon's binary while it runs.
+        let mut old_daemon = FakeLibproc::healthy();
+        old_daemon
+            .info
+            .insert(STRANGER, Ok(process(DAEMON_EXECUTABLE, uid())));
+        old_daemon.paths.insert(STRANGER, Err(libc::ENOENT));
+        assert!(old_daemon.read().expect("readable"));
+        assert_blocked(old_daemon, OtherDaemonState::Present);
+
+        // A browser helper still running after its update.
+        let mut helper = FakeLibproc::healthy();
+        helper
+            .info
+            .insert(STRANGER, Ok(process("chrome-native-h", uid())));
+        helper.paths.insert(STRANGER, Err(libc::ENOENT));
+        assert!(!helper.read().expect("readable"));
+        let (_f, planted, report) = sweep_with(helper);
+        assert_eq!(report.other_daemon_check, OtherDaemonState::Clear);
+        assert_eq!(report.removed, 3);
+        assert!(planted.iter().all(|(orphan, _)| !orphan.exists()));
+    }
+
+    #[test]
+    fn daemon_started_under_another_name_applies_nothing() {
+        let mut renamed = FakeLibproc::healthy();
+        renamed
+            .info
+            .insert(STRANGER, Ok(process("my-daemon-link", uid())));
+        renamed
+            .paths
+            .insert(STRANGER, Ok("/opt/ottto/bin/ottto-service"));
+        assert_blocked(renamed, OtherDaemonState::Present);
     }
 }
