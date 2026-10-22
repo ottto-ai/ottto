@@ -383,10 +383,16 @@ mod tests {
         legacy["bounded_sweep_had_unsettled_upload"] = json!(true);
         let mut legacy: ScanIndex = serde_json::from_value(legacy).unwrap();
         assert!(legacy.bounded_sweep_had_unsettled_upload);
-        assert!(legacy.bounded_sweep_unsettled_cause_names().is_empty());
+        assert_eq!(
+            legacy.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
         let started = start(&mut legacy, T0, BACKFILL_WINDOW_DAYS);
         assert_eq!(started[0]["counts"]["prior_unsettled_upload"], true);
-        assert_eq!(started[0]["counts"]["prior_unsettled_causes"], json!([]));
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["unattributed"])
+        );
 
         // Every cause round-trips, in declaration order.
         let mut marked = ScanIndex::default();
@@ -403,6 +409,7 @@ mod tests {
         ] {
             marked.mark_bounded_sweep_unsettled_by(cause);
         }
+        marked.mark_bounded_sweep_unsettled();
         let all = [
             "shed",
             "upload_error",
@@ -412,6 +419,7 @@ mod tests {
             "authority_census_withheld",
             "legacy_reconcile",
             "admission_reoffer",
+            "unattributed",
         ];
         assert_eq!(marked.bounded_sweep_unsettled_cause_names(), all);
         let restored: ScanIndex =
@@ -444,6 +452,106 @@ mod tests {
         index.prepare_historical_replay("unsettled-cause-replay".into());
         assert!(!index.bounded_sweep_had_unsettled_upload);
         assert!(index.bounded_sweep_unsettled_cause_names().is_empty());
+    }
+
+    /// A path that marks without naming itself is still named, as
+    /// `unattributed`, beside any named path in the same sweep. A flag with no
+    /// attribution (an older daemon) is unattributed too, so a later named
+    /// mark cannot conceal it. Bits a newer daemon set stay unknown.
+    #[test]
+    fn plain_and_missing_attribution_are_named_unattributed() {
+        let mut plain = ScanIndex::default();
+        plain.mark_bounded_sweep_unsettled();
+        assert!(plain.bounded_sweep_had_unsettled_upload);
+        assert_eq!(
+            plain.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
+
+        let mut named = ScanIndex::default();
+        named.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+        assert!(named.bounded_sweep_had_unsettled_upload);
+        assert_eq!(
+            named.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+
+        let mut plain_first = ScanIndex::default();
+        plain_first.mark_bounded_sweep_unsettled();
+        plain_first.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        let mut named_first = ScanIndex::default();
+        named_first.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        named_first.mark_bounded_sweep_unsettled();
+        for index in [&plain_first, &named_first] {
+            assert!(index.bounded_sweep_had_unsettled_upload);
+            assert_eq!(
+                index.bounded_sweep_unsettled_cause_names(),
+                ["shed", "unattributed"]
+            );
+        }
+
+        // An older daemon's flag, then a named mark on this daemon.
+        let mut legacy = serde_json::to_value(ScanIndex::default()).unwrap();
+        legacy["bounded_sweep_had_unsettled_upload"] = json!(true);
+        let mut legacy: ScanIndex = serde_json::from_value(legacy).unwrap();
+        legacy.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+        assert_eq!(
+            legacy.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict", "unattributed"]
+        );
+        let mut restored: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+        let started = start(&mut restored, T0, BACKFILL_WINDOW_DAYS);
+        assert_eq!(
+            started[0]["counts"]["prior_unsettled_causes"],
+            json!(["deferred_conflict", "unattributed"])
+        );
+
+        // A newer daemon's unknown bit stays beside later marks and a reload.
+        let mut flagged = ScanIndex::default();
+        flagged.bounded_sweep_had_unsettled_upload = true;
+        let mut newer = with_unsettled_causes(&flagged, 1 << 15);
+        assert_eq!(newer.bounded_sweep_unsettled_cause_names(), ["unknown"]);
+        newer.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+        let newer: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&newer).unwrap()).unwrap();
+        assert_eq!(
+            newer.bounded_sweep_unsettled_cause_names(),
+            ["shed", "unknown"]
+        );
+
+        // The flag is authoritative: stored bits without it name nothing.
+        let mut stray = with_unsettled_causes(&ScanIndex::default(), u16::MAX);
+        assert!(stray.bounded_sweep_unsettled_cause_names().is_empty());
+        stray.mark_bounded_sweep_unsettled();
+        assert_eq!(
+            stray.bounded_sweep_unsettled_cause_names(),
+            ["unattributed"]
+        );
+
+        // The retiring line names a plain mark too.
+        let mut index = ScanIndex::default();
+        start(&mut index, T1, BACKFILL_WINDOW_DAYS);
+        index.mark_bounded_sweep_unsettled();
+        let (_, rows) = capture(|| {
+            scan_source_roots(
+                SnapshotSource::Pi,
+                &[],
+                &mut index,
+                T1,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap()
+        });
+        let retired = rows
+            .iter()
+            .find(|row| row["counts"]["event"] == "retiring")
+            .unwrap();
+        assert_eq!(retired["counts"]["reason"], "complete_needs_clean_followup");
+        assert_eq!(
+            retired["counts"]["unsettled_causes"],
+            json!(["unattributed"])
+        );
     }
 
     /// The causes are diagnostics only. An index that differs only in them
@@ -694,7 +802,7 @@ mod tests {
             starting.context_matches = false; // longest boolean spelling
             starting.prior_unsettled_upload = false;
             starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
-            assert_eq!(starting.prior_unsettled_causes.len(), 8);
+            assert_eq!(starting.prior_unsettled_causes.len(), 10);
             starting.retry_due = Some(false);
             starting.stale_pending_families = usize::MAX;
             starting.rearmed_index_files = usize::MAX;
@@ -734,7 +842,7 @@ mod tests {
                     .as_array()
                     .unwrap()
                     .len(),
-                8
+                10
             );
             assert_complete_max_row(rows[0].clone());
         }

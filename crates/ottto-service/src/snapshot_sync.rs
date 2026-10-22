@@ -17307,6 +17307,26 @@ mod tests {
             .index
             .bounded_sweep_unsettled_cause_names()
             .is_empty());
+        // A Rejected page whose holds are restorable and non-blocking. H1
+        // (#690) settles it; then it must name no cause. Until then it stays
+        // unsettled and names itself. Either way no cause is named without
+        // the flag, nor the flag without a cause.
+        let restorable = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &LocalHoldSettlement {
+                progress_blocking: false,
+                ..holds(&held)
+            },
+            true,
+        );
+        let restorable_causes = restorable.index.bounded_sweep_unsettled_cause_names();
+        if restorable.index.bounded_sweep_had_unsettled_upload() {
+            assert_eq!(restorable_causes, ["rejected_with_holds"]);
+        } else {
+            assert!(restorable_causes.is_empty(), "{restorable_causes:?}");
+        }
 
         // The shed and error branches mark through the partial checkpoint.
         // A cause from an earlier page of the same sweep is kept beside it.

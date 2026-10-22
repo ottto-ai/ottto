@@ -35385,6 +35385,72 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    /// The unsettled causes are a diagnostic leaf. A malformed value decodes
+    /// as unattributed beside the authoritative flag; it never discards the
+    /// index or reads as a clean sweep.
+    #[test]
+    fn scan_index_load_isolates_a_malformed_unsettled_cause_diagnostic() {
+        let root = temp_dir("scan-index-malformed-unsettled-causes");
+        let malformed = [
+            serde_json::json!(null),
+            serde_json::json!("shed"),
+            serde_json::json!(-1),
+            serde_json::json!(65536),
+            serde_json::json!(1.5),
+            serde_json::json!([1]),
+            serde_json::json!({"shed": true}),
+        ];
+        for flag in [true, false] {
+            for (case, value) in malformed.iter().enumerate() {
+                let path = root.join(format!("claude-scan-index-{flag}-{case}.json"));
+                let mut index = ScanIndex {
+                    generation: 41,
+                    resume_after_path: Some("content-free-cursor".to_string()),
+                    ..ScanIndex::default()
+                };
+                if flag {
+                    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+                }
+                index.save(&path).expect("persist index");
+                let mut saved: serde_json::Value =
+                    serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+                saved["bounded_sweep_unsettled_causes"] = value.clone();
+                fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+
+                let loaded = ScanIndex::load(&path).expect("a diagnostic leaf never fails load");
+                assert!(path.exists(), "{value} must not quarantine the index");
+                assert_eq!(loaded.bounded_sweep_had_unsettled_upload, flag, "{value}");
+                assert_eq!(
+                    loaded.bounded_sweep_unsettled_cause_names(),
+                    if flag { vec!["unattributed"] } else { vec![] },
+                    "{value}"
+                );
+                let mut reloaded = serde_json::to_value(&loaded).unwrap();
+                for object in [&mut saved, &mut reloaded] {
+                    object
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("bounded_sweep_unsettled_causes");
+                }
+                assert_eq!(reloaded, saved, "{value}: the rest of the index survives");
+                assert_eq!(loaded.generation, 41);
+                assert_eq!(
+                    loaded.resume_after_path.as_deref(),
+                    Some("content-free-cursor")
+                );
+            }
+        }
+        assert_eq!(
+            fs::read_dir(&root)
+                .expect("read index directory")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
+                .count(),
+            0
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     #[test]
     fn scan_index_quarantines_syntactically_valid_corrupt_activity_witness() {
         let root = temp_dir("scan-index-corrupt-activity");

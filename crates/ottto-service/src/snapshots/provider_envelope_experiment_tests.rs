@@ -3771,6 +3771,39 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
 }
 
+/// Diagnostics only: the comparison fallback's fold and its selected restore
+/// each mark the sweep without naming a path, so both name `unattributed`,
+/// also beside a named page cause and across a reload.
+#[test]
+fn native_comparison_fallback_marks_name_unattributed() {
+    if !native_positive_layout_for_test("native_comparison_fallback_marks_name_unattributed") {
+        return;
+    }
+    let (_fixture, mut index, _scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    assert!(index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["unattributed"]
+    );
+    // Isolate the restore's own mark.
+    index.bounded_sweep_had_unsettled_upload = false;
+    index.bounded_sweep_unsettled_causes = 0;
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert!(index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        index.bounded_sweep_unsettled_cause_names(),
+        ["unattributed"]
+    );
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::Shed);
+    index.save(&path).unwrap();
+    let restored = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        restored.bounded_sweep_unsettled_cause_names(),
+        ["shed", "unattributed"]
+    );
+}
+
 /// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
 /// to `previous` and REMOVES its request-census record. No record of the
 /// withheld revision, and none restored from `previous`, survives.
