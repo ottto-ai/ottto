@@ -16484,8 +16484,10 @@ fn install_codex_parent_proof(
 /// U1a-2a (fix round 4, AutoReview #1): the install's P checks on `proof`
 /// now, for its completion fence: P's unique cap-free locate
 /// (`Identity`), then the proof seal's `admits` on that FD (`Seal`). It
-/// reads at most the seal's two sample windows. `None`: P is the object
-/// the proof was sealed against.
+/// reads at most the seal's two sample windows (`SAMPLE_READ_BYTES`, charged
+/// by the caller). `None`: P is the object the proof was sealed against.
+/// `Identity(Absent)` also stands for "census unavailable" (fix round 5,
+/// R1-N3): an unavailable census locates nothing.
 fn codex_parent_proof_refusal_now(
     census: CodexParentCensus<'_>,
     proof: &CodexParentPrefixProof,
@@ -16503,6 +16505,50 @@ fn codex_parent_proof_refusal_now(
             .err()
             .map(ProofRefusal::Seal),
     }
+}
+
+/// U1a-2a (fix round 5, R2-N2): whether the completion fence re-fences this
+/// parse's consumed proof: it consumed one and decided as it says, with no
+/// install refusal (the record site's `Admitted` case).
+fn codex_parent_proof_refenced(parsed: &ParsedJsonlFile) -> bool {
+    parsed.codex_parent_proof_used.is_some()
+        && parsed.codex_parent_prefix_decided.is_some()
+        && parsed.codex_parent_proof_refusal.is_none()
+}
+
+/// U1a-2a (fix round 5, N1): whether a held singleton completion forgets its
+/// hold memo instead of recording it, because the next parse installs a
+/// proof this one never tried. The key's entry is `Proven` for this parse's
+/// parent and `installable`, the census is available, the parse attempted no
+/// install (no proof used, no refusal: its parser was built before the entry
+/// turned `Proven`, e.g. a cursor job paused across the transition), and it
+/// is held for a cap cause, the only witness the proof arm consumes. Any
+/// install outcome (an `Identity` refusal included), a mislabelled or
+/// mis-scoped proof, an unavailable census or another cause keeps today's
+/// memo, so a persistent skip never reparses every page.
+fn codex_held_memo_awaits_proof_install(
+    index: &ScanIndex,
+    census: CodexParentCensus<'_>,
+    key: &str,
+    parsed: &ParsedJsonlFile,
+) -> bool {
+    parsed.codex_parent_proof_used.is_none()
+        && parsed.codex_parent_proof_refusal.is_none()
+        && census.available
+        && parsed
+            .codex_parent_unresolvable
+            .is_some_and(CodexParentUnresolvable::cap)
+        && parsed
+            .codex_parent_session_ref
+            .as_deref()
+            .is_some_and(|parent| {
+                matches!(
+                    index.codex_parent_prefix_proofs.get(key),
+                    Some(CodexParentProofState::Proven(proof))
+                        if proof.parent == resolve_codex_identity(parent)
+                            && proof.installable(&codex_parent_proof_scope()).is_some()
+                )
+            })
 }
 
 /// U1a-2a (row 33, D6(c)): slots of a proof job's signature window.
@@ -19504,13 +19550,13 @@ fn invalidate_stale_codex_parent_resolution(
     // (`Identity` or `Seal`, so the record site never settles `Admitted`)
     // and the parse is invalidated as below. A proof arm leaves no ledger
     // identity, so a passing proof falls through to `false`.
-    let proof_refusal = match (
-        parsed.codex_parent_proof_used.as_ref(),
-        parsed.codex_parent_prefix_decided.as_ref(),
-        parsed.codex_parent_proof_refusal.as_ref(),
-    ) {
-        (Some(proof), Some(_), None) => codex_parent_proof_refusal_now(census, proof),
-        _ => None,
+    let proof_refusal = if codex_parent_proof_refenced(parsed) {
+        parsed
+            .codex_parent_proof_used
+            .as_ref()
+            .and_then(|proof| codex_parent_proof_refusal_now(census, proof))
+    } else {
+        None
     };
     if let Some(refusal) = proof_refusal {
         parsed.codex_parent_proof_refusal = Some(refusal);
@@ -22560,6 +22606,11 @@ impl OwnedSourceScan {
                     }
                 }
                 let codex_parent_census = codex_parent_identities.census(index);
+                // Fix round 5 (R2-N2): the proof re-fence's seal samples are
+                // charged like every proof-side fence read.
+                if codex_parent_proof_refenced(&parsed_file) {
+                    codex_page.charge(false, sampled_scan::codex_cursor::SAMPLE_READ_BYTES);
+                }
                 invalidate_stale_codex_parent_resolution(
                     &mut parsed_file,
                     &mut codex_parent_identities,
@@ -22936,7 +22987,17 @@ impl OwnedSourceScan {
                     let held = !parse_complete
                         && non_progressing_residue
                         && ownership_incomplete_file_count > 0;
-                    match memo_candidate.filter(|_| held) {
+                    // U1a-2a (fix round 5, N1): a hold built before its proof
+                    // turned `Proven` is not memoized, so the next page parses
+                    // and reaches the install.
+                    let awaits_proof = held
+                        && codex_held_memo_awaits_proof_install(
+                            index,
+                            codex_parent_identities.census(index),
+                            &index_key,
+                            &parsed_file,
+                        );
+                    match memo_candidate.filter(|_| held && !awaits_proof) {
                         Some((digest, live, stamp, sidecar)) => {
                             // L4: the ledger identity the classification used, and
                             // the parent's opened identity. When a ledger was used,

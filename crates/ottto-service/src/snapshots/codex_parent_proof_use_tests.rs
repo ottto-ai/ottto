@@ -2406,6 +2406,9 @@ fn a_consumed_proof_is_refenced_against_p_at_completion() {
         );
         assert!(parsed.complete() && parsed.codex_parent_prefix_decided.is_some());
         assert!(!parsed.snapshots.is_empty());
+        // Fix round 5 (R2-N2): the predicate the call site charges
+        // `SAMPLE_READ_BYTES` on.
+        assert!(codex_parent_proof_refenced(&parsed));
         (scene, proof, parsed)
     };
     let fence = |scene: &Scene, parsed: &mut ParsedJsonlFile| {
@@ -2415,6 +2418,7 @@ fn a_consumed_proof_is_refenced_against_p_at_completion() {
         invalidate_stale_codex_parent_resolution(parsed, &mut ids, census)
     };
     let refused = |parsed: &ParsedJsonlFile| {
+        assert!(!codex_parent_proof_refenced(parsed));
         assert!(parsed.snapshots.is_empty());
         assert!(parsed.codex_parent_resolution_pending);
         assert!(!parsed.complete());
@@ -2656,4 +2660,110 @@ fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     let mut page = PageBudget::default();
     scene.hook_in(&cache, &hook_pass(), &mut page, now);
     assert_eq!((scene.proof().matched, scene.proof().owned), (2, true));
+}
+
+/// Fix round 5 (N1): a held completion whose parser was built before its
+/// entry turned `Proven` (a cursor job paused across the transition: no
+/// install, no refusal) does not memoize its hold, so the next page parses,
+/// reaches the install and resolves. Every install outcome (an `Identity`
+/// refusal included) and every persistent skip (a mis-scoped or mislabelled
+/// proof, no `Proven` entry, another parent, an unavailable census, a cause
+/// the proof arm does not consume) keeps today's memo: no per-page reparse.
+#[test]
+fn a_hold_built_before_its_proof_is_not_memoized() {
+    use CodexParentUnresolvable::*;
+    let awaits = |scene: &Scene, parsed: &ParsedJsonlFile| {
+        let ids = CodexParentIdentities::new(SnapshotSource::Codex, scene.index.traversal.as_ref());
+        codex_held_memo_awaits_proof_install(
+            &scene.index,
+            ids.census(&scene.index),
+            &scene.key(),
+            parsed,
+        )
+    };
+    let held = |scene: &Scene, cause: CodexParentUnresolvable| {
+        let parsed = parse(&scene.child.path, witness(cause), None);
+        assert!(!parsed.complete());
+        assert_eq!(parsed.codex_parent_unresolvable, Some(cause));
+        parsed
+    };
+
+    // The paused job's parse: held on P's cap, no install tried: no memo.
+    let mut scene = Scene::new("await-proof");
+    assert!(awaits(&scene, &held(&scene, Oversize)));
+    assert!(awaits(&scene, &held(&scene, LedgerCapped)));
+    // The next page installs, the child resolves, and records as today.
+    let proof = scene.proof();
+    assert_eq!(scene.install(), (true, Some(proof.clone()), None));
+    let resolved = parse(
+        &scene.child.path,
+        witness(Oversize),
+        Some(installed(&proof)),
+    );
+    assert!(resolved.complete());
+    assert_eq!(resolved.codex_parent_proof_used.as_ref(), Some(&proof));
+    assert!(!awaits(&scene, &resolved));
+    // A cause the proof arm does not consume: the memo stays.
+    let lossy = parse(&scene.child.path, witness(ParentLossy), None);
+    assert!(!lossy.complete());
+    assert!(!awaits(&scene, &lossy));
+
+    // An `Identity` refusal: the install ran; the memo stays.
+    let mut scene = Scene::new("await-identity");
+    fs::remove_file(&scene.parent).unwrap();
+    let (_, _, refusal) = scene.install();
+    assert!(
+        matches!(refusal, Some(ProofRefusal::Identity(_))),
+        "{refusal:?}"
+    );
+    let refused = parse_forged(&scene.child.path, witness(Oversize), None, |acc| {
+        acc.codex_parent_proof_refusal = refusal.clone();
+    });
+    assert!(!refused.complete());
+    assert!(!awaits(&scene, &refused));
+
+    // Persistent skips: each keeps the memo.
+    let mut scene = Scene::new("await-skips");
+    let key = scene.key();
+    let parsed = held(&scene, Oversize);
+    let p_file = File::open(&scene.parent).unwrap();
+    let now = sampled_scan::now_seconds();
+    let mis_scoped = proof_of(
+        &child_values(),
+        &parent_values(),
+        seal_of(&p_file, now, &codex_parent_side_scope().0),
+    );
+    let mislabelled = CodexParentPrefixProof {
+        owned: false,
+        ..scene.proof()
+    };
+    let other_parent = CodexParentPrefixProof {
+        parent: OTHER.into(),
+        ..scene.proof()
+    };
+    for proof in [mis_scoped, mislabelled, other_parent] {
+        scene
+            .index
+            .codex_parent_prefix_proofs
+            .insert(key.clone(), CodexParentProofState::Proven(proof));
+        assert!(!awaits(&scene, &parsed));
+    }
+    scene.index.remove_codex_parent_proof(&key);
+    assert!(!awaits(&scene, &parsed), "no proven entry");
+
+    let mut scene = Scene::new("await-census");
+    let parsed = held(&scene, Oversize);
+    scene
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .pending_directories
+        .push_back(ScanTraversalPath {
+            scan_root: scene.root.clone(),
+            path: scene.root.join("sub"),
+            census_member: true,
+            watcher_hint: false,
+        });
+    assert!(!awaits(&scene, &parsed), "an unavailable census");
 }
