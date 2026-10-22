@@ -19,8 +19,8 @@ use super::decode::{
 use super::file::LineSink;
 use super::MAX_ITEMS_PER_CALL;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, CallClass, ContentLabel, InnerItem, Kind, LineCtx, ParsedCommand,
-    Request1, Verdict,
+    self as kinds, Agent, Author, CallClass, ContentLabel, InnerItem, Kind, KindsVersion, LineCtx,
+    ParsedCommand, Request1, Verdict,
 };
 use serde_json::Value;
 use std::borrow::Cow;
@@ -188,6 +188,8 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         } else {
             Author::You
         },
+        // kinds_version 1 ids until this reader adopts the v2 classifier.
+        kinds_version: KindsVersion::V1,
     };
     let payload_type = payload.kind.str();
     let payload_type = payload_type.as_deref().unwrap_or("");

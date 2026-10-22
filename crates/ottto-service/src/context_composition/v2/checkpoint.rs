@@ -428,6 +428,9 @@ impl StoredParse {
                 part: part_from_str(part)?,
                 tool: ToolKey::new(tool),
                 file: file.map(Into::into),
+                // kinds_version 1 classes have no shares; storing them comes
+                // with the v2 classifier.
+                shares: Box::default(),
             })
         };
         let mut open_calls = BTreeMap::new();

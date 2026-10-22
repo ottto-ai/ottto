@@ -20,7 +20,8 @@ use super::decode::{
 };
 use super::file::LineSink;
 use crate::composition_kinds::{
-    self as kinds, Agent, Author, CallClass, ClaudeAttachment, LineCtx, Request1, Verdict,
+    self as kinds, Agent, Author, CallClass, ClaudeAttachment, KindsVersion, LineCtx, Request1,
+    Verdict,
 };
 use serde_json::Value;
 use std::path::Path;
@@ -155,6 +156,8 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         cwd: cwd.as_deref().map(Path::new),
         file_has_rendered: state.has_rendered,
         author,
+        // kinds_version 1 ids until this reader adopts the v2 classifier.
+        kinds_version: KindsVersion::V1,
     };
 
     let blocks: Vec<Raw> = message

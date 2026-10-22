@@ -12,12 +12,15 @@
 //! folders; `~/.codex/sessions`, `archived_sessions` and accepted Codex slot
 //! homes).
 //!
-//! The measurement methodology is a straight Rust port of the reference
-//! implementation `context_composition_audit.py` and its `methodology.md`; the
-//! golden tests below pin the same hand-computed numbers, so this collector
-//! produces numerically identical per-category / per-file / per-session results
-//! on the same inputs. Every number is an ESTIMATE (chars/4 tokenizer proxy;
-//! nominal per-image cost); nothing here reproduces a provider tokenizer.
+//! The kinds_version 1 methodology started as a port of an earlier Python
+//! reference script, and the golden tests pin its hand-computed numbers. The
+//! two have since diverged (this collector skips copied history and reads
+//! Codex's per-block content labels; the script does neither), and the
+//! kinds_version 2 classification in `composition_kinds` exists only here.
+//! The shared wire fixture (`fixtures/context-composition/kinds-v2.json`), not
+//! the script, is the cross-check. Every number is an ESTIMATE (chars/4
+//! tokenizer proxy; nominal per-image cost); nothing here reproduces a
+//! provider tokenizer.
 //!
 //! Privacy: aggregates only, never message bodies. Top-file names are made
 //! repo-relative or reduced to a bare basename; session ids are hashed with
@@ -69,7 +72,7 @@ use {
 };
 
 // -------------------------------------------------------------------------
-// Methodology knobs (see references/methodology.md in the audit skill).
+// Methodology knobs.
 // -------------------------------------------------------------------------
 
 /// Tokenizer proxy: ~4 chars per token. ESTIMATE ONLY.

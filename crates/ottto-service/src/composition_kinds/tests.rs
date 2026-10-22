@@ -185,6 +185,7 @@ fn codex_calls_and_events_match_v1() {
                     part: Part::Unsplit,
                     tokens: 25,
                     file: None,
+                    tool: None,
                 }]
             );
         }
