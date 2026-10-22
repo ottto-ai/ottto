@@ -346,6 +346,7 @@ fn inventory_paths(hint: Option<&ActivityHintResponse>) -> Option<InventoryPaths
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn harvest_recent_workspaces(
     client: &SnapshotApiClient,
     relay_token: &str,
@@ -432,6 +433,7 @@ fn should_include_mcp_servers(workspace_index: usize) -> bool {
     workspace_index == 0
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_request_for_workspace(
     workspace: &Path,
     machine_id: &str,
