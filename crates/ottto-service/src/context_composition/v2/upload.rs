@@ -21,7 +21,7 @@ use super::super::{BUCKET_TIMEZONE, CHARS_PER_TOKEN, COUNTER_SOURCE, IMAGE_NOMIN
 use super::aggregate::{
     date_of, merge_file_totals, AggregateRef, Bucket, Day, FileTotals, Slot, Window,
 };
-use super::checkpoint::{read_json, write_json};
+use super::checkpoint::{name_hash, read_json, write_json};
 use super::file::Source;
 use super::scope::{scope_file_stem, Scope};
 use super::{
@@ -783,22 +783,35 @@ fn parent_session(session: &str) -> &str {
 }
 
 /// Fill each top file's session counts from the checkpoints' own per-day
-/// file rows (the days still in the window): no state of its own.
+/// file rows (and a cold checkpoint's last day per file), for the days still
+/// in the window: no state of its own.
 fn count_file_sessions(scope: &Scope, window: Window, rows: &mut [FileRow]) {
     let mut sessions: BTreeMap<&str, (BTreeSet<&str>, BTreeSet<&str>)> = rows
         .iter()
         .map(|row| (row.relative_path_or_name.as_str(), Default::default()))
+        .collect();
+    let by_hash: BTreeMap<u32, &str> = rows
+        .iter()
+        .map(|row| {
+            let name = row.relative_path_or_name.as_str();
+            (name_hash(name), name)
+        })
         .collect();
     for checkpoint in scope.files.values() {
         let Some(session) = checkpoint.contribution.session() else {
             continue;
         };
         let session = parent_session(session);
-        for (day, path) in checkpoint.contribution.file_days() {
+        // Names in state are the safe names the rows carry.
+        let warm = checkpoint.contribution.file_days();
+        let cold = checkpoint.cold.iter().flat_map(|cold| {
+            cold.files()
+                .filter_map(|(hash, day)| Some((day, *by_hash.get(&hash)?)))
+        });
+        for (day, path) in warm.chain(cold) {
             if !window.contains(day) {
                 continue;
             }
-            // Names in state are the safe names the rows carry.
             if let Some((all, recent)) = sessions.get_mut(path) {
                 all.insert(session);
                 if day >= window.period_floor {

@@ -1302,6 +1302,20 @@ impl StoredContribution {
             + self.session.as_ref().map_or(0, String::len)
     }
 
+    /// Drop all but the session (a cold file's share). Returns whether
+    /// anything was dropped.
+    pub(super) fn keep_session_only(&mut self) -> bool {
+        let dropped = !(self.parts.is_empty()
+            && self.files.is_empty()
+            && self.tools.is_empty()
+            && self.sessions.is_empty());
+        self.parts = Vec::new();
+        self.files = Vec::new();
+        self.tools = Vec::new();
+        self.sessions = Vec::new();
+        dropped
+    }
+
     /// Drop days before `floor` (their daily rows are gone).
     pub(super) fn prune(&mut self, floor: Day) {
         self.parts.retain(|row| row.0 >= floor);

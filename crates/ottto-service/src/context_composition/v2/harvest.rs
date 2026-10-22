@@ -28,6 +28,7 @@ use super::aggregate::{day_of, Aggregate, Day, StoredContribution, Window};
 use super::checkpoint::{
     birth_secs, born_secs, file_identity, fingerprints, fingerprints_match, prefix_matches,
     read_json, stamp, write_json, Checkpoint, Index, Pin, RunRecord, Stamp, Status, StoredParse,
+    COLD_AFTER_SECS,
 };
 use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::scope::{
@@ -258,7 +259,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} bad_state={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -283,6 +284,8 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.repair_waiting,
         stats.repair_waiting_bytes,
         stats.repair_restarted,
+        stats.cold_compacted,
+        stats.cold_restarted,
         stats.bad_state,
         stats.pins_rebuilt,
         stats.moved,
@@ -451,6 +454,10 @@ pub(super) struct SourceStats {
     pub(super) repair_waiting: u64,
     pub(super) repair_waiting_bytes: u64,
     pub(super) repair_restarted: u64,
+    /// Checkpoints made cold this run (see `Checkpoint::compact`).
+    pub(super) cold_compacted: u64,
+    /// Cold files rewritten: restarted at their end, not read again.
+    pub(super) cold_restarted: u64,
     pub(super) bad_state: u64,
     pub(super) pins_rebuilt: u64,
     pub(super) scopes_committed: u64,
@@ -1162,6 +1169,10 @@ fn process_scope(
 
     let read_keys: Vec<String> = read_files.iter().map(|(key, _)| key.clone()).collect();
     scope.files.extend(read_files);
+    // Files unchanged for `COLD_AFTER_SECS` and not read now go cold.
+    let cold_before = run.now.unix_timestamp() - COLD_AFTER_SECS;
+    let read_now: BTreeSet<&str> = read_keys.iter().map(String::as_str).collect();
+    let mut compacted = 0;
     // Checkpoints follow their pins: a file forgotten by the pins is gone.
     // A pin with no scope (rebuilt pins that lost it) is pinned here again,
     // never dropped.
@@ -1181,9 +1192,16 @@ fn process_scope(
         if pin.done {
             checkpoint.status = Status::Done;
         }
-        checkpoint.contribution.prune(window.floor);
+        checkpoint.prune(window.floor);
+        if checkpoint.mtime.0 < cold_before
+            && !read_now.contains(key.as_str())
+            && checkpoint.compact()
+        {
+            compacted += 1;
+        }
         true
     });
+    stats.cold_compacted += compacted;
     scope.agg.prune(window);
     if scope
         .agg
@@ -1290,13 +1308,22 @@ fn read_file(
             let rewritten = size < checkpoint.offset
                 || !fingerprints_match(&file, checkpoint)
                 || checkpoint.parse.clone().into_state().is_none();
-            if rewritten {
+            if rewritten && checkpoint.cold.is_some() {
+                stats.cold_restarted += 1;
+                mode = Mode::RestartAtEnd;
+            } else if rewritten {
                 mode = grant(run, stats, size);
                 if mode == Mode::Forward {
                     return Ok(Some(Outcome::Waiting));
                 }
             }
         }
+    }
+    // A cold file's share of the totals is gone, so a full read could not
+    // replace it: it restarts at its end instead.
+    if mode == Mode::Full && existing.is_some_and(|checkpoint| checkpoint.cold.is_some()) {
+        stats.cold_restarted += 1;
+        mode = Mode::RestartAtEnd;
     }
     // The scope keeps this checkpoint until the read succeeds.
     let existing = existing.cloned();
@@ -1305,6 +1332,9 @@ fn read_file(
         |checkpoint| checkpoint.created,
     );
     let mut old_share = None;
+    let cold = existing
+        .as_ref()
+        .and_then(|checkpoint| checkpoint.cold.clone());
     let (mut checkpoint, mut state) = match (mode, existing) {
         (Mode::Forward, Some(checkpoint)) => {
             // Checked above: a checkpoint whose state does not load is
@@ -1352,6 +1382,7 @@ fn read_file(
                     parse: StoredParse::default(),
                     contribution,
                     last_seen: window.today,
+                    cold,
                 },
                 state,
             )

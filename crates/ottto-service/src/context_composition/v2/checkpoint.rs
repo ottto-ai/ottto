@@ -12,7 +12,7 @@
 //! never lets one file count in two scopes; the scope state stays the truth
 //! for offsets.
 
-use super::aggregate::{Day, Id, Slot, StoredContribution};
+use super::aggregate::{stable_hash, Day, Id, Slot, StoredContribution};
 use super::scope::ScopeInfo;
 use super::{MAX_OPEN_CALLS, STATE_SCHEMA};
 use crate::composition_kinds::{CallClass, CallShare, Kind, Part, ToolKey};
@@ -237,6 +237,42 @@ pub(super) struct Checkpoint {
     #[serde(default)]
     pub(super) contribution: StoredContribution,
     pub(super) last_seen: Day,
+    /// Set once the file has been idle for `COLD_AFTER_SECS`: see
+    /// `compact`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) cold: Option<Cold>,
+}
+
+/// A file unchanged this long is cold.
+pub(super) const COLD_AFTER_SECS: i64 = 2 * 86_400;
+
+/// What a cold checkpoint keeps of the per-day file rows: the last day each
+/// file was read, by a short hash of its name (for the per-file session
+/// counts), grouped by that day.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub(super) struct Cold {
+    files: Vec<(Day, Vec<u32>)>,
+}
+
+impl Cold {
+    /// (name hash, last day read) of each file the transcript read.
+    pub(super) fn files(&self) -> impl Iterator<Item = (u32, Day)> + '_ {
+        self.files
+            .iter()
+            .flat_map(|(day, hashes)| hashes.iter().map(move |hash| (*hash, *day)))
+    }
+
+    fn rows(&self) -> usize {
+        self.files.iter().map(|(_, hashes)| 1 + hashes.len()).sum()
+    }
+}
+
+/// The hash a cold checkpoint keeps of a file name. 32 bits: the session
+/// counts only look up the few top file names, so a rare collision can add
+/// one session to one count, never move tokens.
+pub(super) fn name_hash(name: &str) -> u32 {
+    stable_hash(name.as_bytes()) as u32
 }
 
 impl Checkpoint {
@@ -246,6 +282,40 @@ impl Checkpoint {
             + self.parser_version.len()
             + self.parse.accounted_bytes()
             + self.contribution.accounted_bytes()
+            + self.cold.as_ref().map_or(0, |cold| cold.rows() * 8)
+    }
+
+    /// Keep an idle file's checkpoint small: its offset, fingerprints and
+    /// parse state stay; its share of the totals is dropped (only the
+    /// session is kept), the open tokens are kept per day and kind (on the
+    /// largest part of each), and the file rows become the last day each
+    /// file was read. A cold file is never read again in full, since its
+    /// share could not be replaced: a rewrite restarts it at its end.
+    /// Returns whether anything was dropped.
+    pub(super) fn compact(&mut self) -> bool {
+        let was_cold = self.cold.is_some();
+        let cold = self.cold.get_or_insert_with(Cold::default);
+        let mut last: BTreeMap<u32, Day> = cold.files().collect();
+        for (day, name) in self.contribution.file_days() {
+            let entry = last.entry(name_hash(name)).or_insert(day);
+            *entry = (*entry).max(day);
+        }
+        let mut by_day: BTreeMap<Day, Vec<u32>> = BTreeMap::new();
+        for (hash, day) in last {
+            by_day.entry(day).or_default().push(hash);
+        }
+        cold.files = by_day.into_iter().collect();
+        let dropped = self.contribution.keep_session_only();
+        let folded = self.parse.fold_open_by_kind();
+        !was_cold || dropped || folded
+    }
+
+    /// Drop days before `floor`.
+    pub(super) fn prune(&mut self, floor: Day) {
+        self.contribution.prune(floor);
+        if let Some(cold) = &mut self.cold {
+            cold.files.retain(|(day, _)| *day >= floor);
+        }
     }
 }
 
@@ -439,6 +509,29 @@ impl StoredParse {
                 .iter()
                 .map(|call| 192 + call.shares.len() * 96 + call.items.len() * 128)
                 .sum::<usize>()
+    }
+
+    /// Keep one open row per day and kind, on the part holding the most
+    /// tokens (later residency then lands on that part). Returns whether
+    /// rows were merged.
+    fn fold_open_by_kind(&mut self) -> bool {
+        type Folded = (Id<Part>, Option<Box<str>>, u64, u64);
+        let before = self.open.len();
+        let mut by_kind: BTreeMap<(Day, Id<Kind>), Folded> = BTreeMap::new();
+        for (day, kind, part, server, tokens) in std::mem::take(&mut self.open) {
+            let entry = by_kind
+                .entry((day, kind))
+                .or_insert_with(|| (part, server.clone(), tokens, 0));
+            if tokens > entry.2 {
+                (entry.0, entry.1, entry.2) = (part, server, tokens);
+            }
+            entry.3 += tokens;
+        }
+        self.open = by_kind
+            .into_iter()
+            .map(|((day, kind), (part, server, _, total))| (day, kind, part, server, total))
+            .collect();
+        self.open.len() != before
     }
 
     pub(super) fn from_state(state: &ParseState) -> Self {

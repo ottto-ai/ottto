@@ -15,9 +15,9 @@ use super::super::report::{DateWindow, WorkspaceReport};
 use super::super::tests::{codex_sess, sess_a, sess_b, sess_c};
 use super::aggregate::{
     all_kinds, day_of, kind_from_str, kind_position, part_from_str, part_position, Aggregate,
-    Contribution, Day, Sink, Window, ALL_PARTS,
+    Contribution, Day, Sink, Slot, Window, ALL_PARTS,
 };
-use super::checkpoint::{CopiedMode, Index, ParseState, StoredParse};
+use super::checkpoint::{Checkpoint, CopiedMode, Index, ParseState, Status, StoredParse};
 use super::decode::{claude_never_counted, codex_never_counted, content_chars_and_images, Raw};
 use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::harvest::{begin_run, run_source, Run, SourceStats};
@@ -1950,6 +1950,160 @@ fn top_files_count_the_sessions_that_read_them() {
     );
     env.cleanup();
     env_one.cleanup();
+}
+
+/// `records` as another session's.
+fn as_session(records: Vec<Value>, session: &str) -> Vec<Value> {
+    records
+        .into_iter()
+        .map(|mut record| {
+            record["sessionId"] = json!(session);
+            record["uuid"] = json!(format!("{session}-{}", record["uuid"].as_str().unwrap()));
+            record
+        })
+        .collect()
+}
+
+#[test]
+fn idle_checkpoints_go_cold_and_a_cold_rewrite_restarts_at_its_end() {
+    let env = Env::new("composition-v2-cold");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let file = format!("{cwd}/src/shared.rs");
+    let idle = env.root.join("p/idle.jsonl");
+    let mut records = claude_turn(&cwd, day, 1);
+    records.extend(claude_read_turn(&cwd, day, 2, &file));
+    write_records(&idle, &records);
+    env.run(Source::Claude, now, None);
+    let first = env.scope(Source::Claude);
+    assert!(first
+        .files
+        .values()
+        .all(|checkpoint| checkpoint.cold.is_none()));
+    let day_tokens = |agg: &Aggregate| -> u64 {
+        agg.days
+            .iter()
+            .filter(|((row_day, _), _)| *row_day == day_of(day))
+            .map(|(_, bucket)| bucket.tokens)
+            .sum()
+    };
+
+    // Days later another session reads the same file. The idle file (its
+    // file unchanged for over two days) goes cold: its totals stay, its
+    // share is dropped, and it still counts as a session that read the file.
+    let later = now + time::Duration::days(13);
+    let other = env.root.join("p/other.jsonl");
+    write_records(
+        &other,
+        &as_session(claude_read_turn(&cwd, later.date(), 3, &file), "s2"),
+    );
+    let mut capture = Capture::default();
+    let stats = env.run(Source::Claude, later, Some(&mut capture));
+    assert_eq!(stats.cold_compacted, 1);
+    let scope = env.scope(Source::Claude);
+    let cold = |scope: &super::scope::Scope| {
+        scope
+            .files
+            .values()
+            .find(|checkpoint| checkpoint.path.ends_with("idle.jsonl"))
+            .cloned()
+            .unwrap()
+    };
+    let checkpoint = cold(&scope);
+    assert!(checkpoint.cold.is_some());
+    assert_eq!(checkpoint.contribution.file_days().count(), 0);
+    assert_eq!(checkpoint.contribution.session(), Some("s1"));
+    assert_eq!(day_tokens(&scope.agg), day_tokens(&first.agg));
+    let row = capture.payloads[0]["top_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["relative_path_or_name"] == "src/shared.rs")
+        .cloned()
+        .unwrap();
+    assert_eq!(
+        (&row["session_count"], &row["session_count_30d"]),
+        (&json!(2), &json!(2))
+    );
+    let totals = total_tokens(&scope.agg);
+
+    // A cold file rewritten is never read again: it restarts at its end,
+    // counted, and nothing changes.
+    let replacement = env.root.join("p/idle.tmp");
+    write_records(&replacement, &claude_turn(&cwd, day, 7));
+    fs::rename(&replacement, &idle).unwrap();
+    let stats = env.run(Source::Claude, later + time::Duration::days(1), None);
+    assert_eq!(
+        (stats.cold_restarted, stats.bytes_repair, stats.bytes_new),
+        (1, 0, 0)
+    );
+    let scope = env.scope(Source::Claude);
+    assert_eq!(total_tokens(&scope.agg), totals);
+    assert!(cold(&scope).cold.is_some());
+
+    // Lines appended to it later count as new lines.
+    let more = claude_turn(&cwd, later.date(), 8);
+    append_records(&idle, &more);
+    let stats = env.run(Source::Claude, later + time::Duration::days(2), None);
+    assert_eq!(stats.bytes_new as usize, body(&more).len());
+    assert!(total_tokens(&env.scope(Source::Claude).agg) > totals);
+    env.cleanup();
+}
+
+#[test]
+fn compaction_keeps_open_tokens_per_day_and_kind() {
+    use crate::composition_kinds::Part;
+    let mut state = ParseState {
+        session: "s".into(),
+        ..Default::default()
+    };
+    state.add_open(1, &Slot::plain(Kind::CommandOutput, Part::Git), 10);
+    state.add_open(1, &Slot::plain(Kind::CommandOutput, Part::Search), 30);
+    state.add_open(1, &Slot::plain(Kind::FilesRead, Part::FileTool), 5);
+    state.add_open(2, &Slot::plain(Kind::CommandOutput, Part::Git), 7);
+    let mut checkpoint = Checkpoint {
+        path: String::new(),
+        dev: 0,
+        ino: 0,
+        created: 0,
+        offset: 0,
+        skipping: false,
+        head: Default::default(),
+        tail: Default::default(),
+        size: 0,
+        mtime: (0, 0),
+        parser_version: String::new(),
+        status: Status::Live,
+        parse: StoredParse::from_state(&state),
+        contribution: Default::default(),
+        last_seen: 0,
+        cold: None,
+    };
+    assert!(checkpoint.compact());
+    let open: BTreeSet<(Day, Kind, Part, u64)> = checkpoint
+        .parse
+        .clone()
+        .into_state()
+        .unwrap()
+        .open
+        .into_iter()
+        .map(|(day, slot, tokens)| (day, slot.kind, slot.part, tokens))
+        .collect();
+    // Each day and kind keeps its tokens, on its largest part.
+    assert_eq!(
+        open,
+        BTreeSet::from([
+            (1, Kind::CommandOutput, Part::Search, 40),
+            (1, Kind::FilesRead, Part::FileTool, 5),
+            (2, Kind::CommandOutput, Part::Git, 7),
+        ])
+    );
+    // Compacting again changes nothing; the cold form round-trips.
+    assert!(!checkpoint.compact());
+    let json = serde_json::to_string(&checkpoint).unwrap();
+    let back: Checkpoint = serde_json::from_str(&json).unwrap();
+    assert_eq!(back.cold, checkpoint.cold);
 }
 
 // -------------------------------------------------------------------------
