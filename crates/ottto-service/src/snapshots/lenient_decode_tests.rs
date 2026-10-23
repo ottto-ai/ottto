@@ -621,19 +621,21 @@ fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
         let mut index = fixture();
         index.save(&path).unwrap();
         let mut value = serde_json::to_value(&index).unwrap();
-        value["files"]["opaque-large"] = serde_json::json!({"unknown": "x".repeat(8192)});
-        value["unknown_padding"] = serde_json::json!("p".repeat(128 * 1024));
+        value["files"]["opaque-large"] =
+            serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+        value["unknown_padding"] = serde_json::json!("p".repeat(20 * 1024 * 1024));
         let bytes = serde_json::to_vec(&value).unwrap();
         fs::write(&path, &bytes).unwrap();
         let mut loaded = ScanIndex::load(&path).unwrap();
         assert!(!loaded.decode_holds.is_empty());
         let generation = loaded.generation;
         let result = if bounded {
-            loaded.save_with_read_limit(&path, 1024 * 1024)
+            loaded.save_with_read_limit(&path, 32 * 1024 * 1024)
         } else {
             loaded.save(&path)
         };
         assert!(result.is_err());
+        assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
         assert_eq!(loaded.generation, generation);
         assert_eq!(fs::read(&path).unwrap(), bytes);
         assert_eq!(corrupt_count(scratch.as_ref()), 0);
@@ -1887,7 +1889,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"pending-family":{"census_window_end":"2026-10-22T00:00:00Z","member_request_id_hashes":{"member":["hash"]},"invalid":false}})
             }
             "claude_request_census" => {
-                serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact"}})
+                serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact","b":"AAAAAAAAAAE="}})
             }
             "claude_request_census_shadow" => serde_json::json!({"o":true}),
             "claude_duplicate_request_owners" => {
