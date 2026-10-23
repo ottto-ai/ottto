@@ -292,6 +292,36 @@ fn with_bootstrap_deferred(
     }
 }
 
+/// Carry a newer refused-body conflict even when the frozen upload delta is
+/// empty. New conflicts were already counted by bootstrap/main upload; this
+/// adds only older, untransmitted debt from the current source universe.
+fn with_retained_refusal_conflicts(
+    result: ResumableUploadResult,
+    index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+) -> ResumableUploadResult {
+    let retained = index
+        .current_snapshot_fingerprint_refs()
+        .filter(|fingerprint| {
+            !progress.attempted_reason_reoffers.contains(*fingerprint)
+                && progress
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|refusal| {
+                        progress
+                            .quarantined_fingerprints
+                            .get(*fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(refusal.body_witness.as_str())
+                            })
+                    })
+        })
+        .collect::<BTreeSet<_>>();
+    with_bootstrap_deferred(result, retained.len())
+}
+
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
@@ -6171,7 +6201,13 @@ fn finish_sync_source(
         }
         Ok(result)
     })
-    .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
+    .map(|result| {
+        with_retained_refusal_conflicts(
+            with_bootstrap_deferred(result, bootstrap_deferred),
+            &index,
+            &upload_progress,
+        )
+    });
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
@@ -8478,7 +8514,6 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
-    let mut conflicts_this_pass = BTreeSet::new();
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -8523,22 +8558,6 @@ where
             }
             Ok(SnapshotPageOutcome::Settled { conflicted }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
-                if conflicted > 0 {
-                    for index in &indices {
-                        let item = &items[*index];
-                        if progress
-                            .quarantined_fingerprints
-                            .get(fingerprint(item))
-                            .is_some_and(|record| {
-                                record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                    && record.upload_body_witness.as_deref()
-                                        == Some(body_witness(item).as_str())
-                            })
-                        {
-                            conflicts_this_pass.insert(fingerprint(item));
-                        }
-                    }
-                }
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -8662,23 +8681,6 @@ where
         }
     }
 
-    conflicted_entities += current_body_witnesses
-        .iter()
-        .filter(|(fingerprint, body)| {
-            !conflicts_this_pass.contains(fingerprint.as_str())
-                && progress
-                    .permanent_rejections
-                    .get(*fingerprint)
-                    .is_some_and(|refusal| refusal.body_witness == **body)
-                && progress
-                    .quarantined_fingerprints
-                    .get(*fingerprint)
-                    .is_some_and(|record| {
-                        record.disposition == SnapshotQuarantineDisposition::RetryPending
-                            && record.upload_body_witness.as_deref() == Some(body.as_str())
-                    })
-        })
-        .count();
     if conflicted_entities > 0 {
         // Every conflicting entity is durably quarantined with the same
         // bounded backoff a rejection gets, and every sibling in the page is

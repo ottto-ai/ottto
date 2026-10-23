@@ -717,7 +717,34 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         |_| Ok(()),
     )
     .unwrap();
-    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(
+        with_retained_refusal_conflicts(result, &index, &progress),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    assert_eq!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress),
+        ResumableUploadResult::Deferred { count: 1 },
+        "an empty frozen delta still owes retry debt"
+    );
+    assert_eq!(
+        with_retained_refusal_conflicts(
+            ResumableUploadResult::Deferred { count: 2 },
+            &index,
+            &progress
+        ),
+        ResumableUploadResult::Deferred { count: 3 },
+        "ordinary and retained conflicts are distinct"
+    );
+    progress.attempted_reason_reoffers.insert(fp(1));
+    assert_eq!(
+        with_retained_refusal_conflicts(
+            ResumableUploadResult::Deferred { count: 1 },
+            &index,
+            &progress
+        ),
+        ResumableUploadResult::Deferred { count: 1 },
+        "a fresh re-offer conflict was already counted once"
+    );
     assert_eq!(progress.quarantined_fingerprints[&fp(1)], retry);
     assert_eq!(
         progress.permanent_rejections[&fp(1)].reoffer,
