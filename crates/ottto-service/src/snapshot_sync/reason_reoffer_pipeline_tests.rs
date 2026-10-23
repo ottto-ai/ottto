@@ -86,7 +86,9 @@ fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
 }
 
 impl ReofferServer {
-    fn new(first: Answer) -> Self {
+    /// `capture`: the activity hint carries the exact contract-5 token, so
+    /// each cycle captures and emits request identity.
+    fn new(first: Answer, capture: bool) -> Self {
         use std::sync::atomic::{AtomicBool, Ordering};
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -121,10 +123,15 @@ impl ReofferServer {
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-reoffer-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
-                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                    let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    if capture {
+                        hint["session_request_identity_contract"] =
+                            "own_request_identity_rows:v1".into();
+                    }
+                    hint
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
@@ -247,6 +254,15 @@ struct ReofferPipeline {
 
 impl ReofferPipeline {
     fn new(name: &str, first: Answer, start: u64) -> Self {
+        Self::build(name, first, start, false)
+    }
+
+    /// The same pipeline with request-identity capture on (R12).
+    fn with_capture(name: &str, first: Answer, start: u64) -> Self {
+        Self::build(name, first, start, true)
+    }
+
+    fn build(name: &str, first: Answer, start: u64, capture: bool) -> Self {
         let fixture = IdentityPipelineHome::new();
         let native = crate::snapshots::claude_native_comparison::enable_for_test();
         let cadence = IdentityPipelineCadence::new();
@@ -254,7 +270,7 @@ impl ReofferPipeline {
         let secrets = fixture.base.join(format!("{name}-secrets"));
         std::fs::create_dir_all(&support).unwrap();
         std::fs::create_dir_all(&secrets).unwrap();
-        let server = ReofferServer::new(first);
+        let server = ReofferServer::new(first, capture);
         let guards = vec![
             EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support),
             EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets),
@@ -795,4 +811,172 @@ fn superseded_refused_body_is_never_reoffered_after_the_head_moved() {
         usage_of(&head),
         "only the current head's usage is ever offered after the refusal"
     );
+}
+
+/// A JSON array's elements; none when the field is absent.
+fn json_array(value: &serde_json::Value) -> &[serde_json::Value] {
+    value.as_array().map(Vec::as_slice).unwrap_or(&[])
+}
+
+/// Every usage row of an offered body: the item's rows and its buckets' rows.
+fn usage_rows(offer: &serde_json::Value) -> Vec<&serde_json::Value> {
+    json_array(&offer["model_usage"])
+        .iter()
+        .chain(
+            json_array(&offer["usage_buckets"])
+                .iter()
+                .flat_map(|bucket| json_array(&bucket["model_usage"])),
+        )
+        .collect()
+}
+
+/// The late API capture: the session's API rows are recorded again, now
+/// carrying its login and organization (request identity), as a capture that
+/// lands after the refusal would. The trace rows are unchanged.
+fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str) {
+    let path = pipeline
+        .support
+        .join("local-otel")
+        .join("claude-code-effort")
+        .join(format!(
+            "{:x}.jsonl",
+            Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+        ));
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence =
+                serde_json::from_str(line).unwrap();
+            row.account_identity_checked = true;
+            row.account_identifier_hash = Some(login.to_string());
+            row.request_identity = Some(
+                serde_json::from_value(serde_json::json!({
+                    "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                    "account":{"disposition":"complete", "origin":"log_record", "log_record_hash":login},
+                    "organization":{"disposition":"complete", "origin":"log_record", "log_record_hash":org},
+                }))
+                .unwrap(),
+            );
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+            serde_json::to_string(&row).unwrap() + "\n"
+        })
+        .collect::<String>();
+    std::fs::write(&path, rows).unwrap();
+}
+
+/// SI I-R1 (R12, capture on): between the refusal and the daily re-offer,
+/// SOURCE proves the original pair and a late API capture adds the session's
+/// identity. The session's next offer is rebuilt from the current evidence,
+/// never from the refused body: the server accepts a body with the refused
+/// body's usage and the late rows' login and org tags, and the refused body
+/// is never sent again.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
+    if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
+        return;
+    }
+    use crate::snapshots::claude_request_identity as identity;
+    let login = "a".repeat(64);
+    let org = "d".repeat(64);
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::with_capture("reoffer-late-row", Answer::Refuse(ORIGINAL_PAIR), t0);
+
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let refused = offered[0].clone();
+    let refused_fingerprint = fingerprint_of(&refused);
+    assert!(first
+        .progress
+        .permanent_rejections
+        .contains_key(&refused_fingerprint));
+    assert!(
+        usage_rows(&refused)
+            .iter()
+            .all(|row| row["account_identifier_hash"] != login.as_str()),
+        "the refused body predates the late rows: {refused}"
+    );
+    assert!(
+        json_array(&refused["request_evidence"])
+            .iter()
+            .all(|entry| entry["identity_basis"] != identity::TELEMETRY),
+        "{refused}"
+    );
+
+    // Between the refusal and the daily re-offer.
+    capture_late_identity_rows(&pipeline, &login, &org);
+    pipeline.server.answer(Answer::Accept);
+
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_ok(), "{:?}", day1.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "one offer for the session on the due day");
+    let accepted = &offered[1];
+    assert_eq!(accepted["source_session_id"], IDENTITY_PIPELINE_ROOT);
+    let accepted_fingerprint = fingerprint_of(accepted);
+    assert_ne!(
+        accepted_fingerprint, refused_fingerprint,
+        "rebuilt from the current evidence, not the refused body"
+    );
+    assert_eq!(
+        usage_of(accepted),
+        usage_of(&refused),
+        "same usage; only the identity tags are new"
+    );
+    // The late rows' tags: every usage row carries the login and links to a
+    // telemetry entry naming the org.
+    let evidence = accepted["request_evidence"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the tagged body declares its evidence: {accepted}"));
+    let rows = usage_rows(accepted);
+    assert!(!rows.is_empty(), "{accepted}");
+    for row in rows {
+        assert_eq!(
+            row["account_identifier_hash"],
+            login.as_str(),
+            "login tag: {accepted}"
+        );
+        let reference = row["evidence_ref"]
+            .as_u64()
+            .unwrap_or_else(|| panic!("every usage row has an identity tag: {accepted}"));
+        let entry = &evidence[usize::try_from(reference).unwrap()];
+        assert_eq!(entry["identity_basis"], identity::TELEMETRY, "{accepted}");
+        assert_eq!(
+            entry["provider_workspace_hash"],
+            org.as_str(),
+            "org tag: {accepted}"
+        );
+    }
+    assert!(
+        accepted.get("request_identity_refusals").is_none(),
+        "{accepted}"
+    );
+    // The server-accepted body is the tagged one.
+    assert!(day1
+        .index
+        .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
+
+    // Later days: the refused body is superseded, never re-offered, and its
+    // refusal is retired; the tagged body stays accepted.
+    let later = pipeline.cycle(t1 + DAY + 60);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    assert_eq!(pipeline.server.offered().len(), 2);
+    assert!(!later
+        .progress
+        .permanent_rejections
+        .contains_key(&refused_fingerprint));
+    assert!(later
+        .index
+        .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
 }
