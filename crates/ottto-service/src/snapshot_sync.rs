@@ -349,7 +349,8 @@ const _: () = assert!(
 /// record of an earlier upload; a quarantined (`.corrupt.`) sibling of this
 /// index; any Claude index, ledger or quarantined copy another destination
 /// or a legacy layout left in the support directory (an interrupted
-/// bootstrap before a re-pair); or the re-emission seen-marker. Read before scanning; none of it
+/// bootstrap before a re-pair), again unless a different-user cutoff was
+/// recorded; or the re-emission seen-marker. Read before scanning; none of it
 /// lives in the index, so it survives index loss (fail closed, SOURCE
 /// F1a/F1b, StateMissing H1).
 fn claude_prior_history(
@@ -365,7 +366,10 @@ fn claude_prior_history(
         .get(slug)
         .map(String::as_str)
         == Some(destination_namespace);
-    let earlier_bootstrap = backfill_state.backfill_cutoff_at.is_none()
+    // A claim that recorded a different-user cutoff keeps the other
+    // destinations' history excluded by that cutoff, not by the gate.
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some();
+    let earlier_bootstrap = !other_user_cutoff
         && (backfill_state
             .completed_destination_namespaces
             .contains_key(slug)
@@ -428,7 +432,7 @@ fn claude_prior_history(
         || earlier_bootstrap
         || ledger
         || quarantined_sibling()
-        || other_destination()
+        || (!other_user_cutoff && other_destination())
         || seen_marker()
 }
 

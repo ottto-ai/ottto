@@ -871,6 +871,11 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
         HISTORY_DESTINATION,
     );
     crate::backfill::save_backfill_state(&fixture.support, &state).expect("save claim state");
+    // The previous destination's Claude index stays behind, as in production.
+    let previous = fixture.support.join("snapshots/destinations/destination-a");
+    std::fs::create_dir_all(&previous).expect("create previous destination");
+    std::fs::write(previous.join("claude_code-scan-index-v3.json"), b"{}")
+        .expect("previous destination index");
     fixture.append(HISTORY_SESSIONS[0], "req_0_2");
     let moved = fixture.cycle(
         "2026-08-02T09:00:00Z",
