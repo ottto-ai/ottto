@@ -1175,7 +1175,7 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
         let path = dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadCounter::Missing,
-            Ok(meta) if meta.len() <= 256 => std::fs::read(path)
+            Ok(meta) if meta.file_type().is_file() && meta.len() <= 256 => std::fs::read(path)
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<Budget>(&bytes).ok())
                 .map_or(ReadCounter::Damaged, |budget| {
