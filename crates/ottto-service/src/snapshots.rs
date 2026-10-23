@@ -14749,6 +14749,76 @@ impl SnapshotAccumulator {
         }
     }
 
+    /// X_out family U1 (#665, c22 amendment 2): what `apply_claude_title_metadata`
+    /// and `into_items` allocate from `metadata`, measured on the resident
+    /// metadata without applying it. `fixed` charges every live copy of each
+    /// string (the accumulator's, the item's clone, and for `source_created_at`
+    /// the rewrite) plus the two transient sets of `session_account_evidence`;
+    /// `per_usage_row` is the account hash each `model_usage` row clones
+    /// (family D multiplies it). A subagent transcript names itself from agent
+    /// metadata on disk (IO): `None`, so the proof releases nothing.
+    #[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
+    fn claude_title_metadata_bound(
+        &self,
+        path: &Path,
+        metadata: &ClaudeTitleMetadata,
+    ) -> Option<TitleMetadataBound> {
+        let stem = path.file_stem().and_then(|value| value.to_str());
+        let Some(session_id) = self.source_session_id.as_deref().or(stem) else {
+            return Some(TitleMetadataBound::default());
+        };
+        if claude_subagent_identity(path).is_some() {
+            return None;
+        }
+        let per_usage_row = metadata
+            .account_identifier_hash(session_id)
+            .map_or(0, str::len);
+        let mut fixed = per_usage_row;
+        let native = stem == Some(session_id);
+        if self.claude_owned_session_id_observed && native {
+            let entries = metadata.original_identity_evidence.get(session_id);
+            // `session_account_evidence` clones at most one value per field.
+            let mut longest = [0usize; 3];
+            for entry in entries.into_iter().flatten() {
+                let values = [
+                    &entry.account_identifier_hash,
+                    &entry.provider_workspace_hash,
+                    &entry.source_created_at,
+                ];
+                for (slot, value) in longest.iter_mut().zip(values) {
+                    *slot = (*slot).max(value.as_ref().map_or(0, String::len));
+                }
+            }
+            let strings = longest
+                .iter()
+                .try_fold(0usize, |sum, len| sum.checked_add(*len))?;
+            let sets = crate::heap_layout_bound::tree_node_bytes::<&String, ()>()?
+                .checked_mul(entries.map_or(0, BTreeSet::len).checked_add(1)?)?
+                .checked_mul(2)?;
+            fixed = fixed
+                .checked_add(strings.checked_mul(3)?)?
+                .checked_add(sets)?;
+        }
+        if native {
+            if let Some(lineage) = metadata.spawn_lineage(session_id) {
+                fixed = fixed.checked_add(lineage.parent_session_id.len())?;
+            }
+        }
+        if let Some(candidate) = metadata.titles.get(session_id) {
+            // `normalize_title` (a whitespace join, then a <= 255-char collect
+            // with amortized growth) stays under max(8, 2x) the source; the
+            // item's clone is exact. Plus both copies of "desktop_title".
+            let title = candidate.title.len().max(4).checked_mul(3)?;
+            fixed = fixed
+                .checked_add(title)?
+                .checked_add(2 * "desktop_title".len())?;
+        }
+        Some(TitleMetadataBound {
+            fixed,
+            per_usage_row,
+        })
+    }
+
     fn apply_first_prompt_fallback(&mut self) {
         if self.title.is_some() {
             return;
@@ -14990,12 +15060,31 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
+    // Production finishes through `into_items_with_repository_identity`.
+    #[cfg(test)]
     fn into_items(
+        self,
+        path: &Path,
+        collected_at: &str,
+        source_file_fingerprint: String,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    ) -> Vec<SnapshotItem> {
+        self.into_items_with_repository_identity(
+            path,
+            collected_at,
+            source_file_fingerprint,
+            attribution_context,
+            None,
+        )
+    }
+
+    fn into_items_with_repository_identity(
         mut self,
         path: &Path,
         collected_at: &str,
         source_file_fingerprint: String,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
     ) -> Vec<SnapshotItem> {
         // Defence in depth: the scan already refuses to collect the Workflow
         // journal, but the parse entry points are public, so nothing downstream
@@ -15147,10 +15236,9 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
-        let repository_identity = self
-            .workspace_path
-            .as_deref()
-            .map(cached_repository_identity);
+        let repository_identity = self.workspace_path.as_deref().map(|workspace| {
+            measured_repository_identity.unwrap_or_else(|| cached_repository_identity(workspace))
+        });
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
@@ -15572,20 +15660,51 @@ impl SnapshotAccumulator {
     }
 }
 
+/// Observed-input bound of Claude title metadata (X_out family U1, #665).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
+struct TitleMetadataBound {
+    fixed: usize,
+    per_usage_row: usize,
+}
+
+type RepositoryIdentityCache =
+    BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
+
+fn repository_identity_cache() -> &'static Mutex<RepositoryIdentityCache> {
+    static CACHE: OnceLock<Mutex<RepositoryIdentityCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn fresh_repository_identity(
+    cache: &RepositoryIdentityCache,
+    workspace: &Path,
+    now: SystemTime,
+) -> Option<crate::context_footprint::RepositoryIdentity> {
+    let (captured_at, identity) = cache.get(workspace)?;
+    now.duration_since(*captured_at)
+        .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
+        .unwrap_or(false)
+        .then(|| identity.clone())
+}
+
+/// Read-only view of the repository-identity cache for the M-a release proof
+/// (#665, X_out family U3): no IO, no insert, no TTL refresh. A miss, an
+/// expired entry or a poisoned lock is `None`, so the proof refuses.
+#[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
+pub(super) fn peek_repository_identity(
+    workspace: &Path,
+) -> Option<crate::context_footprint::RepositoryIdentity> {
+    let guard = repository_identity_cache().lock().ok()?;
+    fresh_repository_identity(&guard, workspace, SystemTime::now())
+}
+
 fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
-    type Cache = BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cache = repository_identity_cache();
     let now = SystemTime::now();
     if let Ok(guard) = cache.lock() {
-        if let Some((captured_at, identity)) = guard.get(workspace) {
-            if now
-                .duration_since(*captured_at)
-                .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
-                .unwrap_or(false)
-            {
-                return identity.clone();
-            }
+        if let Some(identity) = fresh_repository_identity(&guard, workspace, now) {
+            return identity;
         }
     }
 
@@ -26293,6 +26412,33 @@ impl OwnedJsonlParser {
         claude_title_metadata: Option<&ClaudeTitleMetadata>,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> Result<ParsedJsonlFile> {
+        self.finish_with_repository_identity(
+            expected_opened_object_identity,
+            path,
+            collected_at,
+            source_file_fingerprint,
+            codex_title_metadata,
+            claude_title_metadata,
+            attribution_context,
+            None,
+        )
+    }
+
+    /// `finish`, with the repository identity the M-a release proof measured
+    /// (#665, X_out family U3). `Some` is used as-is, so the finished item never
+    /// re-resolves (IO) a value the proof did not measure.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with_repository_identity(
+        self,
+        expected_opened_object_identity: &str,
+        path: &Path,
+        collected_at: &str,
+        source_file_fingerprint: String,
+        codex_title_metadata: Option<&CodexTitleMetadata>,
+        claude_title_metadata: Option<&ClaudeTitleMetadata>,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+    ) -> Result<ParsedJsonlFile> {
         anyhow::ensure!(
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
@@ -26514,11 +26660,12 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
-        let snapshots = accumulator.into_items(
+        let snapshots = accumulator.into_items_with_repository_identity(
             path,
             collected_at,
             source_file_fingerprint,
             attribution_context,
+            repository_identity,
         );
         // A syntactically valid, positive provider usage record that yields no
         // entity is still loss. Typical causes are an absent/unparseable activity
@@ -75388,6 +75535,8 @@ crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_sess
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
+// Measurement only (#665, X_out family U3): the identity the release proof peeks.
+crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
 crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);

@@ -1058,8 +1058,9 @@ fn r0_unknown_resident_evicts_nothing() {
 /// `ParsedJsonlFile` and its `SnapshotItem` is named here with its X_out
 /// family, so a new field fails compile until it is classified. Families:
 /// I inline, R per Claude response, D derived from the accumulator at
-/// `into_items`, M moved unchanged, K capped constant, U not owned at the
-/// proof site (X_out refuses). Compile-only: the closures never run.
+/// `into_items`, M moved unchanged, K capped constant, U observed inputs
+/// measured at the proof site (c22 amendment 2; unmeasurable refuses).
+/// Compile-only: the closures never run.
 #[test]
 fn x_out_coverage_witness_names_every_finished_field() {
     let _parsed = |file: ParsedJsonlFile| {
@@ -1155,10 +1156,112 @@ fn x_out_coverage_witness_names_every_finished_field() {
             origin: _,                                      // D
             originator: _,                                  // D
             attribution_facts: _,                           // K (enforce_fact_limits caps)
-            request_evidence: _,                            // U (ownership fold)
-            request_identity_refusals: _,                   // I
-            claude_org_markers: _,                          // M
-            claude_account_withheld_reason: _,              // I (&'static str)
+            request_evidence: _, // K (empty at finish; filled post-scan, snapshot_sync)
+            request_identity_refusals: _, // I
+            claude_org_markers: _, // M
+            claude_account_withheld_reason: _, // I (&'static str)
         } = item;
     };
+}
+
+fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+    crate::context_footprint::RepositoryIdentity {
+        repository_hash: Some(format!("hash-{tag}")),
+        repository_label: Some(format!("label-{tag}")),
+        repository_label_source: Some("git_remote".to_string()),
+        repository_identity_source: Some("git".to_string()),
+        workspace_kind: Some("git_repo".to_string()),
+    }
+}
+
+/// X_out family U3 control (c22 amendment 2): a cold or expired cache entry
+/// is `None` (the proof releases nothing), and peeking neither inserts nor
+/// refreshes. Each workspace path is unique to this test: the cache is global.
+#[test]
+fn u3_repository_identity_peek_is_read_only_and_refuses_a_miss() {
+    let cold = Path::new("/u3-peek-test/cold-workspace");
+    assert_eq!(peek_repository_identity(cold), None);
+    assert_eq!(
+        peek_repository_identity(cold),
+        None,
+        "a miss is not inserted"
+    );
+    assert!(!repository_identity_cache()
+        .lock()
+        .expect("cache")
+        .contains_key(cold));
+
+    let warm = Path::new("/u3-peek-test/warm-workspace");
+    let expired = Path::new("/u3-peek-test/expired-workspace");
+    let stale_at =
+        SystemTime::now() - Duration::from_secs(REPOSITORY_IDENTITY_CACHE_TTL_SECONDS + 60);
+    {
+        let mut cache = repository_identity_cache().lock().expect("cache");
+        cache.insert(warm.to_path_buf(), (SystemTime::now(), u3_identity("warm")));
+        cache.insert(expired.to_path_buf(), (stale_at, u3_identity("expired")));
+    }
+    assert_eq!(peek_repository_identity(warm), Some(u3_identity("warm")));
+    assert_eq!(peek_repository_identity(expired), None);
+    let cache = repository_identity_cache().lock().expect("cache");
+    assert_eq!(
+        cache.get(expired).map(|(at, _)| *at),
+        Some(stale_at),
+        "peek never extends the TTL"
+    );
+}
+
+/// X_out family U3 (c22 amendment 2): the identity the proof measured is the
+/// one the finished item carries; `into_items` resolves nothing (no IO, no
+/// cache insert) when it is supplied.
+#[test]
+fn u3_measured_repository_identity_is_the_finished_value() {
+    let workspace = "/u3-threading-test/workspace";
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    apply_claude_code_line(
+        &serde_json::json!({"type":"assistant","sessionId":"u3-session","cwd":workspace,"requestId":"req_u3","timestamp":"2026-10-23T10:00:00Z","message":{"id":"msg_u3","model":"claude-opus-4-8","usage":{"input_tokens":10,"output_tokens":2}}}),
+        &mut accumulator,
+    );
+    accumulator.finalize_claude_responses();
+    let items = accumulator.into_items_with_repository_identity(
+        Path::new("u3-session.jsonl"),
+        "2026-10-23T10:00:01Z",
+        "f".repeat(64),
+        None,
+        Some(u3_identity("measured")),
+    );
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].repository_hash.as_deref(), Some("hash-measured"));
+    assert_eq!(items[0].repository_label.as_deref(), Some("label-measured"));
+    assert!(!repository_identity_cache()
+        .lock()
+        .expect("cache")
+        .contains_key(Path::new(workspace)));
+}
+
+/// X_out family U1 (c22 amendment 2): a subagent transcript names itself from
+/// agent metadata on disk, so its title bound is `None` (zero victims); a
+/// top-level transcript's bound charges the desktop title it would take.
+#[test]
+fn u1_title_metadata_bound_refuses_subagents_and_charges_the_title() {
+    let accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    let mut metadata = ClaudeTitleMetadata::default();
+    metadata.titles.insert(
+        "u1-session".to_string(),
+        ClaudeTitleCandidate {
+            title: "  a   desktop  title  ".to_string(),
+            user_set: true,
+        },
+    );
+    assert_eq!(
+        accumulator.claude_title_metadata_bound(
+            Path::new("/p/u1-parent/subagents/agent-u1.jsonl"),
+            &metadata
+        ),
+        None
+    );
+    let bound = accumulator
+        .claude_title_metadata_bound(Path::new("/p/u1-session.jsonl"), &metadata)
+        .expect("top-level bound");
+    assert_eq!(bound.per_usage_row, 0);
+    assert_eq!(bound.fixed, 3 * 22 + 2 * "desktop_title".len());
 }
