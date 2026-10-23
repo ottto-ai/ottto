@@ -1,9 +1,11 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
+#[cfg(test)]
+use crate::backfill::save_backfill_state;
 use crate::backfill::{
     apply_backfill_cutoff, current_historical_replay, load_backfill_state,
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
-    save_backfill_state,
+    update_backfill_state,
 };
 use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
 use crate::detected_uses::{
@@ -25,9 +27,9 @@ use crate::snapshots::{
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
     SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -46,6 +48,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use zeroize::Zeroize;
 
 mod continuation;
+mod reason_reoffer;
 mod rejection_log;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
@@ -149,55 +152,64 @@ fn bootstrap_cache_heads_with_budget(
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
-    let mut deferred = 0usize;
-    let stages: &[bool] = if ordinary_bootstrap {
-        &[false, true]
-    } else {
-        &[true]
-    };
-    for &enforce_head_cas in stages {
-        // A prior ordinary body ACK has no head proof. Force the exact probe
-        // even when delivery of these bytes was previously acknowledged.
-        if enforce_head_cas {
-            for probe in probes {
-                progress
-                    .accepted_fingerprints
-                    .remove(&probe.snapshot_fingerprint);
-                progress
-                    .accepted_body_witnesses
-                    .remove(&probe.snapshot_fingerprint);
+    let leased = progress.active_reason_reoffers.clone();
+    let mut shed = false;
+    let result = (|| -> Result<usize> {
+        let mut deferred = 0usize;
+        let stages: &[bool] = if ordinary_bootstrap {
+            &[false, true]
+        } else {
+            &[true]
+        };
+        for &enforce_head_cas in stages {
+            // A prior ordinary body ACK has no head proof. Force the exact probe
+            // even when delivery of these bytes was previously acknowledged.
+            if enforce_head_cas {
+                for probe in probes {
+                    progress
+                        .accepted_fingerprints
+                        .remove(&probe.snapshot_fingerprint);
+                    progress
+                        .accepted_body_witnesses
+                        .remove(&probe.snapshot_fingerprint);
+                }
+            }
+            let mut accepted = 0;
+            let outcome = upload_resumable_batches_with_body_witness_partitioned(
+                probes,
+                poison_scope,
+                progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |item| Some(item.source_session_id.as_str()),
+                |_| false,
+                inplace_retry,
+                |items| upload(items, enforce_head_cas),
+                |progress| persist(progress),
+            )?;
+            match outcome {
+                ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+                // The partitioned uploader persisted each conflicting probe's exact
+                // body quarantine. Carry that hold into the normal upload rather
+                // than discarding every unrelated file's progress.
+                ResumableUploadResult::Deferred { count } => {
+                    deferred = deferred.saturating_add(count);
+                }
+                outcome => {
+                    shed = matches!(outcome, ResumableUploadResult::Shed { .. });
+                    return Err(anyhow::Error::new(SnapshotAckRejected {
+                        reason: "cache head probe did not settle exact predecessor evidence",
+                    }));
+                }
             }
         }
-        let mut accepted = 0;
-        let outcome = upload_resumable_batches_with_body_witness_partitioned(
-            probes,
-            poison_scope,
-            progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |item| Some(item.source_session_id.as_str()),
-            |_| false,
-            inplace_retry,
-            |items| upload(items, enforce_head_cas),
-            |progress| persist(progress),
-        )?;
-        match outcome {
-            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
-            // The partitioned uploader persisted each conflicting probe's exact
-            // body quarantine. Carry that hold into the normal upload rather
-            // than discarding every unrelated file's progress.
-            ResumableUploadResult::Deferred { count } => {
-                deferred = deferred.saturating_add(count);
-            }
-            _ => {
-                return Err(anyhow::Error::new(SnapshotAckRejected {
-                    reason: "cache head probe did not settle exact predecessor evidence",
-                }));
-            }
-        }
+        Ok(deferred)
+    })();
+    if result.is_err() {
+        progress.finish_reason_reoffers(&leased, shed, poison_scope);
     }
-    Ok(deferred)
+    result
 }
 
 fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
@@ -212,6 +224,9 @@ fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
 fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem) -> bool {
     let fingerprint = &probe.snapshot_fingerprint;
     let witness = snapshot_upload_body_witness(probe);
+    if progress.active_reason_reoffers.get(fingerprint) == Some(&witness) {
+        return false;
+    }
     progress
         .permanent_rejections
         .get(fingerprint)
@@ -279,16 +294,235 @@ fn with_bootstrap_deferred(
     }
 }
 
+/// Carry a newer refused-body conflict even when the frozen upload delta is
+/// empty. New conflicts were already counted by bootstrap/main upload; this
+/// adds only older, untransmitted debt from the current source universe.
+fn with_retained_refusal_conflicts(
+    result: ResumableUploadResult,
+    index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+) -> ResumableUploadResult {
+    let retained = index
+        .current_snapshot_fingerprint_refs()
+        .filter(|fingerprint| {
+            !progress.attempted_reason_reoffers.contains(*fingerprint)
+                && progress
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|refusal| {
+                        progress
+                            .quarantined_fingerprints
+                            .get(*fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(refusal.body_witness.as_str())
+                            })
+                    })
+        })
+        .collect::<BTreeSet<_>>();
+    with_bootstrap_deferred(result, retained.len())
+}
+
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
 // Code 2 re-reads its history once so the newer context numbers fill in. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
-pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::ClaudeCode => 2,
         SnapshotSource::Codex | SnapshotSource::Pi => 1,
     }
+}
+
+// SOURCE F2: a Claude revision the history gate is not complete for does not
+// build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
+const _: () = assert!(
+    effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
+);
+
+/// Where this destination's Claude prior history comes from (SOURCE
+/// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
+/// support state.
+/// - `Unverified`: the backfill state is unreadable.
+/// - `Here`: this destination's completed bootstrap; a server-attested record
+///   in its upload ledger (an accepted, quarantined or refused body or
+///   accepted cache evidence; a generation or replay claim alone is saved
+///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
+///   sibling of this index; or the re-emission seen-marker.
+/// - `Moved`: only a Claude bootstrap completed for another destination or
+///   recorded by a legacy state, or a Claude index, ledger or quarantined
+///   copy another destination or a legacy layout left in the support
+///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   recorded a different-user cutoff, which keeps that history excluded by
+///   the cutoff, as before.
+///
+/// Read before scanning; none of it lives in the index, so it survives index
+/// loss (fail closed).
+fn claude_prior_history(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) -> crate::snapshots::PriorHistory {
+    use crate::snapshots::PriorHistory;
+    if backfill_state.prior_history_unverified {
+        return PriorHistory::Unverified;
+    }
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty (SOURCE h695 N2).
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    let other_destination = || {
+        let prefix = format!("{slug}-scan-index");
+        let own = index_path.parent();
+        // An unreadable directory fails closed; a missing one is empty.
+        let holds_claude_state = |directory: &Path| {
+            Some(directory) != own
+                && match std::fs::read_dir(directory) {
+                    Ok(mut entries) => entries.any(|entry| match entry {
+                        Ok(entry) => entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix)),
+                        Err(_) => true,
+                    }),
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                }
+        };
+        let snapshots = support_dir.join("snapshots");
+        holds_claude_state(&snapshots)
+            || match std::fs::read_dir(snapshots.join("destinations")) {
+                Ok(mut destinations) => destinations.any(|destination| match destination {
+                    Ok(destination) => holds_claude_state(&destination.path()),
+                    Err(_) => true,
+                }),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+    };
+    // Fails closed: only a positively missing marker is absent (h695 N2).
+    let seen_marker = || match std::fs::symlink_metadata(
+        crate::snapshots::claude_reemission_seen_marker_path(support_dir),
+    ) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if here
+        || upload_progress.records_server_attested_upload()
+        || quarantined_sibling()
+        || seen_marker()
+    {
+        return PriorHistory::Here;
+    }
+    // A claim that recorded a different-user cutoff keeps the other
+    // destinations' history excluded by that cutoff, not by the gate, but
+    // only on that claim's own destination: a later same-user re-claim keeps
+    // the cutoff on a new destination (SOURCE h695 N1).
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
+        && backfill_state
+            .backfill_cutoff_destination_namespace
+            .as_deref()
+            == Some(destination_namespace);
+    // Claude's own entries only: `last_completed_at` is stamped by any
+    // source's bootstrap, so a Codex or Pi completion is not Claude history.
+    let earlier_bootstrap = backfill_state
+        .completed_destination_namespaces
+        .contains_key(slug)
+        || backfill_state.completed_parser_versions.contains_key(slug)
+        || backfill_state.completed_replay_revisions.contains_key(slug);
+    if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
+        PriorHistory::Moved
+    } else {
+        PriorHistory::None
+    }
+}
+
+/// Claude only, before scanning: with prior history, a fresh index (missing
+/// or quarantined), a replay that dropped entries or the first gated load of
+/// an index without one records the history cutoff; see
+/// `ScanIndex::note_claude_history_cutoff`.
+fn note_claude_history_cutoff_for_cycle(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    prior_history: crate::snapshots::PriorHistory,
+    backfill_state: &crate::backfill::BackfillState,
+    entries_lost: bool,
+) {
+    if source != SnapshotSource::ClaudeCode {
+        return;
+    }
+    index.note_claude_history_cutoff(
+        prior_history,
+        backfill_state.claim_backfill_policy_full,
+        entries_lost,
+    );
+}
+
+/// The historical replays one cycle arms (StateMissing H1, N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayArming {
+    /// The source's bootstrap for this destination is pending.
+    backfill_pending: bool,
+    /// The index needs the current context-curve replay.
+    curve_replay_pending: bool,
+}
+
+impl ReplayArming {
+    /// One decision for production and the history pipeline tests. An
+    /// unreadable backfill state arms no Claude replay of either kind (its
+    /// history is unknown, and a replay would drop the index's entries);
+    /// Codex and Pi replays are not affected.
+    fn decide(
+        source: SnapshotSource,
+        backfill_state: &crate::backfill::BackfillState,
+        destination_namespace: &str,
+        curve_replay_needed: bool,
+    ) -> Self {
+        Self {
+            backfill_pending: pending_backfill_sources_for_destination(
+                backfill_state,
+                destination_namespace,
+            )
+            .contains(&source),
+            curve_replay_pending: curve_replay_needed
+                && !claude_replay_suppressed(source, backfill_state),
+        }
+    }
+}
+
+/// Claude only: the unreadable backfill state suppresses replays until a
+/// Claude census under the history gate clears it (N2).
+fn claude_replay_suppressed(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+) -> bool {
+    source == SnapshotSource::ClaudeCode && backfill_state.prior_history_unverified
 }
 
 fn exclude_held_effective_body_witness_revision(
@@ -349,7 +583,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled();
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -502,7 +736,11 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
@@ -562,7 +800,17 @@ fn settle_upload_corrections_after_selection(
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
-    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+    // Correction members the history gate holds wait for it; they are counted,
+    // not blocking (StateMissing M2).
+    let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
+    if deferred > 0 {
+        eprintln!(
+            "local snapshot proof corrections deferred to the history gate for {}: members={deferred}",
+            scan.source.api_slug()
+        );
+        crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
+    }
+    transport_fully_settled && !blocking
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -769,7 +1017,18 @@ struct PendingCacheHeadFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PermanentSnapshotRejection {
     body_witness: String,
+    /// Old enum vocabulary only: `original_pair_candidate_unproved` is
+    /// written as `other`, so an older daemon keeps reading and suppressing it.
     reason: crate::upload_receipts::RejectedUsageReason,
+    /// Optional daily/one-time re-offer schedule for this exact body. Older
+    /// daemons ignore it; a malformed value disables only this record's retry.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reason_reoffer::serialize",
+        deserialize_with = "reason_reoffer::deserialize"
+    )]
+    reoffer: Option<reason_reoffer::RefusalReoffer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -810,9 +1069,32 @@ struct SnapshotUploadProgress {
     /// clears it; this set only bypasses suppression for the current request.
     #[serde(skip)]
     active_quarantine_retries: BTreeSet<String>,
+    /// Runtime leases for refusals re-offered this cycle: fingerprint -> the
+    /// exact refused body witness. Only that body passes permanent
+    /// suppression, once per logical offer; the refusal stays durable.
+    #[serde(skip)]
+    active_reason_reoffers: BTreeMap<String, String>,
+    #[serde(skip)]
+    attempted_reason_reoffers: BTreeSet<String>,
+    #[serde(skip)]
+    reason_reoffer_counts: reason_reoffer::ReofferCounts,
 }
 
 impl SnapshotUploadProgress {
+    /// A server-attested record of an earlier upload to this destination: an
+    /// accepted, quarantined or refused body, or accepted cache evidence
+    /// (SOURCE F1a prior history). A saved generation, a replay claim or a
+    /// pending cache head is this daemon's own claim, saved before any upload,
+    /// so it is not evidence (StateMissing N1).
+    fn records_server_attested_upload(&self) -> bool {
+        !self.accepted_fingerprints.is_empty()
+            || !self.accepted_body_witnesses.is_empty()
+            || !self.accepted_cache_states.is_empty()
+            || !self.accepted_cache_heads.is_empty()
+            || !self.quarantined_fingerprints.is_empty()
+            || !self.permanent_rejections.is_empty()
+    }
+
     fn new(
         destination_namespace_hash: String,
         active_quarantine_witness: SnapshotQuarantineWitness,
@@ -831,6 +1113,9 @@ impl SnapshotUploadProgress {
             permanent_rejections: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
+            active_reason_reoffers: BTreeMap::new(),
+            attempted_reason_reoffers: BTreeSet::new(),
+            reason_reoffer_counts: reason_reoffer::ReofferCounts::default(),
         }
     }
 
@@ -932,6 +1217,7 @@ impl SnapshotUploadProgress {
         };
         progress.active_quarantine_witness = Some(active_quarantine_witness);
         progress.active_quarantine_retries.clear();
+        progress.active_reason_reoffers.clear();
         Ok(progress)
     }
 
@@ -939,13 +1225,43 @@ impl SnapshotUploadProgress {
         &mut self,
         index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> bool {
+        self.prepare_quarantine_and_reason_retries(index_quarantine, None)
+    }
+
+    /// Select this cycle's ordinary quarantine retries and due refusal
+    /// re-offers from one shared per-cycle budget, oldest deadline first.
+    /// A selected re-offer reserves its next 24 h deadline here; the caller
+    /// saves that claim before any scan or upload uses the lease.
+    fn prepare_quarantine_and_reason_retries(
+        &mut self,
+        index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
+        reoffer: Option<&reason_reoffer::Scope<'_>>,
+    ) -> bool {
         self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
+        self.attempted_reason_reoffers.clear();
+        self.reason_reoffer_counts = reason_reoffer::ReofferCounts::default();
         // The upload ledger is saved immediately after an exact ACK, before
         // the index can retire its older quarantine. On crash/restart that ACK
         // is the stronger fact and must not be overwritten by restoring the
         // stale index-owned obligation.
         self.quarantined_fingerprints
             .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
+        let newer_retryable_refusals = self
+            .quarantined_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && self
+                        .permanent_rejections
+                        .get(*fingerprint)
+                        .is_some_and(|refusal| {
+                            record.upload_body_witness.as_deref()
+                                == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<BTreeSet<_>>();
         for (fingerprint, record) in index_quarantine {
             if !self.accepted_fingerprints.contains(fingerprint) {
                 // The durable index claims a bounded admission re-offer before
@@ -969,6 +1285,12 @@ impl SnapshotUploadProgress {
         // The server-permanent exact-body fact dominates an older index timer.
         // Keep the index-facing disposition truthful as well as suppressing I/O.
         for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            // A conflict recorded alongside the retained refusal is newer:
+            // permanent refusal recording itself always writes terminal. Keep
+            // that retry debt while the old refusal still suppresses early I/O.
+            if newer_retryable_refusals.contains(fingerprint) {
+                continue;
+            }
             if self
                 .permanent_rejections
                 .get(fingerprint)
@@ -986,7 +1308,7 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
-        let retry = self
+        let mut candidates = self
             .quarantined_fingerprints
             .iter()
             .filter(|(fingerprint, record)| {
@@ -1007,11 +1329,64 @@ impl SnapshotUploadProgress {
                     fingerprint.clone(),
                 )
             })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
-            .map(|(_, _, fingerprint)| fingerprint)
             .collect::<BTreeSet<_>>();
+        let mut reoffer_changed = false;
+        let mut due_reoffers = BTreeMap::new();
+        if let Some(scope) = reoffer {
+            reoffer_changed = self.collect_due_reason_reoffers(scope, &mut due_reoffers);
+            // A due re-offer has the same rank as a due ordinary retry under
+            // the active witness: oldest deadline first, fingerprint ties.
+            // A fingerprint owns one shared slot even if a crash left an
+            // ordinary retry for a different body in the progress ledger.
+            candidates.retain(|(_, _, fingerprint)| !due_reoffers.contains_key(fingerprint));
+            candidates.extend(
+                due_reoffers
+                    .iter()
+                    .map(|(fingerprint, (due, _))| (1u8, *due, fingerprint.clone())),
+            );
+        }
+        let reoffer_now = reoffer.map_or(0, |scope| scope.now);
+        let mut retry = BTreeSet::new();
+        for (_, _, fingerprint) in candidates {
+            if retry.len() + self.active_reason_reoffers.len()
+                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+            {
+                break;
+            }
+            if due_reoffers.contains_key(&fingerprint) {
+                let legacy = self
+                    .permanent_rejections
+                    .get(&fingerprint)
+                    .is_some_and(|refusal| {
+                        matches!(
+                            refusal.reoffer,
+                            None | Some(reason_reoffer::RefusalReoffer::LegacyOther { .. })
+                        )
+                    });
+                // The one-time migration gets at most half the shared slots;
+                // keep walking so ordinary retries can use their share.
+                if legacy
+                    && self.reason_reoffer_counts.legacy_selected
+                        >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE / 2
+                {
+                    continue;
+                }
+            }
+            match due_reoffers.remove(&fingerprint) {
+                Some((_, body_witness)) => {
+                    self.reserve_reason_reoffer(&fingerprint, body_witness, reoffer_now);
+                    reoffer_changed = true;
+                }
+                None => {
+                    retry.insert(fingerprint);
+                }
+            }
+        }
+        self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
+        let active = self
+            .active_quarantine_witness
+            .as_ref()
+            .expect("upload progress always has an active quarantine witness");
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
@@ -1030,7 +1405,205 @@ impl SnapshotUploadProgress {
             );
         }
         self.active_quarantine_retries = retry;
-        !self.active_quarantine_retries.is_empty()
+        !self.active_quarantine_retries.is_empty() || reoffer_changed
+    }
+
+    /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
+    /// Returns whether a schedule was changed (re-clamped by the clock bound).
+    fn collect_due_reason_reoffers(
+        &mut self,
+        scope: &reason_reoffer::Scope<'_>,
+        due: &mut BTreeMap<String, (u64, String)>,
+    ) -> bool {
+        use reason_reoffer::RefusalReoffer;
+        let index = scope.index;
+        // A missing or quarantined index cannot prove current membership.
+        if index.generation == 0 || self.permanent_rejections.is_empty() {
+            return false;
+        }
+        let current = index
+            .current_snapshot_fingerprint_refs()
+            .collect::<BTreeSet<_>>();
+        let latest = reason_reoffer::latest_valid_deadline(scope.now);
+        let counts = &mut self.reason_reoffer_counts;
+        let mut changed = false;
+        for (fingerprint, refusal) in &mut self.permanent_rejections {
+            // Known reasons are never re-offered; only the old `other`
+            // vocabulary can carry this reason or a legacy record of it.
+            if refusal.reason != crate::upload_receipts::RejectedUsageReason::Other {
+                continue;
+            }
+            let retry_after = match refusal.reoffer {
+                None => 0,
+                Some(RefusalReoffer::Classified) => continue,
+                Some(reoffer) => reoffer.retry_after().unwrap_or_default(),
+            };
+            if retry_after > latest {
+                // A wall-clock rollback must not consume the one-time pass or
+                // permanently disable daily offers. Keep suppression this cycle
+                // and durably restart the conservative 24 h cooldown.
+                refusal.reoffer = refusal.reoffer.map(|reoffer| {
+                    reoffer.with_retry_after(reason_reoffer::next_offer_after(scope.now))
+                });
+                counts.clock_bound_skipped += 1;
+                changed = true;
+                continue;
+            }
+            let bound = index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+                        && record.upload_body_witness.as_deref()
+                            == Some(refusal.body_witness.as_str())
+                });
+            if !bound
+                || !current.contains(fingerprint.as_str())
+                || self.accepted_fingerprints.contains(fingerprint)
+                || index.accepted_snapshot_fingerprint_recorded(fingerprint)
+            {
+                counts.ineligible_unbound += 1;
+                continue;
+            }
+            if retry_after > scope.now {
+                continue;
+            }
+            let outside_window = index
+                .snapshot_activity_at
+                .get(fingerprint)
+                .and_then(Option::as_deref)
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .is_some_and(|activity| {
+                    activity.unix_timestamp() < scope.window_start_unix_seconds as i64
+                });
+            if outside_window {
+                counts.outside_policy_window += 1;
+                continue;
+            }
+            counts.due += 1;
+            due.insert(
+                fingerprint.clone(),
+                (retry_after, refusal.body_witness.clone()),
+            );
+        }
+        changed
+    }
+
+    /// Reserve the next logical offer before any scan or upload can use it.
+    /// A crash or an unmaterialized lease therefore waits a day.
+    fn reserve_reason_reoffer(&mut self, fingerprint: &str, body_witness: String, now: u64) {
+        use reason_reoffer::RefusalReoffer;
+        let refusal = self
+            .permanent_rejections
+            .get_mut(fingerprint)
+            .expect("selected re-offer has its refusal");
+        let next = reason_reoffer::next_offer_after(now);
+        refusal.reoffer = Some(match refusal.reoffer {
+            None => {
+                self.reason_reoffer_counts.legacy_selected += 1;
+                RefusalReoffer::LegacyOther {
+                    retry_after_unix_seconds: next,
+                }
+            }
+            Some(reoffer) => {
+                if matches!(reoffer, RefusalReoffer::LegacyOther { .. }) {
+                    self.reason_reoffer_counts.legacy_selected += 1;
+                }
+                reoffer.with_retry_after(next)
+            }
+        });
+        self.reason_reoffer_counts.selected += 1;
+        self.active_reason_reoffers
+            .insert(fingerprint.to_string(), body_witness);
+    }
+
+    /// Immediately before the first actual transmission of this cycle, move
+    /// each materialized lease's next deadline to at least now + 24 h.
+    /// Returns whether a deadline moved; the caller persists before POST.
+    fn extend_reason_reoffers_before_upload(
+        &mut self,
+        items: &[SnapshotItem],
+        locally_held: &BTreeSet<String>,
+    ) -> bool {
+        if self.active_reason_reoffers.is_empty() {
+            return false;
+        }
+        let materialized = items
+            .iter()
+            .filter(|item| {
+                self.active_reason_reoffers
+                    .get(&item.snapshot_fingerprint)
+                    .is_some_and(|body| {
+                        *body == snapshot_upload_body_witness(item)
+                            || (item.cache_observations.is_some()
+                                && item.cache_base_head_etag.is_none()
+                                && *body == snapshot_upload_body_witness(&cache_head_probe(item)))
+                    })
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        self.reason_reoffer_counts.gate_held = self
+            .active_reason_reoffers
+            .keys()
+            .filter(|fingerprint| locally_held.contains(*fingerprint))
+            .count();
+        // Unmaterialized leases are no longer usable this cycle.
+        self.active_reason_reoffers
+            .retain(|fingerprint, _| materialized.contains(fingerprint));
+        self.reason_reoffer_counts.not_materialized = self
+            .reason_reoffer_counts
+            .selected
+            .saturating_sub(materialized.len())
+            .saturating_sub(self.reason_reoffer_counts.gate_held);
+        let next = reason_reoffer::next_offer_after(reason_reoffer::now_unix_seconds());
+        let mut changed = false;
+        for fingerprint in &materialized {
+            if let Some(refusal) = self.permanent_rejections.get_mut(fingerprint) {
+                if let Some(reoffer) = refusal.reoffer {
+                    if reoffer
+                        .retry_after()
+                        .is_some_and(|retry_after| retry_after < next)
+                    {
+                        refusal.reoffer = Some(reoffer.with_retry_after(next));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// The logical offer ends with the main upload call. Classify each
+    /// attempted lease by its validated durable outcome; a lease still held
+    /// had no validated response and keeps its reserved cooldown.
+    fn finish_reason_reoffers(
+        &mut self,
+        attempted: &BTreeMap<String, String>,
+        shed: bool,
+        source: &str,
+    ) {
+        let counts = &mut self.reason_reoffer_counts;
+        for fingerprint in attempted.keys() {
+            if !self.attempted_reason_reoffers.contains(fingerprint) {
+                counts.gate_held += 1;
+            } else if self.active_reason_reoffers.contains_key(fingerprint) {
+                if shed {
+                    counts.shed += 1;
+                } else {
+                    counts.failed += 1;
+                }
+            }
+            // Validated outcomes were counted when they consumed the exact
+            // lease. Later cache enrichment cannot relabel a probe's ACK, and
+            // an old refusal cannot relabel a fresh retryable conflict.
+        }
+        self.active_reason_reoffers.clear();
+        counts.invalid_extension = counts
+            .invalid_extension
+            .max(reason_reoffer::take_logged_invalid_extensions());
+        if reason_reoffer::should_log(source, counts) {
+            eprintln!("{}", counts.line(source));
+        }
     }
 
     /// Rearm every current entity exactly once for a new historical replay.
@@ -1067,7 +1640,12 @@ impl SnapshotUploadProgress {
             .get(fingerprint)
             .is_some_and(|record| record.body_witness == body_witness)
         {
-            return true;
+            // Only this exact body's own re-offer lease passes suppression.
+            return self
+                .active_reason_reoffers
+                .get(fingerprint)
+                .map(String::as_str)
+                != Some(body_witness);
         }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
@@ -1089,12 +1667,22 @@ impl SnapshotUploadProgress {
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.accepted += 1;
+        }
         self.permanent_rejections.remove(fingerprint);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
         self.quarantined_fingerprints.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
+        self.active_reason_reoffers.remove(fingerprint);
     }
 
     fn record_cache_state<T: Serialize>(
@@ -1175,18 +1763,48 @@ impl SnapshotUploadProgress {
     }
 
     fn quarantine_permanent_body(&mut self, fingerprint: &str, body_witness: &str, reason: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            if reason == reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED {
+                self.reason_reoffer_counts.refused_same += 1;
+            } else {
+                self.reason_reoffer_counts.refused_other += 1;
+            }
+        }
         self.quarantine_body(fingerprint, body_witness);
         let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
         record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
         record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
         record.retry_after_unix_seconds = 0;
+        let persisted_reason = crate::upload_receipts::RejectedUsageReason::from_wire(reason);
+        // Each same-reason refusal restarts the 24 h clock. Any other `other`
+        // answer is the server's classification of this body: done, never
+        // re-offered. Known reasons keep their old record byte-for-byte.
+        let reoffer = if reason == reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED {
+            Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: reason_reoffer::next_offer_after(
+                    reason_reoffer::now_unix_seconds(),
+                ),
+            })
+        } else if persisted_reason == crate::upload_receipts::RejectedUsageReason::Other {
+            Some(reason_reoffer::RefusalReoffer::Classified)
+        } else {
+            None
+        };
         self.permanent_rejections.insert(
             fingerprint.to_string(),
             PermanentSnapshotRejection {
                 body_witness: body_witness.to_string(),
-                reason: crate::upload_receipts::RejectedUsageReason::from_wire(reason),
+                reason: persisted_reason,
+                reoffer,
             },
         );
+        self.active_reason_reoffers.remove(fingerprint);
     }
 
     /// The server answered `unchanged` with an `unchanged_basis`: it did not
@@ -1195,6 +1813,26 @@ impl SnapshotUploadProgress {
     /// refusal: no usage was rejected. A changed body is a new fingerprint and
     /// is offered again; a historical replay rearms it once.
     fn hold_unstored_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.unchanged_unstored += 1;
+        }
+        // A validated unchanged answer for a re-offered refused body replaces
+        // that refusal's verdict. Retire it, so its reason schedules no more
+        // offers; the hold below keeps the no-body-stored disclosure.
+        if self
+            .permanent_rejections
+            .get(fingerprint)
+            .is_some_and(|refusal| refusal.body_witness == body_witness)
+        {
+            self.permanent_rejections.remove(fingerprint);
+        }
+        self.active_reason_reoffers.remove(fingerprint);
         self.quarantine_body(fingerprint, body_witness);
         let record = self
             .quarantined_fingerprints
@@ -1206,6 +1844,16 @@ impl SnapshotUploadProgress {
     }
 
     fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.retryable += 1;
+        }
+        self.active_reason_reoffers.remove(fingerprint);
         self.quarantine_body(fingerprint, body_witness);
         let record = self
             .quarantined_fingerprints
@@ -1550,8 +2198,21 @@ impl SnapshotUploadProgress {
         }
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
-        self.quarantined_fingerprints.clear();
+        // A later conflict on the refused bytes is the stronger settlement
+        // fact, even while the retained refusal gates its next daily offer.
+        // Keep it in the same atomic ledger so an older index-only timer can
+        // still be distinguished from this newer server answer on restart.
+        self.quarantined_fingerprints.retain(|fingerprint, record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && self
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+        });
         self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
         self.save(path)
     }
 
@@ -1807,6 +2468,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         || Ok(()),
         None,
         Some(NativeSelectedRestore::Logical(fallback)),
+        None,
     )
 }
 
@@ -1865,6 +2527,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         validate_destination,
         read_limit,
         None,
+        None,
     )
 }
 
@@ -1902,6 +2565,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
     fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1928,6 +2592,9 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     // These fields are runtime leases, not persisted settlement evidence.
     durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
     durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
+    durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
+    durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
+    durable.reason_reoffer_counts = progress.reason_reoffer_counts;
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -1980,7 +2647,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
-    committable.mark_bounded_sweep_unsettled();
+    match cause {
+        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
+        None => committable.mark_bounded_sweep_unsettled(),
+    }
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -3441,6 +4111,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_context_curve_request_index_complete: false,
         claude_context_curve_owned_start_proven: false,
         claude_file_birth: item.claude_file_birth,
+        claude_file_birth_verdict: item.claude_file_birth_verdict(),
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
@@ -4788,13 +5459,18 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    let (mut index, load_origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
     let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
+    // Absent, quarantined or undecodable: every file would come back new. The
+    // load origin decides it (StateMissing M3); an empty saved index counts too.
+    let claude_index_loaded_fresh = load_origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
+        || (index.generation == 0 && index.files.is_empty());
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -4819,9 +5495,17 @@ fn prepare_sync_source(
         index.mark_context_curve_capability_disabled();
     }
     let backfill_state = load_backfill_state(support_dir);
-    let backfill_pending =
-        pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
-            .contains(&source);
+    // Read before this cycle's replay claims a generation in the upload
+    // ledger: only a generation an earlier cycle left there is evidence.
+    let prior_claude_history = (source == SnapshotSource::ClaudeCode).then(|| {
+        claude_prior_history(
+            &backfill_state,
+            &upload_destination_namespace,
+            &upload_progress,
+            &index_path,
+            support_dir,
+        )
+    });
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -4843,8 +5527,17 @@ fn prepare_sync_source(
             upload_destination_namespace
         )
     };
-    let curve_replay_pending =
-        context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
+    // An unreadable backfill state arms no Claude replay of either kind, and
+    // no replay-wide scan window (StateMissing H1, N2).
+    let ReplayArming {
+        backfill_pending,
+        curve_replay_pending,
+    } = ReplayArming::decide(
+        source,
+        &backfill_state,
+        &upload_destination_namespace,
+        context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
+    );
     let historical_replay_pending = backfill_pending || curve_replay_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
@@ -4875,11 +5568,21 @@ fn prepare_sync_source(
             }
         }
     }
-    if prepare_upload_progress_for_cycle(
+    // Due exact refusal re-offers are reserved from the loaded, committed
+    // index and saved below before any lease reaches the scan or uploader.
+    let reoffer_now = reason_reoffer::now_unix_seconds();
+    let reoffer_scope = reason_reoffer::Scope {
+        index: &index,
+        now: reoffer_now,
+        window_start_unix_seconds: reoffer_now
+            .saturating_sub(receipt_window_days.saturating_mul(86_400)),
+    };
+    if prepare_upload_progress_for_cycle_with_reoffer(
         &mut upload_progress,
         &index,
         &replay_generation,
         historical_replay_pending,
+        Some(&reoffer_scope),
     ) {
         // Claim the new generation before the potentially long historical
         // scan. This prevents ACKs from the prior revision from suppressing
@@ -4893,7 +5596,7 @@ fn prepare_sync_source(
         .collect::<BTreeSet<_>>();
     // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
     // scan is built.
-    crate::snapshots::prepare_historical_replay_with_side(
+    let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
         &mut index,
         historical_replay_pending,
         replay_generation.clone(),
@@ -4901,6 +5604,15 @@ fn prepare_sync_source(
         &daemon.transcript_cache,
         &index_path,
     );
+    if let Some(prior_history) = prior_claude_history {
+        note_claude_history_cutoff_for_cycle(
+            &mut index,
+            source,
+            prior_history,
+            &backfill_state,
+            claude_index_loaded_fresh || replay_dropped_entries,
+        );
+    }
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
@@ -4912,8 +5624,12 @@ fn prepare_sync_source(
         index.load_claude_reemission_exclusions(support_dir);
     }
     let committed_index = index.clone();
+    let reoffer_paths =
+        index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
-    let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
+    let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
+    // Leased unchanged files join the same bounded, revalidated hint queue.
+    watcher_hints.paths.extend(reoffer_paths);
     if watcher_hints.overflowed {
         eprintln!(
             "local snapshot watcher hint queue overflowed for {}; durable traversal will reconcile",
@@ -5298,6 +6014,9 @@ fn finish_sync_source(
             backfill_succeeded = false;
         }
     }
+    // The history-upgrade emission seam: after the local evidence fold, before
+    // every ordinary and correction upload path can see a held body.
+    index.veto_claude_history_emission(source, &mut scan_result.snapshots);
 
     // Recheck after the potentially long scan, not only when status was
     // acquired. A cached login must not claim sessions created after a switch.
@@ -5455,15 +6174,15 @@ fn finish_sync_source(
         &current_codex_bindings,
         cached_codex_login_changed,
     );
-    // Judge recency on the clock at reconciliation, not the scan start: a long
-    // scan reads transcripts that were still being written after it began, and
-    // anchoring to the start rejected that live activity as "future".
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
     )
     .is_err()
@@ -5568,6 +6287,15 @@ fn finish_sync_source(
         // obligation survives until both cache settlement and index save.
         upload_progress.save(&upload_progress_path)?;
     }
+    // One logical offer per leased refusal: its next deadline is at least
+    // this first transmission + 24 h, and durable before it. A failed save
+    // sends nothing.
+    if upload_progress
+        .extend_reason_reoffers_before_upload(&scan_result.snapshots, locally_held_fingerprints)
+    {
+        upload_progress.save(&upload_progress_path)?;
+    }
+    let attempted_reason_reoffers = upload_progress.active_reason_reoffers.clone();
     // Existing entities cannot authorize their first cache enrichment without
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
@@ -5634,7 +6362,14 @@ fn finish_sync_source(
         )
         .inspect_err(log_bootstrap_failure("probe"))?;
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-            .inspect_err(log_bootstrap_failure("apply"))?;
+            .inspect_err(log_bootstrap_failure("apply"))
+            .inspect_err(|_| {
+                upload_progress.finish_reason_reoffers(
+                    &attempted_reason_reoffers,
+                    false,
+                    source.api_slug(),
+                );
+            })?;
         if held > 0 {
             eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -5642,6 +6377,8 @@ fn finish_sync_source(
             );
         }
     }
+    // The same hook every resend path calls; nothing held is left by now.
+    index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -5726,7 +6463,19 @@ fn finish_sync_source(
         }
         Ok(result)
     })
-    .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
+    .map(|result| {
+        with_retained_refusal_conflicts(
+            with_bootstrap_deferred(result, bootstrap_deferred),
+            &index,
+            &upload_progress,
+        )
+    });
+    // The logical offer ends here; normal bounded HTTP retries happened inside.
+    upload_progress.finish_reason_reoffers(
+        &attempted_reason_reoffers,
+        matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
+        source.api_slug(),
+    );
 
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state
@@ -5822,6 +6571,7 @@ fn finish_sync_source(
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -5941,6 +6691,7 @@ fn finish_sync_source(
                     comparison_completion
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
+                    Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
                         index = committable;
@@ -6154,12 +6905,19 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    settle_context_curve_replay_state(
-        &mut index,
-        context_curve_enabled,
-        scan_result.census_complete && upload_fully_settled,
-        &replay_generation,
-    );
+    // A Claude curve replay an unreadable backfill state suppressed stays
+    // pending (StateMissing H1), so it runs once the marker clears.
+    let curve_replay_suppressed = context_curve_enabled
+        && claude_replay_suppressed(source, &backfill_state)
+        && index.context_curve_replay_needed(&replay_generation);
+    if !curve_replay_suppressed {
+        settle_context_curve_replay_state(
+            &mut index,
+            context_curve_enabled,
+            scan_result.census_complete && upload_fully_settled,
+            &replay_generation,
+        );
+    }
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -6251,18 +7009,35 @@ fn finish_sync_source(
         );
     }
 
+    // StateMissing N2: a Claude census completed and settled under the
+    // history gate clears the unverified marker. A fresh index recorded its
+    // cutoff this cycle and an intact one keeps its entries, so the rebuilt
+    // history stays gated; Claude's bootstrap and replays may then run.
+    if claude_replay_suppressed(source, &backfill_state)
+        && scan_result.census_complete
+        && upload_fully_settled
+    {
+        if let Err(error) = crate::backfill::clear_prior_history_unverified(support_dir) {
+            eprintln!(
+                "local snapshot backfill state save failed for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+            return Err(anyhow!("local snapshot backfill state save failed"));
+        }
+    }
+
     if backfill_succeeded {
-        // Reload before mutating: a claim completion can persist an
-        // account-switch backfill cutoff while this (potentially minutes-long)
-        // sync is running, and saving the stale pre-scan copy would clobber it.
-        let mut backfill_state = load_backfill_state(support_dir);
-        mark_backfill_complete_for_destination(
-            &mut backfill_state,
-            source,
-            &upload_destination_namespace,
-        );
-        backfill_state.last_completed_at = Some(scan_started_at.clone());
-        if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
+        // Keep completion's reload, mutation and save atomic with claims,
+        // list intent and deliberate installation reset.
+        if let Err(error) = update_backfill_state(support_dir, |backfill_state| {
+            mark_backfill_complete_for_destination(
+                backfill_state,
+                source,
+                &upload_destination_namespace,
+            );
+            backfill_state.last_completed_at = Some(scan_started_at.clone());
+        }) {
             eprintln!(
                 "local snapshot backfill state save failed for {}: {}",
                 source.api_slug(),
@@ -6400,15 +7175,37 @@ fn finish_sync_source(
 /// quarantine must not be restored after progress is rearmed. For the same
 /// generation, restore it only after progress has claimed that generation so a
 /// clean follow-up cannot erase a replacement conflict before its retry.
+#[cfg(test)]
 fn prepare_upload_progress_for_cycle(
     upload_progress: &mut SnapshotUploadProgress,
     index: &ScanIndex,
     replay_generation: &str,
     historical_replay_pending: bool,
 ) -> bool {
+    prepare_upload_progress_for_cycle_with_reoffer(
+        upload_progress,
+        index,
+        replay_generation,
+        historical_replay_pending,
+        None,
+    )
+}
+
+/// Production form of the above: outside a historical replay, due refusal
+/// re-offers share the ordinary retry budget. A replay neither re-offers nor
+/// resets a cooldown.
+fn prepare_upload_progress_for_cycle_with_reoffer(
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    historical_replay_pending: bool,
+    reoffer: Option<&reason_reoffer::Scope<'_>>,
+) -> bool {
     if !historical_replay_pending {
-        return upload_progress
-            .prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        return upload_progress.prepare_quarantine_and_reason_retries(
+            &index.quarantined_snapshot_fingerprints,
+            reoffer,
+        );
     }
 
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
@@ -7243,7 +8040,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // until a complete family pass reconstructs the exact witness.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -7653,6 +8450,19 @@ where
         .iter()
         .map(|index| items[*index].clone())
         .collect::<Vec<_>>();
+    for index in indices {
+        let item = &items[*index];
+        let fp = fingerprint(item);
+        if progress.active_reason_reoffers.get(fp) == Some(&body_witness(item))
+            && progress.attempted_reason_reoffers.insert(fp.to_string())
+        {
+            progress.reason_reoffer_counts.attempted += 1;
+            progress.reason_reoffer_counts.attempted_bytes = progress
+                .reason_reoffer_counts
+                .attempted_bytes
+                .saturating_add(snapshot_packing_json_length(item)?);
+        }
+    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -7910,7 +8720,11 @@ where
                     .get(*fingerprint)
                     .is_some_and(|record| {
                         record.upload_body_witness.as_deref() == Some(body.as_str())
-                            && record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                            && matches!(
+                                record.disposition,
+                                SnapshotQuarantineDisposition::UnprovenTerminal
+                                    | SnapshotQuarantineDisposition::RetryPending
+                            )
                     })
         })
         .map(|(fingerprint, body)| (fingerprint.clone(), body.clone()))
@@ -17559,6 +18373,161 @@ mod tests {
         );
     }
 
+    /// Diagnostics only: every settlement path that marks the sweep unsettled
+    /// names itself, causes accumulate across pages and survive a reload, and
+    /// a settled outcome names nothing.
+    #[test]
+    fn unsettled_cause_names_each_settlement_and_partial_checkpoint_producer() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
+            held_entity_count: held_fingerprints.len(),
+            retry_pending_family_count: 0,
+            held_fingerprints: held_fingerprints.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            // Restorable non-blocking Rejected holds settle once H1 is composed.
+            progress_blocking: !held_fingerprints.is_empty(),
+        };
+
+        let blocked = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        let restored = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!restored.bounded_sweep_had_unsettled_upload());
+        assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
+
+        let deferred = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            false,
+        );
+        assert!(deferred.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+        let rejected_beside_hold =
+            settle_checkpointed_upload(scanned.clone(), &committed, &progress, &holds(&held), true);
+        assert!(rejected_beside_hold
+            .index
+            .bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            rejected_beside_hold
+                .index
+                .bounded_sweep_unsettled_cause_names(),
+            ["rejected_with_holds"]
+        );
+        let rejected = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            true,
+        );
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        // H1 settles a Rejected page whose holds are restorable and
+        // non-blocking, so it must name no unsettled cause.
+        let restorable = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &LocalHoldSettlement {
+                progress_blocking: false,
+                ..holds(&held)
+            },
+            true,
+        );
+        assert!(!restorable.index.bounded_sweep_had_unsettled_upload());
+        assert!(restorable
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+
+        // The shed and error branches mark through the partial checkpoint.
+        // A cause from an earlier page of the same sweep is kept beside it.
+        for (cause, name) in [
+            (UnsettledUploadCause::Shed, "shed"),
+            (UnsettledUploadCause::UploadError, "upload_error"),
+        ] {
+            let root = test_dir(&format!("unsettled-cause-checkpoint-{name}"));
+            std::fs::create_dir_all(&root).expect("create checkpoint fixture root");
+            let index_path = root.join("scan-index.json");
+            let progress_path = root.join("upload-progress.json");
+            let mut durable = SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 589),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load upload progress");
+            durable.save(&progress_path).expect("save upload progress");
+            let mut working = scanned.clone();
+            working.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+            let checkpoint = checkpoint_partial_snapshot_index_with_comparison(
+                &working,
+                &committed,
+                &durable,
+                &[],
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            )
+            .expect("partial checkpoint");
+            assert!(checkpoint.bounded_sweep_had_unsettled_upload());
+            let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+            assert!(reloaded.bounded_sweep_had_unsettled_upload());
+            assert_eq!(
+                reloaded.bounded_sweep_unsettled_cause_names(),
+                [name, "deferred_conflict"]
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     /// The backend's error-code set is closed and its forward tolerance covers
     /// unknown fields, never unknown values: `census_residue` against a backend
     /// that does not admit it would reject the ENTIRE receipt. So until the
@@ -19582,6 +20551,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod history_upgrade_pipeline_tests {
+        include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+    }
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
@@ -19602,8 +20574,14 @@ mod tests {
     pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }
+    mod reason_reoffer_tests {
+        include!("snapshot_sync/reason_reoffer_tests.rs");
+    }
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
+    }
+    mod load_containment_tests {
+        include!("snapshot_sync/load_containment_tests.rs");
     }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
@@ -21021,7 +21999,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
@@ -21029,7 +22007,7 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
 
-crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
