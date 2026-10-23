@@ -1994,6 +1994,30 @@ fn cursor_job_copy_refusal_keeps_conservative_release() {
         let active = scan.active_file.as_deref_mut().unwrap();
         active.sampling = sampling;
         active.parser.reader.acquisition = acquisition;
+        // P1-RETAIN R0 (T-R0d): read as a Tail, with its acquisition, the
+        // cursor conjunct alone still keeps the job off shape F, so its
+        // refusal keeps ClearOtherActive and its completion never reaches
+        // R0's release.
+        let active = scan.active_file.as_deref_mut().unwrap();
+        let sampling = active.sampling.as_mut().unwrap();
+        let mode = sampling.mode;
+        sampling.mode = crate::transcript_acquisition::ReadMode::Tail;
+        assert!(
+            active.parser.reader.acquisition.is_some(),
+            "precondition: the job's acquisition"
+        );
+        assert!(!crate::snapshots::sampled_scan::borrows_only_retained_reduction(active));
+        let cursor = active.cursor.take();
+        assert!(
+            crate::snapshots::sampled_scan::borrows_only_retained_reduction(active),
+            "precondition: only the cursor conjunct differs from shape F"
+        );
+        active.cursor = cursor;
+        let lifecycle = release(&scan);
+        assert_eq!(lifecycle.clear_other_active, 1, "a Tail cursor job");
+        assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.sampling.as_mut().unwrap().mode = mode;
     });
 }
 
@@ -6372,7 +6396,8 @@ fn hopeless_admission_evicts_nothing() {
         }
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .retained;
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
         let floor = admission_floor(&cache);
@@ -6382,6 +6407,7 @@ fn hopeless_admission_evicts_nothing() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
                 unsealed: false,
             },
             0,
@@ -6533,11 +6559,13 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         }
         let copy = cache
             .take(&key)
-            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+            .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+            .retained;
         let completed = |copy: crate::transcript_cache::Retained<_>| {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
                 unsealed: false,
             }
         };
@@ -6548,7 +6576,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
         let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
         assert!(with_copy + state <= STATE_BYTES);
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         // F4b exact boundary: a claim that leaves exactly the copy's room
         // beside the side ledger's reservation; the copy is kept.
         let exact = STATE_BYTES - state - with_copy;
@@ -6563,7 +6591,7 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
             STATE_BYTES
         );
         credit.refund();
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         // A claim that leaves one byte too few for it.
         let claim = exact + 1;
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
@@ -7085,7 +7113,8 @@ fn witness_admission() -> WitnessAdmission {
     }
     let copy = cache
         .take(&key)
-        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)));
+        .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
+        .retained;
     let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     // A single-session root has no parent refs: no `parents` entry exists.
@@ -7097,6 +7126,7 @@ fn witness_admission() -> WitnessAdmission {
         sampled_jsonl::CompletedNativeAcquisition {
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
+            released: None,
             unsealed: false,
         },
         0,
@@ -8981,14 +9011,15 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
                 unsealed: false,
             }
         };
-        let copy = cache.take(&key).expect("a certified copy");
+        let copy = cache.take(&key).expect("a certified copy").retained;
         cache.insert(key.clone(), completed(copy), 0);
         let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
         let proof = proof_charge(&job);
         // Room for the copy and the proof exactly: both stay.
@@ -9004,7 +9035,7 @@ fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
             STATE_BYTES
         );
         credit.refund();
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         assert!(matches!(
             cache.proof_take(&Scope("ns-a".to_owned()), Path::new("/idx/a.json"), "inc-1"),
             ProofTake::Mine(_)
@@ -9079,14 +9110,15 @@ fn a_suspended_proof_never_shrinks_mains_copy_budget() {
             sampled_jsonl::CompletedNativeAcquisition {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
+                released: None,
                 unsealed: false,
             }
         };
-        let copy = cache.take(&key).expect("a certified copy");
+        let copy = cache.take(&key).expect("a certified copy").retained;
         cache.insert(key.clone(), completed(copy), 0);
         let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
-        let copy = cache.take(&key).expect("retained");
+        let copy = cache.take(&key).expect("retained").retained;
         let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
         let proof = proof_charge(&job);
         let context = main_context(&cache);
