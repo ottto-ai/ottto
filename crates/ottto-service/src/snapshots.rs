@@ -22400,6 +22400,65 @@ impl OwnedSourceScan {
                 // uncertified with its prepared debt, like a lossy full read.
                 let sealed_only = parser.reader.sealed_fragment()
                     || parser.reader.consumed_bytes() == parser.reader.last_complete_line_end();
+                // N4 (fe-seam-ack §5): the file branch decides its H3c route
+                // before the retire below. A grown Claude prefix retains
+                // nothing, so it must not retire a suspended proof.
+                let file_acquisition = file_sampling
+                    .as_ref()
+                    .filter(|_| cursor_certificate.is_none() && side_origin.is_none());
+                let (current_scope, prefix) = match file_acquisition {
+                    Some(acquisition) => {
+                        // Known dependencies and the current path are separate from the
+                        // sampled prefix promise. Neither may be stale at completion.
+                        let current_scope = sampled_scan::reduction_dependencies(
+                            source,
+                            &candidate,
+                            &codex_title_metadata,
+                            &claude_title_metadata,
+                            claude_effort_support_dir_ref,
+                        )
+                        .zip(sampling.as_ref())
+                        .map(|(dependency, context)| {
+                            context.file_scope(
+                                source,
+                                &candidate,
+                                &dependency,
+                                source != SnapshotSource::ClaudeCode || artifacts_enabled,
+                                context_curve_enabled,
+                                index,
+                            )
+                        });
+                        // H3c: a passed certificate permits native finish of
+                        // this prefix only. Discard its checkpoint: no cache copy,
+                        // audit credit or source verification can follow it.
+                        let prefix = current_scope
+                            .as_ref()
+                            .filter(|scope| *scope == &acquisition.scope)
+                            .filter(|_| {
+                                acquisition.audit_due.is_some()
+                                    && sampling.as_ref().is_some_and(|context| {
+                                        context.audit_metadata_supported
+                                            && (context.audit_slots > 0
+                                                || index.files.get(&acquisition.key).is_some_and(
+                                                    ScanIndexEntry::has_unverified_source,
+                                                ))
+                                    })
+                            })
+                            .and_then(|scope| {
+                                parser.commit_claude_grown_prefix(
+                                    &candidate.path,
+                                    scope,
+                                    index
+                                        .files
+                                        .get(&acquisition.key)
+                                        .map_or(0, |entry| entry.size_bytes),
+                                )
+                            });
+                        (current_scope, prefix)
+                    }
+                    None => (None, None),
+                };
+                let h3c_route = prefix.is_some();
                 // U1a-2a (R2-B3, fix round 2 DB1; fix round 3 DM3): a suspended
                 // proof that the copy and finish/output shares would overrun is
                 // retired first, before either clone, and only where a copy can
@@ -22412,7 +22471,11 @@ impl OwnedSourceScan {
                     };
                 sampled_scan::retire_proof_beside_copy(
                     sampling.as_ref(),
-                    if retaining { copy_budget } else { 0 },
+                    if retaining && !h3c_route {
+                        copy_budget
+                    } else {
+                        0
+                    },
                     copy_measure,
                 );
                 let finish_copy_budget = parser
@@ -22434,53 +22497,6 @@ impl OwnedSourceScan {
                 } else if let Some(acquisition) =
                     file_sampling.as_ref().filter(|_| side_origin.is_none())
                 {
-                    // Known dependencies and the current path are separate from the
-                    // sampled prefix promise. Neither may be stale at completion.
-                    let current_scope = sampled_scan::reduction_dependencies(
-                        source,
-                        &candidate,
-                        &codex_title_metadata,
-                        &claude_title_metadata,
-                        claude_effort_support_dir_ref,
-                    )
-                    .zip(sampling.as_ref())
-                    .map(|(dependency, context)| {
-                        context.file_scope(
-                            source,
-                            &candidate,
-                            &dependency,
-                            source != SnapshotSource::ClaudeCode || artifacts_enabled,
-                            context_curve_enabled,
-                            index,
-                        )
-                    });
-                    // H3c: a passed certificate permits native finish of
-                    // this prefix only. Discard its checkpoint: no cache copy,
-                    // audit credit or source verification can follow it.
-                    let prefix = current_scope
-                        .as_ref()
-                        .filter(|scope| *scope == &acquisition.scope)
-                        .filter(|_| {
-                            acquisition.audit_due.is_some()
-                                && sampling.as_ref().is_some_and(|context| {
-                                    context.audit_metadata_supported
-                                        && (context.audit_slots > 0
-                                            || index
-                                                .files
-                                                .get(&acquisition.key)
-                                                .is_some_and(ScanIndexEntry::has_unverified_source))
-                                })
-                        })
-                        .and_then(|scope| {
-                            parser.commit_claude_grown_prefix(
-                                &candidate.path,
-                                scope,
-                                index
-                                    .files
-                                    .get(&acquisition.key)
-                                    .map_or(0, |entry| entry.size_bytes),
-                            )
-                        });
                     if let Some(prefix) = prefix {
                         match prefix {
                             Ok(grant) => parser.reader.sealed_prefix = Some(grant),

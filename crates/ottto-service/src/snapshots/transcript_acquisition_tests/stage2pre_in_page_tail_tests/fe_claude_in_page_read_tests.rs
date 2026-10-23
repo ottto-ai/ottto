@@ -1763,3 +1763,78 @@ fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
     assert_eq!(entry.unverified_deadline(), before);
     assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
 }
+
+/// N4 (fe-seam-ack §5, #660 second-lander parity): only a completion that
+/// retains a copy retires a suspended Codex proof beside it. An ordinary
+/// retaining Claude Full still passes its copy budget to the retire
+/// (unchanged); an H3c grown Claude read retains nothing, so it passes none
+/// (`retaining && !h3c_route`) and the suspended proof is kept.
+#[test]
+fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
+    use crate::snapshots::sampled_scan::codex_cursor::{ProofJob, ProofLease};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let suspend = |cache: &Arc<sampled_scan::SharedCache>| {
+        let job = Box::new(ProofJob {
+            namespace: "n4-proof".to_owned(),
+            index_path: PathBuf::from("/n4/index.json"),
+            incarnation: "n4".to_owned(),
+            entries: vec![("k".repeat(1 << 20), 1)],
+            next_row_end: 0,
+            touched_page: 0,
+            readers: None,
+        });
+        assert!(
+            ProofLease::new(cache, job).suspend(),
+            "precondition: suspended"
+        );
+        assert!(cache.proof_suspended_for_test().is_some());
+        sampled_scan::copy_retire_probe();
+    };
+
+    // Ordinary retaining path (unchanged): a quiescent first Full keeps its
+    // copy and calls the retire with its copy budget.
+    let fixture = ScanFixture::new(CLAUDE);
+    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    suspend(&cache);
+    let (_, _, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    assert_eq!(seen.modes, (1, 0, 0), "precondition: one Full read");
+    assert!(cache
+        .retained_checkpoint(&local_index_key(&fixture.file.0))
+        .is_some());
+    let probe = sampled_scan::copy_retire_probe().expect("a retaining completion retires beside");
+    assert!(probe.budget > 0, "{probe:?}");
+    assert!(probe.fits(), "{probe:?}");
+
+    // H3c: the grown in-page Full publishes its sealed prefix and passes no
+    // copy budget, so no budgeted retire runs and the proof is kept.
+    let mut base = baseline(CLAUDE, 4, 2);
+    base.cache.clear();
+    suspend(&base.cache);
+    let path = base.path.clone();
+    let index = std::mem::take(&mut base.index);
+    let ((index, _, seen, read), counts) = observe_side(|| {
+        page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
+            append_raw(&path, &row_bytes(CLAUDE, 6..9))
+        })
+    });
+    assert!(is_full(read.mode), "precondition: an in-page Full");
+    assert_eq!(seen.unreadable, 0, "causes={:?}", seen.causes);
+    assert!(
+        index.files[&base.key].has_prefix_provenance(),
+        "precondition: H3c published a prefix"
+    );
+    assert!(base.cache.retained_checkpoint(&base.key).is_none());
+    assert!(
+        sampled_scan::copy_retire_probe().is_none(),
+        "no budgeted retire on the H3c route"
+    );
+    assert!(
+        base.cache.proof_suspended_for_test().is_some(),
+        "proof kept"
+    );
+    assert_eq!(counts.side_proof_drops, 0);
+}
