@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "c346f9a90d97cdd446a8367dffd3248e8f0a8eb6b5954e0dceeaa69159f3cd4d",
+  "content_sha256": "ec068368a04146ec1ea9b0a41abf5d61edf286ccfcb71ae894d1ed56198af18b",
   "files": [
     {
       "executable": false,
@@ -1987,8 +1987,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/full_rearm_progress_tests.rs",
-      "sha256": "0a6bfba00ff6b506a9a268ffa303650e54b02c21bf11e2f42f6efb1ca455e583",
-      "size_bytes": 49917
+      "sha256": "829c90000eee0b0ce4cf4b4b2c6054a0b9ca5f7763af9e9d63768afa1f92e748",
+      "size_bytes": 50861
     },
     {
       "executable": false,
@@ -5806,7 +5806,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T19:15:56+00:00",
+  "generated_at": "2026-10-23T20:22:39+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "542ab916f87b759117b5766c6fcbb6e9de645be7"
+  "source_commit": "877011423ce2052319f71cd4ca252515423580c1"
 }

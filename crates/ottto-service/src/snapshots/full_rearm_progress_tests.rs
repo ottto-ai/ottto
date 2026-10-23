@@ -981,15 +981,23 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
                 let row = if !matches!(cause, "unpaired" | "malformed-pair") {
                     if kind == "claude-code-effort" {
                         let mut row = complete_api_row(&rearm.parent, "req_1", 0, 10, 10, 0);
+                        // This dark-path control claims no account identity.
+                        // Partial checked coverage would independently veto the
+                        // skip and mask semantic client/row failures below.
+                        row.account_identity_checked = false;
+                        row.account_identifier_hash = None;
                         if cause == "invalid-api" {
                             row.request_count = 2;
-                            row.fingerprint.clear();
-                            row.fingerprint = format!(
-                                "sha256:{:x}",
-                                Sha256::digest(serde_json::to_vec(&row).unwrap())
-                            );
-                            assert!(!validate_claude_api_row(&row, &rearm.parent));
                         }
+                        row.fingerprint.clear();
+                        row.fingerprint = format!(
+                            "sha256:{:x}",
+                            Sha256::digest(serde_json::to_vec(&row).unwrap())
+                        );
+                        assert_eq!(
+                            validate_claude_api_row(&row, &rearm.parent),
+                            cause != "invalid-api"
+                        );
                         serde_json::to_string(&row).unwrap()
                     } else {
                         let request = if cause == "request-gap" {
@@ -1047,6 +1055,15 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
             let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 &support, &mut scan, &mut index,
             );
+            assert!(
+                scan.snapshots
+                    .iter()
+                    .all(|item| item.claude_account_withheld_reason.is_none()),
+                "{cause}: account withholding cannot mask semantic qualification"
+            );
+            assert!(index.claude_account_deferred_holds.is_empty(), "{cause}");
+            assert!(index.claude_owned_start_census.is_empty(), "{cause}");
+            assert!(!index.claude_request_identity_contract_changed, "{cause}");
             if cause == "request-gap" {
                 assert_eq!(stats.api_incomplete_root_count, 0);
                 assert_eq!(stats.trace_incomplete_root_count, 0);
@@ -1066,7 +1083,7 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
             if matches!(cause, "absent" | "matched") {
                 assert!(
                     run.suppression.full_rearm_suppressed,
-                    "healthy control: {run:?}"
+                    "{cause} healthy control: {run:?}"
                 );
                 assert!(!run.counts.full_rearm);
                 assert_eq!(run.rearmed_files, 0);
