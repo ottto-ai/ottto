@@ -14757,7 +14757,6 @@ impl SnapshotAccumulator {
     /// `per_usage_row` is the account hash each `model_usage` row clones
     /// (family D multiplies it). A subagent transcript names itself from agent
     /// metadata on disk (IO): `None`, so the proof releases nothing.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
     fn claude_title_metadata_bound(
         &self,
         path: &Path,
@@ -14817,6 +14816,207 @@ impl SnapshotAccumulator {
             fixed,
             per_usage_row,
         })
+    }
+
+    /// X_out (#665): an allocation-free upper bound of
+    /// `completed_bound(&parsed_file, ..)` once this Claude transcript is
+    /// finished, together with the finalize and `into_items` scratch beside
+    /// it, measured before any copy or eviction (hunk map §0-§3). `None`, so
+    /// the proof releases nothing: a non-Claude or subagent transcript (its
+    /// agent metadata is read from disk), a workspace whose repository
+    /// identity was not peeked, an unsupported layout, or a bound past
+    /// `limit`.
+    ///
+    /// By family (`x_out_coverage_witness_names_every_finished_field`):
+    /// - R: the response book's `completion_bounds` output; and per resolved
+    ///   response, what its row copies take from this accumulator (the
+    ///   running selector, the model fallback).
+    /// - D and M: every other finished field is a move, a clone, or a
+    ///   derivation no larger than one accumulator field (outside the book),
+    ///   and at most three of each are live at once (the field, its output,
+    ///   one transient), so three charges of the accumulator without the
+    ///   book. Usage rows have `ROW_COPIES` copies, and each emitted row
+    ///   clones the account hash and five cost texts; the vectors `finalize`
+    ///   and `into_items` grow are charged from their lengths.
+    /// - K: constant-capped text: digests, provenance, the unavailable
+    ///   context curve, cost text, attribution facts.
+    /// - U: title metadata (U1), `session_start` (U2) and the peeked
+    ///   repository identity, which `finish` must receive (U3), twice.
+    fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
+        use crate::heap_layout_bound::tree_node_bytes;
+        use crate::session_attribution::{
+            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+            MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+            MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+        };
+        use claude_response_records::{RFC3339_TEXT_BYTES, ROW_COPIES, SHA256_HEX_TEXT_BYTES};
+        use std::mem::size_of;
+        /// `usd_picos_string`: at most 39 integer digits, a point and 12
+        /// fraction digits, in a `format!` buffer at most twice that.
+        const USD_TEXT_BYTES: usize = 2 * (39 + 1 + 12);
+        /// A top-level Claude item's attribution facts come from four
+        /// producers (`direct_provider_facts`, desktop spawn, launch,
+        /// grouping), each stopping at `MAX_SESSION_ATTRIBUTION_FACTS`
+        /// (`push_labeled_fact`); `extend` at most doubles the capacity.
+        const FACT_SLOTS: usize = 2 * 4 * MAX_SESSION_ATTRIBUTION_FACTS;
+        /// A fact's `field`, `kind` and `strength` are literals at their call
+        /// sites (the longest is 22 bytes).
+        const FACT_LITERAL_BYTES: usize = 64;
+
+        if self.source != SnapshotSource::ClaudeCode
+            || !crate::heap_layout_bound::layout_supported()
+            || claude_subagent_identity(input.path).is_some()
+        {
+            return None;
+        }
+        let FinishOutputInput {
+            path,
+            collected_at,
+            source_file_fingerprint,
+            opened_object_identity,
+            title_metadata,
+            attribution,
+            repository_identity,
+        } = input;
+        let heap = |bytes: Option<usize>| bytes.filter(|bytes| *bytes <= limit);
+        // U1, U2, U3.
+        let title = match title_metadata {
+            Some(metadata) => self.claude_title_metadata_bound(path, metadata)?,
+            None => TitleMetadataBound::default(),
+        };
+        let session_start = self
+            .session_start
+            .finished_heap_bound(attribution, true, limit)?;
+        let repository = match (&self.workspace_path, repository_identity) {
+            (None, _) => 0,
+            (Some(_), Some(identity)) => heap(completed_heap(identity, limit))?.checked_mul(2)?,
+            (Some(_), None) => return None,
+        };
+        // R: the book, and what each resolved response's rows take from here.
+        let responses = self.claude_responses.completion_bounds(limit)?.output?;
+        let resolved = self
+            .claude_responses
+            .values()
+            .filter(|response| !response.record_limit_exceeded)
+            .count();
+        let current_selector = heap(completed_heap(&self.current_selector, limit))?;
+        let model_fallback = self
+            .latest_model
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add("unknown".len())?;
+        let per_response = current_selector
+            .checked_mul(2)? // the row's maps and its hoisted billing text
+            .checked_add(model_fallback)?
+            .checked_mul(ROW_COPIES)?;
+        // D and M.
+        let book = heap(completed_heap(&self.claude_responses, limit))?;
+        let state = heap(completed_heap(self, limit))?.checked_sub(book)?;
+        let usage_buckets = heap(completed_heap(&self.usage_buckets, limit))?;
+        let file_rows = self
+            .usage_buckets
+            .values()
+            .try_fold(0usize, |rows, bucket| rows.checked_add(bucket.rows.len()))?;
+        let rows = file_rows.checked_add(resolved)?;
+        let per_row = self
+            .account_identifier_hash
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add(title.per_usage_row)?
+            .checked_add(5 * USD_TEXT_BYTES)?
+            .checked_mul(2)?;
+        // Vectors grown by `push` from the file's own length: cache requests,
+        // usage buckets, the file's rows' `SnapshotModelUsage` slots (the
+        // book charges each resolved response's).
+        let slots = self
+            .cache_requests
+            .len()
+            .checked_mul(2)?
+            .checked_add(4)?
+            .checked_mul(size_of::<cache_observations::OwnedRequest>())?
+            .checked_add(
+                self.usage_buckets
+                    .len()
+                    .checked_mul(2)?
+                    .checked_add(4)?
+                    .checked_mul(size_of::<SnapshotUsageBucket>())?,
+            )?
+            .checked_add(file_rows.checked_mul(7 * size_of::<SnapshotModelUsage>())?)?;
+        // `claude_compaction_summary`'s pairing maps and timestamp vectors.
+        let compaction = tree_node_bytes::<u64, usize>()?
+            .checked_add(tree_node_bytes::<usize, ()>()?.checked_mul(2)?)?
+            .checked_add(3 * size_of::<String>())?
+            .checked_mul(self.claude_compaction_observations.len())?
+            .checked_add((MAX_COMPACTION_TIMESTAMPS + 4) * size_of::<String>())?;
+        // K.
+        let session_id = match self.source_session_id {
+            Some(_) => 0,
+            None => path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map_or(0, str::len)
+                .checked_mul(3)?,
+        };
+        let context_curve = if self.context_curve_enabled {
+            CONTEXT_CURVE_CONTRACT_VERSION.len()
+                + self.source.parser_version().len()
+                + CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION.len()
+                + CONTEXT_CURVE_SAMPLING_REVISION.len()
+                + "ownership_unresolved".len()
+        } else {
+            0
+        };
+        let single_fact = MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+            + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+            + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
+            + 3 * FACT_LITERAL_BYTES;
+        // Past one fact the wire budget bounds every kept string; capacity is
+        // at most twice the length, at least 8 for each of a fact's 9 texts.
+        let facts = MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+            .checked_add(single_fact)?
+            .checked_add(collected_at.len())?
+            .checked_mul(2)?
+            .checked_add(9 * 8 * MAX_SESSION_ATTRIBUTION_FACTS)?
+            .checked_add(
+                FACT_SLOTS
+                    .checked_mul(size_of::<crate::session_attribution::SessionAttributionFact>())?,
+            )?;
+        let constants = SHA256_HEX_TEXT_BYTES // snapshot_fingerprint
+            .checked_add("final".len())?
+            .checked_add(collected_at.len())?
+            .checked_add(source_file_fingerprint.len().checked_mul(2)?)?
+            .checked_add(opened_object_identity.len())? // the ownership ledger's
+            .checked_add(2 * ("claude_code_jsonl".len() + "uncached".len()))?
+            .checked_add(context_curve)?
+            .checked_add(5 * USD_TEXT_BYTES + "pi_usage_cost".len())?
+            .checked_add("agent_capability_usage:v2".len())?
+            .checked_add(RFC3339_TEXT_BYTES)? // a fallback bucket input
+            .checked_add(session_id)?
+            .checked_add(facts)?;
+        let mut out = crate::heap_layout_bound::Counter::new(limit);
+        for bytes in [
+            size_of::<ParsedJsonlFile>(),
+            size_of::<SnapshotItem>(), // `vec![item]`
+            responses,
+            resolved.checked_mul(per_response)?,
+            current_selector, // `add_usage_with_selector_placed`'s `merged`
+            state.checked_mul(3)?,
+            usage_buckets.checked_mul(ROW_COPIES.checked_sub(3)?)?,
+            rows.checked_mul(per_row)?,
+            slots,
+            compaction,
+            constants,
+            title.fixed,
+            session_start,
+            repository,
+        ] {
+            out.add(bytes)?;
+        }
+        Some(out.bytes)
     }
 
     fn apply_first_prompt_fallback(&mut self) {
@@ -15662,10 +15862,33 @@ impl SnapshotAccumulator {
 
 /// Observed-input bound of Claude title metadata (X_out family U1, #665).
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
 struct TitleMetadataBound {
     fixed: usize,
     per_usage_row: usize,
+}
+
+/// What `SnapshotAccumulator::finish_output_bound` measures besides the
+/// accumulator (X_out, #665): the `finish` arguments, resident at the proof.
+struct FinishOutputInput<'a> {
+    path: &'a Path,
+    collected_at: &'a str,
+    source_file_fingerprint: &'a str,
+    opened_object_identity: &'a str,
+    title_metadata: Option<&'a ClaudeTitleMetadata>,
+    attribution: bool,
+    /// The identity peeked for `workspace_path` (U3); `finish` must take
+    /// exactly this value (`finish_with_repository_identity`).
+    repository_identity: Option<&'a crate::context_footprint::RepositoryIdentity>,
+}
+
+/// `completed_heap_bound` of `value` on a fresh counter.
+fn completed_heap<T: crate::heap_layout_bound::HeapLayoutBound>(
+    value: &T,
+    limit: usize,
+) -> Option<usize> {
+    let mut counter = crate::heap_layout_bound::Counter::new(limit);
+    value.completed_heap_bound(&mut counter)?;
+    Some(counter.bytes)
 }
 
 type RepositoryIdentityCache =
@@ -15691,7 +15914,6 @@ fn fresh_repository_identity(
 /// Read-only view of the repository-identity cache for the M-a release proof
 /// (#665, X_out family U3): no IO, no insert, no TTL refresh. A miss, an
 /// expired entry or a poisoned lock is `None`, so the proof refuses.
-#[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
 pub(super) fn peek_repository_identity(
     workspace: &Path,
 ) -> Option<crate::context_footprint::RepositoryIdentity> {
@@ -22387,6 +22609,8 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                 }
                 let mut parser = parser;
+                // The repository identity X_out measured, if any (#665 U3).
+                let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
                         Ok(receipt) => {
@@ -22552,6 +22776,30 @@ impl OwnedSourceScan {
                     // a granted one. M-a (S-a): only now, after main's proof
                     // retirement and that reservation, may a shape-F release be
                     // proven; its `budget_after` is peak-reserved the same way.
+                    // X_out (#665): Claude's finish-output bound, only for a
+                    // proof. The repository identity it measured (U3) is the
+                    // one `finish` takes below; a miss refuses.
+                    let x_out = sampled_scan::x_out_for(source, || {
+                        release_proof.as_ref()?;
+                        measured_repository_identity = parser
+                            .accumulator
+                            .workspace_path
+                            .as_deref()
+                            .and_then(peek_repository_identity);
+                        parser.finish_output_bound(
+                            FinishOutputInput {
+                                path: &candidate.path,
+                                collected_at: collected_at.as_str(),
+                                source_file_fingerprint: &source_file_fingerprint,
+                                opened_object_identity: &candidate.opened_object_identity,
+                                title_metadata: Some(&claude_title_metadata),
+                                attribution: attribution_context.is_some(),
+                                repository_identity: measured_repository_identity.as_ref(),
+                            },
+                            // `proven_release` checks it against `remaining'`.
+                            usize::MAX,
+                        )
+                    });
                     let retain_budget = sampled_scan::prove_release(
                         retain_budget.reserve_peak(copy_budget, |budget| {
                             parser
@@ -22561,7 +22809,7 @@ impl OwnedSourceScan {
                         }),
                         release_proof,
                         sampling.as_ref(),
-                        sampled_scan::x_out_for(source),
+                        x_out,
                         |budget| {
                             parser
                                 .accumulator
@@ -22692,7 +22940,7 @@ impl OwnedSourceScan {
                 } else {
                     Vec::new()
                 };
-                let parsed_file = parser.finish(
+                let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
                     collected_at.as_str(),
@@ -22701,6 +22949,7 @@ impl OwnedSourceScan {
                     (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
                     // U1a-2a B8′: a side read takes no attribution context.
                     attribution_context.filter(|_| side_origin.is_none()),
+                    measured_repository_identity,
                 );
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
@@ -26422,6 +26671,17 @@ impl OwnedJsonlParser {
             attribution_context,
             None,
         )
+    }
+
+    /// `SnapshotAccumulator::finish_output_bound` (X_out, #665) without the
+    /// scan's live shared inputs (Codex turn traces, parent ledgers): no
+    /// finished field holds them, and `retention_bound` leaves them out the
+    /// same way.
+    fn finish_output_bound(&mut self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
+        let inputs = self.take_live_reduction_inputs();
+        let bound = self.accumulator.finish_output_bound(input, limit);
+        self.restore_live_reduction_inputs(inputs);
+        bound
     }
 
     /// `finish`, with the repository identity the M-a release proof measured

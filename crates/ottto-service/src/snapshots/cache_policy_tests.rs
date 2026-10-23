@@ -29,9 +29,10 @@
 //! (ruling 2): they are the acceptance controls. Their
 //! `cache_policy_r0_diagnostic_m1_*` twins and the regime-B rows
 //! (`cache_policy_r0_regime_b_*`, fillers ranked two days back) are
-//! diagnostics, not acceptance: they print R0's probe and decision. For a
-//! Claude usage tail with `F_prev > C`, Q-PR15's guard still suppresses R0's
-//! release (ruling 5). G3 is unchanged. The decision matrix, the counters and
+//! diagnostics, not acceptance: they print R0's probe and decision. A Claude
+//! tail proves its release with its measured X_out (M-a, without Q-PR15's
+//! guard); a Codex tail keeps `F_prev` and the guard (ruling 5). G3 is
+//! unchanged. The decision matrix, the counters and
 //! the visit-limited active pin evict-to-fit on a non-F tail (a comparison
 //! target), each with a shape-F control that releases nothing;
 //! `cache_policy_m1_path_a_admits_a_non_f_tail_from_older_entries_only` pins
@@ -1619,9 +1620,9 @@ fn assert_regime_b_invariants(passes: &[RegimePass], label: &str) {
 /// Diagnostic, not acceptance (parent ruling 2). Regime B, Claude, usage
 /// appends: the hot-file model with idle fillers ranked below the tailed
 /// file's taken hint, each pass appending a usage record. The outcome is a
-/// receipt only (`CACHE_POLICY test=R0_regime_b_claude_usage`): where
-/// `F_prev > C` the Q-PR15 guard (kept, ruling 5) suppresses R0's release, so
-/// the copy is kept only if `b_ins ≥ C`.
+/// receipt only (`CACHE_POLICY test=R0_regime_b_claude_usage`): M-a proves
+/// the release with the tail's measured X_out, so the copy is kept when
+/// `|P*| <= |P_C|` or `b_ins ≥ C`.
 #[test]
 fn cache_policy_r0_regime_b_claude_usage_tail_receipt() {
     if unexecuted("R0_regime_b_claude_usage") {
@@ -1722,7 +1723,7 @@ impl MaRun {
 /// tail), `extra` small Claude entries `(key, mtime)` beside them, then the
 /// tailed file's padded append (a zero copy budget at its step starts),
 /// stamped `tail_modified`, read as one tail with `x_out` in place of the
-/// unwired Claude bound (`x_out_for`). `touch_at_gate` restamps the file
+/// measured Claude bound (`x_out_for`). `touch_at_gate` restamps the file
 /// after the proof, just before the deferred path's stamp gate.
 fn m_a_tail(
     source: SnapshotSource,

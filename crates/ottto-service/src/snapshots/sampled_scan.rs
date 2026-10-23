@@ -1403,11 +1403,8 @@ pub(super) struct ReleaseProof {
 
 /// The finish-output bound a release proof may use (B1 ruling 3; X_out
 /// hunk map). `Legacy` keeps `K = max(C, F_prev)` and the Q-PR15 guard:
-/// Codex's explicit residual (ruling 5), and every source until X_out lands
-/// (c22 amendment 1). `Refused`: no owned bound, so zero victims.
-// Until H1-H3 wire Claude's X_out only the M-a controls construct `Refused`
-// and `Bound` (`test_hooks::set_x_out`).
-#[cfg_attr(not(test), allow(dead_code))]
+/// Codex's explicit residual (ruling 5). `Refused`: no owned bound, so zero
+/// victims. `Bound`: Claude's X_out, without the guard (S-c).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum XOut {
     Legacy,
@@ -1415,9 +1412,10 @@ pub(super) enum XOut {
     Bound(usize),
 }
 
-/// The X_out a completion of `source` proves with. Claude's bound is not
-/// wired yet (H1-H3 await the #667 owner's ACK), so it is `Legacy` too.
-pub(super) fn x_out_for(source: SnapshotSource) -> XOut {
+/// The X_out a completion of `source` proves with: Claude's `bound`
+/// (`SnapshotAccumulator::finish_output_bound`, `None` refuses), the legacy
+/// decision for every other source. `bound` runs only for Claude.
+pub(super) fn x_out_for(source: SnapshotSource, bound: impl FnOnce() -> Option<usize>) -> XOut {
     if source != SnapshotSource::ClaudeCode {
         return XOut::Legacy;
     }
@@ -1425,7 +1423,7 @@ pub(super) fn x_out_for(source: SnapshotSource) -> XOut {
     if let Some(x_out) = test_hooks::x_out() {
         return x_out;
     }
-    XOut::Legacy
+    bound().map_or(XOut::Refused, XOut::Bound)
 }
 
 /// M-a's release proof at the retention site (S-a): after main's proof
@@ -1796,8 +1794,8 @@ pub(super) mod test_hooks {
         INS_EXTRA.with(std::cell::Cell::get)
     }
 
-    /// Sets a Claude completion's X_out in place of the unwired one
-    /// (`x_out_for`), until `clear`: drives M-a's proof before H1-H3.
+    /// Sets a Claude completion's X_out in place of its measured bound
+    /// (`x_out_for`), until `clear`: drives M-a's proof at a chosen X_out.
     pub(in crate::snapshots) fn set_x_out(x_out: Option<super::XOut>) {
         X_OUT.with(|cell| cell.set(x_out));
     }

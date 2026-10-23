@@ -36,7 +36,6 @@ pub(crate) const MAX_OPENING_FILES: usize = 64;
 const CONFIG_FINGERPRINT_LEN: usize = 16;
 /// An opening file's `path_hash`: `session_attribution::opaque_hmac_id`, i.e.
 /// "<key version>:" + URL-safe unpadded base64 of the 32-byte HMAC-SHA256 (43).
-#[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
 const PATH_HASH_LEN: usize =
     crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION.len() + 1 + 43;
 /// Retained capacity of the whole in-window state, charged with the daemon's
@@ -1335,7 +1334,6 @@ impl SessionStartState {
     /// fixed output length (`PATH_HASH_LEN` at most doubled by `format!`'s
     /// growth; `CONFIG_FINGERPRINT_LEN` exact). Every tracked file is charged,
     /// not only the <= 64 `finish` keeps. `None` past `limit`.
-    #[cfg_attr(not(test), allow(dead_code))] // Wired with X_out after the R1a ACK on H1-H3.
     pub(super) fn finished_heap_bound(
         &self,
         attribution: bool,

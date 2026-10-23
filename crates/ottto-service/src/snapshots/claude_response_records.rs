@@ -11,13 +11,18 @@
 //! is. Resolution decodes each record back to `ClaudeResponseRecord` before
 //! the unchanged response merge, so finalized output is identical by
 //! construction.
+use super::cache_observations::OwnedRequest;
 use super::{
-    ClaudeResponseObservation, ClaudeResponseRecord, RequestSlot, SelectorCapture, UsageCosts,
-    UsageTotals,
+    BucketRowAccumulator, ClaudeResponseObservation, ClaudeResponseRecord,
+    ClaudeTranscriptUsageOccurrence, RequestSlot, RowKey, SelectorCapture, SnapshotModelUsage,
+    SnapshotToolUsage, SnapshotUsageBucket, UsageBucketState, UsageCosts, UsageTotals,
+    SELECTOR_CONTEXT_ALLOWED,
 };
-use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+use crate::heap_layout_bound::{tree_node_bytes, Counter, HeapLayoutBound};
 use crate::owned_heap::{OwnedMap, OwnedVec, ValueGuard};
 use std::collections::BTreeMap;
+use std::mem::{align_of, size_of};
+use std::sync::Arc;
 
 /// Distinct selectors interned per file. Sessions normally carry a handful;
 /// past the cap a record keeps its own selector, so interning never refuses.
@@ -97,20 +102,35 @@ impl ClaudeResponseBook {
     /// every decoded record in the file. The compact input backing storage and
     /// unprocessed responses remain covered by the active charge throughout.
     pub(super) fn decode_peak_bound(&self, limit: usize) -> Option<usize> {
+        self.completion_bounds(limit).map(|bounds| bounds.peak)
+    }
+
+    /// `decode_peak_bound`'s peak, and from the same pass what finalizing the
+    /// responses adds to the finished file (X_out family R, #665). Only the
+    /// peak decides `None`, exactly where it did before the output term
+    /// existed; an output that cannot be bounded within `limit` is
+    /// `output: None` and never changes the peak.
+    pub(super) fn completion_bounds(&self, limit: usize) -> Option<CompletionBounds> {
         if self.responses.is_empty() {
-            return Some(0);
+            return Some(CompletionBounds {
+                peak: 0,
+                output: Some(0),
+            });
         }
         if !crate::heap_layout_bound::layout_supported() {
             return None;
         }
         let mut peak = 0;
+        let mut output = Some(BookOutput::default());
         for response in self.responses.iter() {
+            // A response over the record limit resolves to nothing (only a
+            // dropped-usage count), so it adds no output either.
             if !response.record_limit_exceeded {
-                peak = peak.max(decoded_response_peak_bound(
-                    &response.records,
-                    &self.selectors,
-                    limit,
-                )?);
+                let response = decoded_response_bounds(&response.records, &self.selectors, limit)?;
+                peak = peak.max(response.peak);
+                output = output
+                    .zip(response.output)
+                    .and_then(|(book, response)| book.add(response, limit));
             }
         }
         // finalize_claude_responses sorts the response vector before decoding;
@@ -120,11 +140,237 @@ impl ClaudeResponseBook {
             .len()
             .checked_mul(std::mem::size_of::<ClaudeResponseObservation>())?;
         let peak = peak.max(response_sort);
-        (peak <= limit).then_some(peak)
+        (peak <= limit).then(|| CompletionBounds {
+            peak,
+            output: output.and_then(|book| book.bytes(limit)),
+        })
     }
 
     pub(super) fn into_parts(self) -> (Vec<ClaudeResponseObservation>, ClaudeSelectorTable) {
         (self.responses.into_vec(), self.selectors)
+    }
+}
+
+/// `ClaudeResponseBook::completion_bounds`: #667's decode peak, and the
+/// finish-output term of the book's responses (X_out family R, #665).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CompletionBounds {
+    /// `decode_peak_bound`'s value.
+    pub(super) peak: usize,
+    /// What `finalize_claude_responses_captured` and `into_items` build from
+    /// these responses, with their finalize scratch; `None` when it cannot
+    /// be bounded.
+    pub(super) output: Option<usize>,
+}
+
+/// Live copies of one usage row's strings and maps (X_out family R): the
+/// accumulator's row, `bound_claude_attribution_mcp_tool_cardinality`'s
+/// clone (past its row limit also a fallback key and a rewritten row), and
+/// the bucket and session `SnapshotModelUsage` clones `into_items` emits.
+pub(super) const ROW_COPIES: usize = 5;
+/// A `time` RFC 3339 text: at most 35 bytes (four-digit year, nine fraction
+/// digits, a `+hh:mm` offset) in a buffer grown to at most twice that.
+pub(super) const RFC3339_TEXT_BYTES: usize = 128;
+/// `build_row_identity`'s `selector_hash`: 16 hex digits, or "base".
+const ROW_SELECTOR_HASH_BYTES: usize = 16;
+/// The `context_bucket` selector `finalize_claude_responses_captured` may
+/// insert: its key in both maps, "long" or "short", and its source text.
+const CONTEXT_BUCKET_BYTES: usize =
+    2 * "context_bucket".len() + "short".len() + "derived_from_effective_input_volume".len();
+/// `sha256_hex`'s `format!` text (64 hex digits, buffer at most twice that).
+pub(super) const SHA256_HEX_TEXT_BYTES: usize = 128;
+/// `serde_json::to_string`'s initial buffer.
+const JSON_TEXT_MIN_BYTES: usize = 128;
+
+/// One record's decoded bound (#667, unchanged) and its output term.
+struct RecordBounds {
+    decoded: usize,
+    output: Option<ResponseOutput>,
+}
+
+/// One response's decode peak (#667, unchanged) and merged output term.
+struct ResponseBounds {
+    peak: usize,
+    output: Option<ResponseOutput>,
+}
+
+/// A response's strings in the merge's real direction (`resolve_with`,
+/// `merge_claude_response_record`; R1a R3): the response keeps one record's
+/// first-non-None text (model, effort, request id) and one record's
+/// last-writer slot and timestamp, so those are the largest over its
+/// records; the selector and tool uses are unions, so those are sums.
+#[derive(Debug, Default, Clone, Copy)]
+struct ResponseOutput {
+    records: usize,
+    model: usize,
+    effort: usize,
+    request_id: usize,
+    timestamp: usize,
+    slot: usize,
+    selector_bytes: usize,
+    /// Context plus sources entries.
+    selector_entries: usize,
+    tool_bytes: usize,
+    tool_entries: usize,
+}
+
+impl ResponseOutput {
+    fn merge(self, record: Self) -> Option<Self> {
+        let Self {
+            records,
+            model,
+            effort,
+            request_id,
+            timestamp,
+            slot,
+            selector_bytes,
+            selector_entries,
+            tool_bytes,
+            tool_entries,
+        } = record;
+        Some(Self {
+            records: self.records.checked_add(records)?,
+            model: self.model.max(model),
+            effort: self.effort.max(effort),
+            request_id: self.request_id.max(request_id),
+            timestamp: self.timestamp.max(timestamp),
+            slot: self.slot.max(slot),
+            selector_bytes: self.selector_bytes.checked_add(selector_bytes)?,
+            selector_entries: self.selector_entries.checked_add(selector_entries)?,
+            tool_bytes: self.tool_bytes.checked_add(tool_bytes)?,
+            tool_entries: self.tool_entries.checked_add(tool_entries)?,
+        })
+    }
+}
+
+/// The book's output term, summed over its responses (X_out family R). Tree
+/// nodes are counted as entries (roots included) and charged once, at the
+/// summed count, in `bytes` (R1a R4).
+#[derive(Debug, Default, Clone, Copy)]
+struct BookOutput {
+    responses: usize,
+    max_model: usize,
+    strings: usize,
+    /// The largest single response's finalize scratch: responses resolve
+    /// one at a time.
+    scratch: usize,
+    /// `(String, String)` entries and roots of every selector map built.
+    selector_nodes: usize,
+    tool_entries: usize,
+}
+
+impl BookOutput {
+    /// Adds one resolved response: what `finalize_claude_responses_captured`
+    /// builds from it (cache request, request-id set entry, occurrence with
+    /// its selector `Arc`, the `shared_selectors` entry, a usage row and
+    /// bucket, tool names) and what `into_items` clones from that row. A
+    /// response that resolves to nothing adds nothing.
+    fn add(self, response: ResponseOutput, limit: usize) -> Option<Self> {
+        let ResponseOutput {
+            records,
+            model,
+            effort,
+            request_id,
+            timestamp,
+            slot,
+            selector_bytes,
+            selector_entries,
+            tool_bytes,
+            tool_entries,
+        } = response;
+        if records == 0 {
+            return Some(self);
+        }
+        // `finalize_claude_responses_captured` may insert `context_bucket`.
+        let selector = selector_bytes.checked_add(CONTEXT_BUCKET_BYTES)?;
+        let entries = selector_entries.checked_add(2)?;
+        let row_copy = effort
+            .checked_mul(2)?
+            .checked_add(ROW_SELECTOR_HASH_BYTES)?
+            .checked_add(selector.checked_mul(2)?)?;
+        let strings = request_id
+            .checked_mul(2)? // the request-id set and the occurrence key
+            .checked_add(model)? // the occurrence (rows take `max_model`)
+            .checked_add(effort)?
+            .checked_add(timestamp.checked_mul(2)?)? // occurrence; bucket input
+            .checked_add(selector)? // the occurrence's selector
+            .checked_add(slot)? // the cache request's slot clone
+            .checked_add("sequential".len())?
+            .checked_add(row_copy.checked_mul(ROW_COPIES)?)?
+            .checked_add(RFC3339_TEXT_BYTES.checked_mul(4)?)? // bucket key, first, last, normalized
+            .checked_add(tool_bytes.checked_mul(2)?)?; // names counted, then cloned
+                                                       // The row identity's JSON text (every byte escaped at most 6 times)
+                                                       // and its digest, dropped before the next response.
+        let json = selector
+            .checked_add(entries)?
+            .checked_mul(6)?
+            .checked_add(2)?
+            .checked_mul(2)?
+            .max(JSON_TEXT_MIN_BYTES);
+        let scratch = json.checked_add(SHA256_HEX_TEXT_BYTES)?;
+        // Selector map roots: the occurrence's two, two per row copy; a row
+        // keeps only allow-listed keys.
+        let row_entries = entries.min(2 * SELECTOR_CONTEXT_ALLOWED.len());
+        let selector_nodes = entries
+            .checked_add(2)?
+            .checked_add(row_entries.checked_add(2)?.checked_mul(ROW_COPIES)?)?;
+        let next = Self {
+            responses: self.responses.checked_add(1)?,
+            max_model: self.max_model.max(model),
+            strings: self.strings.checked_add(strings)?,
+            scratch: self.scratch.max(scratch),
+            selector_nodes: self.selector_nodes.checked_add(selector_nodes)?,
+            tool_entries: self.tool_entries.checked_add(tool_entries)?,
+        };
+        (next.strings <= limit).then_some(next)
+    }
+
+    /// The summed term, on its own counter. Per response: one node each in
+    /// the request-id set, the occurrence map, `shared_selectors` (R1a R6)
+    /// and the bucket map; a row-map root and `ROW_COPIES` row nodes; the
+    /// occurrence's and `shared_selectors`' `Arc` headers; `SnapshotModelUsage`
+    /// slots for two clones in vectors grown from four, two bucket slots, and
+    /// two `cache_requests` slots (the file's own share is
+    /// `finish_output_bound`'s).
+    /// Rows without a model take an earlier response's (`latest_model`), so
+    /// each row copy is charged the largest model, plus the live
+    /// `latest_model`.
+    fn bytes(self, limit: usize) -> Option<usize> {
+        let Self {
+            responses,
+            max_model,
+            strings,
+            scratch,
+            selector_nodes,
+            tool_entries,
+        } = self;
+        let arc = size_of::<SelectorCapture>()
+            .checked_add(align_of::<SelectorCapture>())?
+            .checked_add(2 * size_of::<usize>())?;
+        let per_response = tree_node_bytes::<String, ()>()?
+            .checked_add(tree_node_bytes::<String, ClaudeTranscriptUsageOccurrence>()?)?
+            .checked_add(tree_node_bytes::<Arc<SelectorCapture>, ()>()?)?
+            .checked_add(tree_node_bytes::<String, UsageBucketState>()?)?
+            .checked_add(
+                tree_node_bytes::<RowKey, BucketRowAccumulator>()?
+                    .checked_mul(ROW_COPIES.checked_add(1)?)?,
+            )?
+            .checked_add(arc.checked_mul(2)?)?
+            .checked_add(size_of::<SnapshotModelUsage>().checked_mul(7)?)?
+            .checked_add(size_of::<SnapshotUsageBucket>().checked_mul(2)?)?
+            .checked_add(size_of::<OwnedRequest>().checked_mul(2)?)?
+            .checked_add(max_model.checked_mul(ROW_COPIES)?)?;
+        let tool = tree_node_bytes::<String, u64>()?.checked_add(size_of::<SnapshotToolUsage>())?;
+        let mut out = Counter::new(limit);
+        out.add(strings)?;
+        out.add(scratch)?;
+        out.add(selector_nodes.checked_mul(tree_node_bytes::<String, String>()?)?)?;
+        out.add(responses.checked_mul(per_response)?)?;
+        out.add(tool_entries.checked_mul(tool)?)?;
+        // `shared_selectors`' root and the live `latest_model`.
+        out.add(tree_node_bytes::<Arc<SelectorCapture>, ()>()?)?;
+        out.add(max_model)?;
+        Some(out.bytes)
     }
 }
 
@@ -470,12 +716,17 @@ impl CompactClaudeResponseRecord {
 /// ClaudeResponseRecord; moved strings keep their capacity, cloned strings
 /// cannot exceed the original capacity. Exhaustive destructuring keeps new
 /// compact fields from silently escaping this preflight.
+///
+/// The record's output term (`RecordBounds::output`) is measured on its own
+/// counter against `output_limit`, never against `limit`'s remainder, so it
+/// cannot change the decoded bound or its `None` (R1a R1, R2).
 fn decoded_record_heap_bound(
     record: &CompactClaudeResponseRecord,
     first: Option<&CompactClaudeResponseRecord>,
     selectors: &ClaudeSelectorTable,
     limit: usize,
-) -> Option<usize> {
+    output_limit: usize,
+) -> Option<RecordBounds> {
     let CompactClaudeResponseRecord {
         usage: _, // UsageTotals (including costs) is entirely inline.
         slot,
@@ -496,7 +747,8 @@ fn decoded_record_heap_bound(
     effort.heap_bound(&mut c)?;
     request_id.heap_bound(&mut c)?;
     timestamp.heap_bound(&mut c)?;
-    selectors.get(selector)?.completed_heap_bound(&mut c)?;
+    let selector = selectors.get(selector)?;
+    selector.completed_heap_bound(&mut c)?;
     match slot {
         ClaudeSlot::Explicit(slot) => slot.completed_heap_bound(&mut c)?,
         ClaudeSlot::Derived(_) => {
@@ -524,17 +776,125 @@ fn decoded_record_heap_bound(
             .len()
             .checked_mul(3 * std::mem::size_of::<(String, String)>())?,
     )?;
-    Some(c.bytes)
+    Some(RecordBounds {
+        decoded: c.bytes,
+        output: record_output(
+            RecordText {
+                model,
+                effort,
+                request_id,
+                timestamp,
+            },
+            slot,
+            selector,
+            tool_uses,
+            output_limit,
+        ),
+    })
 }
 
+/// One record's resolved text, as `decoded_record_heap_bound` borrows it.
+struct RecordText<'a> {
+    model: &'a Option<String>,
+    effort: &'a Option<String>,
+    request_id: &'a Option<String>,
+    timestamp: &'a Option<String>,
+}
+
+/// What one record's strings can contribute to the finished output (X_out
+/// family R, #665), on a counter of its own: the strings
+/// `decoded_record_heap_bound` visits, measured by capacity. A decoded clone
+/// (an interned selector, a `Derived` slot's text) cannot exceed it.
+fn record_output(
+    text: RecordText<'_>,
+    slot: &ClaudeSlot,
+    selector: &SelectorCapture,
+    tool_uses: &[(String, String)],
+    limit: usize,
+) -> Option<ResponseOutput> {
+    let RecordText {
+        model,
+        effort,
+        request_id,
+        timestamp,
+    } = text;
+    let capacity = |value: &Option<String>| value.as_ref().map_or(0, String::capacity);
+    let slot = match slot {
+        ClaudeSlot::Explicit(slot) => {
+            let mut strings = Counter::new(limit);
+            (**slot).completed_heap_bound(&mut strings)?;
+            strings.bytes
+        }
+        // `ClaudeSlot::decode` clones the record's own text.
+        ClaudeSlot::Derived(_) => capacity(request_id)
+            .checked_add(capacity(timestamp))?
+            .checked_add(capacity(model))?
+            .checked_add(capacity(effort))?,
+    };
+    let mut selector_bytes = 0usize;
+    for (key, value) in selector.context.iter().chain(&selector.sources) {
+        selector_bytes = selector_bytes
+            .checked_add(key.capacity())?
+            .checked_add(value.capacity())?;
+    }
+    let mut tool_bytes = 0usize;
+    for (id, name) in tool_uses {
+        tool_bytes = tool_bytes
+            .checked_add(id.capacity())?
+            .checked_add(name.capacity())?;
+    }
+    let output = ResponseOutput {
+        records: 1,
+        model: capacity(model),
+        effort: capacity(effort),
+        request_id: capacity(request_id),
+        timestamp: capacity(timestamp),
+        slot,
+        selector_bytes,
+        selector_entries: selector.context.len().checked_add(selector.sources.len())?,
+        tool_bytes,
+        tool_entries: tool_uses.len(),
+    };
+    let mut out = Counter::new(limit);
+    for bytes in [
+        output.model,
+        output.effort,
+        output.request_id,
+        output.timestamp,
+        output.slot,
+        output.selector_bytes,
+        output.tool_bytes,
+    ] {
+        out.add(bytes)?;
+    }
+    Some(output)
+}
+
+/// One response's #667 peak; production reads it through `completion_bounds`.
+#[cfg(test)]
 pub(super) fn decoded_response_peak_bound(
     records: &OwnedVec<CompactClaudeResponseRecord>,
     selectors: &ClaudeSelectorTable,
     limit: usize,
 ) -> Option<usize> {
+    decoded_response_bounds(records, selectors, limit).map(|bounds| bounds.peak)
+}
+
+/// `decoded_response_peak_bound`'s peak, and the response's merged output
+/// term. The output never decides `None` (R1a R1): its failure is
+/// `output: None`.
+fn decoded_response_bounds(
+    records: &OwnedVec<CompactClaudeResponseRecord>,
+    selectors: &ClaudeSelectorTable,
+    limit: usize,
+) -> Option<ResponseBounds> {
     let count = records.len();
     if count == 0 {
-        return Some(0);
+        // Resolves to nothing (no first record): no output.
+        return Some(ResponseBounds {
+            peak: 0,
+            output: Some(ResponseOutput::default()),
+        });
     }
     // The decoded vector is allocated exactly once. Stable sorting can ask
     // for another count slots. Later, canonical_records grows geometrically
@@ -549,15 +909,24 @@ pub(super) fn decoded_response_peak_bound(
         .max()
         .unwrap_or(0);
     bytes = bytes.checked_add(timestamp_copy)?; // first_timestamp in the resolver
+    let mut output = Some(ResponseOutput::default());
     for record in records.iter() {
-        bytes = bytes.checked_add(decoded_record_heap_bound(
+        let record = decoded_record_heap_bound(
             record,
             records.first(),
             selectors,
             limit.checked_sub(bytes)?,
-        )?)?;
+            limit,
+        )?;
+        bytes = bytes.checked_add(record.decoded)?;
+        output = output
+            .zip(record.output)
+            .and_then(|(response, record)| response.merge(record));
     }
-    (bytes <= limit).then_some(bytes)
+    (bytes <= limit).then_some(ResponseBounds {
+        peak: bytes,
+        output,
+    })
 }
 
 /// Decode one response's records in physical order. Any record that cannot
@@ -616,3 +985,170 @@ crate::heap_layout_bound::fields!(ClaudeSelectorTable; selectors);
 crate::heap_layout_bound::fields!(CompactClaudeUsage; input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, costs);
 crate::heap_layout_bound::fields!(ClaudeSlotTokens; prompt_tokens, cache_read_tokens, cache_creation_tokens, uncached_tokens, output_tokens);
 crate::heap_layout_bound::fields!(CompactClaudeResponseRecord; usage, slot, physical_sequence, model, reasoning_effort, request_id, timestamp, computed_effective_input_context, selector, tool_uses);
+
+/// R1a R8 (T3): main's (`bc77deb9`) decode-peak preflight, verbatim except that
+/// the two book methods take the book as an argument. T3 pins the peak, the
+/// copy budget and their `None` against it.
+#[cfg(test)]
+pub(super) mod main_reference {
+    use super::*;
+
+    pub(in crate::snapshots) fn finish_copy_budget(
+        book: &ClaudeResponseBook,
+        budget: usize,
+    ) -> Option<usize> {
+        budget.checked_sub(decode_peak_bound(book, budget)?)
+    }
+
+    pub(in crate::snapshots) fn decode_peak_bound(
+        book: &ClaudeResponseBook,
+        limit: usize,
+    ) -> Option<usize> {
+        if book.responses.is_empty() {
+            return Some(0);
+        }
+        if !crate::heap_layout_bound::layout_supported() {
+            return None;
+        }
+        let mut peak = 0;
+        for response in book.responses.iter() {
+            if !response.record_limit_exceeded {
+                peak = peak.max(decoded_response_peak_bound(
+                    &response.records,
+                    &book.selectors,
+                    limit,
+                )?);
+            }
+        }
+        // finalize_claude_responses sorts the response vector before decoding;
+        // this scratch never overlaps the per-response decode/sort scratch.
+        let response_sort = book
+            .responses
+            .len()
+            .checked_mul(std::mem::size_of::<ClaudeResponseObservation>())?;
+        let peak = peak.max(response_sort);
+        (peak <= limit).then_some(peak)
+    }
+
+    fn decoded_record_heap_bound(
+        record: &CompactClaudeResponseRecord,
+        first: Option<&CompactClaudeResponseRecord>,
+        selectors: &ClaudeSelectorTable,
+        limit: usize,
+    ) -> Option<usize> {
+        let CompactClaudeResponseRecord {
+            usage: _, // UsageTotals (including costs) is entirely inline.
+            slot,
+            physical_sequence: _,
+            model,
+            reasoning_effort,
+            request_id,
+            timestamp,
+            computed_effective_input_context: _,
+            selector,
+            tool_uses,
+        } = record;
+        let model = model.get(first.map(|first| &first.model))?;
+        let effort = reasoning_effort.get(first.map(|first| &first.reasoning_effort))?;
+        let request_id = request_id.get(first.map(|first| &first.request_id))?;
+        let mut c = Counter::new(limit);
+        model.heap_bound(&mut c)?;
+        effort.heap_bound(&mut c)?;
+        request_id.heap_bound(&mut c)?;
+        timestamp.heap_bound(&mut c)?;
+        selectors.get(selector)?.completed_heap_bound(&mut c)?;
+        match slot {
+            ClaudeSlot::Explicit(slot) => slot.completed_heap_bound(&mut c)?,
+            ClaudeSlot::Derived(_) => {
+                request_id.heap_bound(&mut c)?;
+                timestamp.heap_bound(&mut c)?;
+                model.heap_bound(&mut c)?;
+                effort.heap_bound(&mut c)?;
+            }
+        }
+        crate::heap_layout_bound::tree_nodes::<String, String>(tool_uses.len(), &mut c)?;
+        // Use per-element counters exactly like completed_heap_bound, so the
+        // completion preflight does not inherit a per-line history visit wall.
+        let mut tool_bytes = 0usize;
+        for (id, name) in tool_uses {
+            let mut tool = Counter::new(limit.checked_sub(c.bytes)?.checked_sub(tool_bytes)?);
+            id.heap_bound(&mut tool)?;
+            name.heap_bound(&mut tool)?;
+            tool_bytes = tool_bytes.checked_add(tool.bytes)?;
+        }
+        c.add(tool_bytes)?;
+        // BTreeMap's FromIterator can collect/sort a temporary entry vector while
+        // the original compact list is still alive. Reserve its realloc/scratch.
+        c.add(
+            tool_uses
+                .len()
+                .checked_mul(3 * std::mem::size_of::<(String, String)>())?,
+        )?;
+        Some(c.bytes)
+    }
+
+    pub(in crate::snapshots) fn decoded_response_peak_bound(
+        records: &OwnedVec<CompactClaudeResponseRecord>,
+        selectors: &ClaudeSelectorTable,
+        limit: usize,
+    ) -> Option<usize> {
+        let count = records.len();
+        if count == 0 {
+            return Some(0);
+        }
+        // The decoded vector is allocated exactly once. Stable sorting can ask
+        // for another count slots. Later, canonical_records grows geometrically
+        // while that input vector remains alive; include both old and new buffers
+        // during its largest realloc (also covers sorting). No merge code changes.
+        let canonical_capacity = count.checked_next_power_of_two()?.max(4);
+        let slots = count.checked_add(canonical_capacity.checked_mul(2)?)?;
+        let mut bytes = slots.checked_mul(std::mem::size_of::<ClaudeResponseRecord>())?;
+        let timestamp_copy = records
+            .iter()
+            .filter_map(|record| record.timestamp.as_ref().map(String::capacity))
+            .max()
+            .unwrap_or(0);
+        bytes = bytes.checked_add(timestamp_copy)?; // first_timestamp in the resolver
+        for record in records.iter() {
+            bytes = bytes.checked_add(decoded_record_heap_bound(
+                record,
+                records.first(),
+                selectors,
+                limit.checked_sub(bytes)?,
+            )?)?;
+        }
+        (bytes <= limit).then_some(bytes)
+    }
+}
+
+#[cfg(test)]
+mod output_tests {
+    use super::*;
+
+    /// R1a R1, R5, R7: output arithmetic that overflows is `None` (never a
+    /// wrap or a panic), and a response that resolves to nothing adds nothing.
+    #[test]
+    fn output_overflow_is_none_and_empty_responses_add_nothing() {
+        let huge = ResponseOutput {
+            records: 1,
+            request_id: usize::MAX,
+            ..ResponseOutput::default()
+        };
+        assert!(BookOutput::default().add(huge, usize::MAX).is_none());
+        let full = ResponseOutput {
+            records: usize::MAX,
+            ..ResponseOutput::default()
+        };
+        assert!(full.merge(ResponseOutput::default()).is_some());
+        let one = ResponseOutput {
+            records: 1,
+            ..ResponseOutput::default()
+        };
+        assert!(full.merge(one).is_none());
+        let empty = BookOutput::default()
+            .add(ResponseOutput::default(), 0)
+            .expect("an empty response adds nothing");
+        assert_eq!(empty.responses, 0);
+        assert_eq!(empty.strings, 0);
+    }
+}
