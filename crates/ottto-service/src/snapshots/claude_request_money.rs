@@ -1546,9 +1546,27 @@ fn shadow_page_with_coverage(
                 rows.row.absent_old_unknown = members.len().saturating_sub(items.len()) as u64;
             }
         }
+        let digest = match semantic_digest_by(&mut rows, Some(deadline)) {
+            Some(digest) => digest,
+            None => {
+                // Digest expiry is an explicit failure, never a partial hash
+                // that could suppress a later complete publication.
+                rows = failure_rows(
+                    root,
+                    "deadline",
+                    coverage_view.family(root),
+                    now,
+                    snapshot,
+                    ledger,
+                    &mut counts,
+                );
+                basis = None;
+                owned_reservation = None;
+                semantic_digest(&mut rows) // bounded pre-admitted failure row
+            }
+        };
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);
-        let digest = semantic_digest(&mut rows);
         let key = family_key(root);
         let unchanged = !ledger.in_flight(&key)
             && ledger
@@ -1562,7 +1580,7 @@ fn shadow_page_with_coverage(
                 });
         memos.push(PendingMemo {
             key,
-            basis,
+            basis: if unchanged { None } else { basis },
             observed_unix: now,
             published: ClaudeFamilyPublication {
                 utc_day: utc_day(now),
@@ -1844,18 +1862,17 @@ fn build_slice(
     let mut traces = BTreeMap::<String, BTreeMap<u64, String>>::new();
     for &root in &roots {
         if let Some(trace_rows) = trace_report.evidence.get(root) {
-            traces.insert(
-                root.to_owned(),
-                trace_rows
-                    .iter()
-                    .map(|row| {
-                        (
-                            claude_request_hash(&row.request_id),
-                            claude_trace_owner_session_id(root, &row.agent_id),
-                        )
-                    })
-                    .collect(),
-            );
+            let mut collected = BTreeMap::new();
+            for row in trace_rows {
+                if Instant::now() >= deadline {
+                    return Err("deadline");
+                }
+                collected.insert(
+                    claude_request_hash(&row.request_id),
+                    claude_trace_owner_session_id(root, &row.agent_id),
+                );
+            }
+            traces.insert(root.to_owned(), collected);
         }
     }
 
@@ -1974,6 +1991,9 @@ fn build_slice(
         let mut absent_old = ClaudeMoneyTotals::default();
         let mut absent_old_unknown = 0_u64;
         for member in members {
+            if Instant::now() >= deadline {
+                return Err("deadline");
+            }
             if present.contains(member.as_str()) {
                 continue;
             }
@@ -2177,9 +2197,35 @@ fn failure_rows(
 /// Streaming canonical digest, without a second copy of the row or grains.
 /// Snapshot, observation time and removal-basis deltas are not semantic content.
 fn semantic_digest(rows: &mut FamilyRows) -> u64 {
-    struct HashWriter(Sha256);
+    semantic_digest_by(rows, None).expect("bounded writer digest")
+}
+
+fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Option<u64> {
+    struct HashWriter(Sha256, Option<Instant>);
     impl Write for HashWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.1.is_some_and(|deadline| Instant::now() >= deadline) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "money digest deadline",
+                ));
+            }
+            #[cfg(test)]
+            if self.1.is_some()
+                && DIGEST_WRITES_FOR_TEST.with(|left| match left.get() {
+                    Some(0) => true,
+                    Some(n) => {
+                        left.set(Some(n - 1));
+                        false
+                    }
+                    None => false,
+                })
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "synthetic digest deadline",
+                ));
+            }
             self.0.update(bytes);
             Ok(bytes.len())
         }
@@ -2198,11 +2244,14 @@ fn semantic_digest(rows: &mut FamilyRows) -> u64 {
     );
     row.snapshot = 0;
     row.observed_unix = 0;
-    let mut hash = HashWriter(Sha256::new());
-    let _ = serde_json::to_writer(&mut hash, &*row);
-    for (key, (old, new)) in &rows.grains {
-        let _ = serde_json::to_writer(&mut hash, &grain_row(row, key, old, new));
-    }
+    let mut hash = HashWriter(Sha256::new(), deadline);
+    let result = (|| {
+        serde_json::to_writer(&mut hash, &*row)?;
+        for (key, (old, new)) in &rows.grains {
+            serde_json::to_writer(&mut hash, &grain_row(row, key, old, new))?;
+        }
+        Ok::<(), serde_json::Error>(())
+    })();
     (
         row.snapshot,
         row.observed_unix,
@@ -2211,7 +2260,15 @@ fn semantic_digest(rows: &mut FamilyRows) -> u64 {
         row.removed_change_basis_snapshot,
         row.removed_change_unavailable,
     ) = saved;
-    u64::from_be_bytes(hash.0.finalize()[..8].try_into().expect("digest"))
+    result.ok()?;
+    Some(u64::from_be_bytes(
+        hash.0.finalize()[..8].try_into().expect("digest"),
+    ))
+}
+
+#[cfg(test)]
+thread_local! {
+    static DIGEST_WRITES_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
 /// A page whose shadow does not take its captures: they are dropped by the
@@ -2458,26 +2515,32 @@ fn apply_results(
             continue;
         }
         for memo in result.memos {
-            let previous = ledger
-                .get(&memo.key)
-                .and_then(ClaudeRequestCensusRecord::family_memo)
-                .map(|(revision, basis)| (*revision, basis));
-            let (revision, mut basis) = memo.basis.or(previous).unwrap_or((
-                [0; 32],
-                ClaudeFamilyMemo {
-                    removed_requests: u64::MAX,
-                    ..Default::default()
-                },
-            ));
-            basis.published = Some(memo.published);
-            let record =
-                ClaudeRequestCensusRecord::family_record(revision, memo.observed_unix, basis);
-            let fits = ledger.census().serialized_headroom() >= memo.key.len() + 1024;
-            let stored =
-                fits && ledger.insert(memo.key, record) == ClaudeRequestCensusInsert::Stored;
-            counts.family_memos_withheld += u64::from(!stored);
+            apply_published_memo(ledger, memo, counts);
         }
     }
+}
+
+fn apply_published_memo(
+    ledger: &mut ClaudeLedger,
+    memo: PendingMemo,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+) {
+    let previous = ledger
+        .get(&memo.key)
+        .and_then(ClaudeRequestCensusRecord::family_memo)
+        .map(|(revision, basis)| (*revision, basis));
+    let (revision, mut basis) = memo.basis.filter(|_| memo.row).or(previous).unwrap_or((
+        [0; 32],
+        ClaudeFamilyMemo {
+            removed_requests: u64::MAX,
+            ..Default::default()
+        },
+    ));
+    basis.published = Some(memo.published);
+    let record = ClaudeRequestCensusRecord::family_record(revision, memo.observed_unix, basis);
+    let fits = ledger.census().serialized_headroom() >= memo.key.len() + 1024;
+    let stored = fits && ledger.insert(memo.key, record) == ClaudeRequestCensusInsert::Stored;
+    counts.family_memos_withheld += u64::from(!stored);
 }
 
 /// Record the message-only ids one parse's capture saw as the ledger's
@@ -3334,6 +3397,45 @@ mod round3_tests {
             family_key("root"),
             ClaudeRequestCensusRecord::family_record(revision, 10, memo),
         );
+        let (_, unchanged_basis) = family_rows(
+            "root",
+            body(),
+            [1; 32],
+            Default::default(),
+            0,
+            CoveredForTest.family("root"),
+            11,
+            101,
+            &ledger,
+            &mut counts,
+        );
+        apply_published_memo(
+            &mut ledger,
+            PendingMemo {
+                key: family_key("root"),
+                basis: unchanged_basis,
+                observed_unix: 11,
+                published: ClaudeFamilyPublication {
+                    utc_day: 0,
+                    digest: 1,
+                    epoch: 1,
+                    attempted: 11,
+                },
+                row: false,
+            },
+            &mut counts,
+        );
+        assert_eq!(
+            ledger
+                .get(&family_key("root"))
+                .unwrap()
+                .family_memo()
+                .unwrap()
+                .1
+                .snapshot,
+            100,
+            "unchanged ack preserves last emitted basis"
+        );
         let failed = failure_rows(
             "root",
             "deadline",
@@ -3362,5 +3464,34 @@ mod round3_tests {
         assert_eq!(next.row.removed_change_basis, Some("previous_shadow"));
         let change = next.row.removed_change.unwrap();
         assert_eq!((change.requests, change.tokens), (0, 0));
+    }
+}
+
+#[cfg(test)]
+mod digest_deadline_tests {
+    use super::*;
+    #[test]
+    fn money_p1b_digest_stops_inside_serialization_and_restores_observation_fields() {
+        let ledger = ClaudeLedger::new_for_test();
+        let mut counts = ClaudeRequestMoneyShadowCounts::default();
+        let mut rows = failure_rows(
+            "root",
+            "memory",
+            FamilyCensus::Covered,
+            10,
+            100,
+            &ledger,
+            &mut counts,
+        );
+        let before = semantic_digest(&mut rows);
+        DIGEST_WRITES_FOR_TEST.with(|left| left.set(Some(5)));
+        assert_eq!(
+            semantic_digest_by(&mut rows, Some(Instant::now() + Duration::from_secs(30))),
+            None
+        );
+        assert_eq!(DIGEST_WRITES_FOR_TEST.with(std::cell::Cell::get), Some(0));
+        DIGEST_WRITES_FOR_TEST.with(|left| left.set(None));
+        assert_eq!((rows.row.observed_unix, rows.row.snapshot), (10, 100));
+        assert_eq!(semantic_digest(&mut rows), before);
     }
 }
