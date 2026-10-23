@@ -1816,12 +1816,12 @@ impl Custody {
             && self
                 .files
                 .get(&format!("file:{}", digest(path)))
-                .is_none_or(|file| {
+                .map_or(true, |file| {
                     file.rebuild_owed
                         || file
                             .current_m
                             .as_ref()
-                            .is_none_or(|slot| slot.value.view().over_budget())
+                            .map_or(true, |slot| slot.value.view().over_budget())
                 })
     }
     pub(super) fn rebuilt(&mut self, path: &str) -> bool {
@@ -2197,7 +2197,7 @@ impl Custody {
                         && file
                             .path
                             .as_ref()
-                            .is_none_or(|path| !index.files.contains_key(path))
+                            .map_or(true, |path| !index.files.contains_key(path))
                 }) {
                     self.files.remove(&old);
                 }
@@ -2339,7 +2339,7 @@ impl Custody {
                     .delivery
                     .hold
                     .as_ref()
-                    .is_none_or(|slot| !bodies.contains(&slot.value.money_revision()))
+                    .map_or(true, |slot| !bodies.contains(&slot.value.money_revision()))
         });
         self.recount_globals();
     }

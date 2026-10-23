@@ -2636,6 +2636,7 @@ fn note_message_record(
     else {
         return;
     };
+    let verified = record.current_holder_for(fingerprint, true);
     let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());
     if let Some((root, member)) = logical_family_member(index, key) {
         if !ledger.bind_file(key, root, member, record.birth()) {
@@ -2645,7 +2646,9 @@ fn note_message_record(
     }
     let message = message_key(key);
     if ledger.get(&message).is_some_and(|old| old.matches(&next)) {
-        ledger.note_rebuilt(key);
+        if verified {
+            ledger.note_rebuilt(key);
+        }
         return;
     }
     let hashes = next.request_hashes().len();
@@ -2653,7 +2656,9 @@ fn note_message_record(
     let fits = census.hash_headroom() >= hashes
         && census.serialized_headroom() >= hashes * 11 + message.len() + 512;
     if fits && ledger.insert(message, next) == ClaudeRequestCensusInsert::Stored {
-        ledger.note_rebuilt(key);
+        if verified {
+            ledger.note_rebuilt(key);
+        }
         counts.message_records_written += 1;
     } else {
         counts.message_records_refused += 1;
@@ -3209,6 +3214,12 @@ pub(crate) fn checkpoint_pending(support: &Path) -> bool {
 
 pub(crate) fn has_offer(support: &Path, key: &str) -> bool {
     store::has_offer(support, key)
+}
+
+/// Evidence rebuilding is independent of adoption. It schedules an opened
+/// read for older saved witness revisions while literal offers remain closed.
+pub(crate) fn money_rebuild_due(support_dir: &Path, index_key: &str) -> bool {
+    request_owned_live(support_dir) && store::rebuild_due(support_dir, index_key)
 }
 
 pub(crate) fn money_due(support_dir: &Path, index_key: &str, now: u64) -> bool {
@@ -4436,7 +4447,7 @@ fn schedule_trace(
             || watches.iter().any(|(_, watch)| {
                 ledger
                     .get(watch)
-                    .is_none_or(|old| old.money_revision() != revision)
+                    .map_or(true, |old| old.money_revision() != revision)
             });
         if !changed {
             continue;

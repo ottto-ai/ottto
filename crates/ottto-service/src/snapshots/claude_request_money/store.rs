@@ -1134,9 +1134,10 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     for shard in missing {
         ledger.dirty[shard] = true;
     }
-    if (ledger.load_damaged || ledger.census.recovery())
-        && money_io!(Metadata, support_dir.join(LEGACY_LEDGER_DIR).exists())
-    {
+    // A valid generation already published the legacy import, even while
+    // its fresh traversal is unfinished. Keep per-file rebuild progress and
+    // cleared fields across restart; only actual damage reopens old input.
+    if ledger.load_damaged && money_io!(Metadata, support_dir.join(LEGACY_LEDGER_DIR).exists()) {
         let history_unknown = recover_legacy(support_dir, &mut ledger)?;
         ledger
             .census
@@ -1592,6 +1593,16 @@ pub(crate) fn checkpoint_for_test(support_dir: &Path, ledger: &mut ClaudeLedger)
         flush();
     }
     false
+}
+
+pub(super) fn rebuild_due(support_dir: &Path, index_key: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
+        return false;
+    };
+    ledger.census.rebuild_needed(index_key)
 }
 
 /// Snapshot the ready ledger without taking custody from a running page.

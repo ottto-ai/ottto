@@ -39461,7 +39461,10 @@ impl ScanIndex {
                     || self
                         .active_request_money_support_dir
                         .as_deref()
-                        .is_some_and(|support| claude_request_money::has_offer(support, &key))
+                        .is_some_and(|support| {
+                            claude_request_money::has_offer(support, &key)
+                                || claude_request_money::money_rebuild_due(support, &key)
+                        })
             })
             && self
                 .active_request_money_support_dir

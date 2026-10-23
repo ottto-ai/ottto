@@ -485,6 +485,9 @@ fn versioned_recovery_preserves_history_clocks_pause_and_old_directory() {
         ClaudeRequestCensusRecord::money_debt([8; 32], 30),
     );
     drain(&support, &mut ledger);
+    // Simulate an interrupted/damaged generation, rather than a valid
+    // restart that has already published the legacy import.
+    std::fs::remove_file(support.join(store::LEDGER_DIR).join("shard-00.json")).unwrap();
     let mut restarted = store::load_for_test(&support);
     assert!(restarted.recovering());
     assert_eq!(
@@ -728,5 +731,121 @@ fn vanished_empty_carrier_retires_but_outstanding_debt_survives() {
         ledger.census().record_count(),
         2,
         "last cleared field releases the vanished shell"
+    );
+}
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn valid_recovery_restart_preserves_progress_and_does_not_resurrect_cleared_fields() {
+    let scratch = crate::test_scratch::ScratchDir::new("custody-rebuild-restart");
+    let support = scratch.join("support");
+    let a = "/custody/a.jsonl";
+    let b = "/custody/b.jsonl";
+    let due = store::money_key("due:", a);
+    legacy_input(
+        &support,
+        vec![
+            (
+                message_key(a),
+                ClaudeRequestCensusRecord::message_record(&record(vec![1]), Vec::new()),
+            ),
+            (
+                message_key(b),
+                ClaudeRequestCensusRecord::message_record(&record(vec![2]), Vec::new()),
+            ),
+            (
+                due.clone(),
+                ClaudeRequestCensusRecord::money_debt([1; 32], 30),
+            ),
+        ],
+    );
+    let mut ledger = store::load_for_test(&support);
+    assert!(ledger.recovering());
+    assert!(ledger.census().rebuild_needed(a) && ledger.census().rebuild_needed(b));
+    assert!(ledger.bind_file(a, "root-a".into(), "root-a".into(), None));
+    ledger.note_rebuilt(a);
+    ledger.remove(&due);
+    drain(&support, &mut ledger);
+    let mut restarted = store::load_for_test(&support);
+    assert!(!restarted.load_damaged);
+    assert!(restarted.recovering());
+    assert!(
+        !restarted.census().rebuild_needed(a),
+        "fresh file progress survives process restart"
+    );
+    assert!(
+        restarted.census().rebuild_needed(b),
+        "unfinished files remain owed"
+    );
+    assert!(
+        restarted.get(&due).is_none(),
+        "old recovery input cannot resurrect a cleared field"
+    );
+    assert_eq!(
+        restarted.dirty_shards(),
+        0,
+        "a valid restart does not rewrite all custody shards"
+    );
+    assert!(restarted
+        .take_save(Instant::now() + Duration::from_secs(60))
+        .is_none());
+}
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn old_witness_revision_can_rebuild_while_adoption_is_paused() {
+    use super::super::{CandidateDecision, CandidateFile, CandidateParseReason};
+    let scratch = crate::test_scratch::ScratchDir::new("custody-old-revision-rebuild");
+    let support = scratch.join("support");
+    let path = "/custody/projects/-repo/a1111111-1111-4111-8111-111111111111.jsonl";
+    legacy_input(
+        &support,
+        vec![(
+            message_key(path),
+            ClaudeRequestCensusRecord::message_record(&record(vec![1]), Vec::new()),
+        )],
+    );
+    store::reload_for_test(&support).unwrap();
+    let _live = LiveForTest::new(&support);
+    let mut index = ScanIndex::default();
+    let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+    entry.source_file_fingerprint = "a".repeat(64);
+    entry.effective_upload_body_witness_revision = 1;
+    index.files.insert(path.into(), entry);
+    std::fs::create_dir_all(support.join("snapshots")).unwrap();
+    std::fs::write(
+        support.join("snapshots/claude_code-reemission-exclusions.txt"),
+        b"",
+    )
+    .unwrap();
+    index.activate_effective_upload_body_witness_revision(3);
+    index.load_claude_reemission_exclusions(&support);
+    assert!(index.request_money_adoption_paused());
+    assert!(adoption_paused(&support, &index));
+    assert!(money_rebuild_due(&support, path));
+    let candidate = CandidateFile {
+        scan_root: PathBuf::from("/custody/projects"),
+        path: PathBuf::from(path),
+        size_bytes: 1,
+        modified_unix_seconds: 2,
+        modified_unix_nanos: 3,
+        source_file_fingerprint: "a".repeat(64),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    assert!(
+        matches!(
+            index.candidate_decision_with_reason_gated(&candidate, 40, false),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::RequestMoneyDue)
+            )
+        ),
+        "rebuild read does not require adoption permission, revision 3 or a prior offer"
+    );
+    assert_eq!(
+        index.files[path].effective_upload_body_witness_revision, 1,
+        "scheduling is never an adopted stamp"
     );
 }
