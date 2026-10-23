@@ -182,6 +182,10 @@ impl<'a> RecordRef<'a> {
             _ => None,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn retired_for_test(self) -> Option<u64> {
+        self.retired()
+    }
     pub(crate) fn retired(self) -> Option<u64> {
         match self.kind {
             Kind::Evidence(v) => v.retired(),

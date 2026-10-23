@@ -1011,7 +1011,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
     assert_eq!((counts.rows_valid, counts.rows_refused), (1, 1));
     assert!(counts.sweep_wrapped && !counts.sweep_debt);
     assert_eq!(telemetry_complete_through(&ledger), 1_800_000_000);
-    let record = ledger.get(&key).expect("telemetry record").clone();
+    let record = ledger.get(&key).expect("telemetry record");
     assert_eq!(record.request_hashes(), &[claude_request_hash("req_1")]);
     let len = std::fs::metadata(tail.path(session)).unwrap().len();
     assert_eq!(record.tail().unwrap().offset, len);
@@ -1020,7 +1020,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         crate::snapshots::rfc3339_unix_seconds(t).unwrap()
     );
     // The foreign row is refused: the root's rows are never complete.
-    assert!(ClaudeRootRows::from_record(&record).is_none());
+    assert!(ClaudeRootRows::from_record(record).is_none());
 
     // A partial line is not consumed until its newline arrives.
     let line = money_api_line(session, "req_2", t);
@@ -1376,7 +1376,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     tail.append(session, &money_api_line(session, "req_1", t));
     let mut ledger = ClaudeLedger::new_for_test();
     tail.advance(&mut ledger, &budget);
-    let before = ledger.get(&key).unwrap().clone();
+    let before = ledger.get(&key).unwrap().to_owned_record();
     tail.append(session, &money_api_line(session, "req_2", t));
     let run = |ledger: &mut ClaudeLedger| {
         let out = tail.page(
@@ -1401,7 +1401,11 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert!(counts.sweep_debt, "a raced read is debt");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key), Some(&before), "nothing committed");
+    assert_eq!(
+        ledger.get(&key).map(|record| record.to_owned_record()),
+        Some(before.clone()),
+        "nothing committed"
+    );
 
     // Rewritten in place: same object, same length, new times.
     race_reads_for_test(Some(Box::new(|path: &Path| {
@@ -1413,7 +1417,11 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     let (counts, roots) = run(&mut ledger);
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key), Some(&before), "nothing committed");
+    assert_eq!(
+        ledger.get(&key).map(|record| record.to_owned_record()),
+        Some(before.clone()),
+        "nothing committed"
+    );
 
     // Appended mid-read: committed through the frozen extent.
     let appended = money_api_line(session, "req_late", t);

@@ -3298,13 +3298,6 @@ pub(crate) fn literal_version_skew_body(raw: &[u8]) -> bool {
     found.get()
 }
 
-fn response_body_excerpt(response: ureq::Response) -> Option<String> {
-    response
-        .into_string()
-        .ok()
-        .and_then(|body| safe_response_body_excerpt(&body))
-}
-
 fn safe_response_body_excerpt(body: &str) -> Option<String> {
     let compact = body
         .split_whitespace()

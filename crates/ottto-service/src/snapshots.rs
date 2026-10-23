@@ -36126,6 +36126,17 @@ fn canonicalize_codex_identity_map<T: PartialEq>(values: &mut BTreeMap<String, T
 }
 
 impl ScanIndex {
+    pub(crate) fn current_claude_money_files(
+        &self,
+    ) -> impl Iterator<Item = &claude_request_money::MoneyFileSelection> {
+        self.claude_money_files.iter().filter_map(|(key, state)| {
+            self.files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint == state.revision)
+                .then_some(state)
+        })
+    }
+
     pub(crate) fn local_codex_census_aggregates(
         &self,
     ) -> codex_scan_diagnostics::CensusIndexAggregates {

@@ -3950,7 +3950,7 @@ pub(crate) fn update_unbuilt_lifecycle(
             .as_bytes(),
     )
     .into();
-    let expired = |record: &ClaudeRequestCensusRecord| {
+    let expired = |record: custody::RecordRef<'_>| {
         record.window() & UNBUILT_RELEASED == 0
             && (now.saturating_sub(record.window()) >= 86400 || record.money_revision() != cycle)
     };

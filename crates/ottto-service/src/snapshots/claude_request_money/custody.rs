@@ -207,10 +207,10 @@ impl Custody {
                 path: None,
             });
         }
-        if key.starts_with("ever:") {
+        if let Some(root) = key.strip_prefix("ever:") {
             return Some(Address {
                 carrier: EVER.into(),
-                field: key[5..].into(),
+                field: root.into(),
                 query: key.into(),
                 path: None,
             });
@@ -815,7 +815,7 @@ pub(super) enum Carrier<'a> {
     File(&'a FileCustody),
     Telemetry(&'a TelemetryCustody),
     Control(&'a Control),
-    Ever(&'a Vec<[u8; 32]>),
+    Ever(&'a [[u8; 32]]),
 }
 impl Carrier<'_> {
     fn slots(&self) -> impl Iterator<Item = &Slot> {
@@ -2192,7 +2192,7 @@ impl Custody {
                 Some(current) if field == "adoption" => {
                     current.value.money_revision() == slot.value.money_revision()
                         && current.value.window() == 0
-                        && matches!(slot.value.window(), 3 | 4 | 5 | 6)
+                        && matches!(slot.value.window(), 3..=6)
                 }
                 Some(current) => slot.value.window() > current.value.window(),
             };
@@ -2353,7 +2353,7 @@ impl Custody {
                 && file
                     .adoption
                     .as_ref()
-                    .is_some_and(|slot| matches!(slot.value.window(), 3 | 4 | 5 | 6))
+                    .is_some_and(|slot| matches!(slot.value.window(), 3..=6))
         } else {
             false
         }

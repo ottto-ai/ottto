@@ -6913,16 +6913,11 @@ async fn finish_sync_source_resume(
                     source_bytes = source_bytes.checked_add(source.len())?;
                 }
             }
-            for (key, state) in &index.claude_money_files {
-                if index
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| entry.source_file_fingerprint == state.revision)
-                    && scan_result.snapshots.iter().any(|item| {
-                        crate::snapshots::claude_request_money::family_root(item) == state.root
-                            && item.source_session_id == state.member
-                    })
-                {
+            for state in index.current_claude_money_files() {
+                if scan_result.snapshots.iter().any(|item| {
+                    crate::snapshots::claude_request_money::family_root(item) == state.root
+                        && item.source_session_id == state.member
+                }) {
                     sources = sources.checked_add(1)?;
                     source_bytes = source_bytes.checked_add(state.revision.len())?;
                 }

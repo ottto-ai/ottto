@@ -1125,8 +1125,7 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
         ledger.account(shard, before);
         ledger.dirty[shard] = damaged;
     }
-    if present > 0 && !missing.is_empty()
-        || present > 0 && (!control_seen || !history_seen)
+    if present > 0 && (!missing.is_empty() || !control_seen || !history_seen)
         || present == 0 && dir.exists()
     {
         ledger.load_damaged = true;
@@ -1384,7 +1383,7 @@ pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedger
 }
 
 /// Stable, content-free identity of a physical member's local scheduling debt.
-pub(in crate::snapshots) fn money_key(prefix: &str, index_key: &str) -> String {
+pub(crate) fn money_key(prefix: &str, index_key: &str) -> String {
     if let Some(root) = index_key.strip_prefix("synthetic:") {
         return format!("{prefix}otel:{root}");
     }
