@@ -5,7 +5,10 @@ hashes. Retirement moves the shared hash buffer; money getters remain empty.
 A maintained oldest-retired queue lets an incoming active record reclaim only
 the safety slots it needs. Active hashes are never reclaimed. Optional safety
 metadata is best effort under serialized pressure; loss retains global safety
-debt rather than making a negative certificate.
+debt rather than making a negative certificate. Retired reparses first decline their
+own reconstruction safety when it does not fit. Peer reclaim may fund their
+main-equivalent MONEY core metadata, and never funds extra reconstruction
+safety; the same oldest-retired queue and incomplete marker apply.
 
 The existing root shadow metadata stores `s` with up to 4,096 SHA-256 local key ids, their first
 incomplete timestamp, cumulative reclaimed hashes and a sticky overflow flag.
@@ -35,3 +38,11 @@ zero is not asserted as measured demand. No runtime corpus receipt is claimed.
 Activation OFF; Fix 3 phase B. No selector, scheduler, history replay, new file
 read, production activation or release is introduced. Validation runs only in
 CI on the exact pushed head; no local Cargo or tests.
+
+The synthetic receipts include full serialized pressure for active admission
+and retired-core metadata growth, plus optional numeric-overflow isolation and
+peer provenance for the closed old/inert/retired/alias difference reasons.
+Production peak counters explicitly mark measurement unavailable; the CI
+allocator receipt measures requested overlap separately from RSS, including
+retained old/new state and pretty-checkpoint decode. Workspace refusals remain
+in the healthy-terminal denominator.

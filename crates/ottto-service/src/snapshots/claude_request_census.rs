@@ -388,7 +388,7 @@ impl ClaudeRequestCensusRecord {
 
     fn safety_complete(&self) -> bool {
         !self.over_budget()
-            && self.safety.as_ref().is_none_or(|safety| !safety.sr)
+            && self.safety.as_ref().map_or(true, |safety| !safety.sr)
             && (self.retired.is_none() || self.safety.as_ref().is_some_and(|safety| safety.sc == 1))
     }
 
@@ -401,6 +401,19 @@ impl ClaudeRequestCensusRecord {
             safety.sc = 1;
             safety.oc = if self.twin { 0 } else { 1 };
         }
+    }
+
+    fn mark_safety_refused(&mut self) {
+        let twin = self.twin;
+        self.safety
+            .get_or_insert_with(|| {
+                Box::new(TranscriptSafety {
+                    sc: 1,
+                    oc: u8::from(!twin),
+                    ..TranscriptSafety::default()
+                })
+            })
+            .sr = true;
     }
 
     /// Another handle on the record's hash buffer (nothing is copied).
@@ -957,7 +970,7 @@ impl ClaudeRequestCensus {
             self.admission_serialized_total -= admission;
             self.active_hash_total -= active;
         }
-        if record.safety.is_some() && record.safety_hashes.is_none() {
+        if record.safety.is_some() {
             let order = (record.window, key.to_owned());
             if sign {
                 self.extension_order.insert(order);
@@ -1029,10 +1042,10 @@ impl ClaudeRequestCensus {
                 .serialized_total
                 .saturating_add(entry_serialized_bytes(&key, &record));
             let mut hashes = self.hash_total.saturating_add(record.hash_count());
-            // Optional active metadata is best effort; never drop active hashes.
+            // Optional safety metadata is best effort; never drop active hashes.
             // Retain the key as incomplete until an authorized parse restores it.
             // No scan: the maintained extension queue contains precisely these keys.
-            let mut plan = Vec::new();
+            let mut plan = BTreeMap::new();
             let marker_bytes = |_: &SafetyIncomplete| 0_usize;
             if bytes.saturating_add(marker_bytes(&marker))
                 > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
@@ -1059,7 +1072,7 @@ impl ClaudeRequestCensus {
                     .saturating_sub(entry_serialized_bytes(extension_key, old))
                     .saturating_add(entry_serialized_bytes(extension_key, &replacement));
                 marker.note(extension_key, 0, record.window);
-                plan.push((extension_key.clone(), replacement));
+                plan.insert(extension_key.clone(), replacement);
             }
             if record.retired.is_some()
                 && (hashes > MAX_CLAUDE_REQUEST_CENSUS_HASHES
@@ -1102,18 +1115,17 @@ impl ClaudeRequestCensus {
                     .saturating_sub(before)
                     .saturating_add(entry_serialized_bytes(&key, &record));
             }
-            for (_, retired_key) in self
-                .retired_order
-                .iter()
-                .filter(|_| record.retired.is_none())
-            {
+            // A retired reparse has already declined its own new safety if
+            // necessary. Peer reclaim here can fund only its MONEY core metadata,
+            // never additional reconstruction safety or active hashes.
+            for (_, retired_key) in &self.retired_order {
                 if hashes <= MAX_CLAUDE_REQUEST_CENSUS_HASHES
                     && bytes.saturating_add(marker_bytes(&marker))
                         <= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
                 {
                     break;
                 }
-                let old = &self.records[retired_key];
+                let old = plan.get(retired_key).unwrap_or(&self.records[retired_key]);
                 let old_hashes = old
                     .safety_hashes
                     .as_deref()
@@ -1121,10 +1133,7 @@ impl ClaudeRequestCensus {
                 let hash_need = hashes.saturating_sub(MAX_CLAUDE_REQUEST_CENSUS_HASHES);
                 let mut without_buffer = old.clone();
                 without_buffer.safety_hashes = None;
-                without_buffer
-                    .safety
-                    .get_or_insert_with(Default::default)
-                    .sr = true;
+                without_buffer.mark_safety_refused();
                 let base_total = bytes
                     .saturating_sub(entry_serialized_bytes(retired_key, old))
                     .saturating_add(entry_serialized_bytes(retired_key, &without_buffer));
@@ -1137,13 +1146,22 @@ impl ClaudeRequestCensus {
                 let mut replacement = old.clone();
                 replacement.safety_hashes =
                     shared_hashes(old_hashes[..old_hashes.len() - reclaimed].to_vec());
-                replacement.safety.get_or_insert_with(Default::default).sr = true;
+                replacement.mark_safety_refused();
                 marker.note(retired_key, reclaimed, record.window);
                 hashes = hashes.saturating_sub(reclaimed);
                 bytes = bytes
                     .saturating_sub(entry_serialized_bytes(retired_key, old))
                     .saturating_add(entry_serialized_bytes(retired_key, &replacement));
-                plan.push((retired_key.clone(), replacement));
+                if replacement.safety_hashes.is_none()
+                    && bytes > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+                {
+                    let before = entry_serialized_bytes(retired_key, &replacement);
+                    replacement.safety = None;
+                    bytes = bytes
+                        .saturating_sub(before)
+                        .saturating_add(entry_serialized_bytes(retired_key, &replacement));
+                }
+                plan.insert(retired_key.clone(), replacement);
             }
             if hashes > MAX_CLAUDE_REQUEST_CENSUS_HASHES
                 || bytes.saturating_add(marker_bytes(&marker))
@@ -2120,10 +2138,11 @@ impl<'de> Visitor<'de> for RecordVisitor {
             if seen & (bit | alias) != 0 {
                 if matches!(FIELDS[position], "x" | "sb") {
                     extension_bad = true;
+                    map.next_value::<Box<serde_json::value::RawValue>>()?;
                 } else {
                     malformed = true;
+                    map.next_value::<IgnoredAny>()?;
                 }
-                map.next_value::<IgnoredAny>()?;
                 continue;
             }
             seen |= bit;
@@ -2136,13 +2155,19 @@ impl<'de> Visitor<'de> for RecordVisitor {
                         .map(Box::new);
                     extension_bad |= safety.is_none();
                 }
-                "sb" => match map.next_value_seed(HashesSeed {
-                    remaining: self.remaining,
-                    encoding: HashEncoding::Base64,
-                })? {
-                    Some(hashes) => safety_hashes = hashes,
-                    None => extension_bad = true,
-                },
+                "sb" => {
+                    let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                    let mut isolated = serde_json::Deserializer::from_str(raw.get());
+                    match (HashesSeed {
+                        remaining: self.remaining,
+                        encoding: HashEncoding::Base64,
+                    })
+                    .deserialize(&mut isolated)
+                    {
+                        Ok(Some(hashes)) if isolated.end().is_ok() => safety_hashes = hashes,
+                        _ => extension_bad = true,
+                    }
+                }
                 name @ ("h" | "b") => {
                     let encoding = if name == "h" {
                         HashEncoding::Hex
@@ -2201,8 +2226,8 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 || extension.acquired > extension.extent
                 || extension.last_progress_at < extension.unread_since;
         }
-        extension_bad |= !safety_hashes.is_empty()
-            && (safety.is_none() || !request_hashes.is_empty() || !scalars.contains_key("r"));
+        extension_bad |=
+            !safety_hashes.is_empty() && (!request_hashes.is_empty() || !scalars.contains_key("r"));
         if malformed {
             return Ok(None);
         }
@@ -2851,7 +2876,7 @@ pub(crate) fn record_claude_request_census(
         // hashes retirement dropped) are excluded.
         let comparable = |record: &ClaudeRequestCensusRecord| {
             !record.unverified
-                && record.safety.as_ref().is_none_or(|safety| safety.ac)
+                && record.safety.as_ref().map_or(true, |safety| safety.ac)
                 && record.safety_complete()
                 && !matches!(
                     record.shape,
@@ -2957,6 +2982,9 @@ pub(crate) fn prepare_claude_request_census_terminal(
     counts.would_open_flips = state.would_open_flips;
     counts.derivation_drift = state.derivation_drift;
     counts.json_bytes = serialized_bytes(&index.claude_request_census);
+    counts.census_evidence_bytes = counts.json_bytes.saturating_add(serialized_len(
+        &index.claude_request_census.safety_incomplete,
+    )) as u64;
     counts.shadow_elapsed_us = started.elapsed().as_micros().min(u64::MAX as u128) as u64;
     counts.heap_bytes =
         crate::heap_layout_bound::completed_bound(&index.claude_request_census, usize::MAX)
@@ -2971,6 +2999,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
 pub(crate) fn prepare_safety_checkpoint(index: &mut ScanIndex) {
     if !index.claude_request_census.records.is_empty()
         || index.claude_request_census.safety_incomplete.incomplete()
+        || index.claude_request_census_shadow.would_open.is_some()
     {
         index.claude_request_census_shadow.safety_incomplete =
             Some(index.claude_request_census.safety_incomplete.clone());
@@ -3147,6 +3176,8 @@ pub(crate) struct ClaudeRequestCensusJoin {
     unknown_roots: BTreeSet<String>,
     retired_shared_keys: BTreeSet<String>,
     retired_keys: BTreeSet<String>,
+    key_reasons: BTreeMap<String, u8>,
+    shared_reasons: BTreeMap<String, u8>,
 }
 
 impl ClaudeRequestCensusJoin {
@@ -3206,6 +3237,8 @@ impl ClaudeRequestCensusJoin {
                     >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * 80,
                 ..ClaudeRequestCensusShadowCounts::default()
             },
+            key_reasons: BTreeMap::new(),
+            shared_reasons: BTreeMap::new(),
             retired_shared_keys: BTreeSet::new(),
             retired_keys: BTreeSet::new(),
             coverage: BTreeMap::new(),
@@ -3348,6 +3381,25 @@ impl ClaudeRequestCensusJoin {
             crate::heap_layout_bound::completed_bound(&path_owners, usize::MAX)
                 .unwrap_or(usize::MAX),
         );
+        for (key, record) in census.records() {
+            let alias = record.twin
+                || claude_index_path_family_member(Path::new(key))
+                    .is_some_and(|owner| path_owners.get(&owner).is_some_and(|keys| *keys > 1));
+            let inert = !matches!(
+                join.coverage.get(key),
+                Some(
+                    ClaudeRequestCensusCoverage::Fingerprint | ClaudeRequestCensusCoverage::Window
+                )
+            ) || record.shape.unknown()
+                || record.unverified;
+            let reason = u8::from(record.window != window)
+                | (u8::from(inert) << 1)
+                | (u8::from(record.retired.is_some()) << 2)
+                | (u8::from(alias) << 3);
+            if reason != 0 {
+                join.key_reasons.insert(key.clone(), reason);
+            }
+        }
         // A path twin: one (root, member) on two or more keys.
         join.unknown_roots.extend(
             path_owners
@@ -3372,7 +3424,7 @@ impl ClaudeRequestCensusJoin {
         for (key, record) in census.records() {
             if !record.current_derivation()
                 || (record.retired.is_some() && record.safety.is_none())
-                || (record.twin && record.safety.as_ref().is_none_or(|safety| safety.oc != 1))
+                || (record.twin && record.safety.as_ref().map_or(true, |safety| safety.oc != 1))
                 || (record.shape == ClaudeRequestCensusShape::Lossy && record.safety.is_none())
             {
                 migration.insert(key);
@@ -3471,6 +3523,12 @@ impl ClaudeRequestCensusJoin {
                 }
             }
         }
+        bytes = bytes.checked_add(
+            records
+                .checked_add(1)?
+                .checked_mul(tree_node_bytes::<String, u8>()?.checked_mul(2)?)?,
+        )?;
+        bytes = bytes.checked_add(record_keys.checked_mul(2)?)?;
         let merge_slot = std::mem::size_of::<(&String, &[u64])>()
             + std::mem::size_of::<Reverse<(u64, usize, usize)>>()
             + std::mem::size_of::<usize>();
@@ -3496,6 +3554,15 @@ impl ClaudeRequestCensusJoin {
                     .and_then(|roots| bytes.checked_add(roots))
             })
             .unwrap_or(usize::MAX);
+        let owned = owned
+            .saturating_add(
+                crate::heap_layout_bound::completed_bound(&self.key_reasons, usize::MAX)
+                    .unwrap_or(usize::MAX),
+            )
+            .saturating_add(
+                crate::heap_layout_bound::completed_bound(&self.shared_reasons, usize::MAX)
+                    .unwrap_or(usize::MAX),
+            );
         self.counts.transient_peak_bytes = self
             .counts
             .transient_peak_bytes
@@ -3597,6 +3664,21 @@ impl ClaudeRequestCensusJoin {
             .saturating_add(run_lists.len());
         self.shared_keys
             .extend(run_lists.iter().map(|list| lists[*list].0.clone()));
+        let reason = run_lists.iter().fold(0_u8, |mask, list| {
+            mask | self
+                .key_reasons
+                .get(lists[*list].0)
+                .copied()
+                .unwrap_or_default()
+        });
+        if reason != 0 {
+            for list in run_lists {
+                *self
+                    .shared_reasons
+                    .entry(lists[*list].0.clone())
+                    .or_default() |= reason;
+            }
+        }
         if run_lists
             .iter()
             .any(|list| self.retired_keys.contains(lists[*list].0))
@@ -3901,29 +3983,18 @@ impl CensusShadowView {
                 .filter(|((owner, _), _)| *owner == root)
                 .flat_map(|(_, keys)| keys.iter().copied())
                 .collect::<Vec<_>>();
-            let retired = keys
-                .iter()
-                .any(|key| self.join.retired_shared_keys.contains(*key));
-            let inert = keys.iter().any(|key| {
-                !matches!(
-                    self.join.coverage.get(*key),
-                    Some(
-                        ClaudeRequestCensusCoverage::Fingerprint
-                            | ClaudeRequestCensusCoverage::Window
-                    )
-                )
+            let reason = keys.iter().fold(0_u8, |mask, key| {
+                mask | self
+                    .join
+                    .shared_reasons
+                    .get(*key)
+                    .copied()
+                    .unwrap_or_default()
             });
-            let alias = keys.iter().any(|key| {
-                index
-                    .claude_request_census
-                    .get(key)
-                    .is_some_and(|record| record.twin)
-            });
-            let old = keys.iter().any(|key| {
-                index.claude_request_census.get(key).is_some_and(|record| {
-                    record.window != rfc3339_unix_seconds(window).unwrap_or_default()
-                })
-            });
+            let old = reason & 1 != 0;
+            let inert = reason & 2 != 0;
+            let retired = reason & 4 != 0;
+            let alias = reason & 8 != 0;
             counts.shadow_diff_retired_families += usize::from(retired);
             counts.shadow_diff_inert_families += usize::from(inert);
             counts.shadow_diff_alias_families += usize::from(alias);
@@ -3971,7 +4042,7 @@ impl CensusShadowView {
                     .claude_request_census
                     .records
                     .get(*key)
-                    .is_none_or(|record| evidence_digest(record) != **digest)
+                    .map_or(true, |record| evidence_digest(record) != **digest)
             })
             .count();
         let pending_mismatches = comparison
@@ -3981,7 +4052,7 @@ impl CensusShadowView {
                 saved
                     .claude_usage_family_pending
                     .get(*root)
-                    .is_none_or(|pending| evidence_digest(pending) != **digest)
+                    .map_or(true, |pending| evidence_digest(pending) != **digest)
             })
             .count();
         counts.shadow_post_save_mismatch_keys = record_mismatches
@@ -4909,5 +4980,158 @@ mod phase_b_tests {
         assert_eq!(restored.retired(), Some(1));
         assert!(restored.request_hashes().is_empty());
         assert_eq!(restored.duplicate_safety_hashes(), &[9]);
+    }
+    #[test]
+    fn optional_safety_numeric_overflow_never_drops_valid_money_fields() {
+        let mut index = index_with(vec![(A, record('a', vec![9]).without_safety_for_test())]);
+        prepare_safety_checkpoint(&mut index);
+        let base = serde_json::to_string(&index).unwrap();
+        let scratch = crate::test_scratch::ScratchDir::new("phase-b-safety-number");
+        let path = scratch.join("index.json");
+        for extra in [
+            r#""sb":1e400,"#,
+            r#""x":1e400,"#,
+            r#""sb":false,"sb":1e400,"#,
+            r#""x":false,"x":1e400,"#,
+        ] {
+            let bytes = base.replacen(r#""v":1"#, &format!(r#"{extra}"v":1"#), 1);
+            std::fs::write(&path, bytes).unwrap();
+            let loaded = ScanIndex::load(&path).unwrap();
+            let record = loaded
+                .claude_request_census
+                .get(A)
+                .expect("valid MONEY record survives optional numeric overflow");
+            assert_eq!(record.request_hashes(), &[9]);
+            assert!(record.current_for(&"a".repeat(64)));
+            assert!(!record.over_budget());
+            let join = ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new());
+            assert!(!join.disjointness_complete(true));
+        }
+    }
+
+    #[test]
+    fn shared_difference_reasons_follow_the_inert_peer_to_the_current_key() {
+        let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![9]))]);
+        index.files.remove(A);
+        let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
+        assert_eq!(
+            join.shared_reasons.get(B).copied().unwrap_or_default() & 2,
+            2
+        );
+        assert!(join.shared_keys.contains(B));
+    }
+    #[test]
+    fn serialized_pressure_preserves_active_and_retired_money_admission() {
+        const NEW: &str = "/phase-b/projects/new.jsonl";
+        const KEY_BYTES: usize = 768;
+        let mut candidate = ClaudeRequestCensus::default();
+        let mut a = record('a', (0..200000).collect());
+        a.retire_transcript_preserving_safety();
+        candidate.insert_for_test(A, a);
+        let mut b = record('b', vec![1]).without_safety_for_test();
+        b.retire();
+        candidate.insert_for_test(B, b);
+        let filler = ClaudeRequestCensusRecord::synthetic_for_test(
+            &"f".repeat(64),
+            7,
+            ClaudeRequestCensusShape::OverBudget,
+            vec![],
+        );
+        let entry_base = entry_serialized_bytes("", &filler);
+        let min_bytes = entry_base + 32;
+        let full_bytes = entry_base + KEY_BYTES;
+        let key = |row: usize, bytes: usize| {
+            let prefix = format!("/f/{row:05}/");
+            let tail = "f.jsonl";
+            let room = bytes - prefix.len() - tail.len();
+            format!(
+                "{prefix}{}{}{tail}",
+                "d/".repeat(room / 2),
+                if room % 2 == 1 { "x" } else { "" }
+            )
+        };
+        let mut row = 0;
+        while MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - candidate.serialized_total
+            > full_bytes + min_bytes
+        {
+            assert_eq!(
+                candidate.insert_for_test(&key(row, KEY_BYTES), filler.clone()),
+                ClaudeRequestCensusInsert::Stored
+            );
+            row += 1;
+        }
+        let mut room = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - candidate.serialized_total;
+        if room > full_bytes {
+            candidate.insert_for_test(&key(row, 32), filler.clone());
+            row += 1;
+            room = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - candidate.serialized_total;
+        }
+        assert!(room >= min_bytes);
+        candidate.insert_for_test(&key(row, room - entry_base), filler);
+        assert_eq!(
+            candidate.serialized_total,
+            MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+        );
+        let mut main = candidate.clone();
+        let mut a = main.take(A).unwrap();
+        a.retire();
+        main.charge(A, &a, true);
+        main.records.insert(A.to_owned(), a);
+        let scope = |census: ClaudeRequestCensus, path: &str, fingerprint: char, root: &str| {
+            let mut index = ScanIndex::default();
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+            entry.source_file_fingerprint = fingerprint.to_string().repeat(64);
+            index.files.insert(path.to_owned(), entry);
+            index.claude_request_census = census;
+            let ledger = ClaudeRequestCensus::default();
+            let scope = crate::snapshots::claude_request_ledger::ClaudeLedgerScope::build(
+                &index,
+                &ledger,
+                &BTreeSet::new(),
+                &BTreeSet::from([root]),
+                std::time::Instant::now() + std::time::Duration::from_secs(30),
+            )
+            .unwrap();
+            (
+                scope.family_complete(root),
+                serde_json::to_vec(&scope.debt).unwrap(),
+            )
+        };
+        for retired in [false, true] {
+            let (path, fingerprint, root, updated) = if retired {
+                let mut updated = record('b', vec![1]);
+                updated.birth = Some(ClaudeRequestBirth {
+                    unix_seconds: 1700000000,
+                    device: 1,
+                    inode: 2,
+                });
+                updated.modified = Some(1700000000);
+                updated.old_path_usage = Some((1, 10));
+                updated.retire_transcript_preserving_safety();
+                (B, 'b', "b", updated)
+            } else {
+                (NEW, 'c', "new", record('c', vec![200000]))
+            };
+            let mut control = main.clone();
+            let mut actual = candidate.clone();
+            let mut legacy = updated.clone();
+            legacy.safety = None;
+            legacy.safety_hashes = None;
+            assert_eq!(
+                control.insert_for_test(path, legacy),
+                ClaudeRequestCensusInsert::Stored
+            );
+            assert_eq!(
+                actual.insert_for_test(path, updated.clone()),
+                ClaudeRequestCensusInsert::Stored,
+                "retired={retired}"
+            );
+            assert!(actual.serialized_total <= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES);
+            assert_eq!(actual.serialized_total, actual.recounted_for_test().1);
+            assert_eq!(
+                scope(actual, path, fingerprint, root),
+                scope(control, path, fingerprint, root)
+            );
+        }
     }
 }
