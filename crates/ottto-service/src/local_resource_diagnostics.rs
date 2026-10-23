@@ -278,6 +278,16 @@ pub(crate) fn claude_reemission_list_missing() {
         &EmptyCounts {},
     );
 }
+/// Local alarm, at most hourly: Claude history owes an upgrade to the active
+/// body-witness revision while the protected list was never installed, so
+/// the history gate holds it. Counts only; no path, id or wire event.
+pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_upgrade_owed_without_list",
+        "claude_code",
+        counts,
+    );
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.

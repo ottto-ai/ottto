@@ -334,6 +334,29 @@ pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> 
     }
 }
 
+/// Claude only, before scanning: when every file would come back new (a
+/// fresh index or a replay reset) on a destination that already received its
+/// Claude history bootstrap, record the history cutoff. The backfill state,
+/// not the index, remembers that bootstrap, so the signal survives index
+/// loss; a genuinely fresh install or a new destination has none.
+fn note_claude_history_cutoff_for_cycle(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    entries_lost: bool,
+) {
+    if source != SnapshotSource::ClaudeCode {
+        return;
+    }
+    let prior_history = backfill_state
+        .completed_destination_namespaces
+        .get(source.api_slug())
+        .map(String::as_str)
+        == Some(destination_namespace);
+    index.note_claude_history_cutoff(prior_history, entries_lost);
+}
+
 fn exclude_held_effective_body_witness_revision(
     index: &mut ScanIndex,
     items: &[SnapshotItem],
@@ -5250,6 +5273,8 @@ fn prepare_sync_source(
     let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
+    // Absent, quarantined or undecodable: every file would come back new.
+    let claude_index_loaded_fresh = index.generation == 0 && index.files.is_empty();
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -5358,13 +5383,20 @@ fn prepare_sync_source(
         .collect::<BTreeSet<_>>();
     // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
     // scan is built.
-    crate::snapshots::prepare_historical_replay_with_side(
+    let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
         &mut index,
         historical_replay_pending,
         replay_generation.clone(),
         source,
         &daemon.transcript_cache,
         &index_path,
+    );
+    note_claude_history_cutoff_for_cycle(
+        &mut index,
+        source,
+        &backfill_state,
+        &upload_destination_namespace,
+        claude_index_loaded_fresh || replay_dropped_entries,
     );
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
@@ -5767,6 +5799,9 @@ fn finish_sync_source(
             backfill_succeeded = false;
         }
     }
+    // The history-upgrade emission seam: after the local evidence fold, before
+    // every ordinary and correction upload path can see a held body.
+    index.veto_claude_history_emission(source, &mut scan_result.snapshots);
 
     // Recheck after the potentially long scan, not only when status was
     // acquired. A cached login must not claim sessions created after a switch.
@@ -6127,6 +6162,8 @@ fn finish_sync_source(
             );
         }
     }
+    // The same hook every resend path calls; nothing held is left by now.
+    index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -20275,6 +20312,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod history_upgrade_pipeline_tests {
+        include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+    }
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }

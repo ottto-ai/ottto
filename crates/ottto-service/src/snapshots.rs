@@ -33,7 +33,12 @@ mod claude_context_file_birth;
 pub(crate) use claude_context_file_birth::ClaudeFileBirthVerdict;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
 pub(crate) use claude_context_file_birth::{ClaudeFileBirth, ClaudeVetoApiRows};
+mod claude_history_upgrade;
+#[cfg(test)]
+mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
+#[cfg(test)]
+pub(crate) use claude_reemission_exclusions::with_no_list_cutoff;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
 pub(crate) mod claude_request_identity;
@@ -95,6 +100,7 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+use claude_history_upgrade::{HistoryDecision, HistoryEmission, HistoryHold, HistoryPage};
 use claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
@@ -3090,6 +3096,14 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
+    /// Claude only: when this destination, after completing its history
+    /// bootstrap, loaded a fresh index or a historical replay dropped its
+    /// entries. A new file born before it (or at an unknown time) is history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claude_history_cutoff_unix_seconds: Option<u64>,
+    /// Runtime-only history-gate decisions of this cycle, by source file.
+    #[serde(skip)]
+    claude_history_emission: HistoryEmission,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -3310,6 +3324,8 @@ impl Default for ScanIndex {
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
+            claude_history_cutoff_unix_seconds: None,
+            claude_history_emission: HistoryEmission::default(),
         }
     }
 }
@@ -5730,6 +5746,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
     index: &mut ScanIndex,
     mut body_witness: impl FnMut(&SnapshotItem) -> String,
 ) {
+    // Backstop of the one emission seam: no held history body is finalized.
+    index.veto_claude_history_emission(source, &mut result.snapshots);
     for snapshot in &mut result.snapshots {
         snapshot.snapshot_fingerprint = snapshot_fingerprint(source, snapshot);
         index.snapshot_activity_at.insert(
@@ -5765,6 +5783,10 @@ pub fn finalize_scan_after_policy_with_body_witness(
             }
         }
         if !pending.parse_complete {
+            continue;
+        }
+        if index.finalize_claude_held_history(&pending.index_key, &pending.source_file_fingerprint)
+        {
             continue;
         }
         let final_fingerprints = by_source_file
@@ -5814,15 +5836,12 @@ pub fn finalize_scan_after_policy_with_body_witness(
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
-            if pending.effective_upload_body_witness_revision != 0
-                && !index
-                    .effective_upload_body_witness_revision_excluded_source_files
-                    .contains(&pending.source_file_fingerprint)
-            {
-                entry.effective_upload_body_witness_revision =
-                    pending.effective_upload_body_witness_revision;
-            }
         }
+        index.stamp_effective_upload_body_witness_revision(
+            &pending.index_key,
+            &pending.source_file_fingerprint,
+            pending.effective_upload_body_witness_revision,
+        );
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
             for sample in diagnostic.lineage.iter_mut().flatten() {
@@ -20123,13 +20142,8 @@ pub(crate) struct OwnedSourceScan {
     scanned_file_count: usize,
     scanned_session_count: usize,
     semantic_noop_count: usize,
-    /// Files parsed on this page only to adopt a new body-witness revision,
-    /// and the ones deferred past `body_witness_adoption_page_budget`.
-    body_witness_adoption_only_parses: usize,
-    body_witness_adoption_only_bytes: u64,
-    body_witness_adoption_deferred: usize,
-    body_witness_adoption_excluded: usize,
-    body_witness_adoption_held_no_list: usize,
+    /// This page's history-upgrade budget and count-only gate diagnostics.
+    history_upgrade: HistoryPage,
     codex_state_only_blocked_session_ids: BTreeSet<String>,
     codex_parent_resolution_retry_required: bool,
     residue_index_keys: BTreeSet<String>,
@@ -21023,11 +21037,7 @@ impl OwnedSourceScan {
             scanned_file_count,
             scanned_session_count,
             semantic_noop_count,
-            body_witness_adoption_only_parses: 0,
-            body_witness_adoption_only_bytes: 0,
-            body_witness_adoption_deferred: 0,
-            body_witness_adoption_excluded: 0,
-            body_witness_adoption_held_no_list: 0,
+            history_upgrade: HistoryPage::default(),
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -21185,11 +21195,7 @@ impl OwnedSourceScan {
             mut scanned_file_count,
             mut scanned_session_count,
             mut semantic_noop_count,
-            mut body_witness_adoption_only_parses,
-            mut body_witness_adoption_only_bytes,
-            mut body_witness_adoption_deferred,
-            mut body_witness_adoption_excluded,
-            mut body_witness_adoption_held_no_list,
+            mut history_upgrade,
             mut codex_state_only_blocked_session_ids,
             mut codex_parent_resolution_retry_required,
             mut residue_index_keys,
@@ -23866,16 +23872,18 @@ impl OwnedSourceScan {
                 if source == SnapshotSource::ClaudeCode
                     && (census.claude_parse_reasons.iter().any(|count| *count > 0)
                         || census.claude_compaction_unlinked_parent_count > 0
-                        || body_witness_adoption_deferred > 0
-                        || body_witness_adoption_excluded > 0
-                        || body_witness_adoption_held_no_list > 0
+                        || history_upgrade.any()
                         || index.claude_reemission_exclusions.pauses_adoption()
                         || claude_reemission_stop_latched())
                 {
+                    claude_history_upgrade::alarm_if_owed_without_list(
+                        &history_upgrade,
+                        index.claude_reemission_exclusions.state(),
+                    );
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -23884,13 +23892,21 @@ impl OwnedSourceScan {
                             .collect::<Vec<_>>()
                             .join(" "),
                         census.claude_compaction_unlinked_parent_count,
-                        body_witness_adoption_deferred,
-                        body_witness_adoption_excluded,
-                        body_witness_adoption_held_no_list,
+                        history_upgrade.denied_for(&[
+                            HistoryHold::UngatedRevision,
+                            HistoryHold::ListPaused,
+                            HistoryHold::Latched,
+                            HistoryHold::Budget,
+                        ]),
+                        history_upgrade.denied_for(&[HistoryHold::Listed]),
+                        history_upgrade.denied_for(&[HistoryHold::NoListBirth]),
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
                         index.claude_reemission_exclusions.state().as_str(),
                         claude_reemission_stop_reason(),
-                        claude_reemission_stop_withheld_folds()
+                        claude_reemission_stop_withheld_folds(),
+                        history_upgrade.owed,
+                        history_upgrade.permitted,
+                        history_upgrade.denied_summary()
                     );
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
@@ -24505,49 +24521,51 @@ impl OwnedSourceScan {
             if comparison_target {
                 decision = CandidateDecision::Parse;
             }
-            // One-time adoption pacing: past this page's file or byte budget,
-            // a file that only a new body-witness revision selects is skipped
-            // unchanged.
-            // Its stamp stays old, so a later page adopts it. A file the local
-            // re-emission list names is skipped the same way without using the
-            // budget; an unreadable or vanished list defers every such file.
-            // Before the list was ever installed, a file born before the
-            // cutoff (the index keeps no first-indexed time) is held. Once a
-            // Claude fold has withheld for a resource limit, the budget is 0
-            // until the daemon restarts (SOURCE Amendments 7 and 10).
-            if decision == CandidateDecision::Parse
-                && !comparison_target
-                && parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
-                && index.candidate_requires_only_body_witness_adoption(&candidate)
-            {
-                let adoption_paused = index.claude_reemission_exclusions.pauses_adoption()
-                    || (source == SnapshotSource::ClaudeCode && claude_reemission_stop_latched());
-                if index.claude_reemission_excluded(&candidate) {
-                    body_witness_adoption_excluded += 1;
-                    decision = CandidateDecision::Skip;
-                } else if source == SnapshotSource::ClaudeCode
-                    && index.claude_reemission_exclusions.holds_without_list(
+            // History-upgrade gate (SOURCE P1), whatever selected the file:
+            // unchanged Claude history that would carry a new body-witness
+            // revision passes the list, the no-list birth hold, the family
+            // skip, the stop latch and this page's budget (reserved once per
+            // file). A held file that only owes the upgrade is skipped with
+            // its old stamp. A held file selected for another reason (upload
+            // context, re-arm, family, audit, authority, a rebuilt or replayed
+            // index) still parses for its local work, but none of its bodies
+            // is emitted and its upload tuple stays (`veto_claude_history_emission`).
+            // Codex and Pi keep the adoption-only page budget.
+            if decision == CandidateDecision::Parse {
+                let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
+                    && index.candidate_requires_only_body_witness_adoption(&candidate);
+                let history = if source == SnapshotSource::ClaudeCode {
+                    index.claude_history_upgrade_decision(
+                        &candidate,
                         opened_file
                             .metadata()
                             .and_then(|metadata| metadata.created())
                             .ok()
                             .and_then(unix_seconds),
+                        &mut history_upgrade,
                     )
+                } else if adoption_only
+                    && !comparison_target
+                    && !history_upgrade
+                        .reserve(&local_index_key(&candidate.path), candidate.size_bytes)
                 {
-                    body_witness_adoption_held_no_list += 1;
-                    decision = CandidateDecision::Skip;
-                } else if !adoption_paused
-                    && body_witness_adoption_only_parses < body_witness_adoption_page_budget()
-                    && (body_witness_adoption_only_parses == 0
-                        || body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes)
-                            <= body_witness_adoption_byte_budget())
-                {
-                    body_witness_adoption_only_parses += 1;
-                    body_witness_adoption_only_bytes =
-                        body_witness_adoption_only_bytes.saturating_add(candidate.size_bytes);
+                    history_upgrade.note_denied(
+                        HistoryHold::Budget,
+                        index.claude_reemission_exclusions.state(),
+                    );
+                    HistoryDecision::Held(HistoryHold::Budget)
                 } else {
-                    body_witness_adoption_deferred += 1;
-                    decision = CandidateDecision::Skip;
+                    HistoryDecision::NotOwed
+                };
+                match history {
+                    HistoryDecision::Held(_) if adoption_only && !comparison_target => {
+                        decision = CandidateDecision::Skip;
+                    }
+                    HistoryDecision::Held(hold) => {
+                        index.gate_claude_history_candidate(&candidate, Some(hold));
+                    }
+                    HistoryDecision::Owed => index.gate_claude_history_candidate(&candidate, None),
+                    HistoryDecision::NotOwed => {}
                 }
             }
             if source == SnapshotSource::ClaudeCode && decision == CandidateDecision::Parse {
@@ -25516,11 +25534,7 @@ impl OwnedSourceScan {
             scanned_file_count,
             scanned_session_count,
             semantic_noop_count,
-            body_witness_adoption_only_parses,
-            body_witness_adoption_only_bytes,
-            body_witness_adoption_deferred,
-            body_witness_adoption_excluded,
-            body_witness_adoption_held_no_list,
+            history_upgrade,
             codex_state_only_blocked_session_ids,
             codex_parent_resolution_retry_required,
             residue_index_keys,
@@ -34503,13 +34517,15 @@ fn unix_nanos(value: SystemTime) -> Option<u64> {
         .map(|duration| duration.as_nanos().min(u64::MAX as u128) as u64)
 }
 
-/// Most files one page re-reads only to adopt a new body-witness revision.
-/// The rest wait for later pages, which paces a one-time history re-read.
-/// Files selected for any other reason are never deferred.
-const BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE: usize = 2_000;
-/// Bytes of adoption-only files read per page (4 GiB). The first such file of
-/// a page is always admitted, whatever its size.
-const BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE: u64 = 16 * MAX_JSONL_FILE_BYTES;
+/// Most history files one page upgrades to a new body-witness revision,
+/// whatever selected them. The rest wait for later pages, which paces a
+/// history re-read. Changed and genuinely new files are never deferred.
+const BODY_WITNESS_ADOPTION_ONLY_PARSES_PER_PAGE: usize =
+    claude_history_upgrade::HISTORY_UPGRADE_FILES_PER_PAGE;
+/// Bytes of history upgraded per page (1 GiB, one constant for every
+/// revision). No file is admitted past it, including a page's first file.
+const BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE: u64 =
+    claude_history_upgrade::HISTORY_UPGRADE_BYTES_PER_PAGE;
 
 #[cfg(test)]
 thread_local! {
@@ -34526,7 +34542,10 @@ fn body_witness_adoption_page_budget() -> usize {
 }
 
 #[cfg(test)]
-fn with_body_witness_adoption_page_budget<T>(budget: usize, run: impl FnOnce() -> T) -> T {
+pub(crate) fn with_body_witness_adoption_page_budget<T>(
+    budget: usize,
+    run: impl FnOnce() -> T,
+) -> T {
     BODY_WITNESS_ADOPTION_TEST_PAGE_BUDGET.with(|slot| slot.set(Some(budget)));
     let value = run();
     BODY_WITNESS_ADOPTION_TEST_PAGE_BUDGET.with(|slot| slot.set(None));
@@ -35135,6 +35154,7 @@ impl ScanIndex {
         self.active_effective_upload_body_witness_revision_monotone = false;
         self.effective_upload_body_witness_revision_excluded_source_files
             .clear();
+        self.claude_history_emission = HistoryEmission::default();
     }
 
     /// Claude only (MONEY P2), after activating: re-read a file only when its
@@ -35194,6 +35214,272 @@ impl ScanIndex {
             (true, 0) => UnsettledUploadCause::Unattributed.bit(),
             (true, causes) => causes,
         }
+    }
+
+    /// Claude only, before scanning: a destination that already completed its
+    /// history bootstrap and now loaded a fresh index, or whose historical
+    /// replay just dropped its entries, records the history cutoff. A new
+    /// file born before it (or at an unknown time) is history (SOURCE P1).
+    /// A later cutoff only moves forward; a fresh install records none.
+    pub(crate) fn note_claude_history_cutoff(&mut self, prior_history: bool, entries_lost: bool) {
+        if !(prior_history && entries_lost) {
+            return;
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_secs())
+            .unwrap_or_default();
+        self.claude_history_cutoff_unix_seconds = Some(
+            self.claude_history_cutoff_unix_seconds
+                .map_or(now, |cutoff| cutoff.max(now)),
+        );
+    }
+
+    /// The one reason-independent history decision for a Claude candidate,
+    /// against its entry before this parse. Every caller (the candidate loop,
+    /// MONEY's emitter) uses it; the parse reason stays diagnostic only.
+    pub(crate) fn claude_history_upgrade_decision(
+        &self,
+        candidate: &CandidateFile,
+        birth_unix_seconds: Option<u64>,
+        page: &mut HistoryPage,
+    ) -> HistoryDecision {
+        let key = local_index_key(&candidate.path);
+        let extent = |size_bytes, modified_unix_seconds, modified_unix_nanos| {
+            claude_history_upgrade::FileExtent {
+                size_bytes,
+                modified_unix_seconds,
+                modified_unix_nanos,
+            }
+        };
+        let kind = claude_history_upgrade::classify(
+            self.files.get(&key).map(|entry| {
+                extent(
+                    entry.size_bytes,
+                    entry.modified_unix_seconds,
+                    entry.modified_unix_nanos,
+                )
+            }),
+            extent(
+                candidate.size_bytes,
+                candidate.modified_unix_seconds,
+                Some(candidate.modified_unix_nanos),
+            ),
+            self.effective_upload_body_witness_revision_requires_adoption(&key),
+            self.claude_history_cutoff_unix_seconds,
+            birth_unix_seconds,
+        );
+        claude_history_upgrade::decide(
+            kind,
+            &claude_history_upgrade::PolicyInputs {
+                exclusions: &self.claude_reemission_exclusions,
+                listed: self.claude_reemission_excluded(candidate),
+                birth_unix_seconds,
+                latched: claude_reemission_stop_latched(),
+                active_revision: self.active_effective_upload_body_witness_revision,
+            },
+            page,
+            &key,
+            candidate.size_bytes,
+        )
+    }
+
+    /// Record a gated candidate before its parse, with the entry's upload
+    /// tuple as it stands now. `hold: None` marks a permitted upgrade, which
+    /// the emission seam still rechecks against the stop latch.
+    fn gate_claude_history_candidate(
+        &mut self,
+        candidate: &CandidateFile,
+        hold: Option<HistoryHold>,
+    ) {
+        let key = local_index_key(&candidate.path);
+        let previous = self
+            .files
+            .get(&key)
+            .map(|entry| claude_history_upgrade::HeldUploadTuple {
+                last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
+                last_upload_body_witness: entry.last_upload_body_witness.clone(),
+                revision: entry.effective_upload_body_witness_revision,
+                file_snapshot_fingerprints: self.file_snapshot_fingerprints.get(&key).cloned(),
+                confirmed_empty: self.confirmed_empty_files.contains(&key),
+            });
+        let gated = self
+            .claude_history_emission
+            .files
+            .entry(candidate.source_file_fingerprint.clone())
+            .or_insert_with(|| claude_history_upgrade::GatedHistory {
+                index_key: key,
+                held: None,
+                previous,
+                local: BTreeMap::new(),
+            });
+        if gated.held.is_none() {
+            gated.held = hold;
+        }
+    }
+
+    /// The hold on this source file's history this cycle, if any.
+    pub(crate) fn claude_history_emission_held(
+        &self,
+        source_file_fingerprint: &str,
+    ) -> Option<HistoryHold> {
+        self.claude_history_emission.held(source_file_fingerprint)
+    }
+
+    /// The one emission seam (idempotent): remove every body of a held
+    /// history file from `snapshots`, before account binding, cutoff
+    /// corrections, cache-head and proof capture, native corrections and
+    /// finalization, so neither the ordinary nor a correction upload can carry
+    /// it. A latch set by a fold after the candidate loop holds every
+    /// permitted upgrade too. A held new file's local entity identities are
+    /// kept for the index. Returns how many bodies were removed.
+    pub(crate) fn veto_claude_history_emission(
+        &mut self,
+        source: SnapshotSource,
+        snapshots: &mut Vec<SnapshotItem>,
+    ) -> usize {
+        if source != SnapshotSource::ClaudeCode || self.claude_history_emission.files.is_empty() {
+            return 0;
+        }
+        if claude_reemission_stop_latched() {
+            self.claude_history_emission.hold_permitted_for_latch();
+        }
+        let emission = &mut self.claude_history_emission;
+        let before = snapshots.len();
+        snapshots.retain(|snapshot| {
+            let Some(gated) = snapshot
+                .source_file_fingerprint
+                .as_ref()
+                .and_then(|fingerprint| emission.files.get_mut(fingerprint))
+                .filter(|gated| gated.held.is_some())
+            else {
+                return true;
+            };
+            gated.local.insert(
+                snapshot.snapshot_fingerprint.clone(),
+                snapshot_semantic_activity_at(snapshot),
+            );
+            false
+        });
+        before - snapshots.len()
+    }
+
+    /// Hook for resend paths outside the page (StateMissing #706 re-offer
+    /// leases, #692 in-place resends): drop every item of a source file the
+    /// history gate holds this cycle. They must call it on what they send.
+    pub(crate) fn retain_claude_history_emission_permitted(&self, items: &mut Vec<SnapshotItem>) {
+        items.retain(|item| {
+            item.source_file_fingerprint
+                .as_deref()
+                .map_or(true, |fingerprint| {
+                    self.claude_history_emission_held(fingerprint).is_none()
+                })
+        });
+    }
+
+    /// Finalize a held history file without its new bodies: an existing entry
+    /// keeps its upload tuple (revision, semantic group, body witness,
+    /// membership); a new one keeps its local entity identities with no body
+    /// witness and revision 0, so it stays owed and is not re-read. Its new
+    /// source identity, size and mtime stay recorded. Returns false when the
+    /// gate does not hold this file.
+    fn finalize_claude_held_history(
+        &mut self,
+        index_key: &str,
+        source_file_fingerprint: &str,
+    ) -> bool {
+        let Some(gated) = self
+            .claude_history_emission
+            .files
+            .get(source_file_fingerprint)
+            .filter(|gated| gated.held.is_some() && gated.index_key == index_key)
+            .cloned()
+        else {
+            return false;
+        };
+        let key = index_key.to_owned();
+        let (last_snapshot_fingerprint, last_upload_body_witness, revision, members, empty) =
+            match gated.previous {
+                Some(previous) => (
+                    previous.last_snapshot_fingerprint,
+                    previous.last_upload_body_witness,
+                    previous.revision,
+                    previous.file_snapshot_fingerprints,
+                    previous.confirmed_empty,
+                ),
+                None => {
+                    for (fingerprint, activity_at) in &gated.local {
+                        self.snapshot_activity_at
+                            .insert(fingerprint.clone(), activity_at.clone());
+                    }
+                    let members = gated.local.keys().cloned().collect::<BTreeSet<_>>();
+                    let group = (!members.is_empty()).then(|| {
+                        let mut digest = Sha256::new();
+                        update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
+                        for fingerprint in &members {
+                            update_length_prefixed(&mut digest, fingerprint.as_bytes());
+                        }
+                        format!("{:x}", digest.finalize())
+                    });
+                    let empty = members.is_empty();
+                    (group, None, 0, (!empty).then_some(members), empty)
+                }
+            };
+        if let Some(entry) = self.files.get_mut(&key) {
+            entry.last_snapshot_fingerprint = last_snapshot_fingerprint;
+            entry.last_upload_body_witness = last_upload_body_witness;
+            entry.effective_upload_body_witness_revision = revision;
+        }
+        match members {
+            Some(members) => {
+                self.file_snapshot_fingerprints.insert(key.clone(), members);
+            }
+            None => {
+                self.file_snapshot_fingerprints.remove(&key);
+            }
+        }
+        if empty {
+            self.confirmed_empty_files.insert(key);
+        } else {
+            self.confirmed_empty_files.remove(&key);
+        }
+        true
+    }
+
+    /// The one writer of a settled file's `effective_upload_body_witness_revision`.
+    /// Claude never downgrades (`max(stored, allowed_active)`); Codex and Pi
+    /// keep the exact stamp. Refuses a zero revision, a file excluded for a
+    /// local hold, and a file the history gate holds: a protected root never
+    /// stamps to a new revision. MONEY (#699) routes its covering-ACK,
+    /// below-floor and confirmed-empty settlements here.
+    pub(crate) fn stamp_effective_upload_body_witness_revision(
+        &mut self,
+        index_key: &str,
+        source_file_fingerprint: &str,
+        allowed_active: u64,
+    ) -> bool {
+        if allowed_active == 0
+            || self
+                .effective_upload_body_witness_revision_excluded_source_files
+                .contains(source_file_fingerprint)
+            || self
+                .claude_history_emission_held(source_file_fingerprint)
+                .is_some()
+        {
+            return false;
+        }
+        let monotone = self.active_effective_upload_body_witness_revision_monotone;
+        let Some(entry) = self.files.get_mut(index_key) else {
+            return false;
+        };
+        entry.effective_upload_body_witness_revision = if monotone {
+            entry
+                .effective_upload_body_witness_revision
+                .max(allowed_active)
+        } else {
+            allowed_active
+        };
+        true
     }
 
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
@@ -37197,6 +37483,10 @@ impl ScanIndex {
                 .clone(),
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
+            claude_history_cutoff_unix_seconds: self
+                .claude_history_cutoff_unix_seconds
+                .or(previous.claude_history_cutoff_unix_seconds),
+            claude_history_emission: self.claude_history_emission.clone(),
         };
         for key in &safe_keys {
             match self.terminal_jsonl_dispositions.get(key) {
@@ -61651,7 +61941,7 @@ mod tests {
     fn claude_context_backfill_caps_adoption_only_bytes_per_page() {
         assert_eq!(
             BODY_WITNESS_ADOPTION_ONLY_BYTES_PER_PAGE,
-            4 * 1024 * 1024 * 1024
+            1024 * 1024 * 1024
         );
         let pages = |byte_budget: u64, name: &str| {
             let (home, root, mut index) = claude_context_backfill_fixture(name, 3);
@@ -61678,24 +61968,28 @@ mod tests {
                     }
                 }
             });
-            assert!(index
+            let revisions = index
                 .files
                 .values()
-                .all(|entry| entry.effective_upload_body_witness_revision == 2));
+                .map(|entry| entry.effective_upload_body_witness_revision)
+                .collect::<BTreeSet<_>>();
             let _ = fs::remove_dir_all(home);
-            (sizes, parsed_per_page)
+            (sizes, parsed_per_page, revisions)
         };
-        // Every file is larger than the byte budget: each page still admits
-        // exactly one, so the re-read always progresses.
-        let (_, oversized) = pages(1, "claude-context-backfill-bytes-oversized");
-        assert_eq!(oversized, vec![1, 1, 1, 1, 1, 1, 0]);
+        // Every file is larger than the byte budget: there is no first-file
+        // exception, so no history is re-read and every file stays owed.
+        let (_, oversized, revisions) = pages(1, "claude-context-backfill-bytes-oversized");
+        assert_eq!(oversized, vec![0]);
+        assert_eq!(revisions, BTreeSet::from([1]));
         // A budget that holds any two files but no three spreads six files
         // over three pages, under a file budget that would admit all six.
-        let (sizes, _) = pages(u64::MAX, "claude-context-backfill-bytes-sizes");
+        let (sizes, _, revisions) = pages(u64::MAX, "claude-context-backfill-bytes-sizes");
+        assert_eq!(revisions, BTreeSet::from([2]));
         let two = sizes[4] + sizes[5];
         assert!(sizes[0] + sizes[1] + sizes[2] > two, "{sizes:?}");
-        let (_, paired) = pages(two, "claude-context-backfill-bytes-paired");
+        let (_, paired, revisions) = pages(two, "claude-context-backfill-bytes-paired");
         assert_eq!(paired, vec![2, 2, 2, 0]);
+        assert_eq!(revisions, BTreeSet::from([2]));
     }
 
     #[test]
@@ -75997,12 +76291,12 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, body_witness_adoption_only_parses, body_witness_adoption_only_bytes, body_witness_adoption_deferred, body_witness_adoption_excluded, body_witness_adoption_held_no_list, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, reason_reoffer_retries);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_emission, reason_reoffer_retries);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
