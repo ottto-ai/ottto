@@ -5750,7 +5750,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T07:21:38+00:00",
+  "generated_at": "2026-10-23T07:22:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 822,
   "public_roots": [
@@ -5789,5 +5789,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "f78fc7a55aced6e218e23df87ba6c9fd4c7ef934"
+  "source_commit": "53ac763eedfde018f33466f001a061355ea13bcd"
 }
