@@ -47,6 +47,7 @@ struct MoneyPipelineArm {
     lines: Vec<serde_json::Value>,
     /// Every JSONL row (grain, family and coverage).
     rows: Vec<serde_json::Value>,
+    owed_days: usize,
 }
 
 impl MoneyPipelineArm {
@@ -190,6 +191,7 @@ fn money_pipeline_arm(name: &str, corpus: MoneyCorpus) -> MoneyPipelineArm {
         census: money_census(&fixture, &last.expect("pages")),
         lines: money::take_shadow_lines_for_test(),
         rows: money_jsonl_rows(&fixture.support),
+        owed_days: money_owed_markers(&fixture.support),
     }
 }
 
@@ -756,10 +758,8 @@ fn money_shadow_refusal_logs_and_changes_nothing() {
         .all(|line| line["counts"]["refused_budget"] == 1 && line["counts"]["families"] == 0));
     assert!(on.of("family").is_empty() && on.of("grain").is_empty());
     let coverage = on.of("page");
-    assert!(!coverage.is_empty());
-    assert!(coverage
-        .iter()
-        .all(|row| row["coverage_complete"] == false && row["refused"] == true));
+    assert!(coverage.is_empty(), "no unfunded refusal allocation");
+    assert!(on.owed_days > 0, "the writer persists a false-row debt even with the whole ceiling occupied");
 }
 
 /// One armed scan of a fresh fixture, for direct `shadow_page_at` calls.
@@ -782,7 +782,8 @@ fn money_armed_scan(name: &str) -> (PipelineFixture, ScanIndex, crate::snapshots
 
 /// Immature units (younger than the maturity window) are neither counted nor
 /// removed and their live slices leave the new body as `immature`; at a
-/// later clock the same corpus counts them all and equals the live body.
+/// later clock the interim holder seam holds them: maturity cannot establish
+/// an unobserved holder's absence before the strong view exists.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_holds_immature_units_until_they_mature() {
@@ -818,10 +819,11 @@ fn money_shadow_holds_immature_units_until_they_mature() {
         response + 3600,
     );
     assert_eq!(mature.units_immature, 0, "{mature:?}");
-    assert_eq!(mature.units_counted, units, "{mature:?}");
-    assert_eq!(mature.units_undecided, 0, "{mature:?}");
-    assert_eq!(mature.tokens_new, mature.tokens_old, "{mature:?}");
-    assert_eq!(mature.families_equal, mature.families, "{mature:?}");
+    assert_eq!(mature.units_counted, 0, "{mature:?}");
+    assert_eq!(mature.units_undecided, units, "{mature:?}");
+    assert_eq!(mature.undecided_holder_view, units, "{mature:?}");
+    assert_eq!(mature.tokens_held, mature.tokens_old, "{mature:?}");
+    assert_eq!(mature.tokens_new, 0, "{mature:?}");
     money::store::flush();
     assert_eq!(money::reserved_for_test(), 0);
 }
@@ -1047,7 +1049,8 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
     // latched in memory (no file I/O on the page's thread), and written by
     // the writer's next batch.
     money::owe_coverage_for_test(&fixture.support, response + 3602, false);
-    assert_eq!(money_owed_markers(&fixture.support), 0);
+    money::store::flush();
+    assert_eq!(money_owed_markers(&fixture.support), 1, "idle writer persists dropped-page debt");
     page(response + 3603);
     let rows = money_jsonl_rows(&fixture.support);
     let owed = rows
