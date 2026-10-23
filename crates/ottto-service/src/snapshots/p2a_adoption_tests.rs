@@ -221,6 +221,19 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
         &support, &mut index, &literal
     ));
     let before = serde_json::to_value(&index).unwrap()["claude_money_files"].clone();
+    // Unrelated publication progress must preserve exact-body ACK idempotence.
+    // Keep the following positive ownership-change control unchanged.
+    money::store::with_ledger_for_test(&support, |ledger| {
+        ledger.insert("sweep:diagnostic".into(),
+            claude_request_census::ClaudeRequestCensusRecord::sweep_record([8; 32], 10,
+                claude_request_census::ClaudeLedgerSweep { complete_through: 0, debt: 1 }));
+        ledger.insert("fam:diagnostic".into(),
+            claude_request_census::ClaudeRequestCensusRecord::money_debt([7; 32], 10));
+    }).unwrap();
+    assert!(money::stage_selection_fingerprints(&support, &mut index, &literal));
+    assert_eq!(before, serde_json::to_value(&index).unwrap()["claude_money_files"]);
+    assert!(index.claude_money_selection_changed.is_empty());
+    assert_eq!(wire, serde_json::to_vec(&literal).unwrap());
     // Equal-count ownership evidence, deliberately absent from every wire field.
     money::store::with_ledger_for_test(&support, |ledger| {
         ledger.insert(

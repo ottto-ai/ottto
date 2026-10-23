@@ -140,6 +140,12 @@ pub(crate) fn stage_selection_fingerprints(
             || key.starts_with("due:")
             || key.starts_with("dirty:")
             || key.starts_with("unbuilt:")
+            // Sweep cursors and shadow-family memos are publication progress,
+            // not ownership evidence. Actual census/telemetry/watch evidence
+            // stays conservative across families: request conflicts can cross
+            // roots even when the resulting wire body happens to be equal.
+            || key.starts_with("sweep:")
+            || key.starts_with("fam:")
         {
             continue;
         }
