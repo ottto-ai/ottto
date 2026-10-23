@@ -1,14 +1,16 @@
-// Record-local load containment (follow-up to #694). A record that fails a
-// per-record `ScanIndex::load` check is dropped or normalized alone; the
-// index, its generation and every other record stay. Nothing is re-armed:
-// the existing candidate gate re-reads a file whose activity clock is missing
-// or whose RetryPending refusal is due, and finalize keeps a due refusal out
-// of semantic no-op suppression, so no retry obligation or disclosure is lost
-// and no accepted body is re-sent. Save applies the same checks, as #694 does
-// for authority records, so save and load cannot disagree. Whole-index
-// quarantine is kept for structural damage: a JSON decode error and the Codex
-// canonical-key collision. An accepted-ledger version above the supported one
-// is future state and is refused like a schema mismatch.
+// Record-local load containment (follow-up to #694). For the converted
+// semantic checks, dropping or normalizing one record preserves unrelated
+// checkpoints and avoids whole-index replay. The candidate gate re-reads a
+// file whose activity clock is missing or whose RetryPending refusal is due;
+// finalize preserves that retry obligation. In a file with a repaired,
+// now-due RetryPending sibling, existing due-retry machinery can re-offer
+// accepted siblings of THAT file. That behavior exists on main and is made
+// local here; this change does not fix it or add semantic-fingerprint
+// suppression. Save normalizes the working index before its CAS re-read.
+// Whole-index quarantine remains for non-I/O decode errors, including serde
+// type errors in a single field/record, and the Codex canonical-key collision.
+// Per-record lenient decoding is a separate follow-up. A decodable accepted-
+// ledger version above the supported one is refused like a schema mismatch.
 
 /// Content-free counts of the records one load or save dropped or normalized.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -120,7 +122,7 @@ impl ScanIndex {
     /// activity clock (the gate re-reads the file to re-derive it) and a
     /// malformed accepted identity (it can never equal a real body
     /// fingerprint, so it vouched for nothing; the ledger version is kept so
-    /// valid acceptances are not re-offered), and normalize a malformed sweep
+    /// valid acceptance evidence is retained), and normalize a malformed sweep
     /// cursor and every out-of-shape refusal record in place.
     fn drop_invalid_index_records(&mut self) -> ScanIndexLoadDrops {
         let mut drops = ScanIndexLoadDrops::NONE;

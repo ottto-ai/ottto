@@ -1,13 +1,7 @@
-// Record-local load containment (follow-up to #694). A record that fails a
-// per-record `ScanIndex::load` check is dropped or normalized alone: the file
-// stays at its path, no `.corrupt.*` sibling appears, the generation is the
-// one on disk and every other record survives. Nothing is re-armed: the
-// existing candidate gate re-reads a file whose activity clock is missing or
-// whose RetryPending refusal is due, and finalize keeps a due refusal out of
-// semantic no-op suppression, so no retry obligation or disclosure is lost
-// and no accepted body is re-sent. A ledger version from a newer build is
-// future state: load refuses it and leaves the file in place. All fixtures
-// are synthetic and content-free.
+// For the converted semantic checks, load preserves unrelated checkpoints
+// and avoids whole-index replay. Fixtures are synthetic and content-free.
+// Finalize/upload coverage also asserts existing due-retry behavior: accepted
+// siblings of a repaired retry in the same file can be re-offered.
 use super::*;
 
 const LC_WINDOW: &str = "2026-10-22T23:00:00Z";
@@ -185,7 +179,8 @@ fn load_keeps_index_with_one_bad_activity_timestamp() {
             ..ScanIndexLoadDrops::default()
         }
     );
-    // Re-read to re-derive the clock; the accepted body is a semantic no-op.
+    // Re-read to re-derive the clock; accepted-only finalization is covered
+    // through upload selection in snapshot_sync/load_containment_tests.rs.
     assert_eq!(
         lc_reread(&mut index),
         BTreeMap::from([(
@@ -197,7 +192,7 @@ fn load_keeps_index_with_one_bad_activity_timestamp() {
 
 /// A malformed accepted identity can never equal a real body fingerprint,
 /// so dropping it alone loses no acceptance; the ledger version is kept so
-/// the valid acceptances are not re-offered.
+/// valid acceptance evidence is retained.
 #[test]
 fn load_keeps_index_with_one_malformed_accepted_fingerprint() {
     let scratch = crate::test_scratch::ScratchDir::new("load-containment-accepted");
@@ -439,4 +434,86 @@ fn load_still_quarantines_undecodable_index_and_drops_nothing_from_valid_one() {
     assert_eq!(lc_corrupt_siblings(&scratch), 1);
     assert_eq!(rebuilt.generation, 0);
     assert!(rebuilt.files.is_empty());
+}
+
+#[test]
+fn load_repairs_superseded_terminal_without_changing_witness_body_or_disposition() {
+    let scratch = crate::test_scratch::ScratchDir::new("load-containment-superseded");
+    let mut expected = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+    expected.upload_body_witness = Some(lc_hex('a'));
+    expected.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+    expected.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+    expected.retry_after_unix_seconds = 0;
+    let load = lc_load(&scratch, "superseded", |value| {
+        let mut corrupt = expected.clone();
+        corrupt.failed_reconstruction_count = u8::MAX;
+        corrupt.retry_after_unix_seconds = 1;
+        value["quarantined_snapshot_fingerprints"][lc_hex('f')] = json!(corrupt);
+    });
+    let (mut index, drops) = lc_assert_kept(&scratch, load);
+    assert_eq!(
+        index.quarantined_snapshot_fingerprints[&lc_hex('f')],
+        expected
+    );
+    assert!(snapshot_quarantine_deadline_is_bounded(&expected));
+    assert_eq!(index.snapshot_unproven_terminal_count(), 0);
+    assert_eq!(
+        drops,
+        ScanIndexLoadDrops {
+            quarantine: 1,
+            ..ScanIndexLoadDrops::default()
+        }
+    );
+    assert!(lc_reread(&mut index).is_empty());
+}
+
+#[test]
+fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_self() {
+    let scratch = crate::test_scratch::ScratchDir::new("load-containment-save-cas");
+    let load = lc_load(&scratch, "save-cas", |value| {
+        value["snapshot_activity_at"][lc_hex('c')] = json!("not-rfc3339");
+        value["accepted_snapshot_fingerprints"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!("bad-identity"));
+        value["legacy_settlement_reconcile_after_fingerprint"] = json!("bad-cursor");
+        value["quarantined_snapshot_fingerprints"][lc_hex('e')]["retry_after_unix_seconds"] =
+            json!(u64::MAX);
+        value["quarantined_snapshot_fingerprints"][lc_hex('f')]["failed_reconstruction_count"] =
+            json!(0);
+    });
+    let path = load.path.clone();
+    let raw = load.written.clone();
+    let (mut repaired, drops) = lc_assert_kept(&scratch, load);
+    assert_eq!(
+        drops,
+        ScanIndexLoadDrops {
+            activity: 1,
+            accepted: 1,
+            cursor: 1,
+            quarantine: 2,
+        }
+    );
+    let generation = repaired.generation;
+    let mut expected = serde_json::to_value(&repaired).unwrap();
+    expected["generation"] = json!(generation + 1);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        raw,
+        "CAS will read the bad records"
+    );
+    repaired
+        .save(&path)
+        .expect("raw semantic damage does not reject CAS");
+    assert_eq!(repaired.generation, generation + 1);
+    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(
+        saved, expected,
+        "save replaces raw damage with repaired self"
+    );
+    assert_eq!(lc_corrupt_siblings(&scratch), 0);
+    let before_reload = scan_index_load_drops_for_test();
+    let reloaded = ScanIndex::load(&path).expect("reload repaired checkpoint");
+    assert_eq!(scan_index_load_drops_for_test(), before_reload);
+    assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);
 }

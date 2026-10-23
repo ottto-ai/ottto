@@ -19412,6 +19412,9 @@ mod tests {
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
     }
+    mod load_containment_tests {
+        include!("snapshot_sync/load_containment_tests.rs");
+    }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
         codex_union_native_transport_restart(false, false);

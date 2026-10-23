@@ -40391,7 +40391,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_index_drops_only_a_syntactically_valid_corrupt_activity_witness() {
+    fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         let root = temp_dir("scan-index-corrupt-activity");
         let path = root.join("codex-scan-index-v2.json");
         let fingerprint = "a".repeat(64);
