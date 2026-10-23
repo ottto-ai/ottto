@@ -7,8 +7,10 @@ use super::body::{ClaudeEntityBody, ClaudeRequestUsageOrigin};
 use super::{ClaudeMoneyTokens, REQUEST_OWNED_CONTRACT};
 use std::collections::BTreeMap;
 
+// Contract-5 reproduction compares the literal row against the canonical
+// trimmed spelling; published shadow facts keep their own fixed format.
 fn dollars(micros: u64) -> String {
-    super::usd_string(micros)
+    super::super::usd_picos_string(u128::from(micros) * 1_000_000)
 }
 fn removed(tokens: ClaudeMoneyTokens) -> ClaudeRemovedUsage {
     ClaudeRemovedUsage {

@@ -6866,171 +6866,211 @@ async fn finish_sync_source_resume(
         && !upload_result.as_ref().err().is_some_and(|error| {
             snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
         }) {
-        crate::snapshots::claude_request_money::pace_money_debt(
-            support_dir,
-            &index,
-            &scan_result.snapshots,
-            |item| {
-                upload_progress
-                    .quarantined_fingerprints
-                    .get(&item.snapshot_fingerprint)
-                    .filter(|record| {
-                        (record.hold.is_some() || record.version_skew_attempts > 0)
-                            && record.upload_body_witness.as_deref()
-                                == Some(snapshot_upload_body_witness(item).as_str())
-                    })
-                    .map(|record| record.retry_after_unix_seconds)
-            },
-        );
-        if let Some(memory) = money_memory {
-            memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
-        }
-        money_resume::until(|| {
-            crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
+        // Everything below runs after the POST. A refusal must not drop the
+        // exact server outcomes upload progress already holds: commit the
+        // same partial subset an upload error would, without settling money.
+        let settlement = async {
+            crate::snapshots::claude_request_money::pace_money_debt(
                 support_dir,
                 &index,
                 &scan_result.snapshots,
                 |item| {
-                    let fp = &item.snapshot_fingerprint;
-                    if upload_progress.accepted_fingerprints.contains(fp) {
-                        4
-                    } else if let Some(rejection) = upload_progress.permanent_rejections.get(fp) {
-                        if rejection.reason.is_dominated() {
-                            6
-                        } else {
-                            3
-                        }
-                    } else if upload_progress
+                    upload_progress
                         .quarantined_fingerprints
-                        .get(fp)
-                        .is_some_and(|record| record.hold.is_some())
-                    {
-                        2
-                    } else {
-                        0
-                    }
+                        .get(&item.snapshot_fingerprint)
+                        .filter(|record| {
+                            (record.hold.is_some() || record.version_skew_attempts > 0)
+                                && record.upload_body_witness.as_deref()
+                                    == Some(snapshot_upload_body_witness(item).as_str())
+                        })
+                        .map(|record| record.retry_after_unix_seconds)
                 },
-            )
-        })
-        .await?;
+            );
+            if let Some(memory) = money_memory {
+                memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
+            }
+            money_resume::until(|| {
+                crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
+                    support_dir,
+                    &index,
+                    &scan_result.snapshots,
+                    |item| {
+                        let fp = &item.snapshot_fingerprint;
+                        if upload_progress.accepted_fingerprints.contains(fp) {
+                            4
+                        } else if let Some(rejection) = upload_progress.permanent_rejections.get(fp)
+                        {
+                            if rejection.reason.is_dominated() {
+                                6
+                            } else {
+                                3
+                            }
+                        } else if upload_progress
+                            .quarantined_fingerprints
+                            .get(fp)
+                            .is_some_and(|record| record.hold.is_some())
+                        {
+                            2
+                        } else {
+                            0
+                        }
+                    },
+                )
+            })
+            .await?;
 
-        let offered = scan_result.snapshots.iter().filter(|item| {
-            item.usage_accounting_contract.as_deref()
-                == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-        });
-        let required = (|| -> Option<usize> {
-            let mut maps = 0_usize;
-            let mut witness = 0_usize;
-            let node = crate::heap_layout_bound::tree_node_bytes::<String, ()>()?
-                .checked_add(crate::heap_layout_bound::tree_node_bytes::<String, String>()?)?;
-            // One full node per entry plus a root overcounts the supported
-            // B-tree layout and covers the first small page's root nodes.
-            for item in offered.clone() {
-                maps = maps
-                    .checked_add(node)?
-                    .checked_add(item.snapshot_fingerprint.len().checked_mul(2)?)?
-                    .checked_add(64)?;
-                witness = witness
-                    .max(crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)?);
-            }
-            let mut sources = 0_usize;
-            let mut source_bytes = 0_usize;
-            for item in &scan_result.snapshots {
-                if let Some(source) = &item.source_file_fingerprint {
-                    sources = sources.checked_add(1)?;
-                    source_bytes = source_bytes.checked_add(source.len())?;
-                }
-            }
-            for state in index.current_claude_money_files() {
-                if scan_result.snapshots.iter().any(|item| {
-                    crate::snapshots::claude_request_money::family_root(item) == state.root
-                        && item.source_session_id == state.member
-                }) {
-                    sources = sources.checked_add(1)?;
-                    source_bytes = source_bytes.checked_add(state.revision.len())?;
-                }
-            }
-            let stamp_nodes = scan_result
-                .snapshots
-                .len()
-                .checked_add(sources.checked_mul(2)?)?
-                .checked_add(3)?;
-            let stamp = crate::heap_layout_bound::tree_node_bytes::<String, String>()?
-                .checked_mul(stamp_nodes)?
-                .checked_add(source_bytes)?;
-            maps.checked_add(node)?
-                .checked_add(stamp)?
-                .checked_add(witness)
-        })()
-        .ok_or_else(money_resume::admission_refused)?;
-        #[cfg(test)]
-        let offered_count = offered.count();
-        let build_settlement = || {
-            #[cfg(test)]
-            if crate::retry_allocation_probe::money_settlement_refused_for_test() {
-                return Err(money_resume::admission_refused());
-            }
-            let Some(settlement_funds) =
-                crate::snapshots::claude_request_money::ShadowReservation::admit(required)
-            else {
-                return Err(money_resume::admission_refused());
-            };
-            #[cfg(test)]
-            crate::retry_allocation_probe::money_settlement_admitted(settlement_funds.bytes());
-            // A dominated/stale exact literal is settled-refused, never accepted.
-            // Use the same covering body check for adoption and debt retirement.
-            let mut settled = BTreeSet::new();
-            let mut settled_bodies = BTreeMap::new();
-            for item in &scan_result.snapshots {
-                if item.usage_accounting_contract.as_deref()
+            let offered = scan_result.snapshots.iter().filter(|item| {
+                item.usage_accounting_contract.as_deref()
                     == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-                {
-                    if upload_progress
-                        .accepted_fingerprints
-                        .contains(&item.snapshot_fingerprint)
+            });
+            let required = (|| -> Option<usize> {
+                let mut maps = 0_usize;
+                let mut witness = 0_usize;
+                let node = crate::heap_layout_bound::tree_node_bytes::<String, ()>()?
+                    .checked_add(crate::heap_layout_bound::tree_node_bytes::<String, String>()?)?;
+                // One full node per entry plus a root overcounts the supported
+                // B-tree layout and covers the first small page's root nodes.
+                for item in offered.clone() {
+                    maps = maps
+                        .checked_add(node)?
+                        .checked_add(item.snapshot_fingerprint.len().checked_mul(2)?)?
+                        .checked_add(64)?;
+                    witness = witness
+                        .max(crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)?);
+                }
+                let mut sources = 0_usize;
+                let mut source_bytes = 0_usize;
+                for item in &scan_result.snapshots {
+                    if let Some(source) = &item.source_file_fingerprint {
+                        sources = sources.checked_add(1)?;
+                        source_bytes = source_bytes.checked_add(source.len())?;
+                    }
+                }
+                for state in index.current_claude_money_files() {
+                    if scan_result.snapshots.iter().any(|item| {
+                        crate::snapshots::claude_request_money::family_root(item) == state.root
+                            && item.source_session_id == state.member
+                    }) {
+                        sources = sources.checked_add(1)?;
+                        source_bytes = source_bytes.checked_add(state.revision.len())?;
+                    }
+                }
+                let stamp_nodes = scan_result
+                    .snapshots
+                    .len()
+                    .checked_add(sources.checked_mul(2)?)?
+                    .checked_add(3)?;
+                let stamp = crate::heap_layout_bound::tree_node_bytes::<String, String>()?
+                    .checked_mul(stamp_nodes)?
+                    .checked_add(source_bytes)?;
+                maps.checked_add(node)?
+                    .checked_add(stamp)?
+                    .checked_add(witness)
+            })()
+            .ok_or_else(money_resume::admission_refused)?;
+            #[cfg(test)]
+            let offered_count = offered.count();
+            let build_settlement = || {
+                #[cfg(test)]
+                if crate::retry_allocation_probe::money_settlement_refused_for_test() {
+                    return Err(money_resume::admission_refused());
+                }
+                let Some(settlement_funds) =
+                    crate::snapshots::claude_request_money::ShadowReservation::admit(required)
+                else {
+                    return Err(money_resume::admission_refused());
+                };
+                #[cfg(test)]
+                crate::retry_allocation_probe::money_settlement_admitted(settlement_funds.bytes());
+                // A dominated/stale exact literal is settled-refused, never accepted.
+                // Use the same covering body check for adoption and debt retirement.
+                let mut settled = BTreeSet::new();
+                let mut settled_bodies = BTreeMap::new();
+                for item in &scan_result.snapshots {
+                    if item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
                     {
-                        if let Some(body) = upload_progress
-                            .accepted_body_witnesses
+                        if upload_progress
+                            .accepted_fingerprints
+                            .contains(&item.snapshot_fingerprint)
+                        {
+                            if let Some(body) = upload_progress
+                                .accepted_body_witnesses
+                                .get(&item.snapshot_fingerprint)
+                                .filter(|body| **body == snapshot_upload_body_witness(item))
+                            {
+                                settled.insert(item.snapshot_fingerprint.clone());
+                                settled_bodies
+                                    .insert(item.snapshot_fingerprint.clone(), body.clone());
+                            }
+                        }
+                        if let Some(refusal) = upload_progress
+                            .permanent_rejections
                             .get(&item.snapshot_fingerprint)
-                            .filter(|body| **body == snapshot_upload_body_witness(item))
+                            .filter(|refusal| {
+                                refusal.reason.is_dominated()
+                                    && refusal.body_witness == snapshot_upload_body_witness(item)
+                            })
                         {
                             settled.insert(item.snapshot_fingerprint.clone());
-                            settled_bodies.insert(item.snapshot_fingerprint.clone(), body.clone());
+                            settled_bodies.insert(
+                                item.snapshot_fingerprint.clone(),
+                                refusal.body_witness.clone(),
+                            );
                         }
                     }
-                    if let Some(refusal) = upload_progress
-                        .permanent_rejections
-                        .get(&item.snapshot_fingerprint)
-                        .filter(|refusal| {
-                            refusal.reason.is_dominated()
-                                && refusal.body_witness == snapshot_upload_body_witness(item)
-                        })
-                    {
-                        settled.insert(item.snapshot_fingerprint.clone());
-                        settled_bodies.insert(
-                            item.snapshot_fingerprint.clone(),
-                            refusal.body_witness.clone(),
+                }
+                index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
+                #[cfg(test)]
+                crate::retry_allocation_probe::money_settlement_pairs(settled.len());
+                Ok(Some((settled, settled_bodies, settlement_funds)))
+            };
+            #[cfg(test)]
+            let result = crate::retry_allocation_probe::observe_money_settlement(
+                required,
+                offered_count,
+                build_settlement,
+            );
+            #[cfg(not(test))]
+            let result = {
+                let mut build_settlement = build_settlement;
+                build_settlement()
+            };
+            result
+        }
+        .await;
+        match settlement {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                if !matches!(upload_result, Ok(ResumableUploadResult::Disabled(_))) {
+                    if let Err(checkpoint_error) = checkpoint_partial_snapshot_index_with_comparison(
+                        &index,
+                        &committed_index,
+                        &upload_progress,
+                        &scan_result.snapshots,
+                        Some(&scan_result),
+                        locally_held_fingerprints,
+                        &index_path,
+                        &upload_progress_path,
+                        || {
+                            ensure_authority()?;
+                            scan_result.validate_codex_checkpoint()
+                        },
+                        None,
+                        comparison_completion
+                            .as_mut()
+                            .map(NativeSelectedRestore::Paid),
+                    ) {
+                        eprintln!(
+                            "local snapshot partial scan checkpoint failed for {}: {}",
+                            source.api_slug(),
+                            safe_error(&checkpoint_error)
                         );
                     }
                 }
+                return Err(error);
             }
-            index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
-            #[cfg(test)]
-            crate::retry_allocation_probe::money_settlement_pairs(settled.len());
-            Ok(Some((settled, settled_bodies, settlement_funds)))
-        };
-        #[cfg(test)]
-        let result = crate::retry_allocation_probe::observe_money_settlement(
-            required,
-            offered_count,
-            build_settlement,
-        );
-        #[cfg(not(test))]
-        let result = {
-            let mut build_settlement = build_settlement;
-            build_settlement()
-        };
-        result?
+        }
     } else {
         #[cfg(test)]
         crate::retry_allocation_probe::money_settlement_skipped();
@@ -8579,6 +8619,24 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
+    // A first duplicate-census fence closure re-arms every family file so the
+    // NEXT window re-reads it. This page's completed parses (captures and
+    // census) stay the live money authority for this finish; the re-arm is
+    // restored after the live page so the index saves exactly what it decided.
+    let page_revisions = if request_owned_live {
+        scan_result
+            .completed_parses()
+            .filter(|(key, revision)| {
+                index
+                    .files
+                    .get(*key)
+                    .is_some_and(|entry| entry.source_file_fingerprint == *revision)
+            })
+            .map(|(key, revision)| (key.to_owned(), revision.to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
@@ -8626,6 +8684,16 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             })?;
     }
     if request_owned_live {
+        let rearmed = page_revisions
+            .into_iter()
+            .filter_map(|(key, revision)| {
+                let entry = index.files.get_mut(&key)?;
+                entry.source_file_fingerprint.is_empty().then(|| {
+                    entry.source_file_fingerprint = revision;
+                    key
+                })
+            })
+            .collect::<Vec<_>>();
         let mut groupings = BTreeMap::new();
         let holds = crate::snapshots::claude_request_money::live_page_resume(
             support_dir,
@@ -8652,6 +8720,11 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
                     .iter()
                     .map(|item| item.source_session_id.clone()),
             );
+        }
+        for key in &rearmed {
+            if let Some(entry) = index.files.get_mut(key) {
+                entry.source_file_fingerprint.clear();
+            }
         }
         for item in &scan_result.snapshots {
             if item.usage_accounting_contract.as_deref()

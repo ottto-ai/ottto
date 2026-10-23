@@ -3591,7 +3591,7 @@ pub(crate) fn prepare_money_offers_receipt(
     if ledger.recovering() {
         return MoneyReceipt::Refused;
     }
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     let cutoff = page_now(support_dir).saturating_sub(35 * 86400);
     let stale_count = ledger
         .census()
@@ -3771,7 +3771,7 @@ pub(crate) fn settle_money_acks(
         &mut ledger,
         &mut ClaudeRequestMoneyShadowCounts::default(),
     );
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     let by_source = union_items_by_source(index, snapshots)
         .into_iter()
         .filter(|(_, item)| {
@@ -3958,7 +3958,7 @@ pub(crate) fn reconcile_saved_money_offers(
         saved,
         proposed_index,
         snapshots,
-        Instant::now() + Duration::from_millis(100),
+        Instant::now() + PAGE_MAX_ELAPSED,
     );
     if ledger.epoch() != before {
         let _ = store::checkpoint(support, &mut ledger);
@@ -4171,7 +4171,7 @@ pub(crate) fn note_adoption_outcomes_receipt(
         &mut ClaudeRequestMoneyShadowCounts::default(),
     );
     let prefix = adoption_prefix(index);
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     let mut seen = BTreeSet::new();
     let mut rates = [0_u64; 4];
     for item in snapshots {
@@ -4569,7 +4569,7 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         // preparation. Do not start another slice and starve the real scan.
         return receipt;
     }
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     let Some(_funds) =
         ShadowReservation::admit(ledger.census().primary_projection_bytes(index.files.len()))
     else {
@@ -4695,7 +4695,7 @@ pub(crate) fn pace_money_debt(
         .into_iter()
         .filter_map(|(source, item)| Some((source, retry_after(item)?)))
         .collect::<BTreeMap<_, _>>();
-    let deadline = Instant::now() + Duration::from_millis(100);
+    let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     for (key, entry) in &index.files {
         if Instant::now() >= deadline {
             break;

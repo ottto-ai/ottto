@@ -96,12 +96,14 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             &namespace,
         ));
         ScanIndex::default().save(&index_path).unwrap();
+        // Money keys use the scanner's index key, the discovered path under
+        // the configured root. It is not canonicalized: on macOS $TMPDIR is
+        // /var/... while canonicalize() yields /private/var/...
         let transcript = fixture
             .home
             .join(".claude/projects/-synthetic-repo")
-            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
-            .canonicalize()
-            .unwrap();
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        assert!(transcript.is_file());
         let dirty = format!(
             "dirty:{:x}",
             Sha256::digest(transcript.to_string_lossy().as_bytes())
@@ -286,6 +288,12 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             ) {
                 assert!(result.is_ok(), "{outcome:?}: {result:?}");
                 assert!(!saved.files.is_empty());
+                assert!(
+                    saved
+                        .files
+                        .contains_key(transcript.to_string_lossy().as_ref()),
+                    "debt assertions must address the scanner's actual index key"
+                );
                 assert!(saved
                     .files
                     .values()
@@ -731,7 +739,11 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                 .unwrap();
             }
             "rebuild" => {
-                ScanIndex::default().save(&control.index_path).unwrap();
+                // An empty rebuilt index replaces the saved one through the
+                // same generation compare-and-swap every writer uses.
+                let mut rebuilt = ScanIndex::default();
+                rebuilt.generation = control.saved().generation;
+                rebuilt.save(&control.index_path).unwrap();
             }
             _ => unreachable!(),
         }
@@ -884,7 +896,10 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
                 record.retry_after_unix_seconds = 0;
             }
-            assert!(snapshot_quarantine_deadline_is_bounded(record), "quiet-page fixture must survive production bounded decoding");
+            assert!(
+                snapshot_quarantine_deadline_is_bounded(record),
+                "quiet-page fixture must survive production bounded decoding"
+            );
             assert!(
                 record.hold.is_none(),
                 "this is v1 custody, not a money server hold"
@@ -1137,7 +1152,7 @@ fn p2a_cost_published_jsonl_matches_wire_and_withholds_unpriced_unattributed() {
                 "transcript tokens stay authoritative"
             );
             assert_eq!(item["request_count"], 2);
-            assert_eq!(item["cost"]["total_cost_usd"], "0.000200");
+            assert_eq!(item["cost"]["total_cost_usd"], "0.0002");
             assert_eq!(family["new"]["requests"], item["request_count"]);
             let grains = rows
                 .iter()
@@ -1191,7 +1206,7 @@ fn p2a_priced_side_call_then_zero_token_transcript_retains_accepted_cost_and_hol
     let before = control.offers();
     let accepted = before.last().expect("priced side call must be POSTed");
     assert_eq!(accepted["request_count"], 3);
-    assert_eq!(accepted["cost"]["total_cost_usd"], "0.000300");
+    assert_eq!(accepted["cost"]["total_cost_usd"], "0.0003");
     let mut row: serde_json::Value = serde_json::from_str(
         std::fs::read_to_string(control.transcript())
             .unwrap()
@@ -1223,15 +1238,12 @@ fn p2a_priced_side_call_then_zero_token_transcript_retains_accepted_cost_and_hol
     assert!(control.saved().accepted_snapshot_fingerprint_recorded(
         accepted["snapshot_fingerprint"].as_str().unwrap()
     ));
-    assert!(money::money_due(
-        &control.support,
-        &control
-            .transcript()
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy(),
-        u64::MAX
-    ));
+    let key = control.transcript().to_string_lossy().into_owned();
+    assert!(
+        control.saved().files.contains_key(&key),
+        "debt assertion must address the scanner's actual index key"
+    );
+    assert!(money::money_due(&control.support, &key, u64::MAX));
 }
 
 #[test]
@@ -1287,7 +1299,7 @@ fn p2a_sidecars_only_real_maturity_restart_and_first_transcript_keep_entity() {
         .find(|item| item["request_count"] == 2)
         .expect("mature sidecars-only literal must be uploaded");
     assert_eq!(synthetic["source_session_id"], IDENTITY_PIPELINE_ROOT);
-    assert_eq!(synthetic["cost"]["total_cost_usd"], "0.000200");
+    assert_eq!(synthetic["cost"]["total_cost_usd"], "0.0002");
     assert!(control.saved().files.is_empty());
     std::fs::write(control.transcript(), transcript).unwrap();
     control.restart();
@@ -1420,6 +1432,12 @@ fn p2a_bad_first_adoption_slice_over_good_history_restarts_and_recovers() {
         .files
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 3));
+    // Production reads the pause only after the next preparation's
+    // reclaim_metadata consumes the post-save settle_money_acks receipt.
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+    })
+    .unwrap();
     assert!(!money::adoption_paused(&control.support, &control.saved()));
 }
 
@@ -1628,7 +1646,8 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
         // Model a restored physical file's older retained birth explicitly;
         // ownership, message watches and all reoffers still come from the
         // actual parser/census/finish caller, never from fabricated wire items.
-        let key = path.canonicalize().unwrap().to_string_lossy().into_owned();
+        // The scanner's (non-canonical) index key; see the ACK/CAS control.
+        let key = path.to_string_lossy().into_owned();
         let revision = format!("{:x}", Sha256::digest(text.as_bytes()));
         let mut saved = control.saved();
         saved.claude_request_census_mut_for_test().insert_for_test(
@@ -1948,6 +1967,9 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::Accept);
     control.resource_receipt = true;
+    // Production always runs the shadow, so the pre-live transcript already
+    // owns its carrier; only the new physical file below needs admission.
+    money::enable_shadow_for_test(&control.support);
     control.cycle();
     let _live = money::LiveForTest::new(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
@@ -1975,9 +1997,16 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     // Existing carriers can accept more fields at the record ceiling. Force
     // admission of a new physical carrier to exercise actual aggregate refusal.
     let denied_root = "00000000-1111-4000-8000-000000000001";
-    let denied = std::fs::read_to_string(control.transcript()).unwrap()
+    let denied = std::fs::read_to_string(control.transcript())
+        .unwrap()
         .replace(IDENTITY_PIPELINE_ROOT, denied_root);
-    std::fs::write(control.transcript().with_file_name(format!("{denied_root}.jsonl")), denied).unwrap();
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{denied_root}.jsonl")),
+        denied,
+    )
+    .unwrap();
     let _refused = control.cycle_changing(|attempt| {
         assert!(
             attempt < 12,
@@ -2032,6 +2061,7 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
         );
     })
     .unwrap();
+    money::disable_shadow_for_test(&control.support);
 }
 
 #[test]
@@ -2469,6 +2499,10 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
         assert!(restored.quarantined_fingerprints[fingerprint.as_str()]
             .hold
             .is_none());
-        assert_eq!(restored.quarantined_fingerprints[fingerprint.as_str()].retry_after_unix_seconds, now + 1800, "ordinary quarantine jitter must not delay transient recovery");
+        assert_eq!(
+            restored.quarantined_fingerprints[fingerprint.as_str()].retry_after_unix_seconds,
+            now + 1800,
+            "ordinary quarantine jitter must not delay transient recovery"
+        );
     }
 }

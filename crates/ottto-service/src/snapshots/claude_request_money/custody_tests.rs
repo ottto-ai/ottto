@@ -1011,7 +1011,11 @@ fn recovery_does_not_require_messages_from_protected_or_other_source_files() {
     let support = scratch.join("support");
     let root = "a1111111-1111-4111-8111-111111111111";
     let protected = format!("/custody/projects/-repo/{root}.jsonl");
-    let other = "/custody/codex/session.jsonl";
+    // Scan indexes are per source, so a Codex rollout never enters this one.
+    // The out-of-domain entries a Claude index can hold are non-member files
+    // such as a subagent journal (here under an unprotected root).
+    let other =
+        "/custody/projects/-repo/c1111111-1111-4111-8111-111111111111/subagents/journal.jsonl";
     let mut index = ScanIndex::default();
     for path in [protected.as_str(), other] {
         index.files.insert(
@@ -1027,6 +1031,7 @@ fn recovery_does_not_require_messages_from_protected_or_other_source_files() {
     .unwrap();
     index.load_claude_reemission_exclusions(&support);
     assert!(index.claude_reemission_exclusions.protected_root(root));
+    assert!(logical_family_member(&index, other).is_none());
     let mut custody = custody::Custody::default();
     custody.mark_recovery(false);
     assert!(custody.rebuild_complete(&index));

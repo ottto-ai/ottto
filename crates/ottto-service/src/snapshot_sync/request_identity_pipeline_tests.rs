@@ -1438,6 +1438,39 @@ fn money_fixture_rss_bytes() -> u64 {
         * 1024
 }
 
+// Diagnostic only: live heap versus allocated zones explains an RSS delta
+// (retained free pages are not live custody). Never feeds an assertion.
+#[cfg(target_os = "macos")]
+fn money_fixture_heap() -> (usize, usize) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Statistics {
+        blocks_in_use: u32,
+        size_in_use: usize,
+        max_size_in_use: usize,
+        size_allocated: usize,
+    }
+    extern "C" {
+        fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Statistics);
+    }
+    let mut stats = Statistics::default();
+    // SAFETY: a null zone aggregates every registered zone into `stats`.
+    unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+    (stats.size_in_use, stats.size_allocated)
+}
+#[cfg(not(target_os = "macos"))]
+fn money_fixture_heap() -> (usize, usize) {
+    (0, 0)
+}
+fn money_fixture_phase(phase: &str, phases: &mut Vec<serde_json::Value>) {
+    let rss = money_fixture_rss_bytes();
+    let (in_use, allocated) = money_fixture_heap();
+    eprintln!(
+        "MONEY_RSS_PHASE phase={phase} rss={rss} heap_in_use={in_use} heap_allocated={allocated}"
+    );
+    phases.push(serde_json::json!({"phase": phase, "rss": rss, "heap_in_use": in_use, "heap_allocated": allocated}));
+}
+
 #[test]
 #[serial]
 #[serial(claude_request_money_shadow)]
@@ -1459,6 +1492,8 @@ fn money_gate_off_rss_fixture_receipt() {
     }
     std::fs::create_dir_all(&support).unwrap();
     let index: ScanIndex = serde_json::from_value(money_m4_saved_inputs(&base, &support)).unwrap();
+    let mut phases = Vec::new();
+    money_fixture_phase("inputs", &mut phases);
     use crate::snapshots::claude_request_money as money;
     money::enable_shadow_for_test(&support);
     drop(money::store::acquire(&support));
@@ -1479,6 +1514,7 @@ fn money_gate_off_rss_fixture_receipt() {
         std::thread::sleep(Duration::from_millis(25));
     };
     assert_eq!(hashes, 554_400);
+    money_fixture_phase("ledger_ready", &mut phases);
     money::shadow_page_at(
         &support,
         &[],
@@ -1488,6 +1524,7 @@ fn money_gate_off_rss_fixture_receipt() {
         true,
         1_785_653_000,
     );
+    money_fixture_phase("page", &mut phases);
     money::store::flush();
     let _ = money_fixture_rss_bytes();
     let mut samples = [0_u64; 3];
@@ -1495,6 +1532,17 @@ fn money_gate_off_rss_fixture_receipt() {
         *sample = money_fixture_rss_bytes();
     }
     samples.sort_unstable();
+    money_fixture_phase("flushed", &mut phases);
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone asks every zone to return free pages.
+        let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        eprintln!("MONEY_RSS_PHASE released_free_bytes={released}");
+        money_fixture_phase("after_relief", &mut phases);
+    }
     // Both source builds use the identical saved M4 ledger and audit the
     // real load/save routines, independently of fixture creation and RSS.
     let (mut measured, load_peak) = crate::retry_allocation_probe::measure_caller_thread(|| {
@@ -1513,8 +1561,13 @@ fn money_gate_off_rss_fixture_receipt() {
             key.to_string()
         })
         .collect::<Vec<_>>();
-    let legacy_node_bytes = keys.len() * (std::mem::size_of::<String>()
-        + std::mem::size_of::<crate::snapshots::claude_request_census::ClaudeRequestCensusRecord>()) * 3 / 2;
+    let legacy_node_bytes = keys.len()
+        * (std::mem::size_of::<String>()
+            + std::mem::size_of::<
+                crate::snapshots::claude_request_census::ClaudeRequestCensusRecord,
+            >())
+        * 3
+        / 2;
     let mut legacy_heap_bytes = 0;
     for key in keys {
         let bytes = serde_json::to_vec(&BTreeMap::from([(
@@ -1541,7 +1594,7 @@ fn money_gate_off_rss_fixture_receipt() {
             assert_eq!(unwritten, 0);
         }
     });
-    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "p1_map_node_bytes":legacy_node_bytes, "query_key_capacity":query_key_capacity, "p1_record_heap_bytes":legacy_heap_bytes, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
+    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "p1_map_node_bytes":legacy_node_bytes, "query_key_capacity":query_key_capacity, "p1_record_heap_bytes":legacy_heap_bytes, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "rss_phases": phases, "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
     std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     eprintln!("MONEY_RSS_OFF_FIXTURE median_bytes={} samples={samples:?} p1_shadow_enabled=true live_gate=false hashes={hashes} matched_source_build_fixture=true release_daemon_rss=false", samples[1]);
 }

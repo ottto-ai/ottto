@@ -26321,6 +26321,11 @@ impl OwnedSourceScan {
                         && !forced_family
                         && !comparison_target
                         && !parent_proof_required
+                        // Live request-owned money accepts only source-verified
+                        // census; a sampled tail owes an audit and would hold the
+                        // family until the audit interval.
+                        && !(source == SnapshotSource::ClaudeCode
+                            && index.request_money_live_revision())
                         && (debt.is_some() || context.audit_slots > 0);
                         context
                             .admission

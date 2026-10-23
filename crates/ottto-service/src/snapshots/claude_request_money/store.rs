@@ -1463,11 +1463,14 @@ pub(crate) fn refuse_live(support: &Path) {
 /// Diagnostic memos may keep changing while a receipt is in flight; they do
 /// not invalidate durable due/dirty/offer/watch authority. A partial save or
 /// failed shard never acknowledges the epoch. No caller-side disk wait.
+///
+/// The serialization walk covers every carrier of a ledger that may sit at
+/// its record cap, so it gets the page budget the shadow uses for that walk.
 pub(super) fn checkpoint(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
     checkpoint_until(
         support_dir,
         ledger,
-        Instant::now() + Duration::from_millis(100),
+        Instant::now() + super::PAGE_MAX_ELAPSED,
     )
 }
 
@@ -1483,7 +1486,7 @@ pub(super) fn checkpoint_receipt(support_dir: &Path, ledger: &mut ClaudeLedger) 
     checkpoint_receipt_until(
         support_dir,
         ledger,
-        Instant::now() + Duration::from_millis(100),
+        Instant::now() + super::PAGE_MAX_ELAPSED,
     )
 }
 
