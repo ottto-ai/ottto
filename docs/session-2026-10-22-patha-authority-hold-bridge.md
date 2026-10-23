@@ -72,9 +72,11 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   witness, re-read only when its revision changes or its retry is due, and
   going terminal (disclosed) at the existing failure cap. While tombstoned,
   the whole-family disappearance rule does not resolve that record, because a
-  held returning member is unindexed. The tombstone clears once a member is
-  indexed again with no authority record left. A lost or malformed tombstone
-  falls back to a fresh read of that root.
+  held returning member is unindexed. The tombstone clears in the fold of
+  the page that settles the proof: every member it read carries the
+  reported-usage contract and no authority record is left. Never earlier,
+  because the scan indexes a returning member before the fold demotes it. A
+  lost or malformed tombstone falls back to a fresh read of that root.
 - Local content-free process counters appear on each Claude traversal's
   `retiring` transition row: `absent_retry_pending_retired`,
   `absent_family_tombstone_hits`, `retirements_refused` and

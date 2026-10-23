@@ -1660,6 +1660,14 @@ fn absence_retirement_names_the_latch_and_unverified_history_refusals() {
     );
 }
 
+/// Saves `index` at a new `path` through ordinary compare-and-swap saves
+/// until the saved index carries `generation`; it never loads the path.
+fn save_through_generation(index: &mut ScanIndex, path: &std::path::Path, generation: u64) {
+    while index.generation < generation {
+        index.save(path).unwrap();
+    }
+}
+
 // SOURCE Round 11 guard (b) at load: a missing, quarantined or empty
 // generation-0 load marks its path unverified for the rest of the process;
 // a load with history does not, until a restart forgets the fresh load.
@@ -1673,11 +1681,7 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
             .unwrap()
             .claude_history_unverified_in_process
     );
-    let mut index = ScanIndex {
-        generation: 3,
-        ..ScanIndex::default()
-    };
-    index.save(&fresh).unwrap();
+    save_through_generation(&mut ScanIndex::default(), &fresh, 3);
     assert!(
         ScanIndex::load(&fresh)
             .unwrap()
@@ -1692,11 +1696,7 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
             .claude_history_unverified_in_process
     );
     let historic = dir.join("historic-index.json");
-    let mut index = ScanIndex {
-        generation: 3,
-        ..ScanIndex::default()
-    };
-    index.save(&historic).unwrap();
+    save_through_generation(&mut ScanIndex::default(), &historic, 3);
     assert!(
         !ScanIndex::load(&historic)
             .unwrap()
@@ -1720,12 +1720,9 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
     let kept = claude_retired_family_digest("kept-root");
-    let mut index = ScanIndex {
-        generation: 7,
-        ..ScanIndex::default()
-    };
+    let mut index = ScanIndex::default();
     index.insert_retry_pending_claude_authority_for_test("held-root");
-    index.save(&path).unwrap();
+    save_through_generation(&mut index, &path, 7);
     let saved = || serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap();
     let write_tombstones = |tombstones: serde_json::Value| {
         let mut value = saved();

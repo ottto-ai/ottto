@@ -2731,7 +2731,7 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
 /// re-forms against the same witness. Once the evidence is healthy again,
 /// the ordinary parser rebuilds every member from the CURRENT sidecar rows,
 /// the record resolves, the reported bodies are offered and accepted, and the
-/// next raw-complete census clears the tombstone.
+/// tombstone clears with that settled proof.
 #[test]
 #[serial(source_manifests)]
 fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
@@ -2870,7 +2870,7 @@ fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() 
     }
     assert_eq!(ApcFixture::family_keys(&page.index).len(), family.len());
 
-    // 5. The settled return clears the tombstone on a raw-complete census.
+    // 5. The settled proof cleared the tombstone; the family stays settled.
     let cleared = pages_until("the tombstone clears", &|page| {
         !page.index.claude_family_tombstoned_for_test(APC_ROOT)
     });

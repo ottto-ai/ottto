@@ -7597,6 +7597,32 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .remove(&root_session_id);
         index.claude_usage_family_pending.remove(&root_session_id);
     }
+    // SOURCE/COST/SI Round 12: a returning family's tombstone clears once its
+    // proof settles, on the page whose members all carry the reported-usage
+    // contract with no authority record left. Its bodies commit with this
+    // page. Never earlier: a returning member is indexed on the page that
+    // reads it, before this fold demotes it and re-forms its record.
+    if !index.claude_retired_family_tombstones.is_empty() {
+        let mut cleared = 0_u64;
+        for (root_session_id, members) in &current_authority_by_root {
+            if members.values().all(|reported| *reported)
+                && !index
+                    .claude_usage_authority_quarantine
+                    .contains_key(root_session_id)
+                && index
+                    .claude_retired_family_tombstones
+                    .remove(&claude_retired_family_digest(root_session_id))
+                    .is_some()
+            {
+                cleared += 1;
+            }
+        }
+        if cleared > 0 {
+            with_claude_absence_counters(|counters| {
+                counters.tombstones_cleared = counters.tombstones_cleared.saturating_add(cleared);
+            });
+        }
+    }
     duplicate_census.fence_after = index.claude_duplicate_request_witness_overflowed;
     disposition.duplicate_census = duplicate_census;
     #[cfg(test)]
@@ -8174,7 +8200,7 @@ pub(crate) struct ClaudeAbsenceCounters {
     /// Malformed tombstone entries, or a malformed tombstone container,
     /// dropped while decoding an index.
     pub(crate) tombstone_decode_drops: u64,
-    /// Tombstones cleared because the returning family settled.
+    /// Tombstones cleared because the returning family re-proved.
     pub(crate) tombstones_cleared: u64,
 }
 
@@ -24735,21 +24761,6 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // Round 12: a returning family's tombstone clears once its
-                // member is indexed again with no authority record left.
-                if raw_census_complete && source == SnapshotSource::ClaudeCode {
-                    let cleared = index.clear_settled_claude_family_tombstones();
-                    if cleared > 0 {
-                        with_claude_absence_counters(|counters| {
-                            counters.tombstones_cleared =
-                                counters.tombstones_cleared.saturating_add(cleared as u64);
-                        });
-                        eprintln!(
-                            "local snapshot census cleared {cleared} retired Claude family \
-                             tombstone(s): the returning family settled"
-                        );
-                    }
-                }
                 // Path-(a) bridge: RetryPending authority debt no longer marks
                 // the sweep, but it still withholds the ordinary census (and so
                 // its complete fold and upload-context adoption), as the mark
@@ -36328,48 +36339,6 @@ impl ScanIndex {
         !self.claude_retired_family_tombstones.is_empty()
             && claude_index_path_member_ref(path)
                 .is_some_and(|member| self.claude_root_tombstoned(member.root))
-    }
-
-    /// SOURCE/COST/SI Round 12: a tombstone clears once its family's return
-    /// settled, that is once a member is indexed again (its body committed
-    /// after the normal proof path re-offered it) and no authority record
-    /// holds the root. A family still held, RetryPending or terminal, keeps
-    /// its tombstone, and with it its retained witness. One pass over the
-    /// indexed keys, hashing only witnessed roots without a record; nothing is
-    /// allocated beyond those digests. Returns how many cleared.
-    fn clear_settled_claude_family_tombstones(&mut self) -> usize {
-        if self.claude_retired_family_tombstones.is_empty() {
-            return 0;
-        }
-        let mut cleared = 0;
-        let mut previous_root: Option<&str> = None;
-        for index_key in self.files.keys() {
-            let Some(member) = claude_index_path_member_ref(Path::new(index_key)) else {
-                continue;
-            };
-            if previous_root == Some(member.root) {
-                continue;
-            }
-            previous_root = Some(member.root);
-            if !self.claude_usage_family_witnesses.contains_key(member.root)
-                || self
-                    .claude_usage_authority_quarantine
-                    .contains_key(member.root)
-            {
-                continue;
-            }
-            if self
-                .claude_retired_family_tombstones
-                .remove(&claude_retired_family_digest(member.root))
-                .is_some()
-            {
-                cleared += 1;
-                if self.claude_retired_family_tombstones.is_empty() {
-                    break;
-                }
-            }
-        }
-        cleared
     }
 
     /// Path-(a) bridge: retire every RetryPending family that a raw-complete
