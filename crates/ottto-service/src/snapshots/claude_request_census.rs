@@ -192,7 +192,8 @@ pub(crate) struct ClaudeLedgerSweep {
 
 /// One family's last complete shadow body (`fam:` records): what the next
 /// removal delta is bound to. The record's fingerprint is the union
-/// revision (member set) it was built over.
+/// revision (member set) it was built over; its window is when a row of the
+/// family was last published (the shadow's scheduling time).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeFamilyMemo {
     pub(crate) removed_requests: u64,
@@ -200,6 +201,25 @@ pub(crate) struct ClaudeFamilyMemo {
     /// The snapshot id of the family row this memo describes: a later
     /// removal delta names it as its basis.
     pub(crate) snapshot: u64,
+    /// The family's last published row (None: none since JSONL v3).
+    pub(crate) published: Option<ClaudeFamilyPublication>,
+}
+
+/// What the family's last published row said, and when: the shadow skips
+/// writing an unchanged row only against a publication of this UTC day by
+/// this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeFamilyPublication {
+    /// UTC day as `yyyymmdd`.
+    pub(crate) utc_day: u64,
+    /// Digest of the row's canonical content.
+    pub(crate) digest: u64,
+    /// The publishing process's epoch.
+    pub(crate) epoch: u64,
+    /// When a page last attempted the family (unix seconds; a family the
+    /// page deadline never reached keeps its older time): pages take the
+    /// least recently attempted families first.
+    pub(crate) attempted: u64,
 }
 
 /// A bounded audit of `[0, target_offset)` in progress across pages.
@@ -1003,6 +1023,12 @@ impl Serialize for ClaudeRequestCensusRecord {
             map.serialize_entry("fr", &memo.removed_requests)?;
             map.serialize_entry("ft", &memo.removed_tokens)?;
             map.serialize_entry("fs", &memo.snapshot)?;
+            if let Some(published) = &memo.published {
+                map.serialize_entry("fd", &published.utc_day)?;
+                map.serialize_entry("fh", &published.digest)?;
+                map.serialize_entry("fe", &published.epoch)?;
+                map.serialize_entry("fa", &published.attempted)?;
+            }
         }
         if let Some(facts) = &ledger.facts {
             map.serialize_entry("f", &BytesBase64(facts))?;
@@ -1635,10 +1661,10 @@ impl<'de> Visitor<'de> for RecordVisitor {
         Ok(None)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        const FIELDS: [&str; 37] = [
+        const FIELDS: [&str; 41] = [
             "v", "fp", "w", "s", "tw", "u", "h", "b", "f", "bi", "bd", "bn", "r", "ur", "ut", "to",
             "td", "tn", "ta", "tc", "tl", "tv", "tw2", "tm", "te", "tk", "xa", "xs", "xp", "xq",
-            "xk", "m", "sk", "sd", "fr", "ft", "fs",
+            "xk", "m", "sk", "sd", "fr", "ft", "fs", "fd", "fh", "fe", "fa",
         ];
         let mut seen = 0_u64;
         let mut malformed = false;
@@ -1735,7 +1761,15 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 None
             }
         };
-        let (Some(birth), Some(old_path_usage), Some(tail), Some(audit), Some(sweep), Some(family)) = (
+        let (
+            Some(birth),
+            Some(old_path_usage),
+            Some(tail),
+            Some(audit),
+            Some(sweep),
+            Some(family),
+            Some(published),
+        ) = (
             group(&["bi", "bd", "bn"]),
             group(&["ur", "ut"]),
             group(&[
@@ -1744,9 +1778,15 @@ impl<'de> Visitor<'de> for RecordVisitor {
             group(&["xa", "xs", "xp", "xq", "xk"]),
             group(&["sk", "sd"]),
             group(&["fr", "ft", "fs"]),
-        ) else {
+            group(&["fd", "fh", "fe", "fa"]),
+        )
+        else {
             return Ok(None);
         };
+        // A publication belongs to a family memo.
+        if published.is_some() && family.is_none() {
+            return Ok(None);
+        }
         let retired = scalar("r");
         let modified = scalar("m");
         let audit = audit.map(|values| ClaudeTelemetryAudit {
@@ -1791,6 +1831,12 @@ impl<'de> Visitor<'de> for RecordVisitor {
             removed_requests: values[0],
             removed_tokens: values[1],
             snapshot: values[2],
+            published: published.map(|values| ClaudeFamilyPublication {
+                utc_day: values[0],
+                digest: values[1],
+                epoch: values[2],
+                attempted: values[3],
+            }),
         });
         // Facts belong to a telemetry record and hold exactly one fact per
         // hash; anything else is malformed.

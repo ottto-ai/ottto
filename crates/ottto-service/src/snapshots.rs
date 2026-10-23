@@ -14661,8 +14661,7 @@ impl SnapshotAccumulator {
         mut capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
     ) {
         if let Some(capture) = capture.as_deref_mut() {
-            let keys = self.claude_responses.message_keys();
-            capture.note_messages(keys.clone().count(), keys);
+            capture.note_messages(self.claude_responses.message_keys());
         }
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);

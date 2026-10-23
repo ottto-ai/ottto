@@ -9,7 +9,10 @@
 //! the responses the occurrence map does not keep (message-only, idless and
 //! displaced). Every byte is admitted first against the capture ceiling,
 //! which is the shadow's own budget, never a live reservation; a refusal
-//! drops the capture and the shadow reports the file unbuilt.
+//! drops the capture and the shadow reports the file unbuilt. Its CPU is
+//! bounded apart from its memory: the message ids it hashes are checked
+//! (each id's length and the parse's total) before any is hashed, and they
+//! are sorted only when they arrive out of order.
 //!
 //! Captures wait in a process store keyed by index key until the page's
 //! shadow takes them (bound to the parse's fingerprint), and expire after a
@@ -19,7 +22,7 @@ use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageT
 use super::ClaudeMoneyTokens;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -33,8 +36,16 @@ const MAX_ROWS_PER_FILE: usize = 4096;
 const FUNDS_CHUNK_BYTES: usize = 16 * 1024;
 /// Per-node share of a B-tree entry (key, value and node overhead).
 pub(super) const MAP_ENTRY_BYTES: usize = 64;
+/// A message id longer than this refuses the capture (real ids are ~30 B).
+const MAX_MESSAGE_ID_BYTES: usize = 256;
+/// Message-id bytes one parse's capture may hash, and how many ids (the
+/// hashing and the sort are linear and `n log n` in them).
+const MAX_MESSAGE_HASH_INPUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_MESSAGE_IDS: usize = 131_072;
 
 static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
+/// Time spent in capture work since the last page took it (microseconds).
+static CAPTURE_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Bytes held against the capture ceiling, released on drop.
 #[derive(Debug, Default)]
@@ -158,6 +169,7 @@ impl ClaudeResponseCapture {
             return;
         }
         let mut finished = false;
+        let started = Instant::now();
         super::guarded(|| {
             #[cfg(test)]
             if PANIC_FOR_TEST.with(std::cell::Cell::get) {
@@ -166,6 +178,7 @@ impl ClaudeResponseCapture {
             run(self);
             finished = true;
         });
+        CAPTURE_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
         if !finished {
             self.refuse();
         }
@@ -186,15 +199,30 @@ impl ClaudeResponseCapture {
     /// Record the message-id hash of every message-keyed response.
     pub(crate) fn note_messages<'k>(
         &mut self,
-        count: usize,
-        keys: impl Iterator<Item = (u64, &'k str)>,
+        keys: impl Iterator<Item = (u64, &'k str)> + Clone,
     ) {
-        self.contained(|capture| capture.record_messages(count, keys));
+        self.contained(|capture| capture.record_messages(keys));
     }
 
-    fn record_messages<'k>(&mut self, count: usize, keys: impl Iterator<Item = (u64, &'k str)>) {
+    /// One pass checks the ids (their count, each length, total bytes) before the
+    /// count is funded and any id is hashed; then the hashes are sorted by
+    /// sequence only if they came out of order.
+    fn record_messages<'k>(&mut self, keys: impl Iterator<Item = (u64, &'k str)> + Clone) {
         if self.refused {
             return;
+        }
+        let mut count = 0_usize;
+        let mut bytes = 0_usize;
+        for (_, message_id) in keys.clone() {
+            count += 1;
+            bytes = bytes.saturating_add(message_id.len());
+            if count > MAX_MESSAGE_IDS
+                || message_id.len() > MAX_MESSAGE_ID_BYTES
+                || bytes > MAX_MESSAGE_HASH_INPUT_BYTES
+            {
+                self.refuse();
+                return;
+            }
         }
         if !self
             .funds
@@ -208,7 +236,9 @@ impl ClaudeResponseCapture {
             self.messages
                 .push((sequence, super::claude_message_hash(message_id)));
         }
-        self.messages.sort_unstable();
+        if self.messages.windows(2).any(|pair| pair[0] > pair[1]) {
+            self.messages.sort_unstable();
+        }
     }
 
     pub(crate) fn message(&self, sequence: u64) -> Option<u64> {
@@ -479,4 +509,9 @@ pub(crate) fn purge_scope_for_test(scope: &Path) {
 
 pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
+}
+
+/// Capture work time since the last call (microseconds).
+pub(crate) fn take_capture_us() -> u64 {
+    CAPTURE_MICROS.swap(0, Ordering::Relaxed)
 }

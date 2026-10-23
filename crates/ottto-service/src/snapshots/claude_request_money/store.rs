@@ -7,7 +7,14 @@
 //! one in-memory copy per support directory, persisted under
 //! `<support>/claude-request-ledger/` as 256 hash-sharded JSON maps (shard =
 //! first byte of SHA-256 of the key) and `meta.json` (the sweep records).
-//! Only changed shards are rewritten, a bounded number per page.
+//! Only changed shards are rewritten. Saves are coalesced (at most one per
+//! `SAVE_MIN_INTERVAL`, each at most `SAVE_BYTES_PER_PAGE`) and capped per
+//! UTC day at `SAVE_DAILY_BYTES` of attempted bytes (data shards, both metas
+//! and every retry), counted in `save-budget.json` before each save is
+//! written so a restart resumes the day's count. Past the cap, dirty state
+//! stays resident (within the ledger's bound) until the next day; a crash
+//! then loses only unsaved progress, which errs toward rereading and
+//! rewriting.
 //!
 //! Crash order (Sol R3-2), one rule: when the telemetry certificate went to
 //! zero, a meta whose certificates are all ZERO is written as its own write
@@ -22,7 +29,10 @@
 //!
 //! One writer thread does every file write of the shadow (diagnostics JSONL
 //! rows, serialized there, and ledger shards) and the ledger load, outside
-//! `SNAPSHOT_SYNC_LOCK`. Its outbox is bounded in batches and in admitted
+//! `SNAPSHOT_SYNC_LOCK`. While it has work (or debt held only in memory) a
+//! durable run marker says so; it persists that debt before it removes the
+//! marker, so a marker found when a process starts is an unclean run whose
+//! days owe a false row (`super::note_unclean_run`). Its outbox is bounded in batches and in admitted
 //! bytes; each batch carries the admission of its own buffers (released
 //! when it is written, dropped or refused), and the load admits each
 //! shard's bytes and a structural bound of its decoded records before
@@ -40,13 +50,15 @@ use super::super::claude_request_census::{
     ClaudeRequestCensusRecord, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
     MIN_ENTRY_SERIALIZED_BYTES, RECORD_RESIDENT_OVERHEAD_BYTES, SWEEP_KEY_PREFIX,
 };
-use super::{ClaudeFamilyMemo, JsonlBatch, JsonlOutcome, ShadowReservation};
+use super::{
+    ClaudeFamilyMemo, ClaudeFamilyPublication, JsonlBatch, JsonlOutcome, ShadowReservation,
+};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
+use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TryRecvError, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -67,10 +79,16 @@ pub(crate) const LEDGER_MAX_RECORDS: usize = 65_536;
 pub(crate) const LEDGER_RESIDENT_BOUND_BYTES: usize = LEDGER_MAX_RECORDS
     * RECORD_RESIDENT_OVERHEAD_BYTES
     + 2 * MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES;
-/// Dirty shard bytes one page serializes. A shard larger than this is never
-/// one page's work: it stays dirty (counted) and no certificate is written
+/// Dirty shard bytes one save serializes. A shard larger than this is never
+/// one save's work: it stays dirty (counted) and no certificate is written
 /// over it; the load refuses a file larger than this as damage.
-const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
+pub(crate) const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
+/// At most one save this often (plus the first of a process).
+pub(crate) const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Attempted save bytes per UTC day.
+pub(crate) const SAVE_DAILY_BYTES: usize = 64 * 1024 * 1024;
+/// The day's attempted save bytes, beside the shards.
+const SAVE_BUDGET_FILE: &str = "save-budget.json";
 /// The load waits this long, in steps, for each shard's admission; then it
 /// gives up (nothing is lost: the next page asks for the load again).
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
@@ -120,6 +138,34 @@ pub(crate) struct ClaudeLedger {
     /// Where the `mh:` round-robin resumes (process memory only: pruning
     /// is housekeeping, a stale record is never a holder).
     pub(crate) message_cursor: String,
+    /// When this process last took a save (None: not yet).
+    last_save: Option<Instant>,
+    /// The UTC day (`yyyymmdd`) of `save_bytes_today`.
+    save_day: u64,
+    /// Save bytes attempted on `save_day` (persisted before each save).
+    pub(crate) save_bytes_today: u64,
+    /// Why the last page took no save while shards were dirty.
+    pub(crate) save_held: Option<SaveHeld>,
+    /// Families with a row in a batch whose result has not come back (process
+    /// memory): none of them is "unchanged" until it does.
+    in_flight: BTreeMap<String, u32>,
+}
+
+/// Why a page with dirty shards took no save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveHeld {
+    /// The last save is younger than `SAVE_MIN_INTERVAL`.
+    Interval,
+    /// The day's `SAVE_DAILY_BYTES` would be passed.
+    DailyCap,
+}
+
+/// What one page's save may take: the UTC day and the coalescing interval.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SavePolicy {
+    pub(crate) deadline: Instant,
+    pub(crate) utc_day: u64,
+    pub(crate) min_interval: Duration,
 }
 
 impl ClaudeLedger {
@@ -133,7 +179,35 @@ impl ClaudeLedger {
             oversized_shards: 0,
             load_damaged: false,
             message_cursor: String::new(),
+            last_save: None,
+            save_day: 0,
+            save_bytes_today: 0,
+            save_held: None,
+            in_flight: BTreeMap::new(),
         }
+    }
+
+    /// The families of a handed-off batch's rows.
+    pub(crate) fn note_in_flight<'k>(&mut self, keys: impl Iterator<Item = &'k str>) {
+        for key in keys {
+            *self.in_flight.entry(key.to_owned()).or_default() += 1;
+        }
+    }
+
+    /// A batch's result came back (or it was never queued).
+    pub(crate) fn settle_in_flight<'k>(&mut self, keys: impl Iterator<Item = &'k str>) {
+        for key in keys {
+            if let Some(count) = self.in_flight.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.in_flight.remove(key);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn in_flight(&self, key: &str) -> bool {
+        self.in_flight.contains_key(key)
     }
 
     pub(crate) fn census(&self) -> &ClaudeRequestCensus {
@@ -196,23 +270,44 @@ impl ClaudeLedger {
         self.dirty.iter().filter(|dirty| **dirty).count()
     }
 
-    /// Serialize the dirty shards of this page's bounded save. The data
-    /// shards come in a fair rotation up to `SAVE_BYTES_PER_PAGE`. A zero
-    /// meta (every certificate 0) rides first when a certificate went to
-    /// zero; the current meta rides last only when no data shard stays
-    /// dirty. None when nothing is dirty, its buffers are not admitted or the
-    /// page deadline passes while serializing (everything stays dirty). The
+    /// Serialize the dirty shards of this page's save, when one is due
+    /// (`SAVE_MIN_INTERVAL` since this process's last) and the day's
+    /// `SAVE_DAILY_BYTES` has room. A zero meta (every certificate 0) rides
+    /// first when a certificate went to zero; the data shards come in a fair
+    /// rotation up to `SAVE_BYTES_PER_PAGE` and the day's room; the current
+    /// meta rides last only when no data shard stays dirty. Its bytes count
+    /// as attempted when it is taken, whatever happens to them. None when
+    /// nothing is dirty or due, its buffers are not admitted or the page
+    /// deadline passes while serializing (everything stays dirty). The
     /// deadline is checked before every record, so the walk stops within one
     /// record's serialization of it (at most `SAVE_BYTES_PER_PAGE`).
     pub(crate) fn take_save(
         &mut self,
-        deadline: Instant,
+        policy: SavePolicy,
     ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
-        if Instant::now() >= deadline {
+        self.save_held = None;
+        if Instant::now() >= policy.deadline || self.dirty_shards() == 0 {
             return None;
         }
+        if self
+            .last_save
+            .is_some_and(|last| last.elapsed() < policy.min_interval)
+        {
+            self.save_held = Some(SaveHeld::Interval);
+            return None;
+        }
+        if policy.utc_day != self.save_day {
+            self.save_day = policy.utc_day;
+            self.save_bytes_today = 0;
+        }
+        let room = SAVE_BYTES_PER_PAGE
+            .min(SAVE_DAILY_BYTES.saturating_sub(self.save_bytes_today as usize));
+        // The day's room, not the save's bound, decides what stays dirty.
+        let day_bound = room < SAVE_BYTES_PER_PAGE;
+        let meta_bytes = self.shard_bytes[META] + 2;
+        let zero_first = self.meta_debt;
+        let mut bytes = usize::from(zero_first) * meta_bytes;
         let mut selected = vec![false; DATA_SHARDS];
-        let mut bytes = 0_usize;
         let mut next_save = self.next_save;
         self.oversized_shards = 0;
         for step in 0..DATA_SHARDS {
@@ -225,7 +320,7 @@ impl ClaudeLedger {
                 self.oversized_shards += 1;
                 continue;
             }
-            if bytes + need > SAVE_BYTES_PER_PAGE {
+            if bytes + need > room {
                 break;
             }
             selected[shard] = true;
@@ -233,11 +328,13 @@ impl ClaudeLedger {
             next_save = (shard + 1) % DATA_SHARDS;
         }
         let data_left = (0..DATA_SHARDS).any(|shard| self.dirty[shard] && !selected[shard]);
-        let zero_first = self.meta_debt;
-        let meta_last = self.dirty[META] && !data_left;
-        let metas = usize::from(zero_first) + usize::from(meta_last);
-        bytes += metas * (self.shard_bytes[META] + 2);
-        if !selected.contains(&true) && metas == 0 {
+        let meta_last = self.dirty[META] && !data_left && bytes + meta_bytes <= room;
+        bytes += usize::from(meta_last) * meta_bytes;
+        // A zero meta goes before any data shard, or nothing goes.
+        if bytes > room || !selected.contains(&true) && !zero_first && !meta_last {
+            if day_bound {
+                self.save_held = Some(SaveHeld::DailyCap);
+            }
             return None;
         }
         let reservation = ShadowReservation::admit(bytes)?;
@@ -289,7 +386,12 @@ impl ClaudeLedger {
             buffer.push(b'}');
             buffer
         };
-        let mut save = ClaudeLedgerSave::default();
+        self.last_save = Some(Instant::now());
+        self.save_bytes_today = self.save_bytes_today.saturating_add(bytes as u64);
+        let mut save = ClaudeLedgerSave {
+            budget: (self.save_day, self.save_bytes_today),
+            ..ClaudeLedgerSave::default()
+        };
         for (shard, buffer) in buffers {
             self.dirty[shard] = false;
             save.shards.push((shard, close(buffer)));
@@ -348,6 +450,8 @@ pub(crate) struct ClaudeLedgerSave {
     meta_first: Option<Vec<u8>>,
     meta_last: Option<Vec<u8>>,
     meta_debt: bool,
+    /// The UTC day and its attempted bytes with this save: persisted first.
+    budget: (u64, u64),
 }
 
 impl ClaudeLedgerSave {
@@ -365,13 +469,19 @@ impl ClaudeLedgerSave {
     }
 }
 
-/// A family memo that moves only when its rows were written.
+/// A family memo that moves only when its batch was published (written,
+/// flushed and synced): its scheduling time and publication always, its
+/// money basis only from a complete body.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingMemo {
     pub(crate) key: String,
-    pub(crate) revision: [u8; 32],
+    /// A complete body's union revision and money (the next removal
+    /// basis); None keeps the stored basis.
+    pub(crate) basis: Option<([u8; 32], ClaudeFamilyMemo)>,
     pub(crate) observed_unix: u64,
-    pub(crate) memo: ClaudeFamilyMemo,
+    pub(crate) published: ClaudeFamilyPublication,
+    /// The batch carries a row of the family (else it was unchanged).
+    pub(crate) row: bool,
 }
 
 /// One page's batch for the writer.
@@ -391,6 +501,8 @@ pub(crate) struct WriteResult {
     failed_shards: Vec<usize>,
     /// The meta shard was not written (with its debt flag).
     meta_unwritten: Option<bool>,
+    /// The writer's time on the batch.
+    pub(crate) writer_us: u64,
 }
 
 enum Job {
@@ -398,6 +510,9 @@ enum Job {
     Write(Box<WriteJob>),
     #[cfg(test)]
     Flush(SyncSender<()>),
+    /// A restart of the writer's state of a directory (a new process).
+    #[cfg(test)]
+    Restart(PathBuf),
 }
 
 enum Slot {
@@ -590,10 +705,21 @@ pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec
 
 fn run_writer(receiver: Receiver<Job>) {
     // Per support directory: shards whose last write failed (no sweep
-    // advance is written over them), and whether a debt-carrying meta failed
-    // (no data shard is written until one lands).
+    // advance is written over them), whether a debt-carrying meta failed
+    // (no data shard is written until one lands), and its run marker.
     let mut failed = BTreeMap::<PathBuf, WriterState>::new();
-    while let Ok(job) = receiver.recv() {
+    loop {
+        let job = match receiver.try_recv() {
+            Ok(job) => job,
+            Err(TryRecvError::Empty) => {
+                settle_runs(&mut failed);
+                match receiver.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            }
+            Err(TryRecvError::Disconnected) => break,
+        };
         match job {
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
@@ -613,6 +739,7 @@ fn run_writer(receiver: Receiver<Job>) {
             Job::Write(job) => {
                 let bytes = job.queued_bytes();
                 let failed = failed.entry(job.support_dir.clone()).or_default();
+                begin_run(&job.support_dir, failed, job.jsonl.now());
                 let (support_dir, result) = write(*job, failed);
                 QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
                 if let Ok(mut results) = RESULTS.lock() {
@@ -621,8 +748,48 @@ fn run_writer(receiver: Receiver<Job>) {
             }
             #[cfg(test)]
             Job::Flush(done) => {
+                // Idle as far as the caller is concerned: settled first.
+                settle_runs(&mut failed);
                 let _ = done.send(());
             }
+            #[cfg(test)]
+            Job::Restart(support_dir) => {
+                failed.remove(&support_dir);
+            }
+        }
+    }
+}
+
+/// The writer has work for `support_dir` (a page observed at
+/// `observed_unix`): its run marker is on disk before anything is written.
+/// The first work of a process first reads the marker an earlier process
+/// left (an unclean run: its days owe a false row).
+fn begin_run(support_dir: &Path, state: &mut WriterState, observed_unix: u64) {
+    if !state.started {
+        state.started = true;
+        super::note_unclean_run(support_dir);
+    }
+    // The marker names the run's first and last page: rewritten only when
+    // a page of another UTC day comes.
+    let day = super::utc_day(observed_unix);
+    let covered = state.run_days.is_some_and(|(first, last)| {
+        day == super::utc_day(first) || day == super::utc_day(last)
+    });
+    if !covered {
+        let days = state.run_days.map_or((observed_unix, observed_unix), |(first, last)| {
+            (first.min(observed_unix), last.max(observed_unix))
+        });
+        state.run_days = super::open_run_marker(support_dir, days).then_some(days);
+    }
+}
+
+/// The writer is idle: every debt held in memory is persisted, then the run
+/// markers go (a marker that cannot be removed stays: a later start reads
+/// it as unclean, which errs toward a cut line).
+fn settle_runs(states: &mut BTreeMap<PathBuf, WriterState>) {
+    for (support_dir, state) in states.iter_mut() {
+        if state.run_days.is_some() && super::close_run_marker(support_dir) {
+            state.run_days = None;
         }
     }
 }
@@ -638,24 +805,31 @@ fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
         .is_ok()
 }
 
-/// What the writer remembers of one directory's failed writes.
+/// What the writer remembers of one directory: its failed writes and its
+/// run.
 #[derive(Debug, Default)]
 pub(crate) struct WriterState {
     failed: BTreeSet<usize>,
     /// A meta carrying debt failed: until one lands, no data shard (and no
     /// meta advance) is written, whichever batch it comes in.
     debt_unwritten: bool,
+    /// This process has written for the directory (its start was checked).
+    started: bool,
+    /// The run marker is on disk, naming the first and last page observed
+    /// (unix seconds) since it was written.
+    run_days: Option<(u64, u64)>,
 }
 
 fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
+    let started = Instant::now();
     let WriteJob {
         support_dir,
-        jsonl,
+        mut jsonl,
         memos,
         save,
         reservations,
     } = job;
-    let jsonl = super::write_jsonl(&support_dir, &jsonl);
+    let jsonl = super::write_jsonl(&support_dir, &mut jsonl);
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
         write_save(&support_dir.join(LEDGER_DIR), &save, failed)
     });
@@ -664,6 +838,7 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         memos,
         failed_shards,
         meta_unwritten,
+        writer_us: started.elapsed().as_micros() as u64,
     };
     drop(reservations);
     (support_dir, result)
@@ -680,7 +855,14 @@ fn write_save(
 ) -> (Vec<usize>, Option<bool>) {
     let mut unwritten = Vec::new();
     let mut meta_unwritten = None;
-    let mut blocked = std::fs::create_dir_all(dir).is_err();
+    // The day's attempted bytes are on disk before any byte of the save
+    // (else nothing of it goes).
+    let (day, bytes) = save.budget;
+    let mut blocked = std::fs::create_dir_all(dir).is_err()
+        || !write_atomic(
+            &dir.join(SAVE_BUDGET_FILE),
+            format!("{{\"day\":{day},\"bytes\":{bytes}}}").as_bytes(),
+        );
     if let Some(meta) = &save.meta_first {
         if blocked || !write_atomic(&shard_path(dir, META), meta) {
             blocked = true;
@@ -802,7 +984,22 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     for shard in missing {
         ledger.dirty[shard] = true;
     }
+    (ledger.save_day, ledger.save_bytes_today) = load_budget(&dir);
     Some(ledger)
+}
+
+/// The day's attempted save bytes a save persisted (none: (0, 0)).
+fn load_budget(dir: &Path) -> (u64, u64) {
+    #[derive(serde::Deserialize)]
+    struct Budget {
+        day: u64,
+        bytes: u64,
+    }
+    std::fs::read(dir.join(SAVE_BUDGET_FILE))
+        .ok()
+        .filter(|bytes| bytes.len() <= 256)
+        .and_then(|bytes| serde_json::from_slice::<Budget>(&bytes).ok())
+        .map_or((0, 0), |budget| (budget.day, budget.bytes))
 }
 
 /// Wait until the writer has done everything handed to it so far.
@@ -832,6 +1029,19 @@ pub(crate) fn forget_for_test(support_dir: &Path) {
     if let Ok(mut results) = RESULTS.lock() {
         results.remove(support_dir);
     }
+}
+
+/// A new process for `support_dir`: its ledger and the writer's memory of
+/// it are forgotten (the next write checks the run marker again).
+#[cfg(test)]
+pub(crate) fn restart_for_test(support_dir: &Path) {
+    forget_for_test(support_dir);
+    if let Some(sender) = writer() {
+        if let Ok(sender) = sender.lock() {
+            let _ = sender.send(Job::Restart(support_dir.to_path_buf()));
+        }
+    }
+    flush();
 }
 
 /// A restart that reloads the saved ledger before the next page (the page
@@ -866,6 +1076,16 @@ impl ClaudeLedger {
     }
 }
 
+/// A save every call, on today's budget.
+#[cfg(test)]
+pub(crate) fn policy_for_test(deadline: Instant) -> SavePolicy {
+    SavePolicy {
+        deadline,
+        utc_day: super::utc_day(super::now_unix()),
+        min_interval: Duration::ZERO,
+    }
+}
+
 /// One page's bounded save of `ledger`, written synchronously (the writer's
 /// crash order); `failed` is the writer's memory of the directory. Returns
 /// (shards in the save, the meta went first, shards not written).
@@ -875,7 +1095,7 @@ pub(crate) fn save_page_for_test(
     ledger: &mut ClaudeLedger,
     failed: &mut WriterState,
 ) -> Option<(usize, bool, usize)> {
-    let (save, _reservation) = ledger.take_save(Instant::now() + Duration::from_secs(60))?;
+    let (save, _reservation) = ledger.take_save(policy_for_test(Instant::now() + Duration::from_secs(60)))?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
     ledger.restore(&unwritten, meta);
     Some((save.shards(), save.meta_first.is_some(), unwritten.len()))
@@ -905,7 +1125,7 @@ pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
 #[cfg(test)]
 pub(crate) fn take_save_for_test(ledger: &mut ClaudeLedger) -> Option<ClaudeLedgerSave> {
     ledger
-        .take_save(Instant::now() + Duration::from_secs(60))
+        .take_save(policy_for_test(Instant::now() + Duration::from_secs(60)))
         .map(|(save, _reservation)| save)
 }
 
@@ -914,7 +1134,9 @@ pub(crate) fn take_save_by_for_test(
     ledger: &mut ClaudeLedger,
     deadline: Instant,
 ) -> Option<ClaudeLedgerSave> {
-    ledger.take_save(deadline).map(|(save, _reservation)| save)
+    ledger
+        .take_save(policy_for_test(deadline))
+        .map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
