@@ -742,34 +742,37 @@ fn append_growth(tailed: &ScanFixture) {
     tailed.append_usage(SnapshotSource::ClaudeCode, 1..1 + tail_growth_records());
 }
 
-/// M1 test (ii), evict only the overflow (design §6 row M1; §2 L1).
+/// M1 test (ii), corrected (joint M1 (ii) disposition, Oct 22; StateMissing
+/// sign-off closed).
 ///
 /// The same full cache, but the tailed file's append is
-/// `tail_growth_records` ordinary responses. The borrowed tail state grows
-/// past the room the fillers leave: a real overflow of the state budget, not
-/// a merely full cache. Desired: no wipe-all clear. The zero-budget step
-/// start evicts in victim order until the tail fits; the grown state stays
-/// below one filler's charge, so that is at most one filler.
+/// `tail_growth_records` ordinary responses: the borrowed tail state grows
+/// past the room the fillers leave, a real overflow of the state budget.
+/// Main refused this copy at `retain_reduction`; R0 before M-a released
+/// fillers and then refused at finalization, an eviction without benefit.
 ///
-/// Restated for Path A, the intended behavior (owner-accepted; review §3c):
-/// the fillers are older than the tailed file, so the same step then evicts
-/// older fillers until the tail's own copy would fit its next step's budget
-/// at that step's charge (its walk plus twice its charge, about three times
-/// the room one filler leaves): two fillers in all, "at most the overflow
-/// plus the copy's admission room". Round 1 expected exactly one. The tail
-/// keeps growing after that step, so its copy may still be refused at
-/// completion; this test pins the eviction bound only.
+/// Desired: an optional-copy refusal with zero eviction. No copy is
+/// retained, all `FILLERS` fillers stay, and the refusal is counted. A
+/// release runs only where an owned bound proves the clone, the finished
+/// output and the decode peak fit (M-a), and this growth never does.
 ///
-/// Red on main: the zero budget beside the tail records `ClearOtherActive`
-/// and releases every filler.
+/// Was `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
+/// which pinned two evictions: a release without benefit.
 #[test]
-fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
-    if unexecuted("M1_tail_growth") {
+fn cache_policy_m1_tail_growth_refuses_its_copy_without_eviction() {
+    if unexecuted("M1_tail_growth_refusal") {
         return;
     }
     let run = tail_beside_full_cache(false, append_growth);
+    let refusals = run.counts.retention_bound_refused
+        + run.counts.retention_clone_bound_refused
+        + run.counts.retention_finalization_bound_refused
+        + run.counts.insert_live_reservation_refused
+        + run.counts.insert_entry_bound_refused
+        + run.counts.insert_frozen_charge_refused
+        + run.counts.insert_no_victim_refused;
     let receipt = format!(
-        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} cursor_reservation_entries_evicted={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} fillers_after={} tail_retained_after={}",
+        "state_bytes={POLICY_STATE_BYTES} resident_before={} filler_charge={} tail_zero_budget_steps={} clear_other_active={} clear_entries_released={} cursor_reservation_entries_evicted={} copy_refusal_entries_evicted={} copy_refusal_admission_evicted={} insert_entries_evicted={} refusals={refusals} fillers_after={} tail_retained_after={} {}",
         run.resident_before,
         run.filler_charge,
         run.tail.tail_zero_budget_steps,
@@ -781,8 +784,9 @@ fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
         run.counts.insert_entries_evicted,
         run.fillers_after,
         run.tail_retained_after,
+        run.r0,
     );
-    eprintln!("CACHE_POLICY test=M1_tail_growth {receipt}");
+    eprintln!("CACHE_POLICY test=M1_tail_growth_refusal {receipt}");
     assert_eq!(
         wipe_clears(&run.counts),
         0,
@@ -793,20 +797,28 @@ fn cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry() {
         "M1: a growing tail cleared entries; {receipt}"
     );
     assert_eq!(
-        run.fillers_after,
-        FILLERS - 2,
-        "M1: the overflow and the copy's room did not release exactly two entries; {receipt}"
+        run.counts.copy_refusal_entries_evicted
+            + run.counts.copy_refusal_admission_evicted
+            + run.counts.cursor_reservation_entries_evicted
+            + run.counts.insert_entries_evicted,
+        0,
+        "M1: a refused copy evicted residents; {receipt}"
     );
     assert_eq!(
-        run.counts.cursor_reservation_entries_evicted, 0,
-        "M1: a copy refusal eviction was counted as a cursor reservation; {receipt}"
+        run.fillers_after, FILLERS,
+        "M1: a refused copy did not keep every filler; {receipt}"
     );
+    assert!(
+        !run.tail_retained_after,
+        "precondition: the grown tail's copy does not fit; {receipt}"
+    );
+    assert!(refusals >= 1, "M1: the refusal was not counted; {receipt}");
 }
 
 /// Diagnostic, not acceptance (parent ruling 2): M1 (ii)'s scenario, with
 /// R0's completion probe and decision in its receipt. The acceptance row is
-/// main's `cache_policy_m1_tail_growth_releases_at_most_overflow_plus_one_entry`,
-/// unchanged. Asserts only that nothing is wiped.
+/// `cache_policy_m1_tail_growth_refuses_its_copy_without_eviction`. Asserts
+/// only that nothing is wiped.
 #[test]
 fn cache_policy_r0_diagnostic_m1_tail_growth() {
     if unexecuted("R0_diag_M1_tail_growth") {
