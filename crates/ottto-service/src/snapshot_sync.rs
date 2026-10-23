@@ -2657,6 +2657,12 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     } else {
         committable.save(index_path)?;
     }
+    if let Some(view) = correction_scan.and_then(|scan| scan.claude_request_census_view.as_ref()) {
+        let counts = view.qualify_saved(&committable);
+        if let Ok(line) = serde_json::to_string(&counts) {
+            eprintln!("local snapshot sync: request_census partial_post_save={line}");
+        }
+    }
     Ok(committable)
 }
 

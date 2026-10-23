@@ -24355,11 +24355,8 @@ impl OwnedSourceScan {
                                 census_window_end: &census_window_end,
                                 complete: parse_complete,
                                 acquired_eof: cursor_fragment.is_none()
-                                    && attempt_read_end
-                                        .is_none_or(|end| end >= candidate.size_bytes),
-                                acquired: attempt_read_end
-                                    .unwrap_or(candidate.size_bytes)
-                                    .min(candidate.size_bytes),
+                                    && attempt_read_end >= candidate.size_bytes,
+                                acquired: attempt_read_end.min(candidate.size_bytes),
                                 extent: candidate.size_bytes,
                                 lossy: dropped_usage_record_count > 0
                                     || recognized_usage_drop_count > 0
@@ -37562,6 +37559,7 @@ impl ScanIndex {
                 "local snapshot scan index disappeared concurrently"
             ));
         }
+        claude_request_census::prepare_safety_checkpoint(self);
         let previous_generation = self.generation;
         self.schema_version = SCAN_INDEX_SCHEMA_VERSION;
         self.generation = self

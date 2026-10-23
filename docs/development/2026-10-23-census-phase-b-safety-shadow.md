@@ -7,9 +7,11 @@ the safety slots it needs. Active hashes are never reclaimed. Optional safety
 metadata is best effort under serialized pressure; loss retains global safety
 debt rather than making a negative certificate.
 
-The census stores `!safety` with up to 4,096 SHA-256 local key ids, their first
+The existing root shadow metadata stores `s` with up to 4,096 SHA-256 local key ids, their first
 incomplete timestamp, cumulative reclaimed hashes and a sticky overflow flag.
 Missing or malformed persisted metadata closes strong shadow comparison.
+The bounded key marker is charged as shadow metadata; record serialization and
+active-plus-safety hash storage retain their existing 47/48 MiB boundaries.
 Healthy complete-terminal prune or full authorized reconstruction removes a
 key. Overflow cannot clear through timeout, prune or restart.
 

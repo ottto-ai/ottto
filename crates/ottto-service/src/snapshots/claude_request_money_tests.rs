@@ -2846,13 +2846,19 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
     *main_index.claude_request_census_mut_for_test() = main;
     let mut reserved_index = main_index.clone();
     *reserved_index.claude_request_census_mut_for_test() = reserved;
+    for (key, seed) in [(OLD, 'a'), (CURRENT, 'b')] {
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = money_fingerprint(seed);
+        main_index.files.insert(key.to_owned(), entry.clone());
+        reserved_index.files.insert(key.to_owned(), entry);
+    }
     let ledger = ClaudeRequestCensus::default();
     let scope = |index: &ScanIndex| {
         let scope = ClaudeLedgerScope::build(
             index,
             &ledger,
             &BTreeSet::new(),
-            &BTreeSet::from(["new"]),
+            &BTreeSet::from(["new", "old", "current"]),
             Instant::now() + Duration::from_secs(10),
         )
         .expect("scope admitted");
@@ -2877,4 +2883,15 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
         claude_census_member_status(&reserved_index, NEW, MONEY_WINDOW, true),
         ClaudeCensusMemberStatus::SafetyIncomplete
     );
+    // A natural unchanged reparse must remain money-retired even when its
+    // reconstructed full safety set no longer fits after NEW's admission.
+    let mut rebuilt = money_record('a', (0..half as u64).collect());
+    rebuilt.retire_transcript_preserving_safety();
+    assert_eq!(reserved_index.claude_request_census_mut_for_test().insert_for_test(OLD, rebuilt), ClaudeRequestCensusInsert::Stored);
+    let rebuilt = reserved_index.claude_request_census_for_test().get(OLD).expect("retirement survives pressure");
+    assert_eq!(rebuilt.retired(), Some(half as u64));
+    assert!(rebuilt.request_hashes().is_empty());
+    assert_eq!(rebuilt.duplicate_safety_hashes().len(), half - 1);
+    assert_eq!(scope(&reserved_index), main_scope, "reparse preserves scoped MONEY bytes");
+
 }
