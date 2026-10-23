@@ -1173,3 +1173,105 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
         "lease consumed only by final answer"
     );
 }
+
+/// The Claude scan index this pipeline's destination uses.
+fn claude_index_path(support: &Path) -> PathBuf {
+    std::fs::read_dir(support.join("snapshots/destinations"))
+        .unwrap()
+        .flatten()
+        .map(|destination| destination.path().join("claude_code-scan-index-v3.json"))
+        .find(|path| path.exists())
+        .expect("the Claude scan index")
+}
+
+/// The local Claude re-emission list.
+fn reemission_list_path(support: &Path) -> PathBuf {
+    support.join("snapshots/claude_code-reemission-exclusions.txt")
+}
+
+/// #712 held-body control for #706 (test-only): a history-held file (stored
+/// revision below the active one, no list, a saved history cutoff after its
+/// birth; the refusal in the ledger is prior history) with a due
+/// original-pair re-offer lease is not re-offered. The lease is granted but
+/// never delivered: no body reaches the server, the refusal and its
+/// original-pair extension stay, nothing is accepted and the hold stays
+/// terminal. Once an installed list lets the upgrade through, the same lease
+/// delivers the exact refused body, so the hold is what blocked it.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
+    if !supported("history_held_file_is_not_reoffered_and_its_lease_is_not_delivered") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-history-held", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(pipeline.server.offered().len(), 1);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+
+    // History-held: every Claude entry stored below the active revision, and
+    // a saved history cutoff at or after every fixture birth.
+    let index_path = claude_index_path(&pipeline.support);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    let files = saved["files"].as_object_mut().expect("indexed files");
+    assert!(!files.is_empty());
+    for entry in files.values_mut() {
+        entry["effective_upload_body_witness_revision"] = 1.into();
+    }
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
+
+    pipeline.server.answer(Answer::Accept);
+    for day in 1..=2 {
+        let due = pipeline.cycle(t0 + day * (DAY + 60));
+        assert!(due.result.is_ok(), "day {day}: {:?}", due.result);
+        assert_eq!(due.leased_offers, 1, "day {day}: the lease is granted");
+        assert_eq!(
+            pipeline.server.offered().len(),
+            1,
+            "day {day}: a history-held body is never re-offered"
+        );
+        let refusal = &due.progress.permanent_rejections[&fingerprint];
+        assert_eq!(refusal.body_witness, refused_body, "day {day}");
+        assert_eq!(
+            reoffer_json(&due, &fingerprint)["reason"],
+            ORIGINAL_PAIR,
+            "day {day}: the lease is not settled"
+        );
+        assert!(!due.progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!due
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(
+            due.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal,
+            "day {day}"
+        );
+        assert!(due
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+    }
+
+    // Positive control: an installed (empty) list paces the upgrade, and the
+    // next due lease delivers the exact refused body.
+    std::fs::write(reemission_list_path(&pipeline.support), "# synthetic\n").unwrap();
+    let permitted = pipeline.cycle(t0 + 3 * (DAY + 60));
+    assert!(permitted.result.is_ok(), "{:?}", permitted.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "the permitted upgrade delivers the lease");
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert!(permitted
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+}
