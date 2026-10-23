@@ -3124,7 +3124,7 @@ pub struct ScanIndex {
     /// Claude only: this index's cutoff was recorded for history another
     /// destination received, under a claim policy other than an explicit
     /// `full` (SOURCE ruling, cross-org move). Kept, so the hold outlives this
-    /// destination's own bootstrap; only an explicit `full` claim lifts it.
+    /// destination's own bootstrap; only an explicit `full` claim clears it.
     #[serde(
         default,
         skip_serializing_if = "std::ops::Not::not",
@@ -35346,6 +35346,11 @@ impl ScanIndex {
             *cutoff = (*cutoff).min(now);
         }
         let first_gated_load = !std::mem::replace(&mut self.claude_history_gate_loaded, true);
+        // An explicit `full` claim lifts a move hold for good: a later
+        // claim with another policy does not bring it back.
+        if claim_policy_full {
+            self.claude_history_move_not_full = false;
+        }
         let moved_not_full = prior_history == PriorHistory::Moved && !claim_policy_full;
         if prior_history.any()
             && (entries_lost
@@ -35361,7 +35366,7 @@ impl ScanIndex {
         }
         self.claude_no_list_policy = if prior_history == PriorHistory::Unverified {
             NoListPolicy::HoldUnverified
-        } else if moved_not_full || (self.claude_history_move_not_full && !claim_policy_full) {
+        } else if moved_not_full || self.claude_history_move_not_full {
             NoListPolicy::HoldMoveNotFull
         } else {
             NoListPolicy::Pace
@@ -37730,8 +37735,8 @@ impl ScanIndex {
                 .or(previous.claude_history_cutoff_unix_seconds),
             claude_history_gate_loaded: self.claude_history_gate_loaded
                 || previous.claude_history_gate_loaded,
-            claude_history_move_not_full: self.claude_history_move_not_full
-                || previous.claude_history_move_not_full,
+            // Not OR-ed with the previous index: a `full` claim clears it.
+            claude_history_move_not_full: self.claude_history_move_not_full,
             claude_no_list_policy: self.claude_no_list_policy,
             claude_history_emission: self.claude_history_emission.clone(),
         };

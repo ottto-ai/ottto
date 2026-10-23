@@ -678,18 +678,37 @@ fn no_list_policy_follows_the_prior_history_evidence() {
         NoListPolicy::Pace,
         "an explicit full claim lifts it"
     );
+    assert!(!index.claude_history_move_not_full, "and clears it");
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::Pace,
+        "a later claim with another policy does not bring it back"
+    );
     let scratch = crate::test_scratch::ScratchDir::new("history-gate-move-kept");
     let path = scratch.join("index.json");
     let mut moved = ScanIndex::default();
     moved.note_claude_history_cutoff(PriorHistory::Moved, false, true);
     moved.save(&path).unwrap();
-    let reloaded = ScanIndex::load(&path).unwrap();
+    let mut reloaded = ScanIndex::load(&path).unwrap();
     assert!(reloaded.claude_history_move_not_full, "persisted");
     assert!(
         reloaded
             .committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new())
             .claude_history_move_not_full
     );
+    // Move, then `full`, then save, reload and a same-destination claim with
+    // another policy: the hold stays lifted.
+    let previous = reloaded.clone();
+    reloaded.note_claude_history_cutoff(PriorHistory::Here, true, false);
+    let mut lifted = reloaded.committable_subset(&previous, &BTreeSet::new(), &BTreeMap::new());
+    assert!(
+        !lifted.claude_history_move_not_full,
+        "a partial commit keeps it lifted"
+    );
+    lifted.save(&path).unwrap();
+    let mut again = ScanIndex::load(&path).unwrap();
+    again.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
 }
 
 /// StateMissing M3 (lenient decode): a malformed gate marker, move marker or
