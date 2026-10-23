@@ -116,11 +116,14 @@ fn lock_is_free(path: &Path) -> bool {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EWOULDBLOCK)
         );
+    } else {
+        // Unlock the shared open file description even if a child inherited it.
+        drop(HeldLock(file.into()));
     }
     free
 }
 
-fn hold_lock(path: &Path) -> fs::File {
+fn hold_lock(path: &Path) -> HeldLock {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -131,7 +134,7 @@ fn hold_lock(path: &Path) -> fs::File {
         0,
         "test takes the lock"
     );
-    file
+    HeldLock(file.into())
 }
 
 fn listing(dir: &Path) -> Vec<(String, u64, i64, i64, i64)> {
