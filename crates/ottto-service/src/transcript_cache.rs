@@ -224,6 +224,45 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         heap_layout_bound::bound(self, usize::MAX)
             .is_some_and(|resident| resident.saturating_sub(older) <= limit)
     }
+    /// M-a's churn bound: `release_older_until`, refusing (evicting nothing)
+    /// unless at most `max_victims` entries ranked strictly below `rank` fit
+    /// `limit` by their stored `heap_bytes` (`older_prefix_len`). The exact
+    /// eviction stops at the first fit, so it never evicts more than that.
+    pub(crate) fn release_older_until_at_most(
+        &mut self,
+        limit: usize,
+        rank: (i64, i64),
+        max_victims: usize,
+    ) -> bool {
+        self.older_prefix_len(limit, rank)
+            .is_some_and(|victims| victims <= max_victims)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// How many entries ranked strictly below `rank`, taken in victim order,
+    /// fit `limit` by their stored `heap_bytes` alone: `Some(0)` when the
+    /// cache fits already, `None` when all of them do not. Allocation-free
+    /// (one ordered pass per victim, as `evict_until` selects them).
+    pub(crate) fn older_prefix_len(&self, limit: usize, rank: (i64, i64)) -> Option<usize> {
+        if heap_layout_bound::bound(self, limit).is_some() {
+            return Some(0);
+        }
+        let mut resident = heap_layout_bound::bound(self, usize::MAX)?;
+        let mut last = None;
+        let mut victims = 0usize;
+        while resident > limit {
+            let (order, entry) = self
+                .entries
+                .values()
+                .filter(|entry| entry.modified_hint < rank)
+                .map(|entry| ((entry.modified_hint, entry.used), entry))
+                .filter(|(order, _)| last.map_or(true, |last| *order > last))
+                .min_by_key(|(order, _)| *order)?;
+            resident = resident.saturating_sub(entry.heap_bytes);
+            last = Some(order);
+            victims = victims.checked_add(1)?;
+        }
+        Some(victims)
+    }
     /// Evict in victim order, only entries ranked strictly below `below`
     /// when given, until the resident state fits `limit`.
     fn evict_until(&mut self, limit: usize, cause: Release, below: Option<(i64, i64)>) -> bool {

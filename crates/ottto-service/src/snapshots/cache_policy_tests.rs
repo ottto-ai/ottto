@@ -1679,3 +1679,375 @@ fn assert_regime_b_retained(passes: &[RegimePass], label: &str) {
         "{label}: R0 released older fillers"
     );
 }
+
+/// Resident entries in victim order: key, admitted rank, stored bytes.
+type Residents = Vec<(String, (i64, i64), usize)>;
+
+fn residents(cache: &sampled_scan::SharedCache) -> Residents {
+    cache.retained().expect("retained cache lock").victims()
+}
+
+/// One M-a control: what a single tail completion proved and released.
+struct MaRun {
+    modes: (usize, usize, usize),
+    counts: Counts,
+    probe: sampled_scan::test_hooks::Probe,
+    decisions: Vec<sampled_scan::test_hooks::Decision>,
+    before: Residents,
+    after: Residents,
+    tail_key: String,
+}
+impl MaRun {
+    fn receipt(&self) -> String {
+        format!(
+            "modes={:?} probe={:?} decisions={:?} admission_evicted={} before={:?} after={:?}",
+            self.modes,
+            self.probe,
+            self.decisions,
+            self.counts.copy_refusal_admission_evicted,
+            self.before,
+            self.after
+        )
+    }
+    fn resident(&self, key: &str) -> Option<(i64, i64)> {
+        self.after
+            .iter()
+            .find(|(resident, _, _)| resident == key)
+            .map(|(_, rank, _)| *rank)
+    }
+}
+
+/// M-a controls at real scale (SS-3 (c)): main's full cache with the
+/// fillers pinned at `fillers_modified` (regime B when older than the
+/// tail), `extra` small Claude entries `(key, mtime)` beside them, then the
+/// tailed file's padded append (a zero copy budget at its step starts),
+/// stamped `tail_modified`, read as one tail with `x_out` in place of the
+/// unwired Claude bound (`x_out_for`). `touch_at_gate` restamps the file
+/// after the proof, just before the deferred path's stamp gate.
+fn m_a_tail(
+    source: SnapshotSource,
+    fillers_modified: u64,
+    tail_modified: u64,
+    extra: &[(&str, u64)],
+    x_out: sampled_scan::XOut,
+    touch_at_gate: Option<u64>,
+) -> MaRun {
+    let FullCache {
+        cache,
+        tailed,
+        index,
+        ..
+    } = full_cache_in(source, false, Some(fillers_modified));
+    for (key, modified) in extra {
+        let entry = ScanFixture::new(SnapshotSource::ClaudeCode);
+        entry.append(&usage(SnapshotSource::ClaudeCode, 100, 0, MODEL));
+        entry.set_modified(*modified);
+        let retained = retained_reduction(&entry);
+        assert!(
+            cache
+                .retained()
+                .expect("retained cache lock")
+                .insert((*key).to_string(), retained),
+            "precondition: {key} is admitted"
+        );
+    }
+    hot_append(source, &tailed, 1, source == SnapshotSource::ClaudeCode);
+    tailed.set_modified(tail_modified);
+    // The scan takes the tailed file's own entry first: never a victim.
+    let tail_key = tailed.key();
+    let before: Residents = residents(&cache)
+        .into_iter()
+        .filter(|(key, _, _)| *key != tail_key)
+        .collect();
+    sampled_scan::test_hooks::clear();
+    sampled_scan::test_hooks::set_x_out(Some(x_out));
+    if let Some(modified) = touch_at_gate {
+        let path = tailed.path.clone();
+        sampled_scan::test_hooks::set(
+            sampled_scan::test_hooks::Point::BeforeStampGate,
+            move || {
+                OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(
+                        fs::FileTimes::new()
+                            .set_modified(UNIX_EPOCH + std::time::Duration::from_secs(modified)),
+                    )
+                    .unwrap();
+            },
+        );
+    }
+    let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
+    let run = MaRun {
+        modes: tail.modes,
+        counts,
+        probe: sampled_scan::test_hooks::last_probe(),
+        decisions: sampled_scan::test_hooks::decisions(),
+        before,
+        after: residents(&cache),
+        tail_key,
+    };
+    sampled_scan::test_hooks::clear();
+    eprintln!("CACHE_POLICY M-a {source:?} {}", run.receipt());
+    assert_eq!(
+        run.modes,
+        (0, 1, 0),
+        "precondition: a tail; {}",
+        run.receipt()
+    );
+    run
+}
+
+/// No mutation besides the tail's own copy: every entry resident before is
+/// resident after, at its rank.
+fn assert_no_victims(run: &MaRun, label: &str) {
+    let receipt = run.receipt();
+    assert_eq!(
+        (
+            run.counts.copy_refusal_admission_evicted,
+            run.counts.copy_refusal_entries_evicted,
+            run.counts.cursor_reservation_entries_evicted,
+            run.counts.insert_entries_evicted,
+            run.counts.clear_entries_released,
+            wipe_clears(&run.counts),
+        ),
+        (0, 0, 0, 0, 0, 0),
+        "{label}: zero victims; {receipt}"
+    );
+    for (key, rank, _) in &run.before {
+        assert_eq!(
+            run.resident(key),
+            Some(*rank),
+            "{label}: {key} stays; {receipt}"
+        );
+    }
+}
+
+/// M-a T2: a Claude completion without an owned X_out (`Refused`), or with
+/// one whose checked arithmetic overflows, releases nothing: the copy is
+/// refused at its pre-release budget and every resident stays.
+#[test]
+fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
+    if unexecuted("M_a_T2") {
+        return;
+    }
+    let now = unix_now();
+    for x_out in [
+        sampled_scan::XOut::Refused,
+        sampled_scan::XOut::Bound(usize::MAX),
+    ] {
+        let run = m_a_tail(
+            SnapshotSource::ClaudeCode,
+            now - OLD_SECONDS,
+            now - 600,
+            &[],
+            x_out,
+            None,
+        );
+        assert_no_victims(&run, &format!("{x_out:?}"));
+        assert!(
+            matches!(
+                run.decisions.as_slice(),
+                [sampled_scan::test_hooks::Decision::Granted { .. }]
+            ),
+            "{x_out:?}: no release is deferred; {}",
+            run.receipt()
+        );
+        assert!(
+            run.resident(&run.tail_key).is_none(),
+            "{x_out:?}: the tail's copy does not fit without a release; {}",
+            run.receipt()
+        );
+    }
+}
+
+/// M-a T8, the positive provable-fit control: an X_out within the clone's
+/// bound (`K' = C`) proves `|P*| = |P_C|`, so exactly the copy-only prefix
+/// of strictly older fillers leaves and the copy is retained. An entry at
+/// the copy's rank and a newer one stay.
+#[test]
+fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
+    if unexecuted("M_a_T8") {
+        return;
+    }
+    let now = unix_now();
+    let tail_modified = now - 600;
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        tail_modified,
+        &[
+            ("cache-policy-equal", tail_modified),
+            ("cache-policy-newer", tail_modified + 300),
+        ],
+        sampled_scan::XOut::Bound(0),
+        None,
+    );
+    let receipt = run.receipt();
+    let (victims, copy_only) = run.probe.prefixes.expect("the prefixes were measured");
+    assert_eq!(victims, copy_only, "|P*| = |P_C|; {receipt}");
+    assert!(
+        copy_only >= 1,
+        "precondition: the copy needs room; {receipt}"
+    );
+    let evicted = run.counts.copy_refusal_admission_evicted as usize;
+    assert!(
+        (1..=copy_only).contains(&evicted),
+        "at most |P_C| leave, by the release only; {receipt}"
+    );
+    let rank = run.probe.rank.expect("the copy's rank");
+    let left: Vec<_> = run
+        .before
+        .iter()
+        .filter(|(key, _, _)| run.resident(key).is_none())
+        .collect();
+    assert_eq!(left.len(), evicted, "{receipt}");
+    assert!(
+        left.iter().all(|(_, hint, _)| *hint < rank),
+        "only strictly older entries leave; {receipt}"
+    );
+    assert!(
+        left.iter()
+            .zip(&run.before)
+            .all(|((key, _, _), (first, _, _))| key == first),
+        "the victim-order prefix leaves; {receipt}"
+    );
+    assert!(run.resident("cache-policy-equal").is_some(), "{receipt}");
+    assert!(run.resident("cache-policy-newer").is_some(), "{receipt}");
+    assert_eq!(
+        run.resident(&run.tail_key),
+        Some(rank),
+        "the copy is retained at its proof's rank; {receipt}"
+    );
+    assert_eq!(
+        (
+            run.counts.copy_refusal_entries_evicted,
+            run.counts.insert_entries_evicted,
+            wipe_clears(&run.counts),
+        ),
+        (0, 0, 0),
+        "{receipt}"
+    );
+}
+
+/// M-a T9 (parent ruling 1), equal rank: fillers stamped at the copy's own
+/// rank are never victims, so a provable X_out still releases nothing.
+#[test]
+fn cache_policy_m_a_equal_rank_is_never_a_victim() {
+    if unexecuted("M_a_T9_equal") {
+        return;
+    }
+    let tail_modified = unix_now() - 600;
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        tail_modified,
+        tail_modified,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        None,
+    );
+    assert_eq!(run.probe.rank, Some((tail_modified as i64, 0)));
+    assert_no_victims(&run, "equal rank");
+}
+
+/// M-a T9, a future mtime is clipped once, and the rank agrees across
+/// proof, release and insert: the copy is admitted at exactly the clipped
+/// rank its release ranked residents against.
+#[test]
+fn cache_policy_m_a_future_mtime_is_clipped_once_and_ranks_agree() {
+    if unexecuted("M_a_T9_future") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now + 3600,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        None,
+    );
+    let receipt = run.receipt();
+    let rank = run.probe.rank.expect("the copy's rank");
+    assert!(
+        rank.0 >= now as i64 && rank < ((now + 3600) as i64, 0),
+        "clipped to the admission clock; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "the release ran; {receipt}"
+    );
+    assert_eq!(
+        run.resident(&run.tail_key),
+        Some(rank),
+        "admitted at the proof's rank, not a later clock; {receipt}"
+    );
+    assert!(
+        run.before
+            .iter()
+            .filter(|(key, _, _)| run.resident(key).is_none())
+            .all(|(_, hint, _)| *hint < rank),
+        "{receipt}"
+    );
+}
+
+/// M-a T9, a failed gate mutates nothing: the file changes after the proof,
+/// so the stamp gate declines and the deferred release never runs.
+#[test]
+fn cache_policy_m_a_failed_gate_releases_nothing() {
+    if unexecuted("M_a_T9_gate") {
+        return;
+    }
+    let now = unix_now();
+    let tail_modified = now - 600;
+    let run = m_a_tail(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        tail_modified,
+        &[],
+        sampled_scan::XOut::Bound(0),
+        Some(tail_modified + 7),
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "precondition: the proof deferred a release; {}",
+        run.receipt()
+    );
+    assert_no_victims(&run, "failed stamp gate");
+}
+
+/// M-a T10, Codex's explicit residual (ruling 5): a Codex completion keeps
+/// `K = max(C, F_prev)` and the Q-PR15 guard whatever X_out says; M-a's
+/// proof never runs for it.
+#[test]
+fn cache_policy_m_a_codex_keeps_the_legacy_release() {
+    if unexecuted("M_a_T10") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail(
+        SnapshotSource::Codex,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        sampled_scan::XOut::Refused,
+        None,
+    );
+    let receipt = run.receipt();
+    assert_eq!(run.probe.x_out, None, "no M-a proof; {receipt}");
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "the legacy release is deferred; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "and runs; {receipt}"
+    );
+}

@@ -21988,12 +21988,13 @@ impl OwnedSourceScan {
                 // `retire_proof_beside_copy`); `copy_budget` is the
                 // pre-release budget, which main's proof retirement and decode
                 // peak reserve against (U1a-2a, #667).
-                let (retain_budget, copy_measure) = if active.cursor.is_some() {
+                let (retain_budget, copy_measure, release_proof) = if active.cursor.is_some() {
                     let (budget, measure) =
                         sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active);
                     (
                         sampled_scan::RetainBudget::granted_unclassified(budget),
                         measure,
+                        None,
                     )
                 } else if active.sampling.is_some()
                     && sampled_scan::codex_cursor::byte_charged(&active)
@@ -22001,6 +22002,7 @@ impl OwnedSourceScan {
                     (
                         sampled_scan::RetainBudget::granted_unclassified(copy_budget),
                         step_measure,
+                        None,
                     )
                 } else if active.sampling.is_some() {
                     if sampled_scan::borrows_only_retained_reduction(&active) {
@@ -22011,12 +22013,17 @@ impl OwnedSourceScan {
                             Some(&mut *active),
                             true,
                         );
-                        (sampled_scan::RetainBudget::from((budget, measure)), measure)
+                        (
+                            sampled_scan::RetainBudget::from((budget, measure)),
+                            measure,
+                            None,
+                        )
                     }
                 } else {
                     (
                         sampled_scan::RetainBudget::granted_unclassified(copy_budget),
                         step_measure,
+                        None,
                     )
                 };
                 let copy_budget = retain_budget.raw();
@@ -22423,14 +22430,27 @@ impl OwnedSourceScan {
                     }
                     // #667: the decode peak is reserved from the budget the
                     // copy is admitted against: main's `copy_budget` above for
-                    // a granted one, and a deferred release's `budget_after`,
-                    // which then runs only if that peak fits too.
-                    let retain_budget = retain_budget.reserve_peak(copy_budget, |budget| {
-                        parser
-                            .accumulator
-                            .claude_responses
-                            .finish_copy_budget(budget)
-                    });
+                    // a granted one. M-a (S-a): only now, after main's proof
+                    // retirement and that reservation, may a shape-F release be
+                    // proven; its `budget_after` is peak-reserved the same way.
+                    let retain_budget = sampled_scan::prove_release(
+                        retain_budget.reserve_peak(copy_budget, |budget| {
+                            parser
+                                .accumulator
+                                .claude_responses
+                                .finish_copy_budget(budget)
+                        }),
+                        release_proof,
+                        sampling.as_ref(),
+                        sampled_scan::x_out_for(source),
+                        |budget| {
+                            parser
+                                .accumulator
+                                .claude_responses
+                                .finish_copy_budget(budget)
+                        },
+                        |limit| parser.accumulator.claude_responses.decode_peak_bound(limit),
+                    );
                     released_finalization_budget = retain_budget.released_budget();
                     #[cfg(test)]
                     sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeRetain);
