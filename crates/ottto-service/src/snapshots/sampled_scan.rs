@@ -15,36 +15,7 @@ const STATE_BYTES: usize =
     CACHE_BYTES - crate::source_rotation::OVERLAP_BUDGET - AUDIT_AND_SCRATCH_BYTES;
 
 pub(super) mod codex_cursor;
-
-#[cfg(test)]
-thread_local! {
-    static TEST_STATE_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// `STATE_BYTES`, or this thread's scaled override (tests only).
-pub(super) fn state_bytes() -> usize {
-    #[cfg(test)]
-    if let Some(bytes) = TEST_STATE_BYTES.with(std::cell::Cell::get) {
-        return bytes;
-    }
-    STATE_BYTES
-}
-
-/// Scale the state budget (here and in the cursor) and the per-entry limit on
-/// this thread for `run` (tests only). Build the `SharedCache` inside `run`.
-#[cfg(test)]
-pub(super) fn with_test_budgets<T>(state: usize, entry: usize, run: impl FnOnce() -> T) -> T {
-    struct Reset(Option<usize>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_STATE_BYTES.with(|bytes| bytes.set(self.0));
-        }
-    }
-    let _reset = Reset(TEST_STATE_BYTES.with(|bytes| bytes.replace(Some(state))));
-    codex_cursor::with_test_state_budget(state, || {
-        crate::transcript_cache::with_test_entry_bytes(entry, run)
-    })
-}
+pub(super) mod side_ledger;
 
 /// The retained-copy cache behind `SharedCache::retained`.
 pub(super) type RetainedCache = TranscriptCache<CachedJsonlReduction>;
@@ -114,12 +85,17 @@ pub(crate) struct SharedCache {
     /// The resumable Codex job slot and held-singleton memo. Charged once,
     /// here; copy budgets and insert admission see it through this cache.
     cursor: Mutex<codex_cursor::CursorState>,
+    /// Codex parent side-request pacing (U1a-2a), process lifetime. A leaf
+    /// lock (retained, then cursor, then side; nothing is locked under it).
+    /// Charged as the fixed `side_ledger::SIDE_LEDGER_BYTES`, never walked.
+    side: Mutex<side_ledger::SideLedger>,
 }
 impl Default for SharedCache {
     fn default() -> Self {
         Self {
-            inner: Mutex::new(TranscriptCache::with_byte_limit(state_bytes())),
+            inner: Mutex::new(TranscriptCache::with_byte_limit(STATE_BYTES)),
             cursor: Mutex::new(codex_cursor::CursorState::default()),
+            side: Mutex::new(side_ledger::SideLedger::default()),
         }
     }
 }
@@ -137,11 +113,16 @@ impl HeapLayoutBound for SharedCache {
             // cursor critical section does), so contention is never read as
             // an unbounded resident.
             self.retained().ok()?.heap_bound(c)?;
-            self.with_cursor(|cursor| cursor.heap_bound(c)).flatten()
+            self.with_cursor(|cursor| cursor.heap_bound(c)).flatten()?;
         } else {
             self.inner.heap_bound(c)?;
-            self.cursor.heap_bound(c)
+            self.cursor.heap_bound(c)?;
         }
+        // Never `side`'s lock: a busy lock would read as unbounded and zero
+        // every copy budget. The ledger's whole heap is this proved constant;
+        // its inline tables are inside `size_of::<SharedCache>()`, which the
+        // caller's `bound` (or `Arc`) charges once (D5′ size test).
+        c.add(side_ledger::SIDE_LEDGER_BYTES)
     }
 }
 impl SharedCache {
@@ -180,28 +161,36 @@ impl SharedCache {
     /// poisoned, the cursor state is unbounded or poisoned, or even an empty
     /// cache would not fit. Evicted copies drop under the retained lock, as
     /// `clear` drops them; no guard or credit drops there, so nothing relocks.
+    /// U1a-2a D6(e): the cursor state is main's, without a suspended proof;
+    /// where the fit is reachable, that proof is retired first, under these
+    /// same locks, if the copies overflow beside it, so its bytes count
+    /// toward the fit before any copy is evicted (`release_room_for_main`).
     pub(super) fn release_to_fit(&self, pinned: usize) -> bool {
         let Ok(mut retained) = self.retained() else {
             return false;
         };
-        let floor = crate::heap_layout_bound::bound(&RetainedCache::default(), state_bytes());
-        state_bytes()
-            .checked_sub(self.cursor_resident())
-            .and_then(|room| room.checked_sub(pinned))
-            .filter(|limit| floor.is_some_and(|floor| floor <= *limit))
-            .is_some_and(|limit| retained.release_until_for(limit, Release::CopyRefusal))
+        let floor = crate::heap_layout_bound::bound(&RetainedCache::default(), STATE_BYTES);
+        let Some(limit) = self.release_room_for_main(&retained, pinned, |limit| {
+            floor.is_some_and(|floor| floor <= limit)
+        }) else {
+            return false;
+        };
+        retained.release_until_for(limit, Release::CopyRefusal)
     }
     /// M1 Path A: `release_to_fit`, evicting only retained copies ranked
     /// strictly below `rank`, and only where evicting them makes room;
-    /// otherwise nothing (`TranscriptCache::release_older_until`).
+    /// otherwise nothing, the suspended proof included
+    /// (`TranscriptCache::release_older_until`, `older_release_fits`).
     pub(super) fn release_older_to_fit(&self, pinned: usize, rank: (i64, i64)) -> bool {
         let Ok(mut retained) = self.retained() else {
             return false;
         };
-        state_bytes()
-            .checked_sub(self.cursor_resident())
-            .and_then(|room| room.checked_sub(pinned))
-            .is_some_and(|limit| retained.release_older_until(limit, rank))
+        let Some(limit) = self.release_room_for_main(&retained, pinned, |limit| {
+            retained.older_release_fits(limit, rank)
+        }) else {
+            return false;
+        };
+        retained.release_older_until(limit, rank)
     }
     pub(super) fn take(
         &self,
@@ -245,15 +234,26 @@ impl SharedCache {
         if let Some(state) = completed.reduction {
             if let Ok(mut cache) = self.retained() {
                 // The whole cursor state (paused job, memo, parked and rotation
-                // records, outstanding claims) keeps its charge: admission may
-                // not fill the state budget underneath it. Measured under the
-                // retained lock, so every claim made before this insert is seen.
+                // records, outstanding claims) and the side ledger's fixed charge
+                // keep their charge: admission may not fill the state budget
+                // underneath them. Measured under the retained lock, so every
+                // claim made before this insert is seen. The side term is the
+                // same constant `heap_bound` adds and cursor admission keeps
+                // (`codex_cursor::admission_budget`, F4b). Slice M order: PR-R,
+                // then M2, extend this reservation; they keep this term.
+                // U1a-2a ss-6: the cursor term is main's (`cursor_resident_for_main`,
+                // no suspended proof), so the insert decides as with no proof;
+                // the proof is then retired under this same lock if the insert
+                // took its room.
                 // `live_bytes` is this copy's own finalization charge: kept on
                 // the entry, so its next shape-F completion reserves it beside
-                // the copy (P1-RETAIN β, `K = max(C, F_prev)`).
-                // A copy whose R0 release ran is admitted at exactly the rank
-                // that release ranked residents against.
-                let reserved = live_bytes.saturating_add(self.cursor_resident());
+                // the copy (P1-RETAIN β, `K = max(C, F_prev)`). A copy whose R0
+                // release ran is admitted at exactly the rank that release
+                // ranked residents against.
+                let live_bytes_in = live_bytes;
+                let reserved = live_bytes
+                    .saturating_add(self.cursor_resident_for_main())
+                    .saturating_add(side_ledger::SIDE_LEDGER_BYTES);
                 cache.insert_reserving_at_rank(
                     key,
                     crate::transcript_cache::Retained {
@@ -264,6 +264,7 @@ impl SharedCache {
                     live_bytes,
                     completed.released,
                 );
+                self.drop_suspended_proof_if_over(&cache, live_bytes_in);
             } else {
                 record(Event::InsertPoisonedLock);
             }
@@ -523,6 +524,24 @@ impl StepMeasure {
     fn visit_limited(&self) -> bool {
         self.active.is_some() && self.used.is_none()
     }
+
+    /// U1a-2a (fix round 2, DB1): the room this walk left in main's view
+    /// (`bound_for_main`) for the copy budget's two equal shares, a retained
+    /// copy and finish/output: `STATE_BYTES - resident - used`, or
+    /// `STATE_BYTES - resident` with no active. The same arithmetic
+    /// `copy_budget_step` halves, on this walk's own fields (no second
+    /// walk; a field would edit M1's unedited test literals). `None`:
+    /// unknown. Read only beside this walk's own non-zero budget, which
+    /// implies a known room, where that budget is allocated against
+    /// (`retire_proof_beside_copy`).
+    pub(super) fn room(&self) -> Option<usize> {
+        let remaining = STATE_BYTES.checked_sub(self.resident?)?;
+        match (self.active, self.used) {
+            (_, Some(used)) => remaining.checked_sub(used),
+            (None, None) => Some(remaining),
+            (Some(_), None) => None,
+        }
+    }
 }
 
 /// The conservative copy-refusal release, given at most a resident bound and
@@ -594,7 +613,7 @@ fn release_for_copy_refusal(
     let (charge, cause) = if !context.audit_metadata_supported {
         (None, Event::ClearMetadataUnsupported)
     } else if native_full_baseline {
-        if crate::heap_layout_bound::bound(context, state_bytes()).is_some() {
+        if crate::heap_layout_bound::bound(context, STATE_BYTES).is_some() {
             return;
         }
         (step.map(|_| 0), Event::ClearFullResidentBoundUnknown)
@@ -607,7 +626,7 @@ fn release_for_copy_refusal(
         // is not a combined native-plus-cache bound.
         if step
             .and_then(|step| step.resident)
-            .is_some_and(|resident| resident <= state_bytes())
+            .is_some_and(|resident| resident <= STATE_BYTES)
         {
             return;
         }
@@ -651,7 +670,7 @@ fn fit_residents(context: &Context, resident: Option<usize>, charge: usize) -> b
     // merely full cache. Nothing is released.
     if resident
         .and_then(|resident| resident.checked_add(charge))
-        .is_some_and(|total| total <= state_bytes())
+        .is_some_and(|total| total <= STATE_BYTES)
     {
         record(Event::CopyRefusalKept);
         return true;
@@ -734,14 +753,17 @@ fn context_overhead(context: &Context) -> Option<usize> {
         completion_overdue_seconds: _,
         admission,
     } = context;
-    // The shared cache's `Arc` payload charge.
+    // The shared cache's `Arc` payload charge, and the side ledger's fixed
+    // charge, which `heap_bound` adds lock-free outside the two locked states
+    // (U1a-2a ss-4, F4b).
     let shared = size_of::<SharedCache>()
         .checked_add(align_of::<SharedCache>())?
-        .checked_add(2 * size_of::<usize>())?;
+        .checked_add(2 * size_of::<usize>())?
+        .checked_add(side_ledger::SIDE_LEDGER_BYTES)?;
     size_of::<Context>()
         .checked_add(shared)?
-        .checked_add(bound(namespace, state_bytes())?)?
-        .checked_add(bound(admission, state_bytes())?)
+        .checked_add(bound(namespace, STATE_BYTES)?)?
+        .checked_add(bound(admission, STATE_BYTES)?)
 }
 
 /// Whether `context_overhead` plus the two locked states covers
@@ -749,13 +771,13 @@ fn context_overhead(context: &Context) -> Option<usize> {
 #[cfg(test)]
 pub(super) fn context_overhead_covers(context: &Context) -> bool {
     use crate::heap_layout_bound::bound;
-    let Some(whole) = bound(context, state_bytes()) else {
+    let Some(whole) = bound(context, STATE_BYTES) else {
         return false;
     };
     let Ok(retained) = context.cache.retained() else {
         return false;
     };
-    bound(&*retained, state_bytes())
+    bound(&*retained, STATE_BYTES)
         .zip(context_overhead(context))
         .and_then(|(retained, overhead)| {
             retained
@@ -766,16 +788,110 @@ pub(super) fn context_overhead_covers(context: &Context) -> bool {
 }
 
 /// A completing cursor job's exact copy budget (E3), with the same
-/// refusal release the step start applies to an ordinary file.
+/// refusal release the step start applies to an ordinary file, and the
+/// walk it came from (for `retire_proof_beside_copy`).
 pub(super) fn completion_copy_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
-) -> usize {
+) -> (usize, StepMeasure) {
     let (budget, step) = copy_budget_step(sampling, Some(&mut *active), true);
     if budget == 0 {
         release_cache_to_fit(sampling, Some(&*active), step);
     }
-    budget
+    (budget, step)
+}
+
+/// U1a-2a (R2-B3, fix round 2 DB1, c22 ruling (b); fix round 3 DM3): main's
+/// copy budget funds two shares at once, a retained copy and finish/output
+/// (`ClaudeResponses::finish_copy_budget`), so before main allocates
+/// against `budget` (its completion's clone and finish), a suspended proof
+/// larger than what both shares leave of `step`'s room is retired:
+/// `proof + copy + finish/output <= room`, the room main's view
+/// (`bound_for_main`) measured without the proof. Both clones admit a copy
+/// only within `min(budget, ENTRY_BYTES)` before they allocate it
+/// (`retain_reduction`'s `retention_bound`, `retain_sealed_prefix`'s
+/// `admitted`), so the copy's share is `min(budget, ENTRY_BYTES)`. The
+/// caller passes 0 where its completion cannot retain a copy. Where no copy
+/// can be allocated (`budget == 0`, which an unknown room always gives)
+/// nothing is retired: no proof drops on unavailable inputs. Non-allocating
+/// steps never call this, and M1 Path A (`admit_tail_copy`) clones nothing
+/// at its zero-budget step.
+pub(super) fn retire_proof_beside_copy(
+    sampling: Option<&Context>,
+    budget: usize,
+    step: StepMeasure,
+) {
+    if budget == 0 {
+        return;
+    }
+    let Some((context, room)) = sampling.zip(step.room()) else {
+        return;
+    };
+    context
+        .cache
+        .retire_proof_over_room(room.saturating_sub(copy_shares(budget)));
+    #[cfg(test)]
+    COPY_RETIRE_PROBE.with(|probe| {
+        let whole = crate::heap_layout_bound::bound(context, STATE_BYTES);
+        let main = codex_cursor::bound_for_main(context, STATE_BYTES);
+        probe.set(Some(CopyRetireProbe {
+            proof: whole
+                .zip(main)
+                .and_then(|(whole, main)| whole.checked_sub(main)),
+            resident: step.resident,
+            used: step.used.unwrap_or(0),
+            budget,
+        }))
+    });
+}
+
+/// U1a-2a (fix round 3, DM3): the finish/output share plus the copy's share,
+/// which both clones cap at `ENTRY_BYTES` before they allocate.
+fn copy_shares(budget: usize) -> usize {
+    budget.saturating_add(budget.min(ENTRY_BYTES))
+}
+
+/// Tests only: what `retire_proof_beside_copy` saw right after its retire.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CopyRetireProbe {
+    /// The suspended proof's charge left beside the copy (`bound(context)`
+    /// less main's view, measured together, so main's own growth since the
+    /// walk cancels).
+    pub(super) proof: Option<usize>,
+    /// The walk's main-view resident, its active charge and the budget.
+    pub(super) resident: Option<usize>,
+    pub(super) used: usize,
+    pub(super) budget: usize,
+}
+#[cfg(test)]
+impl CopyRetireProbe {
+    /// At the clone: the walk's resident + the proof + the active + both
+    /// shares (`copy_shares`) fit `STATE_BYTES`.
+    pub(super) fn fits(&self) -> bool {
+        self.resident
+            .zip(self.proof)
+            .and_then(|(resident, proof)| {
+                resident
+                    .checked_add(proof)?
+                    .checked_add(self.used)?
+                    .checked_add(copy_shares(self.budget))
+            })
+            .is_some_and(|total| total <= STATE_BYTES)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: the last `retire_proof_beside_copy` on this thread.
+    static COPY_RETIRE_PROBE: std::cell::Cell<Option<CopyRetireProbe>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Tests only: the last `COPY_RETIRE_PROBE` on this thread, taken.
+#[cfg(test)]
+pub(super) fn copy_retire_probe() -> Option<CopyRetireProbe> {
+    COPY_RETIRE_PROBE.with(std::cell::Cell::take)
 }
 
 /// The copy budget left beside the active file. A cursor job's state grows
@@ -796,8 +912,13 @@ pub(super) fn copy_budget_step(
     let Some(context) = sampling.filter(|context| context.audit_metadata_supported) else {
         return (0, StepMeasure::default());
     };
-    let resident = crate::heap_layout_bound::bound(context, state_bytes());
-    let remaining = resident.and_then(|resident| state_bytes().checked_sub(resident));
+    // U1a-2a (R2-B3): main's view, any suspended proof charged as none, so
+    // optional proof work never shrinks a copy budget. It is no allocation
+    // authority either: the walk's `room` goes with the budget, and where
+    // main allocates against it the proof is retired first
+    // (`retire_proof_beside_copy`, fix round 2 DB1).
+    let resident = codex_cursor::bound_for_main(context, STATE_BYTES);
+    let remaining = resident.and_then(|resident| STATE_BYTES.checked_sub(resident));
     let Some(active) = active else {
         let budget = remaining.map_or(0, |remaining| remaining / 2);
         return (
@@ -820,9 +941,9 @@ pub(super) fn copy_budget_step(
     // (M1; F2 for a byte-charged job). The budget below is unchanged: it
     // still charges the walk against the measured remainder.
     let limit = if byte_charged {
-        state_bytes()
+        STATE_BYTES
     } else {
-        state_bytes().saturating_add(buffer)
+        STATE_BYTES.saturating_add(buffer)
     };
     // (the budget's charge, the refusal's optional charge)
     let (used, optional) = if let Some(estimate) = estimate {
@@ -874,11 +995,10 @@ pub(super) fn copy_budget_step(
             )
         }
     };
-    let budget = remaining
+    let room = remaining
         .zip(used)
-        .and_then(|(remaining, used)| remaining.checked_sub(used))
-        .map(|remaining| remaining / 2)
-        .unwrap_or(0);
+        .and_then(|(remaining, used)| remaining.checked_sub(used));
+    let budget = room.map_or(0, |room| room / 2);
     (
         budget,
         StepMeasure {
@@ -932,16 +1052,50 @@ impl RetainBudget {
             | Self::Deferred { raw, .. } => *raw,
         }
     }
-    /// The finalization copy's limits, taken before this budget moves into a
-    /// retention call. Which one applies depends on what retention did
-    /// (`FinalizationBudget::after`).
-    pub(super) fn finalization(&self) -> FinalizationBudget {
-        FinalizationBudget {
-            raw: self.raw(),
-            released: match self {
-                Self::Deferred { budget_after, .. } => Some(*budget_after),
-                _ => None,
+    /// #667's decode peak reserved from the budget a copy is admitted
+    /// against (`ClaudeResponses::finish_copy_budget`, `finish`): `granted`
+    /// is main's already peak-reserved pre-release budget; a deferred
+    /// release keeps running only where `finish_copy_budget(budget_after)`
+    /// fits too, and is otherwise dropped unrun (granted at `granted`), so a
+    /// release never precedes an unfunded peak. Excluded and unsealed budgets
+    /// are never admitted and keep their pre-release figure.
+    pub(super) fn reserve_peak(
+        self,
+        granted: usize,
+        finish_copy_budget: impl FnOnce(usize) -> Option<usize>,
+    ) -> Self {
+        match self {
+            Self::Granted {
+                resident_measured,
+                active_measured,
+                ..
+            } => Self::Granted {
+                budget: granted,
+                resident_measured,
+                active_measured,
             },
+            Self::Deferred {
+                budget_after,
+                release,
+                ..
+            } => match finish_copy_budget(budget_after) {
+                Some(budget_after) => Self::Deferred {
+                    raw: granted,
+                    budget_after,
+                    release,
+                },
+                None => Self::granted_unclassified(granted),
+            },
+            other => other,
+        }
+    }
+    /// A deferred release's (peak-reserved) `budget_after`: the finalization
+    /// copy's limit once that release has actually run
+    /// (`CompletedNativeAcquisition::released`); `None` otherwise.
+    pub(super) fn released_budget(&self) -> Option<usize> {
+        match self {
+            Self::Deferred { budget_after, .. } => Some(*budget_after),
+            _ => None,
         }
     }
     /// What a retained copy is admitted against without a deferred release:
@@ -982,24 +1136,6 @@ impl From<(usize, StepMeasure)> for RetainBudget {
     }
 }
 
-/// The finalization copy's limit for one completion: its pre-release budget,
-/// or `budget_after` once its deferred release has actually run
-/// (`CompletedNativeAcquisition::released`). A release that was refused,
-/// raced, or never reached leaves the pre-release budget.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct FinalizationBudget {
-    raw: usize,
-    released: Option<usize>,
-}
-impl FinalizationBudget {
-    pub(super) fn after(self, released: bool) -> usize {
-        match self.released {
-            Some(budget_after) if released => budget_after,
-            _ => self.raw,
-        }
-    }
-}
-
 /// How a deferred release ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReleaseOutcome {
@@ -1020,8 +1156,14 @@ pub(super) enum ReleaseOutcome {
 /// exact prefix evicts nothing.
 pub(super) struct DeferredRelease {
     cache: Arc<SharedCache>,
-    /// `R − need`, in the retained cache's bound units.
-    target: usize,
+    /// What must fit beside the retained copies after the release, besides
+    /// main's cursor state: the context's own charge (the side ledger's
+    /// fixed charge once, `context_overhead`), the copy's clone and
+    /// finish/output (`2K`) and `max(A, ins_extra)`. With main's cursor
+    /// state measured at the release, the retained copies' limit is
+    /// `STATE_BYTES - cursor - pinned`, the completion's `R - need`
+    /// (`SharedCache::release_older_to_fit`).
+    pinned: usize,
     /// The copy's re-admission rank, computed once
     /// (`transcript_cache::admission_rank` of `modified`): only residents
     /// ranked strictly below it leave, and the copy is admitted at exactly it.
@@ -1029,28 +1171,33 @@ pub(super) struct DeferredRelease {
     /// The source mtime `rank` was computed from (the read plan's stamp). A
     /// checkpoint carrying any other releases nothing.
     pub(super) modified: (i64, i64),
-    /// `entry_bytes() − entry_overhead − bound(key)`: the copy's admission
+    /// `ENTRY_BYTES − entry_overhead − bound(key)`: the copy's admission
     /// limit, so the insert's entry and key bounds cannot refuse it (e).
     pub(super) entry_limit: usize,
 }
 impl DeferredRelease {
-    /// Re-measure and re-check under the retained lock, then release exactly
-    /// the lower-ranked prefix through the cache's one eviction path
-    /// (`TranscriptCache::release_older_prefix`, `Release::CopyAdmission`).
-    /// A race, a poisoned lock or an unmeasurable cache evicts nothing.
+    /// Release through M1's one mechanism (`SharedCache::release_older_to_fit`,
+    /// U1a-2a D6(e)): under the retained and cursor locks, a suspended proof
+    /// is retired first where the fit is reachable, then the shortest
+    /// victim-order prefix ranked strictly below `rank` is evicted
+    /// (`Release::CopyAdmission`), fit-or-nothing. Already fitting evicts
+    /// nothing. A poisoned lock or an unmeasurable cache (classified first,
+    /// for the packet only) or a fit the lower-ranked entries cannot reach
+    /// evicts nothing.
     pub(super) fn execute(self) -> ReleaseOutcome {
-        let Ok(mut retained) = self.cache.retained() else {
+        let measured = self
+            .cache
+            .retained()
+            .ok()
+            .and_then(|retained| crate::heap_layout_bound::bound(&*retained, usize::MAX))
+            .is_some();
+        if !measured {
             return ReleaseOutcome::Unmeasurable;
-        };
-        let Some(resident) = crate::heap_layout_bound::bound(&*retained, usize::MAX) else {
-            return ReleaseOutcome::Unmeasurable;
-        };
-        let Some(need) = resident.checked_sub(self.target).filter(|need| *need > 0) else {
-            return ReleaseOutcome::Released;
-        };
-        match retained.release_older_prefix(self.rank, need) {
-            Some(_) => ReleaseOutcome::Released,
-            None => ReleaseOutcome::Race,
+        }
+        if self.cache.release_older_to_fit(self.pinned, self.rank) {
+            ReleaseOutcome::Released
+        } else {
+            ReleaseOutcome::Race
         }
     }
 }
@@ -1071,10 +1218,14 @@ impl DeferredRelease {
 /// (Q-PR14, `release_for_copy_refusal`).
 ///
 /// The measure is the step walk's (`copy_budget_step`, completing), taken
-/// under blocking locks: `A` is the active's whole walk (`StepMeasure::used`)
-/// and the room is the state budget less the residents. An unmeasured part
-/// (residents, a visit-limited or over-budget active) grants nothing and
-/// releases nothing.
+/// under blocking locks and main's view (`bound_for_main`, so a suspended
+/// proof never inflates the need): `A` is the active's whole walk
+/// (`StepMeasure::used`) and the room is the state budget less the
+/// residents. An unmeasured part (residents, a visit-limited or over-budget
+/// active) grants nothing and releases nothing. Feasibility is the shared
+/// release's own precheck (`older_release_fits`), and the release is
+/// `release_older_to_fit`, so the proof is retired first and there is one
+/// release path.
 ///
 /// `K = max(C, F_prev)` (Q-PR13(iii) β): the clone charge, or the
 /// finalization charge reserved beside the copy at its last admission. The
@@ -1091,17 +1242,18 @@ impl DeferredRelease {
 pub(super) fn tail_completion_budget(
     sampling: Option<&Context>,
     active: &mut OwnedActiveFile,
-) -> RetainBudget {
-    // 1. Measure, waiting on the locks.
+) -> (RetainBudget, StepMeasure) {
+    // 1. Measure, waiting on the locks, in main's view (`copy_budget_step`
+    // walks `bound_for_main`): a suspended proof never inflates `need`.
     let (budget, step) = {
         let _blocking = BlockingResidentMeasure::enter();
         copy_budget_step(sampling, Some(&mut *active), true)
     };
-    let measured = RetainBudget::from((budget, step));
+    let measured = (RetainBudget::from((budget, step)), step);
     let (Some(context), Some(resident), Some(a)) = (sampling, step.resident, step.used) else {
         return measured;
     };
-    let Some(remaining) = state_bytes().checked_sub(resident) else {
+    let Some(remaining) = STATE_BYTES.checked_sub(resident) else {
         return measured;
     };
     let Some(file) = active.sampling.as_ref() else {
@@ -1115,11 +1267,14 @@ pub(super) fn tail_completion_budget(
     // 2. The insert-aware budget, computed before the clone charge.
     let Some(slot) = crate::transcript_cache::entry_slot_bytes::<CachedJsonlReduction>(key_len)
     else {
-        return RetainBudget::Granted {
-            budget: 0,
-            resident_measured: true,
-            active_measured: true,
-        };
+        return (
+            RetainBudget::Granted {
+                budget: 0,
+                resident_measured: true,
+                active_measured: true,
+            },
+            step,
+        );
     };
     let ins_extra = slot.saturating_sub(
         std::mem::size_of::<CachedJsonlReduction>()
@@ -1148,9 +1303,9 @@ pub(super) fn tail_completion_budget(
     });
     let Some(clone) = active
         .parser
-        .retention_bound(crate::transcript_cache::entry_bytes())
+        .retention_bound(crate::transcript_cache::ENTRY_BYTES)
     else {
-        return granted;
+        return (granted, step);
     };
     let k = clone.max(finalization_prev);
     #[cfg(test)]
@@ -1167,22 +1322,22 @@ pub(super) fn tail_completion_budget(
         .and_then(|total| total.checked_sub(remaining))
         .filter(|need| *need > 0)
     else {
-        return granted;
+        return (granted, step);
     };
     #[cfg(test)]
     test_hooks::probe(|probe| probe.need = Some(need));
-    let Some(entry_limit) = crate::transcript_cache::entry_bytes()
+    let Some(entry_limit) = crate::transcript_cache::ENTRY_BYTES
         .checked_sub(crate::transcript_cache::entry_overhead::<
             CachedJsonlReduction,
         >())
         .zip(key_bound)
         .and_then(|(limit, key)| limit.checked_sub(key))
     else {
-        return granted;
+        return (granted, step);
     };
     // In the entry/key band the insert would refuse it: never release for it.
     if clone > entry_limit {
-        return granted;
+        return (granted, step);
     }
     // Q-PR15 (b): the conservative finalization guard (see above).
     if finalization_prev > clone
@@ -1190,41 +1345,57 @@ pub(super) fn tail_completion_budget(
     {
         #[cfg(test)]
         test_hooks::probe(|probe| probe.finalization_guard = true);
-        return granted;
+        return (granted, step);
     }
     // 3. The re-admission rank, once; only a continued copy with a plan.
     if !continued {
-        return granted;
+        return (granted, step);
     }
     let Some(modified) = active.parser.planned_modified_hint() else {
-        return granted;
+        return (granted, step);
     };
     let rank =
         crate::transcript_cache::admission_rank(modified, crate::transcript_cache::admission_now());
     #[cfg(test)]
     test_hooks::probe(|probe| probe.rank = Some(rank));
-    // 4. Exact feasibility under the retained lock, without mutating.
+    // 4. What must fit beside the retained copies after the release:
+    // `R - need = STATE_BYTES - cursor - pinned`, with the context's own
+    // charge (the side ledger once) in `pinned` (`DeferredRelease::pinned`).
+    let Some(pinned) = context_overhead(context)
+        .and_then(|overhead| overhead.checked_add(k.checked_mul(2)?))
+        .and_then(|pinned| pinned.checked_add(floor))
+    else {
+        return (granted, step);
+    };
+    // 5. Feasibility under the retained lock, without mutating: the
+    // lower-ranked entries can make the copies fit `R - need`
+    // (`older_release_fits`, the test `release_older_to_fit` repeats).
     let Ok(retained) = context.cache.retained() else {
-        return granted;
+        return (granted, step);
     };
-    let Some(resident) = crate::heap_layout_bound::bound(&*retained, usize::MAX) else {
-        return granted;
+    let Some(target) = crate::heap_layout_bound::bound(&*retained, usize::MAX)
+        .and_then(|resident| resident.checked_sub(need))
+    else {
+        return (granted, step);
     };
-    if resident < need || retained.release_prefix(rank, need).is_none() {
-        return granted;
+    if !retained.older_release_fits(target, rank) {
+        return (granted, step);
     }
     drop(retained);
-    RetainBudget::Deferred {
-        raw: b_ins,
-        budget_after: k,
-        release: DeferredRelease {
-            cache: Arc::clone(&context.cache),
-            target: resident - need,
-            rank,
-            modified,
-            entry_limit,
+    (
+        RetainBudget::Deferred {
+            raw: b_ins,
+            budget_after: k,
+            release: DeferredRelease {
+                cache: Arc::clone(&context.cache),
+                pinned,
+                rank,
+                modified,
+                entry_limit,
+            },
         },
-    }
+        step,
+    )
 }
 
 /// Completion hooks and recorders (tests only). Nothing here runs in a

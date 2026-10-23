@@ -41,6 +41,8 @@ pub(super) struct Starting {
     new_retry_attempt: u8,
     pub(super) stale_pending_families: usize,
     pub(super) rearmed_index_files: usize,
+    pub(super) carried_pending_families: usize,
+    pub(super) carried_index_files: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -82,6 +84,8 @@ impl Starting {
             new_retry_attempt: attempt,
             stale_pending_families: 0,
             rearmed_index_files: 0,
+            carried_pending_families: 0,
+            carried_index_files: 0,
         }
     }
 
@@ -182,6 +186,19 @@ mod tests {
                 .len(),
             4
         );
+        let sites = first[0]["counts"]["disappearance_process_totals_v1"]["not_found_sites"]
+            .as_array()
+            .unwrap();
+        assert_eq!(sites.len(), 5);
+        assert!(sites
+            .iter()
+            .all(|site| site.as_array().is_some_and(|slots| slots.len() == 2)));
+        for vanished in [
+            "vanished_audit_debt_dropped",
+            "vanished_request_census_removed",
+        ] {
+            assert!(first[0]["counts"]["disappearance_process_totals_v1"][vanished].is_u64());
+        }
         assert!(first[0]["counts"]["disappearance_process_totals_v1"]["overflowed"].is_boolean());
         assert_eq!(
             first[0]["counts"]["window_unix_seconds"],
@@ -409,9 +426,12 @@ mod tests {
         assert_eq!(
             totals,
             &json!({"version":1,"scope":"process_lifetime_not_window",
-            "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],"overflowed":true})
+            "counts":[u64::MAX,u64::MAX,u64::MAX,u64::MAX],
+            "not_found_sites":([[u64::MAX, u64::MAX]; 5]),
+            "vanished_audit_debt_dropped":u64::MAX,
+            "vanished_request_census_removed":u64::MAX,"overflowed":true})
         );
-        assert_eq!(totals.as_object().unwrap().len(), 4);
+        assert_eq!(totals.as_object().unwrap().len(), 7);
         assert_eq!(row["observation"]["wall_elapsed_us"], 0);
         for field in [
             "shared_process_cpu_delta_us",
@@ -460,6 +480,8 @@ mod tests {
             starting.retry_due = Some(false);
             starting.stale_pending_families = usize::MAX;
             starting.rearmed_index_files = usize::MAX;
+            starting.carried_pending_families = usize::MAX;
+            starting.carried_index_files = usize::MAX;
             starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
             let previous = starting.previous.as_mut().unwrap();
             previous.window_unix_seconds = Some(u64::MAX);

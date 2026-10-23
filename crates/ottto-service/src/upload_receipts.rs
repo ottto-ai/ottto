@@ -119,6 +119,17 @@ pub(crate) enum RejectedUsageReason {
 }
 
 impl RejectedUsageReason {
+    /// The backend already holds an equal-or-better (authority downgrade) or
+    /// newer (stale older upload) accepted record for this entity. Refusing
+    /// the body loses no usage the server does not already own.
+    pub(crate) fn is_dominated(self) -> bool {
+        matches!(
+            self,
+            RejectedUsageReason::UsageAccountingAuthorityDowngrade
+                | RejectedUsageReason::AcceptedLogStaleOlderUpload
+        )
+    }
+
     pub(crate) fn from_wire(reason: &str) -> Self {
         match reason {
             "usage_accounting_authority_downgrade" => {
@@ -1119,6 +1130,7 @@ mod tests {
                 body_witness_digest: None,
                 head_etag: None,
                 head_challenge: None,
+                unchanged_basis: None,
             }],
             unchanged_entities: Vec::new(),
             rejected_entities: Vec::new(),

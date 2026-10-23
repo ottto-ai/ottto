@@ -11,34 +11,6 @@ pub(crate) const CACHE_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) const ENTRY_BYTES: usize = 8 * 1024 * 1024;
 pub(crate) const CACHE_ENTRIES: usize = 256;
 
-#[cfg(test)]
-thread_local! {
-    static TEST_ENTRY_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
-}
-
-/// `ENTRY_BYTES`, or this thread's scaled override (tests only).
-pub(crate) fn entry_bytes() -> usize {
-    #[cfg(test)]
-    if let Some(bytes) = TEST_ENTRY_BYTES.with(std::cell::Cell::get) {
-        return bytes;
-    }
-    ENTRY_BYTES
-}
-
-/// Scale `entry_bytes()` on this thread for `run` (tests only). Caches built
-/// inside `run` keep the scaled per-entry limit.
-#[cfg(test)]
-pub(crate) fn with_test_entry_bytes<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
-    struct Reset(Option<usize>);
-    impl Drop for Reset {
-        fn drop(&mut self) {
-            TEST_ENTRY_BYTES.with(|limit| limit.set(self.0));
-        }
-    }
-    let _reset = Reset(TEST_ENTRY_BYTES.with(|limit| limit.replace(Some(bytes))));
-    run()
-}
-
 /// Explicit adapter opt-in: a retained graph must have no externally mutable
 /// allocation. HeapLayoutBound alone also supports Arc/Mutex graphs, whose
 /// measured capacities could change without transferring ownership back out.
@@ -102,8 +74,8 @@ pub(crate) enum Release {
     /// Room for a tail's own copy, from entries ranked strictly older than
     /// the tailed file only: a non-F tail's zero-budget step start (M1 Path
     /// A), and a shape-F completion's exact prefix ranked below its copy's
-    /// re-admission rank after every non-budget gate (P1-RETAIN R0,
-    /// `release_older_prefix`).
+    /// re-admission rank after every non-budget gate (P1-RETAIN R0, through
+    /// the same `release_older_until`).
     CopyAdmission,
 }
 
@@ -181,7 +153,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for TranscriptCache<S> {
 }
 impl<S: FrozenCacheState> Default for TranscriptCache<S> {
     fn default() -> Self {
-        Self::new(CACHE_BYTES, entry_bytes(), CACHE_ENTRIES)
+        Self::new(CACHE_BYTES, ENTRY_BYTES, CACHE_ENTRIES)
     }
 }
 impl<S: FrozenCacheState> TranscriptCache<S> {
@@ -195,7 +167,7 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         }
     }
     pub(crate) fn with_byte_limit(byte_limit: usize) -> Self {
-        Self::new(byte_limit, entry_bytes(), CACHE_ENTRIES)
+        Self::new(byte_limit, ENTRY_BYTES, CACHE_ENTRIES)
     }
     /// Moves state into the existing active frame: there is no cached duplicate
     /// while the provider mutates it. The active frame must count this allocation
@@ -233,6 +205,14 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// unless evicting all of them fits `limit` by their stored `heap_bytes`
     /// alone, a lower bound on what each eviction frees.
     pub(crate) fn release_older_until(&mut self, limit: usize, rank: (i64, i64)) -> bool {
+        self.older_release_fits(limit, rank)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// `release_older_until`'s fit-or-nothing test, evicting nothing: the
+    /// cache fits `limit` already, or evicting every entry ranked strictly
+    /// below `rank` fits it by their stored `heap_bytes` alone (U1a-2a
+    /// D6(e): a suspended proof is retired only where Path A can fit).
+    pub(crate) fn older_release_fits(&self, limit: usize, rank: (i64, i64)) -> bool {
         if heap_layout_bound::bound(self, limit).is_some() {
             return true;
         }
@@ -243,7 +223,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .fold(0usize, |sum, entry| sum.saturating_add(entry.heap_bytes));
         heap_layout_bound::bound(self, usize::MAX)
             .is_some_and(|resident| resident.saturating_sub(older) <= limit)
-            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
     }
     /// Evict in victim order, only entries ranked strictly below `below`
     /// when given, until the resident state fits `limit`.
@@ -276,53 +255,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
                 }
             }
         }
-    }
-    /// The shortest victim-order prefix of entries admitted with a hint
-    /// strictly older than `rank` whose removal frees at least `need`
-    /// bytes of this cache's bound: `(count, freed)`. `None` when every such
-    /// entry together frees less, or the arithmetic overflows. Each entry
-    /// frees exactly `entry_slot_bytes(key.capacity()) + heap_bytes`. Mutates
-    /// nothing.
-    pub(crate) fn release_prefix(&self, rank: (i64, i64), need: usize) -> Option<(usize, usize)> {
-        let mut order = self
-            .entries
-            .iter()
-            .filter(|(_, entry)| entry.modified_hint < rank)
-            .map(|(key, entry)| ((entry.modified_hint, entry.used), key, entry))
-            .collect::<Vec<_>>();
-        order.sort_unstable_by_key(|(rank, _, _)| *rank);
-        // Global victim order ranks by hint first, so the lower-ranked entries
-        // are exactly its first entries.
-        let older = order.len();
-        let mut freed = 0usize;
-        for (count, (_, key, entry)) in order.into_iter().enumerate() {
-            if freed >= need {
-                return Some((count, freed));
-            }
-            freed = freed
-                .checked_add(entry_slot_bytes::<S>(key.capacity())?)?
-                .checked_add(entry.heap_bytes)?;
-        }
-        (freed >= need).then_some((older, freed))
-    }
-    /// P1-RETAIN R0: evict exactly the `release_prefix(rank, need)` victims,
-    /// through `evict_until` restricted to entries ranked strictly below
-    /// `rank`, so an entry ranked at or above it never leaves
-    /// whatever the arithmetic says. Counted under `Release::CopyAdmission`.
-    /// `None`, with nothing evicted, when the lower-ranked entries together
-    /// cannot free `need` or the cache cannot be measured; otherwise how many
-    /// entries left.
-    pub(crate) fn release_older_prefix(&mut self, rank: (i64, i64), need: usize) -> Option<usize> {
-        let (count, freed) = self.release_prefix(rank, need)?;
-        let limit = heap_layout_bound::bound(self, usize::MAX)?.checked_sub(freed)?;
-        let before = self.entries.len();
-        let fitted = self.evict_until(limit, Release::CopyAdmission, Some(rank));
-        let evicted = before - self.entries.len();
-        // `freed` is exact (`entry_slot_bytes`), so the loop stops at the
-        // prefix end.
-        debug_assert!(fitted);
-        debug_assert_eq!(evicted, count);
-        Some(evicted)
     }
     /// Resident entries (tests only).
     #[cfg(test)]
@@ -898,14 +830,6 @@ mod tests {
             let slot = entry_slot_bytes::<String>(capacity).unwrap();
             let after = cache.resident_bound().unwrap();
             assert_eq!(after - before, slot + heap_bytes, "insert {key}");
-            assert_eq!(
-                cache.release_prefix((30, 0), 1),
-                Some((
-                    1,
-                    entry_slot_bytes::<String>(8).unwrap() + cache.entries["resident"].heap_bytes
-                )),
-                "the oldest resident is the whole first prefix step"
-            );
             cache.remove(&key);
             assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
         }
@@ -918,10 +842,12 @@ mod tests {
         );
     }
 
-    /// The prefix is the strict older-hint start of victim order, sized by the
-    /// exact freed bytes, and mutates nothing.
+    /// P1-RETAIN R0 releases through M1's `release_older_until` (c22 integ1
+    /// ruling 6): only entries ranked strictly below the rank leave, in victim
+    /// order, the shortest prefix that fits; an unreachable fit evicts
+    /// nothing; equal and newer hints never leave.
     #[test]
-    fn release_prefix_is_exact_and_strictly_older_than_the_file_hint() {
+    fn release_older_until_is_fit_or_nothing_and_strictly_older() {
         if !heap_layout_bound::layout_supported() {
             return;
         }
@@ -930,7 +856,7 @@ mod tests {
         for (key, modified) in [("old", 10), ("mid", 20), ("same", 30), ("new", 40)] {
             assert!(cache.insert_at(
                 key.into(),
-                retained_at(key.repeat(50), Some(modified)),
+                retained_at(key.repeat(5_000), Some(modified)),
                 0,
                 at
             ));
@@ -941,26 +867,19 @@ mod tests {
         let (old, mid) = (freed("old"), freed("mid"));
         let hint = cache.entries["same"].modified_hint;
         assert_eq!(hint, (30, 0));
-        let before = cache.resident_bound();
-        assert_eq!(cache.release_prefix(hint, 0), Some((0, 0)));
-        assert_eq!(cache.release_prefix(hint, 1), Some((1, old)));
-        assert_eq!(cache.release_prefix(hint, old), Some((1, old)));
-        assert_eq!(cache.release_prefix(hint, old + 1), Some((2, old + mid)));
-        assert_eq!(cache.release_prefix(hint, old + mid), Some((2, old + mid)));
-        // `same` and `new` are never candidates: equal or newer hints.
-        assert_eq!(cache.release_prefix(hint, old + mid + 1), None);
-        assert_eq!(cache.resident_bound(), before, "nothing is mutated");
-        assert_eq!(cache.entry_count(), 4);
-        assert_eq!(cache.release_older_prefix(hint, old + mid + 1), None);
-        assert_eq!(
-            cache.resident_bound(),
-            before,
-            "an infeasible prefix evicts nothing"
-        );
-        // The release itself frees exactly the prefix, under `CopyAdmission`.
         let resident = cache.resident_bound().unwrap();
+        // Already fitting evicts nothing.
+        assert!(cache.older_release_fits(resident, hint));
+        // `same` and `new` are never candidates: an unreachable fit evicts
+        // nothing.
+        let unreachable = resident - old - mid - 1;
+        assert!(!cache.older_release_fits(unreachable, hint));
+        assert!(!cache.release_older_until(unreachable, hint));
+        assert_eq!(cache.resident_bound().unwrap(), resident);
+        assert_eq!(cache.entry_count(), 4);
+        // The release frees exactly the shortest prefix, under `CopyAdmission`.
         let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
-            assert_eq!(cache.release_older_prefix(hint, old + 1), Some(2));
+            assert!(cache.release_older_until(resident - old - 1, hint));
         });
         assert_eq!(counts.copy_refusal_admission_evicted, 2);
         assert!(counts.copy_refusal_bytes_released > 0);

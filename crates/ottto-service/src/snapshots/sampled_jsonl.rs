@@ -52,12 +52,31 @@ pub(super) struct CompletedNativeAcquisition {
     pub(super) reduction: Option<CachedJsonlReduction>,
     /// `Some(rank)`: this completion's deferred release ran (P1-RETAIN R0)
     /// against `rank`, the copy's re-admission rank, so the copy is admitted
-    /// at exactly that rank and its finalization copy is limited by
-    /// `budget_after`, not the pre-release budget
-    /// (`sampled_scan::FinalizationBudget`).
+    /// at exactly that rank and its finalization copy is limited by its
+    /// peak-reserved `budget_after`, not the pre-release budget
+    /// (`sampled_scan::RetainBudget::released_budget`).
     pub(super) released: Option<(i64, i64)>,
+    /// Native EOF applied bytes past the sealed offset (an unterminated final
+    /// row), so the reduction is not the reduction through `checkpoint`. A
+    /// cursor certificate does not compute it and reports `true` (fail-closed);
+    /// its own bit is the job's `eof_applied` or `fragment`.
+    pub(super) unsealed: bool,
 }
-crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released);
+crate::heap_layout_bound::fields!(CompletedNativeAcquisition; checkpoint, reduction, released, unsealed);
+
+/// A side read's certificate (U1a-2a): no retained copy and no cache event.
+#[allow(clippy::large_enum_variant)] // Moved once to the side exit; never stored.
+pub(super) enum SideCertificate {
+    /// `len` is the held file's length when the certificate was committed.
+    Certified {
+        completed: CompletedNativeAcquisition,
+        len: u64,
+    },
+    /// Data loss in the source report: the same bytes give the same loss.
+    Lossy,
+    /// No certificate for any other reason.
+    Uncertified,
+}
 
 // Source-scan dependencies are refreshed on reuse and never retained in a
 // checkpoint. Keep the same exclusion for active-copy and retained-copy charges.
@@ -245,7 +264,7 @@ impl OwnedJsonlParser {
             // Never retained, and not a budget refusal (packet).
             false
         } else if self
-            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::entry_bytes()))
+            .retention_bound(remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES))
             .is_some()
         {
             true
@@ -279,9 +298,10 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
+                unsealed,
             }));
         }
-        let limit = remaining_copy_budget.min(crate::transcript_cache::entry_bytes());
+        let limit = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
         let reduction = self.reduction_copy();
         let charge = crate::heap_layout_bound::bound(&reduction, limit);
         #[cfg(test)]
@@ -303,6 +323,7 @@ impl OwnedJsonlParser {
             checkpoint,
             reduction,
             released: None,
+            unsealed,
         }))
     }
 
@@ -365,13 +386,14 @@ impl OwnedJsonlParser {
         if unsealed {
             record(Event::RetentionUnsealedEof);
         }
-        fn declined(checkpoint: Checkpoint) -> Result<Option<CompletedNativeAcquisition>> {
+        let declined = |checkpoint: Checkpoint| -> Result<Option<CompletedNativeAcquisition>> {
             Ok(Some(CompletedNativeAcquisition {
                 checkpoint,
                 reduction: None,
                 released: None,
+                unsealed,
             }))
-        }
+        };
         if unsealed || !compatible {
             return declined(checkpoint);
         }
@@ -435,7 +457,45 @@ impl OwnedJsonlParser {
             checkpoint,
             reduction,
             released: Some(rank),
+            unsealed,
         }))
+    }
+
+    /// A side read's certificate: `retain_reduction`'s completion gate and
+    /// commit, without a retained copy or any `cache_lifecycle` event. It never
+    /// touches main's cache; the caller mints the side seal from it.
+    pub(super) fn certify_without_retention(
+        &mut self,
+        scope: &Scope,
+        now: u64,
+    ) -> Result<SideCertificate> {
+        if !self.reader.finished || self.reader.failure.is_some() {
+            self.reader.acquisition = None;
+            return Ok(SideCertificate::Uncertified);
+        }
+        if !loss_free_source_report(
+            &self.reader.report,
+            self.recognized_usage_drop_count,
+            self.accumulator.dropped_usage_record_count,
+        ) {
+            self.reader.acquisition = None;
+            return Ok(SideCertificate::Lossy);
+        }
+        let Some(plan) = self.reader.acquisition.take() else {
+            return Ok(SideCertificate::Uncertified);
+        };
+        let checkpoint =
+            plan.commit_after_native_completion(self.reader.reader.get_ref(), scope, now)?;
+        let len = self.reader.reader.get_ref().metadata()?.len();
+        Ok(SideCertificate::Certified {
+            completed: CompletedNativeAcquisition {
+                unsealed: checkpoint.sealed_offset() != len,
+                checkpoint,
+                reduction: None,
+                released: None,
+            },
+            len,
+        })
     }
 
     /// Pair a cursor job's prefix certificate (`ReadPlan::commit_sealed_prefix`)
@@ -456,7 +516,7 @@ impl OwnedJsonlParser {
             "never Deferred after without_release"
         );
         let remaining_copy_budget = budget.without_release().admission_budget();
-        let budget = remaining_copy_budget.min(crate::transcript_cache::entry_bytes());
+        let budget = remaining_copy_budget.min(crate::transcript_cache::ENTRY_BYTES);
         // The job kept every turn witness (K1); a retained copy keeps the
         // cache-only caps that govern every other retained reduction.
         let witnesses_retainable = self
@@ -477,6 +537,7 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
+                unsealed: true,
             };
         }
         // The certificate consumed the acquisition plan, so charge the
@@ -502,6 +563,7 @@ impl OwnedJsonlParser {
                 checkpoint,
                 reduction: None,
                 released: None,
+                unsealed: true,
             };
         };
         let reduction = CachedJsonlReduction {
@@ -516,6 +578,7 @@ impl OwnedJsonlParser {
             checkpoint,
             reduction,
             released: None,
+            unsealed: true,
         }
     }
 }
@@ -545,7 +608,7 @@ pub(super) struct RefusalView {
     active_measured: bool,
     /// `budget` for `Granted`, `budget_after` for `Deferred`.
     budget: usize,
-    /// `entry_bytes()` for `Granted`, the release's `entry_limit` for
+    /// `ENTRY_BYTES` for `Granted`, the release's `entry_limit` for
     /// `Deferred`.
     entry_limit: usize,
 }
@@ -562,7 +625,7 @@ impl RefusalView {
                 resident_measured: *resident_measured,
                 active_measured: *active_measured,
                 budget: *budget,
-                entry_limit: crate::transcript_cache::entry_bytes(),
+                entry_limit: crate::transcript_cache::ENTRY_BYTES,
             },
             sampled_scan::RetainBudget::Deferred {
                 budget_after,
@@ -576,7 +639,7 @@ impl RefusalView {
                 resident_measured: true,
                 active_measured: true,
                 budget: 0,
-                entry_limit: crate::transcript_cache::entry_bytes(),
+                entry_limit: crate::transcript_cache::ENTRY_BYTES,
             },
         }
     }

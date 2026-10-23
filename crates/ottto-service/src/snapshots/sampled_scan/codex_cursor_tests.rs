@@ -7,6 +7,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::codex_scan_diagnostics::PARENT_UNRESOLVABLE_CAUSES;
+use crate::transcript_cache::ENTRY_BYTES;
 
 const NOW: &str = "2026-10-07T12:00:00Z";
 const SESSION: &str = "019fa111-2222-7333-8444-555555555555";
@@ -4542,18 +4543,19 @@ fn session_usage(scan: &SourceScanResult, session: &str) -> Vec<(u64, u64)> {
 }
 
 /// One page stepped to completion, with `between` run before every step
-/// call: a deterministic point between two records of the active file.
+/// call: a deterministic point between two records of the active file. It
+/// may change the scan's own index there (fix round 6's proof transition).
 fn page_between(
     fixture: &ScanRoot,
     index: ScanIndex,
     cache: &Arc<SharedCache>,
     collected_at: &str,
-    mut between: impl FnMut(&OwnedSourceScan),
+    mut between: impl FnMut(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
     let mut scan = codex_scan(fixture, index, collected_at)
         .with_sampled_acquisition(Arc::clone(cache), Scope("cursor-fixture".into()));
     for _ in 0..100_000 {
-        between(&scan);
+        between(&mut scan);
         match scan.step(None) {
             OwnedSourceScanStep::Pending(next) => scan = next,
             OwnedSourceScanStep::Complete {
@@ -6121,6 +6123,12 @@ fn retained_floor(cache: &SharedCache) -> usize {
     crate::heap_layout_bound::bound(&*cache.retained().unwrap(), usize::MAX).unwrap()
 }
 
+/// F4b: everything admission keeps beside the state and a charge: the
+/// retained cache's own bound and the side ledger's fixed reservation.
+fn admission_floor(cache: &SharedCache) -> usize {
+    retained_floor(cache) + crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES
+}
+
 /// Every release `release_join_owners` reports, with its member keys.
 fn released(
     cache: &SharedCache,
@@ -6181,7 +6189,7 @@ fn join_provenance_charge_is_the_exact_accounted_delta() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
     cache.record_join_owner(JOIN_OWNER, &three);
@@ -6306,7 +6314,7 @@ fn outstanding_claim_blocks_a_second_claim_and_provenance() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let state = cache.cursor_resident();
     let claim = 4096;
     let members = join_members(&["a.jsonl", "b.jsonl"]);
@@ -6340,7 +6348,7 @@ fn paused_reserve_outranks_join_provenance() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let members = join_members(&["a.jsonl", "b.jsonl"]);
     cache.record_join_owner(JOIN_OWNER, &members);
@@ -6392,7 +6400,7 @@ fn hopeless_admission_evicts_nothing() {
             .retained;
         // Measured with no retained copy and no provenance: the least an
         // admission could ever evict down to.
-        let floor = retained_floor(&cache);
+        let floor = admission_floor(&cache);
         let empty = cache.cursor_resident();
         cache.insert(
             key.clone(),
@@ -6400,6 +6408,7 @@ fn hopeless_admission_evicts_nothing() {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
+                unsealed: false,
             },
             0,
         );
@@ -6446,6 +6455,86 @@ fn hopeless_admission_evicts_nothing() {
     });
 }
 
+/// F4b: every cursor admission keeps the side ledger's fixed reservation
+/// (full ledger here; its heap charge is the constant either way). Mandatory
+/// and optional admissions fit exactly at the boundary with it and are
+/// refused one byte past it, including where the old budget (no side term)
+/// would have taken them; a budget below the floor fails closed and evicts
+/// nothing. Settling returns the room; the ledger is never locked.
+#[test]
+fn cursor_admission_keeps_the_side_ledger_reservation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let cache = Arc::new(SharedCache::default());
+    cache.side_ledger().fill_for_test(7);
+    let entries = cache.side_ledger().len();
+    let floor = admission_floor(&cache);
+    assert_eq!(floor, retained_floor(&cache) + side);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    // The ledger lock is held throughout: admission never takes it.
+    let held = cache.side_ledger();
+    // Mandatory, exact boundary: one byte more is refused, the claim fits.
+    with_test_state_budget(state + claim + floor, || {
+        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
+        let credit = cache.cursor_reserve(claim).expect("exactly fits");
+        assert_eq!(cache.cursor_resident(), state + claim);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    // The old budget (no side term) would take it: refused, nothing claimed.
+    with_test_state_budget(state + claim + retained_floor(&cache), || {
+        assert!(cache.cursor_reserve(claim).is_none());
+    });
+    assert_eq!(cache.cursor_resident(), state);
+    // Optional (join provenance), exact boundary and one byte short.
+    let members = join_members(&["a.jsonl", "b.jsonl"]);
+    let optional = join_charge(JOIN_OWNER, &members);
+    with_test_state_budget(state + optional + floor - 1, || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+    with_test_state_budget(state + optional + retained_floor(&cache), || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), None, "old budget: refused");
+    with_test_state_budget(state + optional + floor, || {
+        cache.record_join_owner(JOIN_OWNER, &members);
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+    let resident = cache.cursor_resident();
+    assert_eq!(resident, state + optional);
+    // Below the floor (below the side reservation alone; below it with the
+    // retained floor; no room for one byte beside the state without its
+    // provenance): fails closed, and the provenance a mandatory charge
+    // could forget is kept.
+    for budget in [side - 1, floor - 1, state + floor] {
+        with_test_state_budget(budget, || {
+            assert!(cache.cursor_reserve(1).is_none(), "{budget}");
+            cache.record_join_owner(JOIN_OTHER, &members);
+        });
+        assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&members)));
+        assert_eq!(join_entry(&cache, JOIN_OTHER), None);
+        assert_eq!(cache.cursor_resident(), resident);
+    }
+    // A mandatory claim still forgets optional provenance for its room
+    // (baseline progress), inside the side reservation.
+    with_test_state_budget(state + optional + floor, || {
+        let credit = cache
+            .cursor_reserve(optional)
+            .expect("baseline progress forgets provenance");
+        assert_eq!(join_entry(&cache, JOIN_OWNER), None);
+        assert_eq!(cache.cursor_resident(), state + optional);
+        credit.refund();
+    });
+    assert_eq!(cache.cursor_reserved(), 0);
+    assert_eq!(cache.cursor_resident(), state);
+    drop(held);
+    assert_eq!(cache.side_ledger().len(), entries);
+}
+
 /// J-T8: claim vs retained insert. The insert measures outstanding claims
 /// under the retained lock, so a copy that fits only if the claim is
 /// ignored is not kept.
@@ -6477,21 +6566,38 @@ fn outstanding_claim_is_charged_against_a_retained_insert() {
                 checkpoint: copy.checkpoint,
                 reduction: Some(copy.state),
                 released: None,
+                unsealed: false,
             }
         };
         // Control: without a claim the copy fits.
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_some());
-        let with_copy = retained_floor(&cache);
+        // F4b: the side ledger's reservation is part of the floor.
+        let with_copy = admission_floor(&cache);
         let state = cache.cursor_resident();
         assert!(with_copy + state <= STATE_BYTES);
         let copy = cache.take(&key).expect("retained").retained;
+        // F4b exact boundary: a claim that leaves exactly the copy's room
+        // beside the side ledger's reservation; the copy is kept.
+        let exact = STATE_BYTES - state - with_copy;
+        let credit = cache.cursor_reserve(exact).expect("the claim fits alone");
+        cache.insert(key.clone(), completed(copy), 0);
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "kept at the boundary"
+        );
+        assert_eq!(
+            admission_floor(&cache) + cache.cursor_resident(),
+            STATE_BYTES
+        );
+        credit.refund();
+        let copy = cache.take(&key).expect("retained").retained;
         // A claim that leaves one byte too few for it.
-        let claim = STATE_BYTES - state - with_copy + 1;
+        let claim = exact + 1;
         let credit = cache.cursor_reserve(claim).expect("the claim fits alone");
         cache.insert(key.clone(), completed(copy), 0);
         assert!(cache.retained_checkpoint(&key).is_none(), "refused");
-        assert!(retained_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
         credit.refund();
         assert_eq!(cache.cursor_reserved(), 0);
     });
@@ -6800,7 +6906,7 @@ fn many_witnesses_stay_bounded_and_yield_to_a_paused_job() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     for n in 0..5_000_u64 {
         if n % 64 == 0 {
@@ -6845,7 +6951,7 @@ fn optional_65th_namespace_is_refused_and_the_retained_64_are_kept() {
         return;
     }
     let cache = Arc::new(SharedCache::default());
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     let namespace = |n: usize| Scope(format!("namespace-{n:02}"));
     for n in 0..ROTATION_KEYS {
@@ -7009,7 +7115,7 @@ fn witness_admission() -> WitnessAdmission {
         .take(&key)
         .unwrap_or_else(|| panic!("a certified copy: {}", counters(&cache)))
         .retained;
-    let floor = retained_floor(&cache);
+    let floor = admission_floor(&cache);
     let empty = cache.cursor_resident();
     // A single-session root has no parent refs: no `parents` entry exists.
     assert!(cache
@@ -7021,6 +7127,7 @@ fn witness_admission() -> WitnessAdmission {
             checkpoint: copy.checkpoint,
             reduction: Some(copy.state),
             released: None,
+            unsealed: false,
         },
         0,
     );
@@ -7265,6 +7372,163 @@ fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     );
     let (oracle_index, oracle) = home.oracle(n);
     assert_eq!(census(&index, &settled), census(&oracle_index, &oracle));
+}
+
+/// Fix round 6 (R1-F1): the proof hook's `Proven` transition for C over P,
+/// on the page's own index (census keys): C's proof as the job mints it (m
+/// = the leading signatures C shares with P's `parent_records`, the chain
+/// over C's s_0..s_m, P at `parent` sealed now under the proof scope), P's
+/// settled side record covering it, and C's hold memo forgotten
+/// (`forget_proven_hold_memos`). Returns C's key.
+fn prove_child(
+    scan: &mut OwnedSourceScan,
+    cache: &SharedCache,
+    parent: &Path,
+    parent_records: &[Value],
+    child: &Path,
+    child_records: &[Value],
+) -> String {
+    use crate::snapshots::codex_parent_proof_use_tests::seal_of;
+    use crate::snapshots::{
+        codex_digest_hex, codex_ownership_signature, codex_parent_prefix_chain,
+        codex_parent_prefix_seed, codex_parent_proof_scope, codex_parent_side_scope,
+        CodexParentPrefixProof, CodexParentProofState, CodexParentSide, SideVerdict,
+    };
+    let census_key = |path: &Path| {
+        let name = file_name(path);
+        scan.index
+            .traversal
+            .as_ref()
+            .and_then(|traversal| {
+                traversal
+                    .codex_rollout_paths
+                    .iter()
+                    .find(|key| key.ends_with(name.as_str()))
+                    .cloned()
+            })
+            .expect("in the census")
+    };
+    let (p_key, c_key) = (census_key(parent), census_key(child));
+    let signatures = |records: &[Value]| {
+        records
+            .iter()
+            .filter_map(codex_ownership_signature)
+            .collect::<Vec<_>>()
+    };
+    let (theirs, ours) = (signatures(parent_records), signatures(child_records));
+    let matched = theirs
+        .iter()
+        .zip(&ours)
+        .take_while(|(parent, child)| parent == child)
+        .count();
+    let mut digest = codex_parent_prefix_seed();
+    for signature in &ours[..=matched] {
+        digest = codex_parent_prefix_chain(&digest, signature);
+    }
+    let file = File::open(parent).unwrap();
+    let now = crate::snapshots::sampled_scan::now_seconds();
+    scan.index.codex_parent_prefix_proofs.insert(
+        c_key.clone(),
+        CodexParentProofState::Proven(CodexParentPrefixProof {
+            parent: PARENT.into(),
+            parent_seal: seal_of(&file, now, &codex_parent_proof_scope().0),
+            matched: matched as u64,
+            child_digest: codex_digest_hex(&digest),
+            owned: matched > 0,
+            published: false,
+        }),
+    );
+    scan.index.codex_parent_side.insert(
+        p_key,
+        CodexParentSide {
+            verdict: SideVerdict::Settled,
+            seal: seal_of(&file, now, &codex_parent_side_scope().0),
+            parsed: OpenStamp::capture(&file).unwrap(),
+            pace: None,
+            generation: 1,
+            referenced_epoch: 0,
+        },
+    );
+    cache.memo_forget(&memo_key(&Scope("cursor-fixture".into()), &c_key));
+    c_key
+}
+
+/// Fix round 6 (R1-F1, control A): with the ref set full, C's parser is
+/// built while C is owed (no install), and C's proof turns `Proven` before
+/// C's parse completes (production: a cursor job paused across the hook's
+/// page; here: between two step calls of C's parse, so the record site sees
+/// the same state). C completes pending, is deferred `DeferredRef` with no
+/// step-map witness and held, and that hold is not memoized; the next page
+/// parses C, installs the proof and C resolves. Before fix round 6 the hold
+/// was memoized and replayed on every later page.
+#[test]
+fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::CodexParentProofState;
+    use CodexParentUnresolvable::DeferredRef;
+    let home = ForkHome::new(&ForkHome::matching_child());
+    let mut index = ScanIndex::default();
+    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS {
+        index
+            .codex_parent_ownership_refs
+            .insert(format!("prefilled-{n:03}"));
+    }
+    let (mut index, owed) = home.generation(index, &Arc::new(SharedCache::default()), 0);
+    assert!(session_usage(&owed, CHILD).is_empty());
+    assert_eq!(parent_causes(&owed), only(DeferredRef, 1));
+
+    // A fresh cache, so C is parsed (no hold memo).
+    let cache = Arc::new(SharedCache::default());
+    let (parent, child) = (home.fixture.file(PARENT), home.fixture.file(CHILD));
+    let mut key = None;
+    index.traversal = None;
+    let ((index, held), parsed) = parses(|| {
+        page_between(&home.fixture, index, &cache, &collected_at(1), |scan| {
+            if key.is_none() && active_is(scan, &child) {
+                key = Some(prove_child(
+                    scan,
+                    &cache,
+                    &parent,
+                    &ForkHome::parent(),
+                    &child,
+                    &ForkHome::matching_child(),
+                ));
+            }
+        })
+    });
+    let key = key.expect("C's parse spans step calls");
+    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
+    assert!(session_usage(&held, CHILD).is_empty());
+    assert_eq!(
+        parent_causes(&held),
+        only(DeferredRef, 1),
+        "{}",
+        counters(&cache)
+    );
+    assert!(matches!(
+        index.codex_parent_prefix_proofs.get(&key),
+        Some(CodexParentProofState::Proven(_))
+    ));
+    assert_eq!(
+        counter(&cache, |c| c.memo_records),
+        0,
+        "the hold is not memoized: {}",
+        counters(&cache)
+    );
+    assert!(home.child_entry(&cache).is_none());
+
+    // The next page parses C, installs the proof, and C resolves.
+    let ((_, resolved), parsed) = parses(|| home.generation(index, &cache, 2));
+    assert!(parsed.contains(&file_name(&child)), "{parsed:?}");
+    assert_eq!(
+        session_usage(&resolved, CHILD),
+        vec![(30, 1)],
+        "{}",
+        counters(&cache)
+    );
+    assert_eq!(parent_causes(&resolved), only(DeferredRef, 0));
 }
 
 /// P-T14 (M1): the step-start match runs once per traversal: one census
@@ -8037,6 +8301,73 @@ fn deferred_intermediate_parent_is_not_reread_every_generation() {
     }
 }
 
+/// Fix round 6 (control B): C -> P -> X with X's ref never fitting, so C is
+/// held `DeferredRef` under P's step-map witness. C's hold memo ends and its
+/// proof turns `Proven` once C's parser is built (as in control A: no install,
+/// no refusal, the record site sees `Proven`). The witness arm holds C, and
+/// that hold is memoized: from the page after, C is not parsed. (An install
+/// would change nothing here: the witness arm drops a proof unused, so the
+/// record site reads the same no-proof, no-refusal parse.)
+#[test]
+fn a_witnessed_deferred_ref_hold_stays_memoized_beside_its_proven_entry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::CodexParentProofState;
+    use CodexParentUnresolvable::DeferredRef;
+    let fixture = ScanRoot::with_sessions(&[]);
+    let parent_records = ForkHome::parent()[1..].to_vec();
+    let child_records = ForkHome::diverging_child(2);
+    write_rollout(&fixture, PARENT, Some(ABSENT_GRANDPARENT), &parent_records);
+    write_rollout(&fixture, CHILD, Some(PARENT), &child_records);
+    let mut index = ScanIndex::default();
+    for n in 0..crate::snapshots::MAX_CODEX_PARENT_LEDGER_REFS - 1 {
+        index
+            .codex_parent_ownership_refs
+            .insert(format!("prefilled-{n:03}"));
+    }
+    index.codex_parent_ownership_refs.insert(PARENT.to_owned());
+    let cache = Arc::new(SharedCache::default());
+    for n in 0..3 {
+        index = fixture_generation(&fixture, &cache, index, n).0;
+    }
+    let (parent, child) = (fixture.file(PARENT), fixture.file(CHILD));
+    cache.memo_forget(&stored_key(&cache, &child).expect("C's hold memo"));
+    let mut key = None;
+    index.traversal = None;
+    let ((index, held), parsed) = parses(|| {
+        page_between(&fixture, index, &cache, &collected_at(3), |scan| {
+            if key.is_none() && active_is(scan, &child) {
+                key = Some(prove_child(
+                    scan,
+                    &cache,
+                    &parent,
+                    &parent_records,
+                    &child,
+                    &child_records,
+                ));
+            }
+        })
+    });
+    let key = key.expect("C's parse spans step calls");
+    assert_eq!(parsed, vec![file_name(&child)], "{}", counters(&cache));
+    assert_eq!(parent_causes(&held), only(DeferredRef, 2));
+    assert!(matches!(
+        index.codex_parent_prefix_proofs.get(&key),
+        Some(CodexParentProofState::Proven(_))
+    ));
+    assert!(stored_key(&cache, &child).is_some(), "{}", counters(&cache));
+    let hits = counter(&cache, |c| c.memo_hits);
+    let ((_, again), parsed) = parses(|| fixture_generation(&fixture, &cache, index, 4));
+    assert!(parsed.is_empty(), "{parsed:?}: {}", counters(&cache));
+    assert_eq!(parent_causes(&again), only(DeferredRef, 2));
+    assert!(
+        counter(&cache, |c| c.memo_hits) > hits,
+        "{}",
+        counters(&cache)
+    );
+}
+
 const GREAT_GRANDPARENT: &str = "019fa111-2222-7333-8444-222222222222";
 
 /// The settled census of `fixture` from generation `n` on a fresh index and
@@ -8330,4 +8661,1036 @@ fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
         4,
         CodexParentUnresolvable::ParentLossy,
     );
+}
+
+// ---------------------------------------------------------------------------
+// U1a-2a cc rows 1–5, 8 and ss-6: the proof holder (dormant until the proof
+// hook; driven directly here).
+
+fn proof_job(namespace: &str, path: &str, incarnation: &str, bytes: usize) -> Box<ProofJob> {
+    Box::new(ProofJob {
+        namespace: namespace.to_owned(),
+        index_path: PathBuf::from(path),
+        incarnation: incarnation.to_owned(),
+        entries: vec![("k".repeat(bytes), 1)],
+        next_row_end: 0,
+        touched_page: 0,
+        readers: None,
+    })
+}
+
+fn proof_charge(job: &ProofJob) -> usize {
+    crate::heap_layout_bound::bound(job, STATE_BYTES).unwrap()
+}
+
+/// Suspend `job` through a lease, as the proof hook will.
+fn suspend(cache: &Arc<SharedCache>, job: Box<ProofJob>) -> bool {
+    ProofLease::new(cache, job).suspend()
+}
+
+fn proof_drops(counts: crate::local_resource_diagnostics::codex_side_lifecycle::Counts) -> u64 {
+    counts.side_proof_drops
+}
+
+fn next_page(cache: &SharedCache) {
+    next_page_in(cache, "ns");
+}
+
+fn next_page_in(cache: &SharedCache, namespace: &str) {
+    PageBudget::default().note_page(cache, &Scope(namespace.into()));
+}
+
+/// cc rows 1–2: a suspended proof is charged exactly its walked bound, and
+/// `Admitter::Proof` admits only into free room: one byte short is refused
+/// (the job is dropped, counted) and nothing else is released.
+#[test]
+fn proof_suspend_takes_free_room_only_and_charges_its_walk() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = admission_floor(&cache);
+    let empty = cache.cursor_resident();
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+    let charge = proof_charge(&job);
+    let (suspended, counts) =
+        observe(|| with_test_state_budget(empty + charge + floor - 1, || suspend(&cache, job)));
+    assert!(!suspended);
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(cache.cursor_resident(), empty);
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+    let (suspended, counts) =
+        observe(|| with_test_state_budget(empty + charge + floor, || suspend(&cache, job)));
+    assert!(suspended);
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(
+        cache.proof_suspended_for_test(),
+        Some(("ns-a".to_owned(), charge))
+    );
+    assert_eq!(cache.cursor_resident(), empty + charge);
+    assert_eq!(cache.cursor_resident_for_main(), empty);
+    // A second suspend while the holder is taken is refused and counted.
+    let (suspended, counts) = observe(|| suspend(&cache, proof_job("ns-b", "/idx/b.json", "i", 8)));
+    assert!(!suspended);
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(
+        cache.proof_suspended_for_test(),
+        Some(("ns-a".to_owned(), charge))
+    );
+}
+
+/// cc row 2: main decides as if no proof existed. An optional main charge
+/// that fits only without the proof is admitted, exactly as with no proof,
+/// and the proof is dropped first (counted); with room for both it stays.
+#[test]
+fn main_admission_measures_without_the_proof_and_drops_it_first() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let three = join_members(&["a.jsonl", "bb.jsonl", "rollout-ccc.jsonl"]);
+    let charge = join_charge(JOIN_OWNER, &three);
+    // Control: no proof, budget with exactly the join's room.
+    let control = Arc::new(SharedCache::default());
+    let floor = admission_floor(&control);
+    let empty = control.cursor_resident();
+    with_test_state_budget(empty + charge + floor, || {
+        control.record_join_owner(JOIN_OWNER, &three);
+    });
+    assert_eq!(join_entry(&control, JOIN_OWNER), Some(joined(&three)));
+    // Treated: a suspended proof sits in the same room.
+    let cache = Arc::new(SharedCache::default());
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", 2048);
+    let proof = proof_charge(&job);
+    assert!(suspend(&cache, job));
+    let (_, counts) = observe(|| {
+        with_test_state_budget(empty + charge + floor, || {
+            cache.record_join_owner(JOIN_OWNER, &three);
+        })
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert_eq!(cache.proof_suspended_for_test(), None, "dropped first");
+    assert_eq!(proof_drops(counts), 1);
+    assert_eq!(cache.cursor_resident(), control.cursor_resident());
+    // Room for both: the proof stays.
+    let cache = Arc::new(SharedCache::default());
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 2048)
+    ));
+    let (_, counts) = observe(|| {
+        with_test_state_budget(empty + charge + proof + floor, || {
+            cache.record_join_owner(JOIN_OWNER, &three);
+        })
+    });
+    assert_eq!(join_entry(&cache, JOIN_OWNER), Some(joined(&three)));
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(cache.cursor_resident(), empty + charge + proof);
+}
+
+/// cc row 2: mandatory-main progress. A paused job's mandatory claim that
+/// fits only without the proof is granted as with no proof; the proof goes.
+#[test]
+fn a_mandatory_claim_is_never_refused_for_a_proof() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let floor = admission_floor(&cache);
+    let empty = cache.cursor_resident();
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 2048)
+    ));
+    let claim = 4096;
+    let credit = with_test_state_budget(empty + claim + floor, || cache.cursor_reserve(claim));
+    let credit = credit.expect("granted as with no proof");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert_eq!(cache.cursor_resident(), empty + claim);
+    credit.refund();
+    assert_eq!(cache.cursor_resident(), empty);
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// cc rows 1, 5: the hook's claim. Another index's job is busy until it is
+/// `NAMESPACE_STALE_PAGES` cursor pages old, then dropped (counted); this
+/// index's job comes out with its pages touched; the same index under a new
+/// incarnation drops it (counted); a dropped lease loses its job (counted).
+#[test]
+fn proof_take_is_mine_busy_stale_or_mismatched() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let ns_a = Scope("ns-a".to_owned());
+    let ns_b = Scope("ns-b".to_owned());
+    let (a, b) = (Path::new("/idx/a.json"), Path::new("/idx/b.json"));
+    let cache = Arc::new(SharedCache::default());
+    assert!(matches!(
+        cache.proof_take(&ns_a, a, "inc-1"),
+        ProofTake::Free
+    ));
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    for _ in 0..NAMESPACE_STALE_PAGES - 1 {
+        next_page(&cache);
+        assert!(matches!(
+            cache.proof_take(&ns_b, b, "inc-9"),
+            ProofTake::Busy
+        ));
+    }
+    // The same namespace with another index path is another index.
+    assert!(matches!(
+        cache.proof_take(&ns_a, b, "inc-1"),
+        ProofTake::Busy
+    ));
+    let ProofTake::Mine(mut lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("this index's own job");
+    };
+    assert_eq!(lease.job().touched_page, NAMESPACE_STALE_PAGES - 1);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    assert!(lease.suspend());
+    for _ in 0..NAMESPACE_STALE_PAGES {
+        next_page(&cache);
+    }
+    let (take, counts) = observe(|| cache.proof_take(&ns_b, b, "inc-9"));
+    assert!(matches!(take, ProofTake::Free));
+    assert_eq!(proof_drops(counts), 1, "stale");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    // A new incarnation of the same index never resumes the old job.
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let (take, counts) = observe(|| cache.proof_take(&ns_a, a, "inc-2"));
+    assert!(matches!(take, ProofTake::Free));
+    assert_eq!(proof_drops(counts), 1, "mismatch");
+    assert_eq!(cache.proof_suspended_for_test(), None);
+    // A lease dropped holding its job loses it; `finish` does not count.
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("mine");
+    };
+    let ((), counts) = observe(|| drop(lease));
+    assert_eq!(proof_drops(counts), 1);
+    assert!(suspend(
+        &cache,
+        proof_job("ns-a", "/idx/a.json", "inc-1", 8)
+    ));
+    let ProofTake::Mine(lease) = cache.proof_take(&ns_a, a, "inc-1") else {
+        panic!("mine");
+    };
+    let ((), counts) = observe(|| lease.finish());
+    assert_eq!(proof_drops(counts), 0);
+    assert_eq!(cache.proof_suspended_for_test(), None);
+}
+
+/// cc row 8: a page with due proof work that never reached the hook is
+/// counted once, at the next page's tick; a page that reached it is not,
+/// and nothing is counted while no work is due.
+#[test]
+fn a_due_page_that_missed_the_proof_hook_is_counted_at_the_next_tick() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    let cache = Arc::new(SharedCache::default());
+    let ns = Scope("ns".into());
+    next_page(&cache);
+    cache.note_proof_hook(&ns, true);
+    let ((), counts) = observe(|| next_page(&cache));
+    assert_eq!(proof_drops(counts), 0, "the hook ran on that page");
+    let ((), counts) = observe(|| next_page(&cache));
+    assert_eq!(proof_drops(counts), 1, "due, hook missed");
+    cache.note_proof_hook(&ns, false);
+    let ((), counts) = observe(|| {
+        next_page(&cache);
+        next_page(&cache);
+    });
+    assert_eq!(proof_drops(counts), 0, "nothing due");
+    // One tick per scan object, as the page clock.
+    let mut page = PageBudget::default();
+    cache.note_proof_hook(&ns, true);
+    page.note_page(&cache, &ns);
+    let ((), counts) = observe(|| page.note_page(&cache, &ns));
+    assert_eq!(proof_drops(counts), 0);
+}
+
+/// Increment-14 disclosure: the due flag never crosses namespaces. Another
+/// namespace's pages neither count nor clear it, its own "nothing due" hook
+/// leaves it, and it gates nothing but the diagnostic count (no pacing or
+/// admission reads it; per-request pacing stays in the index entries).
+#[test]
+fn the_proof_due_flag_is_per_namespace() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    let cache = Arc::new(SharedCache::default());
+    let (x, y) = (Scope("x".into()), Scope("y".into()));
+    cache.note_proof_hook(&x, true);
+    let ((), counts) = observe(|| {
+        next_page_in(&cache, "y");
+        next_page_in(&cache, "y");
+    });
+    assert_eq!(proof_drops(counts), 0, "y never had due work");
+    cache.note_proof_hook(&y, false);
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 0, "x's page reached its hook");
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 1, "x due, x's hook missed");
+    cache.note_proof_hook(&x, false);
+    let ((), counts) = observe(|| next_page_in(&cache, "x"));
+    assert_eq!(proof_drops(counts), 0);
+    // A due hook in y replaces x's entry: x is then never counted.
+    cache.note_proof_hook(&x, true);
+    cache.note_proof_hook(&y, true);
+    let ((), counts) = observe(|| {
+        next_page_in(&cache, "x");
+        next_page_in(&cache, "x");
+    });
+    assert_eq!(proof_drops(counts), 0, "under-count only");
+}
+
+/// cc row 4: the step needs `PROOF_STEP_HEADROOM_BYTES` beside the context
+/// and the job's walked charge.
+#[test]
+fn proof_room_keeps_the_headroom() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let context = super::super::Context {
+        cache: Arc::new(SharedCache::default()),
+        namespace: Scope("ns-a".to_owned()),
+        audit_metadata_supported: true,
+        audit_slots: 0,
+        full_files: 0,
+        tail_files: 0,
+        unchanged_files: 0,
+        native_bytes: 0,
+        sample_bytes: 0,
+        full_reasons: [0; 11],
+        priority_replays: 0,
+        audits_started: 0,
+        audits_completed: 0,
+        start_overdue_seconds: 0,
+        completion_overdue_seconds: 0,
+        admission: Default::default(),
+    };
+    let resident = crate::heap_layout_bound::bound(&context, STATE_BYTES).unwrap();
+    let exact = STATE_BYTES - resident - PROOF_STEP_HEADROOM_BYTES;
+    assert_eq!(proof_room(&context), Some(exact));
+}
+
+/// ss-6: the retained insert reserves main's cursor term, so its decision is
+/// the no-proof one; the proof is retired under the same lock exactly when
+/// the kept copy took its room, and the charged state stays within budget.
+#[test]
+fn a_retained_insert_decides_without_the_proof_and_retires_it_when_needed() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+                released: None,
+                unsealed: false,
+            }
+        };
+        let copy = cache.take(&key).expect("a certified copy").retained;
+        cache.insert(key.clone(), completed(copy), 0);
+        let with_copy = admission_floor(&cache);
+        let state = cache.cursor_resident();
+        let copy = cache.take(&key).expect("retained").retained;
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let proof = proof_charge(&job);
+        // Room for the copy and the proof exactly: both stay.
+        let claim = STATE_BYTES - state - with_copy - proof;
+        let credit = cache.cursor_reserve(claim).expect("fits alone");
+        assert!(suspend(&cache, job));
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(cache.retained_checkpoint(&key).is_some());
+        assert!(cache.proof_suspended_for_test().is_some());
+        assert_eq!(proof_drops(counts), 0);
+        assert_eq!(
+            admission_floor(&cache) + cache.cursor_resident(),
+            STATE_BYTES
+        );
+        credit.refund();
+        let copy = cache.take(&key).expect("retained").retained;
+        assert!(matches!(
+            cache.proof_take(&Scope("ns-a".to_owned()), Path::new("/idx/a.json"), "inc-1"),
+            ProofTake::Mine(_)
+        ));
+        // One byte more claimed: the copy still fits beside main's state, so
+        // it is kept as with no proof, and the proof is retired.
+        let credit = cache.cursor_reserve(claim + 1).expect("fits alone");
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", 4096)
+        ));
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "the no-proof decision"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None);
+        assert_eq!(proof_drops(counts), 1);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
+        assert_eq!(cache.cursor_reserved(), 0);
+    });
+}
+
+fn main_context(cache: &Arc<SharedCache>) -> super::super::Context {
+    super::super::Context {
+        cache: Arc::clone(cache),
+        namespace: Scope("ns-main".to_owned()),
+        audit_metadata_supported: true,
+        audit_slots: 0,
+        full_files: 0,
+        tail_files: 0,
+        unchanged_files: 0,
+        native_bytes: 0,
+        sample_bytes: 0,
+        full_reasons: [0; 11],
+        priority_replays: 0,
+        audits_started: 0,
+        audits_completed: 0,
+        start_overdue_seconds: 0,
+        completion_overdue_seconds: 0,
+        admission: Default::default(),
+    }
+}
+
+/// R2-B3: main's copy budget is measured as if no proof existed. With and
+/// without a suspended proof that fits free room, main gets the same copy
+/// budget and resident measure (the proof keeps its slot: nothing was
+/// spent yet); the insert that needs the proof's room then retires it and
+/// keeps the copy (ss-6).
+#[test]
+fn a_suspended_proof_never_shrinks_mains_copy_budget() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let (next, _, _) = page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture");
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        let completed = |copy: crate::transcript_cache::Retained<_>| {
+            sampled_jsonl::CompletedNativeAcquisition {
+                checkpoint: copy.checkpoint,
+                reduction: Some(copy.state),
+                released: None,
+                unsealed: false,
+            }
+        };
+        let copy = cache.take(&key).expect("a certified copy").retained;
+        cache.insert(key.clone(), completed(copy), 0);
+        let with_copy = admission_floor(&cache);
+        let state = cache.cursor_resident();
+        let copy = cache.take(&key).expect("retained").retained;
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let proof = proof_charge(&job);
+        let context = main_context(&cache);
+        let budget = || super::super::copy_budget_step(Some(&context), None, false);
+        let (without, measured_without) = budget();
+        assert!(without > proof, "precondition: a visible difference");
+        assert!(suspend(&cache, job));
+        let (with, measured_with) = budget();
+        assert_eq!(with, without, "parity");
+        assert_eq!(measured_with.resident, measured_without.resident);
+        assert!(cache.proof_suspended_for_test().is_some());
+        // One byte short of room for both: the copy needs the proof's room.
+        let claim = STATE_BYTES - state - with_copy - proof + 1;
+        let credit = cache.cursor_reserve(claim).expect("fits beside the proof");
+        assert!(cache.proof_suspended_for_test().is_some());
+        let ((), counts) = observe(|| cache.insert(key.clone(), completed(copy), 0));
+        assert!(
+            cache.retained_checkpoint(&key).is_some(),
+            "the copy is kept"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None);
+        assert_eq!(proof_drops(counts), 1);
+        assert!(admission_floor(&cache) + cache.cursor_resident() <= STATE_BYTES);
+        credit.refund();
+    });
+}
+
+/// R2-B3, fix round 2 DB1 (c22 ruling (b)), fix round 3 DM3: main's copy
+/// budget funds two shares, so where it is allocated against
+/// (`retire_proof_beside_copy`) a suspended proof over `room - budget -
+/// min(budget, ENTRY_BYTES)` is retired, even one the finish/output share
+/// alone leaves room for (`room - budget - 1`); then `bound(context)` +
+/// copy + finish/output fit `STATE_BYTES`. `copy_budget_step` itself retires nothing, and nothing is
+/// retired where no copy is allocated (budget 0, as an unknown room gives):
+/// no drop on unavailable inputs. The retired job keeps only its `seq`s.
+#[test]
+fn a_proof_is_retired_only_where_both_copy_shares_are_allocated() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let context = main_context(&cache);
+    let budget = || super::super::copy_budget_step(Some(&context), None, false);
+    let (without, measured) = budget();
+    let room = measured.room().expect("a measured room");
+    assert_eq!(without, room / 2);
+    // Kept by the copy's share alone, over both shares.
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    let job = proof_job("ns-a", "/idx/a.json", "inc-1", room - without - 1 - fixed);
+    let charge = proof_charge(&job);
+    assert!(
+        charge > room - without - without.min(ENTRY_BYTES) && charge < room - without,
+        "{charge}"
+    );
+    assert!(suspend(&cache, job), "fits the free room alone");
+    let ((with, step), counts) = observe(budget);
+    assert_eq!(with, without, "the budget is unchanged");
+    assert_eq!(step.room(), Some(room));
+    assert!(
+        cache.proof_suspended_for_test().is_some(),
+        "no retire at the step"
+    );
+    assert_eq!(proof_drops(counts), 0);
+    // No copy allocated: nothing retired.
+    let ((), counts) = observe(|| super::super::retire_proof_beside_copy(Some(&context), 0, step));
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+    // A busy cache: an unknown room and budget 0; the proof is kept.
+    let busy = {
+        let _held = cache.retained().unwrap();
+        budget()
+    };
+    assert_eq!((busy.0, busy.1.room()), (0, None));
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), busy.0, busy.1));
+    assert!(cache.proof_suspended_for_test().is_some());
+    assert_eq!(proof_drops(counts), 0);
+    // The allocation: retired first, and both shares fit beside the rest.
+    super::super::copy_retire_probe();
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), with, step));
+    assert_eq!(cache.proof_suspended_for_test(), None, "retired first");
+    assert_eq!(proof_drops(counts), 1);
+    let probe = super::super::copy_retire_probe().expect("probed");
+    assert_eq!((probe.proof, probe.used, probe.budget), (Some(0), 0, with));
+    assert!(probe.fits(), "{probe:?}");
+    let scope = Scope("ns-a".to_owned());
+    let index = std::path::Path::new("/idx/a.json");
+    assert_eq!(cache.take_retired_proof_seqs(&scope, index, "inc-1"), [1]);
+    assert!(cache
+        .take_retired_proof_seqs(&scope, index, "inc-1")
+        .is_empty());
+    // Nothing of the retired job stays charged.
+    assert_eq!(budget().1.resident, measured.resident);
+}
+
+/// Fix round 2 DB1, the completion site: a cursor job's pages that allocate
+/// nothing keep a suspended proof of a third of the state budget; the page
+/// whose completion retains the certified copy retires it before the clone:
+/// the walk's resident + the proof left there (none) + the active + both
+/// shares fit `STATE_BYTES`.
+#[test]
+fn a_completing_cursor_job_retires_the_proof_before_its_clone() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+        ));
+        super::super::copy_retire_probe();
+        let mut index = ScanIndex::default();
+        let mut certified = false;
+        for _ in 0..64 {
+            let ((next, _, _), counts) =
+                observe(|| page_in(&fixture, index, Some(Arc::clone(&cache)), "cursor-fixture"));
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                assert_eq!(cache.proof_suspended_for_test(), None);
+                assert_eq!(proof_drops(counts), 1);
+                certified = true;
+                break;
+            }
+            assert!(
+                cache.proof_suspended_for_test().is_some(),
+                "a page with no clone keeps the proof"
+            );
+        }
+        assert!(certified, "precondition: the job certified");
+        assert!(cache.take(&key).is_some(), "the certified copy is retained");
+        let probe = super::super::copy_retire_probe().expect("probed");
+        assert!(probe.budget > 0);
+        assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
+        assert!(probe.fits(), "{probe:?}");
+    });
+}
+
+/// Fix round 3 (DM3(2)): with a room whose budget is over `ENTRY_BYTES`,
+/// the copy's share is the 8 MiB cap, so a suspended proof that fits
+/// beside both shares (`room - budget - ENTRY_BYTES`) is kept where main
+/// allocates, and the whole still fits `STATE_BYTES` at the clone.
+#[test]
+fn a_proof_beside_a_capped_copy_share_is_kept() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    let context = main_context(&cache);
+    let (budget, step) = super::super::copy_budget_step(Some(&context), None, false);
+    let room = step.room().expect("a measured room");
+    assert!(budget > ENTRY_BYTES, "precondition: a large room: {budget}");
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    let job = proof_job(
+        "ns-a",
+        "/idx/a.json",
+        "inc-1",
+        room - budget - ENTRY_BYTES - fixed - 4096,
+    );
+    let charge = proof_charge(&job);
+    assert!(charge < room - budget - ENTRY_BYTES, "{charge}");
+    assert!(
+        charge > room - 2 * budget,
+        "fix round 2 retired it: {charge}"
+    );
+    assert!(suspend(&cache, job));
+    super::super::copy_retire_probe();
+    let ((), counts) =
+        observe(|| super::super::retire_proof_beside_copy(Some(&context), budget, step));
+    assert!(cache.proof_suspended_for_test().is_some(), "kept");
+    assert_eq!(proof_drops(counts), 0);
+    let probe = super::super::copy_retire_probe().expect("probed");
+    assert!(
+        probe.proof.is_some_and(|proof| proof >= charge),
+        "{probe:?}"
+    );
+    assert!(probe.fits(), "{probe:?}");
+}
+
+/// Fix round 3 (DM3, DL3), the completion site of an ordinary (not cursor)
+/// singleton read: it retains its copy with a budget over `ENTRY_BYTES`,
+/// and retires a suspended proof only over what both shares leave of the
+/// room: a third of the state budget is retired before the clone; one that
+/// fits beside the finish/output share and the 8 MiB-capped copy is kept.
+/// Either way the whole fits `STATE_BYTES` at the clone.
+#[test]
+fn an_ordinary_completion_retires_only_a_proof_over_both_shares() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let room = {
+        let cache = Arc::new(SharedCache::default());
+        let context = main_context(&cache);
+        let (_, step) = super::super::copy_budget_step(Some(&context), None, false);
+        step.room().expect("a measured room")
+    };
+    let fixed = proof_charge(&proof_job("ns-a", "/idx/a.json", "inc-1", 4096)) - 4096;
+    assert!(room / 2 > ENTRY_BYTES + (2 << 20), "precondition: {room}");
+    let beside = room / 2 - ENTRY_BYTES - (1 << 20) - fixed;
+    for (bytes, retired) in [(STATE_BYTES / 3, true), (beside, false)] {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", bytes)
+        ));
+        super::super::copy_retire_probe();
+        let (_, counts) = observe(|| {
+            page_in(
+                &fixture,
+                ScanIndex::default(),
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+            )
+        });
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 0, "not a cursor job");
+        assert!(cache.take(&key).is_some(), "the copy is retained");
+        let probe = super::super::copy_retire_probe().expect("probed");
+        assert!(probe.budget > ENTRY_BYTES, "{probe:?}");
+        assert!(probe.fits(), "{probe:?}");
+        assert_eq!(cache.proof_suspended_for_test().is_none(), retired);
+        assert_eq!(proof_drops(counts), u64::from(retired));
+        if retired {
+            assert_eq!(probe.proof, Some(0), "nothing of the proof at the clone");
+        } else {
+            assert!(probe.proof.is_some_and(|proof| proof >= bytes), "{probe:?}");
+        }
+    }
+}
+
+/// Fix round 3 (DM3(1)): a completion that cannot retain a copy (an
+/// incomplete sidecar census: the cursor job publishes unverified, with no
+/// certificate) passes no copy budget, so a suspended proof of a third of
+/// the state budget is kept through every page, its completion included.
+#[test]
+fn a_completion_that_retains_no_copy_keeps_the_proof() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let clock = TestClock;
+    clock.set(1_900_000_000);
+    let incomplete = |scan: &mut OwnedSourceScan| scan.sidecar_census_complete = false;
+    with_test_limits(2048, 8192, 64, || {
+        let fixture = ScanRoot::new(40);
+        let key = local_index_key(&fixture.file(SESSION));
+        let cache = Arc::new(SharedCache::default());
+        assert!(suspend(
+            &cache,
+            proof_job("ns-a", "/idx/a.json", "inc-1", STATE_BYTES / 3)
+        ));
+        super::super::copy_retire_probe();
+        let mut index = ScanIndex::default();
+        for _ in 0..64 {
+            let ((next, _, _), counts) = observe(|| {
+                page_with(
+                    &fixture,
+                    index,
+                    Some(Arc::clone(&cache)),
+                    "cursor-fixture",
+                    NOW,
+                    incomplete,
+                )
+            });
+            index = next;
+            assert_eq!(proof_drops(counts), 0);
+            assert!(cache.proof_suspended_for_test().is_some(), "kept");
+            if counter(&cache, |c| c.jobs_certified) == 1 {
+                break;
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(cache.retained_checkpoint(&key).is_none(), "no copy kept");
+        assert!(
+            super::super::copy_retire_probe().is_none(),
+            "no budgeted retire"
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// U1a-2a D6(e): M1's release to fit measures main's cursor state (no
+// suspended proof) and retires the proof first, under the same locks.
+
+type SideCounts = crate::local_resource_diagnostics::codex_side_lifecycle::Counts;
+type CacheCounts = crate::local_resource_diagnostics::cache_lifecycle::Counts;
+
+/// The `FILLERS` filled shared cache (`cache_policy_tests::filled_cache`),
+/// with a suspended proof when `proof`, and its measures.
+struct ReleaseScene {
+    cache: Arc<SharedCache>,
+    /// Main's cursor state (`cursor_resident_for_main`).
+    main: usize,
+    /// The retained copies' bound.
+    resident: usize,
+    /// One filler's charge.
+    filler: usize,
+    /// The proof's charge (suspended only when `proof`).
+    proof: usize,
+}
+impl ReleaseScene {
+    fn new(proof: bool) -> Self {
+        let (cache, filler) = crate::snapshots::cache_policy_tests::filled_cache();
+        let job = proof_job("ns-a", "/idx/a.json", "inc-1", 4096);
+        let charge = proof_charge(&job);
+        if proof {
+            assert!(
+                suspend(&cache, job),
+                "precondition: the proof fits beside the fillers"
+            );
+        }
+        let main = cache.cursor_resident_for_main();
+        assert_eq!(
+            cache.cursor_resident(),
+            main + if proof { charge } else { 0 }
+        );
+        Self {
+            resident: retained_floor(&cache),
+            cache,
+            main,
+            filler,
+            proof: charge,
+        }
+    }
+    /// The `pinned` at which the copies fit exactly beside main's state.
+    fn exact(&self) -> usize {
+        STATE_BYTES - self.main - self.resident
+    }
+    /// `pinned` at which even an empty retained cache would not fit.
+    fn unreachable(&self) -> usize {
+        let floor =
+            crate::heap_layout_bound::bound(&super::super::RetainedCache::default(), STATE_BYTES)
+                .unwrap();
+        STATE_BYTES - self.main - floor + 1
+    }
+    /// M1's release (`release_to_fit`) or Path A (`release_older_to_fit`)
+    /// at `rank`, observing both counter sets.
+    fn release(
+        &self,
+        pinned: usize,
+        path_a: Option<(i64, i64)>,
+    ) -> (bool, SideCounts, CacheCounts) {
+        let ((released, side), counts) =
+            crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                crate::local_resource_diagnostics::codex_side_lifecycle::observe(|| match path_a {
+                    Some(rank) => self.cache.release_older_to_fit(pinned, rank),
+                    None => self.cache.release_to_fit(pinned),
+                })
+            });
+        (released, side, counts)
+    }
+    fn fillers(&self) -> usize {
+        crate::snapshots::cache_policy_tests::fillers_resident(&self.cache)
+    }
+    /// What the release charged, all of it: the copies, the whole cursor
+    /// state (any proof left included) and `pinned`.
+    fn charged(&self, pinned: usize) -> usize {
+        retained_floor(&self.cache) + self.cache.cursor_resident() + pinned
+    }
+}
+
+fn evicted(counts: &CacheCounts) -> (u64, u64, u64) {
+    (
+        counts.copy_refusal_entries_evicted,
+        counts.copy_refusal_admission_evicted,
+        counts.copy_refusal_bytes_released,
+    )
+}
+
+const NONE_OLDER: (i64, i64) = (0, 0);
+const ALL_OLDER: (i64, i64) = (i64::MAX, 0);
+
+/// D6(e) (a), (d): over budget only beside a suspended proof. M1's release
+/// retires the proof first, counted under its own cause, and evicts no
+/// copy; with room for both, the proof stays. One retained lock, then one
+/// cursor critical section: the proof's box is freed under them (a
+/// `ProofJob` and its readers have no `Drop` that locks), a relock would
+/// trip the `retained` and `with_cursor` debug guards, and both locks are
+/// free and unpoisoned after.
+#[test]
+fn release_to_fit_retires_a_suspended_proof_before_any_copy() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let pinned = scene.exact() - scene.proof;
+    let (released, side, counts) = scene.release(pinned, None);
+    assert!(released);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(evicted(&counts), (0, 0, 0));
+    assert_eq!(scene.charged(pinned), STATE_BYTES);
+    // One byte more: the proof goes, and no copy does.
+    let (released, side, counts) = scene.release(pinned + 1, None);
+    assert!(released);
+    assert_eq!(scene.cache.proof_suspended_for_test(), None);
+    assert_eq!(
+        (side.side_proof_release_drops, side.side_proof_drops),
+        (1, 0)
+    );
+    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
+    assert_eq!(scene.fillers(), FILLERS);
+    assert_eq!(scene.cache.cursor_resident(), scene.main);
+    assert!(scene.charged(pinned + 1) <= STATE_BYTES);
+    // (d) Nothing is held, locked or poisoned after the drop.
+    assert!(!cursor_held());
+    assert!(scene.cache.inner.try_lock().is_ok());
+    assert!(scene.cache.cursor.try_lock().is_ok());
+    assert_eq!(scene.cache.cursor_reserved(), 0);
+}
+
+/// D6(e) (b): Path A likewise, with no copy ranked older than the tail: an
+/// overflow the proof covers retires the proof and evicts nothing; one past
+/// it cannot fit, so nothing goes, the proof included (fit-or-nothing).
+#[test]
+fn release_older_to_fit_retires_the_proof_only_where_path_a_fits() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let (released, side, counts) = scene.release(scene.exact() + 1, Some(NONE_OLDER));
+    assert!(!released);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(evicted(&counts), (0, 0, 0));
+    let pinned = scene.exact() - scene.proof + 1;
+    let (released, side, counts) = scene.release(pinned, Some(NONE_OLDER));
+    assert!(released);
+    assert_eq!(scene.cache.proof_suspended_for_test(), None);
+    assert_eq!(
+        (side.side_proof_release_drops, side.side_proof_drops),
+        (1, 0)
+    );
+    assert_eq!(evicted(&counts), (0, 0, 0), "{counts:?}");
+    assert_eq!(scene.fillers(), FILLERS);
+    assert!(scene.charged(pinned) <= STATE_BYTES);
+}
+
+/// D6(e) (c) and no-proof parity: an overflow past the proof retires the
+/// proof first, then evicts in victim order only what main's room still
+/// needs, exactly what the same release evicts with no proof (one copy),
+/// for M1's release and for Path A with every copy ranked older.
+#[test]
+fn a_proof_smaller_than_the_overflow_goes_first_then_the_minimal_copies() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    for path_a in [None, Some(ALL_OLDER)] {
+        let mut outcomes = Vec::new();
+        for proof in [true, false] {
+            let scene = ReleaseScene::new(proof);
+            assert!(scene.proof < scene.filler / 2, "precondition");
+            let pinned = scene.exact() + scene.filler / 2;
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert!(released, "{path_a:?} proof={proof}");
+            assert_eq!(scene.cache.proof_suspended_for_test(), None);
+            assert_eq!(
+                (side.side_proof_release_drops, side.side_proof_drops),
+                (u64::from(proof), 0)
+            );
+            assert!(scene.charged(pinned) <= STATE_BYTES);
+            outcomes.push((
+                counts.copy_refusal_entries_evicted,
+                counts.copy_refusal_admission_evicted,
+                scene.fillers(),
+            ));
+        }
+        assert_eq!(outcomes[0], outcomes[1], "the no-proof decision");
+        let one = if path_a.is_some() { (0, 1) } else { (1, 0) };
+        assert_eq!(outcomes[0], (one.0, one.1, FILLERS - 1), "{path_a:?}");
+    }
+}
+
+/// D6(e) no-proof parity and the charge bound: with no proof, main's measure
+/// is the whole cursor state, so M1's limit is unchanged. `pinned` carries
+/// the side ledger's fixed charge once and nothing adds it again: copies
+/// fitting exactly beside main's state and `pinned` evict nothing (as the
+/// cursor admission floor agrees, F4b), one byte more evicts one copy, an
+/// unreachable fit evicts nothing. No proof drop is counted.
+#[test]
+fn with_no_proof_the_release_is_m1s() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::local_resource_diagnostics::cache_lifecycle::observe;
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    use crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let scene = ReleaseScene::new(false);
+    assert_eq!(scene.cache.cursor_resident(), scene.main);
+    let exact = scene.exact();
+    assert!(exact > SIDE_LEDGER_BYTES, "precondition");
+    let (credit, counts) = observe(|| scene.cache.cursor_reserve(exact - SIDE_LEDGER_BYTES));
+    credit
+        .expect("F4b: the cursor admission floor agrees")
+        .refund();
+    assert_eq!(counts.cursor_reservation_entries_evicted, 0);
+    for path_a in [Some(NONE_OLDER), None] {
+        for (pinned, fits) in [
+            (exact, true),
+            (scene.unreachable(), false),
+            (usize::MAX, false),
+        ] {
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert_eq!(released, fits, "{path_a:?} {pinned}");
+            assert_eq!(side, SideCounts::default());
+            assert_eq!(evicted(&counts), (0, 0, 0));
+            assert_eq!(scene.fillers(), FILLERS);
+        }
+    }
+    let (released, side, counts) = scene.release(exact + 1, Some(NONE_OLDER));
+    assert!(!released, "nothing older: Path A fits or evicts nothing");
+    assert_eq!((side, evicted(&counts)), (SideCounts::default(), (0, 0, 0)));
+    let (released, side, counts) = scene.release(exact + 1, None);
+    assert!(released);
+    assert_eq!(side, SideCounts::default());
+    assert_eq!(counts.copy_refusal_entries_evicted, 1);
+    assert_eq!(scene.fillers(), FILLERS - 1);
+    assert!(scene.charged(exact + 1) <= STATE_BYTES);
+}
+
+/// D6(e): a release that cannot measure keeps M1's refusal and drops no
+/// proof: an unreachable fit, a `pinned` past the budget, unsupported
+/// (overflowing) cursor accounting, a poisoned cursor lock. No copy goes.
+#[test]
+fn a_release_without_a_measure_drops_no_proof() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use crate::snapshots::cache_policy_tests::FILLERS;
+    let scene = ReleaseScene::new(true);
+    let overflow = scene.exact() + scene.filler / 2;
+    let refuses = |pinned: usize, label: &str| {
+        for path_a in [None, Some(ALL_OLDER)] {
+            let (released, side, counts) = scene.release(pinned, path_a);
+            assert!(!released, "{label} {path_a:?}");
+            assert_eq!(side, SideCounts::default(), "{label}");
+            assert_eq!(evicted(&counts), (0, 0, 0), "{label}");
+            assert_eq!(scene.fillers(), FILLERS, "{label}");
+        }
+    };
+    refuses(scene.unreachable(), "unreachable");
+    refuses(usize::MAX, "past the budget");
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    scene
+        .cache
+        .with_cursor(|cursor| cursor.reserved = usize::MAX);
+    refuses(overflow, "unsupported accounting");
+    scene.cache.with_cursor(|cursor| cursor.reserved = 0);
+    assert!(scene.cache.proof_suspended_for_test().is_some());
+    let unwound = catch_unwind(AssertUnwindSafe(|| {
+        scene.cache.with_cursor(|_| panic!("poison the cursor"));
+    }));
+    assert!(unwound.is_err());
+    assert!(!cursor_held());
+    refuses(overflow, "poisoned cursor");
 }

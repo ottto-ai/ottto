@@ -20,6 +20,7 @@ mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
 pub(crate) mod command_env;
+mod composition_kinds;
 pub mod context_composition;
 mod context_file_counts;
 pub mod context_footprint;

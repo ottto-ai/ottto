@@ -10,6 +10,23 @@ enum FinishOutcome {
     PermanentStatusFailure,
     PermanentWithoutSidecars,
     PermanentUncleanCensus,
+    /// Every body is refused for a reason the backend already dominates with
+    /// an accepted record; `admit_residue` is the activity-hint admission of
+    /// `census_residue_status:v1`.
+    Dominated {
+        reason: &'static str,
+        admit_residue: bool,
+    },
+}
+
+impl FinishOutcome {
+    /// The refused body is retained, then two quiet cycles re-disclose it.
+    fn retains_refusal_across_quiet_cycles(self) -> bool {
+        matches!(
+            self,
+            FinishOutcome::Permanent | FinishOutcome::Dominated { .. }
+        )
+    }
 }
 
 struct FinishServer {
@@ -55,10 +72,21 @@ impl FinishServer {
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
                 } else if request.contains("/activity-hints") {
-                    serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
+                    let mut hint = serde_json::json!({"source":"claude_code","server_time":current_rfc3339(),
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Dominated {
+                            admit_residue: true,
+                            ..
+                        }
+                    ) {
+                        hint["census_residue_status_contract"] =
+                            crate::snapshot_client::CENSUS_RESIDUE_STATUS_CONTRACT.into();
+                    }
+                    hint
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
@@ -75,13 +103,17 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
+                    let reason = match outcome {
+                        FinishOutcome::Dominated { reason, .. } => reason,
+                        _ => "invalid",
+                    };
                     let rejected = items
                         .iter()
                         .map(|item| {
                             serde_json::json!({
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
-                                "reason":"invalid","detail":"synthetic finish refusal",
+                                "reason":reason,"detail":"synthetic finish refusal",
                                 "permanent":true,"occurrence_count":1
                             })
                         })
@@ -199,7 +231,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         codex_scan_homes: Vec::new(),
         codex_home_bindings: Vec::new(),
     };
-    let cycles = if matches!(outcome, FinishOutcome::Permanent) {
+    let cycles = if outcome.retains_refusal_across_quiet_cycles() {
         3
     } else {
         1
@@ -299,12 +331,36 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
         );
         assert_eq!(
             terminal[cycle]["last_error_code"],
-            if matches!(outcome, FinishOutcome::Retryable) {
-                "server_error"
-            } else {
-                "backend_validation_error"
-            }
+            match outcome {
+                FinishOutcome::Retryable => "server_error",
+                // The refused body is settled unproven-terminal residue; the
+                // server already owns a better or newer record for it.
+                FinishOutcome::Dominated {
+                    admit_residue: true,
+                    ..
+                } => "census_residue",
+                // A backend that predates the admission reads settled residue
+                // only in the legacy shape.
+                FinishOutcome::Dominated {
+                    admit_residue: false,
+                    ..
+                } => "parse_error",
+                _ => "backend_validation_error",
+            },
+            "{outcome:?}, cycle {cycle}"
         );
+        if let FinishOutcome::Dominated { admit_residue, .. } = outcome {
+            assert_eq!(terminal[cycle]["last_census_residue_settled"], true);
+            assert_eq!(terminal[cycle]["last_snapshot_unproven_terminal_count"], 1);
+            assert_eq!(
+                terminal[cycle]["consecutive_failures"],
+                u64::from(!admit_residue)
+            );
+            assert_eq!(
+                terminal[cycle]["last_success_at"].is_string(),
+                admit_residue
+            );
+        }
         let retained_valid = daemon.native_comparison.retained_valid_for_test();
         for (key, expected) in [
             "last_malformed_json_line_count",
@@ -321,12 +377,12 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
             );
         }
         assert_eq!(terminal[cycle]["last_census_complete"], !unclean);
-        if cycle > 0 || !matches!(outcome, FinishOutcome::Permanent) {
+        if cycle > 0 || !outcome.retains_refusal_across_quiet_cycles() {
             assert_eq!(retained_valid, expected_valid,
             "{outcome:?}, cycle {cycle}: only an earned native conjunction or actual predecessor permit plus durable settlement and successful status may reach the common lease finalizer");
         }
         writeln!(std::io::stderr().lock(), "permanent_finish_pipeline: outcome={outcome:?} cycle={cycle} selected_save=true refusal_not_accepted=true refusal_debt_retained=true retained_valid={retained_valid}").unwrap();
-        if cycle == 0 && matches!(outcome, FinishOutcome::Permanent) {
+        if cycle == 0 && outcome.retains_refusal_across_quiet_cycles() {
             // Change only the source revision, not usage or its body witness. The
             // normal-window pass must perform its own native parse and retain the
             // original permanent refusal without offering that body again.
@@ -372,6 +428,193 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
+}
+
+/// T1/T6: the page's only permanent refusals are dominated, no holds. The
+/// first refusal and both quiet retained cycles report settled residue, never
+/// `backend_validation_error`, and the native lease outcome is unchanged.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
+    for reason in [
+        "usage_accounting_authority_downgrade",
+        "accepted_log_stale_older_upload",
+    ] {
+        permanent_finish_pipeline(
+            FinishOutcome::Dominated {
+                reason,
+                admit_residue: true,
+            },
+            true,
+        );
+    }
+}
+
+/// T4: a backend that does not admit `census_residue_status:v1` never
+/// receives the `census_residue` code.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
+    permanent_finish_pipeline(
+        FinishOutcome::Dominated {
+            reason: "usage_accounting_authority_downgrade",
+            admit_residue: false,
+        },
+        true,
+    );
+}
+
+/// F1: body A is refused as dominated, then a newer body B of the same entity
+/// gets a retryable conflict. A conflict finish leaves exactly one durable
+/// fact for B: the index-owned `RetryPending(B)` quarantine beside the
+/// permanent refusal of A. This fixture cannot vary only witness-bound
+/// evidence, so that record is installed with the production retry deadline.
+/// While B is pending, quiet cycles must not report a settled success.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(std::io::stderr().lock(), "permanent_finish_pending_newer_body: supported_positive=UNEXECUTED layout_supported=false").unwrap();
+        return;
+    }
+    let fixture = IdentityPipelineHome::new();
+    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join("pending-newer-body-support");
+    let secrets = fixture.base.join("pending-newer-body-secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = FinishServer::new(FinishOutcome::Dominated {
+        reason: "usage_accounting_authority_downgrade",
+        admit_residue: true,
+    });
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: "pending-newer-body-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    write_native_bootstrap_sidecars(&fixture, &support);
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    for cycle in 0..3 {
+        cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("real due native preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        assert!(scan.census_complete);
+        let index_path = preparation.index_path.clone();
+        let progress_path = preparation.upload_progress_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        });
+        assert!(result.is_ok(), "cycle {cycle}: {result:?}");
+        let fingerprint = {
+            let offered = server.offered.lock().unwrap();
+            assert_eq!(offered.len(), 1, "cycle {cycle}: no body is offered again");
+            offered[0]["snapshot_fingerprint"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &snapshot_upload_destination_namespace(&device, "device-secret"),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        assert!(
+            progress.permanent_rejections.contains_key(&fingerprint),
+            "cycle {cycle}: the refusal of body A is retained"
+        );
+        let mut saved = ScanIndex::load(&index_path).unwrap();
+        assert!(!saved.accepted_snapshot_fingerprint_recorded(&fingerprint));
+        let terminal = server.terminal.lock().unwrap();
+        assert_eq!(terminal.len(), cycle + 1);
+        if cycle == 0 {
+            assert_eq!(terminal[cycle]["last_error_code"], "census_residue");
+            let record = saved
+                .quarantined_snapshot_fingerprints
+                .get_mut(&fingerprint)
+                .unwrap();
+            assert_eq!(
+                record.disposition,
+                SnapshotQuarantineDisposition::UnprovenTerminal
+            );
+            record.upload_body_witness = Some("b".repeat(64));
+            record.failed_reconstruction_count = 1;
+            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            record.retry_after_unix_seconds = quarantine_retry_after(&fingerprint);
+            saved.save(&index_path).unwrap();
+        } else {
+            assert_eq!(
+                saved.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+                SnapshotQuarantineDisposition::RetryPending,
+                "cycle {cycle}: body B is still pending"
+            );
+            assert_eq!(
+                terminal[cycle]["last_error_code"], "backend_validation_error",
+                "cycle {cycle}: a refusal of an older body cannot settle a pending newer body"
+            );
+        }
+        writeln!(
+            std::io::stderr().lock(),
+            "permanent_finish_pending_newer_body: cycle={cycle} code={}",
+            terminal[cycle]["last_error_code"]
+        )
+        .unwrap();
+    }
 }
 
 // Same real finish fixture; the new tests own only a test-thread observer.

@@ -46,6 +46,7 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             ownership_incomplete_file_count: 0,
             zero_snapshot_usage_evidence: false,
             dropped_usage_record_count: 0,
+            claude_compaction_unlinked_parent_count: 0,
             terminal_line_loss_count: 0,
             state_only_blocked_session_ids: BTreeSet::new(),
             codex_parent_session_ref: None,
@@ -55,6 +56,9 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
             codex_parent_unresolvable: None,
             codex_parent_ledger_unusable: None,
             codex_parent_ledger_consulted: false,
+            codex_parent_prefix_decided: None,
+            codex_parent_proof_used: None,
+            codex_parent_proof_refusal: None,
         };
         let mut payload = Counter::new(usize::MAX);
         for snapshot in &parsed.snapshots {
@@ -1302,19 +1306,48 @@ fn envelope_experiment_two_successful_deferrals_use_locked_shed_restore_then_dis
     writeln!(std::io::stderr().lock(), "envelope_experiment_attempts: successful_deferrals=2 base_exits=1 no_renewal=true locked_shed_restore=true restart_native_priority=true age_unknown_count=1").unwrap();
 }
 
+/// Restores a file's original mode at teardown, also when an assertion panics.
+#[cfg(unix)]
+struct RestoreFileMode<'a>(&'a Path, fs::Permissions);
+#[cfg(unix)]
+impl Drop for RestoreFileMode<'_> {
+    fn drop(&mut self) {
+        let _ = fs::set_permissions(self.0, self.1.clone());
+    }
+}
+
+/// A failed read, not a deletion: a Claude file deleted beneath its present
+/// parent is a removal (N), so the failure is injected as a permission error.
+#[cfg(unix)]
 #[test]
 fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_rearm() {
+    use std::os::unix::fs::PermissionsExt;
+    assert_ne!(
+        // SAFETY: geteuid() is always-successful and has no preconditions.
+        unsafe { libc::geteuid() },
+        0,
+        "this test injects a failed open with chmod 000, which root reads through; run it as a non-root user"
+    );
     let fixture = SelectionFixture::new();
     let scope = envelope_selection_experiment::Scope::controlled();
     scope.register("family", BTreeSet::from([fixture.paths[0].clone()]));
     let native = fixture.prepare(fixture.previous.clone(), 1);
     assert_eq!(native.identified_candidates[0].path, fixture.paths[0]);
     let bytes = fs::read(&fixture.paths[0]).unwrap();
-    fs::remove_file(&fixture.paths[0]).unwrap(); // after frozen selection, before safe open
+    // After frozen selection, before safe open.
+    let unreadable = RestoreFileMode(
+        &fixture.paths[0],
+        fs::metadata(&fixture.paths[0]).unwrap().permissions(),
+    );
+    fs::set_permissions(&fixture.paths[0], fs::Permissions::from_mode(0o000)).unwrap();
     let ((index, scan), producer_events) =
         disappearance_diagnostics::observe(|| SelectionFixture::run(native));
-    assert_eq!(producer_events, [[0; 4], [1, 0, 0, 0], [0; 4]]);
-    assert_eq!(scan.disappeared_file_count, 1);
+    assert_eq!(
+        producer_events, [[0; 4]; 3],
+        "a failed read is not a NotFound producer"
+    );
+    assert_eq!(scan.disappeared_file_count, 0);
+    assert_eq!(scan.unreadable_path_count, 1);
     assert!(scan.disappeared_file_count + scan.unreadable_path_count > 0);
     scope.defer_after_native("family", &scan);
     assert_eq!(scope.counts().unavailable, 1);
@@ -1343,6 +1376,7 @@ fn envelope_experiment_failed_open_is_unavailable_not_success_and_keeps_durable_
         saved.accepted_snapshot_fingerprints,
         fixture.previous.accepted_snapshot_fingerprints
     );
+    drop(unreadable);
     fs::write(&fixture.paths[0], bytes).unwrap();
     drop(scope);
     let restarted = envelope_selection_experiment::Scope::restart();
@@ -3768,6 +3802,41 @@ fn native_comparison_selected_fallback_preserves_prior_body_and_queues_native_be
         .iter()
         .all(|item| item.source_session_id == FALLBACK_HEALTHY));
     writeln!(std::io::stderr().lock(), "native_comparison_selected_fallback: actual_native_copy_peer_observed=true healthy_body_retained=true old_body_accepted_ledger_unchanged=true terminal_graph_moved=true native_targets_before_BC=true normal_save_reload=true parked_schema=false").unwrap();
+}
+
+/// Slice D1 (TD1b, SOURCE #588): a selected restore reverts the withheld key
+/// to `previous` and REMOVES its request-census record. No record of the
+/// withheld revision, and none restored from `previous`, survives.
+#[test]
+fn native_comparison_selected_restore_removes_the_withheld_census_record() {
+    if !native_positive_layout_for_test(
+        "native_comparison_selected_restore_removes_the_withheld_census_record",
+    ) {
+        return;
+    }
+    let (fixture, mut index, _scan, mut fallback, mut previous, _path) =
+        native_comparison_selected_fallback_fixture();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    let record = |seed: char| {
+        claude_request_census::ClaudeRequestCensusRecord::synthetic_for_test(
+            &seed.to_string().repeat(64),
+            1,
+            claude_request_census::ClaudeRequestCensusShape::Exact,
+            vec![1],
+        )
+    };
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('a'));
+    previous
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record('b'));
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&index.files[&key]).unwrap(),
+        serde_json::to_vec(&previous.files[&key]).unwrap()
+    );
+    assert!(index.claude_request_census_for_test().get(&key).is_none());
 }
 
 #[test]

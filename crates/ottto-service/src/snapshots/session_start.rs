@@ -21,6 +21,9 @@
 
 use super::UsageTotals;
 use crate::codex_prelude_footprint::{char_count as units, BlockKind, CodexPreludeParser};
+use crate::composition_kinds::shell::{
+    extension, normalize_path, shell_changes_directory, shell_path_tokens, MAX_SHELL_PATH_TOKENS,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -40,12 +43,10 @@ const MAX_HELD_COLLECTION_BYTES: usize = MAX_HELD_BYTES - MAX_HELD_INSTRUCTION_B
 /// Codex keeps its AGENTS.md text inside the shared prelude parser, beside
 /// the parser's own small strings (`codex_prelude_footprint::MAX_SMALL_TEXT_BYTES` each).
 const MAX_CODEX_AGENTS_MD_BYTES: usize = MAX_HELD_INSTRUCTION_BYTES - 8 * 1024;
-const MAX_SHELL_PATH_TOKENS: usize = 16;
-const MAX_PATH_BYTES: usize = 512;
 /// Tool call ids are short; a longer one is not tracked.
 const MAX_CALL_ID_BYTES: usize = 256;
 const MAX_TOOL_LABEL_CHARS: usize = 64;
-const WINDOW_REQUESTS: usize = 3;
+pub(super) const WINDOW_REQUESTS: usize = 3;
 /// Claude Code appends this line to the request-1 auto-memory entry when it
 /// loaded only part of MEMORY.md.
 const MEMORY_CUT_MARKER: &str = "> WARNING: MEMORY.md is";
@@ -281,62 +282,6 @@ fn tool_label(name: &str) -> String {
         .to_string()
 }
 
-/// `ext` of a path's last segment: 1-8 ASCII alphanumerics after the last dot.
-fn extension(path: &str) -> Option<&str> {
-    let name = path.rsplit('/').next()?;
-    let (_, ext) = name.rsplit_once('.')?;
-    ((1..=8).contains(&ext.len()) && ext.bytes().all(|byte| byte.is_ascii_alphanumeric()))
-        .then_some(ext)
-}
-
-/// File-like tokens of a shell command, taken lexically (no `stat`): not a
-/// flag, no URL or shell syntax, and either a path (`/`) or a file extension.
-fn shell_path_tokens(command: &str) -> impl Iterator<Item = &str> {
-    command
-        .split(|ch: char| {
-            ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')' | '<' | '>' | '`')
-        })
-        .map(|token| token.trim_matches(|ch| matches!(ch, '"' | '\'' | ',')))
-        .filter(|token| {
-            !token.is_empty()
-                && !token.starts_with('-')
-                && !token.contains("://")
-                && !token.contains(['*', '?', '$', '{', '}', '=', '[', ']'])
-                && (token.contains('/') || extension(token).is_some())
-        })
-        .take(MAX_SHELL_PATH_TOKENS)
-}
-
-/// True when a shell command may change its working directory, so its
-/// relative paths cannot be shown to be inside the session's checkout.
-fn shell_changes_directory(command: &str) -> bool {
-    // Quotes and braces split too, so `bash -lc 'cd x && ...'` is caught.
-    command
-        .split(|ch: char| {
-            ch.is_whitespace()
-                || matches!(
-                    ch,
-                    ';' | '|' | '&' | '(' | ')' | '`' | '\'' | '"' | '{' | '}'
-                )
-        })
-        .any(|word| {
-            matches!(word, "cd" | "pushd" | "popd" | "chdir")
-                // `-C dir` and attached `-Cdir` (git, make, tar, `env -C`).
-                || word.starts_with("-C")
-                || [
-                    "--chdir",
-                    "--directory",
-                    "--git-dir",
-                    "--work-tree",
-                    "-chdir",
-                    "--cwd",
-                    "--prefix",
-                ]
-                .iter()
-                .any(|flag| word.starts_with(flag))
-        })
-}
-
 /// A Claude response spanning several model requests (`usage.iterations[]`):
 /// its counters are not request 1's and later ordinals shift.
 fn claude_multi_request(value: &Value) -> bool {
@@ -344,89 +289,6 @@ fn claude_multi_request(value: &Value) -> bool {
         .and_then(|usage| usage.get("iterations"))
         .and_then(Value::as_array)
         .is_some_and(|iterations| iterations.len() > 1)
-}
-
-fn is_repo_relative(path: &str) -> bool {
-    !path.is_empty()
-        && !path.starts_with('/')
-        && !path.starts_with('~')
-        && !path.split('/').any(|segment| segment == "..")
-}
-
-/// Admission's forbidden fragments for any plain path
-/// (`backend/app/schemas/context_footprint.py`), matched case-insensitively.
-const PLAIN_PATH_FORBIDDEN_FRAGMENTS: [&str; 15] = [
-    "/users/",
-    "\\users\\",
-    "/home/",
-    "\\home\\",
-    "file://",
-    "transcript_path",
-    "workspace_path",
-    "full_transcript_path",
-    "authorization:",
-    "bearer ",
-    "otdev_",
-    "otsi_",
-    "otsr_",
-    "otel_",
-    "otrelay_",
-];
-
-/// True when admission takes `path` as a plain `repo_path` unchanged (its
-/// `_safe_relative_path`): any other path travels hashed or is withheld, so
-/// one unsafe path never clears the whole session-start block.
-fn is_plain_path(path: &str) -> bool {
-    let lowered = path.to_lowercase();
-    is_repo_relative(path)
-        && path.chars().count() <= MAX_PATH_BYTES
-        // No backslash form (`\x`, `a\..\b`, `C:\x`) and no drive or URL form.
-        && !path.contains('\\')
-        && !path.contains(":/")
-        // Admission collapses whitespace runs; only single inner spaces survive it.
-        && !path.starts_with(' ')
-        && !path.ends_with(' ')
-        && !path.contains("  ")
-        && !path
-            .chars()
-            .any(|ch| ch != ' ' && (ch.is_whitespace() || ch.is_control()))
-        && !PLAIN_PATH_FORBIDDEN_FRAGMENTS
-            .iter()
-            .any(|fragment| lowered.contains(fragment))
-}
-
-/// `(key, plain path)`: the key is the repo-relative path when the file is
-/// inside the session's working directory (a lexical prefix test), else the
-/// path as written. The plain path is set only when admission accepts it and
-/// its base is proven: an absolute path under `cwd`, or a relative one when
-/// `trust_relative` and the session directory is known. Every other file can
-/// only travel hashed.
-fn normalize_path(
-    raw: &str,
-    cwd: Option<&Path>,
-    trust_relative: bool,
-) -> Option<(String, Option<String>)> {
-    let raw = raw.trim();
-    let raw = raw.strip_prefix("./").unwrap_or(raw);
-    if raw.is_empty() || raw.len() > MAX_PATH_BYTES {
-        return None;
-    }
-    if raw.starts_with('/') {
-        let inside = cwd
-            .and_then(Path::to_str)
-            .and_then(|cwd| raw.strip_prefix(cwd.trim_end_matches('/')))
-            .and_then(|rest| rest.strip_prefix('/'))
-            .filter(|rest| is_repo_relative(rest));
-        return Some(match inside {
-            Some(rest) => (
-                rest.to_string(),
-                is_plain_path(rest).then(|| rest.to_string()),
-            ),
-            None => (raw.to_string(), None),
-        });
-    }
-    let plain = trust_relative && cwd.is_some() && is_plain_path(raw);
-    Some((raw.to_string(), plain.then(|| raw.to_string())))
 }
 
 /// How many trailing path segments (basename, then parent/basename, ...)
@@ -1688,6 +1550,118 @@ impl SnapshotSessionStart {
     }
 }
 
+/// Whether session-start measured a session's opening, so another reader can
+/// leave request 1 to it instead of counting the same content twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StartVerdict {
+    Measured,
+    NotMeasured,
+}
+
+/// The start verdict of one transcript file's snapshot item, read after the
+/// cycle's ownership fold (copied openings, forks and withheld files keep the
+/// client version only). Measured when the item carries any start value the
+/// server stores besides the client version and the config fingerprint; the
+/// server calls the same start "measured". Reads only the item: no file IO.
+pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+    let Some(start) = item.session_start.as_deref() else {
+        return StartVerdict::NotMeasured;
+    };
+    // Exhaustive, so a new wire field must pick a side here.
+    let SnapshotSessionStart {
+        client_version: _,
+        start_config_fingerprint: _,
+        opening_files: _,
+        file_candidates: _,
+        files_over_guard: _,
+        policy_applied: _,
+        opening_files_unknown: _,
+        user_turn_count,
+        first_request_uncached_input_tokens,
+        first_request_cache_read_tokens,
+        first_request_cache_write_5m_tokens,
+        first_request_cache_write_1h_tokens,
+        opening_request_count,
+        request_2_context_tokens,
+        request_3_context_tokens,
+        opening_output_tokens,
+        opening_tool_calls,
+        opening_truncated_outputs,
+        opening_file_overflow,
+        instruction_load_cut,
+        start_parts_method,
+        start_chars_tools,
+        start_chars_system,
+        start_chars_instructions,
+        start_chars_memory,
+        start_chars_skills,
+        start_chars_agents,
+        start_chars_mcp_names,
+        start_chars_mcp_instructions,
+        start_chars_hooks_env,
+        start_chars_prompt,
+        start_chars_other,
+    } = start;
+    let measured = instruction_load_cut.is_some()
+        || start_parts_method.is_some()
+        || [
+            user_turn_count,
+            first_request_uncached_input_tokens,
+            first_request_cache_read_tokens,
+            first_request_cache_write_5m_tokens,
+            first_request_cache_write_1h_tokens,
+            opening_request_count,
+            request_2_context_tokens,
+            request_3_context_tokens,
+            opening_output_tokens,
+            opening_tool_calls,
+            opening_truncated_outputs,
+            opening_file_overflow,
+            start_chars_tools,
+            start_chars_system,
+            start_chars_instructions,
+            start_chars_memory,
+            start_chars_skills,
+            start_chars_agents,
+            start_chars_mcp_names,
+            start_chars_mcp_instructions,
+            start_chars_hooks_env,
+            start_chars_prompt,
+            start_chars_other,
+        ]
+        .iter()
+        .any(|value| value.is_some());
+    if measured {
+        StartVerdict::Measured
+    } else {
+        StartVerdict::NotMeasured
+    }
+}
+
+/// Test oracle from the uploaded bytes: the item's `session_start` object
+/// holds a non-null value outside the client version, the config fingerprint
+/// and the opening-file rows (those go to their own table).
+#[cfg(test)]
+pub(crate) fn uploaded_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
+    let body = serde_json::to_value(item).expect("serialize item");
+    let measured = body
+        .get("session_start")
+        .and_then(Value::as_object)
+        .is_some_and(|start| {
+            start.iter().any(|(key, value)| {
+                !matches!(
+                    key.as_str(),
+                    "client_version" | "start_config_fingerprint" | "opening_files"
+                ) && !value.is_null()
+            })
+        });
+    if measured {
+        StartVerdict::Measured
+    } else {
+        StartVerdict::NotMeasured
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1696,6 +1670,7 @@ mod tests {
     };
     use super::*;
     use crate::codex_prelude_footprint;
+    use crate::composition_kinds::shell::is_plain_path;
     use crate::session_attribution::{
         SessionAttributionContext, SESSION_ATTRIBUTION_HMAC_KEY_VERSION,
     };
@@ -1732,6 +1707,12 @@ mod tests {
             .bytes()
             .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
         fingerprint
+    }
+
+    /// The accessor agrees with the uploaded body, and both with `expected`.
+    fn assert_start_verdict(item: &SnapshotItem, expected: StartVerdict) {
+        assert_eq!(uploaded_start_verdict(item), expected, "uploaded body");
+        assert_eq!(session_start_verdict(item), expected, "accessor");
     }
 
     fn attribution_context(dir: &Path) -> SessionAttributionContext {
@@ -1814,6 +1795,7 @@ mod tests {
         );
         let context = attribution_context(&dir);
         let items = parse_claude(&path, Some(&context));
+        assert_start_verdict(&items[0], StartVerdict::Measured);
         let parsed = items[0].session_start.clone().expect("session_start");
         // Nothing identifies a file until the upload policy is applied.
         assert!(parsed.opening_files.is_empty());
@@ -2082,6 +2064,7 @@ mod tests {
         let items =
             parse_codex_jsonl_file(&path, "2026-10-18T10:05:00Z", "file-fingerprint".into())
                 .expect("parse");
+        assert_start_verdict(&items[0], StartVerdict::Measured);
         let mut start = items[0].session_start.clone().expect("session_start");
         start.apply_upload_policy(true, false);
         let mut actual = serde_json::to_value(&start).expect("serialize");
@@ -2302,6 +2285,7 @@ mod tests {
                 ..SnapshotSessionStart::default()
             })
         );
+        assert_start_verdict(&items[0], StartVerdict::NotMeasured);
         // Codex: a subagent fork with its parent's copied prefix (the shape
         // of `codex_legacy_full_fork_excludes_inherited_usage_activity_and_posture`).
         let token = |at: &str, total: (u64, u64, u64), last: (u64, u64, u64)| {
@@ -2345,6 +2329,55 @@ mod tests {
                     ..SnapshotSessionStart::default()
                 })
             );
+            assert_start_verdict(&item, StartVerdict::NotMeasured);
+        }
+    }
+
+    /// Version and config fingerprint alone are not a measured start; any
+    /// other stored value is.
+    #[test]
+    fn start_verdict_needs_a_value_beyond_version_and_fingerprint() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-verdict");
+        let path = dir.join("ss-claude-verdict.jsonl");
+        write_lines(
+            &path,
+            serde_json::from_str(CLAUDE_COMMON).unwrap(),
+            claude_fixture_lines(),
+        );
+        let mut item = parse_claude(&path, None).remove(0);
+        let version_only = SnapshotSessionStart {
+            client_version: Some("2.1.300".to_string()),
+            start_config_fingerprint: Some("0123456789abcdef".to_string()),
+            ..SnapshotSessionStart::default()
+        };
+        let cases = [
+            (None, StartVerdict::NotMeasured),
+            (Some(version_only.clone()), StartVerdict::NotMeasured),
+            (
+                Some(SnapshotSessionStart {
+                    user_turn_count: Some(1),
+                    ..version_only.clone()
+                }),
+                StartVerdict::Measured,
+            ),
+            (
+                Some(SnapshotSessionStart {
+                    instruction_load_cut: Some(false),
+                    ..version_only.clone()
+                }),
+                StartVerdict::Measured,
+            ),
+            (
+                Some(SnapshotSessionStart {
+                    start_chars_other: Some(0),
+                    ..version_only
+                }),
+                StartVerdict::Measured,
+            ),
+        ];
+        for (start, expected) in cases {
+            item.session_start = start.map(Box::new);
+            assert_start_verdict(&item, expected);
         }
     }
 
@@ -2380,6 +2413,7 @@ mod tests {
                     ..SnapshotSessionStart::default()
                 })
             );
+            assert_start_verdict(&item, StartVerdict::NotMeasured);
         }
     }
 
@@ -2880,10 +2914,9 @@ mod tests {
                     .cloned()
                     .collect::<Vec<_>>();
                 responses.sort_by_key(|response| response.sequence);
-                for response in responses
-                    .into_iter()
-                    .filter_map(|response| response.resolve())
-                {
+                for response in responses.into_iter().filter_map(|response| {
+                    response.resolve_with(&parser.claude_responses.selectors)
+                }) {
                     shadow.note_claude_response(
                         response.sequence,
                         &response.usage,
