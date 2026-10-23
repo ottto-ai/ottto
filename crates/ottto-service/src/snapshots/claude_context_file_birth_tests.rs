@@ -2165,7 +2165,7 @@ fn native_read(
         .expect("prepare");
     while !parser.step().expect("step") {}
     let acquisition = parser
-        .retain_reduction(&scope, now, crate::transcript_cache::ENTRY_BYTES)
+        .retain_reduction(&scope, now, sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES))
         .expect("retain")
         .expect("retained");
     let retained = acquisition
