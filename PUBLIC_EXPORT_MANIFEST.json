@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "00ae6e10a80dddf66bec72c88c2bda0fdd41e250b2495dbd4f3d9fe5020d5ded",
+  "content_sha256": "56b0e3006c74047f57935195497effb1976a9807bbbb765f773d8f892e536f3d",
   "files": [
     {
       "executable": false,
@@ -2120,8 +2120,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/stale_family_carry_tests.rs",
-      "sha256": "5c68e59a2d7099f766ea322899d25f152bc6490a2908895b6fae98c8581ff06d",
-      "size_bytes": 69259
+      "sha256": "7df1c69e979fe63ae4b77cdd8b2931950bb67c249947eb1ffae5a70f7cec3fa4",
+      "size_bytes": 69309
     },
     {
       "executable": false,
@@ -5806,7 +5806,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T13:43:39+00:00",
+  "generated_at": "2026-10-23T14:38:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "39859e745317ad5dd810cf5d908906263b7f88ce"
+  "source_commit": "435e204b5d79cf18068457481a424ae5136b4d72"
 }

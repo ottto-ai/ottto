@@ -1546,7 +1546,8 @@ fn fix2_window_from_another_context_or_process_is_base() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let mutations: [(&str, fn(&mut ScanIndex)); 3] = [
+    type WindowMutation = (&'static str, fn(&mut ScanIndex));
+    let mutations: [WindowMutation; 3] = [
         ("context", |index| {
             index
                 .claude_full_rearm_progress
