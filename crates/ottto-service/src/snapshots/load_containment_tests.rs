@@ -67,10 +67,12 @@ struct LcLoad {
     generation: u64,
     result: Result<ScanIndex>,
     drops: ScanIndexLoadDrops,
+    lines: Vec<String>,
 }
 
 /// Save the valid fixture (generation 1), apply one mutation to its bytes
-/// the way an older or defective writer would leave them, then load once.
+/// the way an older or defective writer would leave them, then load once
+/// through the daemon's source-aware path.
 fn lc_load(scratch: &Path, name: &str, mutate: impl FnOnce(&mut Value)) -> LcLoad {
     let path = scratch.join(format!("{name}-claude_code-scan-index-v3.json"));
     let mut index = lc_fixture();
@@ -81,8 +83,10 @@ fn lc_load(scratch: &Path, name: &str, mutate: impl FnOnce(&mut Value)) -> LcLoa
     let written = serde_json::to_vec(&value).unwrap();
     fs::write(&path, &written).unwrap();
     let before = scan_index_load_drops_for_test();
-    let result = ScanIndex::load(&path);
+    let lines_before = scan_index_containment_lines_for_test().len();
+    let result = ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, scratch);
     let after = scan_index_load_drops_for_test();
+    let lines = scan_index_containment_lines_for_test().split_off(lines_before);
     LcLoad {
         path,
         written,
@@ -94,6 +98,7 @@ fn lc_load(scratch: &Path, name: &str, mutate: impl FnOnce(&mut Value)) -> LcLoa
             cursor: after.cursor - before.cursor,
             quarantine: after.quarantine - before.quarantine,
         },
+        lines,
     }
 }
 
@@ -115,6 +120,7 @@ fn lc_assert_kept(scratch: &Path, load: LcLoad) -> (ScanIndex, ScanIndexLoadDrop
         generation,
         result,
         drops,
+        lines: _,
     } = load;
     assert!(path.exists(), "the index stays at its path");
     assert_eq!(lc_corrupt_siblings(scratch), 0, "no .corrupt.* sibling");
@@ -371,6 +377,18 @@ fn load_keeps_index_with_one_bad_record_of_every_kind() {
         value["quarantined_snapshot_fingerprints"][lc_hex('f')]["retry_after_unix_seconds"] =
             json!(1);
     });
+    // One content-free line for the whole load, naming the source kind and
+    // each conversion kind as its own field; the process total varies.
+    assert_eq!(load.lines.len(), 1, "one line per load: {:?}", load.lines);
+    assert!(
+        load.lines[0].starts_with(
+            "local snapshot scan index load dropped or normalized invalid record(s); \
+             index kept: source=claude_code activity_dropped=1 accepted_dropped=1 \
+             cursor_normalized=1 quarantine_normalized=2 record_repairs_this_process="
+        ),
+        "{}",
+        load.lines[0]
+    );
     let (mut index, drops) = lc_assert_kept(&scratch, load);
     assert_eq!(index.quarantined_snapshot_fingerprints.len(), 2);
     assert!(index
@@ -415,6 +433,41 @@ fn load_refuses_future_ledger_version_without_quarantine() {
     assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
     assert_eq!(fs::read(&load.path).unwrap(), load.written);
     assert_eq!(load.drops, ScanIndexLoadDrops::default());
+}
+
+/// The refusal stops the source until a compatible build, so it alarms
+/// once per source per process, naming the source, and the next cycle's
+/// refused load stays quiet.
+#[test]
+fn future_ledger_refusal_alarms_once_per_source_and_does_not_repeat() {
+    let scratch = crate::test_scratch::ScratchDir::new("load-containment-future-alarm");
+    let load = lc_load(&scratch, "future-alarm", |value| {
+        value["accepted_snapshot_fingerprint_ledger_version"] =
+            json!(SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1);
+    });
+    assert!(load.result.is_err(), "future ledger state is refused");
+    assert_eq!(
+        load.lines,
+        vec![format!(
+            "local snapshot scan index refused: source=claude_code accepted_ledger_version={} \
+             supported={SNAPSHOT_ACCEPTED_LEDGER_VERSION}; written by a newer build, so this \
+             source is paused until a compatible build runs (alarm once per source per process)",
+            SNAPSHOT_ACCEPTED_LEDGER_VERSION + 1
+        )]
+    );
+
+    let lines_before = scan_index_containment_lines_for_test().len();
+    let again =
+        ScanIndex::load_for_snapshot_source(&load.path, SnapshotSource::ClaudeCode, &scratch);
+    assert!(again.is_err(), "the next attempt is still refused");
+    assert_eq!(
+        scan_index_containment_lines_for_test().len(),
+        lines_before,
+        "no repeat alarm for the same source"
+    );
+    assert!(load.path.exists(), "the index stays at its path");
+    assert_eq!(lc_corrupt_siblings(&scratch), 0, "no .corrupt.* sibling");
+    assert_eq!(fs::read(&load.path).unwrap(), load.written);
 }
 
 /// Structural damage keeps the whole-index rebuild: invalid JSON still

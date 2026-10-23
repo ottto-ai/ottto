@@ -35760,7 +35760,7 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<Self> {
-        let index = Self::load(path)?;
+        let index = Self::load_attributed(path, Some(source))?;
         if source == SnapshotSource::ClaudeCode
             && index.generation == 0
             && index.files.is_empty()
@@ -35777,14 +35777,19 @@ impl ScanIndex {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let (mut index, origin) = Self::load_inner(path)?;
+        Self::load_attributed(path, None)
+    }
+
+    /// `source` only names the source kind in containment lines and alarms.
+    fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
+        let (mut index, origin) = Self::load_inner(path, source)?;
         index.mint_or_reuse_codex_proof_incarnation(path, origin);
         Ok(index)
     }
 
     /// `load` before the U1a-2a proof incarnation (row 35): each accepted
     /// return says what it found.
-    fn load_inner(path: &Path) -> Result<(Self, LoadOrigin)> {
+    fn load_inner(path: &Path, source: Option<SnapshotSource>) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
             return Ok((Self::default(), LoadOrigin::Missing));
         }
@@ -35806,6 +35811,10 @@ impl ScanIndex {
                 if index.accepted_snapshot_fingerprint_ledger_version
                     > SNAPSHOT_ACCEPTED_LEDGER_VERSION =>
             {
+                alarm_future_scan_index_ledger(
+                    scan_index_source_label(source),
+                    index.accepted_snapshot_fingerprint_ledger_version,
+                );
                 Err(anyhow::anyhow!(
                     "unsupported local snapshot scan index accepted-ledger version {}",
                     index.accepted_snapshot_fingerprint_ledger_version
@@ -35823,7 +35832,7 @@ impl ScanIndex {
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
-                note_scan_index_record_drops("load", drops);
+                note_scan_index_record_drops("load", scan_index_source_label(source), drops);
                 index.drop_unbound_claude_authority_records("load");
                 // D4: `side_request_rearm{decode_dropped}`.
                 crate::local_resource_diagnostics::codex_side_lifecycle::add(
@@ -35852,7 +35861,7 @@ impl ScanIndex {
         // Fails closed for the one record, in debug and release; never the save.
         self.drop_unbound_claude_authority_records("save");
         let drops = self.drop_invalid_index_records();
-        note_scan_index_record_drops("save", drops);
+        note_scan_index_record_drops("save", scan_index_source_label(None), drops);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;

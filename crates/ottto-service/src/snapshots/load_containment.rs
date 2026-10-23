@@ -38,11 +38,60 @@ static SCAN_INDEX_RECORD_DROPS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 static SCAN_INDEX_WHOLE_QUARANTINES: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Sources already alarmed for a future accepted-ledger version: at most one
+/// alarm per source per process. Tests keep the set per thread so parallel
+/// tests stay independent.
+#[cfg(not(test))]
+static SCAN_INDEX_FUTURE_LEDGER_ALARMED: std::sync::Mutex<BTreeSet<&'static str>> =
+    std::sync::Mutex::new(BTreeSet::new());
 
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_LOAD_DROPS_FOR_TEST: std::cell::Cell<ScanIndexLoadDrops> =
         const { std::cell::Cell::new(ScanIndexLoadDrops::NONE) };
+    static SCAN_INDEX_FUTURE_LEDGER_ALARMED: std::cell::RefCell<BTreeSet<&'static str>> =
+        const { std::cell::RefCell::new(BTreeSet::new()) };
+    static SCAN_INDEX_CONTAINMENT_LINES_FOR_TEST: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// This thread's record-drop and future-ledger lines, in emission order.
+#[cfg(test)]
+pub(crate) fn scan_index_containment_lines_for_test() -> Vec<String> {
+    SCAN_INDEX_CONTAINMENT_LINES_FOR_TEST.with(|lines| lines.borrow().clone())
+}
+
+fn emit_scan_index_containment_line(line: String) {
+    #[cfg(test)]
+    SCAN_INDEX_CONTAINMENT_LINES_FOR_TEST.with(|lines| lines.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
+}
+
+/// The content-free source kind a load names in its lines. Plain `load`
+/// (audit, retry driver, tests) and save do not know their source.
+fn scan_index_source_label(source: Option<SnapshotSource>) -> &'static str {
+    source.map_or("unattributed", SnapshotSource::api_slug)
+}
+
+/// A newer build wrote this index's accepted ledger, so every load refuses
+/// it and the source collects nothing until a compatible build runs. Say so
+/// once per source per process instead of failing silently each cycle.
+fn alarm_future_scan_index_ledger(source: &'static str, version: u8) {
+    #[cfg(not(test))]
+    let first = SCAN_INDEX_FUTURE_LEDGER_ALARMED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(source);
+    #[cfg(test)]
+    let first =
+        SCAN_INDEX_FUTURE_LEDGER_ALARMED.with(|alarmed| alarmed.borrow_mut().insert(source));
+    if first {
+        emit_scan_index_containment_line(format!(
+            "local snapshot scan index refused: source={source} accepted_ledger_version={version} \
+             supported={SNAPSHOT_ACCEPTED_LEDGER_VERSION}; written by a newer build, so this \
+             source is paused until a compatible build runs (alarm once per source per process)"
+        ));
+    }
 }
 
 /// This thread's cumulative record-local load and save drops.
@@ -158,7 +207,9 @@ impl ScanIndex {
     }
 }
 
-fn note_scan_index_record_drops(stage: &str, drops: ScanIndexLoadDrops) {
+/// One content-free line per load or save that repaired anything: the
+/// source kind and a separate count per conversion kind; never per entry.
+fn note_scan_index_record_drops(stage: &str, source: &str, drops: ScanIndexLoadDrops) {
     #[cfg(test)]
     SCAN_INDEX_LOAD_DROPS_FOR_TEST.with(|cell| {
         let total = cell.get();
@@ -175,10 +226,10 @@ fn note_scan_index_record_drops(stage: &str, drops: ScanIndexLoadDrops) {
     let process_total = SCAN_INDEX_RECORD_DROPS
         .fetch_add(drops.records(), std::sync::atomic::Ordering::Relaxed)
         .saturating_add(drops.records());
-    eprintln!(
+    emit_scan_index_containment_line(format!(
         "local snapshot scan index {stage} dropped or normalized invalid record(s); index kept: \
-         activity_dropped={} accepted_dropped={} cursor_normalized={} \
+         source={source} activity_dropped={} accepted_dropped={} cursor_normalized={} \
          quarantine_normalized={} record_repairs_this_process={process_total}",
         drops.activity, drops.accepted, drops.cursor, drops.quarantine
-    );
+    ));
 }
