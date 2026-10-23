@@ -655,14 +655,15 @@ fn no_list_policy_follows_the_prior_history_evidence() {
         NoListPolicy::Pace
     );
     assert_eq!(
-        policy(PriorHistory::Unverified, true, &mut index),
+        policy(PriorHistory::Unverified, false, &mut index),
         NoListPolicy::HoldUnverified
     );
+    let mut full_move = ScanIndex::default();
     assert_eq!(
-        policy(PriorHistory::Moved, true, &mut index),
+        policy(PriorHistory::Moved, true, &mut full_move),
         NoListPolicy::Pace
     );
-    assert!(!index.claude_history_move_not_full);
+    assert!(!full_move.claude_history_move_not_full);
     assert_eq!(
         policy(PriorHistory::Moved, false, &mut index),
         NoListPolicy::HoldMoveNotFull
@@ -709,6 +710,22 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     let mut again = ScanIndex::load(&path).unwrap();
     again.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
+
+    // The evidence may still read as a move after the `full` claim (its own
+    // bootstrap and uploads not done yet): the release holds all the same,
+    // across a save, a reload and a replay drop.
+    let mut moving = ScanIndex::default();
+    moving.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    assert_eq!(moving.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
+    moving.note_claude_history_cutoff(PriorHistory::Moved, true, false);
+    assert_eq!(moving.claude_no_list_policy, NoListPolicy::Pace);
+    moving.save(&path).unwrap();
+    let mut reloaded = ScanIndex::load(&path).unwrap();
+    for entries_lost in [false, true] {
+        reloaded.note_claude_history_cutoff(PriorHistory::Moved, false, entries_lost);
+        assert_eq!(reloaded.claude_no_list_policy, NoListPolicy::Pace);
+        assert!(!reloaded.claude_history_move_not_full);
+    }
 }
 
 /// StateMissing M3 (lenient decode): a malformed gate marker, move marker or
@@ -730,10 +747,12 @@ fn malformed_history_gate_fields_decode_leniently() {
         (json!(true), json!(-5), json!({"x": 1})),
         (json!(null), json!(1.5), json!(null)),
     ] {
+        let released = moved.clone();
         let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         saved["claude_history_gate_loaded"] = gate;
         saved["claude_history_cutoff_unix_seconds"] = cutoff;
         saved["claude_history_move_not_full"] = moved;
+        saved["claude_history_move_released"] = released;
         let malformed = scratch.join("malformed.json");
         fs::write(&malformed, serde_json::to_vec(&saved).unwrap()).unwrap();
         let loaded = ScanIndex::load(&malformed).unwrap();
@@ -747,5 +766,6 @@ fn malformed_history_gate_fields_decode_leniently() {
         assert_eq!(loaded.claude_history_cutoff_unix_seconds, None);
         assert!(!loaded.claude_history_gate_loaded, "re-derived");
         assert!(!loaded.claude_history_move_not_full);
+        assert!(!loaded.claude_history_move_released);
     }
 }
