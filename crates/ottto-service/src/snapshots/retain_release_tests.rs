@@ -1271,5 +1271,12 @@ fn u1_title_metadata_bound_refuses_subagents_and_charges_the_title() {
         .claude_title_metadata_bound(Path::new("/p/u1-session.jsonl"), &metadata)
         .expect("top-level bound");
     assert_eq!(bound.per_usage_row, 0);
-    assert_eq!(bound.fixed, 3 * 22 + 2 * "desktop_title".len());
+    // r36 `desktop_title_bound(22)`: input and join (2 * 22), 11 one-byte
+    // words in 16 slots plus the 8 beside them (24 * 16), the collect
+    // (3 * 22), `is_safe_display_title`'s copies (2 * 22) and the item's
+    // clone (22).
+    assert_eq!(
+        bound.fixed,
+        2 * 22 + 24 * 16 + 3 * 22 + 2 * 22 + 22 + 2 * "desktop_title".len()
+    );
 }
