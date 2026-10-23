@@ -364,7 +364,7 @@ pub(in crate::snapshots) fn select_union_candidates(
                 && money_due(support, key, now);
             // Metadata is only a selection hint. The ordinary opened-file
             // fingerprint/preflight still certifies every selected parse.
-            changed |= std::fs::metadata(key).map_or(true, |metadata| {
+            changed |= money_io!(Metadata, std::fs::metadata(key)).map_or(true, |metadata| {
                 metadata.len() != entry.size_bytes
                     || metadata
                         .modified()

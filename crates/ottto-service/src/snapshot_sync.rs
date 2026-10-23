@@ -6886,63 +6886,81 @@ async fn finish_sync_source_resume(
         })
         .await?;
 
-        let Some(settlement_funds) =
-            crate::snapshots::claude_request_money::ShadowReservation::admit(
-                scan_result
-                    .snapshots
-                    .iter()
-                    .filter(|item| {
-                        item.usage_accounting_contract.as_deref()
-                            == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-                    })
-                    .map(|item| {
-                        512_usize.saturating_add(item.snapshot_fingerprint.len().saturating_mul(2))
-                    })
-                    .sum(),
-            )
-        else {
-            return Err(money_resume::admission_refused());
-        };
-        // A dominated/stale exact literal is settled-refused, never accepted.
-        // Use the same covering body check for adoption and debt retirement.
-        let mut settled = BTreeSet::new();
-        let mut settled_bodies = BTreeMap::new();
-        for item in &scan_result.snapshots {
-            if item.usage_accounting_contract.as_deref()
+        let offered = scan_result.snapshots.iter().filter(|item| {
+            item.usage_accounting_contract.as_deref()
                 == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-            {
-                if upload_progress
-                    .accepted_fingerprints
-                    .contains(&item.snapshot_fingerprint)
+        });
+        let required = offered
+            .clone()
+            .map(|item| 512_usize.saturating_add(item.snapshot_fingerprint.len().saturating_mul(2)))
+            .sum();
+        #[cfg(test)]
+        let offered_count = offered.count();
+        let build_settlement = || {
+            let Some(settlement_funds) =
+                crate::snapshots::claude_request_money::ShadowReservation::admit(required)
+            else {
+                return Err(money_resume::admission_refused());
+            };
+            #[cfg(test)]
+            crate::retry_allocation_probe::money_settlement_admitted(settlement_funds.bytes());
+            // A dominated/stale exact literal is settled-refused, never accepted.
+            // Use the same covering body check for adoption and debt retirement.
+            let mut settled = BTreeSet::new();
+            let mut settled_bodies = BTreeMap::new();
+            for item in &scan_result.snapshots {
+                if item.usage_accounting_contract.as_deref()
+                    == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
                 {
-                    if let Some(body) = upload_progress
-                        .accepted_body_witnesses
+                    if upload_progress
+                        .accepted_fingerprints
+                        .contains(&item.snapshot_fingerprint)
+                    {
+                        if let Some(body) = upload_progress
+                            .accepted_body_witnesses
+                            .get(&item.snapshot_fingerprint)
+                            .filter(|body| **body == snapshot_upload_body_witness(item))
+                        {
+                            settled.insert(item.snapshot_fingerprint.clone());
+                            settled_bodies.insert(item.snapshot_fingerprint.clone(), body.clone());
+                        }
+                    }
+                    if let Some(refusal) = upload_progress
+                        .permanent_rejections
                         .get(&item.snapshot_fingerprint)
-                        .filter(|body| **body == snapshot_upload_body_witness(item))
+                        .filter(|refusal| {
+                            refusal.reason.is_dominated()
+                                && refusal.body_witness == snapshot_upload_body_witness(item)
+                        })
                     {
                         settled.insert(item.snapshot_fingerprint.clone());
-                        settled_bodies.insert(item.snapshot_fingerprint.clone(), body.clone());
+                        settled_bodies.insert(
+                            item.snapshot_fingerprint.clone(),
+                            refusal.body_witness.clone(),
+                        );
                     }
                 }
-                if let Some(refusal) = upload_progress
-                    .permanent_rejections
-                    .get(&item.snapshot_fingerprint)
-                    .filter(|refusal| {
-                        refusal.reason.is_dominated()
-                            && refusal.body_witness == snapshot_upload_body_witness(item)
-                    })
-                {
-                    settled.insert(item.snapshot_fingerprint.clone());
-                    settled_bodies.insert(
-                        item.snapshot_fingerprint.clone(),
-                        refusal.body_witness.clone(),
-                    );
-                }
             }
-        }
-        index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
-        Some((settled, settled_bodies, settlement_funds))
+            index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
+            #[cfg(test)]
+            crate::retry_allocation_probe::money_settlement_pairs(settled.len());
+            Ok(Some((settled, settled_bodies, settlement_funds)))
+        };
+        #[cfg(test)]
+        let result = crate::retry_allocation_probe::observe_money_settlement(
+            required,
+            offered_count,
+            build_settlement,
+        );
+        #[cfg(not(test))]
+        let result = {
+            let mut build_settlement = build_settlement;
+            build_settlement()
+        };
+        result?
     } else {
+        #[cfg(test)]
+        crate::retry_allocation_probe::money_settlement_skipped();
         None
     };
     // A durable ACK does not prove the selected index committed. Retain the

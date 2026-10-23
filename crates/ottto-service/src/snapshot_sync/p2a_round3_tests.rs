@@ -424,6 +424,7 @@ struct P2aControl {
     _env: Vec<EnvVarGuard>,
     previous_deadline: Option<Instant>,
     resource_receipt: bool,
+    settlement_receipt: bool,
     accepted_history: usize,
 }
 impl P2aControl {
@@ -473,6 +474,7 @@ impl P2aControl {
             index_path,
             _env: env,
             resource_receipt: false,
+            settlement_receipt: false,
             accepted_history: 0,
             previous_deadline: source_upload_deadlines()
                 .lock()
@@ -492,6 +494,28 @@ impl P2aControl {
         self.daemon = test_daemon("otm_test");
     }
     fn resource_call<T>(&self, phase: &str, call: impl FnOnce() -> T) -> T {
+        if self.settlement_receipt {
+            let (result, receipts) = crate::retry_allocation_probe::measure_money_settlements(call);
+            for receipt in receipts.iter() {
+                eprintln!("MONEY_SETTLEMENT history={} skipped={} required={} admitted={} funds={} offered={} pairs={} requested_peak={} usable_peak={} allocations={} shared_admission_exact_peak={} within_prepaid={} not_RSS=true",
+                    self.accepted_history, receipt.skipped, receipt.required, receipt.admitted,
+                    receipt.funds, receipt.offered, receipt.pairs,
+                    receipt.allocation.requested_peak_with_overlap, receipt.allocation.usable_peak_with_overlap,
+                    receipt.allocation.allocations, receipt.shared_admission_peak,
+                    receipt.allocation.requested_peak_with_overlap <= receipt.funds);
+                assert!(receipt.pairs <= receipt.offered);
+                assert!(receipt.shared_admission_peak <= crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES);
+                if receipt.admitted {
+                    assert_eq!(receipt.funds, receipt.required);
+                } else {
+                    assert_eq!(receipt.funds, 0);
+                    assert_eq!(receipt.pairs, 0);
+                    // Refusal can allocate the existing error object; it must
+                    // not construct any settled pairs or retain save funds.
+                }
+            }
+            return result;
+        }
         if !self.resource_receipt {
             return call();
         }
@@ -2223,9 +2247,9 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
     }
 }
 
-// This receipt measures the real caller's whole phases with a small offered
-// page and a large ACK history. It does NOT infer settlement-only scratch
-// from the caller peak; an exact before/after settlement hook is still needed.
+// Run whole-caller and settlement-only allocation audits separately against
+// the same real small page and large ACK history. The settlement receipt
+// includes canonical body witnesses and retains funds through selected save.
 #[test]
 #[serial]
 #[serial(source_cadences)]
@@ -2237,10 +2261,11 @@ fn p2a_live_page_large_ack_history_resource_receipt() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    for history in [0, 20_000] {
+    for (history, settlement_only) in [(0, false), (20_000, false), (0, true), (20_000, true)] {
         let mut control = P2aControl::new(FinishOutcome::Accept);
         control.accepted_history = history;
-        control.resource_receipt = true;
+        control.resource_receipt = !settlement_only;
+        control.settlement_receipt = settlement_only;
         let _live = money::LiveForTest::new(&control.support);
         control.cycle();
         assert!(!money_resume::pending_for_test(&control.support));
@@ -2263,5 +2288,48 @@ fn p2a_live_page_large_ack_history_resource_receipt() {
             .files
             .values()
             .all(|entry| entry.effective_upload_body_witness_revision == 3));
+    }
+}
+
+// Head-only observation complements the unchanged independently built main/head
+// comparison. The copied parity test source must keep compiling against main.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_gate_off_m4_money_operation_receipt() {
+    use crate::snapshots::claude_request_money as money;
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for history in [0, 20_000] {
+        let mut control = P2aControl::new(FinishOutcome::Accept);
+        control.accepted_history = history;
+        let index = money_m4_saved_inputs(&control.fixture.base, &control.support);
+        let mut index: ScanIndex = serde_json::from_value(index).unwrap();
+        index.save(&control.index_path).unwrap();
+        money::store::reload_for_test(&control.support).unwrap();
+        money::store::flush();
+        let before = money_saved_ledger_files(&control.support);
+        // The pre-existing once-per-scope shadow kill-switch stat is outside
+        // the incremental money page observation, just as fixture loading is.
+        money::seed_shadow_off(&control.support);
+        assert!(!money::request_owned_live(&control.support));
+        let ((_, settlements), io) = crate::retry_allocation_probe::measure_money_io(|| {
+            crate::retry_allocation_probe::measure_money_settlements(|| control.cycle())
+        });
+        assert_eq!(io, crate::retry_allocation_probe::MoneyIoReceipt::default());
+        let mut skipped = 0;
+        for receipt in settlements.iter() {
+            assert!(receipt.skipped);
+            assert_eq!(receipt.required, 0);
+            assert_eq!(receipt.funds, 0);
+            assert_eq!(receipt.allocation.allocations, 0);
+            assert_eq!(receipt.shared_admission_peak, 0);
+            skipped += 1;
+        }
+        assert!(skipped > 0, "actual finish must observe the OFF branch");
+        assert_eq!(before, money_saved_ledger_files(&control.support));
+        assert!(control.offers().iter().all(|item| item["usage_accounting_contract"] != money::REQUEST_OWNED_CONTRACT));
+        eprintln!("MONEY_OFF_OPERATIONS history={history} saved_files={} scratch_allocations=0 scratch_admission=0 money_boundary_attempts={io:?} off_finishes={skipped} preexisting_seed_stat_excluded=true not_syscalls=true", before.len());
     }
 }

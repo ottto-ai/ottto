@@ -39,6 +39,19 @@
 //! release. Off, it captures nothing either, and the first off page of a
 //! day writes one false coverage row.
 
+// Count money-owned filesystem boundary calls only in opt-in test receipts.
+// Outside test builds this expands to the original expression.
+macro_rules! money_io {
+    ($operation:ident, $expression:expr) => {{
+        #[cfg(test)]
+        crate::retry_allocation_probe::money_io_attempt(
+            crate::retry_allocation_probe::MoneyIoKind::$operation,
+        );
+        $expression
+    }};
+}
+pub(crate) use money_io;
+
 pub(crate) mod body;
 pub(crate) mod capture;
 mod emit;
@@ -126,8 +139,8 @@ fn live_enabled(support_dir: &Path) -> bool {
     let enabled = REQUEST_OWNED_LIVE_ENABLED;
     enabled
         && !SHADOW_PANICKED.load(Ordering::Acquire)
-        && !support_dir.join(LIVE_OFF_FILE).exists()
-        && !support_dir.join(SHADOW_OFF_FILE).exists()
+        && !money_io!(Metadata, support_dir.join(LIVE_OFF_FILE).exists())
+        && !money_io!(Metadata, support_dir.join(SHADOW_OFF_FILE).exists())
 }
 #[cfg(test)]
 static LIVE_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
@@ -513,7 +526,7 @@ pub(crate) fn seed_shadow_off(support_dir: &Path) {
     let first = SHADOW_SEEDED
         .lock()
         .is_ok_and(|mut seeded| seeded.insert(scope.clone()));
-    if first && support_dir.join(SHADOW_OFF_FILE).exists() {
+    if first && money_io!(Metadata, support_dir.join(SHADOW_OFF_FILE).exists()) {
         if let Ok(mut off) = SHADOW_OFF.lock() {
             off.entry(scope).or_default();
         }
@@ -527,7 +540,8 @@ pub(crate) fn seed_shadow_off(support_dir: &Path) {
 /// complete.
 fn shadow_off(support_dir: &Path, now: u64) -> bool {
     let scope = shadow_scope(support_dir);
-    let off = SHADOW_PANICKED.load(Ordering::Acquire) || support_dir.join(SHADOW_OFF_FILE).exists();
+    let off = SHADOW_PANICKED.load(Ordering::Acquire)
+        || money_io!(Metadata, support_dir.join(SHADOW_OFF_FILE).exists());
     let day = day_stamp(now).unwrap_or_default();
     let first_today = SHADOW_OFF.lock().is_ok_and(|mut scopes| {
         if off {
@@ -631,6 +645,8 @@ pub(crate) struct ShadowReservation(usize);
 
 impl ShadowReservation {
     pub(crate) fn admit(bytes: usize) -> Option<Self> {
+        #[cfg(test)]
+        let _event = crate::retry_allocation_probe::money_admission_event();
         SHADOW_RESERVED
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                 reserved
@@ -638,7 +654,13 @@ impl ShadowReservation {
                     .filter(|total| *total <= SHADOW_MEMORY_CEILING_BYTES)
             })
             .ok()
-            .map(|_| Self(bytes))
+            .map(|before| {
+                #[cfg(test)]
+                crate::retry_allocation_probe::money_admission_changed(before + bytes);
+                #[cfg(not(test))]
+                let _ = before;
+                Self(bytes)
+            })
     }
 
     /// Transfer one retained graph's charge as its owned buffers change.
@@ -651,7 +673,13 @@ impl ShadowReservation {
             self.0 = bytes;
             extra.0 = 0; // its charge moved into this reservation
         } else {
-            SHADOW_RESERVED.fetch_sub(self.0 - bytes, Ordering::AcqRel);
+            #[cfg(test)]
+            let _event = crate::retry_allocation_probe::money_admission_event();
+            let before = SHADOW_RESERVED.fetch_sub(self.0 - bytes, Ordering::AcqRel);
+            #[cfg(test)]
+            crate::retry_allocation_probe::money_admission_changed(before - (self.0 - bytes));
+            #[cfg(not(test))]
+            let _ = before;
             self.0 = bytes;
         }
         true
@@ -664,7 +692,13 @@ impl ShadowReservation {
 
 impl Drop for ShadowReservation {
     fn drop(&mut self) {
-        SHADOW_RESERVED.fetch_sub(self.0, Ordering::AcqRel);
+        #[cfg(test)]
+        let _event = crate::retry_allocation_probe::money_admission_event();
+        let before = SHADOW_RESERVED.fetch_sub(self.0, Ordering::AcqRel);
+        #[cfg(test)]
+        crate::retry_allocation_probe::money_admission_changed(before - self.0);
+        #[cfg(not(test))]
+        let _ = before;
     }
 }
 
@@ -2757,7 +2791,10 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
     };
     let dir = support_dir.join("diagnostics");
     let marker = owed_path(&dir, &day);
-    if durable && !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
+    if durable
+        && !money_io!(Metadata, marker.exists())
+        && money_io!(Mutate, std::fs::create_dir_all(&dir)).is_ok()
+    {
         let _ = store::write_atomic(&marker, observed_unix.to_string().as_bytes());
     }
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
@@ -2774,24 +2811,21 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
 fn read_marker_time(path: &Path) -> Option<u64> {
     use std::io::Read;
     let mut text = String::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(64)
-        .read_to_string(&mut text)
-        .ok()?;
+    let file = money_io!(Open, std::fs::File::open(path)).ok()?;
+    money_io!(Read, file.take(64).read_to_string(&mut text)).ok()?;
     text.parse().ok()
 }
 
 fn settle_owed(dir: &Path, day: &str) {
-    let _ = std::fs::remove_file(owed_path(dir, day));
-    if let Ok(entries) = std::fs::read_dir(dir) {
+    let _ = money_io!(Mutate, std::fs::remove_file(owed_path(dir, day)));
+    if let Ok(entries) = money_io!(ReadDir, std::fs::read_dir(dir)) {
         let prefix = format!(".{JSONL_PREFIX}{day}.");
         let own = format!(".{}.", store::intent_run_id());
         for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with(&prefix) && name.ends_with(".pending") && !name.contains(&own) {
-                let _ = std::fs::remove_file(entry.path());
+                let _ = money_io!(Mutate, std::fs::remove_file(entry.path()));
             }
         }
     }
@@ -2809,7 +2843,7 @@ fn take_owed_coverage(
         .ok()
         .and_then(|mut owed| owed.remove(support_dir))
         .unwrap_or_default();
-    let Ok(entries) = std::fs::read_dir(dir) else {
+    let Ok(entries) = money_io!(ReadDir, std::fs::read_dir(dir)) else {
         return owed;
     };
     for entry in entries.take(JSONL_MAX_DIR_ENTRIES).flatten() {
@@ -2825,7 +2859,7 @@ fn take_owed_coverage(
             .filter(|day| day.len() == 8 && day.bytes().all(|b| b.is_ascii_digit()))
         {
             if oldest.is_some_and(|oldest| day < oldest) {
-                let _ = std::fs::remove_file(entry.path());
+                let _ = money_io!(Mutate, std::fs::remove_file(entry.path()));
                 continue;
             }
             if !name.contains(&format!(".{}.", store::intent_run_id())) {
@@ -2850,11 +2884,11 @@ fn take_owed_coverage(
             continue;
         };
         if oldest.is_some_and(|oldest| day < oldest) {
-            let _ = std::fs::remove_file(entry.path());
+            let _ = money_io!(Mutate, std::fs::remove_file(entry.path()));
             continue;
         }
         if marker.is_some() {
-            let observed = std::fs::read_to_string(entry.path())
+            let observed = money_io!(ReadFile, std::fs::read_to_string(entry.path()))
                 .ok()
                 .and_then(|text| text.trim().parse::<u64>().ok())
                 .unwrap_or(0);
@@ -2893,11 +2927,13 @@ pub(crate) struct JsonlOutcome {
 /// The file's last byte is not a newline (an earlier write stopped mid-row).
 fn ends_mid_line(path: &Path) -> bool {
     use std::io::{Read, Seek, SeekFrom};
-    let Ok(mut file) = std::fs::File::open(path) else {
+    let Ok(mut file) = money_io!(Open, std::fs::File::open(path)) else {
         return false;
     };
     let mut last = [0_u8; 1];
-    file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
+    file.seek(SeekFrom::End(-1)).is_ok()
+        && money_io!(Read, file.read_exact(&mut last)).is_ok()
+        && last[0] != b'\n'
 }
 
 /// Rows appended to one day's file, each serialized straight into the
@@ -2918,7 +2954,12 @@ impl DayFile {
     /// open.
     fn open(path: &Path, buffer_bytes: usize, room: u64) -> Self {
         let open_row = ends_mid_line(path);
-        let size = std::fs::metadata(path).map_or(0, |metadata| metadata.len());
+        let size =
+            money_io!(Metadata, std::fs::metadata(path)).map_or(0, |metadata| metadata.len());
+        #[cfg(test)]
+        crate::retry_allocation_probe::money_io_attempt(
+            crate::retry_allocation_probe::MoneyIoKind::Open,
+        );
         let mut writer = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -2926,7 +2967,7 @@ impl DayFile {
             .ok()
             .map(|file| std::io::BufWriter::with_capacity(buffer_bytes, file));
         let written = match writer.as_mut() {
-            Some(writer) => !open_row || writer.write_all(b"\n").is_ok(),
+            Some(writer) => !open_row || money_io!(Write, writer.write_all(b"\n")).is_ok(),
             None => false,
         };
         Self {
@@ -2967,7 +3008,8 @@ impl DayFile {
         self.size += bytes;
         self.written = self.written
             && self.writer.as_mut().is_some_and(|writer| {
-                serde_json::to_writer(&mut *writer, row).is_ok() && writer.write_all(b"\n").is_ok()
+                money_io!(Write, serde_json::to_writer(&mut *writer, row)).is_ok()
+                    && money_io!(Write, writer.write_all(b"\n")).is_ok()
             });
     }
 
@@ -2975,9 +3017,8 @@ impl DayFile {
     fn finish(self) -> bool {
         self.written
             && self.writer.is_some_and(|mut writer| {
-                writer
-                    .flush()
-                    .and_then(|()| writer.get_ref().sync_all())
+                money_io!(Write, writer.flush())
+                    .and_then(|()| money_io!(Sync, writer.get_ref().sync_all()))
                     .is_ok()
             })
     }
@@ -3007,7 +3048,10 @@ fn recover_queued_coverage(support: &Path, now: u64) {
     for days in 0..JSONL_RETENTION_DAYS {
         let observed = now.saturating_sub(days as u64 * 86400);
         if let Some(day) = day_stamp(observed) {
-            if day_path(&support.join("diagnostics"), &day).exists() {
+            if money_io!(
+                Metadata,
+                day_path(&support.join("diagnostics"), &day).exists()
+            ) {
                 owe_coverage(support, observed, true);
             }
         }
@@ -3028,7 +3072,9 @@ fn write_jsonl(support_dir: &Path, batch: &JsonlBatch) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
     let dir = support_dir.join("diagnostics");
-    let Some(today) = day_stamp(now).filter(|_| std::fs::create_dir_all(&dir).is_ok()) else {
+    let Some(today) =
+        day_stamp(now).filter(|_| money_io!(Mutate, std::fs::create_dir_all(&dir)).is_ok())
+    else {
         outcome.failed += 1;
         owe_coverage(support_dir, now, true);
         return outcome;
@@ -4859,7 +4905,7 @@ mod scheduling_reconciliation_tests {
         assert!(ledger.get(&store::money_key("dirty:", &key)).is_some());
         let blocked = store::shard_path_for_test(&scratch, &store::money_key("dirty:", &key))
             .with_extension("json.tmp");
-        std::fs::create_dir_all(&blocked).unwrap();
+        money_io!(Mutate, std::fs::create_dir_all(&blocked)).unwrap();
         assert!(!checkpoint_money_watches(&scratch, &mut ledger, updates));
         assert_eq!(ledger.census().records_with_prefix(&legacy).count(), 1000);
         store::flush();
@@ -5134,7 +5180,7 @@ mod scheduling_reconciliation_tests {
             "phase one retains replay evidence"
         );
         let blocked = store::shard_path_for_test(&support, &dirty).with_extension("json.tmp");
-        std::fs::create_dir_all(&blocked).unwrap();
+        money_io!(Mutate, std::fs::create_dir_all(&blocked)).unwrap();
         assert!(!checkpoint_money_watches(&support, &mut ledger, updates));
         store::flush();
         let mut reloaded = store::load_for_test(&support);

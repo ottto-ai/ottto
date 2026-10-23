@@ -608,7 +608,7 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
                 ClaudeLedgerAcquire::Unavailable
             }
         }
-        None if !support_dir.join(LEDGER_DIR).exists() => {
+        None if !money_io!(Metadata, support_dir.join(LEDGER_DIR).exists()) => {
             ledgers.insert(support_dir.to_path_buf(), Slot::Busy(false));
             ClaudeLedgerAcquire::Ready(ClaudeLedgerGuard {
                 support_dir: support_dir.to_path_buf(),
@@ -739,21 +739,24 @@ fn run_writer(receiver: Receiver<Job>) {
 
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     let staged = path.with_extension("json.tmp");
-    let written = std::fs::File::create(&staged).and_then(|mut file| {
-        file.write_all(bytes)?;
-        file.sync_all()
+    let written = money_io!(Open, std::fs::File::create(&staged)).and_then(|mut file| {
+        money_io!(Write, file.write_all(bytes))?;
+        money_io!(Sync, file.sync_all())
     });
     written
-        .and_then(|()| std::fs::rename(&staged, path))
+        .and_then(|()| money_io!(Mutate, std::fs::rename(&staged, path)))
         // Persist the name before any data shard can replace a zero meta.
         .and_then(|()| {
-            std::fs::File::open(path.parent().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "ledger file has no parent",
-                )
-            })?)?
-            .sync_all()
+            let parent = money_io!(
+                Open,
+                std::fs::File::open(path.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "ledger file has no parent",
+                    )
+                })?)
+            )?;
+            money_io!(Sync, parent.sync_all())
         })
         .is_ok()
 }
@@ -811,15 +814,18 @@ fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) 
         && meta_unwritten.is_none()
     {
         if let Some(intent) = pending_intent {
-            let _ = std::fs::remove_file(intent);
+            let _ = money_io!(Mutate, std::fs::remove_file(intent));
         }
     } else if let Some(now) = job_now(&pending_intent) {
         super::owe_coverage(&support_dir, now, true);
-        if super::day_stamp(now)
-            .is_some_and(|day| super::owed_path(&support_dir.join("diagnostics"), &day).exists())
-        {
+        if super::day_stamp(now).is_some_and(|day| {
+            money_io!(
+                Metadata,
+                super::owed_path(&support_dir.join("diagnostics"), &day).exists()
+            )
+        }) {
             if let Some(intent) = pending_intent {
-                let _ = std::fs::remove_file(intent);
+                let _ = money_io!(Mutate, std::fs::remove_file(intent));
             }
         }
     }
@@ -844,7 +850,7 @@ fn write_save(
 ) -> (Vec<usize>, Option<bool>) {
     let mut unwritten = Vec::new();
     let mut meta_unwritten = None;
-    let mut blocked = std::fs::create_dir_all(dir).is_err();
+    let mut blocked = money_io!(Mutate, std::fs::create_dir_all(dir)).is_err();
     if let Some(meta) = &save.meta_first {
         if blocked || !write_atomic(&shard_path(dir, META), meta) {
             blocked = true;
@@ -912,10 +918,11 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     let mut present = 0_usize;
     for shard in 0..SHARDS {
         let limit = SAVE_BYTES_PER_PAGE as u64;
-        let opened = std::fs::File::open(shard_path(&dir, shard)).and_then(|file| {
-            let len = file.metadata()?.len();
-            Ok((file, len))
-        });
+        let opened =
+            money_io!(Open, std::fs::File::open(shard_path(&dir, shard))).and_then(|file| {
+                let len = money_io!(Metadata, file.metadata())?.len();
+                Ok((file, len))
+            });
         let mut _admitted = None;
         let bytes = match opened {
             Ok((_, len)) if len > limit => {
@@ -926,7 +933,7 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
             Ok((file, len)) => {
                 _admitted = Some(admit_waiting(load_charge(len as usize))?);
                 let mut bytes = Vec::with_capacity(len as usize);
-                match file.take(limit + 1).read_to_end(&mut bytes) {
+                match money_io!(Read, file.take(limit + 1).read_to_end(&mut bytes)) {
                     Ok(_) if bytes.len() as u64 <= limit => bytes,
                     _ => {
                         ledger.load_damaged = true;
@@ -1496,7 +1503,7 @@ fn write_intent(support_dir: &Path, now: u64) -> Option<PathBuf> {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let day = super::day_stamp(now)?;
     let dir = support_dir.join("diagnostics");
-    std::fs::create_dir_all(&dir).ok()?;
+    money_io!(Mutate, std::fs::create_dir_all(&dir)).ok()?;
     let path = dir.join(format!(
         ".{}{day}.{}.{}.pending",
         super::JSONL_PREFIX,
@@ -1701,7 +1708,7 @@ mod refused_intent_tests {
             ClaudeRequestCensusRecord::money_debt([1; 32], 0),
         );
         let blocked = shard_path_for_test(&support, key).with_extension("json.tmp");
-        std::fs::create_dir_all(&blocked).unwrap();
+        money_io!(Mutate, std::fs::create_dir_all(&blocked)).unwrap();
         let (save, funds) = ledger
             .take_save(Instant::now() + Duration::from_secs(2))
             .unwrap();
