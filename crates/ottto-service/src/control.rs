@@ -5433,6 +5433,10 @@ fn complete_pending_auth_claim(
         completed.backfill_policy.as_deref(),
         completed.backfill_cutoff_at.as_deref(),
         &completed.user.id,
+        match &relay_credentials {
+            ClaimRelayDeviceCredential::Legacy(device, secret) => Some((device, secret.as_str())),
+            ClaimRelayDeviceCredential::None | ClaimRelayDeviceCredential::Prepared(_) => None,
+        },
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&completed.setup_run_token)
@@ -5480,14 +5484,23 @@ fn persist_claim_backfill_policy(
     policy: Option<&str>,
     cutoff_at: Option<&str>,
     user_id: &str,
+    destination: Option<(&LocalDeviceBinding, &str)>,
 ) -> Result<(), LocalApiError> {
     let support_dir = default_support_dir();
-    crate::backfill::apply_claim_backfill_policy(&support_dir, policy, cutoff_at, user_id).map_err(
-        |error| {
-            eprintln!("ottto-service: persisting claim backfill policy failed: {error}");
-            LocalApiError::StatePoisoned
-        },
+    let namespace = destination.map(|(device, secret)| {
+        crate::snapshot_sync::snapshot_upload_destination_namespace(device, secret)
+    });
+    crate::backfill::apply_claim_backfill_policy_for_destination(
+        &support_dir,
+        policy,
+        cutoff_at,
+        user_id,
+        namespace.as_deref(),
     )
+    .map_err(|error| {
+        eprintln!("ottto-service: persisting claim backfill policy failed: {error}");
+        LocalApiError::StatePoisoned
+    })
 }
 
 /// Confirmed account switch (`auth_switch_account`): consume the staged claim
@@ -5685,6 +5698,10 @@ fn install_staged_account_switch(
             .as_ref()
             .map(|user| user.id.as_str())
             .unwrap_or_default(),
+        staged
+            .relay_device
+            .as_ref()
+            .zip(staged.relay_device_secret.as_deref()),
     )?;
     KeychainSecretStore::new(OTTTO_SETUP_RUN_TOKEN_ACCOUNT)
         .save(&staged.setup_run_token)
@@ -6422,6 +6439,7 @@ fn write_and_verify_pending_claim_commit(
         claim.backfill_policy.as_deref(),
         claim.backfill_cutoff_at.as_deref(),
         &claim.target_user_id,
+        Some((&pending.device, candidate_secret)),
     )?;
     write_and_verify_active_device_credential(
         pending,
@@ -6869,16 +6887,14 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let support_dir = default_support_dir();
     crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
-    for path in [
-        support_dir.join("snapshots"),
-        support_dir.join("snapshot_backfill_state.json"),
-    ] {
-        if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
-        } else if path.exists() {
-            fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
-        }
+    let path = support_dir.join("snapshots");
+    if path.is_dir() {
+        fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+    } else if path.exists() {
+        fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
     }
+    crate::backfill::remove_backfill_state(&support_dir)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(())
 }
 
