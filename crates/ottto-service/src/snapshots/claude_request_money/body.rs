@@ -371,7 +371,7 @@ pub(crate) fn build_claude_request_body(
         for bucket in &item.usage_buckets {
             for row in &bucket.model_usage {
                 position += 1;
-                if position.is_multiple_of(1024) && ctx.late() {
+                if position % 1024 == 0 && ctx.late() {
                     body.unbuilt = true;
                     return body;
                 }

@@ -151,7 +151,7 @@ fn intersect(
     };
     for hash in short {
         *compared += 1;
-        if (*compared).is_multiple_of(INTERSECT_CHECK_EVERY) && Instant::now() >= deadline {
+        if *compared % INTERSECT_CHECK_EVERY == 0 && Instant::now() >= deadline {
             return false;
         }
         if long.binary_search(hash).is_ok() && !found(*hash) {
@@ -1015,4 +1015,38 @@ pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 
         }
     }
     retired
+}
+
+#[cfg(test)]
+mod inner_deadline_tests {
+    use super::*;
+    #[test]
+    fn money_p1b_intersection_expires_after_entering_large_record() {
+        let hashes = (0..1_000_000).collect::<Vec<u64>>();
+        let started = Instant::now();
+        let deadline = started + std::time::Duration::from_millis(20);
+        let mut compared = 0;
+        let mut found = 0;
+        assert!(!intersect(
+            &hashes,
+            &hashes,
+            &mut compared,
+            deadline,
+            |_| {
+                found += 1;
+                if found == 1 {
+                    // Expire only after the first comparison and callback prove
+                    // the large record's inner loop was entered.
+                    while Instant::now() < deadline {
+                        std::hint::spin_loop();
+                    }
+                }
+                true
+            }
+        ));
+        assert!(found > 0);
+        assert_eq!(compared, INTERSECT_CHECK_EVERY);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        println!("MONEY_P1B_INNER compared={compared} found={found} wall_us={} check_interval={INTERSECT_CHECK_EVERY}", started.elapsed().as_micros());
+    }
 }

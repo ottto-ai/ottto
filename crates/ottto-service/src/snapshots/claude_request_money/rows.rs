@@ -178,7 +178,7 @@ impl ClaudeRootRows {
         let mut facts = Vec::with_capacity(rows.len());
         let mut refused = 0_u64;
         for (at, row) in rows.iter().enumerate() {
-            if at.is_multiple_of(1024) && Instant::now() >= deadline {
+            if at % 1024 == 0 && Instant::now() >= deadline {
                 return (None, 0);
             }
             match row_fact(row, root, &mut header) {
@@ -223,7 +223,7 @@ impl ClaudeRootRows {
         let count = record.request_hashes().len();
         let mut decoded = Vec::with_capacity(count);
         for at in 0..count {
-            if at.is_multiple_of(1024) && Instant::now() >= deadline {
+            if at % 1024 == 0 && Instant::now() >= deadline {
                 return None;
             }
             let fact = facts.next_fact()?;
