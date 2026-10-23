@@ -490,6 +490,7 @@ pub(super) fn validate_context_curve(
         if !matches!(
             curve.coverage.as_str(),
             "ownership_unresolved"
+                | "scalars_file_birth_only"
                 | "parser_unsupported"
                 | "pre_capture"
                 | "payload_budget_exceeded"
