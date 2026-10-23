@@ -2460,5 +2460,6 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
         assert!(restored.quarantined_fingerprints[fingerprint.as_str()]
             .hold
             .is_none());
+        assert_eq!(restored.quarantined_fingerprints[fingerprint.as_str()].retry_after_unix_seconds, now + 1800, "ordinary quarantine jitter must not delay transient recovery");
     }
 }

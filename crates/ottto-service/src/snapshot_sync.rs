@@ -1945,7 +1945,7 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("retry inserted");
-        record.retry_after_unix_seconds = record.retry_after_unix_seconds.max(not_before);
+        record.retry_after_unix_seconds = not_before;
         if let Some((hold, deadline)) = previous {
             record.hold = Some(hold);
             record.retry_after_unix_seconds = deadline.max(not_before);
