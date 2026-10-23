@@ -3959,14 +3959,16 @@ fn claude_index_file_body_accepted(
     index_key: &str,
     entry: &ScanIndexEntry,
 ) -> bool {
-    entry.last_snapshot_fingerprint.is_some()
+    !index.decode_holds_file(index_key)
+        && entry.last_snapshot_fingerprint.is_some()
         && index
             .file_snapshot_fingerprints
             .get(index_key)
             .is_some_and(|fingerprints| {
                 !fingerprints.is_empty()
                     && fingerprints.iter().all(|fingerprint| {
-                        index.accepted_snapshot_fingerprints.contains(fingerprint)
+                        !index.decode_holds_entity(fingerprint)
+                            && index.accepted_snapshot_fingerprints.contains(fingerprint)
                             && !index
                                 .quarantined_snapshot_fingerprints
                                 .contains_key(fingerprint)
@@ -35280,7 +35282,8 @@ impl ScanIndex {
     }
 
     pub(crate) fn accepted_snapshot_fingerprint_recorded(&self, fingerprint: &str) -> bool {
-        self.accepted_snapshot_fingerprints.contains(fingerprint)
+        !self.decode_holds_entity(fingerprint)
+            && self.accepted_snapshot_fingerprints.contains(fingerprint)
     }
 
     /// A well-formed RetryPending family quarantine bound to a retained
@@ -35844,15 +35847,21 @@ impl ScanIndex {
     }
 
     pub(crate) fn record_accepted_snapshot_fingerprints(&mut self, accepted: &BTreeSet<String>) {
-        self.accepted_snapshot_fingerprints
-            .extend(accepted.iter().cloned());
+        for fingerprint in accepted {
+            if !self.decode_holds_entity(fingerprint) {
+                self.accepted_snapshot_fingerprints
+                    .insert(fingerprint.clone());
+            }
+        }
         let current = self.current_snapshot_fingerprints();
-        self.accepted_snapshot_fingerprints.retain(|fingerprint| {
+        let mut retained = std::mem::take(&mut self.accepted_snapshot_fingerprints);
+        retained.retain(|fingerprint| {
             current.contains(fingerprint)
                 && !self
                     .quarantined_snapshot_fingerprints
                     .contains_key(fingerprint)
         });
+        self.accepted_snapshot_fingerprints = retained;
     }
 
     #[cfg(test)]
@@ -37014,7 +37023,8 @@ impl ScanIndex {
     ) -> ScanIndex {
         let empty_advances = self.claude_empty_map_advances(previous);
         let settled = |fingerprint: &str| {
-            accepted.contains(fingerprint) || quarantined.contains_key(fingerprint)
+            !self.decode_holds_entity(fingerprint)
+                && (accepted.contains(fingerprint) || quarantined.contains_key(fingerprint))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
             if self.confirmed_empty_files.contains(key) {

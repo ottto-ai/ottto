@@ -439,7 +439,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             || self
                 .held_bytes
                 .checked_add(span.len)
-                .is_none_or(|bytes| bytes > HOLD_BYTES_MAX.min(self.input_len / 8))
+                .map_or(true, |bytes| bytes > HOLD_BYTES_MAX.min(self.input_len / 8))
         {
             return Err(Error::HoldBudget);
         }
@@ -1019,7 +1019,32 @@ impl ScanIndex {
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
     }
-    pub(super) fn decode_holds_entity(&self, fingerprint: &str) -> bool {
+    pub(crate) fn decode_held_file_keys(&self) -> impl Iterator<Item = &str> {
+        self.decode_holds
+            .0
+            .get("files")
+            .into_iter()
+            .flat_map(|slots| slots.keys())
+            .map(String::as_str)
+    }
+    pub(crate) fn decode_holds_entity(&self, fingerprint: &str) -> bool {
+        if self.decode_holds.is_empty() {
+            return false;
+        }
+        if self
+            .decode_holds
+            .contains("quarantined_snapshot_fingerprints", fingerprint)
+        {
+            return true;
+        }
+        let family_hold = self
+            .decode_holds
+            .0
+            .keys()
+            .any(|field| field.starts_with("claude_"));
+        if !family_hold && !self.decode_holds.0.contains_key("files") {
+            return false;
+        }
         self.decode_holds
             .contains("quarantined_snapshot_fingerprints", fingerprint)
             || self
@@ -1046,7 +1071,7 @@ impl ScanIndex {
     fn decode_holds_codex_owner(&self, id: &str) -> bool {
         let owner = codex_protected_owner(id);
         self.decode_held_codex_owners()
-            .any(|held| held.is_none_or(|held| held == owner))
+            .any(|held| held.map_or(true, |held| held == owner))
     }
     pub(super) fn decode_holds_snapshot(
         &self,

@@ -393,7 +393,10 @@ fn lenient_held_entity_is_absent_from_emission_and_manifest() {
     value["quarantined_snapshot_fingerprints"][&held]["disposition"] =
         Value::String("unknown".into());
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    loaded.record_accepted_snapshot_fingerprints(&BTreeSet::from([held.clone()]));
+    assert!(!loaded.accepted_snapshot_fingerprint_recorded(&held));
+    assert!(!loaded.accepted_snapshot_fingerprints.contains(&held));
     let mut snapshot = tests::sample_session_artifact_item();
     snapshot.snapshot_fingerprint = held;
     assert!(loaded.decode_holds_snapshot(SnapshotSource::ClaudeCode, &snapshot));
