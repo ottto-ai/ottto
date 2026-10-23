@@ -246,6 +246,8 @@ struct CycleResult {
     /// The saved upload ledger as JSON, to read the exact disk form.
     progress_json: serde_json::Value,
     progress_path: PathBuf,
+    /// Distinct exact-body conflicts the scan's cooldown view deferred.
+    cooldown_deferred: usize,
 }
 
 struct ReofferPipeline {
@@ -346,6 +348,7 @@ impl ReofferPipeline {
         .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         assert!(scan.census_complete, "synthetic census is complete");
+        let cooldown_deferred = index.reason_reoffer_cooldown_deferred_count();
         let cache_enabled = preparation.cache_observations_enabled;
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
         let index_path = preparation.index_path.clone();
@@ -384,7 +387,70 @@ impl ReofferPipeline {
             .unwrap(),
             progress_json,
             progress_path,
+            cooldown_deferred,
         }
+    }
+
+    /// One real cycle and its physical transcript reads, from the existing
+    /// per-page resource record: (parser/acquisition entries, native plus
+    /// guard bytes read). `restart` first drops the daemon, as a restart
+    /// does, so no retained reduction can hide a re-read.
+    fn measured_cycle(&mut self, now: u64, restart: bool) -> (CycleResult, u64, u64) {
+        if restart {
+            self.daemon = test_daemon("otm_test");
+        }
+        let (cycle, records) = crate::local_resource_diagnostics::capture(|| self.cycle(now));
+        let pages = records
+            .iter()
+            .filter(|record| {
+                record["stage"] == "native_collection_page" && record["source"] == "claude_code"
+            })
+            .collect::<Vec<_>>();
+        assert!(!pages.is_empty(), "the cycle completed a collection page");
+        let parsed = pages
+            .iter()
+            .map(|page| page["counts"]["scanned_files"].as_u64().unwrap_or_default())
+            .sum::<u64>();
+        let bytes = pages
+            .iter()
+            .map(|page| {
+                let read = &page["counts"]["sampled_acquisition"];
+                read["completed_native_bytes"].as_u64().unwrap_or_default()
+                    + read["completed_guard_bytes"].as_u64().unwrap_or_default()
+            })
+            .sum::<u64>();
+        eprintln!(
+            "O1_MEASURED_CYCLE now={now} restart={restart} parsed={parsed} bytes={bytes} \
+             cooldown_deferred={}",
+            cycle.cooldown_deferred
+        );
+        (cycle, parsed, bytes)
+    }
+
+    fn transcript(&self) -> PathBuf {
+        self.fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"))
+    }
+
+    /// The conflict's ordinary retry is due now on the durable index.
+    fn make_conflict_retry_due(&self, fingerprint: &str) {
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&self.support, SnapshotSource::ClaudeCode),
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+        ));
+        let mut index = ScanIndex::load(&index_path).unwrap();
+        let record = index
+            .quarantined_snapshot_fingerprints
+            .get_mut(fingerprint)
+            .unwrap();
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        record.retry_after_unix_seconds = 0;
+        index.save(&index_path).unwrap();
     }
 }
 
@@ -1172,4 +1238,158 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
         progress.contains_body(&fingerprint, &body),
         "lease consumed only by final answer"
     );
+}
+
+/// The refusal, a conflict on its due daily offer, and the conflict's
+/// ordinary retry made due: the state whose quiet cycles re-read the file.
+fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_json::Value) {
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(name, Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    pipeline.server.answer(Answer::Conflict);
+    let t1 = t0 + DAY + 60;
+    let day1 = pipeline.cycle(t1);
+    assert!(day1.result.is_err(), "a conflict still owes a follow-up");
+    assert_eq!(pipeline.server.offered().len(), 2);
+    let deadline = reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"].clone();
+    assert!(
+        deadline.as_u64().is_some_and(|due| due >= t1 + DAY),
+        "{}",
+        day1.progress_json
+    );
+    pipeline.make_conflict_retry_due(&fingerprint);
+    pipeline.server.answer(Answer::Accept);
+    (pipeline, fingerprint, t1, deadline)
+}
+
+/// O1 (I/O half): quiet cycles before the reserved daily re-offer re-read
+/// nothing for an unchanged file whose only selection is its already
+/// refused exact body, across a restart that rebuilds the runtime view.
+/// The refusal, conflict and deadline stay; the source stays unsettled
+/// exactly as #706 requires. At the due time: one re-read and one offer.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
+    if !supported("cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer") {
+        return;
+    }
+    let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted("reoffer-cooldown-io");
+    let size = std::fs::metadata(pipeline.transcript()).unwrap().len();
+    assert!(size > 0);
+    for (now, restart) in [
+        (t1 + 3_600, false),
+        (t1 + 7_200, true),
+        (t1 + 13 * 3_600, true),
+        (t1 + DAY - 1, true),
+    ] {
+        let (quiet, parsed, bytes) = pipeline.measured_cycle(now, restart);
+        assert_eq!(parsed, 0, "no reason-driven re-read at +{}s", now - t1);
+        assert_eq!(bytes, 0, "no transcript bytes at +{}s", now - t1);
+        assert_eq!(pipeline.server.offered().len(), 2, "no POST before the day");
+        assert_eq!(quiet.leased_offers, 0);
+        assert_eq!(quiet.cooldown_deferred, 1, "counted once per entity");
+        // Settlement is unchanged: the newer conflict still owes follow-up.
+        assert!(quiet.result.is_err());
+        assert!(quiet.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            pipeline.server.last_terminal()["last_error_code"],
+            "server_error"
+        );
+        assert!(quiet.progress.contains_body(
+            &fingerprint,
+            &quiet.progress.permanent_rejections[&fingerprint].body_witness
+        ));
+        assert_eq!(
+            quiet.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            quiet.progress.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+            deadline
+        );
+    }
+
+    // The reserved day arrives: exactly one re-read and one offer.
+    let due = deadline.as_u64().unwrap() + 60;
+    let (day2, parsed, bytes) = pipeline.measured_cycle(due, true);
+    assert_eq!(day2.leased_offers, 1);
+    assert_eq!(parsed, 1, "one reconstruction at the due time");
+    assert!(bytes >= size, "a real full re-read: {bytes} < {size}");
+    assert!(day2.result.is_ok(), "{:?}", day2.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3, "one offer at the due time");
+    assert_eq!(fingerprint_of(&offered[2]), fingerprint);
+    assert_eq!(day2.cooldown_deferred, 0);
+    assert!(!day2
+        .progress
+        .permanent_rejections
+        .contains_key(&fingerprint));
+    assert!(day2
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+}
+
+/// O1 controls: a file that changes during the cooldown is re-read and its
+/// new body offered normally; an injected clock rollback re-clamps the
+/// reservation and still re-reads nothing for the unchanged file.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
+    if !supported("cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback") {
+        return;
+    }
+    let (mut pipeline, fingerprint, t1, _) = refused_then_conflicted("reoffer-cooldown-change");
+
+    // F2: the local clock rolls back an hour, past the tolerance. The
+    // reservation is re-clamped from the prepared ledger (still after the
+    // next cycle below), and the unchanged file is still not re-read.
+    let rolled_back = t1 - 3_600;
+    let (rollback, parsed, bytes) = pipeline.measured_cycle(rolled_back, true);
+    assert_eq!((parsed, bytes), (0, 0));
+    assert_eq!(pipeline.server.offered().len(), 2);
+    assert_eq!(rollback.cooldown_deferred, 1);
+    assert!(rollback.result.is_err());
+    assert_eq!(
+        reoffer_json(&rollback, &fingerprint)["retry_after_unix_seconds"],
+        rolled_back + DAY
+    );
+
+    // The session grows before the daily offer: the file is re-read and its
+    // new body goes through the normal path.
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": IDENTITY_PIPELINE_ROOT, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(pipeline.transcript())
+        .unwrap()
+        .write_all(format!("{grown}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    let (changed, parsed, bytes) = pipeline.measured_cycle(t1 + 3_600, true);
+    assert_eq!(parsed, 1, "a changed file re-parses normally");
+    assert!(bytes > 0);
+    assert!(changed.result.is_ok(), "{:?}", changed.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 3, "the new body is offered");
+    assert_ne!(fingerprint_of(&offered[2]), fingerprint);
+    assert!(changed
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&offered[2])));
 }

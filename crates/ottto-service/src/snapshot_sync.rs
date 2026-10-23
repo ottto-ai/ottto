@@ -1274,6 +1274,48 @@ impl SnapshotUploadProgress {
         changed
     }
 
+    /// Runtime-only exact-body cooldown view (fingerprint -> refused body
+    /// witness) of this prepared cycle: a retained exact-body RetryPending
+    /// conflict whose refusal holds a validated daily re-offer reservation
+    /// and no lease this cycle. Without that lease the exact body cannot be
+    /// sent, so its ordinary retry timer alone must not re-read an unchanged
+    /// file. Due records waiting for budget stay in the view. Missing,
+    /// malformed or classified extensions grant nothing. Bounded by the
+    /// refusal ledger; the reservation remains the sole durable schedule.
+    fn reason_reoffer_cooldowns(&self, now: u64) -> BTreeMap<String, String> {
+        use reason_reoffer::RefusalReoffer;
+        let latest = reason_reoffer::latest_valid_deadline(now);
+        self.permanent_rejections
+            .iter()
+            .filter(|(fingerprint, refusal)| {
+                refusal.reason == crate::upload_receipts::RejectedUsageReason::Other
+                    && matches!(
+                        refusal.reoffer,
+                        Some(
+                            RefusalReoffer::OriginalPair { .. }
+                                | RefusalReoffer::LegacyOther { .. }
+                        )
+                    )
+                    && refusal
+                        .reoffer
+                        .and_then(RefusalReoffer::retry_after)
+                        .is_some_and(|retry_after| retry_after <= latest)
+                    && !self.active_reason_reoffers.contains_key(*fingerprint)
+                    && !self.active_quarantine_retries.contains(*fingerprint)
+                    && !self.accepted_fingerprints.contains(*fingerprint)
+                    && self
+                        .quarantined_fingerprints
+                        .get(*fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                && record.upload_body_witness.as_deref()
+                                    == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, refusal)| (fingerprint.clone(), refusal.body_witness.clone()))
+            .collect()
+    }
+
     /// Reserve the next logical offer before any scan or upload can use it.
     /// A crash or an unmaterialized lease therefore waits a day.
     fn reserve_reason_reoffer(&mut self, fingerprint: &str, body_witness: String, now: u64) {
@@ -5379,6 +5421,12 @@ fn prepare_sync_source(
     let committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
+    // A replay re-reads everything and neither re-offers nor defers.
+    index.activate_reason_reoffer_cooldowns(if historical_replay_pending {
+        BTreeMap::new()
+    } else {
+        upload_progress.reason_reoffer_cooldowns(reoffer_now)
+    });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -6037,6 +6085,9 @@ fn finish_sync_source(
         // obligation survives until both cache settlement and index save.
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress
+        .reason_reoffer_counts
+        .cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
     // One logical offer per leased refusal: its next deadline is at least
     // this first transmission + 24 h, and durable before it. A failed save
     // sends nothing.

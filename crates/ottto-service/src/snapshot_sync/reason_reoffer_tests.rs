@@ -767,6 +767,93 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     );
 }
 
+/// O1: the runtime cooldown view holds exactly the retained exact-body
+/// conflicts that no lease lets through this cycle, including a due record
+/// still waiting for budget (no unlimited ordinary reparse while it waits)
+/// and an F2-re-clamped deadline read from the prepared ledger. A lease, a
+/// done marker, another body or no conflict grants no deferral.
+#[test]
+fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
+    use reason_reoffer::RefusalReoffer;
+    let (mut progress, mut index) = refused(&[
+        (1, original_pair(NOW + DAY)),
+        (2, original_pair(NOW - 1)),
+        (3, Some(RefusalReoffer::Classified)),
+        (4, original_pair(NOW + 5 * DAY)),
+        (5, original_pair(NOW + DAY)),
+        (6, original_pair(NOW + DAY)),
+    ]);
+    for value in 1..=4 {
+        progress.quarantine_retryable_body(&fp(value), &body(value));
+    }
+    // A conflict on another body of the entity is ordinary new work.
+    progress.quarantine_retryable_body(&fp(5), &body(500));
+    progress
+        .quarantined_fingerprints
+        .get_mut(&fp(5))
+        .unwrap()
+        .retry_after_unix_seconds = u64::MAX;
+    // Value 6 keeps only its terminal refusal: nothing to retry.
+    // Older ordinary retries fill the shared budget before the due re-offer.
+    for value in 200..200 + SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE {
+        let mut record = terminal_record(&body(value));
+        record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        record.failed_reconstruction_count = 1;
+        record.retry_after_unix_seconds = 1;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fp(value), record);
+    }
+    assert!(select(&mut progress, &index, NOW));
+    let counts = progress.reason_reoffer_counts;
+    assert_eq!(
+        counts.deferred_budget, 1,
+        "the due re-offer waits for budget"
+    );
+    assert_eq!(counts.clock_bound_skipped, 1);
+    assert!(progress.active_reason_reoffers.is_empty());
+    assert_eq!(
+        progress.permanent_rejections[&fp(4)].reoffer,
+        original_pair(NOW + DAY),
+        "F2 re-clamped before the view reads it"
+    );
+    assert_eq!(
+        progress.reason_reoffer_cooldowns(NOW),
+        BTreeMap::from([(fp(1), body(1)), (fp(2), body(2)), (fp(4), body(4)),])
+    );
+    // The view is a read: every refusal, conflict and deadline is retained.
+    for value in [1, 2, 4] {
+        assert!(progress.contains_body(&fp(value), &body(value)));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp(value)].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+    }
+    assert_eq!(
+        progress.permanent_rejections[&fp(2)].reoffer,
+        original_pair(NOW - 1)
+    );
+
+    // Budget frees: the due record's own lease, not the view, selects it.
+    for value in 200..200 + SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE {
+        index.quarantined_snapshot_fingerprints.remove(&fp(value));
+        progress.quarantined_fingerprints.remove(&fp(value));
+    }
+    assert!(select(&mut progress, &index, NOW + 300));
+    assert_eq!(progress.active_reason_reoffers[&fp(2)], body(2));
+    assert_eq!(
+        progress.reason_reoffer_cooldowns(NOW + 300),
+        BTreeMap::from([(fp(1), body(1)), (fp(4), body(4))])
+    );
+    let mut counts = progress.reason_reoffer_counts;
+    counts.cooldown_conflict_deferred = 2;
+    let summary = counts.line("claude_code");
+    assert!(
+        summary.contains("cooldown_conflict_deferred=2"),
+        "{summary}"
+    );
+}
+
 /// Bootstrap errors must finish the logical-offer counters just as main-page
 /// errors do. Exhausted short sheds count once despite three physical sends.
 #[test]
