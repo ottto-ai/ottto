@@ -979,8 +979,8 @@ fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
 }
 
 impl ClaudeRequestCensus {
-    fn safety_get(&self, key: &str) -> Option<RecordView<'_>> {
-        let core = self.get(key)?;
+    fn all_safety_get(&self, key: &str) -> Option<RecordView<'_>> {
+        let core = self.records.get(key)?;
         let extra = self
             .safety
             .as_deref()
@@ -991,21 +991,18 @@ impl ClaudeRequestCensus {
             safety_hashes: extra.and_then(|extra| extra.safety_hashes.as_deref()),
         })
     }
+    fn safety_get(&self, key: &str) -> Option<RecordView<'_>> {
+        self.all_safety_get(key)
+            .filter(|record| !record.is_birth_stub())
+    }
+    fn all_safety_records(&self) -> impl Iterator<Item = (&String, RecordView<'_>)> {
+        self.records
+            .keys()
+            .map(|key| (key, self.all_safety_get(key).expect("current core key")))
+    }
     fn safety_records(&self) -> impl Iterator<Item = (&String, RecordView<'_>)> {
-        self.records().map(|(key, core)| {
-            let extra = self
-                .safety
-                .as_deref()
-                .and_then(|map| map.get(&safety_key_hash(key)));
-            (
-                key,
-                RecordView {
-                    core,
-                    safety: extra.and_then(|extra| extra.safety.as_deref()),
-                    safety_hashes: extra.and_then(|extra| extra.safety_hashes.as_deref()),
-                },
-            )
-        })
+        self.all_safety_records()
+            .filter(|(_, record)| !record.is_birth_stub())
     }
     fn store_safety(&mut self, key: String, record: SafetyRecord) {
         let SafetyRecord { core, extra } = record;
@@ -1554,6 +1551,9 @@ impl ClaudeRequestCensus {
         let old = SafetyRecord { core, extra };
         self.charge(key, &old, false);
         self.charge(key, &ClaudeRequestCensusRecord::birth_stub(birth), true);
+        if self.safety.as_ref().is_some_and(|map| map.is_empty()) {
+            self.safety = None;
+        }
     }
 
     /// The birth `key`'s next record carries: the old record's (or its
@@ -1651,6 +1651,13 @@ pub(crate) struct ClaudeRequestCensusShadowState {
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, safety_incomplete);
 
 impl ClaudeRequestCensusShadowState {
+    fn closed() -> Self {
+        Self {
+            safety_incomplete: Some(SafetyIncomplete::closed()),
+            ..Self::default()
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         *self == Self::default()
     }
@@ -1822,7 +1829,7 @@ impl Serialize for SafetyRecord {
 impl Serialize for ClaudeRequestCensus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(Some(self.records.len()))?;
-        if !phase_b::enabled() && self.safety.is_none() {
+        if !phase_b::enabled() && self.safety.is_none() && !self.safety_incomplete.incomplete() {
             for (key, core) in &self.records {
                 map.serialize_entry(key, core)?;
             }
@@ -2136,7 +2143,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // leave this reader. JSON syntax outside the optional field is intact.
         Ok(if self.shadow_state {
             let state = serde_json::from_slice::<ClaudeRequestCensusShadowState>(&bytes)
-                .unwrap_or_default();
+                .unwrap_or_else(|_| ClaudeRequestCensusShadowState::closed());
             drop(bytes);
             serde_json::to_vec(&state).expect("shadow serialization")
         } else {
@@ -2330,13 +2337,15 @@ pub(crate) fn decode_ledger_shard(bytes: &[u8]) -> Option<ClaudeRequestCensus> {
 impl<'de> Deserialize<'de> for ClaudeRequestCensusShadowState {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        if raw.get().len() > 512 * 1024 + MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES {
-            return Ok(Self::default());
+        if raw.get().len() > 512 * 1024 + MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
+            || !raw.get().trim_start().starts_with('{')
+        {
+            return Ok(Self::closed());
         }
         let mut isolated = serde_json::Deserializer::from_str(raw.get());
         Ok(isolated
             .deserialize_any(ShadowStateVisitor)
-            .unwrap_or_default())
+            .unwrap_or_else(|_| Self::closed()))
     }
 }
 
@@ -3581,6 +3590,7 @@ pub(crate) fn prepare_safety_checkpoint(index: &mut ScanIndex) {
         && !index.claude_request_census.safety_incomplete.incomplete())
         || !index.claude_request_census.extension_order.is_empty()
         || !index.claude_request_census.retired_order.is_empty()
+        || index.claude_request_census.safety_incomplete.overflow
         || !index
             .claude_request_census
             .safety_incomplete
@@ -4569,7 +4579,7 @@ impl CensusShadowView {
         }
         let records = index
             .claude_request_census
-            .safety_records()
+            .all_safety_records()
             .map(|(key, record)| (key.clone(), evidence_digest(&record)))
             .collect();
         Some(Self {
@@ -4835,7 +4845,7 @@ impl CensusShadowView {
             .filter(|(key, digest)| {
                 saved
                     .claude_request_census
-                    .safety_get(*key)
+                    .all_safety_get(*key)
                     .map_or(true, |record| evidence_digest(&record) != **digest)
             })
             .count();
@@ -5430,7 +5440,8 @@ mod phase_b_tests {
             7,
             ClaudeRequestCensusShape::Exact,
             hashes,
-        );
+        )
+        .into();
         record.extra.safety = Some(Box::new(TranscriptSafety {
             sc: 1,
             oc: 1,
@@ -5453,6 +5464,67 @@ mod phase_b_tests {
         index
     }
 
+    #[test]
+    fn malformed_present_shadow_never_receives_the_legacy_open_default() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let legacy = index_with(vec![(A, record('a', vec![1]).without_safety_for_test())]);
+        let scratch = crate::test_scratch::ScratchDir::new("malformed-shadow-restart");
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!(false),
+            serde_json::json!(42),
+            serde_json::json!([]),
+            serde_json::json!("bad"),
+        ] {
+            let mut value = serde_json::to_value(&legacy).unwrap();
+            value["claude_request_census_shadow"] = bad;
+            let raw = serde_json::to_vec(&value).unwrap();
+            for mut loaded in [
+                decode_index(raw.as_slice()).unwrap(),
+                decode_bounded_index(&raw).unwrap(),
+            ] {
+                assert!(loaded.claude_request_census.safety_incomplete.overflow);
+                assert!(!ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new())
+                    .disjointness_complete(true));
+                let path = scratch.join(format!("{}.json", loaded.generation));
+                if path.exists() {
+                    std::fs::remove_file(&path).unwrap();
+                }
+                loaded.save(&path).unwrap();
+                assert!(
+                    ScanIndex::load(&path)
+                        .unwrap()
+                        .claude_request_census
+                        .safety_incomplete
+                        .overflow
+                );
+            }
+        }
+    }
+    #[test]
+    fn saved_equality_includes_birth_stubs_and_detects_their_removal() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let mut index = index_with(vec![(A, record('a', vec![1]))]);
+        index.claude_request_census.insert_for_test(
+            B,
+            ClaudeRequestCensusRecord::birth_stub(ClaudeRequestBirth {
+                unix_seconds: 1,
+                device: 1,
+                inode: 1,
+            }),
+        );
+        let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
+        let counts = join.counts(true);
+        let view = CensusShadowView::prepare(&index, join, counts, "1970-01-01T00:00:07Z").unwrap();
+        view.compare_legacy(&index, "1970-01-01T00:00:07Z");
+        let scratch = crate::test_scratch::ScratchDir::new("birth-stub-equality");
+        let path = scratch.join("index.json");
+        index.save(&path).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(view.qualify_saved(&loaded).shadow_post_save_qualified);
+        loaded.claude_request_census.remove(B);
+        assert!(!view.qualify_saved(&loaded).shadow_post_save_qualified);
+    }
     #[test]
     fn stale_pending_is_uncomparable_and_dirty_old_fingerprint_does_not_cover() {
         let _mode = phase_b::ShadowMode::set(true);
@@ -5482,28 +5554,50 @@ mod phase_b_tests {
     #[test]
     fn bound_acquisition_survives_later_growth_and_counts_it() {
         let _mode = phase_b::ShadowMode::set(true);
-        let mut a = record('a', vec![1]);
-        let safety = a.extra.safety.as_mut().unwrap();
-        safety.acquired = 100;
-        safety.extent = 100;
-        safety.ac = true;
-        safety.grew_after_bound = true;
-        let index = index_with(vec![(A, a), (B, record('b', vec![2]))]);
+        let mut index = index_with(vec![(A, record('a', vec![1])), (B, record('b', vec![2]))]);
+        record_claude_request_census(
+            &mut index,
+            &[],
+            ClaudeRequestCensusParse {
+                path: Path::new(A),
+                index_key: A,
+                source_file_fingerprint: &"a".repeat(64),
+                census_window_end: "1970-01-01T00:00:07Z",
+                complete: false,
+                acquired_eof: true,
+                grew_after_bound: true,
+                acquired: 100,
+                extent: 100,
+                lossy: false,
+                source_verified: true,
+                itemless_request_hashes: vec![1],
+                opened_birth: None,
+                modified_unix_seconds: 1,
+            },
+        );
+        assert!(
+            index
+                .claude_request_census
+                .safety_get(A)
+                .unwrap()
+                .safety
+                .unwrap()
+                .ac
+        );
         let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
         assert!(join.disjointness_complete(true));
         assert_eq!(join.counts.unread_due_to_growth, 1);
         assert_eq!(join.counts.shape_lossy_unread, 0);
-        let raw = serde_json::to_vec(&index).unwrap();
-        let mut loaded = decode_index(raw.as_slice()).unwrap();
-        // Explicit marker required for post-B records; this fixture intentionally
-        // has none before save, so marker closure is independently asserted.
-        assert!(loaded.claude_request_census.safety_incomplete.incomplete());
-        loaded.claude_request_census.safety_incomplete = SafetyIncomplete::default();
+        let scratch = crate::test_scratch::ScratchDir::new("bound-growth-restart");
+        let path = scratch.join("index.json");
+        index.save(&path).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        let join = ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new());
+        assert!(join.disjointness_complete(true));
+        assert_eq!(join.counts.unread_due_to_growth, 1);
         assert_eq!(
-            ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new())
-                .counts
-                .unread_due_to_growth,
-            1
+            join.member_status(&loaded, B, true),
+            ClaudeCensusMemberStatus::Disjoint
         );
     }
     #[test]
