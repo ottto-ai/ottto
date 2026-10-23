@@ -7874,10 +7874,10 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 BTreeSet::new()
             };
         // Contract-5 identity latch: after a contract change nothing skips.
-        // The first complete, settled closed-fence terminal whose whole
-        // traversal ran under the contract this fold sees re-arms every
-        // family file, including members an earlier skip left unread, and
-        // clears it; so does a full re-arm terminal under that contract.
+        // A complete closed-fence terminal under the recorded contract
+        // re-arms every family file, including members a skip left unread.
+        // Only a settled terminal can also clear the latch below; a full
+        // re-arm under that contract has the same settlement requirement.
         let identity_contract = claude_request_identity::cycle_contract(identity.is_some());
         let identity_contract_recorded =
             index.claude_request_identity_contract.as_deref() == Some(identity_contract);
@@ -7886,8 +7886,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let identity_contract_rearm = index.claude_request_identity_contract_changed
             && fence_stays_closed
             && census_complete
-            && identity_contract_recorded
-            && !index.bounded_sweep_had_unsettled_upload;
+            && identity_contract_recorded;
+        // Partial settlement keeps the latch below, but cannot suppress its
+        // independent corrective re-arm while the liveness deadline waits.
         // Fence recovery: members an earlier skip left unread stay unobserved,
         // and their families' pending goes stale. When witnessed families
         // this window did not read, which the BASE re-arm would have re-read,

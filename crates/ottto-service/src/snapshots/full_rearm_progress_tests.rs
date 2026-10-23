@@ -956,12 +956,12 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
     let rearm = Rearm::new();
     let mut baseline = rearm.index();
     rearm.establish(&mut baseline, &rearm.items);
-    for cause in ["absent", "unpaired", "malformed-pair"] {
+    for cause in ["absent", "unpaired", "malformed-pair", "request-gap"] {
         let support = temp_dir("full-rearm-filtered-sidecars");
         if cause != "absent" {
             let digest = format!("{:x}", Sha256::digest(rearm.parent.as_bytes()));
             let mut kinds = vec!["claude-code-effort"];
-            if cause == "malformed-pair" {
+            if cause == "malformed-pair" || cause == "request-gap" {
                 kinds.push("claude-code-trace-ownership");
             }
             for kind in kinds {
@@ -970,7 +970,25 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
                     .join(kind)
                     .join(format!("{digest}.jsonl"));
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
-                fs::write(path, "not json\n").unwrap();
+                let row = if cause == "request-gap" {
+                    if kind == "claude-code-effort" {
+                        serde_json::to_string(&complete_api_row(
+                            &rearm.parent,
+                            "req_1",
+                            0,
+                            10,
+                            10,
+                            0,
+                        ))
+                        .unwrap()
+                    } else {
+                        serde_json::to_string(&complete_trace_row(&rearm.parent, "req_gap", ""))
+                            .unwrap()
+                    }
+                } else {
+                    "not json".to_string()
+                };
+                fs::write(path, format!("{row}\n")).unwrap();
             }
         }
         // Obtain a real empty scan envelope, independently of the index whose
@@ -989,9 +1007,14 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
         scan.census_complete = true;
         let mut index = baseline.clone();
         index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let (disposition, _, _) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+        let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
             &support, &mut scan, &mut index,
         );
+        if cause == "request-gap" {
+            assert_eq!(stats.api_incomplete_root_count, 0);
+            assert_eq!(stats.trace_incomplete_root_count, 0);
+            assert_eq!(stats.request_set_mismatch_root_count, 1);
+        }
         let run = rearm.reread(&mut index, &disposition);
         assert!(
             run.counts.fence_before && run.counts.fence_after,

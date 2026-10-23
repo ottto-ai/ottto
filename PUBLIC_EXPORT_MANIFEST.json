@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "1a022b632317e40bce72876f59aa006cbd27d43f6ffc9ba1f12543da86510893",
+  "content_sha256": "89bdd933b183aeba809a8c8ebdd5560ab0c4deaa18e0f8aeb684510ff96753ab",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "f298b966c398abd213d48bdeaab58178632e7fc9620891f34398ab4ef567e032",
-      "size_bytes": 917068
+      "sha256": "a787c30882ae17d61c54078a93c73a339f85ef3a696abee02bd1192924354fd1",
+      "size_bytes": 917118
     },
     {
       "executable": false,
@@ -1609,8 +1609,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stale_family_carry_pipeline_tests.rs",
-      "sha256": "581a5ee706422d5b3f387045d98319806af31f84bedca3352fea50b63d6d677f",
-      "size_bytes": 32956
+      "sha256": "34c618ecaf5cf331333f7a2dd5483d337b72061f7966c8fdc10439cd8cef4b43",
+      "size_bytes": 33567
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "9a7954b04d30b24add9e9d3acdf6a44d566e351cd16976806e3e7bda10e73127",
-      "size_bytes": 3411135
+      "sha256": "1cfc8af643506aa64ab8495dc77504bd428ba9ba801819d0811ad4d1cb816090",
+      "size_bytes": 3411233
     },
     {
       "executable": false,
@@ -1987,8 +1987,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/full_rearm_progress_tests.rs",
-      "sha256": "c79614f5a9800e7be37c35bae2564bc73456371ed7f573f00a5a8c9f7609b2ae",
-      "size_bytes": 38951
+      "sha256": "8ac330d1febc6a0fe8673b5e5805f98df690a92a05dc5f8deaa04a40a7814ccd",
+      "size_bytes": 39949
     },
     {
       "executable": false,
@@ -4024,8 +4024,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-23-claude-full-rearm-no-progress.md",
-      "sha256": "fd479d04d733051c74a41eecf62aad1181c8c05ea3c3dfa38b7a9525892049cf",
-      "size_bytes": 9032
+      "sha256": "33c894ae93f80c9b3e6e7633747208819040b1d8594838acd0212a6db3c6ae0b",
+      "size_bytes": 9220
     },
     {
       "executable": false,
@@ -5806,7 +5806,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T16:29:07+00:00",
+  "generated_at": "2026-10-23T17:14:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "91d4d1f5622de7d54b7e94c1cf22a0a8bea85c79"
+  "source_commit": "22456d841e0805d376656180c70319214ed9afd6"
 }

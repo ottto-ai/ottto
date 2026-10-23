@@ -238,6 +238,19 @@ fn c1b_liveness(run: &C1bRun) -> Vec<C1bLiveness> {
     run.windows.iter().map(C1bWindow::liveness).collect()
 }
 
+/// This control measures C1b alone. Fix 2's window/cap has separate pipeline
+/// coverage below and intentionally keeps eligible unwitnessed families too.
+fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
+    c1a_edit_index(fixture, |saved| {
+        let progress = saved
+            .get_mut("claude_full_rearm_progress")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the preceding full re-arm recorded progress");
+        progress.remove("full_rearm_window");
+        progress.remove("full_rearm_window_next");
+    });
+}
+
 /// T0/T1, the unrelated-red-window shape: an unrelated session turns the
 /// 08:10 window red. BASE re-arms every family parsed there at each retry
 /// start, so the unchanged witnessed family is re-read at 08:20 and 08:30
@@ -257,8 +270,8 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let family = rearm_family_sessions().len() as u64;
-    let fix = c1b_red_chain("c1b-red-window", "fix", |_| {});
-    let base = c1b_base_red_chain("c1b-red-window-base", |_| {});
+    let fix = c1b_red_chain("c1b-red-window", "fix", c1b_without_full_rearm_window);
+    let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
     let [_, _, base_retry, base_repaired, _] = &base.windows;
     // Preconditions on BASE: both retries re-arm and re-read the family, and

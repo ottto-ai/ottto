@@ -58,7 +58,9 @@ An incremental window that reads nothing skips only when every unobserved
 member belongs to those same unchanged structural families. The skip never
 touches `identity_contract_rearm`
 or `fence_recovery_rearm`, never clears the latch, and leaves the posture veto
-and M1 per-file re-emission unchanged.
+and M1 per-file re-emission unchanged. A contract-change re-arm still runs
+at a partial-settlement terminal before the liveness deadline; the unsettled
+marker separately prevents that terminal from clearing the contract latch.
 
 First-proof veto. A copied-prefix successor of a dormant owner (C1a) can prove
 only in a window that also re-reads the owner, and the due full re-arm is the
