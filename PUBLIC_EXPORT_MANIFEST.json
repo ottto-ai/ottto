@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 827,
-  "content_sha256": "8628eb271897a0adc9fb7c769aa7fe93d1c7d43ec70e9d64ff4fe3205069095b",
+  "candidate_file_count": 829,
+  "content_sha256": "d5b5010e129bdb6513414489409a4fe1d00d44cfb59f35e087d38a7af1ff1a64",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "7398eaedb20143c9742cdc9110c6a5b244d5289d49077d26f056878c4653234d",
-      "size_bytes": 916094
+      "sha256": "42428a5e784ab1295b927fc847a6c0ee7ccd6a58c23fc7b1984e9bf0e4cdd6e1",
+      "size_bytes": 916543
     },
     {
       "executable": false,
@@ -1609,8 +1609,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/stale_family_carry_pipeline_tests.rs",
-      "sha256": "0752ff37495ffe406fed00ea869f8038b643c35bcee19eb47aff3decc6e5a37c",
-      "size_bytes": 28247
+      "sha256": "581a5ee706422d5b3f387045d98319806af31f84bedca3352fea50b63d6d677f",
+      "size_bytes": 32956
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b577c78cf153dc700038a828130bf8816e3f275630157257a54bc9c6972ba4a6",
-      "size_bytes": 3367581
+      "sha256": "f853a11c6feef09305b9f150121cfad9d9b635c41e335a0ba1532be5cff8adcb",
+      "size_bytes": 3402978
     },
     {
       "executable": false,
@@ -1986,6 +1986,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/full_rearm_progress_tests.rs",
+      "sha256": "ff5781444f1d8144de2ca2af170965f1209bfe34c4cce4cac6e688c573decf21",
+      "size_bytes": 26609
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/giant_row_measurement_tests.rs",
       "sha256": "8c4013e4445645e1d5b56ce741ef9ee1fb805f2208bc348c9b67f88b3bd7c8d3",
       "size_bytes": 17343
@@ -2113,8 +2120,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/stale_family_carry_tests.rs",
-      "sha256": "d349e07cb203ebaed4725c88e124cfdb4f4a3fa48b13c6a921877f1ac9e35c44",
-      "size_bytes": 52539
+      "sha256": "4c09bd82c966836cd93f8ee1ec479e3c95f7bb08919f3c8d6ca88747f70560f9",
+      "size_bytes": 68047
     },
     {
       "executable": false,
@@ -2134,8 +2141,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "3ee940a9a78a7d5b320abc740d49bbe2e116822b6c79145826bdecbc66ac3a82",
-      "size_bytes": 35372
+      "sha256": "052653b79cc17fc3d0cff1f4c5c29b0c90097034cfb600f20601d964a4fa5238",
+      "size_bytes": 39278
     },
     {
       "executable": false,
@@ -4016,6 +4023,13 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "docs/session-2026-10-23-claude-full-rearm-no-progress.md",
+      "sha256": "f453fb4672030b5f4f511ed18a17130882981db7a0495cb8bd53fc114ad80d63",
+      "size_bytes": 7912
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "docs/session-2026-10-23-composition-changed-days-switch-on.md",
       "sha256": "0e1bdc37c6dfc446311564d8356dac10abcc18702a728a3abd40a55c00d01cd4",
       "size_bytes": 2581
@@ -5792,9 +5806,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T10:17:30+00:00",
+  "generated_at": "2026-10-23T13:24:24+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 828,
+  "output_file_count": 830,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5831,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "68794037599e691f3cac8de45e2c4a9f65e7d815"
+  "source_commit": "a456f992a3753d5c76781746602f80a74cf951ab"
 }
