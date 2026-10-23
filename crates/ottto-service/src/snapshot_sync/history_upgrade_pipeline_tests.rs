@@ -955,8 +955,8 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
 /// SOURCE F1b: on the destination of the claim that recorded a
 /// different-user cutoff, the previous user's history stays excluded by the
 /// cutoff, as before, not by the history gate: a session with activity after
-/// the cutoff is still sent whole. (The previous user's bootstrap completed
-/// before that claim, so the cutoff is not yet bound to a destination.)
+/// the cutoff is still sent whole. The claim binds its own destination
+/// before any bootstrap completes.
 #[test]
 fn different_user_cutoff_excludes_history_without_the_gate() {
     let fixture = HistoryFixture::new("history-upgrade-different-user");
@@ -967,11 +967,12 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
         HISTORY_DESTINATION,
     );
     crate::backfill::save_backfill_state(&fixture.support, &state).expect("save user A state");
-    crate::backfill::apply_claim_backfill_policy(
+    crate::backfill::apply_claim_backfill_policy_for_destination(
         &fixture.support,
         Some("from"),
         Some("2026-08-02T07:00:15Z"),
         "user-b",
+        Some("history-upgrade-destination-b"),
     )
     .expect("user B's claim records the cutoff");
     // The previous destination's Claude index stays behind, as in production.
@@ -1002,7 +1003,20 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
 /// ungated.
 #[test]
 fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
-    let fixture = HistoryFixture::new("history-upgrade-same-user-reclaim");
+    same_user_reclaim_is_gated(true);
+}
+
+#[test]
+fn same_user_reclaim_before_bootstrap_is_still_gated() {
+    same_user_reclaim_is_gated(false);
+}
+
+fn same_user_reclaim_is_gated(complete_bootstrap: bool) {
+    let fixture = HistoryFixture::new(if complete_bootstrap {
+        "history-upgrade-same-user-reclaim"
+    } else {
+        "history-upgrade-same-user-reclaim-interrupted"
+    });
     fixture.baseline();
     fixture.cycle(
         "2026-08-02T08:30:00Z",
@@ -1011,11 +1025,12 @@ fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
             ..HISTORY_BASELINE
         },
     );
-    crate::backfill::apply_claim_backfill_policy(
+    crate::backfill::apply_claim_backfill_policy_for_destination(
         &fixture.support,
         Some("from"),
         Some("2026-08-02T07:00:15Z"),
         "user-b",
+        Some("history-upgrade-destination-b"),
     )
     .expect("user B's claim records the cutoff");
     fixture.append(HISTORY_SESSIONS[0], "req_0_2");
@@ -1032,23 +1047,31 @@ fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
         BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
         "the claim's own destination keeps the cutoff exception"
     );
-    // Its bootstrap completes there, which binds the cutoff to it.
-    fixture.cycle(
-        "2026-08-02T09:30:00Z",
-        HistoryCycle {
-            destination: Some("history-upgrade-destination-b"),
-            bootstrapped: true,
-            ..HISTORY_REVISION_2
-        },
-    );
+    // Completion is irrelevant to the already durable claim binding.
+    if complete_bootstrap {
+        fixture.cycle(
+            "2026-08-02T09:30:00Z",
+            HistoryCycle {
+                destination: Some("history-upgrade-destination-b"),
+                bootstrapped: true,
+                ..HISTORY_REVISION_2
+            },
+        );
+    }
     let state = crate::backfill::load_backfill_state(&fixture.support);
     assert_eq!(
         state.backfill_cutoff_destination_namespace.as_deref(),
         Some("history-upgrade-destination-b")
     );
 
-    crate::backfill::apply_claim_backfill_policy(&fixture.support, Some("full"), None, "user-b")
-        .expect("user B re-claims");
+    crate::backfill::apply_claim_backfill_policy_for_destination(
+        &fixture.support,
+        Some("full"),
+        None,
+        "user-b",
+        Some("history-upgrade-destination-c"),
+    )
+    .expect("user B re-claims");
     let state = crate::backfill::load_backfill_state(&fixture.support);
     assert!(
         state.backfill_cutoff_at.is_some(),
@@ -1076,6 +1099,35 @@ fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
         reclaimed(11, HISTORY_SESSIONS.len()),
         BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
         "and paced: the re-claim was an explicit full claim"
+    );
+}
+
+/// An old state has no proof of which destination set its cutoff. It must
+/// not grant the different-user exception, even after bootstrap completion.
+#[test]
+fn an_unbound_legacy_cutoff_does_not_exempt_a_new_destination() {
+    use crate::snapshots::PriorHistory;
+    let fixture = HistoryFixture::new("history-upgrade-unbound-cutoff");
+    let mut state = crate::backfill::BackfillState {
+        backfill_cutoff_at: Some("2026-08-02T07:00:15Z".to_string()),
+        backfill_cutoff_user_id: Some("user-b".to_string()),
+        ..Default::default()
+    };
+    crate::backfill::mark_backfill_complete_for_destination(
+        &mut state,
+        SnapshotSource::ClaudeCode,
+        HISTORY_DESTINATION,
+    );
+    assert_eq!(state.backfill_cutoff_destination_namespace, None);
+    assert_eq!(
+        claude_prior_history(
+            &state,
+            "new-destination",
+            &test_upload_progress(),
+            &fixture.index_path_for(Some("new-destination")),
+            &fixture.support
+        ),
+        PriorHistory::Moved,
     );
 }
 
@@ -1109,6 +1161,19 @@ fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
         std::fs::remove_file(&path).expect("remove quarantined copy");
     }
     assert_eq!(prior(), PriorHistory::None);
+    let blocked_parent = fixture.base.join("not-a-directory");
+    std::fs::write(&blocked_parent, b"").expect("block the sibling directory");
+    assert_eq!(
+        claude_prior_history(
+            &backfill,
+            HISTORY_DESTINATION,
+            &progress,
+            &blocked_parent.join("claude-scan-index.json"),
+            &fixture.support
+        ),
+        PriorHistory::Here,
+        "an unreadable sibling directory fails closed even without a seen marker"
+    );
     let snapshots = fixture.support.join("snapshots");
     std::fs::remove_dir_all(&snapshots).expect("remove snapshots directory");
     std::fs::write(&snapshots, b"").expect("a file where the marker's directory is");

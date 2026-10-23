@@ -386,12 +386,13 @@ fn claude_prior_history(
             return false;
         };
         match std::fs::read_dir(parent) {
-            Ok(entries) => entries.flatten().any(|entry| {
-                entry.file_name().to_str().is_some_and(|name| {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
                     name.contains(".corrupt.")
                         && (own_stem.is_some_and(|stem| name.starts_with(stem))
                             || name.starts_with(&claude_prefix))
-                })
+                }),
+                Err(_) => true,
             }),
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
@@ -403,11 +404,12 @@ fn claude_prior_history(
         let holds_claude_state = |directory: &Path| {
             Some(directory) != own
                 && match std::fs::read_dir(directory) {
-                    Ok(entries) => entries.flatten().any(|entry| {
-                        entry
+                    Ok(mut entries) => entries.any(|entry| match entry {
+                        Ok(entry) => entry
                             .file_name()
                             .to_str()
-                            .is_some_and(|name| name.starts_with(&prefix))
+                            .is_some_and(|name| name.starts_with(&prefix)),
+                        Err(_) => true,
                     }),
                     Err(error) => error.kind() != std::io::ErrorKind::NotFound,
                 }
@@ -415,9 +417,10 @@ fn claude_prior_history(
         let snapshots = support_dir.join("snapshots");
         holds_claude_state(&snapshots)
             || match std::fs::read_dir(snapshots.join("destinations")) {
-                Ok(destinations) => destinations
-                    .flatten()
-                    .any(|destination| holds_claude_state(&destination.path())),
+                Ok(mut destinations) => destinations.any(|destination| match destination {
+                    Ok(destination) => holds_claude_state(&destination.path()),
+                    Err(_) => true,
+                }),
                 Err(error) => error.kind() != std::io::ErrorKind::NotFound,
             }
     };
@@ -443,7 +446,7 @@ fn claude_prior_history(
         && backfill_state
             .backfill_cutoff_destination_namespace
             .as_deref()
-            .is_none_or(|bound| bound == destination_namespace);
+            == Some(destination_namespace);
     // Claude's own entries only: `last_completed_at` is stamped by any
     // source's bootstrap, so a Codex or Pi completion is not Claude history.
     let earlier_bootstrap = backfill_state

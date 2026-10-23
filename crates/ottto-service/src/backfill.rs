@@ -63,9 +63,9 @@ pub struct BackfillState {
     /// re-claims without meaning "resurrect pre-cutoff history").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_cutoff_user_id: Option<String>,
-    /// The destination of the claim that set the cutoff: the first Claude
-    /// bootstrap completed after it. Until then it is unset. Claude history
-    /// recorded for another destination is left to the cutoff (not the
+    /// The destination of the claim that set the cutoff, recorded before
+    /// installing its credentials. Legacy unbound cutoffs fail closed.
+    /// Claude history recorded for another destination is left to the cutoff (not the
     /// history gate) only on this destination, so a later same-user re-claim
     /// that keeps the cutoff on a new destination is gated (SOURCE h695 N1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -155,11 +155,24 @@ pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()
 ///
 /// Idempotent: re-applying the same completion (daemon restart, retried
 /// confirm) converges on the same persisted state.
+#[cfg(test)]
 pub fn apply_claim_backfill_policy(
     state_dir: &Path,
     policy: Option<&str>,
     cutoff_at: Option<&str>,
     user_id: &str,
+) -> Result<()> {
+    apply_claim_backfill_policy_for_destination(state_dir, policy, cutoff_at, user_id, None)
+}
+
+/// Persist the cutoff's claim destination before its credentials become active.
+/// Missing legacy destination evidence never grants an ungated exception.
+pub fn apply_claim_backfill_policy_for_destination(
+    state_dir: &Path,
+    policy: Option<&str>,
+    cutoff_at: Option<&str>,
+    user_id: &str,
+    destination_namespace: Option<&str>,
 ) -> Result<()> {
     let mut state = load_backfill_state(state_dir);
     let before = state.clone();
@@ -176,12 +189,14 @@ pub fn apply_claim_backfill_policy(
         _ => None,
     };
     if let Some(cutoff) = new_cutoff {
-        // A new cutoff belongs to this claim's destination, bound by its
-        // first Claude bootstrap; re-applying the same claim keeps it.
+        // A new cutoff belongs to this claim's destination. Re-applying
+        // that completion converges; a later same-user full claim cannot
+        // bind an old cutoff to its new destination.
         if state.backfill_cutoff_at.as_deref() != Some(cutoff.as_str())
             || state.backfill_cutoff_user_id.as_deref() != Some(user_id)
+            || state.backfill_cutoff_destination_namespace.is_none()
         {
-            state.backfill_cutoff_destination_namespace = None;
+            state.backfill_cutoff_destination_namespace = destination_namespace.map(str::to_string);
         }
         state.backfill_cutoff_at = Some(cutoff);
         state.backfill_cutoff_user_id = Some(user_id.to_string());
@@ -374,12 +389,6 @@ pub fn mark_backfill_complete_for_destination(
         source.api_slug().to_string(),
         destination_namespace_hash.to_string(),
     );
-    if source == SnapshotSource::ClaudeCode
-        && state.backfill_cutoff_at.is_some()
-        && state.backfill_cutoff_destination_namespace.is_none()
-    {
-        state.backfill_cutoff_destination_namespace = Some(destination_namespace_hash.to_string());
-    }
 }
 
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
@@ -845,54 +854,59 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// SOURCE h695 N1: the cutoff belongs to the destination of the claim
-    /// that set it, bound by the first Claude bootstrap after it. A same-user
-    /// re-claim keeps the cutoff and that binding; a new cutoff or a
-    /// different-user `full` claim clears it.
+    /// SOURCE h695 N1: bind at claim persistence, before any bootstrap.
+    /// A same-user full re-claim keeps that binding even if it interrupts
+    /// the first claim's bootstrap. Legacy unbound cutoffs stay unbound.
     #[test]
-    fn the_cutoff_binds_the_first_claude_bootstrap_after_its_claim() {
+    fn the_cutoff_binds_its_claim_destination_before_bootstrap() {
         let dir = temp_dir("cutoff-destination");
         let cutoff = "2026-07-06T10:00:00Z";
-        let mut state = BackfillState::default();
-        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-a");
-        save_backfill_state(&dir, &state).expect("save the previous user's bootstrap");
-        apply_claim_backfill_policy(&dir, Some("from"), Some(cutoff), "user_b").expect("from");
+        let claim = |policy, cutoff, user, destination| {
+            apply_claim_backfill_policy_for_destination(&dir, policy, cutoff, user, destination)
+                .expect("persist claim")
+        };
+        claim(Some("from"), Some(cutoff), "user_b", Some("dest-b"));
+        let first = load_backfill_state(&dir);
+        assert_eq!(
+            first.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        claim(Some("from"), Some(cutoff), "user_b", Some("dest-b"));
+        assert_eq!(load_backfill_state(&dir), first, "idempotent completion");
+        claim(Some("full"), None, "user_b", Some("dest-c"));
         let mut state = load_backfill_state(&dir);
-        assert_eq!(state.backfill_cutoff_destination_namespace, None);
-        mark_backfill_complete_for_destination(&mut state, SnapshotSource::Codex, "dest-b");
-        assert_eq!(
-            state.backfill_cutoff_destination_namespace, None,
-            "Claude only"
-        );
-        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-b");
-        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-c");
-        assert_eq!(
-            state.backfill_cutoff_destination_namespace.as_deref(),
-            Some("dest-b"),
-            "the first Claude bootstrap after the claim binds it"
-        );
-        save_backfill_state(&dir, &state).expect("save the binding");
-        apply_claim_backfill_policy(&dir, Some("from"), Some(cutoff), "user_b").expect("retry");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("same-user");
-        let state = load_backfill_state(&dir);
         assert_eq!(state.backfill_cutoff_at.as_deref(), Some(cutoff));
         assert_eq!(
             state.backfill_cutoff_destination_namespace.as_deref(),
             Some("dest-b")
         );
-        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-07T10:00:00Z"), "user_c")
-            .expect("a new cutoff");
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-c");
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        claim(
+            Some("from"),
+            Some("2026-07-07T10:00:00Z"),
+            "user_c",
+            Some("dest-d"),
+        );
+        assert_eq!(
+            load_backfill_state(&dir)
+                .backfill_cutoff_destination_namespace
+                .as_deref(),
+            Some("dest-d")
+        );
+        claim(Some("full"), None, "user_d", Some("dest-e"));
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at, None);
+        assert_eq!(state.backfill_cutoff_destination_namespace, None);
+        claim(Some("from"), Some(cutoff), "user_b", None);
+        claim(Some("full"), None, "user_b", Some("dest-f"));
         assert_eq!(
             load_backfill_state(&dir).backfill_cutoff_destination_namespace,
             None
         );
-        let mut state = load_backfill_state(&dir);
-        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-d");
-        save_backfill_state(&dir, &state).expect("bind dest-d");
-        apply_claim_backfill_policy(&dir, Some("full"), None, "user_d").expect("other user");
-        let state = load_backfill_state(&dir);
-        assert_eq!(state.backfill_cutoff_at, None);
-        assert_eq!(state.backfill_cutoff_destination_namespace, None);
         let _ = fs::remove_dir_all(dir);
     }
 
