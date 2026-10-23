@@ -100,3 +100,11 @@ counters and N10/age alarms, without a join or digests. A legacy missing marker
 with no retained safety does not trigger this exception. The OFF existing-state
 control verifies full-budget main admission, incremental reclaim, persistence,
 alarm and healthy prune; clean OFF state still emits no new shadow line.
+
+Ordinary tests use production-OFF defaults; shadow-specific controls opt in on
+their own thread. This keeps canonical scan/debt comparisons free of diagnostic
+views and elapsed-time observations. Missing legacy marker state stays absent
+on save when no new safety exists (and remains closed in memory); empty legacy
+indexes do not acquire new metadata. The OFF stamp fast path avoids a global
+atomic when no view has ever existed. CPU receipts retain the first-terminal
+sample and add five alternating steady-state samples, reporting their median.

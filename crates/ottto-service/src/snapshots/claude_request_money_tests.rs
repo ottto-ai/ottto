@@ -366,6 +366,7 @@ fn money_birth_floor_makes_placeholder_births_unknown() {
 /// record ever reaches D1's join, counts or member statuses.
 #[test]
 fn money_ledger_records_are_invisible_to_d1() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let root = "a1111111-1111-4111-8111-111111111111";
     let otel = telemetry_key(root);
     assert!(otel.starts_with(TELEMETRY_KEY_PREFIX));
@@ -461,6 +462,7 @@ fn money_ledger_records_are_invisible_to_d1() {
 /// record drops its hashes and keeps their count, through save and load.
 #[test]
 fn money_transcript_records_retire_after_35_days() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let mut index = ScanIndex::default();
     // (name, record mtime age, entry mtime age, seed, record seed)
@@ -2879,6 +2881,7 @@ fn census_hashes(support: &Path) -> usize {
 /// Admission, scoped debt and completeness must remain byte-identical.
 #[test]
 fn money_retired_safety_reclaim_preserves_main_active_admission() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     const OLD: &str = "/money/projects/old.jsonl";
     const CURRENT: &str = "/money/projects/current.jsonl";
     const NEW: &str = "/money/projects/new.jsonl";

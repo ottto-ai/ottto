@@ -15,7 +15,7 @@ pub(super) fn enabled() -> bool {
     }
 }
 #[cfg(test)]
-thread_local! { static TEST_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+thread_local! { static TEST_SHADOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 #[cfg(test)]
 pub(super) struct ShadowMode(pub(super) bool);
 #[cfg(test)]

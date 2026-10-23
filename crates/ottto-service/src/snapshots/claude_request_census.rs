@@ -1009,6 +1009,11 @@ impl ClaudeRequestCensus {
     }
 
     fn invalidate_view(&mut self) {
+        // Fresh OFF state can never have a view. Avoid the global stamp while
+        // OFF; once a view was possible, keep tracking through mode changes.
+        if self.revision == 0 && !phase_b::enabled() {
+            return;
+        }
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         self.revision = NEXT
             .fetch_update(
@@ -3044,6 +3049,11 @@ pub(crate) fn settle_claude_request_census_terminal(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn d2_shadow_mode_for_test(enabled: bool) -> impl Drop {
+    phase_b::ShadowMode::set(enabled)
+}
+
 pub(crate) fn d2_shadow_enabled() -> bool {
     phase_b::enabled()
 }
@@ -3143,7 +3153,10 @@ pub(crate) fn prepare_claude_request_census_terminal(
 /// Synchronize the optional root metadata immediately before the atomic save.
 /// Partial selected saves retain the same working census/admission transaction.
 pub(crate) fn prepare_safety_checkpoint(index: &mut ScanIndex) {
-    if phase_b::enabled()
+    if (phase_b::enabled()
+        && !index.claude_request_census.records.is_empty()
+        && !index.claude_request_census.safety_incomplete.incomplete())
+        || !index.claude_request_census.extension_order.is_empty()
         || !index.claude_request_census.retired_order.is_empty()
         || !index
             .claude_request_census
@@ -3660,7 +3673,8 @@ impl ClaudeRequestCensusJoin {
             let alias = record.twin
                 || claude_index_path_family_member(Path::new(key))
                     .is_some_and(|owner| path_owners.get(&owner).is_some_and(|keys| *keys > 1));
-            let inert = !record.safety_complete()
+            let inert = !index.files.contains_key(key)
+                || !record.safety_complete()
                 || record.safety.as_ref().is_some_and(|safety| !safety.ac)
                 || !matches!(
                     join.coverage.get(key),
@@ -4102,7 +4116,10 @@ impl CensusShadowView {
         counts: ClaudeRequestCensusShadowCounts,
         window: &str,
     ) -> Option<Self> {
-        if counts.transient_limited {
+        if counts.transient_limited
+            || !phase_b::enabled()
+            || index.claude_request_census.revision == 0
+        {
             return None;
         }
         let records = index
@@ -4899,6 +4916,7 @@ mod phase_b_tests {
 
     #[test]
     fn retired_peer_safety_veto_survives_money_retirement_and_restart() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut a = record('a', vec![9]);
         a.retire_transcript_preserving_safety();
         a.retire_transcript_preserving_safety();
@@ -4923,6 +4941,7 @@ mod phase_b_tests {
 
     #[test]
     fn reclaimed_hash_closes_copy_until_healthy_original_prune() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut a = record('a', vec![9]);
         a.retire_transcript_preserving_safety();
         a.safety_hashes = None;
@@ -4962,6 +4981,7 @@ mod phase_b_tests {
 
     #[test]
     fn safety_marker_overflow_is_sticky_after_prune_restore_and_restart() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(B, record('b', vec![1]))]);
         for key in 0..=MAX_RECLAIMED_KEYS {
             index
@@ -4995,6 +5015,7 @@ mod phase_b_tests {
 
     #[test]
     fn old_retired_capability_is_migration_debt_not_money_over_budget() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut old = record('a', vec![9]);
         old.safety = None;
         old.retire();
@@ -5007,6 +5028,7 @@ mod phase_b_tests {
 
     #[test]
     fn all_read_loss_is_local_but_unread_acquisition_closes_other_families() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         for (acquired, expected) in [(true, true), (false, false)] {
             let mut a = record('a', vec![9]);
             a.shape = ClaudeRequestCensusShape::Lossy;
@@ -5039,6 +5061,7 @@ mod phase_b_tests {
 
     #[test]
     fn absent_malformed_and_duplicate_markers_preserve_siblings_and_close() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(B, record('b', vec![8]))]);
         let scratch = crate::test_scratch::ScratchDir::new("phase-b-marker-decode");
         let path = scratch.join("index.json");
@@ -5073,6 +5096,7 @@ mod phase_b_tests {
 
     #[test]
     fn duplicate_record_keys_never_resurrect_even_after_a_malformed_first() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let b = serde_json::to_string(&record('b', vec![8])).unwrap();
         for first in ["false".to_owned(), b.clone()] {
             let raw = format!(r#"{{"{A}":{first},"{A}":{b},"{A}":{b},"{B}":{b}}}"#);
@@ -5088,6 +5112,7 @@ mod phase_b_tests {
 
     #[test]
     fn post_save_equality_qualifies_only_the_exact_record_and_pending_basis() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let index = index_with(vec![(B, record('b', vec![8]))]);
         let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
         let counts = join.counts(true);
@@ -5106,6 +5131,7 @@ mod phase_b_tests {
     }
     #[test]
     fn failed_cas_cannot_persist_admission_or_reclaim() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut a = record('a', (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect());
         a.retire_transcript_preserving_safety();
         let mut committed = index_with(vec![(A, a)]);
@@ -5142,6 +5168,7 @@ mod phase_b_tests {
 
     #[test]
     fn legacy_comparison_refuses_physical_owner_fanout_before_expansion() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = ScanIndex::default();
         for copy in 0..1000 {
             let key = format!("/phase-b/projects/project-{copy}/member.jsonl");
@@ -5176,6 +5203,7 @@ mod phase_b_tests {
 
     #[test]
     fn synthetic_scale_receipt_includes_old_new_and_checkpoint_decode_overlap() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         const FILES: usize = 12400;
         let mut index = ScanIndex::default();
         let mut next = 0_u64;
@@ -5232,6 +5260,7 @@ mod phase_b_tests {
     }
     #[test]
     fn malformed_optional_safety_retains_money_bytes_but_closes_the_whole_shadow() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![8]))]);
         let scratch = crate::test_scratch::ScratchDir::new("phase-b-inert-safety");
         let path = scratch.join("index.json");
@@ -5257,6 +5286,7 @@ mod phase_b_tests {
 
     #[test]
     fn malformed_unindexed_base_record_cannot_silently_restore_strong_comparison() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![8]))]);
         let scratch = crate::test_scratch::ScratchDir::new("phase-b-base-loss");
         let path = scratch.join("index.json");
@@ -5279,6 +5309,7 @@ mod phase_b_tests {
     }
     #[test]
     fn old_lossy_capability_gap_closes_an_unrelated_exact_family() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut old = record('a', vec![9]).without_safety_for_test();
         old.shape = ClaudeRequestCensusShape::Lossy;
         let index = index_with(vec![(A, old), (B, record('b', vec![8]))]);
@@ -5293,6 +5324,7 @@ mod phase_b_tests {
 
     #[test]
     fn a_full_supported_reparse_restores_a_reclaimed_key_without_money_resurrection() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut a = record('a', vec![9]);
         a.retire_transcript_preserving_safety();
         a.safety_hashes = None;
@@ -5313,6 +5345,7 @@ mod phase_b_tests {
     }
     #[test]
     fn optional_safety_numeric_overflow_never_drops_valid_money_fields() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![9]).without_safety_for_test())]);
         prepare_safety_checkpoint(&mut index);
         let base = serde_json::to_string(&index).unwrap();
@@ -5341,6 +5374,7 @@ mod phase_b_tests {
 
     #[test]
     fn shared_difference_reasons_follow_the_inert_peer_to_the_current_key() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![9]))]);
         index.files.remove(A);
         let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
@@ -5352,6 +5386,7 @@ mod phase_b_tests {
     }
     #[test]
     fn serialized_pressure_preserves_active_and_retired_money_admission() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         const NEW: &str = "/phase-b/projects/new.jsonl";
         const KEY_BYTES: usize = 768;
         let mut candidate = ClaudeRequestCensus::default();
@@ -5467,6 +5502,7 @@ mod phase_b_tests {
     }
     #[test]
     fn confirmed_empty_file_is_never_a_recordless_safety_excusal() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![9]))]);
         index.confirmed_empty_files.insert(A.to_owned());
         index.claude_request_census.remove(A);
@@ -5491,6 +5527,7 @@ mod phase_b_tests {
     }
     #[test]
     fn unindexed_required_keys_close_missing_evidence_and_veto_settlement() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![1]))]);
         let child = "/census/projects/a/subagents/agent-child.jsonl";
         let observed = BTreeSet::from([child.to_owned()]);
@@ -5517,6 +5554,7 @@ mod phase_b_tests {
     }
     #[test]
     fn settled_for_revalidates_current_evidence_completeness_and_window() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![1]))]);
         let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
         let counts = join.counts(true);
@@ -5537,6 +5575,7 @@ mod phase_b_tests {
 
     #[test]
     fn incremental_reclaim_keeps_shared_suffix_without_hash_copies() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let hashes = SafetyHashes::from_slice(&(0..700000).collect::<Vec<_>>()).unwrap();
         let old_resident = hashes.resident_bytes();
         let (suffix, allocation) =
@@ -5586,6 +5625,7 @@ mod phase_b_tests {
 
     #[test]
     fn off_mode_m4_scale_receipt_and_frozen_main_money_maintenance() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let _mode = phase_b::ShadowMode::set(false);
         const FILES: usize = 12400;
         const HASHES: usize = 700000;
@@ -5660,6 +5700,7 @@ mod phase_b_tests {
             baseline.hash_total()
         );
         let mut expected_index = index.clone();
+        let mut steady_baseline = baseline.clone();
         expected_index.claude_request_census = baseline.into_census();
         let checkpoint_actual = serde_json::to_vec_pretty(&index).unwrap();
         let checkpoint_expected = serde_json::to_vec_pretty(&expected_index).unwrap();
@@ -5688,14 +5729,47 @@ mod phase_b_tests {
         assert_eq!(retained_bytes, 0);
         assert_eq!(metadata_bytes, 0);
         assert_eq!(checkpoint_delta, 0);
+        let mut main_steady = Vec::new();
+        let mut off_steady = Vec::new();
+        for sample in 0..5 {
+            let measure_main = |baseline: &mut main_reference::MainAdmission, index: &ScanIndex| {
+                let start = thread_cpu_micros().unwrap();
+                baseline.terminal(index, &BTreeSet::new(), window);
+                thread_cpu_micros().unwrap().saturating_sub(start)
+            };
+            let measure_off = |index: &mut ScanIndex| {
+                let start = thread_cpu_micros().unwrap();
+                let counts = prepare_claude_request_census_terminal(
+                    index,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    WINDOW,
+                    &mut None,
+                );
+                assert_eq!(counts.shadow_join_builds, 0);
+                thread_cpu_micros().unwrap().saturating_sub(start)
+            };
+            if sample % 2 == 0 {
+                main_steady.push(measure_main(&mut steady_baseline, &index));
+                off_steady.push(measure_off(&mut index));
+            } else {
+                off_steady.push(measure_off(&mut index));
+                main_steady.push(measure_main(&mut steady_baseline, &index));
+            }
+        }
+        main_steady.sort_unstable();
+        off_steady.sort_unstable();
+        let main_steady = main_steady[2];
+        let off_steady = off_steady[2];
         let inline_delta = std::mem::size_of::<ClaudeRequestCensusRecord>()
             .saturating_sub(std::mem::size_of::<main_reference::MainRecordLayout>())
             * FILES;
-        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=independent_main_money_maintenance excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, checkpoint_actual.len());
+        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} steady_samples=5 main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=independent_main_money_maintenance excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, checkpoint_actual.len());
     }
 
     #[test]
     fn independent_main_hash_boundary_without_retired_reclaim() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let full = record('a', (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect());
         let mut actual = ClaudeRequestCensus::default();
         actual.insert_for_test(A, full);
@@ -5742,6 +5816,7 @@ mod phase_b_tests {
 
     #[test]
     fn independent_main_byte_boundary_without_retired_reclaim() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         const LIMIT: usize = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES;
         let mut actual = ClaudeRequestCensus::default();
         let mut baseline = main_reference::MainAdmission::default();
@@ -5802,6 +5877,7 @@ mod phase_b_tests {
     }
     #[test]
     fn admitted_scale_receipt_covers_view_comparison_and_saved_equality() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         const FILES: usize = 1024;
         const HASHES: usize = 700000;
         let mut index = ScanIndex::default();
@@ -5905,6 +5981,7 @@ mod phase_b_tests {
     }
     #[test]
     fn off_with_preexisting_safety_keeps_reclaim_marker_and_alarm() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
         let mut retained = record('a', (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect());
         retained.retire_transcript_preserving_safety();
         let mut index = index_with(vec![(A, retained)]);

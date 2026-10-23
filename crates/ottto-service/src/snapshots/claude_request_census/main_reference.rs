@@ -205,7 +205,7 @@ fn entry_bytes(key: &str, record: &ClaudeRequestCensusRecord) -> usize {
         struct Count(usize);
         impl std::io::Write for Count {
             fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 += bytes.len();
+                self.0 = self.0.saturating_add(bytes.len());
                 Ok(bytes.len())
             }
             fn flush(&mut self) -> std::io::Result<()> {
