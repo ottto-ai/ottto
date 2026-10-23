@@ -3091,6 +3091,284 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     assert!(member.is_file());
 }
 
+/// SOURCE Round 13 F1: a retired family whose persisted tombstone set is
+/// then omitted, wrongly typed or damaged (its marker stays) is never read as
+/// new. The load raises the uncertainty fence and re-tombstones the
+/// witnessed, unindexed root, so a complete census while the family is still
+/// absent keeps its witness. When the member returns it is held against that
+/// witness: nothing is uploaded or accepted and a bounded record re-forms.
+#[test]
+#[serial(source_manifests)]
+fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let session = PIPELINE_SESSIONS[2];
+    let digest = crate::snapshots::claude_retired_family_digest_for_test(session);
+    let shapes: [(&str, fn(&mut serde_json::Value, &str)); 3] = [
+        ("omitted-set", |index, _| {
+            index
+                .as_object_mut()
+                .unwrap()
+                .remove("claude_retired_family_tombstones");
+        }),
+        ("null-set", |index, _| {
+            index["claude_retired_family_tombstones"] = serde_json::Value::Null;
+        }),
+        ("damaged-entry", |index, digest| {
+            index["claude_retired_family_tombstones"][digest] = serde_json::json!("lost");
+        }),
+    ];
+    for (shape, damage) in shapes {
+        let mut fixture = PipelineFixture::new(&format!("patha-lost-tombstones-{shape}"));
+        let baseline = fixture.absent_retry_pending_family(session);
+        let witness = ScanIndex::load(&fixture.index_path)
+            .expect("load scan index")
+            .claude_usage_family_witness_digest_for_test(session)
+            .expect("the seeded family keeps its witness");
+        let traversals = walk_until_census_complete(&fixture, 9, 3);
+        assert_absent_family_retired(&traversals, &baseline, session, shape);
+        let mut index_json: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+        assert_eq!(
+            index_json["claude_retired_family_tombstones_initialized"],
+            serde_json::json!(true),
+            "{shape}"
+        );
+        assert!(
+            index_json["claude_retired_family_tombstones"]
+                .get(&digest)
+                .is_some(),
+            "{shape}"
+        );
+        damage(&mut index_json, &digest);
+        std::fs::write(
+            &fixture.index_path,
+            serde_json::to_vec(&index_json).unwrap(),
+        )
+        .unwrap();
+
+        // Still absent: a complete census keeps the witness and tombstone.
+        let absent = walk_until_census_complete(&fixture, 12, 3);
+        let last = absent
+            .last()
+            .and_then(|pages| pages.last())
+            .expect("terminal page");
+        assert!(last.scan.census_complete, "{shape}");
+        assert_eq!(
+            last.index
+                .claude_usage_family_witness_digest_for_test(session),
+            Some(witness.clone()),
+            "{shape}: the witness survives the complete census"
+        );
+        assert!(
+            last.index.claude_family_tombstoned_for_test(session),
+            "{shape}: re-tombstoned from its witness"
+        );
+        assert!(
+            !last
+                .index
+                .claude_retired_family_tombstones_uncertain_for_test(),
+            "{shape}"
+        );
+
+        // The member returns.
+        std::fs::write(
+            fixture.root.join(format!("{session}.jsonl")),
+            pipeline_transcript_line(session, "req_2_1", 0),
+        )
+        .expect("restore the retired family's member");
+        let pages = fixture.walk(16, &ABSENCE_CYCLE);
+        for page in &pages {
+            for item in page
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == session)
+            {
+                assert!(
+                    !page.uploaded.contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is uploaded before a proof"
+                );
+                assert!(
+                    !page
+                        .progress
+                        .accepted_fingerprints
+                        .contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is accepted before a proof"
+                );
+            }
+        }
+        let last = pages.last().expect("terminal page");
+        let record = last
+            .index
+            .claude_authority_record_for_test(session)
+            .unwrap_or_else(|| panic!("{shape}: the returning member re-forms its record"));
+        assert!(
+            record.bound_to_retained_witness && !record.terminal,
+            "{shape}"
+        );
+        assert_eq!(record.proven_witness_fingerprint, witness, "{shape}");
+        assert_eq!(record.failed_reconstruction_count, 1, "{shape}");
+        assert!(
+            last.index.claude_family_tombstoned_for_test(session),
+            "{shape}"
+        );
+    }
+}
+
+/// SOURCE Round 13 F2, on the priced fast path and the bounded fallback: with
+/// the tombstone set full, an absent RetryPending family is kept (record,
+/// pending and witness, so the census stays withheld) and the refusal is
+/// counted; the oldest tombstone is never evicted. The full set survives the
+/// saves and reloads of every page. When both families' members return,
+/// neither is uploaded or accepted: the oldest re-enters its authority path
+/// and re-forms its record against its witness, and the kept family's record
+/// still holds its member.
+#[test]
+#[serial(source_manifests)]
+fn full_tombstone_set_keeps_the_excess_family_and_holds_both_returns() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let cap = crate::snapshots::MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES_FOR_TEST;
+    let (oldest, excess) = (PIPELINE_SESSIONS[1], PIPELINE_SESSIONS[2]);
+    for refuse_scratch in [false, true] {
+        let shape = if refuse_scratch { "fallback" } else { "fast" };
+        let _refuse =
+            refuse_scratch.then(crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new);
+        let mut fixture = PipelineFixture::new(&format!("patha-tombstone-capacity-{shape}"));
+        let baseline = fixture.baseline();
+        fixture.restart_process();
+        for session in [oldest, excess] {
+            fixture.seed_retry_pending_authority(session);
+            fixture.seed_retry_pending_family_pending(session);
+        }
+        let witness_of = |session: &str| {
+            ScanIndex::load(&fixture.index_path)
+                .expect("load scan index")
+                .claude_usage_family_witness_digest_for_test(session)
+                .expect("the seeded family keeps its witness")
+        };
+        let (oldest_witness, excess_witness) = (witness_of(oldest), witness_of(excess));
+        std::fs::remove_file(fixture.root.join(format!("{oldest}.jsonl")))
+            .expect("remove the oldest family's only member");
+        fixture.page_files = 8;
+
+        // The oldest family retires while the other stays present and held.
+        let pages = fixture.walk(9, &ABSENCE_CYCLE);
+        let last = pages.last().expect("terminal page");
+        assert!(
+            last.index
+                .claude_authority_record_for_test(oldest)
+                .is_none(),
+            "{shape}: the absent family retires"
+        );
+        assert!(
+            last.index.claude_family_tombstoned_for_test(oldest),
+            "{shape}"
+        );
+        assert!(
+            last.index
+                .claude_authority_record_for_test(excess)
+                .is_some(),
+            "{shape}"
+        );
+
+        // Every other slot holds a newer retirement.
+        let mut index = ScanIndex::load(&fixture.index_path).expect("load scan index");
+        index.fill_claude_retired_family_tombstones_for_test(cap, u64::from(u32::MAX));
+        index.save(&fixture.index_path).expect("save scan index");
+
+        std::fs::remove_file(fixture.root.join(format!("{excess}.jsonl")))
+            .expect("remove the excess family's only member");
+        let refusals =
+            crate::snapshots::claude_absence_counters_for_test().tombstone_capacity_refusals;
+        let pages = fixture.walk(12, &ABSENCE_CYCLE);
+        assert_absent_family_kept(&pages, &baseline, excess, shape);
+        assert!(
+            crate::snapshots::claude_absence_counters_for_test().tombstone_capacity_refusals
+                > refusals,
+            "{shape}: the capacity refusal is counted"
+        );
+        let reloaded = ScanIndex::load(&fixture.index_path).expect("reload scan index");
+        assert!(
+            reloaded.claude_family_tombstoned_for_test(oldest),
+            "{shape}: the oldest tombstone is never evicted"
+        );
+        assert_eq!(
+            reloaded.claude_retired_family_tombstones_for_test().len(),
+            cap
+        );
+        assert!(!reloaded.claude_retired_family_tombstones_uncertain_for_test());
+        assert_eq!(
+            reloaded.claude_usage_family_witness_digest_for_test(oldest),
+            Some(oldest_witness.clone()),
+            "{shape}"
+        );
+        assert_eq!(
+            reloaded.claude_usage_family_witness_digest_for_test(excess),
+            Some(excess_witness.clone()),
+            "{shape}"
+        );
+
+        // Both families' members return.
+        for (session, request) in [(oldest, "req_1_return"), (excess, "req_2_return")] {
+            std::fs::write(
+                fixture.root.join(format!("{session}.jsonl")),
+                pipeline_transcript_line(session, request, 0),
+            )
+            .expect("restore the member");
+        }
+        let pages = fixture.walk(13, &ABSENCE_CYCLE);
+        for page in &pages {
+            for item in page
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| [oldest, excess].contains(&item.source_session_id.as_str()))
+            {
+                assert!(
+                    !page.uploaded.contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is uploaded before a proof"
+                );
+                assert!(
+                    !page
+                        .progress
+                        .accepted_fingerprints
+                        .contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is accepted before a proof"
+                );
+            }
+        }
+        let last = pages.last().expect("terminal page");
+        for (session, witness) in [(oldest, &oldest_witness), (excess, &excess_witness)] {
+            let record = last
+                .index
+                .claude_authority_record_for_test(session)
+                .unwrap_or_else(|| panic!("{shape}: {session} is held by its record"));
+            assert!(
+                record.bound_to_retained_witness && !record.terminal,
+                "{shape}: {session}"
+            );
+            assert_eq!(&record.proven_witness_fingerprint, witness, "{shape}");
+            assert!(
+                record.member_source_file_fingerprints.contains_key(session),
+                "{shape}: the record binds the returning revision"
+            );
+        }
+        assert!(
+            last.index.claude_family_tombstoned_for_test(oldest),
+            "{shape}"
+        );
+        assert!(
+            !last.index.claude_family_tombstoned_for_test(excess),
+            "{shape}"
+        );
+        assert_eq!(
+            last.index.claude_retired_family_tombstones_for_test().len(),
+            cap,
+            "{shape}"
+        );
+    }
+}
+
 /// F3/#690: a due re-offer on a Rejected page cannot bypass either a bound
 /// terminal authority hold or a RetryPending family. Only the terminal-bound
 /// case may use H1's restorable-hold settlement; real retry debt stays owed.
