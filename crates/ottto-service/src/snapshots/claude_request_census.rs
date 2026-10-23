@@ -837,7 +837,7 @@ pub(crate) fn claude_request_hash(request_id: &str) -> u64 {
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ClaudeRequestCensus {
     records: BTreeMap<String, ClaudeRequestCensusRecord>,
-    safety: Option<Box<BTreeMap<[u8; 32], RecordSafety>>>,
+    safety: Option<BTreeMap<[u8; 32], RecordSafety>>,
     hash_total: usize,
     /// Exact serialized bytes of every `"key":record` pair.
     serialized_total: usize,
@@ -946,12 +946,19 @@ pub(crate) enum ClaudeRequestCensusInsert {
     Refused,
 }
 
+/// Main's core byte accounting, used directly by cold OFF maintenance.
+fn core_entry_serialized_bytes(key: &str, core: &ClaudeRequestCensusRecord) -> usize {
+    serialized_len(&key)
+        .saturating_add(serialized_len(core))
+        .saturating_add(2)
+}
 fn entry_serialized_bytes(key: &str, record: &impl CensusEvidence) -> usize {
     let record = record.view();
-    serialized_len(&key)
-        .saturating_add(serialized_len(record.core))
-        .saturating_add(2)
-        .saturating_add(record.safety.map_or(0, |safety| 5 + serialized_len(safety)))
+    let core = core_entry_serialized_bytes(key, record.core);
+    if record.safety.is_none() && record.safety_hashes.is_none() {
+        return core;
+    }
+    core.saturating_add(record.safety.map_or(0, |safety| 5 + serialized_len(safety)))
         .saturating_add(
             record
                 .safety_hashes
@@ -960,7 +967,7 @@ fn entry_serialized_bytes(key: &str, record: &impl CensusEvidence) -> usize {
 }
 /// Main's core serializer; never clones facts or safety.
 fn admission_bytes(key: &str, record: &impl CensusEvidence) -> usize {
-    entry_serialized_bytes(key, record.view().core)
+    core_entry_serialized_bytes(key, record.view().core)
 }
 
 fn serialized_len<T: Serialize + ?Sized>(value: &T) -> usize {
@@ -983,7 +990,7 @@ impl ClaudeRequestCensus {
         let core = self.records.get(key)?;
         let extra = self
             .safety
-            .as_deref()
+            .as_ref()
             .and_then(|map| map.get(&safety_key_hash(key)));
         Some(RecordView {
             core,
@@ -1609,7 +1616,7 @@ impl ClaudeRequestCensus {
         let safety = self.safety.take();
         for (key, core) in &records {
             let extra = safety
-                .as_deref()
+                .as_ref()
                 .and_then(|map| map.get(&safety_key_hash(key)));
             let record = RecordView {
                 core,
@@ -1825,7 +1832,7 @@ impl Serialize for ClaudeRequestCensus {
             for (key, core) in &self.records {
                 let extra = self
                     .safety
-                    .as_deref()
+                    .as_ref()
                     .and_then(|map| map.get(&safety_key_hash(key)));
                 let view = RecordView {
                     core,
@@ -3493,7 +3500,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
         census.serialized_total = 0;
         for (key, record) in &census.records {
             census.hash_total += record.request_hashes().len();
-            census.serialized_total += entry_serialized_bytes(key, record);
+            census.serialized_total += core_entry_serialized_bytes(key, record);
         }
         census.active_hash_total = census.hash_total;
         census.admission_serialized_total = census.serialized_total;
@@ -3689,10 +3696,10 @@ fn retire_without_safety(index: &mut ScanIndex, window: u64) -> u64 {
         }
         let before = (
             record.request_hashes().len(),
-            entry_serialized_bytes(key, record),
+            core_entry_serialized_bytes(key, record),
         );
         record.retire();
-        let after = entry_serialized_bytes(key, record);
+        let after = core_entry_serialized_bytes(key, record);
         freed.0 += before.0;
         freed.1 += before.1.saturating_sub(after);
         aged += 1;
@@ -4859,7 +4866,7 @@ impl CensusShadowView {
             .filter(|(key, digest)| {
                 saved
                     .claude_request_census
-                    .all_safety_get(*key)
+                    .all_safety_get(key)
                     .map_or(true, |record| evidence_digest(&record) != **digest)
             })
             .count();
