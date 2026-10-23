@@ -1303,6 +1303,18 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
             pipeline.server.last_terminal()["last_error_code"],
             "backend_validation_error"
         );
+        assert_eq!(
+            pipeline.server.last_terminal()["last_census_complete"],
+            true
+        );
+        assert!(
+            pipeline.server.last_terminal()["last_success_at"].is_null(),
+            "transport settlement cannot advertise money completeness"
+        );
+        assert!(!quiet
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert!(!quiet.progress.accepted_fingerprints.contains(&fingerprint));
         assert!(quiet.progress.contains_body(
             &fingerprint,
             &quiet.progress.permanent_rejections[&fingerprint].body_witness
@@ -1504,12 +1516,24 @@ fn cooldown_conflict_before_ordinary_retry_is_counted_and_settles() {
         &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
     ));
     let mut index = ScanIndex::load(&index_path).unwrap();
+    // The ordinary timer uses wall time; keep it inside the loader's 12 h
+    // validity bound so normalization cannot silently make this a due test.
+    let retry_after = current_unix_seconds() + 3_600;
     index
         .quarantined_snapshot_fingerprints
         .get_mut(&fingerprint)
         .unwrap()
-        .retry_after_unix_seconds = u64::MAX;
+        .retry_after_unix_seconds = retry_after;
     index.save(&index_path).unwrap();
+    let loaded = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(
+        loaded.quarantined_snapshot_fingerprints[&fingerprint].retry_after_unix_seconds,
+        retry_after
+    );
+    assert!(
+        retry_after > current_unix_seconds(),
+        "ordinary retry is not due"
+    );
     let (quiet, parsed, bytes) = pipeline.measured_cycle(t1 + 600, true);
     assert_eq!((parsed, bytes), (0, 0));
     assert!(quiet.result.is_ok(), "{:?}", quiet.result);

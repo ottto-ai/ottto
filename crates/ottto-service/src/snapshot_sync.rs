@@ -295,6 +295,8 @@ fn with_bootstrap_deferred(
 /// Carry a newer refused-body conflict even when the frozen upload delta is
 /// empty. New conflicts were already counted by bootstrap/main upload; this
 /// adds only older, untransmitted debt from the current source universe.
+/// A later traversal's proven unchanged cooldown is counted and disclosed,
+/// but leaves settlement to the normal clean-traversal boundary.
 fn with_retained_refusal_conflicts(
     result: ResumableUploadResult,
     index: &ScanIndex,
@@ -308,14 +310,17 @@ fn with_retained_refusal_conflicts(
                     .permanent_rejections
                     .get(*fingerprint)
                     .is_some_and(|refusal| {
-                        progress
-                            .quarantined_fingerprints
-                            .get(*fingerprint)
-                            .is_some_and(|record| {
-                                record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                    && record.upload_body_witness.as_deref()
-                                        == Some(refusal.body_witness.as_str())
-                            })
+                        !index
+                            .reason_reoffer_conflict_is_deferred(fingerprint, &refusal.body_witness)
+                            && progress
+                                .quarantined_fingerprints
+                                .get(*fingerprint)
+                                .is_some_and(|record| {
+                                    record.disposition
+                                        == SnapshotQuarantineDisposition::RetryPending
+                                        && record.upload_body_witness.as_deref()
+                                            == Some(refusal.body_witness.as_str())
+                                })
                     })
         })
         .collect::<BTreeSet<_>>();
@@ -1308,6 +1313,7 @@ impl SnapshotUploadProgress {
                         .get(*fingerprint)
                         .is_some_and(|record| {
                             record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                && self.active_quarantine_witness.as_ref() == Some(&record.witness)
                                 && record.upload_body_witness.as_deref()
                                     == Some(refusal.body_witness.as_str())
                         })
@@ -2839,6 +2845,7 @@ struct SyncCounts {
     ownership_incomplete_file_count: u64,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
+    cooldown_conflict_deferred: usize,
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
@@ -2961,6 +2968,7 @@ impl SyncCounts {
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
+            cooldown_conflict_deferred: 0,
             zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
@@ -2984,7 +2992,26 @@ impl SyncCounts {
         }
     }
 
+    fn terminal_census_line(&self, source: &str) -> String {
+        format!(
+            "snapshot terminal_census source={source} census_complete={} scanned_files={} \
+             uploaded={} unproven_terminal={} superseded_terminal={} \
+             ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
+             dropped_usage_records={} cooldown_conflict_deferred={}",
+            self.census_complete,
+            self.scanned_file_count,
+            self.uploaded_count,
+            self.snapshot_unproven_terminal_count,
+            self.snapshot_superseded_terminal_count,
+            self.ownership_incomplete_file_count,
+            self.zero_snapshot_usage_evidence_count,
+            self.dropped_usage_record_count,
+            self.cooldown_conflict_deferred,
+        )
+    }
+
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
+        self.cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
         // Mirror #389's disclosed-loss convention: terminal unproven entities
@@ -9213,6 +9240,9 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
+    // Keep non-blocking cooldown debt beside the terminal census counters on
+    // every report, even when the re-offer work summary is unchanged/quiet.
+    eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
     let diagnostic = status.counts.local_codex_diagnostics;
     let request = collector_status_request(
         &destination_namespace,

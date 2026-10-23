@@ -569,8 +569,8 @@ pub(super) struct ReofferCounts {
     pub(super) deferred_budget: usize,
     pub(super) outside_policy_window: usize,
     pub(super) invalid_extension: usize,
-    /// Distinct retained exact-body conflicts whose ordinary retry an
-    /// unchanged file deferred until the reserved daily re-offer.
+    /// Current distinct exact-body cooldown debt, including entities not yet
+    /// visited on a bounded page or whose ordinary retry timer is not due.
     pub(super) cooldown_conflict_deferred: usize,
 }
 

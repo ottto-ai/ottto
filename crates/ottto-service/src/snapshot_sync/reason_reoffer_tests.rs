@@ -821,6 +821,20 @@ fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
         progress.reason_reoffer_cooldowns(NOW),
         BTreeMap::from([(fp(1), body(1)), (fp(2), body(2)), (fp(4), body(4)),])
     );
+    let mut mismatched = progress.clone();
+    mismatched
+        .quarantined_fingerprints
+        .get_mut(&fp(1))
+        .unwrap()
+        .witness
+        .parser_version
+        .push_str("-older");
+    assert!(
+        !mismatched
+            .reason_reoffer_cooldowns(NOW)
+            .contains_key(&fp(1)),
+        "a stale ledger witness grants no cooldown proof"
+    );
     // The view is a read: every refusal, conflict and deadline is retained.
     for value in [1, 2, 4] {
         assert!(progress.contains_body(&fp(value), &body(value)));
@@ -941,4 +955,64 @@ fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
         }
         std::fs::remove_dir_all(root).unwrap();
     }
+}
+
+/// Terminal census disclosure shares one per-source line with the other loss
+/// counters, even when the re-offer work summary has no new work to log.
+#[test]
+fn cooldown_conflict_count_is_disclosed_beside_terminal_census_counts() {
+    let counts = SyncCounts {
+        census_complete: true,
+        snapshot_unproven_terminal_count: 2,
+        ownership_incomplete_file_count: 3,
+        cooldown_conflict_deferred: 1,
+        ..SyncCounts::default()
+    };
+    let line = counts.terminal_census_line("claude_code");
+    for field in [
+        "source=claude_code",
+        "census_complete=true",
+        "unproven_terminal=2",
+        "ownership_incomplete_files=3",
+        "cooldown_conflict_deferred=1",
+    ] {
+        assert!(line.contains(field), "missing {field}: {line}");
+    }
+    assert_eq!(line.lines().count(), 1);
+}
+
+/// A bounded page need not revisit every cooldown entity. Its provisional
+/// classification preserves prior traversal causes and all fresh outcomes;
+/// only the scanner's ordinary clean boundary can settle the full traversal.
+#[test]
+fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts() {
+    let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
+    progress.quarantine_retryable_body(&fp(1), &body(1));
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
+    index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert_eq!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress),
+        ResumableUploadResult::Completed
+    );
+    assert!(
+        index.bounded_sweep_had_unsettled_upload(),
+        "classification cannot clear prior causes"
+    );
+    assert_eq!(
+        with_retained_refusal_conflicts(
+            ResumableUploadResult::Deferred { count: 2 },
+            &index,
+            &progress
+        ),
+        ResumableUploadResult::Deferred { count: 2 },
+        "new unrelated conflicts stay blocking"
+    );
+    assert_eq!(
+        progress.quarantined_fingerprints[&fp(1)].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(progress.permanent_rejections.contains_key(&fp(1)));
 }
