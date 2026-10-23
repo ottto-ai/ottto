@@ -14855,13 +14855,10 @@ impl SnapshotAccumulator {
     ///   11*(216 + 320) = 6,248 B on 64-bit, so at least 31 KB, and 5 copies
     ///   of its strings: a file row by `3*state` and `2*usage_buckets`, a
     ///   resolved response by R's `ROW_COPIES + 1` nodes.
-    /// - `enforce_fact_limits` has no per-row bound: up to 96 pre-trim facts
-    ///   (at most 96*(576 + |collected_at|) B of text beside the 192 charged
-    ///   slots), then one `to_vec` buffer (at most 2*24*(736 +
-    ///   |collected_at|) B unescaped; control characters escape up to 6x),
-    ///   about 94 KB, of which K charges 2*(8,192 + 576 + |collected_at|).
-    ///   The rest relies on the item's slack (T1's smallest X_out - output
-    ///   is about 400 KB): a disclosed residual.
+    /// - `enforce_fact_limits`' scratch (the pre-trim facts' text, the
+    ///   dropped field names, their sort and `join`, one `to_vec` buffer
+    ///   escaped 6x) is charged by `fact_limit_scratch_bound` in K, at its
+    ///   caps; no residual relies on the item's slack (c22, r33).
     fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
         use crate::heap_layout_bound::tree_node_bytes;
         use crate::session_attribution::{
@@ -14881,9 +14878,6 @@ impl SnapshotAccumulator {
         /// grouping), each stopping at `MAX_SESSION_ATTRIBUTION_FACTS`
         /// (`push_labeled_fact`); `extend` at most doubles the capacity.
         const FACT_SLOTS: usize = 2 * 4 * MAX_SESSION_ATTRIBUTION_FACTS;
-        /// A fact's `field`, `kind` and `strength` are literals at their call
-        /// sites (the longest is 22 bytes).
-        const FACT_LITERAL_BYTES: usize = 64;
 
         if self.source != SnapshotSource::ClaudeCode
             || !crate::heap_layout_bound::layout_supported()
@@ -15016,7 +15010,11 @@ impl SnapshotAccumulator {
             .checked_add("agent_capability_usage:v2".len())?
             .checked_add(RFC3339_TEXT_BYTES)? // a fallback bucket input
             .checked_add(session_id)?
-            .checked_add(facts)?;
+            .checked_add(facts)?
+            .checked_add(fact_limit_scratch_bound(
+                if attribution { 4 } else { 2 },
+                collected_at.len(),
+            )?)?;
         let mut out = crate::heap_layout_bound::Counter::new(limit);
         for bytes in [
             size_of::<ParsedJsonlFile>(),
@@ -15899,6 +15897,74 @@ struct FinishOutputInput<'a> {
     /// The identity peeked for `workspace_path` (U3); `finish` must take
     /// exactly this value (`finish_with_repository_identity`).
     repository_identity: Option<&'a crate::context_footprint::RepositoryIdentity>,
+}
+
+/// A fact's `field`, `kind` and `strength` are literals at their call sites
+/// (every `push_fact`/`push_labeled_fact` caller in `session_attribution.rs`
+/// passes one; the longest is 22 bytes).
+const FACT_LITERAL_BYTES: usize = 64;
+/// Keys and punctuation of one serialized fact, at most 161 bytes: ten keys
+/// (100 bytes) with their quotes and colons (30), the quotes of nine strings
+/// (18), two objects' braces (4), their eight commas and the array's one.
+const FACT_JSON_SYNTAX_BYTES: usize = 192;
+
+/// X_out family K (#665 r33, c22: no residual may rely on slack): the worst
+/// case of what `enforce_fact_limits` (session_attribution.rs:1374-1411)
+/// holds beside an item's facts, from the caps it and `push_labeled_fact`
+/// enforce. Stack-only, checked; `None` on overflow.
+///
+/// `producers` fact lists reach `into_items`' unconditional call: direct
+/// provider and desktop spawn facts always, launch and grouping facts only
+/// with an attribution context (a top-level Claude item: no subagent lists).
+/// Each list stops at `MAX_SESSION_ATTRIBUTION_FACTS` = 24
+/// (session_attribution.rs:28, the `facts.len()` check at 1504). Each fact's
+/// text is a `to_string` copy (capacity = length; `evidence_ref`'s `format!`
+/// text is 71 bytes) of at most: three literals (`FACT_LITERAL_BYTES`), the
+/// value (128, :31, checked at 1506), the label (96, :34, at 1518), the label
+/// source (32, :35, at 1521), the source version (32, :32, at 1507), the
+/// evidence ref (96, :33, at 1512) and `observed_at` (`collected_at`, 1535).
+/// Charged together, though the phases do not all coexist:
+/// - every pre-trim fact's text (K's `facts` term charges only the kept
+///   facts' text);
+/// - `dropped_fields`: at most `24 * producers` names in a vector at most
+///   doubled, the cloned names (at most `FACT_LITERAL_BYTES` each), the
+///   stable sort's scratch (at most `max(len, 48)` slots) and the `join`
+///   text with its ", " separators;
+/// - one `serde_json::to_vec` buffer (only one is live per loop step) of at
+///   most 24 facts (the count cap truncates first, 1378-1385): each text byte
+///   escapes to at most 6 bytes (`\u00XX`), plus `FACT_JSON_SYNTAX_BYTES` per
+///   fact and the array's brackets, in a `Vec` grown from 128 bytes to at
+///   most twice its length.
+fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usize> {
+    use crate::session_attribution::{
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+        MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+        MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+    };
+    use std::mem::size_of;
+    let text = (3 * FACT_LITERAL_BYTES
+        + MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+        + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+        + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES)
+        .checked_add(collected_at)?;
+    let facts = producers.checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?;
+    let pre_trim = facts.checked_mul(text)?;
+    let dropped = facts
+        .checked_mul(2 * size_of::<String>())? // slots, at most doubled
+        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES)?)? // cloned names
+        .checked_add(facts.max(48).checked_mul(size_of::<String>())?)? // sort
+        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES + 2)?)?; // `join`
+    let json = text
+        .checked_mul(6)?
+        .checked_add(FACT_JSON_SYNTAX_BYTES)?
+        .checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?
+        .checked_add(2)?
+        .checked_mul(2)?
+        .max(128);
+    pre_trim.checked_add(dropped)?.checked_add(json)
 }
 
 /// `completed_heap_bound` of `value` on a fresh counter.

@@ -1988,3 +1988,88 @@ fn x_out_t6_covers_tiny_file_rows_with_attribution() {
         receipt.fingerprint_peak
     );
 }
+
+/// #665 r33 (c22: no residual may rely on slack). `fact_limit_scratch_bound`
+/// covers `enforce_fact_limits` at its adversarial maximum, measured on the
+/// function itself: 96 facts (four producers at the 24-fact cap), every text
+/// at its cap and made of control characters, so each byte escapes to six.
+/// No transcript fixture produces facts like these; the end-to-end T6 rows
+/// (`x_out_t6_covers_tiny_file_rows_with_attribution`, T1 attributed) cover
+/// the term inside `finish_output_bound`.
+#[test]
+fn x_out_fact_limit_scratch_covers_adversarial_facts() {
+    use crate::session_attribution::{
+        SessionAttributionFact, SessionFieldEvidence, MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+        MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+        MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let text = |len: usize| "\u{1}".repeat(len);
+    let fact = || SessionAttributionFact {
+        field: text(FACT_LITERAL_BYTES),
+        value: text(MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES),
+        display_label: Some(text(MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES)),
+        display_label_source: Some(text(MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES)),
+        evidence: SessionFieldEvidence {
+            kind: text(FACT_LITERAL_BYTES),
+            strength: text(FACT_LITERAL_BYTES),
+            observed_at: text(NOW.len()),
+            source_version: text(MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES),
+            evidence_ref: text(MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES),
+        },
+    };
+    let per_fact = 3 * FACT_LITERAL_BYTES
+        + MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+        + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+        + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
+        + NOW.len();
+    let count = 4 * MAX_SESSION_ATTRIBUTION_FACTS;
+    let mut facts: Vec<SessionAttributionFact> = (0..count).map(|_| fact()).collect();
+    let bound = fact_limit_scratch_bound(4, NOW.len()).unwrap();
+    let pre_trim = count * per_fact;
+
+    // One `to_vec` buffer at the count cap: maximal escaping, inside the
+    // term's JSON share.
+    let buffer = serde_json::to_vec(&facts[..MAX_SESSION_ATTRIBUTION_FACTS]).unwrap();
+    let json_share =
+        ((6 * per_fact + FACT_JSON_SYNTAX_BYTES) * MAX_SESSION_ATTRIBUTION_FACTS + 2) * 2;
+    assert!(
+        buffer.len() >= MAX_SESSION_ATTRIBUTION_FACTS * 6 * per_fact,
+        "precondition: every text byte escapes to six ({} B)",
+        buffer.len()
+    );
+    assert!(buffer.len() * 2 <= json_share, "syntax: {} B", buffer.len());
+    assert!(
+        buffer.capacity() <= json_share,
+        "capacity {}",
+        buffer.capacity()
+    );
+    assert!(buffer.capacity() <= bound - pre_trim);
+    drop(buffer);
+
+    let ((), scratch) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        crate::session_attribution::enforce_fact_limits(&mut facts)
+    });
+    let born = scratch.requested_peak_with_overlap;
+    eprintln!(
+        "X_OUT_FACTS facts={count} kept={} per_fact={per_fact} pre_trim={pre_trim} born_scratch={born} json_share={json_share} term={} term_off={} slack={}",
+        facts.len(),
+        bound,
+        fact_limit_scratch_bound(2, NOW.len()).unwrap(),
+        bound - (pre_trim + born).min(bound),
+    );
+    assert_eq!(
+        facts.len(),
+        1,
+        "precondition: the budget loop popped to one"
+    );
+    assert!(
+        pre_trim + born <= bound,
+        "fact-limit scratch {pre_trim} + {born} > term {bound}"
+    );
+}
