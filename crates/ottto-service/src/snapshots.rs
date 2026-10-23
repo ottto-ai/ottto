@@ -14804,12 +14804,10 @@ impl SnapshotAccumulator {
             }
         }
         if let Some(candidate) = metadata.titles.get(session_id) {
-            // `normalize_title` (a whitespace join, then a <= 255-char collect
-            // with amortized growth) stays under max(8, 2x) the source; the
-            // item's clone is exact. Plus both copies of "desktop_title".
-            let title = candidate.title.len().max(4).checked_mul(3)?;
+            // The title's normalization scratch and the item's clone
+            // (`desktop_title_bound`), plus both copies of "desktop_title".
             fixed = fixed
-                .checked_add(title)?
+                .checked_add(desktop_title_bound(candidate.title.len())?)?
                 .checked_add(2 * "desktop_title".len())?;
         }
         Some(TitleMetadataBound {
@@ -16025,6 +16023,56 @@ fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
         last
     };
     slots.checked_mul(std::mem::size_of::<u64>())
+}
+
+/// X_out U1 (#665 r36, AutoReview P2): the most a `len`-byte desktop title
+/// allocates in `finish`, charged together: `apply_claude_title_metadata`
+/// (:14746, `candidate.title.clone()`) -> `set_title` (:14612) ->
+/// `normalize_display_title` (:38445) -> `normalize_title` (:38436) and
+/// `is_safe_display_title` (:38553), then `into_items`' clone (:15846).
+/// - The input clone: exact, `len`; dropped only when `normalize_title`
+///   returns.
+/// - `split_whitespace().collect::<Vec<&str>>()`: at most `ceil(len / 2)`
+///   words (every word and every gap is at least one byte), from a lower
+///   size hint of 0, so 4 slots doubling: the last `4 * 2^k` plus the half
+///   beside it during the last growth (the allocation probe's overlap).
+/// - `join(" ")`: one exact allocation of at most `len`
+///   (`join_generic_copy`'s `Vec::with_capacity(reserved_len)`), alongside
+///   the words.
+/// - `chars().take(255).collect::<String>()`: at most
+///   `min(len, 4 * 255)` bytes, reserved from the lower size hint and then
+///   grown by amortized pushes (at least 8): old and new together are under
+///   three times that.
+/// - `is_safe_display_title` (allocates only for at most 120 chars, so 480
+///   bytes): its `to_ascii_lowercase` copy and one helper's at a time
+///   (`looks_like_raw_identifier`, `contains_blocked_prompt_fragment`; the
+///   `custom_title`-only segment vector is not reached for "desktop_title").
+/// - The item's clone of the kept title: exact.
+///
+/// Stack-only, checked; `None` on overflow.
+fn desktop_title_bound(len: usize) -> Option<usize> {
+    const MAX_TITLE_CHARS: usize = 255;
+    const MAX_DISPLAY_CHARS: usize = 120;
+    let words = match len.div_ceil(2) {
+        0 => 0,
+        words => {
+            let last = words.checked_next_power_of_two()?.max(4);
+            let slots = if last > 4 {
+                last.checked_add(last / 2)?
+            } else {
+                last
+            };
+            slots.checked_mul(std::mem::size_of::<&str>())?
+        }
+    };
+    let kept = len.min(4 * MAX_TITLE_CHARS);
+    let collect = kept.max(8).checked_mul(3)?;
+    let safety = kept.min(4 * MAX_DISPLAY_CHARS).checked_mul(2)?;
+    len.checked_mul(2)? // the input and the joined text
+        .checked_add(words)?
+        .checked_add(collect)?
+        .checked_add(safety)?
+        .checked_add(kept)
 }
 
 /// `completed_heap_bound` of `value` on a fresh counter.

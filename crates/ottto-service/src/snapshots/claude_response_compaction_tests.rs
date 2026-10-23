@@ -2232,3 +2232,71 @@ fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
         "itemless: born {born} > x_out {x_out} + decode peak {peak}"
     );
 }
+
+/// #665 r36 (AutoReview P2, U1): `desktop_title_bound` covers a desktop
+/// title's normalization scratch at adversarial lengths near the sidecar
+/// file cap (`MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES`): one-byte words (the
+/// most words a length allows), one unbroken word, and a short title that
+/// reaches `is_safe_display_title`'s allocations. Measured on
+/// `normalize_display_title` with its input clone, plus the item's clone of
+/// the kept title; then end to end, born within X_out plus the decode peak.
+#[test]
+fn x_out_u1_charges_desktop_title_normalization() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let near_cap = MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES as usize - 4 * 1024;
+    let cases = [
+        ("spaced", "a ".repeat(near_cap / 2)),
+        ("unbroken", "x".repeat(near_cap)),
+        ("safe", "  Investigate   cache\tpolicy  drift  ".to_string()),
+    ];
+    for (label, title) in &cases {
+        let bound = desktop_title_bound(title.len()).unwrap();
+        let (kept, normalized) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            normalize_display_title(title.clone(), "desktop_title")
+        });
+        let kept_len = kept.as_ref().map_or(0, String::len);
+        let peak = normalized.requested_peak_with_overlap;
+        let words = title.split_whitespace().count();
+        eprintln!(
+            "X_OUT_U1 case={label} len={} words={words} kept={kept_len} normalize_peak={peak} item_clone={kept_len} term={bound} slack={}",
+            title.len(),
+            bound - (peak + kept_len).min(bound),
+        );
+        assert!(
+            peak + kept_len <= bound,
+            "{label}: normalization {peak} + clone {kept_len} > term {bound}"
+        );
+        match *label {
+            "spaced" => {
+                let last = words.next_power_of_two();
+                assert!(
+                    peak >= 16 * (last + last / 2),
+                    "precondition: the words vector's last growth was measured"
+                );
+            }
+            "safe" => assert_eq!(kept.as_deref(), Some("Investigate cache policy drift")),
+            _ => assert!(kept.is_none(), "{label}: over 120 chars is not displayed"),
+        }
+    }
+    for (label, title) in cases {
+        let mut titled = ClaudeTitleMetadata::default();
+        titled.titles.insert(
+            SESSION.to_string(),
+            ClaudeTitleCandidate {
+                title,
+                user_set: true,
+            },
+        );
+        let label = format!("u1-{label}");
+        assert_x_out_covers_finish(
+            &label,
+            &with_cwd(
+                realistic_rows(0..3, &[SHELL]),
+                &format!("/work/x-out-{label}"),
+            ),
+            &titled,
+        );
+    }
+}
