@@ -677,8 +677,9 @@ mod bounded_tests {
             };
             assert!(super::super::store::submit_unledgered(job).is_ok());
         }
+        let baseline = capture_reserved();
         let mut occupied = Funds::default();
-        assert!(occupied.spend(CAPTURE_CEILING_BYTES));
+        assert!(occupied.spend(CAPTURE_CEILING_BYTES - baseline));
         let scope = scratch.to_path_buf();
         begin_page(&scope);
         let mut capture = ClaudeResponseCapture {
