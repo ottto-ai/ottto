@@ -111,7 +111,9 @@ pub(crate) use claude_history_upgrade::{
 use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
-use claude_reemission_exclusions::{ListState, ReemissionExclusions};
+#[cfg(test)]
+use claude_reemission_exclusions::ListState;
+use claude_reemission_exclusions::ReemissionExclusions;
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
