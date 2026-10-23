@@ -35238,7 +35238,7 @@ impl ScanIndex {
     /// The one reason-independent history decision for a Claude candidate,
     /// against its entry before this parse. Every caller (the candidate loop,
     /// MONEY's emitter) uses it; the parse reason stays diagnostic only.
-    pub(crate) fn claude_history_upgrade_decision(
+    fn claude_history_upgrade_decision(
         &self,
         candidate: &CandidateFile,
         birth_unix_seconds: Option<u64>,

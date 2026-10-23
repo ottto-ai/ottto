@@ -681,8 +681,10 @@ mod tests {
 
     #[test]
     fn owed_without_list_alarms_at_most_hourly() {
-        let mut page = HistoryPage::default();
-        page.owed = 3;
+        let page = HistoryPage {
+            owed: 3,
+            ..HistoryPage::default()
+        };
         let now = std::time::Instant::now();
         let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
             alarm_if_owed_without_list_at(&page, ListState::NotInstalled, now);

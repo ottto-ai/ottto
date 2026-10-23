@@ -10,8 +10,6 @@
 // Fixtures are synthetic; the cutoff seam makes every fixture birth "old".
 
 use super::*;
-use sha2::Digest as _;
-use std::io::Write as _;
 
 const HISTORY_MACHINE_ID: &str = "machine-history-upgrade";
 const HISTORY_DESTINATION: &str = "history-upgrade-destination";

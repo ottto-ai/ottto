@@ -182,18 +182,18 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     };
     let never = support("history-gate-never");
     assert_eq!(
-        held(&*never, u64::MAX),
+        held(&never, u64::MAX),
         (ListState::NotInstalled, 0, vec![1; 4])
     );
     assert_eq!(
-        held(&*never, 0),
+        held(&never, 0),
         (ListState::NotInstalled, 4, vec![2; 4]),
         "newer births are not held without a list"
     );
 
     let malformed = support("history-gate-malformed");
     fs::write(ReemissionExclusions::path(&malformed), "not-a-digest\n").unwrap();
-    assert_eq!(held(&*malformed, 0), (ListState::Unreadable, 0, vec![1; 4]));
+    assert_eq!(held(&malformed, 0), (ListState::Unreadable, 0, vec![1; 4]));
 
     let missing = support("history-gate-missing");
     fs::write(ReemissionExclusions::path(&missing), "").unwrap();
@@ -203,7 +203,7 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     );
     fs::remove_file(ReemissionExclusions::path(&missing)).unwrap();
     let ((state, emitted, stamps), _) =
-        crate::local_resource_diagnostics::capture(|| held(&*missing, 0));
+        crate::local_resource_diagnostics::capture(|| held(&missing, 0));
     assert_eq!(
         (state, emitted, stamps),
         (ListState::MissingAfterInstall, 0, vec![1; 4])
@@ -217,7 +217,7 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
         fs::write(&list, "").unwrap();
         let snapshots = list.parent().unwrap().to_path_buf();
         fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o500)).unwrap();
-        let outcome = held(&*unwritable, 0);
+        let outcome = held(&unwritable, 0);
         fs::set_permissions(&snapshots, fs::Permissions::from_mode(0o700)).unwrap();
         // A privileged runner can still write the marker; then it installs.
         if outcome.0 == ListState::MarkerUnwritable {
