@@ -52965,8 +52965,22 @@ mod tests {
                 .context_curve
                 .as_ref()
                 .map(|curve| curve.coverage.as_str()),
-            Some("ownership_unresolved"),
+            Some("scalars_file_birth_only"),
             "an invalid peer family can hide a copied request, so the curve stays closed"
+        );
+        assert_eq!(
+            child.claude_file_birth_verdict(),
+            Some(ClaudeFileBirthVerdict::Admitted)
+        );
+        assert_eq!(
+            child.context_curve,
+            Some(unavailable_context_curve(
+                CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                "scalars_file_birth_only",
+                0,
+                0,
+            ))
         );
         // The hidden family is the copier: telemetry assigns req_5 to the
         // child's own root, so the file birth rule keeps the child's scalars.
@@ -59031,7 +59045,11 @@ mod tests {
             &root_timestamp,
         );
         let curve = items[0].context_curve.as_ref().expect("coverage object");
-        assert_eq!(curve.coverage, "ownership_unresolved");
+        assert_eq!(
+            items[0].claude_file_birth_verdict(),
+            Some(ClaudeFileBirthVerdict::Admitted)
+        );
+        assert_eq!(curve.coverage, "scalars_file_birth_only");
         assert_eq!(curve.total_owned_request_count, 0);
         assert!(curve.points.is_empty());
         let _ = fs::remove_file(path);

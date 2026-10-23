@@ -196,6 +196,29 @@ fn inherited_start(item: &SnapshotItem) -> Option<SnapshotSessionStart> {
 
 /// Serialized top-level keys whose values differ between two bodies.
 fn differing_keys(left: &SnapshotItem, right: &SnapshotItem) -> BTreeSet<String> {
+    if left.context_curve != right.context_curve {
+        // The E-on/control comparison may change only the unavailable reason,
+        // never introduce curve evidence alongside the admitted scalars.
+        assert_eq!(
+            left.claude_file_birth_verdict(),
+            Some(ClaudeFileBirthVerdict::Admitted)
+        );
+        for (item, coverage) in [
+            (left, "scalars_file_birth_only"),
+            (right, "ownership_unresolved"),
+        ] {
+            assert_eq!(
+                item.context_curve,
+                Some(unavailable_context_curve(
+                    CLAUDE_CODE_SNAPSHOT_PARSER_VERSION,
+                    CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION,
+                    coverage,
+                    0,
+                    0,
+                ))
+            );
+        }
+    }
     let left = serde_json::to_value(left).expect("serialize body");
     let right = serde_json::to_value(right).expect("serialize body");
     let (left, right) = (
@@ -212,7 +235,7 @@ fn differing_keys(left: &SnapshotItem, right: &SnapshotItem) -> BTreeSet<String>
 fn allowed_difference() -> BTreeSet<String> {
     CONTEXT_KEYS
         .iter()
-        .chain(&["session_start", "snapshot_fingerprint"])
+        .chain(&["session_start", "snapshot_fingerprint", "context_curve"])
         .map(|key| key.to_string())
         .collect()
 }
@@ -1768,7 +1791,8 @@ fn context_basis_counts_by_version_stay_bounded() {
 
 /// SI byte-identity check with request identity capture ON: through the real
 /// scan and local evidence pipeline, the rule changes context scalars,
-/// session start and the derived fingerprint only. Money, usage, identity,
+/// session start, the unavailable curve reason and the derived fingerprint
+/// only. Money, usage, identity,
 /// contract 5 rows and account tags are byte-identical to the clear.
 #[test]
 fn capture_on_bodies_match_the_clear_outside_context_scalars() {
