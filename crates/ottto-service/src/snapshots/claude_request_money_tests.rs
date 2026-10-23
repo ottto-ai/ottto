@@ -2767,3 +2767,91 @@ fn census_hashes(support: &Path) -> usize {
     store::with_ledger_for_test(support, |ledger| ledger.census().hash_total_for_test())
         .unwrap_or(0)
 }
+
+/// Retaining retirement hashes in the shared D1 budget needs an admission
+/// policy before it can be added without changing MONEY. This is a pressure
+/// reproduction, not a safety-buffer implementation: the second census
+/// reserves the proposed safety slots with an ordinary synthetic hash list.
+/// The live pipeline and retirement implementation remain unchanged.
+#[test]
+fn money_retired_safety_reservation_can_displace_an_active_transcript() {
+    const OLD: &str = "/money/projects/old.jsonl";
+    const CURRENT: &str = "/money/projects/current.jsonl";
+    const NEW: &str = "/money/projects/new.jsonl";
+    let half = MAX_CLAUDE_REQUEST_CENSUS_HASHES / 2;
+    let old = money_record('a', (0..half as u64).collect());
+    let current = money_record('b', (half as u64..(2 * half) as u64).collect());
+    let new = money_record('c', vec![MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64]);
+    let mut before = ClaudeRequestCensus::default();
+    assert_eq!(
+        before.insert_for_test(OLD, old.clone()),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(
+        before.insert_for_test(CURRENT, current),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(before.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+
+    // Main's retirement frees the old slots and leaves the record money-retired.
+    let mut main = before.clone();
+    let mut retired = main.take(OLD).expect("old record");
+    retired.retire();
+    assert_eq!(retired.retired(), Some(half as u64));
+    assert!(retired.request_hashes().is_empty());
+    assert_eq!(
+        main.insert_for_test(OLD, retired),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(main.hash_total(), half);
+    assert_eq!(
+        main.insert_for_test(NEW, new.clone()),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(
+        main.get(NEW).unwrap().request_hashes(),
+        new.request_hashes()
+    );
+
+    // Charging the same old slots as safety leaves no slot for the new record.
+    // No extra safety allowance, metadata or serialization pressure is needed
+    // to trigger this: the existing combined hash limit alone is sufficient.
+    let mut reserved = before;
+    assert_eq!(reserved.hash_headroom(), 0);
+    assert_eq!(
+        reserved.insert_for_test(NEW, new),
+        ClaudeRequestCensusInsert::Tombstone
+    );
+    assert!(reserved.get(NEW).unwrap().over_budget());
+    assert!(reserved.get(NEW).unwrap().request_hashes().is_empty());
+    assert_eq!(reserved.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+
+    // Show the resulting existing MONEY decision, not just a budget statistic.
+    let mut main_index = ScanIndex::default();
+    let mut entry = manifest_index_entry(Some("body"));
+    entry.source_file_fingerprint = money_fingerprint('c');
+    main_index.files.insert(NEW.to_owned(), entry);
+    *main_index.claude_request_census_mut_for_test() = main;
+    let mut reserved_index = main_index.clone();
+    *reserved_index.claude_request_census_mut_for_test() = reserved;
+    let ledger = ClaudeRequestCensus::default();
+    let family_complete = |index: &ScanIndex| {
+        ClaudeLedgerScope::build(
+            index,
+            &ledger,
+            &BTreeSet::new(),
+            &BTreeSet::from(["new"]),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("scope admitted")
+        .family_complete("new")
+    };
+    assert!(
+        family_complete(&main_index),
+        "main admits the active transcript"
+    );
+    assert!(
+        !family_complete(&reserved_index),
+        "a shared safety reservation changes MONEY"
+    );
+}
