@@ -525,6 +525,9 @@ impl Custody {
         a: Address,
         entity: Option<Box<EntityBinding>>,
     ) -> Insert {
+        if value.request_hashes().len() > MAX_HASHES {
+            return Insert::Refused;
+        }
         if key.starts_with("hold:body:") && self.get(&key).is_some() {
             return Insert::Stored;
         }
@@ -1786,6 +1789,19 @@ impl Custody {
     pub(super) fn history(&self) -> &[[u8; 32]] {
         &self.ever
     }
+    pub(super) fn rebuild_needed(&self, path: &str) -> bool {
+        self.control.recovery
+            && self
+                .files
+                .get(&format!("file:{}", digest(path)))
+                .is_none_or(|file| {
+                    file.rebuild_owed
+                        || file
+                            .current_m
+                            .as_ref()
+                            .is_none_or(|slot| slot.value.view().over_budget())
+                })
+    }
     pub(super) fn rebuilt(&mut self, path: &str) -> bool {
         let key = format!("file:{}", digest(path));
         let before = self.carrier_size(&key).0;
@@ -1810,6 +1826,11 @@ impl Custody {
                 .is_some_and(|record| record.retired().is_some())
             {
                 return true;
+            }
+            if !index.claude_request_census.get(path).is_some_and(|record| {
+                record.current_holder_for(&entry.source_file_fingerprint, true)
+            }) {
+                return false;
             }
             self.files
                 .get(&format!("file:{}", digest(path)))
@@ -1935,7 +1956,7 @@ impl Custody {
         index: &super::super::ScanIndex,
         retire: bool,
         deadline: Instant,
-    ) -> Option<Vec<FieldChange>> {
+    ) -> Option<(Vec<FieldChange>, bool)> {
         let mut changes = Vec::new();
         let vanished = self
             .files
@@ -1965,7 +1986,7 @@ impl Custody {
         let mut primaries = BTreeMap::<String, (String, (u64, String))>::new();
         for path in index.files.keys() {
             if Instant::now() >= deadline {
-                return Some(changes);
+                return Some((changes, false));
             }
             if let Some((root, member)) = super::logical_family_member(index, path) {
                 let order = super::selection::primary_order(index, path);
@@ -2051,11 +2072,12 @@ impl Custody {
                 }
                 Some((String::clone(old), String::clone(target), Slot::clone(slot)))
             })
-            .take(256)
+            .take(257)
             .collect::<Vec<_>>();
-        for (old, target, slot) in candidates {
+        let truncated = candidates.len() > 256;
+        for (old, target, slot) in candidates.into_iter().take(256) {
             if Instant::now() >= deadline {
-                return Some(changes);
+                return Some((changes, false));
             }
             let field = if slot.key.starts_with("fam:") {
                 "memo"
@@ -2112,7 +2134,7 @@ impl Custody {
                     && !self.telemetry.contains_key(&target)
                     && self.record_count() >= super::store::LEDGER_MAX_RECORDS
                 {
-                    return Some(changes);
+                    return Some((changes, false));
                 }
                 let before = self.carrier_size(&target).0;
                 let address = Address {
@@ -2126,7 +2148,7 @@ impl Custody {
                 if self.bytes.saturating_sub(before).saturating_add(after) > MAX_BYTES - 1024 * 1024
                 {
                     self.replace(&address, previous);
-                    return Some(changes);
+                    return Some((changes, false));
                 }
                 self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
                 changes.push(FieldChange {
@@ -2163,7 +2185,7 @@ impl Custody {
                 });
             }
         }
-        Some(changes)
+        Some((changes, !truncated))
     }
     pub(super) fn entity_matches(
         &self,

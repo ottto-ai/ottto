@@ -1,13 +1,15 @@
 //! The P1 money ledger's own store, and the shadow's writer.
 //!
-//! The ledger (telemetry `otel:`, message-only `mh:`, family `fam:` and
-//! sweep `sweep:` records, #664's census codec) never lives in the scan
-//! index: the index's bytes, its live allowances, its save and its
-//! validation are the same whether the shadow is armed or not. The ledger is
-//! one in-memory copy per support directory, persisted under
-//! `<support>/claude-request-ledger/` as 256 hash-sharded JSON maps (shard =
-//! first byte of SHA-256 of the key) and `meta.json` (the sweep records).
-//! Only changed shards are rewritten, a bounded number per page.
+//! One versioned file carrier per physical transcript path and one telemetry
+//! carrier per root own evidence and optional delivery/lifecycle fields. Control
+//! and the packed, monotone ever-indexed set add two records. Transcript R stays
+//! in ScanIndex with its existing codec, allowance and selected-save owner.
+//! Carriers persist under `<support>/claude-request-custody-v2/` in 256 data
+//! shards and `meta.json` (Control). Field query spellings are compatibility
+//! views; they never add durable records. Old `claude-request-ledger/` files are
+//! read-only recovery input. Missing, damaged or older custody requires a fresh
+//! verified traversal before literal offers; unknown history closes synthetic
+//! work. Only changed shards are rewritten, in bounded slices.
 //!
 //! Crash order (Sol R3-2), one rule: when the telemetry certificate went to
 //! zero, a meta whose certificates are all ZERO is written as its own write
@@ -32,9 +34,10 @@
 //! Results come back to the next page.
 //!
 //! Resident bound (daemon parent): at most `LEDGER_MAX_RECORDS` records,
-//! each `RECORD_RESIDENT_OVERHEAD_BYTES` beyond its payload, and a payload
-//! (keys, hashes, facts) held in at most twice its serialized bytes, which
-//! the census budget caps: `LEDGER_RESIDENT_BOUND_BYTES`.
+//! existing structural overhead credit and twice the serialized payload cover
+//! native carrier/field nodes, keys, packed hashes and facts under the unchanged
+//! byte admission: `LEDGER_RESIDENT_BOUND_BYTES`. Controls measure the actual
+//! carrier layout separately, including spare offer/control vector capacity.
 
 use super::super::claude_request_census::{
     decode_ledger_shard, ClaudeLedgerSweep, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
@@ -255,7 +258,7 @@ impl ClaudeLedger {
         let retire = self.pending_checkpoint.is_none()
             && self.custody_epoch == self.durable_custody_epoch
             && !self.promotion_pending;
-        let Some(changes) = self.census.promote(index, retire, deadline) else {
+        let Some((changes, complete)) = self.census.promote(index, retire, deadline) else {
             return false;
         };
         for change in changes {
@@ -270,7 +273,7 @@ impl ClaudeLedger {
             self.promotion_pending = true;
             self.barrier_needed = true;
         }
-        true
+        complete
     }
     pub(super) fn has_pending_checkpoint(&self) -> bool {
         self.pending_checkpoint.is_some()
@@ -1592,6 +1595,12 @@ pub(super) fn scheduled(support_dir: &Path, index_key: &str, now: u64) -> bool {
     let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
         return false;
     };
+    // Recovery reuses the existing due selector so unchanged saved files are
+    // actually opened and rebuilt. Their holds/deadlines remain intact and
+    // still gate literal submission; this grants only evidence collection.
+    if ledger.census.rebuild_needed(index_key) {
+        return true;
+    }
     let dirty = ledger.get(&money_key("dirty:", index_key));
     if ledger
         .get(&money_key("hold:", index_key))

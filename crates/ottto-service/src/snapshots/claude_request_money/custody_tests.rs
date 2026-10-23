@@ -618,3 +618,36 @@ fn two_offer_slots_and_synthetic_fields_add_no_extra_carrier() {
         ledger.census().recounted_for_test()
     );
 }
+
+#[test]
+fn recovery_requires_a_verified_current_rebuild_of_unchanged_files() {
+    let path = "/custody/rebuild.jsonl";
+    let mut index = ScanIndex::default();
+    let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+    entry.source_file_fingerprint = "a".repeat(64);
+    index.files.insert(path.into(), entry);
+    index
+        .claude_request_census
+        .insert(path.into(), record(vec![1]));
+    let mut census = custody::Custody::default();
+    assert!(census.bind_file(path, "root".into(), "root".into(), None));
+    census.insert(
+        message_key(path),
+        ClaudeRequestCensusRecord::message_record(&record(vec![1]), Vec::new()),
+    );
+    census.mark_recovery(false);
+    assert!(
+        census.rebuild_needed(path),
+        "unchanged files re-enter existing due selection"
+    );
+    assert!(!census.rebuild_complete(&index));
+    assert!(census.rebuilt(path));
+    assert!(census.rebuild_complete(&index));
+    index
+        .claude_request_census
+        .insert(path.into(), record(vec![1]).with_unverified_for_test(true));
+    assert!(
+        !census.rebuild_complete(&index),
+        "unverified evidence never publishes a rebuilt generation"
+    );
+}
