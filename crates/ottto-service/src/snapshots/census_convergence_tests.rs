@@ -1930,6 +1930,9 @@ fn full_tombstone_set_refuses_retirement_and_keeps_the_family() {
     }
 }
 
+/// Edits a saved index's top-level JSON object.
+type IndexJsonEdit = dyn Fn(&mut serde_json::Map<String, serde_json::Value>);
+
 // SOURCE Round 13 F1: the persisted marker separates an index from before
 // the bridge (no marker: an empty set is safe, nothing ever retired) from a
 // marked index whose tombstone set was omitted, wrongly typed or damaged.
@@ -1958,7 +1961,7 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     );
     let digest = claude_retired_family_digest("gone-00");
     assert!(saved["claude_retired_family_tombstones"][&digest].is_u64());
-    let write = |edit: &dyn Fn(&mut serde_json::Map<String, serde_json::Value>)| {
+    let write = |edit: &IndexJsonEdit| {
         let mut value = saved.clone();
         edit(value.as_object_mut().unwrap());
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
@@ -1990,10 +1993,7 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
         .is_empty());
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
 
-    let shapes: [(
-        &str,
-        &dyn Fn(&mut serde_json::Map<String, serde_json::Value>),
-    ); 4] = [
+    let shapes: [(&str, &IndexJsonEdit); 4] = [
         ("omitted set", &|object| {
             object.remove("claude_retired_family_tombstones");
         }),

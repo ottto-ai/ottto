@@ -3091,6 +3091,9 @@ fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     assert!(member.is_file());
 }
 
+/// Damages a saved index's JSON; the second argument is a tombstone digest.
+type IndexJsonDamage = fn(&mut serde_json::Value, &str);
+
 /// SOURCE Round 13 F1: a retired family whose persisted tombstone set is
 /// then omitted, wrongly typed or damaged (its marker stays) is never read as
 /// new. The load raises the uncertainty fence and re-tombstones the
@@ -3103,7 +3106,7 @@ fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
     let _source_manifests = SourceManifestTestGuard::new();
     let session = PIPELINE_SESSIONS[2];
     let digest = crate::snapshots::claude_retired_family_digest_for_test(session);
-    let shapes: [(&str, fn(&mut serde_json::Value, &str)); 3] = [
+    let shapes: [(&str, IndexJsonDamage); 3] = [
         ("omitted-set", |index, _| {
             index
                 .as_object_mut()
