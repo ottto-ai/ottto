@@ -23810,9 +23810,21 @@ impl OwnedSourceScan {
                     && !parent_resolution_restart;
                 let needs_clean_followup =
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
+                // Path-(a) bridge: a raw-complete census first retires every
+                // RetryPending family it proves wholly absent, so a vanished
+                // family's debt cannot withhold the census below forever.
+                if raw_census_complete && source == SnapshotSource::ClaudeCode {
+                    let retired = index.retire_absent_retry_pending_claude_families();
+                    if retired > 0 {
+                        eprintln!(
+                            "local snapshot census retired {retired} wholly absent RetryPending \
+                             Claude usage family/families on a raw-complete census"
+                        );
+                    }
+                }
                 // Path-(a) bridge: RetryPending authority debt no longer marks
-                // the sweep, but it still withholds census completion (and so
-                // the complete fold and upload-context adoption), as the mark
+                // the sweep, but it still withholds the ordinary census (and so
+                // its complete fold and upload-context adoption), as the mark
                 // did. It owes no clean follow-up of its own.
                 let authority_debt_withholds_census = raw_census_complete
                     && source == SnapshotSource::ClaudeCode
@@ -35209,6 +35221,46 @@ impl ScanIndex {
                 record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
             })
             .count()
+    }
+
+    /// Path-(a) bridge: retire every RetryPending family that a raw-complete
+    /// census proves wholly absent. Bounded reconciliation has already
+    /// removed each vanished path from `files`, so a root with no remaining
+    /// member path has no member on disk. Only the record and its pending
+    /// entry go; nothing is accepted, and the retained witness is pruned by
+    /// the next complete census as before. A present family stays held.
+    ///
+    /// This runs independently of the census gate that RetryPending debt
+    /// imposes: the ordinary whole-family disappearance rule needs a complete
+    /// census, which that very debt would otherwise withhold forever once no
+    /// member remains to advance the failure count.
+    fn retire_absent_retry_pending_claude_families(&mut self) -> usize {
+        if self.claude_usage_authority_pending_count() == 0 {
+            return 0;
+        }
+        let present_roots = self
+            .files
+            .keys()
+            .filter_map(|index_key| {
+                claude_index_path_member_ref(Path::new(index_key))
+                    .map(|member| member.root.to_string())
+            })
+            .collect::<BTreeSet<_>>();
+        let absent = self
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(root_session_id, record)| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                    && !present_roots.contains(root_session_id.as_str())
+            })
+            .map(|(root_session_id, _)| root_session_id.clone())
+            .collect::<Vec<_>>();
+        for root_session_id in &absent {
+            self.claude_usage_authority_quarantine
+                .remove(root_session_id);
+            self.claude_usage_family_pending.remove(root_session_id);
+        }
+        absent.len()
     }
 
     pub(crate) fn claude_usage_authority_terminal_entity_count(&self) -> usize {

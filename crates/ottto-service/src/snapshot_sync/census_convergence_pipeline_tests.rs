@@ -2275,3 +2275,195 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
         revision.as_ref()
     );
 }
+
+/// The ordinary-fallback cycle for the absence tests: the baseline's upload
+/// context, so only the authority debt can withhold the census.
+const ABSENCE_CYCLE: PipelineCycle<'static> = PipelineCycle {
+    upload_context: "upload-context-1",
+    replay_generation: "replay-generation-1",
+    ..BRIDGE_CYCLE
+};
+
+/// Walk ordinary traversals (native comparison is absent from this fixture)
+/// until one completes its census, at most `walks` of them.
+fn walk_until_census_complete(
+    fixture: &PipelineFixture,
+    first_hour: u32,
+    walks: u32,
+) -> Vec<Vec<PipelinePage>> {
+    let mut traversals = Vec::new();
+    for hour in first_hour..first_hour + walks {
+        let pages = fixture.walk(hour, &ABSENCE_CYCLE);
+        let complete = pages.last().expect("terminal page").scan.census_complete;
+        traversals.push(pages);
+        if complete {
+            break;
+        }
+    }
+    traversals
+}
+
+/// What every absence test checks once the family's last file is gone: its
+/// RetryPending record and pending retire, the census completes, and no page
+/// offers, uploads or accepts anything for the removed member.
+fn assert_absent_family_retired(
+    traversals: &[Vec<PipelinePage>],
+    baseline: &ScanIndex,
+    session: &str,
+    shape: &str,
+) {
+    let removed_key = PipelineFixture::key(baseline, session);
+    let removed_bodies = &baseline.file_snapshot_fingerprints[&removed_key];
+    for page in traversals.iter().flatten() {
+        assert_eq!(
+            page.scan.disappeared_file_count, 0,
+            "{shape}: removal, not loss"
+        );
+        assert!(page.held.is_empty(), "{shape}");
+        assert!(
+            page.scan
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id != session),
+            "{shape}: the removed member is never offered"
+        );
+        assert!(page.uploaded.is_disjoint(removed_bodies), "{shape}");
+        assert!(
+            page.progress
+                .accepted_fingerprints
+                .is_disjoint(removed_bodies),
+            "{shape}: absence never earns acceptance"
+        );
+    }
+    let last = traversals
+        .last()
+        .and_then(|pages| pages.last())
+        .expect("terminal page");
+    assert!(last.scan.census_complete, "{shape}: the census completes");
+    assert!(!last.index.files.contains_key(&removed_key), "{shape}");
+    assert!(
+        last.index
+            .claude_authority_record_for_test(session)
+            .is_none(),
+        "{shape}: the absent family's record retires"
+    );
+    assert_eq!(
+        last.index.claude_usage_authority_pending_count(),
+        0,
+        "{shape}"
+    );
+    assert!(!last.index.bounded_sweep_had_unsettled_upload(), "{shape}");
+}
+
+/// F1 (path-(a) bridge, ordinary fallback): a valid bound RetryPending family
+/// whose only member is removed before a healthy single-page traversal. The
+/// raw-complete census retires the record, so its debt cannot withhold the
+/// census forever; nothing about the held revision is accepted.
+#[test]
+#[serial(source_manifests)]
+fn absent_retry_pending_family_retires_on_a_single_page_ordinary_census() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("patha-absent-retry-pending-single-page");
+    let baseline = fixture.baseline();
+    fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    std::fs::remove_file(fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[2])))
+        .expect("remove the held family's only member");
+    // Every remaining transcript fits on one page.
+    fixture.page_files = 8;
+    let traversals = walk_until_census_complete(&fixture, 9, 3);
+    assert_eq!(traversals[0].len(), 1, "a single-page traversal");
+    assert_absent_family_retired(&traversals, &baseline, PIPELINE_SESSIONS[2], "single-page");
+}
+
+/// F1 with the #683 shape: the held family's only member vanishes beneath its
+/// still-present parent after the traversal discovered it, so the census
+/// retires it as a removal rather than a loss. The family still retires.
+#[test]
+#[serial(source_manifests)]
+fn absent_retry_pending_family_retires_after_a_parent_present_removal() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("patha-absent-retry-pending-parent-present");
+    let baseline = fixture.baseline();
+    fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    let member = fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[2]));
+    let first = fixture.page(
+        "2026-08-02T09:00:00Z",
+        &ABSENCE_CYCLE,
+        PipelineUpload::Accept,
+    );
+    assert!(
+        first.index.scan_traversal_in_progress_for_test(),
+        "the member is still queued after the first page"
+    );
+    assert!(fixture.root.is_dir());
+    std::fs::remove_file(&member).expect("remove the member beneath its present parent");
+    let mut pages = vec![first];
+    for number in 1..PIPELINE_MAX_PAGES + 2 {
+        let page = fixture.page(
+            &format!("2026-08-02T09:{number:02}:00Z"),
+            &ABSENCE_CYCLE,
+            PipelineUpload::Accept,
+        );
+        let ended = !page.index.scan_traversal_in_progress_for_test();
+        pages.push(page);
+        if ended {
+            break;
+        }
+    }
+    assert!(!pages
+        .last()
+        .expect("terminal page")
+        .index
+        .scan_traversal_in_progress_for_test());
+    let mut traversals = vec![pages];
+    if !traversals[0]
+        .last()
+        .expect("terminal page")
+        .scan
+        .census_complete
+    {
+        traversals.extend(walk_until_census_complete(&fixture, 10, 2));
+    }
+    assert_absent_family_retired(
+        &traversals,
+        &baseline,
+        PIPELINE_SESSIONS[2],
+        "parent-present",
+    );
+}
+
+/// Control: the same bound RetryPending family, still present, stays held
+/// and keeps the ordinary census withheld.
+#[test]
+#[serial(source_manifests)]
+fn present_retry_pending_family_stays_held_beside_the_absence_retirement() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("patha-present-retry-pending-control");
+    let baseline = fixture.baseline();
+    let revision = fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    fixture.page_files = 8;
+    let pages = fixture.walk(9, &ABSENCE_CYCLE);
+    let last = pages.last().expect("terminal page");
+    assert!(
+        !last.scan.census_complete,
+        "the present held family withholds it"
+    );
+    let key = PipelineFixture::key(&baseline, PIPELINE_SESSIONS[2]);
+    assert_eq!(
+        last.index.files[&key].last_snapshot_fingerprint,
+        baseline.files[&key].last_snapshot_fingerprint
+    );
+    let record = last
+        .index
+        .claude_authority_record_for_test(PIPELINE_SESSIONS[2])
+        .expect("the present family stays quarantined");
+    assert!(!record.terminal && record.bound_to_retained_witness);
+    assert_eq!(record.failed_reconstruction_count, 1);
+    assert_eq!(
+        record
+            .member_source_file_fingerprints
+            .get(PIPELINE_SESSIONS[2]),
+        Some(&revision)
+    );
+    assert_eq!(last.index.claude_usage_authority_pending_count(), 1);
+}

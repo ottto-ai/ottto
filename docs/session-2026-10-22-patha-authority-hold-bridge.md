@@ -18,12 +18,25 @@ terminal owed a clean follow-up that the same debt could never satisfy.
 - The census-withheld branch keeps `census_complete = false` and the
   non-terminal scan, with no v1 for held families, but no longer marks the
   sweep.
-- The scanner terminal keeps its census incomplete while RetryPending debt
-  exists, without owing a clean follow-up. The complete proof fold,
-  quarantine retirement and upload-context adoption therefore stay withheld
-  exactly as the mark withheld them; the first fix run (CI 39871789318) showed
-  that without this gate a held family's quarantine rebound to a newly proven
-  witness and the accepted ledger moved to the new upload context.
+- The scanner terminal keeps its ordinary census incomplete while RetryPending
+  debt exists, without owing a clean follow-up. On the ordinary scanner path
+  the complete proof fold, quarantine rebinding and upload-context adoption
+  therefore stay withheld as the mark withheld them; the first fix run (CI
+  39871789318) showed that without this gate a held family's quarantine
+  rebound to a newly proven witness and the accepted ledger moved to the new
+  upload context. Native comparison is separate: its own native census can
+  still re-prove and rebind a RetryPending family, as before this change.
+- Before that gate, a raw-complete census retires every RetryPending family
+  it proves wholly absent (no member path left after reconciliation,
+  including a member that vanished beneath its present parent). The ordinary
+  whole-family disappearance rule needs a complete census, which the debt
+  itself would otherwise withhold forever once no member remains to advance
+  the failure count. Only the record and its pending entry go; absence earns
+  no acceptance, and a present held family stays held.
+- A fresh single-page traversal that starts with RetryPending debt no longer
+  completes its ordinary census (before this change its start reset the mark,
+  so it could). This bridge does not deliver census completion on a source
+  with debt; it is the cost-only fallback, as designed.
 - The C1a latch clear and `identity_contract_rearm` additionally require zero
   authority debt, because the sweep flag no longer carries it.
 
@@ -37,6 +50,15 @@ with pending owned by another family get no carry. A second cause beside the
 debt keeps the BASE re-arm. `claude_unchanged_proof_roots` still excludes every
 quarantined or demoting root. No persisted field is added.
 
+The process counter `CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS`
+keeps its name, but its population now also includes `Rejected` pages whose
+holds are bound RetryPending; it is not an UnprovenTerminal-only count.
+
+When the unsettled-cause bits (#691) compose with this change, the
+authority-only census stamp stays removed (no `AuthorityCensusWithheld` cause
+at that site), and the debt gate at the scanner terminal is a census reason,
+not an unsettled-upload cause.
+
 ## Regression coverage
 
 Pipeline tests cover a bound RetryPending hold that settles on `Completed` and
@@ -46,6 +68,9 @@ witnessed stale family on a red retry (carry only for the unrelated family), a
 held root that is never carried, debt beside an existing mark, and the C1a
 latch surviving debt. Unit tests cover the bound predicate, a held root that is
 never an unchanged-proof root, and debt beside a retryable server conflict.
+Ordinary-fallback absence tests (native comparison absent) retire a wholly
+removed RetryPending family on a single-page traversal and after a
+parent-present removal, and keep a still-present held family withheld.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and
