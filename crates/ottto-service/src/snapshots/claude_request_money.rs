@@ -1351,7 +1351,7 @@ fn shadow_page_with_coverage(
     };
     let ledger: &mut ClaudeLedger = &mut guard;
     let applying = Instant::now();
-    apply_results(support_dir, ledger, &mut counts);
+    apply_results(support_dir, ledger, &mut counts, deadline);
     counts.result_apply_us = applying.elapsed().as_micros() as u64;
     if std::mem::take(&mut ledger.load_damaged) {
         counts.ledger_load_damaged = 1;
@@ -1698,11 +1698,12 @@ fn shadow_page_with_coverage(
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
     if memos.len() > capture::NEXT_PAGE_FAMILIES {
-        let mut next_capture = memos.iter().collect::<Vec<_>>();
-        next_capture.sort_by_key(|memo| memo.observed_unix);
         capture::plan_next_page(
             &scope_key,
-            next_capture.iter().map(|memo| memo.key.as_str()),
+            memos
+                .iter()
+                .map(|memo| (memo.key.as_str(), memo.observed_unix)),
+            started + PAGE_MAX_ELAPSED,
         );
     } else {
         capture::forget_plan(&scope_key);
@@ -2706,22 +2707,22 @@ fn apply_results(
     support_dir: &Path,
     ledger: &mut ClaudeLedger,
     counts: &mut ClaudeRequestMoneyShadowCounts,
+    deadline: Instant,
 ) {
-    for result in store::take_results(support_dir, ledger) {
-        counts.writer_us += result.writer_us;
-        counts.jsonl_rows += result.jsonl.rows;
-        counts.jsonl_truncated += result.jsonl.truncated;
-        counts.jsonl_sealed += result.jsonl.sealed;
-        counts.jsonl_failed += result.jsonl.failed;
-        counts.jsonl_owed_written += result.jsonl.owed_written;
-        if !result.jsonl.published {
-            counts.family_memos_withheld += result.memos.len() as u64;
-            continue;
+    store::consume_results_until(support_dir, ledger, deadline, |ledger, acknowledgement| {
+        match acknowledgement {
+            store::Acknowledgement::Outcome(jsonl, writer_us) => {
+                counts.writer_us += writer_us;
+                counts.jsonl_rows += jsonl.rows;
+                counts.jsonl_truncated += jsonl.truncated;
+                counts.jsonl_sealed += jsonl.sealed;
+                counts.jsonl_failed += jsonl.failed;
+                counts.jsonl_owed_written += jsonl.owed_written;
+            }
+            store::Acknowledgement::Memo(memo, true) => apply_published_memo(ledger, memo, counts),
+            store::Acknowledgement::Memo(_, false) => counts.family_memos_withheld += 1,
         }
-        for memo in result.memos {
-            apply_published_memo(ledger, memo, counts);
-        }
-    }
+    });
 }
 
 fn apply_published_memo(

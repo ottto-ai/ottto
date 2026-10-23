@@ -55,7 +55,7 @@ use super::{
     ClaudeFamilyMemo, ClaudeFamilyPublication, JsonlBatch, JsonlOutcome, ShadowReservation,
 };
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -528,7 +528,8 @@ pub(crate) struct WriteJob {
 /// What the writer did with one batch.
 pub(crate) struct WriteResult {
     pub(crate) jsonl: JsonlOutcome,
-    pub(crate) memos: Vec<PendingMemo>,
+    pub(crate) memos: VecDeque<PendingMemo>,
+    ack_started: bool,
     failed_shards: Vec<usize>,
     /// The meta shard was not written (with its debt flag).
     meta_unwritten: Option<bool>,
@@ -601,7 +602,7 @@ pub(super) fn wake_writer() {
     let _ = submit(Job::Wake);
 }
 
-static RESULTS: Mutex<BTreeMap<PathBuf, Vec<WriteResult>>> = Mutex::new(BTreeMap::new());
+static RESULTS: Mutex<BTreeMap<PathBuf, VecDeque<WriteResult>>> = Mutex::new(BTreeMap::new());
 static WRITER: OnceLock<Option<Mutex<SyncSender<Job>>>> = OnceLock::new();
 
 fn writer() -> Option<&'static Mutex<SyncSender<Job>>> {
@@ -779,12 +780,33 @@ pub(crate) fn submit_unledgered(job: WriteJob) -> Result<(), Box<WriteJob>> {
     }
 }
 
-/// The writer's results for `support_dir` since the last call, applied to
-/// its ledger: unwritten shards are dirty again; memos come back to the
-/// caller, which moves the published ones.
-pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec<WriteResult> {
+/// Results retain FIFO custody until each memo is acknowledged. In-flight
+/// suppression is released only for the memo actually returned to the caller.
+pub(crate) enum Acknowledgement {
+    Outcome(JsonlOutcome, u64),
+    Memo(PendingMemo, bool),
+}
+
+pub(crate) fn consume_results_until(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    deadline: Instant,
+    apply: impl FnMut(&mut ClaudeLedger, Acknowledgement),
+) {
+    consume_results_while(support_dir, ledger, || Instant::now() < deadline, apply);
+}
+
+fn consume_results_while(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    mut within_deadline: impl FnMut() -> bool,
+    mut apply: impl FnMut(&mut ClaudeLedger, Acknowledgement),
+) {
+    if !within_deadline() {
+        return;
+    }
     if let Some(credit) = CREDITS
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|mut credits| credits.remove(support_dir))
     {
@@ -795,22 +817,46 @@ pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec
             ledger.save_credit = credit.bytes;
         }
     }
-    let results = RESULTS
-        .lock()
-        .ok()
-        .and_then(|mut results| results.remove(support_dir))
-        .unwrap_or_default();
-    for result in &results {
-        ledger.restore(&result.failed_shards, result.meta_unwritten);
-        ledger.settle_in_flight(
-            result
-                .memos
-                .iter()
-                .filter(|memo| memo.row)
-                .map(|memo| memo.key.as_str()),
-        );
+    let Ok(mut all_results) = RESULTS.try_lock() else {
+        return;
+    };
+    let Some(results) = all_results.get_mut(support_dir) else {
+        return;
+    };
+    while within_deadline() {
+        let Some(result) = results.front_mut() else {
+            break;
+        };
+        if !result.ack_started {
+            // At most SHARDS (257), independent of the number of memos.
+            ledger.restore(&result.failed_shards, result.meta_unwritten);
+            result.ack_started = true;
+            apply(
+                ledger,
+                Acknowledgement::Outcome(result.jsonl, result.writer_us),
+            );
+        }
+        if !within_deadline() {
+            break;
+        }
+        if let Some(memo) = result.memos.pop_front() {
+            if memo.row {
+                ledger.settle_in_flight(std::iter::once(memo.key.as_str()));
+            }
+            apply(ledger, Acknowledgement::Memo(memo, result.jsonl.published));
+        } else {
+            let _ = results.pop_front();
+        }
     }
-    results
+    if results.is_empty() {
+        all_results.remove(support_dir);
+    }
+}
+
+/// Store-only fixtures discard publications but settle normal save outcomes.
+#[cfg(test)]
+fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) {
+    consume_results_while(support_dir, ledger, || true, |_, _| {});
 }
 
 fn run_writer(receiver: Receiver<Job>) {
@@ -860,7 +906,7 @@ fn run_writer(receiver: Receiver<Job>) {
                 let (support_dir, result) = write(*job, failed);
                 QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
                 if let (false, Ok(mut results)) = (lost_ack, RESULTS.lock()) {
-                    results.entry(support_dir).or_default().push(result);
+                    results.entry(support_dir).or_default().push_back(result);
                 }
             }
             #[cfg(test)]
@@ -979,7 +1025,8 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
     });
     let result = WriteResult {
         jsonl,
-        memos,
+        memos: memos.into(),
+        ack_started: false,
         failed_shards,
         meta_unwritten,
         writer_us: started.elapsed().as_micros() as u64,
@@ -1248,7 +1295,7 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
     }
     // Persist first initialization and each new maximum day BEFORE any
     // fresh counter/ticket/write. A crash here can only lose today's credit.
-    if (!matches!(witness, ReadCounter::Valid((seen, _)) if seen == high_day))
+    if !matches!(witness, ReadCounter::Valid((seen, _)) if seen == high_day)
         && !persist(QUOTA_WITNESS_FILE, (high_day, 0))
     {
         return (exhausted, exhausted);
@@ -1646,6 +1693,110 @@ mod bounded_save_tests {
         println!("MONEY_P1B_IO reserved_bytes={charged} save_cap={SAVE_BYTES_PER_PAGE} daily_cap={SAVE_DAILY_BYTES} restart_refund=0");
         std::fs::remove_dir_all(dir).unwrap();
     }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn acknowledgement_deadline_keeps_fifo_custody_and_applies_each_memo_once() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-ack-deadline");
+        let keys = (0..4096)
+            .map(|at| super::super::family_key(&format!("ack-{at}")))
+            .collect::<Vec<_>>();
+        let mut ledger = ClaudeLedger::new_for_test();
+        let old_basis = ClaudeFamilyMemo {
+            removed_tokens: 42,
+            ..Default::default()
+        };
+        ledger.insert(
+            keys[3].clone(),
+            ClaudeRequestCensusRecord::family_record([7; 32], 1, old_basis),
+        );
+        let memos = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| PendingMemo {
+                key: key.clone(),
+                basis: None,
+                observed_unix: 2,
+                published: ClaudeFamilyPublication {
+                    utc_day: 20261024,
+                    digest: at as u64,
+                    epoch: 8,
+                    attempted: 2,
+                },
+                row: true,
+                deferred: None,
+            })
+            .collect();
+        ledger.note_in_flight(keys.iter().map(String::as_str));
+        RESULTS.lock().unwrap().insert(
+            scratch.to_path_buf(),
+            VecDeque::from([WriteResult {
+                jsonl: JsonlOutcome {
+                    published: true,
+                    rows: 4097,
+                    ..Default::default()
+                },
+                memos,
+                ack_started: false,
+                failed_shards: Vec::new(),
+                meta_unwritten: None,
+                writer_us: 1,
+            }]),
+        );
+        let expired = Instant::now();
+        consume_results_until(&scratch, &mut ledger, expired, |_, _| {
+            panic!("expired ack must not enter")
+        });
+        assert!(expired.elapsed() <= super::super::PAGE_MAX_ELAPSED + Duration::from_millis(25));
+        assert!(keys.iter().all(|key| ledger.in_flight(key)));
+        let applied = std::cell::Cell::new(0_usize);
+        let mut outcomes = 0;
+        let mut counts = super::super::ClaudeRequestMoneyShadowCounts::default();
+        let mut apply = |ledger: &mut ClaudeLedger, event| match event {
+            Acknowledgement::Outcome(jsonl, _) => {
+                assert!(jsonl.published);
+                outcomes += 1;
+            }
+            Acknowledgement::Memo(memo, published) => {
+                assert!(published);
+                assert_eq!(
+                    memo.key,
+                    keys[applied.get()],
+                    "acknowledgements remain FIFO"
+                );
+                super::super::apply_published_memo(ledger, memo, &mut counts);
+                applied.set(applied.get() + 1);
+            }
+        };
+        consume_results_while(&scratch, &mut ledger, || applied.get() < 3, &mut apply);
+        assert_eq!(applied.get(), 3);
+        assert!(keys[..3].iter().all(|key| !ledger.in_flight(key)));
+        assert!(keys[3..].iter().all(|key| ledger.in_flight(key)));
+        let (_, basis) = ledger.get(&keys[3]).unwrap().family_memo().unwrap();
+        assert_eq!(basis.removed_tokens, 42);
+        assert!(
+            basis.published.is_none(),
+            "pending ack cannot advance its old basis/publication"
+        );
+        consume_results_until(
+            &scratch,
+            &mut ledger,
+            Instant::now() + Duration::from_secs(1),
+            &mut apply,
+        );
+        assert_eq!(applied.get(), keys.len());
+        assert!(keys.iter().all(|key| !ledger.in_flight(key)));
+        assert_eq!(
+            outcomes, 1,
+            "resuming a result must not duplicate its outcome counts"
+        );
+        assert_eq!(counts.family_memos_withheld, 0);
+        let (_, basis) = ledger.get(&keys[3]).unwrap().family_memo().unwrap();
+        assert_eq!(basis.removed_tokens, 42);
+        assert_eq!(basis.published.unwrap().digest, 3);
+        assert!(!RESULTS.lock().unwrap().contains_key(&*scratch));
+        println!("MONEY_P1B_ACK memos=4096 expired_applied=0 interrupted_applied=3 resumed_applied={} outcomes={outcomes} pending=0", applied.get());
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn physical_writer_charges_midnight_delays_and_blocks_clock_rollback() {

@@ -72,17 +72,58 @@ struct Plan {
 }
 static PLANS: Mutex<BTreeMap<PathBuf, Plan>> = Mutex::new(BTreeMap::new());
 
-pub(super) fn plan_next_page<'a>(scope: &Path, keys: impl Iterator<Item = &'a str>) {
-    forget_plan(scope);
-    let mut funds = Funds::default();
-    let mut selected = BTreeMap::new();
-    for (at, key) in keys.enumerate() {
-        if !funds.spend(key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>()) {
-            return;
-        }
-        selected.insert(key.to_owned(), at < NEXT_PAGE_FAMILIES);
+pub(super) fn plan_next_page<'a>(
+    scope: &Path,
+    keys: impl Iterator<Item = (&'a str, u64)>,
+    deadline: Instant,
+) -> bool {
+    plan_next_page_while(scope, keys, || Instant::now() < deadline)
+}
+
+fn plan_next_page_while<'a>(
+    scope: &Path,
+    keys: impl Iterator<Item = (&'a str, u64)>,
+    mut within_deadline: impl FnMut() -> bool,
+) -> bool {
+    if !within_deadline() {
+        return false;
     }
-    if let Ok(mut plans) = PLANS.lock() {
+    let old = match PLANS.try_lock() {
+        Ok(mut plans) => plans.remove(scope),
+        Err(_) => return false,
+    };
+    drop(old);
+    let mut funds = Funds::default();
+    if !funds
+        .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, usize), &str)>()))
+    {
+        return false;
+    }
+    let mut selected = BTreeMap::new();
+    // Stable oldest-64 selection without an uninterruptible whole-page sort.
+    let mut oldest = BTreeMap::new();
+    for (at, (key, turn)) in keys.enumerate() {
+        if !within_deadline()
+            || !funds.spend(key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>())
+        {
+            return false;
+        }
+        selected.insert(key.to_owned(), false);
+        oldest.insert((turn, at), key);
+        if oldest.len() > NEXT_PAGE_FAMILIES {
+            let _ = oldest.pop_last();
+        }
+    }
+    for key in oldest.values() {
+        if !within_deadline() {
+            return false;
+        }
+        *selected.get_mut(*key).expect("admitted plan key") = true;
+    }
+    if !within_deadline() {
+        return false;
+    }
+    if let Ok(mut plans) = PLANS.try_lock() {
         plans.retain(|_, plan| plan.created.elapsed() < CAPTURE_TTL);
         plans.insert(
             scope.to_path_buf(),
@@ -92,6 +133,9 @@ pub(super) fn plan_next_page<'a>(scope: &Path, keys: impl Iterator<Item = &'a st
                 created: Instant::now(),
             },
         );
+        true
+    } else {
+        false
     }
 }
 
@@ -706,7 +750,13 @@ mod bounded_tests {
         let keys = (0..NEXT_PAGE_FAMILIES + 1)
             .map(|at| super::super::family_key(&format!("root-{at}")))
             .collect::<Vec<_>>();
-        plan_next_page(&support, keys.iter().map(String::as_str));
+        plan_next_page(
+            &support,
+            keys.iter()
+                .enumerate()
+                .map(|(at, key)| (key.as_str(), at as u64)),
+            Instant::now() + Duration::from_secs(1),
+        );
         assert!(ClaudeResponseCapture::begin(&scratch.join("root-0.jsonl")).is_some());
         assert!(
             ClaudeResponseCapture::begin(&scratch.join("root-0/subagents/agent-one.jsonl"))
@@ -721,12 +771,79 @@ mod bounded_tests {
         );
         // Rotate eligibility to the formerly skipped root, without parsing
         // files or changing a native candidate's ordering or identity.
-        plan_next_page(&support, keys.iter().rev().map(String::as_str));
+        plan_next_page(
+            &support,
+            keys.iter()
+                .rev()
+                .enumerate()
+                .map(|(at, key)| (key.as_str(), at as u64)),
+            Instant::now() + Duration::from_secs(1),
+        );
         assert!(ClaudeResponseCapture::begin(
             &scratch.join(format!("root-{NEXT_PAGE_FAMILIES}.jsonl"))
         )
         .is_some());
         super::super::disable_shadow_for_test(&support);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn capture_plan_stops_at_expiry_and_never_installs_a_partial_plan() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-plan-deadline");
+        let support = scratch.join("support");
+        let before = capture_reserved();
+        let keys = (0..4096)
+            .map(|at| super::super::family_key(&format!("root-{at}")))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let visited = std::cell::Cell::new(0_usize);
+        assert!(!plan_next_page(
+            &support,
+            keys.iter().map(|key| {
+                visited.set(visited.get() + 1);
+                (key.as_str(), 0)
+            }),
+            started
+        ));
+        // Iteration can fetch the next element before its deadline check,
+        // but no walk/sort of the remaining 4095 entries is allowed.
+        assert!(visited.get() <= 1);
+        assert!(started.elapsed() <= super::super::PAGE_MAX_ELAPSED + Duration::from_millis(25));
+        assert!(!PLANS.lock().unwrap().contains_key(&support));
+        assert_eq!(capture_reserved(), before);
+        let checks = std::cell::Cell::new(0);
+        assert!(!plan_next_page_while(
+            &support,
+            keys.iter().map(|key| (key.as_str(), 0)),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() <= 7
+            }
+        ));
+        assert!(!PLANS.lock().unwrap().contains_key(&support));
+        assert_eq!(
+            capture_reserved(),
+            before,
+            "interrupted plan refunds all admitted metadata"
+        );
+        assert!(plan_next_page(
+            &support,
+            keys.iter()
+                .enumerate()
+                .map(|(at, key)| (key.as_str(), at as u64)),
+            Instant::now() + Duration::from_secs(1)
+        ));
+        let plans = PLANS.lock().unwrap();
+        let plan = &plans[&support];
+        assert_eq!(
+            plan.keys.values().filter(|eligible| **eligible).count(),
+            NEXT_PAGE_FAMILIES
+        );
+        assert!(keys[..NEXT_PAGE_FAMILIES].iter().all(|key| plan.keys[key]));
+        drop(plans);
+        forget_plan(&support);
+        assert_eq!(capture_reserved(), before);
+        println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES}", visited.get(), checks.get());
     }
 
     #[test]
