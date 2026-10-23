@@ -28,12 +28,14 @@
 //! unchanged.
 
 mod aggregate;
+mod audit;
 mod checkpoint;
 mod claude;
 mod codex;
 mod decode;
 mod file;
 mod harvest;
+mod health;
 mod reader;
 mod scope;
 mod upload;
@@ -95,6 +97,11 @@ const REPAIR_BYTES_PER_DAY: u64 = 1024 * 1024 * 1024;
 /// A file modified this recently at the first run is "live at install" and
 /// is read from its start once, within the repair budget.
 const LIVE_AT_INSTALL: Duration = Duration::from_secs(24 * 60 * 60);
+/// Audit re-reads of files already read whole, per day (see `audit`).
+const AUDIT_BYTES_PER_DAY: u64 = 100 * 1000 * 1000;
+/// Audited files per day at most, so many small files never turn the audit
+/// into a scan of every scope.
+const AUDIT_FILES_PER_DAY: usize = 32;
 
 // Retention.
 /// Daily rows kept (the server's capture-window cap).

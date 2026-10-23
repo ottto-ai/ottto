@@ -38,7 +38,16 @@ use std::path::{Path, PathBuf};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 pub(super) trait Uploader {
-    fn upload(&mut self, request: &Value) -> Result<()>;
+    fn upload(&mut self, request: &Value) -> Result<UploadReceipt>;
+}
+
+/// What one accepted upload cost and changed, for the run's metrics.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(super) struct UploadReceipt {
+    /// Request body bytes sent.
+    pub(super) payload_bytes: u64,
+    /// The server's `daily_rollup_rows_written`, when it reported one.
+    pub(super) rows_written: Option<u64>,
 }
 
 /// Where and how a source uploads in this run.
@@ -74,6 +83,8 @@ pub(super) struct UploadResult {
     pub(super) dropped_non_v2: u64,
     /// Rows or labels the server's text rules would refuse.
     pub(super) dropped_unsafe: u64,
+    /// Set when the upload was accepted.
+    pub(super) receipt: Option<UploadReceipt>,
 }
 
 impl UploadResult {
@@ -82,6 +93,7 @@ impl UploadResult {
             outcome,
             dropped_non_v2: 0,
             dropped_unsafe: 0,
+            receipt: None,
         }
     }
 }
@@ -147,15 +159,17 @@ pub(super) fn upload_scope(
         outcome: UploadOutcome::Failed,
         dropped_non_v2: dropped.non_v2,
         dropped_unsafe: dropped.unsafe_text,
+        receipt: None,
     };
     let Ok(payload) = serde_json::to_value(&request) else {
         return failed;
     };
-    if target.uploader.upload(&payload).is_err() {
+    let Ok(receipt) = target.uploader.upload(&payload) else {
         return failed;
-    }
+    };
     let uploaded = UploadResult {
         outcome: UploadOutcome::Uploaded,
+        receipt: Some(receipt),
         ..failed
     };
     let ack = UploadAck {

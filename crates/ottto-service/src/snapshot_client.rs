@@ -1646,6 +1646,7 @@ impl SnapshotApiClient {
             device_secret,
             source,
             SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
         )
     }
 
@@ -1657,7 +1658,34 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<String> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        self.issue_relay_token_with_agent(&agent, device, device_secret, source, request_timeout)
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
     }
 
     fn issue_relay_token_with_agent(
@@ -1667,6 +1695,7 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
         timeout: Duration,
+        response_cap: Option<usize>,
     ) -> Result<String> {
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
@@ -1696,10 +1725,13 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?;
-        let response: RelayTokenResponse =
-            require_cloud_session_success(response, "relay token request", "relay_token")?
-                .into_json()
-                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
     }
 
@@ -2590,6 +2622,69 @@ impl SnapshotApiClient {
                 Err(anyhow!("backend rejected context composition: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The composition upload from its serialized body, so the bytes the
+    /// run counts are the bytes sent (the same body `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context composition: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        self.post_context_composition_run_health_with_timeout(
+            relay_token,
+            body,
+            Duration::from_secs(10),
+        )
+    }
+
+    pub(crate) fn post_context_composition_run_health_with_timeout(
+        &self,
+        relay_token: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        match agent
+            .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+        {
+            Ok(response) => bounded_response_json(response, 64 * 1024)
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
         }
     }
 
