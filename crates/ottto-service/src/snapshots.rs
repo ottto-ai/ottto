@@ -29,10 +29,10 @@ pub(crate) mod cache_observations;
 #[cfg(test)]
 mod cache_policy_tests;
 mod claude_context_file_birth;
-#[cfg(test)]
-pub(crate) use claude_context_file_birth::ClaudeFileBirthVerdict;
 pub use claude_context_file_birth::{ClaudeContextBasisCounts, ClaudeContextFileBirthCounts};
-pub(crate) use claude_context_file_birth::{ClaudeFileBirth, ClaudeVetoApiRows};
+pub(crate) use claude_context_file_birth::{
+    ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
+};
 mod claude_reemission_exclusions;
 pub(crate) mod claude_request_accounts;
 pub(crate) mod claude_request_census;
