@@ -1253,3 +1253,64 @@ fn p2a_empty_files_settle_locally_once_without_stamping_stripped_or_prior_bodies
     );
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn p2a_index_hold_retry_obeys_cadence_allowance_and_code_changes() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
+        let mut index = ScanIndex::default();
+        index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+        record.witness.collector_version = "older-collector".into();
+        record.upload_body_witness = Some("same-body".into());
+        record.hold = Some(SnapshotHoldRetry {
+            kind,
+            stage: 0,
+            first_held_unix: now.saturating_sub(31 * 86400),
+            day_start_unix: now,
+            retries_in_day: 0,
+        });
+        record.retry_after_unix_seconds = now + 3600;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("held".into(), record.clone());
+        assert!(
+            !index.quarantine_requires_retry("held"),
+            "code changes cannot bypass future hold cadence"
+        );
+        assert!(!index.quarantine_requires_retry_body("held", "same-body"));
+        assert!(
+            index.quarantine_requires_retry_body("held", "changed-body"),
+            "changed bodies still escape exact-body holds"
+        );
+        record.retry_after_unix_seconds = now.saturating_sub(1);
+        record.hold.as_mut().unwrap().retries_in_day = 6;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("held".into(), record.clone());
+        assert!(
+            !index.quarantine_requires_retry("held"),
+            "exhausted allowance cannot reparse every cycle"
+        );
+        record.hold.as_mut().unwrap().day_start_unix = now.saturating_sub(86400);
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("held".into(), record.clone());
+        assert!(
+            index.quarantine_requires_retry("held"),
+            "next-day due retries remain selectable"
+        );
+        record.hold = None;
+        record.retry_after_unix_seconds = now + 3600;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("held".into(), record);
+        assert!(
+            index.quarantine_requires_retry("held"),
+            "ordinary code-witness retries retain their existing bypass"
+        );
+    }
+}

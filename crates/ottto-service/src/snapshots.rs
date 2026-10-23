@@ -37723,7 +37723,13 @@ impl ScanIndex {
             .zip(self.active_quarantine_witness.as_ref())
             .is_some_and(|(persisted, active)| {
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
+                    && if let Some(hold) = &persisted.hold {
+                        // Match upload-progress leasing: a code change does not
+                        // bypass a server hold's cadence or daily allowance.
+                        persisted.retry_after_unix_seconds <= now && hold.allowance(now)
+                    } else {
+                        &persisted.witness != active || persisted.retry_after_unix_seconds <= now
+                    }
             })
     }
 
