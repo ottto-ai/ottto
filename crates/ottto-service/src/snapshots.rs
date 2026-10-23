@@ -36869,9 +36869,10 @@ impl ScanIndex {
                 break;
             }
             visited += 1;
-            let digest = claude_retired_family_digest(root_session_id);
-            if !tombstones.contains_key(&digest) {
-                tombstones.insert(digest, tombstoned_at);
+            if let std::collections::btree_map::Entry::Vacant(slot) =
+                tombstones.entry(claude_retired_family_digest(root_session_id))
+            {
+                slot.insert(tombstoned_at);
                 inserted += 1;
             }
         }
