@@ -1583,6 +1583,7 @@ mod bounded_save_tests {
             } else {
                 std::fs::write(path, b"broken").unwrap();
             }
+            let physical_used = load_counter(&scratch.join(LEDGER_DIR), WRITE_BUDGET_FILE).1;
             let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
             assert_eq!(loaded.get(key), Some(&record));
             assert!(!loaded.load_damaged);
@@ -1602,7 +1603,7 @@ mod bounded_save_tests {
             assert_eq!(
                 loaded.save_bytes_today,
                 if missing {
-                    SAVE_BYTES_PER_PAGE as u64
+                    physical_used + SAVE_BYTES_PER_PAGE as u64
                 } else {
                     SAVE_DAILY_BYTES as u64
                 }
