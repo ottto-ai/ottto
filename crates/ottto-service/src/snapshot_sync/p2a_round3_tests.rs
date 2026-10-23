@@ -1686,6 +1686,14 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
         // The scanner's (non-canonical) index key; see the ACK/CAS control.
         let key = path.to_string_lossy().into_owned();
         let revision = format!("{:x}", Sha256::digest(text.as_bytes()));
+        // A retained birth carries only onto the same physical object (its
+        // device and inode); any other identity is a replacement whose birth
+        // is this read's. Bind the restored birth to B's actual object.
+        let (device, inode) = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::metadata(&path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
         let mut saved = control.saved();
         saved.claude_request_census_mut_for_test().insert_for_test(
             &key,
@@ -1697,8 +1705,8 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
             )
             .with_birth_for_test(Some(ClaudeRequestBirth {
                 unix_seconds: 1_700_000_000,
-                device: 1,
-                inode: 1,
+                device,
+                inode,
             })),
         );
         saved.save(&control.index_path).unwrap();
