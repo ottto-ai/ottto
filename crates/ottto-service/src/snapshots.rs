@@ -44,6 +44,10 @@ pub(crate) use tests::claude_request_account_mixed_fixture;
 #[cfg(test)]
 pub(crate) use tests::output as claude_request_account_output;
 mod codex_compressed_input;
+mod compaction_events;
+pub(crate) use compaction_events::bounded_compaction_events;
+use compaction_events::CodexCompactionSizes;
+pub use compaction_events::SnapshotCompactionEvent;
 #[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
@@ -59,8 +63,6 @@ mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
 pub(crate) use session_start::OpeningFileCandidate;
-// For the composition reader, which is wired separately.
-#[allow(unused_imports)]
 pub(crate) use session_start::{session_start_verdict, StartVerdict};
 pub use session_start::{SnapshotOpeningFile, SnapshotSessionStart};
 mod disappearance_diagnostics;
@@ -68,6 +70,9 @@ mod disappearance_diagnostics;
 mod launch_demand_tests;
 #[cfg(test)]
 mod launcher_recognition_tests;
+mod local_context_points;
+pub(crate) use local_context_points::LocalContextPoint;
+use local_context_points::LocalContextPoints;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
@@ -1531,6 +1536,16 @@ pub struct SnapshotItem {
     pub compaction_count: Option<u64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub compaction_timestamps: Vec<String>,
+    /// Context sizes around each compaction, one per `compaction_timestamps`
+    /// entry with a byte-identical `at`. Additive evidence: deliberately
+    /// outside the `context_posture` component, the content hash and the body
+    /// witness. Codex only for now; Claude Code leaves it empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub compaction_events: Vec<SnapshotCompactionEvent>,
+    /// Local-only context points for the Mac app's Sessions graph (Codex, last
+    /// activity within 75 minutes). Never serialized or uploaded.
+    #[serde(skip)]
+    pub(crate) local_context_points: Vec<LocalContextPoint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compaction_total_pre_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -10271,6 +10286,11 @@ fn validate_snapshot_item(index: usize, item: &SnapshotItem) -> Result<(), Strin
             "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_timestamps"
         ));
     }
+    if item.compaction_events.len() > MAX_COMPACTION_TIMESTAMPS {
+        return Err(format!(
+            "snapshot[{index}] has more than {MAX_COMPACTION_TIMESTAMPS} compaction_events"
+        ));
+    }
     if let Some(curve) = item.context_curve.as_ref() {
         validate_context_curve(index, curve)?;
         if item.provenance.collector == "codex_state_sqlite"
@@ -12400,6 +12420,10 @@ struct SnapshotAccumulator {
     last_turn_context_tokens: Option<u64>,
     compaction_count: u64,
     compaction_timestamps: crate::owned_heap::OwnedVec<String>,
+    // Codex only: sizes index-aligned with `compaction_timestamps`.
+    codex_compaction_sizes: CodexCompactionSizes,
+    // Codex only: bounded points for the local Sessions graph.
+    local_context_points: LocalContextPoints,
     claude_compaction_observations: crate::owned_heap::OwnedVec<ClaudeCompactionObservation>,
     // Pair key of the latest boundary still waiting for its legacy summary and
     // the uuid at the tip of its `attachment` chain. One slot suffices: the
@@ -12542,6 +12566,8 @@ impl SnapshotAccumulator {
             last_turn_context_tokens: None,
             compaction_count: 0,
             compaction_timestamps: crate::owned_heap::OwnedVec::new(),
+            codex_compaction_sizes: CodexCompactionSizes::default(),
+            local_context_points: LocalContextPoints::default(),
             claude_compaction_observations: crate::owned_heap::OwnedVec::new(),
             claude_compaction_link_tip: None,
             session_start: Box::default(),
@@ -14535,16 +14561,32 @@ impl SnapshotAccumulator {
                 row.account_identifier_hash = self.account_identifier_hash.clone();
             }
         }
-        let (compaction_count, compaction_timestamps, compaction_metrics) =
+        // Claude Code events are built by the ownership fold, never here.
+        let (compaction_count, compaction_timestamps, compaction_events, compaction_metrics) =
             if self.source == SnapshotSource::ClaudeCode {
-                claude_compaction_summary(&self.claude_compaction_observations)
+                let (count, timestamps, metrics) =
+                    claude_compaction_summary(&self.claude_compaction_observations);
+                (count, timestamps, Vec::new(), metrics)
             } else {
+                let timestamps = self.compaction_timestamps.into_vec();
+                let events = if self.source == SnapshotSource::Codex {
+                    self.codex_compaction_sizes.into_events()
+                } else {
+                    Vec::new()
+                };
                 (
                     self.compaction_count,
-                    bounded_compaction_timestamps(self.compaction_timestamps.into_vec()),
+                    bounded_compaction_timestamps(timestamps),
+                    events,
                     CompactionMetrics::default(),
                 )
             };
+        let local_context_points = if self.source == SnapshotSource::Codex {
+            self.local_context_points
+                .into_recent(self.last_activity_at.as_deref(), collected_at)
+        } else {
+            Vec::new()
+        };
         let context_curve = if !self.context_curve_enabled {
             None
         } else {
@@ -14668,6 +14710,12 @@ impl SnapshotAccumulator {
             } else {
                 Vec::new()
             },
+            compaction_events: if self.source.derives_context_posture() {
+                compaction_events
+            } else {
+                Vec::new()
+            },
+            local_context_points,
             compaction_total_pre_tokens: if self.source.derives_context_posture()
                 && compaction_metrics.metrics_count > 0
             {
@@ -17059,8 +17107,9 @@ impl OwnedSourceScan {
                 else {
                     continue;
                 };
-                let Some(mut candidate) = candidate_from_traversal_path(
+                let Some(mut candidate) = candidate_from_traversal_path_at(
                     source,
+                    disappearance_diagnostics::Site::CandidateForcedIndex,
                     ScanTraversalPath {
                         scan_root,
                         path,
@@ -19675,11 +19724,7 @@ impl OwnedSourceScan {
                         body_witness_adoption_held_no_list,
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
                         index.claude_reemission_exclusions.state().as_str(),
-                        if claude_reemission_stop_latched() {
-                            "evidence_bound_withheld"
-                        } else {
-                            "none"
-                        },
+                        claude_reemission_stop_reason(),
                         claude_reemission_stop_withheld_folds()
                     );
                 }
@@ -19696,7 +19741,27 @@ impl OwnedSourceScan {
                         .get(index_key)
                         .is_some_and(ScanIndexEntry::codex_history_is_protected)
                     {
-                        index.remove_file_entry(index_key);
+                        // A Claude member that vanished beneath its present
+                        // parent also drops its unverified audit debt (SOURCE
+                        // N2); every other removal keeps that debt. Both
+                        // retire its request-census record (SOURCE N1).
+                        let vanished = census.claude_vanished_index_keys.contains(index_key);
+                        let census_record =
+                            vanished && index.claude_request_census.get(index_key).is_some();
+                        if vanished && index.retire_vanished_claude_audit_debt_entry(index_key) {
+                            disappearance_diagnostics::vanished(
+                                source,
+                                disappearance_diagnostics::Vanished::AuditDebtDropped,
+                            );
+                        } else {
+                            index.remove_file_entry(index_key);
+                        }
+                        if census_record && index.claude_request_census.get(index_key).is_none() {
+                            disappearance_diagnostics::vanished(
+                                source,
+                                disappearance_diagnostics::Vanished::RequestCensusRemoved,
+                            );
+                        }
                     }
                 }
                 let traversal_discovery_done =
@@ -21424,6 +21489,8 @@ fn codex_state_only_snapshot(
         last_turn_context_tokens: None,
         compaction_count: None,
         compaction_timestamps: Vec::new(),
+        compaction_events: Vec::new(),
+        local_context_points: Vec::new(),
         compaction_total_pre_tokens: None,
         compaction_total_post_tokens: None,
         compaction_total_cumulative_dropped_tokens: None,
@@ -24380,6 +24447,11 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
                 });
         }
         if let Some(timestamp) = timestamp.clone() {
+            // `before` is the session's current "last" value: the last owned
+            // non-zero request before this marker, in the posture measure.
+            accumulator
+                .codex_compaction_sizes
+                .note_marker(&timestamp, accumulator.last_turn_context_tokens);
             accumulator.compaction_timestamps.push(timestamp);
         }
     }
@@ -24410,6 +24482,9 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
             accumulator.peak_context_fill_tokens =
                 accumulator.peak_context_fill_tokens.max(context_tokens);
             accumulator.last_turn_context_tokens = Some(context_tokens);
+            accumulator
+                .local_context_points
+                .push(timestamp.as_deref(), context_tokens);
         }
     }
     // Usage-counting V2 (configured parsers only): version decision on the
@@ -24501,6 +24576,16 @@ fn apply_codex_owned_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
         }
         if let (Some(_), Some(last_usage)) = (admitted.as_ref(), last_usage.as_ref()) {
             accumulator.session_start.note_codex_request(last_usage);
+        }
+        // A compaction's "after" is the first COUNTED request after it: exact
+        // duplicates and re-emissions are not admitted. Same measure as
+        // `before` (the posture read of `last_token_usage`).
+        if admitted.is_some() {
+            if let Some(context_tokens) = codex_last_turn_input_context(value) {
+                accumulator
+                    .codex_compaction_sizes
+                    .note_counted_request(context_tokens);
+            }
         }
         if admitted.is_some() && accumulator.context_curve_enabled {
             match (last_usage, usage_event_identity) {
@@ -26402,6 +26487,10 @@ struct ScanCensus {
     terminal_dropped_usage_record_count: u64,
     observed_index_keys: BTreeSet<String>,
     removed_index_keys: BTreeSet<String>,
+    /// The subset of `removed_index_keys` that are Claude census members
+    /// found absent beneath a still-present parent (N). Only these may drop
+    /// their unverified audit debt with their entry at the page merge.
+    claude_vanished_index_keys: BTreeSet<String>,
     /// Count-only parse-selection reasons for Claude candidates on this page.
     claude_parse_reasons: [usize; CANDIDATE_PARSE_REASON_COUNT],
     /// Local-only V2 counting receipts of this scan's finished parses. Boxed
@@ -29041,10 +29130,10 @@ fn advance_bounded_directory_traversal_with_budget(
         let metadata = match fs::symlink_metadata(&directory.path) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                disappearance_diagnostics::increment(
+                disappearance_diagnostics::not_found(
                     &mut traversal.counts.disappeared_file_count,
                     source,
-                    disappearance_diagnostics::Cause::NotFound,
+                    disappearance_diagnostics::Site::WalkDirectory,
                 );
                 continue;
             }
@@ -29143,10 +29232,10 @@ fn advance_bounded_directory_traversal_with_budget(
             let metadata = match entry.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    disappearance_diagnostics::increment(
+                    disappearance_diagnostics::not_found(
                         &mut traversal.counts.disappeared_file_count,
                         source,
-                        disappearance_diagnostics::Cause::NotFound,
+                        disappearance_diagnostics::Site::WalkEntry,
                     );
                     continue;
                 }
@@ -29198,8 +29287,41 @@ fn advance_bounded_directory_traversal_with_budget(
     }
 }
 
+/// A Claude transcript that is NotFound while its parent is still a real
+/// directory (not a symlink) was deleted or renamed: no retry can recover it,
+/// so the census settles it as a removal, the same as a watcher remove hint.
+/// A missing, renamed or unmounted parent is not evidence of removal and keeps
+/// the NotFound as loss.
+fn claude_absence_is_removal(source: SnapshotSource, path: &Path) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && path
+            .parent()
+            .and_then(|parent| fs::symlink_metadata(parent).ok())
+            .is_some_and(|parent| parent.is_dir() && !parent.file_type().is_symlink())
+}
+
 fn candidate_from_traversal_path(
     source: SnapshotSource,
+    pending: ScanTraversalPath,
+    census: &mut ScanCensus,
+    census_unix_seconds: Option<u64>,
+    backfill_window_days: u64,
+    files: &BTreeMap<String, ScanIndexEntry>,
+) -> Option<CandidateFile> {
+    candidate_from_traversal_path_at(
+        source,
+        disappearance_diagnostics::Site::CandidateWalk,
+        pending,
+        census,
+        census_unix_seconds,
+        backfill_window_days,
+        files,
+    )
+}
+
+fn candidate_from_traversal_path_at(
+    source: SnapshotSource,
+    site: disappearance_diagnostics::Site,
     pending: ScanTraversalPath,
     census: &mut ScanCensus,
     census_unix_seconds: Option<u64>,
@@ -29218,11 +29340,20 @@ fn candidate_from_traversal_path(
                     .removed_index_keys
                     .insert(local_index_key(&pending.path));
             } else if pending.census_member {
-                disappearance_diagnostics::increment(
-                    &mut census.disappeared_file_count,
-                    source,
-                    disappearance_diagnostics::Cause::NotFound,
-                );
+                if claude_absence_is_removal(source, &pending.path) {
+                    // The same exact retirement as a remove hint, whichever
+                    // order the hint and the queued member arrived in.
+                    disappearance_diagnostics::not_found_removal(source, site);
+                    let index_key = local_index_key(&pending.path);
+                    census.claude_vanished_index_keys.insert(index_key.clone());
+                    census.removed_index_keys.insert(index_key);
+                } else {
+                    disappearance_diagnostics::not_found(
+                        &mut census.disappeared_file_count,
+                        source,
+                        site,
+                    );
+                }
             }
             return None;
         }
@@ -29612,11 +29743,24 @@ fn open_and_identify_scan_candidate(
     let opened_file = match open_candidate_file(source, &mut candidate) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            disappearance_diagnostics::increment(
-                &mut census.disappeared_file_count,
-                source,
-                disappearance_diagnostics::Cause::NotFound,
-            );
+            if claude_absence_is_removal(source, &candidate.path) {
+                // Removed after its candidate stat. Drop this page's
+                // observation too, so the page merge retires the key.
+                disappearance_diagnostics::not_found_removal(
+                    source,
+                    disappearance_diagnostics::Site::Open,
+                );
+                let index_key = local_index_key(&candidate.path);
+                census.observed_index_keys.remove(&index_key);
+                census.claude_vanished_index_keys.insert(index_key.clone());
+                census.removed_index_keys.insert(index_key);
+            } else {
+                disappearance_diagnostics::not_found(
+                    &mut census.disappeared_file_count,
+                    source,
+                    disappearance_diagnostics::Site::Open,
+                );
+            }
             return None;
         }
         Err(error)
@@ -29847,7 +29991,7 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
     value
 }
 
-// SOURCE Amendments 7 and 10: the stop latch of the one-time Claude re-read.
+// SOURCE Amendments 7, 10 and 11: the stop latch of the one-time Claude re-read.
 // The first Claude fold whose counts report `resource_withheld()` (a family
 // over its evidence bound, or a full remembered-veto table) latches the stop:
 // Claude adoption then takes no adoption-only file (budget 0, reason
@@ -29855,9 +29999,34 @@ fn with_body_witness_adoption_byte_budget<T>(budget: u64, run: impl FnOnce() -> 
 // does not clear it; a restart is the human reset. In memory only, process-wide
 // across Claude destinations. One local alarm when it sets, at most one
 // reminder an hour while it holds.
+// An empty generation-0 index loaded while the exclusion seen-marker exists
+// also latches it, including a quarantined index or a new pairing destination.
+#[derive(Debug, Clone, Copy)]
+enum ClaudeReemissionStopCause {
+    EvidenceBound,
+    IndexRebuild,
+}
+
+impl ClaudeReemissionStopCause {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound",
+            Self::IndexRebuild => "index_rebuild",
+        }
+    }
+
+    fn reason(self) -> &'static str {
+        match self {
+            Self::EvidenceBound => "evidence_bound_withheld",
+            Self::IndexRebuild => "index_rebuild_withheld",
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ClaudeReemissionStop {
     latched: bool,
+    cause: ClaudeReemissionStopCause,
     /// Folds in this process that withheld for a resource limit.
     withheld_folds: u64,
     last_alarm: Option<std::time::Instant>,
@@ -29867,6 +30036,7 @@ impl ClaudeReemissionStop {
     const fn new() -> Self {
         Self {
             latched: false,
+            cause: ClaudeReemissionStopCause::EvidenceBound,
             withheld_folds: 0,
             last_alarm: None,
         }
@@ -29880,6 +30050,7 @@ const CLAUDE_REEMISSION_STOP_MAX_ROOT_REFS: usize = 16;
 
 #[derive(Serialize)]
 struct ClaudeReemissionStopAlarm {
+    cause: &'static str,
     withheld_evidence_bound_session_count: usize,
     remembered_veto_overflowed: bool,
     withheld_folds: u64,
@@ -29926,6 +30097,22 @@ fn note_claude_reemission_stop_at(
     over_bound_roots: &BTreeSet<String>,
     now: std::time::Instant,
 ) {
+    note_claude_reemission_stop_with_cause_at(
+        counts,
+        over_bound_roots,
+        counts
+            .resource_withheld()
+            .then_some(ClaudeReemissionStopCause::EvidenceBound),
+        now,
+    );
+}
+
+fn note_claude_reemission_stop_with_cause_at(
+    counts: &ClaudeContextFileBirthCounts,
+    over_bound_roots: &BTreeSet<String>,
+    cause: Option<ClaudeReemissionStopCause>,
+    now: std::time::Instant,
+) {
     let withheld = counts.resource_withheld();
     let alarm = with_claude_reemission_stop(|stop| {
         if withheld {
@@ -29942,21 +30129,23 @@ fn note_claude_reemission_stop_at(
                 return None;
             }
             true
-        } else if withheld {
+        } else if let Some(cause) = cause {
             stop.latched = true;
+            stop.cause = cause;
             false
         } else {
             return None;
         };
         stop.last_alarm = Some(now);
-        Some((reminder, stop.withheld_folds))
+        Some((reminder, stop.withheld_folds, stop.cause))
     });
-    let Some((reminder, withheld_folds)) = alarm else {
+    let Some((reminder, withheld_folds, cause)) = alarm else {
         return;
     };
     crate::local_resource_diagnostics::claude_reemission_stop_latched(
         reminder,
         &ClaudeReemissionStopAlarm {
+            cause: cause.as_str(),
             withheld_evidence_bound_session_count: counts
                 .total
                 .withheld_evidence_bound_session_count,
@@ -29974,6 +30163,16 @@ fn note_claude_reemission_stop_at(
 
 fn claude_reemission_stop_latched() -> bool {
     with_claude_reemission_stop(|stop| stop.latched)
+}
+
+fn claude_reemission_stop_reason() -> &'static str {
+    with_claude_reemission_stop(|stop| {
+        if stop.latched {
+            stop.cause.reason()
+        } else {
+            "none"
+        }
+    })
 }
 
 fn claude_reemission_stop_withheld_folds() -> u64 {
@@ -31149,6 +31348,31 @@ impl ScanIndex {
                 record.upload_body_witness.as_deref() != Some(body_witness)
                     || self.quarantine_requires_retry(fingerprint)
             })
+    }
+
+    /// Source-aware daemon load, before replay preparation can save/advance
+    /// the generation. The durable exclusion marker is the active signal:
+    /// there is no separate durable adoption-complete marker. A quarantine
+    /// rebuild returns the same empty generation-0 index as an absent file.
+    pub(crate) fn load_for_snapshot_source(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+    ) -> Result<Self> {
+        let index = Self::load(path)?;
+        if source == SnapshotSource::ClaudeCode
+            && index.generation == 0
+            && index.files.is_empty()
+            && fs::symlink_metadata(ReemissionExclusions::seen_marker_path(support_dir)).is_ok()
+        {
+            note_claude_reemission_stop_with_cause_at(
+                &ClaudeContextFileBirthCounts::default(),
+                &BTreeSet::new(),
+                Some(ClaudeReemissionStopCause::IndexRebuild),
+                std::time::Instant::now(),
+            );
+        }
+        Ok(index)
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -32402,6 +32626,33 @@ impl ScanIndex {
         });
     }
 
+    /// SOURCE N2: retire a Claude entry whose file vanished beneath its
+    /// still-present parent together with its unverified audit marker.
+    /// Only the page merge calls this, and only for keys the scanner settled
+    /// as such a removal; `remove_file_entry` keeps audit debt for every
+    /// other caller. Codex-protected entries are never retired here. The
+    /// key's snapshot fingerprints and account hold stay, because each
+    /// removal path ends in the state main already reaches for the same key:
+    /// main's reconciliation keeps an audit-debt entry and its fingerprints
+    /// forever, so this path drops only the entry and its marker, while a
+    /// vanished entry without audit debt goes through `remove_file_entry`,
+    /// which drops its fingerprints and hold just as main's reconciliation
+    /// does at the next healthy terminal. The hold is later dropped by a
+    /// complete census. Returns false, retiring nothing, for an entry
+    /// without audit debt.
+    fn retire_vanished_claude_audit_debt_entry(&mut self, key: &str) -> bool {
+        if !self.files.get(key).is_some_and(|entry| {
+            entry.has_unverified_source() && !entry.codex_history_is_protected()
+        }) {
+            return false;
+        }
+        self.files.remove(key);
+        self.terminal_jsonl_dispositions.remove(key);
+        self.confirmed_empty_files.remove(key);
+        self.claude_request_census.remove(key);
+        true
+    }
+
     fn remove_file_entry(&mut self, key: &str) {
         if self
             .files
@@ -33629,7 +33880,7 @@ fn claude_subagent_source_session_id(path: &Path) -> Option<String> {
 /// session with two workflow directories has two `journal.jsonl` files that
 /// would both re-key to `<parentSessionId>_journal` and fight over one backend
 /// session. Excluding it at collection time keeps that id from ever existing.
-fn claude_transcript_excluded_from_snapshots(path: &Path) -> bool {
+pub(crate) fn claude_transcript_excluded_from_snapshots(path: &Path) -> bool {
     path.file_name().and_then(|value| value.to_str()) == Some("journal.jsonl")
         && claude_subagent_identity(path).is_some()
 }
@@ -44008,6 +44259,8 @@ mod tests {
             last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            compaction_events: Vec::new(),
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -54033,6 +54286,66 @@ mod tests {
         );
     }
 
+    /// Compaction sizes and local context points are additive evidence: they
+    /// must never move semantic identity, the content hash or the body
+    /// witness, and the points must never reach the wire.
+    #[test]
+    fn compaction_events_and_local_context_points_are_identity_neutral() {
+        let mut request = valid_v6_batch_request();
+        let policy = request.upload_policy;
+        let mut item = request.snapshots.remove(0);
+        item.peak_context_fill_tokens = Some(250_000);
+        item.first_turn_context_tokens = Some(40_000);
+        item.compaction_count = Some(1);
+        item.compaction_timestamps = vec!["2026-08-14T09:00:00Z".to_string()];
+        let mut with = item.clone();
+        with.compaction_events = vec![SnapshotCompactionEvent {
+            at: "2026-08-14T09:00:00Z".to_string(),
+            before: Some(250_000),
+            after: Some(59_000),
+            trigger: Some("manual".to_string()),
+        }];
+        with.local_context_points = vec![LocalContextPoint {
+            at_unix_seconds: 1_786_000_000,
+            prompt_tokens: 250_000,
+        }];
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+            assert_eq!(
+                snapshot_semantic_component_hashes(source, &with),
+                snapshot_semantic_component_hashes(source, &item),
+                "{source:?}"
+            );
+            assert_eq!(
+                snapshot_fingerprint(source, &with),
+                snapshot_fingerprint(source, &item),
+                "{source:?}"
+            );
+            // The whole envelope, so the lists can never slip into the
+            // revision or revision v2 input either.
+            assert_eq!(
+                snapshot_semantic_envelope(source, &with, policy),
+                snapshot_semantic_envelope(source, &item, policy),
+                "{source:?}"
+            );
+        }
+        assert_eq!(
+            snapshot_upload_body_witness(&with),
+            snapshot_upload_body_witness(&item)
+        );
+        assert_eq!(
+            snapshot_upload_body_witness_version(&with),
+            snapshot_upload_body_witness_version(&item)
+        );
+        let wire = serde_json::to_value(&with).expect("serialize");
+        assert_eq!(
+            wire["compaction_events"],
+            json!([{"at": "2026-08-14T09:00:00Z", "before": 250_000, "after": 59_000, "trigger": "manual"}])
+        );
+        assert!(wire.get("local_context_points").is_none());
+        let wire = serde_json::to_value(&item).expect("serialize");
+        assert!(wire.get("compaction_events").is_none());
+    }
+
     #[test]
     fn context_curve_is_hash_neutral_and_deterministically_bounded() {
         let first = max_fractional_context_curve_fixture();
@@ -54099,6 +54412,16 @@ mod tests {
             item.context_curve = Some(first.clone());
             item.compaction_timestamps = (0..MAX_COMPACTION_TIMESTAMPS)
                 .map(|second| format!("2026-08-20T12:00:{:02}Z", second % 60))
+                .collect();
+            item.compaction_events = item
+                .compaction_timestamps
+                .iter()
+                .map(|at| SnapshotCompactionEvent {
+                    at: at.clone(),
+                    before: Some(u64::MAX),
+                    after: Some(u64::MAX),
+                    trigger: Some("manual".to_string()),
+                })
                 .collect();
             item.tool_usage = Some(
                 (0..MAX_TOOL_USAGE_NAMES)
@@ -61808,6 +62131,17 @@ mod tests {
         assert_eq!(item.first_turn_context_tokens, Some(100));
         assert_eq!(item.peak_context_fill_tokens, Some(100));
         assert_eq!(item.compaction_count, Some(1));
+        // The inherited-prefix marker is no event, and the owned marker's
+        // `before` is the owned request, never the inherited 1,000.
+        assert_eq!(
+            item.compaction_events,
+            [SnapshotCompactionEvent {
+                at: "2026-08-02T06:01:03Z".to_string(),
+                before: Some(100),
+                after: None,
+                trigger: None,
+            }]
+        );
         assert_eq!(
             item.model_usage[0].reasoning_effort.as_deref(),
             Some("high")
@@ -66729,6 +67063,7 @@ mod tests {
             "last_turn_context_tokens",
             "compaction_count",
             "compaction_timestamps",
+            "compaction_events",
             "compaction_total_pre_tokens",
             "compaction_total_post_tokens",
             "compaction_total_cumulative_dropped_tokens",
@@ -66910,8 +67245,15 @@ mod tests {
             peak_context_fill_tokens: Some(115),
             first_turn_context_tokens: Some(105),
             last_turn_context_tokens: None,
-            compaction_count: Some(0),
-            compaction_timestamps: Vec::new(),
+            compaction_count: Some(1),
+            compaction_timestamps: vec!["2026-07-20T11:30:00Z".to_string()],
+            compaction_events: vec![SnapshotCompactionEvent {
+                at: "2026-07-20T11:30:00Z".to_string(),
+                before: Some(115),
+                after: Some(105),
+                trigger: None,
+            }],
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -67028,6 +67370,10 @@ mod tests {
             snapshot["context_curve"]["points"][0]["model_window_index"],
             json!(0)
         );
+        assert_eq!(
+            snapshot["compaction_events"],
+            json!([{"at": "2026-07-20T11:30:00Z", "before": 115, "after": 105}])
+        );
 
         // (2) every snapshot-item key is within the backend's allowed item set.
         for key in snapshot.keys() {
@@ -67132,6 +67478,24 @@ mod tests {
             error.contains("more than 64 compaction_timestamps"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn v6_snapshot_preflight_rejects_oversized_compaction_events() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].compaction_events = vec![
+            SnapshotCompactionEvent {
+                at: "2026-07-20T12:00:00Z".to_string(),
+                before: Some(1),
+                after: None,
+                trigger: None,
+            };
+            MAX_COMPACTION_TIMESTAMPS + 1
+        ];
+
+        let error = validate_snapshot_batch_request(&request).expect_err("preflight rejects");
+
+        assert!(error.contains("more than 64 compaction_events"), "{error}");
     }
 
     #[test]
@@ -68355,6 +68719,8 @@ mod tests {
                 last_turn_context_tokens: None,
                 compaction_count: None,
                 compaction_timestamps: Vec::new(),
+                compaction_events: Vec::new(),
+                local_context_points: Vec::new(),
                 compaction_total_pre_tokens: None,
                 compaction_total_post_tokens: None,
                 compaction_total_cumulative_dropped_tokens: None,
@@ -70501,7 +70867,7 @@ crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_p
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
-crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
+crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
 crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
@@ -70515,13 +70881,13 @@ crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
-crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, claude_compaction_observations, claude_compaction_link_tip, session_start);
+crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);
 crate::heap_layout_bound::fields!(SnapshotActivityCount; name, count);
 crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection_version, tool_calls, shell_commands, patch_operations, changed_files, lines_added, lines_deleted, web_searches, mcp_calls, subagent_spawns, tool_counts, mcp_tool_counts, capability_counts, capability_buckets, skills);
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, compaction_events, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);
@@ -70863,3 +71229,8 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+
+#[path = "snapshots/composition_compactions.rs"]
+mod composition_compactions;
+pub(crate) use composition_compactions::CompositionCompactions;
+pub(crate) mod start_verdict_store;

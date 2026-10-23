@@ -629,7 +629,7 @@ fn measure_synthetic_workspace() {
 //   b1 Bash -> "file1\nfile2"(11=3) shell_output @ord4 res{5,7}=2
 //   br1 browser -> "shot"(4=1)+1 image(1300) browser_and_images @ord6 res{7}=1
 // -------------------------------------------------------------------------
-fn sess_a() -> Vec<Value> {
+pub(super) fn sess_a() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessA","message":{"role":"user","content":"hi"}}),
         json!({"type":"assistant","sessionId":"sessA","message":{"role":"assistant","content":[
@@ -659,7 +659,7 @@ fn sess_a() -> Vec<Value> {
 //   w1 result "OK"(2=1) other_tools @ord5 res(5,6){}=0
 //   g1 Grep -> "match1"(6=2) other_tools @ord8 res(8,inf){9}=1
 // -------------------------------------------------------------------------
-fn sess_b() -> Vec<Value> {
+pub(super) fn sess_b() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessB","message":{"role":"user","content":"go"}}),
         json!({"type":"attachment","sessionId":"sessB","attachment":{"type":"task_reminder","content":"REMEMBER","itemCount":1}}),
@@ -689,7 +689,7 @@ fn sess_b() -> Vec<Value> {
 //   h1 Read /proj/efforts.html -> "HTMLDATA"(8=2) doc_reads_html @ord6 res{8}=1
 //   orphan result (unknown id) "ORPHAN12"(8=2) other_tools @ord7 res{8}=1
 // -------------------------------------------------------------------------
-fn sess_c() -> Vec<Value> {
+pub(super) fn sess_c() -> Vec<Value> {
     vec![
         json!({"type":"user","sessionId":"sessC","message":{"role":"user","content":"c"}}),
         json!({"type":"attachment","sessionId":"sessC","attachment":{"type":"edited_text_file","filename":"/x/memory/recall.md","snippet":"MEMSNIP12"}}),
@@ -831,7 +831,7 @@ fn subagent_transcripts_stay_distinct() {
 //   c2 web output "WEBRESULT"(9=3) web_fetch_search @ord5 res(5,6){}=0
 //   c3 exec "AFTER123"(8=2) shell_output @ord8 res(8,inf){9}=1
 // -------------------------------------------------------------------------
-fn codex_sess() -> Vec<Value> {
+pub(super) fn codex_sess() -> Vec<Value> {
     vec![
         json!({"type":"session_meta","payload":{"id":"codexS"}}),
         json!({"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"DEVINSTRUCT"}]}}),
