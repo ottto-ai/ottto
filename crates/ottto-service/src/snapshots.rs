@@ -3700,6 +3700,7 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 }
 
 include!("snapshots/authority_proof_correction.rs");
+include!("snapshots/load_containment.rs");
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -35542,17 +35543,6 @@ fn valid_snapshot_activity(value: &Option<String>) -> bool {
     }
 }
 
-fn quarantine_invalid_scan_index(path: &Path) -> Result<ScanIndex> {
-    // The index is only a local incremental-scan optimization. A crash or
-    // corrupt semantic-clock witness must not permanently block collection,
-    // but never overwrite the unreadable witness in place.
-    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
-    fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
-    sync_checkpoint_parent(path)?;
-    eprintln!("local snapshot scan index was invalid and quarantined; rebuilding");
-    Ok(ScanIndex::default())
-}
-
 fn canonicalize_codex_identity_set(values: &mut BTreeSet<String>) {
     *values = std::mem::take(values)
         .into_iter()
@@ -37006,7 +36996,7 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<Self> {
-        let index = Self::load(path)?;
+        let index = Self::load_attributed(path, Some(source))?;
         if source == SnapshotSource::ClaudeCode
             && index.generation == 0
             && index.files.is_empty()
@@ -37023,7 +37013,12 @@ impl ScanIndex {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let (mut index, origin) = Self::load_inner(path)?;
+        Self::load_attributed(path, None)
+    }
+
+    /// `source` only names the source kind in containment lines and alarms.
+    fn load_attributed(path: &Path, source: Option<SnapshotSource>) -> Result<Self> {
+        let (mut index, origin) = Self::load_inner(path, source)?;
         // Path-(a) absence retirement: a fresh, rebuilt or quarantined load
         // leaves this path's history unverified for the rest of the process.
         let fresh = matches!(origin, LoadOrigin::Missing | LoadOrigin::Quarantined)
@@ -37036,7 +37031,7 @@ impl ScanIndex {
 
     /// `load` before the U1a-2a proof incarnation (row 35): each accepted
     /// return says what it found.
-    fn load_inner(path: &Path) -> Result<(Self, LoadOrigin)> {
+    fn load_inner(path: &Path, source: Option<SnapshotSource>) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
             return Ok((Self::default(), LoadOrigin::Missing));
         }
@@ -37049,62 +37044,49 @@ impl ScanIndex {
         let decoded = claude_request_census::decode_index(file);
         let dropped_side_requests = take_dropped_codex_side_requests();
         match decoded {
-            Ok(mut index)
-                if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
-                    && index
-                        .snapshot_activity_at
-                        .values()
-                        .all(valid_snapshot_activity)
-                    && index
-                        .accepted_snapshot_fingerprints
-                        .iter()
-                        .all(|fingerprint| {
-                            fingerprint.len() == 64
-                                && fingerprint.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-                    && index.accepted_snapshot_fingerprint_ledger_version
-                        <= SNAPSHOT_ACCEPTED_LEDGER_VERSION
-                    && index
-                        .legacy_settlement_reconcile_after_fingerprint
-                        .as_deref()
-                        .map_or(true, |fingerprint| {
-                            fingerprint.len() == 64
-                                && fingerprint.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-                    && index
-                        .quarantined_snapshot_fingerprints
-                        .values()
-                        .all(snapshot_quarantine_deadline_is_bounded) =>
-            {
-                index.retain_decodable_codex_parent_state();
-                if index.canonicalize_codex_identity_keys() {
-                    index.drop_unbound_claude_authority_records("load");
-                    // D4: `side_request_rearm{decode_dropped}`.
-                    crate::local_resource_diagnostics::codex_side_lifecycle::add(
-                        crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
-                        dropped_side_requests,
-                    );
-                    index.codex_parent_proof_parents_live =
-                        codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
-                    Ok((index, LoadOrigin::Loaded(opened)))
-                } else {
-                    quarantine_invalid_scan_index(path)
-                        .map(|index| (index, LoadOrigin::Quarantined))
-                }
-            }
-            Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
-                quarantine_invalid_scan_index(path).map(|index| (index, LoadOrigin::Quarantined))
-            }
-            Ok(_) => Err(anyhow::anyhow!(
+            Ok(index) if index.schema_version != SCAN_INDEX_SCHEMA_VERSION => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
             )),
-            Err(error) if !error.is_io() => {
-                quarantine_invalid_scan_index(path).map(|index| (index, LoadOrigin::Quarantined))
+            // Written by a newer build: future state, refused like a schema
+            // mismatch and never rebuilt over.
+            Ok(index)
+                if index.accepted_snapshot_fingerprint_ledger_version
+                    > SNAPSHOT_ACCEPTED_LEDGER_VERSION =>
+            {
+                alarm_future_scan_index_ledger(
+                    scan_index_source_label(source),
+                    index.accepted_snapshot_fingerprint_ledger_version,
+                );
+                Err(anyhow::anyhow!(
+                    "unsupported local snapshot scan index accepted-ledger version {}",
+                    index.accepted_snapshot_fingerprint_ledger_version
+                ))
             }
+            Ok(mut index) => {
+                let drops = index.drop_invalid_index_records();
+                index.retain_decodable_codex_parent_state();
+                if !index.canonicalize_codex_identity_keys() {
+                    let discarded = index.files.len();
+                    return quarantine_invalid_scan_index(
+                        path,
+                        "codex_identity_collision",
+                        Some(discarded),
+                    )
+                    .map(|index| (index, LoadOrigin::Quarantined));
+                }
+                note_scan_index_record_drops("load", scan_index_source_label(source), drops);
+                index.drop_unbound_claude_authority_records("load");
+                // D4: `side_request_rearm{decode_dropped}`.
+                crate::local_resource_diagnostics::codex_side_lifecycle::add(
+                    crate::local_resource_diagnostics::codex_side_lifecycle::Event::RequestRearmed,
+                    dropped_side_requests,
+                );
+                index.codex_parent_proof_parents_live =
+                    codex_parent_proof_parents_live(&index.codex_parent_prefix_proofs);
+                Ok((index, LoadOrigin::Loaded(opened)))
+            }
+            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path, "decode", None)
+                .map(|index| (index, LoadOrigin::Quarantined)),
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
@@ -37120,6 +37102,8 @@ impl ScanIndex {
     fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         // Fails closed for the one record, in debug and release; never the save.
         self.drop_unbound_claude_authority_records("save");
+        let drops = self.drop_invalid_index_records();
+        note_scan_index_record_drops("save", scan_index_source_label(None), drops);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
@@ -40070,6 +40054,9 @@ mod tests {
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
     }
+    mod load_containment_tests {
+        include!("snapshots/load_containment_tests.rs");
+    }
     mod claude_context_file_birth_tests {
         include!("snapshots/claude_context_file_birth_tests.rs");
     }
@@ -41865,11 +41852,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_index_quarantines_syntactically_valid_corrupt_activity_witness() {
+    fn scan_index_save_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         let root = temp_dir("scan-index-corrupt-activity");
         let path = root.join("codex-scan-index-v2.json");
         let fingerprint = "a".repeat(64);
         let mut corrupt = ScanIndex {
+            files: BTreeMap::from([(
+                "content-free-key".to_string(),
+                manifest_index_entry(Some(&fingerprint)),
+            )]),
             file_snapshot_fingerprints: BTreeMap::from([(
                 "content-free-key".to_string(),
                 BTreeSet::from([fingerprint.clone()]),
@@ -41883,16 +41874,21 @@ mod tests {
         corrupt.save(&path).expect("persist corrupt semantic clock");
 
         let recovered = ScanIndex::load(&path).expect("corrupt semantic clock should self-heal");
-        assert!(recovered.file_snapshot_fingerprints.is_empty());
+        assert_eq!(recovered.generation, 1);
+        assert_eq!(recovered.file_snapshot_fingerprints.len(), 1);
         assert!(recovered.snapshot_activity_at.is_empty());
-        assert!(!path.exists());
+        assert_eq!(
+            recovered.files["content-free-key"].source_file_fingerprint, "source",
+            "the candidate gate re-reads a missing clock without a re-arm"
+        );
+        assert!(path.exists());
         assert_eq!(
             fs::read_dir(&root)
                 .expect("read quarantine directory")
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
                 .count(),
-            1
+            0
         );
         let _ = fs::remove_dir_all(root);
     }

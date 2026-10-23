@@ -93,8 +93,8 @@ pub fn spawn_context_composition_sync() -> Result<()> {
     let home = crate::snapshot_sync::home_dir()?;
     let support_dir = default_support_dir();
     if super::v2::changed_days_enabled() {
-        // The new-lines reader replaces this loop (off until the server
-        // accepts changed-days uploads).
+        // The new-lines reader replaces this loop while its compile-time
+        // switch is on.
         return super::v2::spawn_v2_sync();
     }
     std::thread::Builder::new()
