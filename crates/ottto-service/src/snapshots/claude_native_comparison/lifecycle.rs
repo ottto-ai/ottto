@@ -537,8 +537,35 @@ crate::heap_layout_bound::fields!(Lifecycle; state);
 crate::heap_layout_bound::fields!(State; generation, scope, valid, window, admission_refused, policy, published_policy, policy_in_flight);
 impl crate::heap_layout_bound::HeapLayoutBound for Lease {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        self.owner.heap_bound(c)?;
-        self.completed_heap_bound(c)
+        let Self {
+            owner,
+            generation,
+            previous_scope,
+            previous_valid,
+            scope,
+            allowed,
+            selected_save,
+            native_save,
+            finished,
+            window,
+            policy,
+            policy_hit,
+            diagnostic,
+        } = self;
+        owner.heap_bound(c)?;
+        generation.heap_bound(c)?;
+        previous_scope.heap_bound(c)?;
+        previous_valid.heap_bound(c)?;
+        scope.heap_bound(c)?;
+        allowed.heap_bound(c)?;
+        selected_save.heap_bound(c)?;
+        native_save.heap_bound(c)?;
+        finished.heap_bound(c)?;
+        window.heap_bound(c)?;
+        policy.heap_bound(c)?;
+        policy_hit.heap_bound(c)?;
+        diagnostic.heap_bound(c)?;
+        Some(())
     }
     fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         // The daemon owns the mutable Lifecycle independently of this lease.
