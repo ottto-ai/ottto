@@ -2358,6 +2358,18 @@ pub(crate) fn decode_ledger_shard(bytes: &[u8]) -> Option<ClaudeRequestCensus> {
 impl<'de> Deserialize<'de> for ClaudeRequestCensusShadowState {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        // Old positional indexes accept an out-of-range numeric shadow scalar
+        // as absent diagnostics. It cannot contain an `s` marker. Preserve that
+        // legacy decode; any x/sb records still close missing `s` at root binding.
+        let token = raw.get().trim();
+        if token
+            .as_bytes()
+            .first()
+            .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-')
+            && token.parse::<f64>().is_ok_and(|value| !value.is_finite())
+        {
+            return Ok(Self::default());
+        }
         if raw.get().len() > 512 * 1024 + MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
             || !raw.get().trim_start().starts_with('{')
         {
@@ -3480,22 +3492,17 @@ pub(crate) fn prepare_claude_request_census_terminal(
     {
         *view = None;
         let census = &mut index.claude_request_census;
-        let before = census
-            .records
-            .values()
-            .filter(|record| !record.is_birth_stub())
-            .count();
-        census.records.retain(|key, _| {
-            !is_ledger_key(key)
-                && (index.files.contains_key(key) || observed_index_keys.contains(key))
+        let mut vanished = 0_u64;
+        census.records.retain(|key, record| {
+            let keep = !is_ledger_key(key)
+                && (index.files.contains_key(key) || observed_index_keys.contains(key));
+            // Charge disappearances inside main's existing retain walk, never
+            // with extra whole-census passes on the steady OFF terminal.
+            if !keep && !record.is_birth_stub() {
+                vanished += 1;
+            }
+            keep
         });
-        let vanished = before.saturating_sub(
-            census
-                .records
-                .values()
-                .filter(|record| !record.is_birth_stub())
-                .count(),
-        ) as u64;
         census.hash_total = 0;
         census.serialized_total = 0;
         for (key, record) in &census.records {
@@ -3606,9 +3613,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
 /// Synchronize the optional root metadata immediately before the atomic save.
 /// Partial selected saves retain the same working census/admission transaction.
 pub(crate) fn prepare_safety_checkpoint(index: &mut ScanIndex) {
-    if (phase_b::enabled()
-        && !index.claude_request_census.records.is_empty()
-        && !index.claude_request_census.safety_incomplete.incomplete())
+    if index.claude_request_census.safety.is_some()
         || !index.claude_request_census.extension_order.is_empty()
         || !index.claude_request_census.retired_order.is_empty()
         || index.claude_request_census.safety_incomplete.overflow
@@ -5587,6 +5592,34 @@ mod phase_b_tests {
             }
         }
     }
+    #[test]
+    fn legacy_nonfinite_shadow_without_marker_keeps_serde_parity() {
+        let _mode = phase_b::ShadowMode::set(true);
+        for safety_present in [false, true] {
+            let evidence = if safety_present {
+                record('a', vec![1])
+            } else {
+                record('a', vec![1]).without_safety_for_test()
+            };
+            let index = index_with(vec![(A, evidence)]);
+            let mut value = serde_json::to_value(index).unwrap();
+            value["claude_request_census_shadow"] = serde_json::json!("legacy-overflow");
+            let raw = serde_json::to_string(&value)
+                .unwrap()
+                .replace("\"legacy-overflow\"", "1e400");
+            for loaded in [
+                decode_index(raw.as_bytes()).unwrap(),
+                decode_bounded_index(raw.as_bytes()).unwrap(),
+            ] {
+                assert_eq!(loaded.claude_request_census.hash_total, 1);
+                assert_eq!(
+                    loaded.claude_request_census.safety_incomplete.incomplete(),
+                    safety_present
+                );
+            }
+        }
+    }
+
     #[test]
     fn malformed_present_shadow_never_receives_the_legacy_open_default() {
         let _mode = phase_b::ShadowMode::set(true);

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 837,
-  "content_sha256": "700e91bb748556c8b177d2e1ca7cdf8b0ffeb6cb62f2ee18e36f10b540c57886",
+  "content_sha256": "ec65ca0b2e9e6e51b4566e33616de55785290f6ae67e308d31e4302b3fcfb761",
   "files": [
     {
       "executable": false,
@@ -1763,8 +1763,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "00543669caeae7f83208e686e9def49e924a0807ae66211b0d2486799a32bd59",
-      "size_bytes": 291628
+      "sha256": "d0c38d091bd130d0db8d709e0682f852163c912ed7eee076625156c6299dc7f2",
+      "size_bytes": 293162
     },
     {
       "executable": false,
