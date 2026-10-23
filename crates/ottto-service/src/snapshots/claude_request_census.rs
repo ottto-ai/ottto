@@ -607,8 +607,8 @@ pub(crate) fn message_key(index_key: &str) -> String {
 /// The `fam:` key of a root session.
 pub(crate) fn family_key(root_session_id: &str) -> String {
     format!(
-        "{FAMILY_KEY_PREFIX}{:x}",
-        Sha256::digest(root_session_id.as_bytes())
+        "{FAMILY_KEY_PREFIX}{}",
+        LowerHex(&Sha256::digest(root_session_id.as_bytes()))
     )
 }
 
@@ -617,8 +617,8 @@ pub(crate) fn family_key(root_session_id: &str) -> String {
 /// root spelled two ways can never share or split a record.
 pub(crate) fn telemetry_key(root_session_id: &str) -> String {
     format!(
-        "{TELEMETRY_KEY_PREFIX}{:x}",
-        Sha256::digest(root_session_id.as_bytes())
+        "{TELEMETRY_KEY_PREFIX}{}",
+        LowerHex(&Sha256::digest(root_session_id.as_bytes()))
     )
 }
 
@@ -3366,6 +3366,32 @@ mod memo_accounting_tests {
             assert_eq!(
                 serde_json::to_vec(&LowerHex(&bytes[..len])).unwrap(),
                 serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn batched_root_keys_preserve_the_shared_canonical_digest() {
+        for root in [
+            "",
+            "abc",
+            "root/with\\escapes",
+            "משפחה",
+            "10000000-1234-4567-890a-123456789abc",
+        ] {
+            let digest = format!("{:x}", Sha256::digest(root.as_bytes()));
+            let family = family_key(root);
+            assert_eq!(family, format!("{FAMILY_KEY_PREFIX}{digest}"));
+            assert_eq!(
+                telemetry_key(root),
+                format!("{TELEMETRY_KEY_PREFIX}{digest}")
+            );
+            assert_eq!(
+                telemetry_key(root),
+                format!(
+                    "{TELEMETRY_KEY_PREFIX}{}",
+                    &family[FAMILY_KEY_PREFIX.len()..]
+                )
             );
         }
     }

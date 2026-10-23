@@ -48,7 +48,7 @@ pub(crate) mod store;
 use super::claude_request_census::{
     claude_request_hash, family_key, fingerprint_matches, message_key, telemetry_key,
     ClaudeFamilyMemo, ClaudeFamilyPublication, ClaudeRequestCensusInsert,
-    ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX, MESSAGE_KEY_PREFIX,
+    ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX, MESSAGE_KEY_PREFIX, TELEMETRY_KEY_PREFIX,
 };
 use super::claude_request_ledger::{
     self, ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeUndecidedBy,
@@ -1357,15 +1357,32 @@ fn shadow_page_with_coverage(
         counts.ledger_load_damaged = 1;
         drop_certificate(ledger);
     }
-    // Telemetry runs first and shares the caller's absolute time bound.
+    let mut order = roots
+        .iter()
+        .map(|root| {
+            let key = family_key(root);
+            let turn = ledger.get(&key).map_or(0, |record| record.window());
+            (*root, key, turn)
+        })
+        .collect::<Vec<_>>();
+    order.sort_by_key(|(_, _, turn)| *turn);
+    let capture_turns = order
+        .iter()
+        .take(capture::NEXT_PAGE_FAMILIES)
+        .map(|(root, _, _)| *root)
+        .collect::<BTreeSet<_>>();
+    // Only these oldest turns can have a captured body. Prioritize their
+    // sidecars in the same order; the bounded global sweep still retains
+    // cross-root telemetry debt and never treats an unvisited root as absent.
     let mut work = ClaudeLedgerWork::new(
         WORK_MAX_BYTES,
         WORK_MAX_STATS,
-        deadline.min(started + TELEMETRY_MAX_ELAPSED),
+        deadline.min(Instant::now() + TELEMETRY_MAX_ELAPSED),
     );
-    let unloaded = roots
+    let unloaded = order
         .iter()
-        .copied()
+        .take(capture::NEXT_PAGE_FAMILIES)
+        .map(|(root, _, _)| *root)
         .filter(|root| !api_report.evidence.contains_key(*root))
         .collect::<Vec<_>>();
     let (tail, root_states) = ClaudeTelemetryTail::advance(
@@ -1388,20 +1405,6 @@ fn shadow_page_with_coverage(
     // every body, while the pre-admitted family failure rows still publish.
     let (member_keys, indexed_members) =
         family_members(index, &roots, deadline).unwrap_or_default();
-    let mut order = roots
-        .iter()
-        .map(|root| {
-            let key = family_key(root);
-            let turn = ledger.get(&key).map_or(0, |record| record.window());
-            (*root, key, turn)
-        })
-        .collect::<Vec<_>>();
-    order.sort_by_key(|(_, _, turn)| *turn);
-    let capture_turns = order
-        .iter()
-        .take(capture::NEXT_PAGE_FAMILIES)
-        .map(|(root, _, _)| *root)
-        .collect::<BTreeSet<_>>();
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     let mut captures = BTreeMap::new();
     let mut groups_owned = BTreeSet::new();
@@ -1446,9 +1449,16 @@ fn shadow_page_with_coverage(
     }
     let holder_view = ClaudeHolderView::of(coverage_view);
     // Retain cross-root live claims even when another family is oversized.
-    let root_keys = roots
+    // Both keys use the same canonical SHA-256 root digest. Reuse the
+    // admitted scheduling key instead of hashing every page root again.
+    let root_keys = order
         .iter()
-        .map(|root| (*root, telemetry_key(root)))
+        .map(|(root, key, _)| {
+            (
+                *root,
+                format!("{TELEMETRY_KEY_PREFIX}{}", &key[FAMILY_KEY_PREFIX.len()..]),
+            )
+        })
         .collect::<BTreeMap<_, _>>();
     let mut page_claims = BTreeMap::<u64, Vec<&str>>::new();
     let mut sessions = BTreeMap::new();
