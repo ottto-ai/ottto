@@ -40,6 +40,7 @@ fn native_comparison_target_body_retention_pays_exact_peak_before_buffer_growth(
         assert_eq!(state.scanned_file_count, 1);
         assert_eq!(state.snapshots.len(), 1);
         let parsed = ParsedJsonlFile {
+            census_source_unchanged: false,
             snapshots: state.snapshots,
             report: JsonlReadReport::default(),
             recognized_usage_drop_count: 0,

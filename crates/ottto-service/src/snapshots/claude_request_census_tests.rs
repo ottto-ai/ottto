@@ -1188,6 +1188,16 @@ fn census_retired_record_survives_an_unchanged_reparse() {
         "retired at the terminal"
     );
     let hashes = index.claude_request_census_for_test().totals_for_test().0;
+    // An already-retired record from before this capability stays retired
+    // while its next ordinary parse rebuilds safety; no new work is scheduled.
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, retired.clone().without_safety_for_test());
+    assert!(!claude_census_disjointness_complete(
+        &index,
+        "2027-03-01T09:00:00Z",
+        true
+    ));
     index
         .files
         .get_mut(&key)
@@ -1289,7 +1299,8 @@ fn census_unindexed_lossy_member_leaves_its_family_unknown() {
                 1,
                 shape,
                 vec![hash],
-            ),
+            )
+            .with_acquired_eof_for_test(true),
         );
     }
     assert_eq!(

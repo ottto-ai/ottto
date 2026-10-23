@@ -19,7 +19,7 @@ use super::{
     MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
 };
 use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, SeqAccess, Visitor};
-use serde::ser::SerializeMap;
+use serde::ser::{Error as _, SerializeMap};
 use serde::{Deserialize, Serialize, Serializer};
 use sha2::{Digest, Sha256};
 use std::cmp::Reverse;
@@ -632,6 +632,8 @@ impl ClaudeRequestCensusRecord {
     pub(crate) fn retire(&mut self) {
         let count = self.request_hashes().len() as u64 + self.retired.unwrap_or(0);
         self.request_hashes = None;
+        self.safety = None;
+        self.safety_hashes = None;
         if let Some(fields) = self.ledger.as_mut() {
             fields.facts = None;
         }
@@ -723,8 +725,9 @@ pub(crate) struct ClaudeRequestCensus {
     safety_incomplete: SafetyIncomplete,
     ambiguous: BTreeSet<String>,
     producer_refused: u64,
+    decode_lost: bool,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, retired_order, extension_order, admission_serialized_total, active_hash_total, safety_incomplete, ambiguous, producer_refused);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total, retired_order, extension_order, admission_serialized_total, active_hash_total, safety_incomplete, ambiguous, producer_refused, decode_lost);
 
 const MAX_RECLAIMED_KEYS: usize = 4096;
 
@@ -1399,7 +1402,17 @@ impl Serialize for ClaudeRequestCensusRecord {
 
 impl Serialize for ClaudeRequestCensus {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        self.records.serialize(serializer)
+        // Compact each record inside the pretty outer index. At the supported
+        // 65,536-key boundary the row indentation fits the existing 1 MiB raw
+        // allowance; nested optional metadata cannot inflate a valid 48 MiB
+        // record inventory past that decoder boundary. One bounded record's
+        // encoding scratch is live at a time, included in overlap receipts.
+        let mut map = serializer.serialize_map(Some(self.records.len()))?;
+        for (key, record) in &self.records {
+            let raw = serde_json::value::to_raw_value(record).map_err(S::Error::custom)?;
+            map.serialize_entry(key, &raw)?;
+        }
+        map.end()
     }
 }
 
@@ -1679,7 +1692,7 @@ impl<R: std::io::Read> CensusRead<R> {
             serde_json::to_vec(&state).expect("shadow serialization")
         } else {
             let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
-            self.ambiguous_census |= !census.ambiguous.is_empty();
+            self.ambiguous_census |= census.decode_lost || !census.ambiguous.is_empty();
             drop(bytes);
             serde_json::to_vec(&census).expect("census serialization")
         })
@@ -1827,14 +1840,21 @@ impl<R: std::io::Read> std::io::Read for CensusRead<R> {
 impl<'de> Deserialize<'de> for ClaudeRequestCensus {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
-        if raw.get().len() > MAX_RAW_BYTES {
-            return Ok(Self::default());
+        let refused = || Self {
+            decode_lost: true,
+            ..Self::default()
+        };
+        if raw.get().len() > MAX_RAW_BYTES || !raw.get().trim_start().starts_with('{') {
+            return Ok(refused());
         }
         let mut isolated = serde_json::Deserializer::from_str(raw.get());
         Ok(isolated
             .deserialize_any(CensusVisitor { ledger: false })
-            .map(|(census, _)| census)
-            .unwrap_or_default())
+            .map(|(mut census, dropped)| {
+                census.decode_lost = dropped > 0;
+                census
+            })
+            .unwrap_or_else(|_| refused()))
     }
 }
 
@@ -1932,6 +1952,11 @@ impl<'de> Visitor<'de> for CensusVisitor {
                 break;
             };
             attempted += 1;
+            if is_ledger_key(&key) != self.ledger {
+                dropped += u64::from(self.ledger);
+                map.next_value::<IgnoredAny>()?;
+                continue;
+            }
             if !seen.insert(key.clone()) {
                 census.remove(&key);
                 census.ambiguous.insert(key);
@@ -1942,7 +1967,6 @@ impl<'de> Visitor<'de> for CensusVisitor {
             }
             if key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES
                 || census.records.len() >= MAX_CLAUDE_REQUEST_CENSUS_RECORDS
-                || is_ledger_key(&key) != self.ledger
             {
                 dropped += 1;
                 map.next_value::<IgnoredAny>()?;
@@ -2067,6 +2091,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
         ];
         let mut seen = 0_u64;
         let mut malformed = false;
+        let mut extension_bad = false;
         let mut derivation = None;
         let mut source_file_fingerprint = None;
         let mut window = 0;
@@ -2093,7 +2118,11 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 _ => 0,
             };
             if seen & (bit | alias) != 0 {
-                malformed = true;
+                if matches!(FIELDS[position], "x" | "sb") {
+                    extension_bad = true;
+                } else {
+                    malformed = true;
+                }
                 map.next_value::<IgnoredAny>()?;
                 continue;
             }
@@ -2105,14 +2134,14 @@ impl<'de> Visitor<'de> for RecordVisitor {
                         .then(|| serde_json::from_str::<TranscriptSafety>(raw.get()).ok())
                         .flatten()
                         .map(Box::new);
-                    malformed |= safety.is_none();
+                    extension_bad |= safety.is_none();
                 }
                 "sb" => match map.next_value_seed(HashesSeed {
                     remaining: self.remaining,
                     encoding: HashEncoding::Base64,
                 })? {
                     Some(hashes) => safety_hashes = hashes,
-                    None => malformed = true,
+                    None => extension_bad = true,
                 },
                 name @ ("h" | "b") => {
                     let encoding = if name == "h" {
@@ -2157,9 +2186,9 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 },
             }
         }
-        malformed |= request_hashes.len().saturating_add(safety_hashes.len()) > self.remaining;
+        extension_bad |= request_hashes.len().saturating_add(safety_hashes.len()) > self.remaining;
         if let Some(extension) = &safety {
-            malformed |= extension.sc != 1
+            extension_bad |= extension.sc != 1
                 || extension.oc > 1
                 || extension.co.len() > 8
                 || extension
@@ -2172,7 +2201,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 || extension.acquired > extension.extent
                 || extension.last_progress_at < extension.unread_since;
         }
-        malformed |= !safety_hashes.is_empty()
+        extension_bad |= !safety_hashes.is_empty()
             && (safety.is_none() || !request_hashes.is_empty() || !scalars.contains_key("r"));
         if malformed {
             return Ok(None);
@@ -2207,6 +2236,26 @@ impl<'de> Visitor<'de> for RecordVisitor {
             return Ok(None);
         };
         let retired = scalar("r");
+        if let Some(extension) = &safety {
+            if retired.is_some() && !extension.sr && retired != Some(safety_hashes.len() as u64) {
+                extension_bad = true;
+            }
+            if shape == ClaudeRequestCensusShape::Lossy
+                && extension.ac
+                && !(extension.ld || extension.mi || extension.all_read_residue)
+            {
+                extension_bad = true;
+            }
+        }
+        if extension_bad {
+            safety_hashes.clear();
+            safety = Some(Box::new(TranscriptSafety {
+                sc: 1,
+                oc: 1,
+                sr: true,
+                ..TranscriptSafety::default()
+            }));
+        }
         let modified = scalar("m");
         let audit = audit.map(|values| ClaudeTelemetryAudit {
             target_offset: values[0],
@@ -2775,16 +2824,15 @@ pub(crate) fn record_claude_request_census(
         if !safety.ac {
             safety.unread_since = window;
             safety.last_progress_at = window;
-            if let Some(old) = index
-                .claude_request_census
-                .get(parse.index_key)
-                .filter(|old| old.source_file_fingerprint == record_fingerprint)
-            {
+            if let Some(old) = index.claude_request_census.get(parse.index_key) {
                 if let Some(previous) = &old.safety {
                     if !previous.ac {
                         safety.unread_since = previous.unread_since;
                         safety.unread_complete_terminals = previous.unread_complete_terminals;
-                        if safety.acquired <= previous.acquired {
+                        if (old.source_file_fingerprint == record_fingerprint
+                            && safety.acquired <= previous.acquired)
+                            || safety.acquired == 0
+                        {
                             safety.last_progress_at = previous.last_progress_at;
                         }
                     }
@@ -3284,7 +3332,7 @@ impl ClaudeRequestCensusJoin {
                     ClaudeRequestCensusShape::IdentityIncomplete => {
                         counts.shape_identity_incomplete += 1
                     }
-                    ClaudeRequestCensusShape::Lossy => counts.shape_lossy += 1,
+                    ClaudeRequestCensusShape::Lossy => {}
                     ClaudeRequestCensusShape::OverBudget => {}
                 }
                 counts.unverified += usize::from(record.unverified);
@@ -3347,6 +3395,11 @@ impl ClaudeRequestCensusJoin {
                 join.counts.migration_estimate_known = false;
             }
         }
+        join.counts.shape_lossy = join
+            .counts
+            .shape_lossy_unread
+            .saturating_add(join.counts.shape_lossy_dropped)
+            .saturating_add(join.counts.shape_multi_item);
         join.counts.family_unknown_roots = join.unknown_roots.len();
         join.merge_hashes(census);
         join.observe_workspace(0);
@@ -3701,8 +3754,9 @@ impl CensusShadowView {
         })
     }
 
-    pub(crate) fn settled_for(&self, _index: &ScanIndex, root: &str) -> bool {
-        self.settled_roots.get(root).copied().unwrap_or(false)
+    pub(crate) fn settled_for(&self, index: &ScanIndex, root: &str) -> bool {
+        !index.claude_request_census.safety_incomplete.incomplete()
+            && self.settled_roots.get(root).copied().unwrap_or(false)
     }
 
     /// Called after pending accumulation, before authority/fence mutation. The
@@ -4035,6 +4089,21 @@ impl ClaudeRequestCensusRecord {
             modified: None,
             ledger: None,
         }
+    }
+    pub(crate) fn without_safety_for_test(mut self) -> Self {
+        self.safety = None;
+        self.safety_hashes = None;
+        self
+    }
+    pub(crate) fn with_acquired_eof_for_test(mut self, acquired: bool) -> Self {
+        self.safety = Some(Box::new(TranscriptSafety {
+            sc: 1,
+            oc: 1,
+            ac: acquired,
+            ld: acquired && self.shape == ClaudeRequestCensusShape::Lossy,
+            ..TranscriptSafety::default()
+        }));
+        self
     }
     pub(crate) fn with_modified_for_test(mut self, modified: Option<u64>) -> Self {
         self.modified = modified;
@@ -4726,7 +4795,7 @@ mod phase_b_tests {
             );
         }
         prepare_safety_checkpoint(&mut index);
-        let checkpoint = serde_json::to_vec(&index).unwrap();
+        let checkpoint = serde_json::to_vec_pretty(&index).unwrap();
         let ((counts, workspace), allocation) =
             crate::retry_allocation_probe::measure_caller_thread(|| {
                 let old = index.clone();
@@ -4759,5 +4828,86 @@ mod phase_b_tests {
             counts.shadow_healthy_terminals_memory_refused,
             u64::from(counts.transient_limited)
         );
+    }
+    #[test]
+    fn malformed_optional_safety_retains_money_bytes_but_closes_the_whole_shadow() {
+        let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![8]))]);
+        let scratch = crate::test_scratch::ScratchDir::new("phase-b-inert-safety");
+        let path = scratch.join("index.json");
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"].as_object_mut().unwrap().remove(A);
+        value["claude_request_census"][A]["x"]["sc"] = serde_json::json!(99);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded
+                .claude_request_census
+                .get(A)
+                .unwrap()
+                .request_hashes(),
+            &[9]
+        );
+        assert!(loaded.claude_request_census.get(B).is_some());
+        let join = ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new());
+        assert!(!join.disjointness_complete(true));
+        assert_eq!(join.counts.safety_resource_refused_keys, 1);
+    }
+
+    #[test]
+    fn malformed_unindexed_base_record_cannot_silently_restore_strong_comparison() {
+        let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![8]))]);
+        let scratch = crate::test_scratch::ScratchDir::new("phase-b-base-loss");
+        let path = scratch.join("index.json");
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"].as_object_mut().unwrap().remove(A);
+        value["claude_request_census"][A]["b"] = serde_json::json!("not base64");
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded.claude_request_census.get(A).is_none());
+        assert!(loaded.claude_request_census.get(B).is_some());
+        assert!(loaded.claude_request_census.safety_incomplete.incomplete());
+        assert!(!claude_census_disjointness_complete(&loaded, WINDOW, true));
+        loaded.save(&path).unwrap();
+        assert!(!claude_census_disjointness_complete(
+            &ScanIndex::load(&path).unwrap(),
+            WINDOW,
+            true
+        ));
+    }
+    #[test]
+    fn old_lossy_capability_gap_closes_an_unrelated_exact_family() {
+        let mut old = record('a', vec![9]).without_safety_for_test();
+        old.shape = ClaudeRequestCensusShape::Lossy;
+        let index = index_with(vec![(A, old), (B, record('b', vec![8]))]);
+        let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
+        assert!(!join.disjointness_complete(true));
+        assert_eq!(join.counts.shape_lossy_classification_unknown, 1);
+        assert_eq!(
+            join.member_status(&index, B, true),
+            ClaudeCensusMemberStatus::Unobserved
+        );
+    }
+
+    #[test]
+    fn a_full_supported_reparse_restores_a_reclaimed_key_without_money_resurrection() {
+        let mut a = record('a', vec![9]);
+        a.retire_transcript_preserving_safety();
+        a.safety_hashes = None;
+        a.safety.as_mut().unwrap().sr = true;
+        let mut index = index_with(vec![(A, a), (B, record('b', vec![8]))]);
+        index.claude_request_census.safety_incomplete.note(A, 1, 7);
+        let mut restored = record('a', vec![9]);
+        restored.retire_transcript_preserving_safety();
+        assert_eq!(
+            index.claude_request_census.insert_for_test(A, restored),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert!(!index.claude_request_census.safety_incomplete.incomplete());
+        let restored = index.claude_request_census.get(A).unwrap();
+        assert_eq!(restored.retired(), Some(1));
+        assert!(restored.request_hashes().is_empty());
+        assert_eq!(restored.duplicate_safety_hashes(), &[9]);
     }
 }

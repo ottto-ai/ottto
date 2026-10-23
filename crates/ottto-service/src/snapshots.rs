@@ -24169,6 +24169,7 @@ impl OwnedSourceScan {
                         index.attribute_codex_blocked(&key, blocked.clone());
                     }
                 }
+                let census_source_unchanged = parsed_file.census_source_unchanged;
                 let report = parsed_file.report;
                 let recognized_usage_drop_count = parsed_file.recognized_usage_drop_count;
                 let ownership_incomplete_file_count = parsed_file.ownership_incomplete_file_count;
@@ -24367,7 +24368,8 @@ impl OwnedSourceScan {
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
                                 complete: parse_complete,
-                                acquired_eof: cursor_fragment.is_none()
+                                acquired_eof: census_source_unchanged
+                                    && cursor_fragment.is_none()
                                     && attempt_read_end >= candidate.size_bytes,
                                 acquired: attempt_read_end.min(candidate.size_bytes),
                                 extent: candidate.size_bytes,
@@ -27116,6 +27118,8 @@ fn parse_jsonl_file(
 
 #[derive(Debug)]
 struct ParsedJsonlFile {
+    /// Existing descriptor revalidation: an allowed growing prefix is not acquired EOF.
+    census_source_unchanged: bool,
     snapshots: Vec<SnapshotItem>,
     report: JsonlReadReport,
     recognized_usage_drop_count: usize,
@@ -27660,6 +27664,7 @@ impl OwnedJsonlParser {
             }
         }
         Ok(ParsedJsonlFile {
+            census_source_unchanged: observed_after_read == expected_opened_object_identity,
             snapshots,
             report,
             recognized_usage_drop_count,
@@ -77558,7 +77563,7 @@ crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
 crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
-crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
+crate::heap_layout_bound::fields!(ParsedJsonlFile; census_source_unchanged, snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
     terminal_line_loss_count, state_only_blocked_session_ids, codex_parent_session_ref,
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,

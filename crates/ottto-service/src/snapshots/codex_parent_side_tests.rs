@@ -8,6 +8,7 @@ const SWEEP_NOW: u64 = 1_800_000_000;
 
 fn parsed() -> ParsedJsonlFile {
     ParsedJsonlFile {
+        census_source_unchanged: false,
         snapshots: Vec::new(),
         report: JsonlReadReport::default(),
         recognized_usage_drop_count: 0,
