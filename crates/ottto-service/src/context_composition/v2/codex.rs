@@ -242,6 +242,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         }
     }
     let day: Day = ts.map_or(out.fallback_day, |ts| ts.date().to_julian_day());
+    out.stats.undated += u64::from(ts.is_none());
     let cwd = state.cwd.clone();
     let author = if state.agent_author {
         Author::Agent
