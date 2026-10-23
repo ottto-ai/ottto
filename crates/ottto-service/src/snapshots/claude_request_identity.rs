@@ -9,7 +9,8 @@
 //!
 //! Tagging runs after rows are built and only when the per-request regrouping
 //! reproduces every row exactly; otherwise the item keeps today's path. It adds
-//! no transcript read, parse or retained state.
+//! no transcript read, parse or retained state. Transcript markers never authorize
+//! emitted tags; login-only telemetry keeps its login without a marker org.
 
 use super::claude_request_accounts::{local_subscription, normalize_activity};
 use super::{
@@ -2076,38 +2077,24 @@ fn owner_root(item: &SnapshotItem) -> Option<&str> {
 
 type Duplicates = BTreeMap<String, BTreeSet<super::ClaudeDuplicateRequestOwner>>;
 
-/// What this pass's duplicate census settled about who holds a transcript
-/// request. Known only after the reported rebuild has updated the witness.
+/// This pass's duplicate witness. Census settlement never authorizes marker
+/// tags; duplicates still refuse transcript requests without their own telemetry.
 pub(crate) struct TranscriptOwnership<'i> {
-    /// Request-id hashes that more than one transcript carries.
     duplicates: &'i Duplicates,
-    /// The pass compared every indexed Claude transcript's current requests
-    /// (complete, valid census with the fence open, and every indexed member
-    /// observed this window). Fence coverage alone is not enough: it excuses
-    /// a family under a bound authority quarantine, whose requests were not
-    /// compared. Only then can a request without its own telemetry be shown
-    /// to be this transcript's alone, so only then may markers tag it.
-    settled: bool,
 }
 
 impl<'i> TranscriptOwnership<'i> {
     pub(crate) fn after_census(
         index: &'i ScanIndex,
-        disposition: &super::ClaudeUsageAuthorityDisposition,
+        _disposition: &super::ClaudeUsageAuthorityDisposition,
     ) -> Self {
-        let census = &disposition.duplicate_census;
         Self {
             duplicates: &index.claude_duplicate_request_owners,
-            settled: census.census_complete
-                && census.coverage_complete
-                && disposition.transcript_ownership_complete
-                && !census.census_invalid
-                && !census.fence_after,
         }
     }
 }
 
-/// A settled pass with no duplicates: what the classification tests assume.
+/// No duplicates: what the classification tests assume.
 #[cfg(test)]
 pub(crate) fn apply_scan(
     snapshots: &mut [SnapshotItem],
@@ -2119,10 +2106,7 @@ pub(crate) fn apply_scan(
         snapshots,
         evidence,
         reported,
-        &TranscriptOwnership {
-            duplicates: &NONE,
-            settled: true,
-        },
+        &TranscriptOwnership { duplicates: &NONE },
     )
 }
 
@@ -2190,12 +2174,10 @@ fn tag_item(
         transcript_requests(item, |request| sink.add(item, request))?;
         sink.finish()
     };
-    if !ownership.settled {
-        // An unmarked fork or resume copies its predecessor's lines, markers
-        // included, and nothing short of a fully compared pass shows which
-        // lines are copies: markers tag nothing this pass.
-        grouping.withdraw_transcript_tags();
-    }
+    // A fork or resume can copy its predecessor's markers. Neither a settled
+    // census nor an open fence makes those markers request-owned evidence.
+    // Both grouping sources withdraw them before any identity is installed.
+    grouping.withdraw_transcript_tags();
     // D1 leaves new-collector items alone, so the backend UTC lifecycle
     // spelling it applies to every item it qualifies happens here, inside the
     // byte cap; an ineligible item returns to D1 exactly as it arrived.
