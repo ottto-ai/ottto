@@ -1533,6 +1533,9 @@ fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
     }
 }
 
+/// A synthetic traversal problem, applied to a clean terminal traversal.
+type TraversalProblem = fn(&mut ScanTraversalCheckpoint);
+
 /// A clean terminal traversal that observed `observed`.
 fn clean_terminal_traversal(observed: BTreeSet<String>) -> ScanTraversalCheckpoint {
     ScanTraversalCheckpoint {
@@ -1557,7 +1560,7 @@ fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
         census_member: true,
         watcher_hint: false,
     };
-    let problems: [(&str, fn(&mut ScanTraversalCheckpoint)); 7] = [
+    let problems: [(&str, TraversalProblem); 7] = [
         ("symlink", |traversal| {
             traversal.counts.symlink_rejected_count = 1
         }),
@@ -1670,8 +1673,10 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
             .unwrap()
             .claude_history_unverified_in_process
     );
-    let mut index = ScanIndex::default();
-    index.generation = 3;
+    let mut index = ScanIndex {
+        generation: 3,
+        ..ScanIndex::default()
+    };
     index.save(&fresh).unwrap();
     assert!(
         ScanIndex::load(&fresh)
@@ -1687,8 +1692,10 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
             .claude_history_unverified_in_process
     );
     let historic = dir.join("historic-index.json");
-    let mut index = ScanIndex::default();
-    index.generation = 3;
+    let mut index = ScanIndex {
+        generation: 3,
+        ..ScanIndex::default()
+    };
     index.save(&historic).unwrap();
     assert!(
         !ScanIndex::load(&historic)
@@ -1713,8 +1720,10 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
     let kept = claude_retired_family_digest("kept-root");
-    let mut index = ScanIndex::default();
-    index.generation = 7;
+    let mut index = ScanIndex {
+        generation: 7,
+        ..ScanIndex::default()
+    };
     index.insert_retry_pending_claude_authority_for_test("held-root");
     index.save(&path).unwrap();
     let saved = || serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap();
