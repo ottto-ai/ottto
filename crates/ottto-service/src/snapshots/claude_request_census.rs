@@ -389,6 +389,7 @@ impl ClaudeRequestCensusRecord {
 
     /// Both records were produced at the same file fingerprint (a ledger
     /// `mh:` record and the transcript record it describes).
+    #[cfg(test)]
     pub(crate) fn same_fingerprint(&self, other: &Self) -> bool {
         self.source_file_fingerprint == other.source_file_fingerprint
     }
@@ -437,6 +438,7 @@ impl ClaudeRequestCensusRecord {
         self.source_file_fingerprint
     }
 
+    #[cfg(test)]
     pub(crate) fn money_watch(&self, revision: [u8; 32]) -> Self {
         Self {
             request_hashes: self.shared_request_hashes(),
