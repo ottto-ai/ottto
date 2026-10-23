@@ -1238,7 +1238,7 @@ fn request_relay_token(
     // The device secret never rides the pooled forwarding agent: that agent
     // follows redirects. A token is issued rarely, so a fresh agent with the
     // same timeouts and fallback resolver costs one handshake.
-    let response: RelayTokenResponse = crate::retry_tls::credential_agent_builder()
+    let response = crate::retry_tls::credential_agent_builder()
         .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
         .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
         .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)
@@ -1248,7 +1248,15 @@ fn request_relay_token(
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", device_secret)
         .send_json(relay_token_request_payload(device, source.api_slug()))
-        .map_err(|error| anyhow!("issue relay token failed: {error}"))?
+        .map_err(|error| anyhow!("issue relay token failed: {error}"))?;
+    // With redirects off a 3xx arrives as `Ok`; only a 2xx carries a token.
+    if !(200..300).contains(&response.status()) {
+        return Err(anyhow!(
+            "issue relay token failed: unexpected status {}",
+            response.status()
+        ));
+    }
+    let response: RelayTokenResponse = response
         .into_json()
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
     Ok(response.token)

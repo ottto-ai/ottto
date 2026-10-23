@@ -13026,13 +13026,14 @@ fn request_source_relay_token(
         api_base_url,
         &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
     );
-    let response: RelayTokenApiResponse = crate::retry_tls::credential_agent()
+    let response = crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", device_secret)
         .timeout(BACKEND_REQUEST_TIMEOUT)
         .send_json(relay_token_request_payload(device, source_slug(source)))
-        .map_err(|error| backend_error_from_ureq(&url, error))?
+        .map_err(|error| backend_error_from_ureq(&url, error))?;
+    let response: RelayTokenApiResponse = backend_success(&url, response)?
         .into_json()
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))?;
     Ok(response.token)
@@ -15968,7 +15969,7 @@ fn backend_post_json_with_timeout<T: DeserializeOwned>(
     let response = request
         .send_json(body)
         .map_err(|error| backend_error_from_ureq(url, error))?;
-    response
+    backend_success(url, response)?
         .into_json()
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
@@ -16003,9 +16004,25 @@ fn backend_get_json_with_timeout<T: DeserializeOwned>(
     let response = request
         .call()
         .map_err(|error| backend_error_from_ureq(url, error))?;
-    response
+    backend_success(url, response)?
         .into_json()
         .map_err(|error| backend_response_unexpected(url, error.to_string()))
+}
+
+/// Credential requests never follow a redirect, so ureq returns a 3xx as
+/// `Ok`. Only a 2xx response is a backend success worth decoding.
+fn backend_success(url: &str, response: ureq::Response) -> Result<ureq::Response, LocalApiError> {
+    let status = response.status();
+    if (200..300).contains(&status) {
+        return Ok(response);
+    }
+    Err(LocalApiError::Backend(BackendErrorDetails {
+        kind: BackendErrorKind::ResponseUnexpected,
+        endpoint: safe_backend_endpoint(url),
+        status: Some(status),
+        body_excerpt: None,
+        reason_code: None,
+    }))
 }
 
 fn backend_error_from_ureq(url: &str, error: ureq::Error) -> LocalApiError {
@@ -23433,7 +23450,14 @@ for line in sys.stdin:
                 &[("X-Ottto-Setup-Run-Token", secret.as_str())],
             );
             assert!(
-                result.is_err(),
+                matches!(
+                    result,
+                    Err(LocalApiError::Backend(BackendErrorDetails {
+                        kind: BackendErrorKind::ResponseUnexpected,
+                        status: Some(returned),
+                        ..
+                    })) if returned.to_string() == code
+                ),
                 "{status}: an unfollowed 3xx is not a success"
             );
             let request = backend.finish();
@@ -23447,7 +23471,14 @@ for line in sys.stdin:
             let result: Result<serde_json::Value, LocalApiError> =
                 backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", secret.as_str())]);
             assert!(
-                result.is_err(),
+                matches!(
+                    result,
+                    Err(LocalApiError::Backend(BackendErrorDetails {
+                        kind: BackendErrorKind::ResponseUnexpected,
+                        status: Some(returned),
+                        ..
+                    })) if returned.to_string() == code
+                ),
                 "{status}: an unfollowed 3xx is not a success"
             );
             let request = backend.finish();
@@ -23463,13 +23494,13 @@ for line in sys.stdin:
                 machine_id: None,
                 sources: vec!["codex".to_string()],
             };
-            assert!(request_source_relay_token(
-                &backend.base_url,
-                &device,
-                &secret,
-                &SourceKind::Codex
-            )
-            .is_err());
+            assert!(matches!(
+                request_source_relay_token(&backend.base_url, &device, &secret, &SourceKind::Codex),
+                Err(LocalApiError::Backend(BackendErrorDetails {
+                    kind: BackendErrorKind::ResponseUnexpected,
+                    ..
+                }))
+            ));
             let request = backend.finish();
             assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
             assert_never_logged(&secret);

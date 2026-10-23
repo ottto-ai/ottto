@@ -1367,8 +1367,8 @@ pub(crate) mod credential_test_support {
         assert_eq!(leaked, 0, "a credential reached the host logger");
     }
 
-    /// A backend that answers its first request with `status` and a
-    /// `Location` on a second loopback host nobody serves.
+    /// A backend that answers its first request with `status`, a `Location`
+    /// on a second loopback host nobody serves, and a success-shaped body.
     pub(crate) struct RedirectingBackend {
         pub(crate) base_url: String,
         target: TcpListener,
@@ -1386,8 +1386,12 @@ pub(crate) mod credential_test_support {
             let server = thread::spawn(move || {
                 let (mut stream, _) = listener.accept().expect("accept request");
                 let request = read_request(&mut stream);
+                // A body every caller would decode as success: a client
+                // must reject the 3xx itself, not fail on an empty body.
+                let body = r#"{"token":"redirected","device_released":true}"#;
                 let response = format!(
-                    "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
                 );
                 stream
                     .write_all(response.as_bytes())
