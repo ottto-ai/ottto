@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 828,
-  "content_sha256": "9f67994573db3a7561ea07f7a30cf49b45098eade5558d416252e07d77ba3758",
+  "content_sha256": "4997ca811396aca86bbe664767ddc89a6cd5c77885792ecd3178abae27aa5387",
   "files": [
     {
       "executable": false,
@@ -1469,15 +1469,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/authority_proof_correction_pipeline_tests.rs",
-      "sha256": "3d96aeec5e471cd2ede603db619664c060227d1bff03655c036933d54ba92a4c",
-      "size_bytes": 116054
+      "sha256": "fc123a620a11ac4c0f6ff2644163eec9e26e880806eb4a7e203b88afa13e8dba",
+      "size_bytes": 122641
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "dc75145b5aa3c0c94dfef3c636215a26105126ab45e6d4878ac37496574b1ae0",
-      "size_bytes": 137268
+      "sha256": "1b2714eddd31db38b09ee46ed336e6519d62cfa3952c30ea056303065afc0e1b",
+      "size_bytes": 138558
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "d4bdd4ce46666761359995cfb0c2291ec904ad1dd6940b82f1b264ce2cb34264",
-      "size_bytes": 3412177
+      "sha256": "7c679463551eaaa4afb510997941a9dc8dff68629377939884e0a1e58e59b4e3",
+      "size_bytes": 3417465
     },
     {
       "executable": false,
@@ -2134,8 +2134,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "3ee940a9a78a7d5b320abc740d49bbe2e116822b6c79145826bdecbc66ac3a82",
-      "size_bytes": 35372
+      "sha256": "d196ac00cdc7b927d5b4bef34654a11373499d4dc5406c412ccbd371d27e736a",
+      "size_bytes": 36723
     },
     {
       "executable": false,
@@ -4010,8 +4010,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-patha-authority-hold-bridge.md",
-      "sha256": "72f56d9075d96e19267c2f246f73c21e3d94084294c54f6edd9ec21de444a268",
-      "size_bytes": 8596
+      "sha256": "6a0e16fe9485957a4fd197b9ee0bbb6de600f57d560e3614febe7b9ccf9b31a9",
+      "size_bytes": 9509
     },
     {
       "executable": false,
@@ -5799,7 +5799,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T12:32:50+00:00",
+  "generated_at": "2026-10-23T12:41:17+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 829,
   "public_roots": [
@@ -5838,5 +5838,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "6b508728cdabe716d602d71d80c9ffe2aa9333c8"
+  "source_commit": "c71d62245d5c8a0aaf9753d3ae01e792c354e74b"
 }
