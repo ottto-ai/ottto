@@ -2770,3 +2770,18 @@ fn census_hashes(support: &Path) -> usize {
     store::with_ledger_for_test(support, |ledger| ledger.census().hash_total_for_test())
         .unwrap_or(0)
 }
+
+#[test]
+fn money_p1b_large_holder_record_checks_inner_deadline() {
+    let deadline = Instant::now() + Duration::from_millis(1);
+    let mut ledger = MoneyLedger::new(&[], &[], &[]);
+    let hashes = (0..1_000_000).collect::<Vec<u64>>();
+    ledger.ledger.insert_for_test("otel:large", money_record('a', hashes.clone()));
+    let started = Instant::now();
+    let result = crate::snapshots::claude_request_ledger::scan_holders(
+        ledger.index.claude_request_census_for_test(), &ledger.ledger,
+        &hashes, &[], deadline, &mut |_| true);
+    assert!(result.is_none());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    println!("MONEY_P1B_HOLDER hashes=1000000 wall_us={} check_interval=4096", started.elapsed().as_micros());
+}

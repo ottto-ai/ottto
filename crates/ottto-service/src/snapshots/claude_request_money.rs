@@ -1094,6 +1094,7 @@ static LAST_SHADOW: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new
 /// items, the index, the strict rows and traces the live path already loaded
 /// and the captures of this page's parses; mutates only its own ledger. Never
 /// fails the page.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn shadow_page(
     support_dir: &Path,
     snapshots: &[SnapshotItem],
@@ -2977,4 +2978,52 @@ pub(crate) fn parse_usd_micros_for_test(value: &str) -> Option<u64> {
 #[cfg(test)]
 pub(crate) fn reserved_for_test() -> usize {
     SHADOW_RESERVED.load(Ordering::Acquire)
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn interim_seam_never_covers_and_preserves_reason_precedence() {
+        let view = coverage::InterimFamilyCoverage {
+            fence_invalid: true,
+            census_complete: true,
+            authority_retry: true,
+        };
+        assert_eq!(
+            view.family("root"),
+            FamilyCensus::Unknown(coverage::CensusReason::FenceInvalid)
+        );
+        assert!(!ClaudeHolderView::of(&view).complete());
+        let covered = coverage::CoveredForTest;
+        assert_eq!(covered.family("root"), FamilyCensus::Covered);
+        assert!(ClaudeHolderView::of(&covered).complete());
+    }
+
+    #[test]
+    fn semantic_digest_ignores_publication_and_delta_but_includes_failure_reasons() {
+        let ledger = ClaudeLedger::empty(false);
+        let mut counts = ClaudeRequestMoneyShadowCounts::default();
+        let mut rows = failure_rows(
+            "root",
+            "memory",
+            FamilyCensus::Covered,
+            1,
+            2,
+            &ledger,
+            &mut counts,
+        );
+        let first = semantic_digest(&mut rows);
+        rows.row.snapshot = 88;
+        rows.row.observed_unix = 99;
+        rows.row.removed_change = Some(SignedRequestsTokens {
+            requests: 1,
+            tokens: 20,
+        });
+        rows.row.removed_change_basis = Some("previous_shadow");
+        assert_eq!(first, semantic_digest(&mut rows));
+        rows.row.p1_reasons = vec!["deadline"];
+        assert_ne!(first, semantic_digest(&mut rows));
+    }
 }

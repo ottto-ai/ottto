@@ -1324,3 +1324,78 @@ fn money_restore_files(dir: &Path, saved: &BTreeMap<PathBuf, Vec<u8>>) {
         }
     }
 }
+
+/// M4-sized mixed page: an oversized family cannot stop smaller families,
+/// and a never-reappearing failed family remains disclosed in the file.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, index, mut scan) = money_armed_scan("money-p1b-70k");
+    let large = &mut scan.snapshots[0];
+    let root = crate::snapshots::claude_snapshot_family_root_ref(large).to_owned();
+    let occurrence = large.claude_usage_occurrences.values().next().unwrap().clone();
+    large.claude_usage_occurrences = (0..70_000).map(|at| (format!("req-large-{at}"), occurrence.clone())).collect();
+    let page = |items: &[crate::snapshots::SnapshotItem], now| {
+        let counts = money::shadow_page_at(&fixture.support, items, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete, now);
+        money::store::flush();
+        counts
+    };
+    let first = page(&scan.snapshots, response + 3600);
+    assert_eq!(first.refused_budget, 0, "{first:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let large_row = rows.iter().find(|row| row["row"] == "family" && row["family"] == money::hashed_id_for_test(&root)).unwrap();
+    assert_eq!(large_row["p1_reasons"], serde_json::json!(["oversize"]));
+    assert_eq!(large_row["old_available"], false);
+    assert!(rows.iter().filter(|row| row["row"] == "family").count() > 1);
+    let page_row = rows.iter().find(|row| row["row"] == "page").unwrap();
+    assert_eq!(page_row["page_families"].as_u64().unwrap(), page_row["written"].as_u64().unwrap() + page_row["failed"].as_u64().unwrap() + page_row["unchanged"].as_u64().unwrap());
+    assert!(first.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
+    // Simulate a crash between slices: durable intent survives lost memory.
+    money::store::restart_for_test(&fixture.support);
+    money::forget_owed_coverage_for_test(&fixture.support);
+    page(&scan.snapshots[1..], response + 86_400);
+    money::store::flush(); // loader may have refused the first restart page
+    let next = page(&scan.snapshots[1..], response + 86_401);
+    let rows = money_jsonl_rows(&fixture.support);
+    assert!(rows.iter().any(|row| row["dropped"] == true));
+    assert!(rows.iter().any(|row| row["family"] == money::hashed_id_for_test(&root) && row["p1_reasons"] == serde_json::json!(["oversize"])));
+    assert_eq!(money::reserved_for_test(), 0);
+    println!("MONEY_P1B_PAGE rows=70000 peak_transient={} transient_cap={} wall_us={} deadline_us=2000000 capture_us={} writer_us={} save_bytes_today={} daily_cap=67108864",
+        first.admitted_peak_bytes, money::SHADOW_MEMORY_CEILING_BYTES, first.elapsed_us, first.capture_us, next.writer_us, next.save_bytes_today);
+}
+
+/// Real Full parsing of thousands of files shares one cumulative capture
+/// budget; the native result remains byte-for-byte equal to the unarmed run.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
+    let fixture = PipelineFixture::new("money-p1b-full-reads");
+    for at in 0..2048 {
+        let session = format!("{at:08x}-1234-4567-890a-123456789abc");
+        std::fs::write(fixture.root.join(format!("{session}.jsonl")), pipeline_transcript_line(&session, &format!("req-{at}"), 7)).unwrap();
+    }
+    let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index, "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+    let mut baseline_index = ScanIndex::default();
+    let baseline = scan(&mut baseline_index);
+    money::enable_shadow_for_test(&fixture.support);
+    let mut armed_index = ScanIndex::default();
+    let armed = scan(&mut armed_index);
+    assert!(armed.snapshots.len() >= 2048);
+    assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
+    assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
+    let counts = money::shadow_page_at(&fixture.support, &armed.snapshots, &armed_index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), armed.census_complete,
+        census_pipeline_window("2026-08-02T08:00:00Z"));
+    money::store::flush();
+    assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
+    let rows = money_jsonl_rows(&fixture.support);
+    assert!(rows.iter().any(|row| row["row"] == "page"));
+    assert_eq!(money::reserved_for_test(), 0);
+    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} capture_us={}", armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, counts.capture_us);
+}
