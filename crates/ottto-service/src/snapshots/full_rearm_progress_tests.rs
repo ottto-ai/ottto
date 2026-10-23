@@ -1034,7 +1034,16 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
             scan.snapshots = rearm.items.clone();
             scan.census_complete = true;
             index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-            let record = index.claude_full_rearm_progress.structural_record.clone();
+            let record = index
+                .claude_full_rearm_progress
+                .structural_record
+                .clone()
+                .map(|mut record| {
+                    // A paid rearm preserves the baseline, resetting its skip history.
+                    record.suppressed_since_unix_seconds = None;
+                    record.skipped_full_rearms = 0;
+                    record
+                });
             let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
                 &support, &mut scan, &mut index,
             );
@@ -1191,7 +1200,15 @@ fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
     let (healthy, _) = terminal(&mut index);
     assert!(healthy.suppression.full_rearm_suppressed, "{healthy:?}");
     assert!(!healthy.counts.full_rearm);
-    let record = index.claude_full_rearm_progress.structural_record.clone();
+    let record = index
+        .claude_full_rearm_progress
+        .structural_record
+        .clone()
+        .map(|mut record| {
+            record.suppressed_since_unix_seconds = None;
+            record.skipped_full_rearms = 0;
+            record
+        });
     assert!(record.is_some());
 
     let auxiliary = "auxiliary-no-transcript-clock";
