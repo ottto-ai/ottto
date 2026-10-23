@@ -764,9 +764,130 @@ pub(super) fn admit_activation(revision: u64, kept_revision: u64) -> bool {
     false
 }
 
+/// The prior-history-unverified diagnostic's process state.
+#[derive(Debug, Clone, Copy)]
+struct UnverifiedSince {
+    since_unix_seconds: u64,
+    claude_cycles: u64,
+    last_alarm: Option<std::time::Instant>,
+}
+
+#[cfg(not(test))]
+static PRIOR_HISTORY_UNVERIFIED: std::sync::Mutex<Option<UnverifiedSince>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static PRIOR_HISTORY_UNVERIFIED: std::cell::Cell<Option<UnverifiedSince>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(not(test))]
+fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
+    access(
+        &mut PRIOR_HISTORY_UNVERIFIED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[cfg(test)]
+fn with_unverified_since<T>(access: impl FnOnce(&mut Option<UnverifiedSince>) -> T) -> T {
+    PRIOR_HISTORY_UNVERIFIED.with(|slot| {
+        let mut seen = slot.get();
+        let result = access(&mut seen);
+        slot.set(seen);
+        result
+    })
+}
+
+#[derive(serde::Serialize)]
+struct PriorHistoryUnverifiedAlarm {
+    unverified_since_unix_seconds: u64,
+    unverified_for_seconds: u64,
+    claude_cycles: u64,
+}
+
+/// Count-only local diagnostic (StateMissing r3 of #712), useful where a
+/// Claude census rarely settles: "prior_history_unverified set since T". T is
+/// the first Claude cycle this process read the marker set; the marker's own
+/// set time is not recorded, and this path never writes the backfill state,
+/// so a restart starts T again. A cycle that reads it clear resets it. One
+/// local alarm on the first such cycle, then at most hourly. No path, id or
+/// wire event.
+pub(crate) fn note_prior_history_unverified(unverified: bool) {
+    let now_unix_seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    note_prior_history_unverified_at(unverified, now_unix_seconds, std::time::Instant::now());
+}
+
+fn note_prior_history_unverified_at(
+    unverified: bool,
+    now_unix_seconds: u64,
+    now: std::time::Instant,
+) {
+    let alarm = with_unverified_since(|slot| {
+        if !unverified {
+            *slot = None;
+            return None;
+        }
+        let seen = slot.get_or_insert(UnverifiedSince {
+            since_unix_seconds: now_unix_seconds,
+            claude_cycles: 0,
+            last_alarm: None,
+        });
+        seen.claude_cycles = seen.claude_cycles.saturating_add(1);
+        let due = seen.last_alarm.map_or(true, |at| {
+            now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
+        });
+        if !due {
+            return None;
+        }
+        seen.last_alarm = Some(now);
+        Some(PriorHistoryUnverifiedAlarm {
+            unverified_since_unix_seconds: seen.since_unix_seconds,
+            unverified_for_seconds: now_unix_seconds.saturating_sub(seen.since_unix_seconds),
+            claude_cycles: seen.claude_cycles,
+        })
+    });
+    if let Some(alarm) = alarm {
+        crate::local_resource_diagnostics::claude_prior_history_unverified(&alarm);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// StateMissing r3: the unverified-since diagnostic reports its first
+    /// cycle at once, then at most hourly, and a clear read resets T.
+    #[test]
+    fn prior_history_unverified_reports_since_when_at_most_hourly() {
+        let start = std::time::Instant::now();
+        let at = |seconds: u64| start + std::time::Duration::from_secs(seconds);
+        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+            note_prior_history_unverified_at(true, 1_000, at(0));
+            note_prior_history_unverified_at(true, 1_600, at(600));
+            note_prior_history_unverified_at(true, 4_700, at(3_700));
+            note_prior_history_unverified_at(false, 4_800, at(3_800));
+            note_prior_history_unverified_at(true, 9_000, at(8_000));
+        });
+        assert_eq!(alarms.len(), 3, "{alarms:?}");
+        for alarm in &alarms {
+            assert_eq!(alarm["stage"], "claude_prior_history_unverified");
+            assert_eq!(alarm["source"], "claude_code");
+        }
+        let counts = |index: usize, field: &str| alarms[index]["counts"][field].clone();
+        assert_eq!(counts(0, "unverified_since_unix_seconds"), 1_000);
+        assert_eq!(counts(0, "unverified_for_seconds"), 0);
+        assert_eq!(counts(0, "claude_cycles"), 1);
+        assert_eq!(counts(1, "unverified_since_unix_seconds"), 1_000);
+        assert_eq!(counts(1, "unverified_for_seconds"), 3_700);
+        assert_eq!(counts(1, "claude_cycles"), 3);
+        assert_eq!(counts(2, "unverified_since_unix_seconds"), 9_000, "reset");
+        assert_eq!(counts(2, "claude_cycles"), 1);
+    }
 
     const EXTENT: FileExtent = FileExtent {
         size_bytes: 10,

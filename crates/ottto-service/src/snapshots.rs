@@ -105,10 +105,12 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+pub(crate) use claude_history_upgrade::{
+    note_prior_history_unverified, PriorHistory, MAX_GATED_CLAUDE_REVISION,
+};
 use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
-pub(crate) use claude_history_upgrade::{PriorHistory, MAX_GATED_CLAUDE_REVISION};
 use claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
@@ -24692,7 +24694,7 @@ impl OwnedSourceScan {
                         history_upgrade
                             .denied_for(&[HistoryHold::NoListBirth, HistoryHold::MoveNotFull]),
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
-                        index.claude_reemission_exclusions.state().as_str(),
+                        index.claude_reemission_exclusions.status(),
                         claude_reemission_stop_reason(),
                         claude_reemission_stop_withheld_folds(),
                         history_upgrade.owed,
@@ -36116,8 +36118,8 @@ impl ScanIndex {
             Some((member.root, member.subagent_stem?))
         }));
         self.claude_reemission_exclusions = exclusions;
-        if self.claude_reemission_exclusions.state() == ListState::MissingAfterInstall {
-            crate::local_resource_diagnostics::claude_reemission_list_missing();
+        if let Some(cause) = self.claude_reemission_exclusions.missing_cause() {
+            crate::local_resource_diagnostics::claude_reemission_list_missing(cause.as_str());
         }
     }
 
@@ -63539,6 +63541,7 @@ mod tests {
             "claude_reemission_list_missing_after_install"
         );
         assert_eq!(alarms[0]["source"], "claude_code");
+        assert_eq!(alarms[0]["counts"]["cause"], "seen_marker");
         // Paused: even entities newer than the cutoff wait, with old stamps.
         let paused = with_no_list_cutoff(0, || {
             claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)

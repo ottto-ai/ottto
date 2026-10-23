@@ -354,8 +354,10 @@ const _: () = assert!(
 ///   sibling of this index; or the re-emission seen-marker.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
-///   copy another destination or a legacy layout left in the support
-///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   copy another destination's directory holds (an interrupted bootstrap
+///   before a re-pair). A leftover is another destination only when it sits
+///   under a different namespace: an unscoped legacy index names no
+///   destination, so it is not a move (I-r3-1); unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -399,6 +401,10 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
+    // Only a different namespace's directory is another destination. An
+    // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
+    // no destination; it is usually this Mac's own pre-scoping index, so it
+    // must not hold history as a move (I-r3-1).
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
@@ -416,15 +422,13 @@ fn claude_prior_history(
                     Err(error) => error.kind() != std::io::ErrorKind::NotFound,
                 }
         };
-        let snapshots = support_dir.join("snapshots");
-        holds_claude_state(&snapshots)
-            || match std::fs::read_dir(snapshots.join("destinations")) {
-                Ok(mut destinations) => destinations.any(|destination| match destination {
-                    Ok(destination) => holds_claude_state(&destination.path()),
-                    Err(_) => true,
-                }),
-                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-            }
+        match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
+            Ok(mut destinations) => destinations.any(|destination| match destination {
+                Ok(destination) => holds_claude_state(&destination.path()),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     };
     // Fails closed: only a positively missing marker is absent (h695 N2).
     let seen_marker = || match std::fs::symlink_metadata(
@@ -5506,6 +5510,11 @@ fn prepare_sync_source(
             support_dir,
         )
     });
+    if let Some(prior) = prior_claude_history {
+        crate::snapshots::note_prior_history_unverified(
+            prior == crate::snapshots::PriorHistory::Unverified,
+        );
+    }
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)

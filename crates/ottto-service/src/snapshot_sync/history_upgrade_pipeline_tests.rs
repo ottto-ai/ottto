@@ -1439,6 +1439,22 @@ fn another_destinations_claude_state_is_prior_history() {
         crate::snapshots::PriorHistory::None,
         "this destination's own files are not evidence"
     );
+    // I-r3-1: legacy leftovers that name no other namespace are not a move:
+    // an unscoped pre-destination index and this destination's own v1/v2.
+    for legacy in [
+        fixture
+            .support
+            .join("snapshots/claude_code-scan-index-no-titles.json"),
+        own.join("claude_code-scan-index.json"),
+        own.join("claude_code-scan-index-v2.json"),
+    ] {
+        std::fs::write(&legacy, b"{}").expect("legacy leftover");
+    }
+    assert_eq!(
+        prior(),
+        crate::snapshots::PriorHistory::None,
+        "a same-destination or unscoped legacy leftover is not another destination"
+    );
     let other = destinations.join("destination-a");
     std::fs::create_dir_all(&other).expect("create other destination");
     std::fs::write(

@@ -25,7 +25,9 @@
 //!   If both list and marker disappear, Set or Unreadable intent still pauses
 //!   owed history; Absent intent keeps normal Macs on the paced policy.
 //! - Marker present and file missing: adoption pauses, the status reason says
-//!   so, and a local alarm is raised every cycle until the file is back.
+//!   so, and a local alarm is raised every cycle until the file is back. The
+//!   alarm names its cause (seen-marker, Set intent or unreadable intent), and
+//!   the status reason names unreadable intent when that is why.
 //! - Unreadable, oversized or malformed: adoption pauses.
 //! - Closing over families would pass `MAX_CLOSED_DIGESTS`: adoption pauses
 //!   rather than run with a partial closure.
@@ -90,13 +92,44 @@ impl crate::heap_layout_bound::HeapLayoutBound for ListState {
     }
 }
 
+/// Why a list with no file reads `MissingAfterInstall` (addendum 3, SOURCE
+/// (a)): the seen-marker is present, or the backfill state's durable intent
+/// is Set, or that intent could not be read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum MissingCause {
+    #[default]
+    SeenMarker,
+    IntentSet,
+    IntentUnreadable,
+}
+
+impl MissingCause {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::SeenMarker => "seen_marker",
+            Self::IntentSet => "intent_set",
+            Self::IntentUnreadable => "intent_unreadable",
+        }
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for MissingCause {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct ReemissionExclusions {
     digests: BTreeSet<String>,
     state: ListState,
+    /// Read only while `state` is `MissingAfterInstall`.
+    missing_cause: MissingCause,
 }
 
-crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state);
+crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state, missing_cause);
 
 impl ReemissionExclusions {
     pub(crate) fn path(support_dir: &Path) -> PathBuf {
@@ -111,25 +144,25 @@ impl ReemissionExclusions {
         let file = match std::fs::File::open(Self::path(support_dir)) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Self::with_state(
-                    match std::fs::symlink_metadata(Self::seen_marker_path(support_dir)) {
-                        Ok(_) => ListState::MissingAfterInstall,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            match crate::backfill::load_backfill_state(support_dir)
-                                .claude_history_list_intent
-                            {
-                                crate::backfill::ClaudeHistoryListIntent::Absent => {
-                                    ListState::NotInstalled
-                                }
-                                crate::backfill::ClaudeHistoryListIntent::Set
-                                | crate::backfill::ClaudeHistoryListIntent::Unreadable => {
-                                    ListState::MissingAfterInstall
-                                }
+                return match std::fs::symlink_metadata(Self::seen_marker_path(support_dir)) {
+                    Ok(_) => Self::missing(MissingCause::SeenMarker),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        match crate::backfill::load_backfill_state(support_dir)
+                            .claude_history_list_intent
+                        {
+                            crate::backfill::ClaudeHistoryListIntent::Absent => {
+                                Self::with_state(ListState::NotInstalled)
+                            }
+                            crate::backfill::ClaudeHistoryListIntent::Set => {
+                                Self::missing(MissingCause::IntentSet)
+                            }
+                            crate::backfill::ClaudeHistoryListIntent::Unreadable => {
+                                Self::missing(MissingCause::IntentUnreadable)
                             }
                         }
-                        Err(_) => ListState::Unreadable,
-                    },
-                )
+                    }
+                    Err(_) => Self::with_state(ListState::Unreadable),
+                };
             }
             Err(_) => return Self::with_state(ListState::Unreadable),
         };
@@ -173,6 +206,7 @@ impl ReemissionExclusions {
         Self {
             digests,
             state: ListState::Installed,
+            missing_cause: MissingCause::default(),
         }
     }
 
@@ -180,6 +214,14 @@ impl ReemissionExclusions {
         Self {
             digests: BTreeSet::new(),
             state,
+            missing_cause: MissingCause::default(),
+        }
+    }
+
+    fn missing(cause: MissingCause) -> Self {
+        Self {
+            missing_cause: cause,
+            ..Self::with_state(ListState::MissingAfterInstall)
         }
     }
 
@@ -192,6 +234,20 @@ impl ReemissionExclusions {
 
     pub(crate) fn state(&self) -> ListState {
         self.state
+    }
+
+    /// Why the list reads missing, only while it is `MissingAfterInstall`.
+    pub(crate) fn missing_cause(&self) -> Option<MissingCause> {
+        (self.state == ListState::MissingAfterInstall).then_some(self.missing_cause)
+    }
+
+    /// The plain local status reason: the list state, naming unreadable
+    /// intent when that is why the list reads missing after install.
+    pub(crate) fn status(&self) -> &'static str {
+        match self.missing_cause() {
+            Some(MissingCause::IntentUnreadable) => "missing_after_install_intent_unreadable",
+            _ => self.state.as_str(),
+        }
     }
 
     pub(crate) fn is_invalid(&self) -> bool {
@@ -420,6 +476,7 @@ mod tests {
         let missing = ReemissionExclusions::load(&dir);
         assert_eq!(missing.state(), ListState::MissingAfterInstall);
         assert_eq!(missing.state().as_str(), "missing_after_install");
+        assert_eq!(missing.missing_cause(), Some(MissingCause::SeenMarker));
         assert!(missing.pauses_adoption() && !missing.is_invalid());
         assert!(!missing.holds_without_list(None), "paused, not held");
         // Each load is a fresh read, as after a restart: the marker remains.
@@ -431,6 +488,51 @@ mod tests {
         assert_eq!(
             ReemissionExclusions::load(&dir).state(),
             ListState::Installed
+        );
+    }
+
+    /// Addendum 3 (SOURCE (a)): with the list file gone, the missing pause
+    /// names its cause, and the status reason names unreadable intent.
+    #[test]
+    fn missing_after_install_names_unreadable_intent_as_its_cause() {
+        let dir = crate::test_scratch::ScratchDir::new("reemission-exclusions-missing-cause");
+        let path = ReemissionExclusions::path(&dir);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(
+            ReemissionExclusions::load(&dir).state(),
+            ListState::Installed
+        );
+        std::fs::remove_file(&path).unwrap();
+        let marker = ReemissionExclusions::load(&dir);
+        assert_eq!(marker.missing_cause(), Some(MissingCause::SeenMarker));
+        assert_eq!(marker.status(), "missing_after_install");
+
+        std::fs::remove_file(ReemissionExclusions::seen_marker_path(&dir)).unwrap();
+        let intent = ReemissionExclusions::load(&dir);
+        assert_eq!(intent.state(), ListState::MissingAfterInstall);
+        assert_eq!(intent.missing_cause(), Some(MissingCause::IntentSet));
+        assert_eq!(intent.status(), "missing_after_install");
+
+        std::fs::write(crate::backfill::backfill_state_path(&dir), b"{").unwrap();
+        let unreadable = ReemissionExclusions::load(&dir);
+        assert_eq!(unreadable.state(), ListState::MissingAfterInstall);
+        assert!(unreadable.pauses_adoption());
+        assert_eq!(
+            unreadable.missing_cause(),
+            Some(MissingCause::IntentUnreadable)
+        );
+        assert_eq!(
+            unreadable.missing_cause().map(MissingCause::as_str),
+            Some("intent_unreadable")
+        );
+        assert_eq!(
+            unreadable.status(),
+            "missing_after_install_intent_unreadable"
+        );
+        assert_eq!(
+            ReemissionExclusions::with_state(ListState::Unreadable).missing_cause(),
+            None
         );
     }
 
