@@ -782,7 +782,8 @@ pub struct SourceHealth {
 /// only the sessions whose activity advanced in the latest scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionReconciliation {
-    /// Start of the completed activity scan, absent in older caches.
+    /// Start of the completed Claude activity scan. Absent for other sources,
+    /// cleared lists, and older caches.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_started_at: Option<Rfc3339Timestamp>,
     pub reconciled_at: Rfc3339Timestamp,
