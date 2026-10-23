@@ -1138,6 +1138,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             claude_context_curve_request_index_complete: _, // I
             claude_context_curve_owned_start_proven: _,     // I
             claude_file_birth: _,                           // M
+            claude_file_birth_verdict: _,                   // I (inline enum; None at finish)
             activity_summary: _,                            // D
             tool_usage: _,                                  // D (from R's tool names)
             tool_usage_truncated: _,                        // I
