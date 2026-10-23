@@ -4749,6 +4749,12 @@ fn prepare_sync_source(
         snapshot_quarantine_witness(source),
     )?;
     let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
+    // and eager hydrate run against the index exactly as loaded, namespaced
+    // by this index file. They touch only side requests and side records.
+    let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
+        crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
+    });
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -4845,9 +4851,16 @@ fn prepare_sync_source(
         .intersection(&legacy_reconciliation_pending)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if historical_replay_pending {
-        index.prepare_historical_replay(replay_generation.clone());
-    }
+    // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
+    // scan is built.
+    crate::snapshots::prepare_historical_replay_with_side(
+        &mut index,
+        historical_replay_pending,
+        replay_generation.clone(),
+        source,
+        &daemon.transcript_cache,
+        &index_path,
+    );
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
@@ -4919,7 +4932,8 @@ fn prepare_sync_source(
             "{:x}",
             Sha256::digest(sampled_scope.as_bytes())
         )),
-    );
+    )
+    .with_codex_side_pass(codex_side_pass);
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
@@ -5009,6 +5023,36 @@ fn capture_codex_recovery_evidence(
         }
     }
     scan_result.finish_codex_capture_boundary(index);
+}
+
+/// U1a-2a D5′ (C15), Codex only: read immediately before the call that
+/// assembles and writes the selected save; no side writer runs in between.
+fn codex_side_save_mark(
+    daemon: &LocalDaemon,
+    source: SnapshotSource,
+    index_path: &Path,
+) -> Option<crate::snapshots::CodexSideSaveMark> {
+    (source == SnapshotSource::Codex)
+        .then(|| crate::snapshots::codex_side_save_mark(&daemon.transcript_cache, index_path))
+}
+
+/// U1a-2a (C15): this pass's side-ledger entries up to `mark` are now on
+/// disk (a full save, or a partial checkpoint that carries every side
+/// field). `Ok` arms only.
+fn note_codex_side_saved(
+    daemon: &LocalDaemon,
+    index_path: &Path,
+    full: bool,
+    mark: Option<crate::snapshots::CodexSideSaveMark>,
+) {
+    if let Some(mark) = mark {
+        crate::snapshots::note_codex_side_pass_saved(
+            &daemon.transcript_cache,
+            index_path,
+            full,
+            mark,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5714,6 +5758,7 @@ fn finish_sync_source(
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
+            let side_mark = codex_side_save_mark(daemon, source, &index_path);
             let committable = match checkpoint_partial_snapshot_index_with_comparison(
                 &index,
                 &committed_index,
@@ -5732,7 +5777,10 @@ fn finish_sync_source(
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
             ) {
-                Ok(committable) => committable,
+                Ok(committable) => {
+                    note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    committable
+                }
                 Err(error) => {
                     checkpoint_succeeded = false;
                     eprintln!(
@@ -5829,6 +5877,7 @@ fn finish_sync_source(
             // delta can prune those ACKs. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
+                let side_mark = codex_side_save_mark(daemon, source, &index_path);
                 match checkpoint_partial_snapshot_index_with_comparison(
                     &index,
                     &committed_index,
@@ -5847,7 +5896,10 @@ fn finish_sync_source(
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        index = committable;
+                        note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -6064,6 +6116,7 @@ fn finish_sync_source(
     );
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
+    let side_mark = codex_side_save_mark(daemon, source, &index_path);
     save_index_and_publish_manifest(
         &mut index,
         &index_path,
@@ -6073,6 +6126,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    note_codex_side_saved(daemon, &index_path, true, side_mark);
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()
