@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 827,
-  "content_sha256": "8628eb271897a0adc9fb7c769aa7fe93d1c7d43ec70e9d64ff4fe3205069095b",
+  "candidate_file_count": 828,
+  "content_sha256": "37ff63f922119169713fc5500eabb5b7078651fdcd8fbf0b8a59bd14f390319b",
   "files": [
     {
       "executable": false,
@@ -1819,8 +1819,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "7807b5672a2504b89fb2a17869ace3234577e2535d338517afc3cb82ea912956",
-      "size_bytes": 109153
+      "sha256": "e8209262c13ea8475f8066fbd4037b474cb058fdd416197197c702f67712d8fe",
+      "size_bytes": 112757
     },
     {
       "executable": false,
@@ -2276,6 +2276,13 @@
       "path": "docs/connectors.md",
       "sha256": "296177f70537e93cd8fef23b3980ea7114449179c67c5202c825fb2796b4ddd5",
       "size_bytes": 1982
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/development/2026-10-23-census-safety-admission-pressure.md",
+      "sha256": "e4b5abe2e37c1872f7e4aa70f53e442c76f80e84f6645484ce8e5671426868ae",
+      "size_bytes": 1743
     },
     {
       "executable": false,
@@ -5794,7 +5801,7 @@
   ],
   "generated_at": "2026-10-23T10:17:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 828,
+  "output_file_count": 829,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
