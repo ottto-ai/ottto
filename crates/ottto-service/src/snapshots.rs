@@ -5434,6 +5434,9 @@ pub struct ClaudeDuplicateCensusCounts {
 /// Content-free counts; nothing reads them into a decision.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeFullRearmSuppressionCounts {
+    /// Emitted in the census-line prefix so the numeric JSON summary keeps
+    /// its fixed byte bound even at maximum counter width.
+    #[serde(skip)]
     pub full_rearm_suppressed: bool,
     pub full_rearm_skipped_invalid_unchanged: u64,
     pub structural_invalid_family_count: usize,

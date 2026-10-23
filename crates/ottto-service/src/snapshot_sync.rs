@@ -5735,9 +5735,10 @@ fn finish_sync_source(
         };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
                 crate::snapshots::claude_api_cache_creation_rejection_count(),
+                stats.full_rearm_suppression.full_rearm_suppressed,
                 stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }

@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "56b0e3006c74047f57935195497effb1976a9807bbbb765f773d8f892e536f3d",
+  "content_sha256": "393a3a4ec13ca0078d02ad35a881341fde76451e44251054164324e6a62322cc",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "42428a5e784ab1295b927fc847a6c0ee7ccd6a58c23fc7b1984e9bf0e4cdd6e1",
-      "size_bytes": 916543
+      "sha256": "5c14821041f05b4fe4ac83b1c06038147f2293f3fac731cd0b715f3175f487d9",
+      "size_bytes": 916636
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "85426db5f44e88a3b75dd29ac78c565d8646d69fbf181428415baf68a45472d0",
-      "size_bytes": 3403792
+      "sha256": "d1da98538965c768ff27332de0395b4fe96b1aa9aab5b76101c158e31481ac90",
+      "size_bytes": 3403947
     },
     {
       "executable": false,
@@ -4024,8 +4024,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-23-claude-full-rearm-no-progress.md",
-      "sha256": "f453fb4672030b5f4f511ed18a17130882981db7a0495cb8bd53fc114ad80d63",
-      "size_bytes": 7912
+      "sha256": "4248e7b9cb02f5d5c1662a4b643069b217b585d42f47ad0d59df97c54921301b",
+      "size_bytes": 8113
     },
     {
       "executable": false,
@@ -5806,7 +5806,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T14:38:28+00:00",
+  "generated_at": "2026-10-23T14:45:02+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "435e204b5d79cf18068457481a424ae5136b4d72"
+  "source_commit": "b30951cd36e00123058a2a0c77777e12a90f5cde"
 }

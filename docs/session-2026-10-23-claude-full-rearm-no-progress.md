@@ -56,12 +56,14 @@ only path that does. A closed terminal that counts such a held first proof
 (`dormant_owner_successor_family_count > 0`) sets a sticky flag, and the flag
 vetoes the skip until a full re-arm runs or the fence opens.
 
-Disclosure: `full_rearm_suppression` on the Claude local-evidence counts line
-(beside `duplicate_census`, omitted while empty) carries
-`full_rearm_suppressed`, `full_rearm_skipped_invalid_unchanged`,
+Disclosure: the Claude local-evidence census line prints
+`full_rearm_suppressed=<bool>` and `full_rearm_skipped_invalid_unchanged=<n>`.
+Its `full_rearm_suppression` JSON summary (beside `duplicate_census`, omitted
+while empty) carries `full_rearm_skipped_invalid_unchanged`,
 `structural_invalid_family_count` and `suppressed_since_unix_seconds`. The
-counters stay in their own struct so the duplicate-census line keeps its
-bound.
+boolean is emitted once in the line prefix so the numeric summary keeps its
+192-byte bound even at maximum counter width. The counters stay in their own
+struct so the duplicate-census line keeps its bound.
 
 The persisted value decodes leniently: any malformed value decodes as "no
 progress", so the index still loads (nothing is quarantined) and the next due
