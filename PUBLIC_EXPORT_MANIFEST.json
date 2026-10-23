@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 818,
-  "content_sha256": "2d22c6b2163a76d0af8baca978e7a48a1df016d5a69415109a4eb88f84122849",
+  "content_sha256": "29f82e9417ec241be2115a7df8b8a4dc4087d43efa5df3b36cc3647274478640",
   "files": [
     {
       "executable": false,
@@ -1798,8 +1798,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_sidecar_reduction_tests.rs",
-      "sha256": "ff350846f6deee746ec0706ac6ce3718b7918b5f291127d3c11314ca7b1f971d",
-      "size_bytes": 29041
+      "sha256": "f629fbc02b95b5d68eca908b20fdcf4871dd3006fa0cd3b25f364a4c36841d84",
+      "size_bytes": 29414
     },
     {
       "executable": false,
@@ -5729,7 +5729,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T03:42:35+00:00",
+  "generated_at": "2026-10-23T04:41:45+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 819,
   "public_roots": [
@@ -5768,5 +5768,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "2f6138cd44aa1d1cca089b6a4af6f6805f8a81b6"
+  "source_commit": "86afe0a68394d73f142cda9522cacaf1e885d33d"
 }
