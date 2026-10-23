@@ -2071,3 +2071,164 @@ fn x_out_fact_limit_scratch_covers_adversarial_facts() {
         "fact-limit scratch {pre_trim} + {born} > term {bound}"
     );
 }
+
+/// Zero-usage Claude rows (no positive usage evidence anywhere: an itemless
+/// file): `responses[i]` content-block records of response `i`, all with
+/// the response's request id.
+fn itemless_rows(responses: &[usize]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (index, &records) in responses.iter().enumerate() {
+        for record in 0..records {
+            let mut row = envelope(
+                "assistant",
+                format!("i{index:04}-{record:05}"),
+                at(
+                    60 * index as u64 + (record / 1000) as u64,
+                    (record % 1000) as u64,
+                ),
+            );
+            row["requestId"] = json!(format!("req_011CI{index:019}"));
+            row["message"] = json!({
+                "id": format!("msg_01ITM{index:019}"),
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL,
+                "content": [{"type": "text", "text": "."}],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            });
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// #665 r35 (c22 ruling on F2): `buffered_request_hashes_bound` charges the
+/// request-hash vector the caller builds for an itemless Claude file before
+/// `finish` and keeps across it. The book holds a response of more than
+/// 1,562 records (past R's per-response domination), one past
+/// `MAX_CLAUDE_RECORDS_PER_RESPONSE` (R charges it nothing; its 4,096 stored
+/// records still feed the vector) and fifty one-record responses. The
+/// vector's measured peak is within the term, its capacity is the derived
+/// `4 * 2^k`, and the vector plus `finish`, in production order, stay
+/// within X_out plus the decode peak.
+#[test]
+fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const LONG: usize = 1_600;
+    const OVER: usize = 4_200;
+    const SHORT: usize = 50;
+    let mut shape = vec![LONG, OVER];
+    shape.extend(std::iter::repeat_n(1, SHORT));
+    let fixture = TempJsonl::new("itemless-hashes");
+    fixture.append(&with_cwd(
+        itemless_rows(&shape),
+        "/work/x-out-itemless-hashes",
+    ));
+    let (mut parser, expected) = native_parser(&fixture.path);
+    while !parser.step().unwrap() {}
+    assert!(
+        !parser.positive_usage_evidence,
+        "precondition: no positive usage evidence (itemless)"
+    );
+    let book = &parser.accumulator.claude_responses;
+    let stored: usize = book.values().map(|response| response.records.len()).sum();
+    let over: Vec<usize> = book
+        .values()
+        .filter(|response| response.record_limit_exceeded)
+        .map(|response| response.records.len())
+        .collect();
+    let longest = book
+        .values()
+        .filter(|response| !response.record_limit_exceeded)
+        .map(|response| response.records.len())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(over, vec![MAX_CLAUDE_RECORDS_PER_RESPONSE], "precondition");
+    assert!(longest > 1_562, "precondition: longest {longest}");
+    assert_eq!(stored, LONG + MAX_CLAUDE_RECORDS_PER_RESPONSE + SHORT);
+
+    if let Some(workspace) = parser.accumulator.workspace_path.clone() {
+        repository_identity_cache().lock().unwrap().insert(
+            workspace,
+            (SystemTime::now(), x_out_identity("itemless-hashes")),
+        );
+    }
+    let identity = parser
+        .accumulator
+        .workspace_path
+        .as_deref()
+        .and_then(peek_repository_identity);
+    let title = ClaudeTitleMetadata::default();
+    let peak = parser
+        .accumulator
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    let term = buffered_request_hashes_bound(stored).unwrap();
+    let x_out = parser
+        .finish_output_bound(
+            FinishOutputInput {
+                path: &fixture.path,
+                collected_at: NOW,
+                source_file_fingerprint: "x-out-fixture",
+                opened_object_identity: &expected,
+                title_metadata: Some(&title),
+                attribution: false,
+                repository_identity: identity.as_ref(),
+            },
+            usize::MAX,
+        )
+        .expect("X_out");
+
+    // The vector alone, as the caller builds it.
+    let (hashes, alone) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        super::claude_request_census::claude_buffered_request_hashes(&parser)
+    });
+    let last = stored.next_power_of_two().max(4);
+    let distinct = hashes.len();
+    assert_eq!(hashes.capacity(), last, "the derived doubling");
+    let vector_peak = alone.requested_peak_with_overlap;
+    drop(hashes);
+
+    // Production order: the vector, then `finish` beside it.
+    let ((hashes, parsed), actual) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let hashes = super::claude_request_census::claude_buffered_request_hashes(&parser);
+        let parsed = parser
+            .finish_with_repository_identity(
+                &expected,
+                &fixture.path,
+                NOW,
+                "x-out-fixture".into(),
+                None,
+                Some(&title),
+                None,
+                identity,
+            )
+            .unwrap();
+        (hashes, parsed)
+    });
+    let born = actual.requested_peak_with_overlap;
+    eprintln!(
+        "X_OUT_HASHES stored={stored} longest={longest} limit_exceeded={} distinct={distinct} capacity={last} vector_peak={vector_peak} term={term} x_out={x_out} decode_peak={peak} born={born} items={} born_ratio={:.4}",
+        over[0],
+        parsed.snapshots.len(),
+        born as f64 / (x_out + peak) as f64,
+    );
+    drop(hashes);
+    assert!(
+        vector_peak <= term,
+        "request-hash vector {vector_peak} > term {term}"
+    );
+    assert!(
+        vector_peak >= 8 * (last + last / 2),
+        "precondition: the last growth's old and new buffers were measured"
+    );
+    assert!(
+        born <= x_out + peak,
+        "itemless: born {born} > x_out {x_out} + decode peak {peak}"
+    );
+}

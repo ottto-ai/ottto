@@ -14866,15 +14866,9 @@ impl SnapshotAccumulator {
     ///   state, so D/M's `3*(accumulator - book)` covers it; U2 charges the
     ///   collected vector and the candidates.
     /// - `claude_buffered_request_hashes` (itemless Claude files only, built
-    ///   just before `finish` and live across it): one `u64` per book record
-    ///   with a request id, grown by doubling, so at most 24 B per record;
-    ///   at most 4,096 records per response and 65,536 per file
-    ///   (`MAX_CLAUDE_RECORDS_PER_RESPONSE`, `_PER_FILE`), so at most
-    ///   1,572,864 B. R charges every resolved response at least 6
-    ///   `(RowKey, BucketRowAccumulator)` nodes (37,488 B), which covers the
-    ///   vector while each response holds at most 1,562 records. A response
-    ///   with more records, or one past the record limit (R charges it
-    ///   nothing), is not dominated by a named term (#665 r34, open).
+    ///   just before `finish` and live across it) is charged by
+    ///   `buffered_request_hashes_bound` from every record the book stores,
+    ///   limit-exceeded responses included (c22, r35).
     fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
         use crate::heap_layout_bound::tree_node_bytes;
         use crate::session_attribution::{
@@ -14931,6 +14925,15 @@ impl SnapshotAccumulator {
             .values()
             .filter(|response| !response.record_limit_exceeded)
             .count();
+        // Charged for every Claude file: whether it is itemless (no positive
+        // usage evidence) is the parser's to know, not this accumulator's.
+        let buffered_records = self
+            .claude_responses
+            .values()
+            .try_fold(0usize, |records, response| {
+                records.checked_add(response.records.len())
+            })?;
+        let request_hashes = buffered_request_hashes_bound(buffered_records)?;
         let current_selector = heap(completed_heap(&self.current_selector, limit))?;
         let model_fallback = self
             .latest_model
@@ -15047,6 +15050,7 @@ impl SnapshotAccumulator {
             title.fixed,
             session_start,
             repository,
+            request_hashes,
         ] {
             out.add(bytes)?;
         }
@@ -15996,6 +16000,31 @@ fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usi
         json_len.checked_mul(3)?
     };
     pre_trim.checked_add(dropped)?.checked_add(json)
+}
+
+/// X_out (#665 r35, c22: no residual may rely on slack): the most
+/// `claude_buffered_request_hashes` (claude_request_census.rs:2218-2239)
+/// holds. The caller builds it for an itemless Claude file just before
+/// `finish` (`snapshots.rs`, `claude_itemless_request_hashes`) and keeps it
+/// across `finish`. It collects one `u64` per book record with a request id
+/// (every response's stored records, limit-exceeded ones included: at most
+/// `records`) through `flat_map`/`filter_map`/`take`, whose lower size hint
+/// is 0: `Vec` starts at 4 slots and doubles, so its last buffer is the
+/// smallest `4 * 2^k` holding them, with half of it alongside during the
+/// last growth (the allocation probe's overlap). `claude_request_hash` and
+/// `sort_unstable`/`dedup` allocate nothing. Stack-only, checked; `None` on
+/// overflow.
+fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
+    if records == 0 {
+        return Some(0);
+    }
+    let last = records.checked_next_power_of_two()?.max(4);
+    let slots = if last > 4 {
+        last.checked_add(last / 2)?
+    } else {
+        last
+    };
+    slots.checked_mul(std::mem::size_of::<u64>())
 }
 
 /// `completed_heap_bound` of `value` on a fresh counter.
