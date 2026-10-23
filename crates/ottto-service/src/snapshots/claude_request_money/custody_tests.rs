@@ -897,3 +897,32 @@ fn message_pruning_visits_every_path_and_releases_gate_off_empty_carriers() {
         "gate-OFF pruning releases empty bound carriers without live housekeeping"
     );
 }
+
+#[test]
+fn absent_take_is_inert_and_replacement_keeps_physical_binding() {
+    let mut ledger = ClaudeLedger::new_for_test();
+    let before = ledger.census().clone();
+    assert!(ledger.take("otel:missing").is_none());
+    assert_eq!(ledger.census(), &before);
+    assert_eq!(
+        ledger.census().totals_for_test(),
+        ledger.census().recounted_for_test()
+    );
+    let path = "/custody/replacement.jsonl";
+    assert!(ledger.bind_file(path, "root".into(), "member".into(), None));
+    let key = message_key(path);
+    stored(&mut ledger, key.clone(), record(vec![1]));
+    assert!(ledger.put_money(key.clone(), record(vec![2])));
+    assert!(ledger
+        .census()
+        .binding_matches(path, "root", "member", None));
+    let before = ledger.census().clone();
+    assert!(!ledger.put_money(
+        key,
+        record(
+            (0..=super::super::claude_request_census::MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64)
+                .collect()
+        )
+    ));
+    assert_eq!(ledger.census(), &before);
+}

@@ -1168,6 +1168,10 @@ fn money_gate_off_saved_fixture_receipt() {
             "OFF must not write the saved money ledger"
         );
         let saved_value = serde_json::to_value(&saved).unwrap();
+        if let Ok(output) = std::env::var("OTTTO_MONEY_PARITY_OUTPUT") {
+            let path = format!("{output}.index-{history}.json");
+            std::fs::write(path, serde_json::to_vec_pretty(&saved_value).unwrap()).unwrap();
+        }
         let selections = saved_value
             .get("claude_money_files")
             .and_then(serde_json::Value::as_object)

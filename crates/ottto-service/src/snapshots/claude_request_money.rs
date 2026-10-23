@@ -1542,7 +1542,7 @@ async fn build_page_at(
         };
         if let Some(capture) = capture::take_capture(&scope_key, key, fingerprint) {
             counts.captures_taken += 1;
-            note_message_record(ledger, index, key, fingerprint, &capture, &mut counts);
+            note_message_record(ledger, index, key, fingerprint, &capture, live, &mut counts);
             captures.insert((root.to_owned(), fingerprint.to_owned()), capture);
         }
     }
@@ -2624,6 +2624,7 @@ fn note_message_record(
     key: &str,
     fingerprint: &str,
     capture: &ClaudeResponseCapture,
+    live: bool,
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
     if capture.is_refused() {
@@ -2638,7 +2639,7 @@ fn note_message_record(
     };
     let verified = record.current_holder_for(fingerprint, true);
     let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());
-    if let Some((root, member)) = logical_family_member(index, key) {
+    if let Some((root, member)) = live.then(|| logical_family_member(index, key)).flatten() {
         if !ledger.bind_file(key, root, member, record.birth()) {
             counts.message_records_refused += 1;
             return;
@@ -5168,12 +5169,16 @@ mod scheduling_reconciliation_tests {
         item.source_file_fingerprint = Some(fp);
         item.snapshot_fingerprint = format!("{:064x}", 63);
         let mut ledger = ClaudeLedger::new_for_test();
-        for n in 0..64 {
-            ledger.put_money(
+        for n in [0, 63] {
+            assert!(ledger.put_money(
                 format!("{}:{n:064x}", store::money_key("offer:", &key)),
                 ClaudeRequestCensusRecord::money_debt([1; 32], n),
-            );
+            ));
         }
+        assert!(!ledger.put_money(
+            format!("{}:{:064x}", store::money_key("offer:", &key), 64),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 64),
+        ));
         let dirty = store::money_key("dirty:", &key);
         ledger.put_money(
             dirty.clone(),

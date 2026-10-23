@@ -644,6 +644,8 @@ impl Custody {
                 seen.hashes = current.value.view().shared_request_hashes();
             }
         }
+        let mut key = key;
+        key.shrink_to_fit();
         let previous = self.replace(
             &a,
             Some(Slot {
@@ -690,6 +692,8 @@ impl Custody {
         if key.starts_with("ever:") || key.starts_with("hold:body:") {
             return None;
         }
+        // A failed take must not create an uncharged empty carrier.
+        self.get(key)?;
         let a = self.address(key)?;
         let (before, hashes) = self.carrier_size(&a.carrier);
         let old = self.replace(&a, None)?;
@@ -757,6 +761,25 @@ impl Custody {
                     }
                 }
                 bytes += std::mem::size_of::<Slot>() + slot.key.capacity() + count.bytes;
+                let current = match carrier {
+                    Carrier::File(file) if slot.key.starts_with("watch:m:") => {
+                        file.current_m.as_deref()
+                    }
+                    Carrier::Telemetry(file) if slot.key.starts_with("watch:r:") => {
+                        file.current.as_deref()
+                    }
+                    _ => None,
+                };
+                if let Some(current) = current {
+                    if let (Some(a), Some(b)) = (
+                        current.value.view().shared_request_hashes(),
+                        slot.value.view().shared_request_hashes(),
+                    ) {
+                        if std::sync::Arc::ptr_eq(&a, &b) {
+                            bytes -= b.len() * 8 + 2 * std::mem::size_of::<usize>();
+                        }
+                    }
+                }
                 if let Some(entity) = &slot.entity {
                     bytes += std::mem::size_of::<EntityBinding>()
                         + entity.root.capacity()
@@ -1943,6 +1966,37 @@ impl Serialize for Custody {
 }
 #[cfg(test)]
 impl Custody {
+    pub(crate) fn resident_components_for_test(&self) -> (usize, usize, usize, usize) {
+        let mut hashes = 0;
+        let mut facts = 0;
+        let mut keys = 0;
+        for (_, carrier) in self.entries() {
+            for slot in carrier.slots() {
+                keys += slot.key.capacity();
+                hashes += slot.value.request_hashes().len() * 8;
+                facts += slot.value.view().facts().map_or(0, <[u8]>::len);
+            }
+            let pair = match carrier {
+                Carrier::File(file) => (file.current_m.as_deref(), file.seen_m.as_deref()),
+                Carrier::Telemetry(file) => (file.current.as_deref(), file.seen_r.as_deref()),
+                _ => (None, None),
+            };
+            if let (Some(a), Some(b)) = pair {
+                if let (Some(a), Some(b)) = (
+                    a.value.view().shared_request_hashes(),
+                    b.value.view().shared_request_hashes(),
+                ) {
+                    if std::sync::Arc::ptr_eq(&a, &b) {
+                        hashes -= b.len() * 8;
+                    }
+                }
+            }
+        }
+        let total = self
+            .resident_bytes(Instant::now() + std::time::Duration::from_secs(3600))
+            .unwrap();
+        (facts, hashes, keys, total - facts - hashes - keys)
+    }
     pub(crate) fn totals_for_test(&self) -> (usize, usize) {
         (self.hashes, self.bytes)
     }

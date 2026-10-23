@@ -439,7 +439,7 @@ mod process {
     // The cap receipt can serialize 65,536 ledger records in one caller.
     // Each record owns several pointers; table overflow must not masquerade
     // as a resource peak or force reducing the fixture's production cap.
-    const SLOTS: usize = 262_144;
+    const SLOTS: usize = 1_048_576;
     #[derive(Clone, Copy)]
     struct Entry {
         pointer: usize,

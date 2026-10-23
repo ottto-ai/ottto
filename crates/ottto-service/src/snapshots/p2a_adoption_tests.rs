@@ -131,7 +131,7 @@ fn p2a_adoption_strict_bytes_floor_and_covering_ack_partial_rollback() {
     let floor_count = money::store::with_ledger_for_test(&support, |ledger| {
         ledger
             .census()
-            .records_with_prefix(&money::adoption_prefix(&floor))
+            .records_with_prefix("adopt:member:v1:")
             .filter(|(_, record)| record.window() == 5)
             .count()
     })
@@ -357,6 +357,9 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
         "secondary checkpoint never declares authoritative empty"
     );
     let path = home.join("union.json");
+    // Fork the fixture into a new physical checkpoint, not a CAS update of
+    // the source checkpoint from which its generation was loaded.
+    index.generation = 0;
     index.save(&path).unwrap();
     let mut index = ScanIndex::load(&path).unwrap();
     fs::remove_file(&primary).unwrap();
@@ -554,6 +557,7 @@ fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
     );
     assert!(!partial.claude_money_files.contains_key(&alias_key));
     let path = home.join("held-alias.json");
+    partial.generation = 0;
     partial.save(&path).unwrap();
     let mut restarted = ScanIndex::load(&path).unwrap();
     money::store::reload_for_test(&support).unwrap();

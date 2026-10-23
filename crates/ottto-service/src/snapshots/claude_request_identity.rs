@@ -764,6 +764,12 @@ pub(crate) fn apply_grouped(
 
 fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligible> {
     if row_counts(row) != amounts.counts {
+        #[cfg(test)]
+        eprintln!(
+            "REQUEST_MONEY_REPRODUCE counts row={:?} grouped={:?}",
+            row_counts(row),
+            amounts.counts
+        );
         return Err(Ineligible::RowsNotReproduced);
     }
     for (index, wire) in row_costs(row).into_iter().enumerate() {
@@ -774,7 +780,14 @@ fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligi
                     return Err(Ineligible::MoneyNotMicroExact);
                 }
             }
-            _ => return Err(Ineligible::RowsNotReproduced),
+            _ => {
+                #[cfg(test)]
+                eprintln!(
+                    "REQUEST_MONEY_REPRODUCE cost_field={index} row={wire:?} grouped={:?}",
+                    amounts.wire(index)
+                );
+                return Err(Ineligible::RowsNotReproduced);
+            }
         }
     }
     Ok(())
@@ -2427,19 +2440,8 @@ mod request_money_clock_regressions {
         let nanos = super::super::rfc3339_unix_nanos(at).unwrap();
         let api = Default::default();
         let trace = Default::default();
-        let row = ClaudeLocalOtelEvidence {
-            session_id: root.into(),
-            request_id: request.into(),
-            client_request_id: "client-clock".into(),
-            account_identifier_hash: Some("a".repeat(64)),
-            ..Default::default()
-        };
-        let owner = ClaudeTraceOwnershipEvidence {
-            session_id: root.into(),
-            request_id: request.into(),
-            client_request_id: "client-clock".into(),
-            ..Default::default()
-        };
+        let row = super::super::tests::complete_api_row(root, request, 1, 10, 0, 0);
+        let owner = super::super::tests::complete_trace_row(root, request, "");
         // This seam receives already validated evidence; vary only the original
         // event-clock qualification while keeping owner/login/body constant.
         let mut evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);

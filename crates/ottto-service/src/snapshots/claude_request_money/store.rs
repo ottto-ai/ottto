@@ -1421,17 +1421,10 @@ impl ClaudeLedger {
         if self.get(&key).is_some_and(|old| old.matches(&record)) {
             return true;
         }
-        // The general census codec may replace an over-budget value with a
-        // lossy tombstone. Money custody must instead retain its predecessor.
-        let old = self.take(&key);
-        if self.insert(key.clone(), record) == ClaudeRequestCensusInsert::Stored {
-            return true;
-        }
-        self.remove(&key);
-        if let Some(old) = old {
-            self.insert(key, old);
-        }
-        false
+        // Custody admission is transactional: it restores the previous field
+        // on refusal. Taking first would drop an otherwise empty carrier's
+        // logical binding and publication identity before every replacement.
+        self.insert(key, record) == ClaudeRequestCensusInsert::Stored
     }
 }
 

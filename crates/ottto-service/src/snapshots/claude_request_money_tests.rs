@@ -2772,6 +2772,8 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     let index_bytes = index_census.exact_serialized_len_for_test();
     let census = ledger.census();
     let ledger_bytes = census.exact_serialized_len_for_test();
+    let (fact_bytes, hash_bytes, query_key_bytes, carrier_and_field_bytes) = census.resident_components_for_test();
+    eprintln!("MONEY_M4_RESIDENT_COMPONENTS fact_bytes={fact_bytes} hash_bytes={hash_bytes} query_key_bytes={query_key_bytes} carrier_and_field_bytes={carrier_and_field_bytes} shared_payload_counted_once=true structural_estimate_not_RSS=true");
     let ledger_resident = census
         .resident_bytes(std::time::Instant::now() + std::time::Duration::from_secs(3600))
         .expect("no deadline");

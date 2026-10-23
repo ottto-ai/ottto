@@ -2313,6 +2313,7 @@ fn p2a_live_page_large_ack_history_resource_receipt() {
 #[serial(claude_request_money_shadow)]
 fn p2a_gate_off_m4_money_operation_receipt() {
     use crate::snapshots::claude_request_money as money;
+    let _flush = money::store::flush_timeout_for_test(Duration::from_secs(60));
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for history in [0, 20_000] {
         let mut control = P2aControl::new(FinishOutcome::Accept);
