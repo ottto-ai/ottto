@@ -3548,11 +3548,7 @@ pub(crate) fn prepare_money_offers_receipt(
         }
         ledger.remove(&key);
     }
-    let mut offer_count = ledger
-        .census()
-        .records_with_prefix("offer:")
-        .take(MAX_MONEY_OFFERS_PER_CONTEXT + 1)
-        .count();
+    let mut offer_count = ledger.census().offer_total();
     let by_source = union_items_by_source(index, snapshots);
     for (key, entry) in &index.files {
         if Instant::now() >= deadline {
@@ -3654,12 +3650,7 @@ pub(crate) fn prepare_money_offers_receipt(
             let new_offer = ledger.get(&offer).is_none();
             if new_offer
                 && (offer_count >= MAX_MONEY_OFFERS_PER_CONTEXT
-                    || ledger
-                        .census()
-                        .records_with_prefix(&format!("{}:", store::money_key("offer:", key)))
-                        .take(MAX_MONEY_OFFERS_PER_FILE)
-                        .count()
-                        >= MAX_MONEY_OFFERS_PER_FILE)
+                    || ledger.census().offer_count_for(key) >= MAX_MONEY_OFFERS_PER_FILE)
             {
                 // The due/dirty obligation is independent and remains owed.
                 // Reconciliation must reclaim superseded offers before a new

@@ -599,6 +599,9 @@ fn two_offer_slots_and_synthetic_fields_add_no_extra_carrier() {
         ClaudeRequestCensusInsert::Refused
     );
     assert_eq!(ledger.census().records_with_prefix("offer:").count(), 2);
+    assert_eq!(ledger.census().offer_count_for(path), 2);
+    assert_eq!(ledger.census().offer_count_for("/custody/other.jsonl"), 0);
+    assert_eq!(ledger.census().offer_total(), 2);
     assert_eq!(ledger.census().record_count(), 3);
     let owner = format!("synthetic:{:064x}", 5);
     for prefix in ["due:", "dirty:", "hold:", "unbuilt:"] {
@@ -649,5 +652,81 @@ fn recovery_requires_a_verified_current_rebuild_of_unchanged_files() {
     assert!(
         !census.rebuild_complete(&index),
         "unverified evidence never publishes a rebuilt generation"
+    );
+}
+
+#[test]
+fn packed_history_accounting_is_exact_and_duplicates_do_not_dirty() {
+    let mut ledger = ClaudeLedger::new_for_test();
+    for number in 0..1000 {
+        stored(
+            &mut ledger,
+            format!("ever:{number:064x}"),
+            ClaudeRequestCensusRecord::money_debt([0; 32], 0),
+        );
+        if [0, 1, 2, 255, 999].contains(&number) {
+            assert_eq!(
+                ledger.census().serialized_total(),
+                serde_json::to_vec(ledger.census()).unwrap().len() - 1
+            );
+        }
+    }
+    while ledger
+        .take_save(Instant::now() + Duration::from_secs(60))
+        .is_some()
+    {}
+    assert_eq!(ledger.dirty_shards(), 0);
+    let epoch = ledger.epoch();
+    stored(
+        &mut ledger,
+        format!("ever:{:064x}", 7),
+        ClaudeRequestCensusRecord::money_debt([0; 32], 0),
+    );
+    assert_eq!(ledger.epoch(), epoch);
+    assert_eq!(
+        ledger.dirty_shards(),
+        0,
+        "history rewrites only when a root is added"
+    );
+    assert_eq!(
+        ledger.census().record_count(),
+        2,
+        "historical roots consume set bytes"
+    );
+}
+
+#[test]
+fn vanished_empty_carrier_retires_but_outstanding_debt_survives() {
+    let mut ledger = ClaudeLedger::new_for_test();
+    for path in ["/custody/empty.jsonl", "/custody/owed.jsonl"] {
+        assert!(ledger.bind_file(path, "root".into(), "member".into(), None));
+    }
+    stored(
+        &mut ledger,
+        store::money_key("dirty:", "/custody/owed.jsonl"),
+        ClaudeRequestCensusRecord::money_debt([2; 32], 30),
+    );
+    assert_eq!(ledger.census().record_count(), 4);
+    assert!(ledger.promote(
+        &ScanIndex::default(),
+        Instant::now() + Duration::from_secs(60)
+    ));
+    assert_eq!(
+        ledger.census().record_count(),
+        3,
+        "one counted detached obligation remains"
+    );
+    assert_eq!(
+        ledger
+            .get(&store::money_key("dirty:", "/custody/owed.jsonl"))
+            .unwrap()
+            .window(),
+        30
+    );
+    ledger.remove(&store::money_key("dirty:", "/custody/owed.jsonl"));
+    assert_eq!(
+        ledger.census().record_count(),
+        2,
+        "last cleared field releases the vanished shell"
     );
 }

@@ -407,6 +407,20 @@ impl Custody {
             .into_iter()
             .map(|item| (item.0, item.1))
     }
+    pub(super) fn offer_count_for(&self, owner: &str) -> usize {
+        if let Some(root) = owner.strip_prefix("synthetic:") {
+            self.telemetry
+                .get(&format!("telemetry:{root}"))
+                .map_or(0, |carrier| carrier.delivery.offers.len())
+        } else {
+            self.files
+                .get(&format!("file:{}", digest(owner)))
+                .map_or(0, |carrier| carrier.delivery.offers.len())
+        }
+    }
+    pub(super) fn offer_total(&self) -> usize {
+        self.offers
+    }
     pub(crate) fn record_count(&self) -> usize {
         self.files.len() + self.telemetry.len() + 2
     }
@@ -485,10 +499,15 @@ impl Custody {
         std::mem::replace(self.slot_mut(a)?, slot.map(Box::new)).map(|slot| *slot)
     }
     fn carrier_size(&self, key: &str) -> (usize, usize) {
+        if key == EVER {
+            // Root bytes never need JSON escaping. Charge the exact packed
+            // base64 length without re-encoding every preceding root.
+            static EMPTY_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+            let fixed = *EMPTY_BYTES.get_or_init(|| entry_bytes(EVER, &Carrier::Ever(&[])));
+            return (fixed + (self.ever.len() * 32).div_ceil(3) * 4, 0);
+        }
         let value = if key == CONTROL {
             Some(Carrier::Control(&self.control))
-        } else if key == EVER {
-            Some(Carrier::Ever(&self.ever))
         } else if let Some(file) = self.files.get(key) {
             Some(Carrier::File(file))
         } else {
@@ -497,11 +516,9 @@ impl Custody {
         value.map_or((0, 0), |value| (entry_bytes(key, &value), value.hashes()))
     }
     fn prune_empty(&mut self, a: &Address) {
-        if self
-            .files
-            .get(&a.carrier)
-            .is_some_and(|file| file.slots().next().is_none() && file.path.is_none())
-        {
+        if self.files.get(&a.carrier).is_some_and(|file| {
+            file.slots().next().is_none() && (file.path.is_none() || !file.indexed)
+        }) {
             self.files.remove(&a.carrier);
         }
         if self
@@ -525,6 +542,9 @@ impl Custody {
         a: Address,
         entity: Option<Box<EntityBinding>>,
     ) -> Insert {
+        if a.carrier.starts_with("telemetry:") && a.field == "union" {
+            return Insert::Refused;
+        }
         if value.request_hashes().len() > MAX_HASHES {
             return Insert::Refused;
         }
@@ -619,7 +639,9 @@ impl Custody {
             if let Some(file) = self.files.get_mut(&a.carrier) {
                 file.path = prior_path;
             }
-            self.prune_empty(&a);
+            if !exists {
+                self.prune_empty(&a);
+            }
             return Insert::Refused;
         }
         if a.field == "offer" && previous.is_none() {
@@ -1973,7 +1995,11 @@ impl Custody {
             .collect::<Vec<_>>();
         for carrier in vanished {
             let before = self.carrier_size(&carrier).0;
-            self.files.get_mut(&carrier)?.indexed = false;
+            let file = self.files.get_mut(&carrier)?;
+            file.indexed = false;
+            if file.slots().next().is_none() {
+                self.files.remove(&carrier);
+            }
             let after = self.carrier_size(&carrier).0;
             self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
             changes.push(FieldChange {
@@ -2308,6 +2334,7 @@ impl Custody {
             .collect::<std::collections::BTreeSet<_>>();
         self.files.retain(|key, file| {
             !key.starts_with("file:hold-body:")
+                || file.slots().count() != 1
                 || file
                     .delivery
                     .hold

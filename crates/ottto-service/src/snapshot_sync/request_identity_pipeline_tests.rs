@@ -972,7 +972,18 @@ fn money_gate_off_saved_fixture_receipt() {
     let mut receipts = Vec::new();
     for history in [0, 20_000] {
         let _cadence = IdentityPipelineCadence::new();
-        let _ = std::fs::remove_dir_all(support.join("snapshots"));
+        // Both independently compiled callers start each case from the same
+        // saved inputs, including the empty-history case after a prior run.
+        for state in [
+            "snapshots",
+            "claude-request-ledger",
+            "claude-request-custody-v2",
+        ] {
+            let path = support.join(state);
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
         let server = NativeBootstrapServer::new();
         let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
         let client = SnapshotApiClient::new(server.url.clone());
@@ -988,6 +999,11 @@ fn money_gate_off_saved_fixture_receipt() {
             money_m4_saved_inputs(&base, &support)
         };
         let ledger_before = money_saved_ledger_files(&support);
+        assert_eq!(
+            ledger_before.len(),
+            if history == 0 { 0 } else { 257 },
+            "each independent case restores its own saved ledger input"
+        );
         seed["accepted_snapshot_fingerprints"] = serde_json::json!((0..history)
             .map(|n| format!("{n:064x}"))
             .collect::<Vec<_>>());
@@ -1295,12 +1311,18 @@ fn money_m4_saved_inputs(base: &Path, support: &Path) -> serde_json::Value {
         let dir = saved.join("claude-request-ledger");
         std::fs::create_dir_all(&dir).unwrap();
         for shard in 0..256 {
-            let records = ledger.census().records().filter(|(key,_)| {
-                usize::from(Sha256::digest(key.as_bytes())[0]) == shard
-            }).collect::<BTreeMap<_,_>>();
-            std::fs::write(dir.join(format!("shard-{shard:02x}.json")), serde_json::to_vec(&records).unwrap()).unwrap();
+            let records = ledger
+                .census()
+                .records()
+                .filter(|(key, _)| usize::from(Sha256::digest(key.as_bytes())[0]) == shard)
+                .collect::<BTreeMap<_, _>>();
+            std::fs::write(
+                dir.join(format!("shard-{shard:02x}.json")),
+                serde_json::to_vec(&records).unwrap(),
+            )
+            .unwrap();
         }
-        std::fs::write(dir.join("meta.json"),b"{}").unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
         index.save(&index_path).unwrap();
     }
     let source = saved.join("claude-request-ledger");

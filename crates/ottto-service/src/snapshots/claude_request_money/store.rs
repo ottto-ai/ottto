@@ -298,7 +298,13 @@ impl ClaudeLedger {
         key: String,
         record: ClaudeRequestCensusRecord,
     ) -> ClaudeRequestCensusInsert {
-        let changed = custody_key(&key) && !self.get(&key).is_some_and(|old| old.matches(&record));
+        let previous = self.get(&key);
+        if previous.is_some_and(|old| old.matches(&record))
+            || key.starts_with("ever:") && previous.is_some()
+        {
+            return ClaudeRequestCensusInsert::Stored;
+        }
+        let changed = custody_key(&key);
         let Some(carrier) = self.census.carrier_key(&key) else {
             return ClaudeRequestCensusInsert::Refused;
         };
@@ -308,7 +314,9 @@ impl ClaudeLedger {
         if outcome == ClaudeRequestCensusInsert::Stored && changed {
             self.custody_epoch = self.custody_epoch.wrapping_add(1);
         }
-        self.account(shard, before);
+        if outcome == ClaudeRequestCensusInsert::Stored {
+            self.account(shard, before);
+        }
         outcome
     }
 
@@ -1667,12 +1675,7 @@ pub(super) fn has_offer(support: &Path, key: &str) -> bool {
     let Some(Slot::Ready(ledger)) = ledgers.get(support) else {
         return false;
     };
-    let found = ledger
-        .census()
-        .records_with_prefix(&format!("{}:", money_key("offer:", key)))
-        .next()
-        .is_some();
-    found
+    ledger.census.offer_count_for(key) > 0
 }
 
 #[cfg(test)]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct MoneyFileSelection {
     pub(crate) revision: String,
     pub(crate) root: String,
-    pub(super) member: String,
+    pub(crate) member: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
