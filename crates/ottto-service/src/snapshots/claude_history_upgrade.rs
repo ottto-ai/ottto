@@ -247,11 +247,28 @@ impl HistoryPage {
     /// Reserve this page's budget for one file. A file reserved earlier on
     /// this page keeps its reservation and is not charged twice.
     pub(super) fn reserve(&mut self, index_key: &str, size_bytes: u64) -> bool {
+        self.reserve_within(index_key, size_bytes, false)
+    }
+
+    /// Codex and Pi adoption-only pacing: the same budget, except that a
+    /// page's first file is admitted whatever its size. A Codex transcript
+    /// may exceed the byte budget, and without the exception it could never
+    /// adopt. The Claude history gate never uses this.
+    pub(super) fn reserve_admitting_first_file(
+        &mut self,
+        index_key: &str,
+        size_bytes: u64,
+    ) -> bool {
+        self.reserve_within(index_key, size_bytes, true)
+    }
+
+    fn reserve_within(&mut self, index_key: &str, size_bytes: u64, first_file: bool) -> bool {
         if self.reserved.contains(index_key) {
             return true;
         }
         if self.files >= super::body_witness_adoption_page_budget()
-            || self.bytes.saturating_add(size_bytes) > super::body_witness_adoption_byte_budget()
+            || (self.bytes.saturating_add(size_bytes) > super::body_witness_adoption_byte_budget()
+                && !(first_file && self.files == 0))
         {
             return false;
         }
@@ -326,8 +343,9 @@ pub(super) struct GatedHistory {
     pub(super) held: Option<HistoryHold>,
     /// The entry's upload tuple before this parse; `None` for a new file.
     pub(super) previous: Option<HeldUploadTuple>,
-    /// A held new file's local entity fingerprints and their activity.
-    pub(super) local: BTreeMap<String, Option<String>>,
+    /// A held new file's local entity fingerprints. They name the file's
+    /// semantic group only; they are never advertised as its membership.
+    pub(super) local: BTreeSet<String>,
 }
 
 crate::heap_layout_bound::fields!(GatedHistory; index_key, held, previous, local);
@@ -677,6 +695,15 @@ mod tests {
             ),
             HistoryDecision::Held(HistoryHold::Budget)
         );
+        // Codex and Pi adoption-only pacing keeps progress for a transcript
+        // above the byte budget: only a page's first file passes over it.
+        let huge = HISTORY_UPGRADE_BYTES_PER_PAGE + 1;
+        let mut codex = HistoryPage::default();
+        assert!(codex.reserve_admitting_first_file("codex-huge", huge));
+        assert!(!codex.reserve_admitting_first_file("codex-second", 1));
+        let mut codex = HistoryPage::default();
+        assert!(codex.reserve_admitting_first_file("codex-small", 1));
+        assert!(!codex.reserve_admitting_first_file("codex-huge", huge));
     }
 
     #[test]

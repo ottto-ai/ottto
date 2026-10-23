@@ -325,6 +325,32 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
             assert!(entry.last_snapshot_fingerprint.is_some());
             assert!(entry.last_upload_body_witness.is_none());
         }
+        // Held local bodies never reached this destination or upload policy,
+        // so the source manifest does not advertise them.
+        assert!(rebuilt.index.current_snapshot_fingerprints().is_empty());
+        let manifest = rebuilt
+            .index
+            .manifest_for_window(
+                SnapshotSource::ClaudeCode,
+                "2000-01-01T00:00:00Z",
+                "2100-01-01T00:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(manifest.entity_count, 0);
+        // A partial checkpoint (nothing accepted) keeps every held entry, so
+        // an upload outage does not re-read the history.
+        let partial = rebuilt.index.committable_subset(
+            &ScanIndex::default(),
+            &BTreeSet::new(),
+            &BTreeMap::new(),
+        );
+        assert_eq!(partial.files.len(), rebuilt.index.files.len());
+        for (key, entry) in &rebuilt.index.files {
+            let kept = &partial.files[key];
+            assert_eq!(kept.source_file_fingerprint, entry.source_file_fingerprint);
+            assert_eq!(kept.size_bytes, entry.size_bytes);
+            assert_eq!(kept.last_snapshot_fingerprint, entry.last_snapshot_fingerprint);
+        }
         for hour in [10, 11] {
             let again = fixture.cycle(&format!("2026-08-02T{hour}:00:00Z"), HISTORY_REVISION_2);
             assert_eq!(again.scan.scanned_file_count, 0, "no re-read storm");

@@ -24546,8 +24546,10 @@ impl OwnedSourceScan {
                     )
                 } else if adoption_only
                     && !comparison_target
-                    && !history_upgrade
-                        .reserve(&local_index_key(&candidate.path), candidate.size_bytes)
+                    && !history_upgrade.reserve_admitting_first_file(
+                        &local_index_key(&candidate.path),
+                        candidate.size_bytes,
+                    )
                 {
                     history_upgrade.note_denied(
                         HistoryHold::Budget,
@@ -35311,7 +35313,7 @@ impl ScanIndex {
                 index_key: key,
                 held: None,
                 previous,
-                local: BTreeMap::new(),
+                local: BTreeSet::new(),
             });
         if gated.held.is_none() {
             gated.held = hold;
@@ -35331,8 +35333,8 @@ impl ScanIndex {
     /// corrections, cache-head and proof capture, native corrections and
     /// finalization, so neither the ordinary nor a correction upload can carry
     /// it. A latch set by a fold after the candidate loop holds every
-    /// permitted upgrade too. A held new file's local entity identities are
-    /// kept for the index. Returns how many bodies were removed.
+    /// permitted upgrade too. A held new file's local entity fingerprints are
+    /// kept to name its semantic group. Returns how many bodies were removed.
     pub(crate) fn veto_claude_history_emission(
         &mut self,
         source: SnapshotSource,
@@ -35355,10 +35357,7 @@ impl ScanIndex {
             else {
                 return true;
             };
-            gated.local.insert(
-                snapshot.snapshot_fingerprint.clone(),
-                snapshot_semantic_activity_at(snapshot),
-            );
+            gated.local.insert(snapshot.snapshot_fingerprint.clone());
             false
         });
         before - snapshots.len()
@@ -35379,8 +35378,9 @@ impl ScanIndex {
 
     /// Finalize a held history file without its new bodies: an existing entry
     /// keeps its upload tuple (revision, semantic group, body witness,
-    /// membership); a new one keeps its local entity identities with no body
-    /// witness and revision 0, so it stays owed and is not re-read. Its new
+    /// membership); a new one gets the semantic group of its local bodies, an
+    /// empty exact membership, no body witness and revision 0, so it stays
+    /// owed, is not re-read and is not advertised. Its new
     /// source identity, size and mtime stay recorded. Returns false when the
     /// gate does not hold this file.
     fn finalize_claude_held_history(
@@ -35407,22 +35407,23 @@ impl ScanIndex {
                     previous.file_snapshot_fingerprints,
                     previous.confirmed_empty,
                 ),
+                // The group names the local bodies, so the file is not an
+                // unknown outcome. Its exact membership is empty: none of
+                // these bodies passed upload policy or reached this
+                // destination, so the source manifest does not advertise
+                // them, and a partial checkpoint keeps the entry (nothing
+                // in it awaits acceptance).
                 None => {
-                    for (fingerprint, activity_at) in &gated.local {
-                        self.snapshot_activity_at
-                            .insert(fingerprint.clone(), activity_at.clone());
-                    }
-                    let members = gated.local.keys().cloned().collect::<BTreeSet<_>>();
-                    let group = (!members.is_empty()).then(|| {
+                    let group = (!gated.local.is_empty()).then(|| {
                         let mut digest = Sha256::new();
                         update_length_prefixed(&mut digest, b"snapshot_file_entity_set:v1");
-                        for fingerprint in &members {
+                        for fingerprint in &gated.local {
                             update_length_prefixed(&mut digest, fingerprint.as_bytes());
                         }
                         format!("{:x}", digest.finalize())
                     });
-                    let empty = members.is_empty();
-                    (group, None, 0, (!empty).then_some(members), empty)
+                    let empty = gated.local.is_empty();
+                    (group, None, 0, (!empty).then(BTreeSet::new), empty)
                 }
             };
         if let Some(entry) = self.files.get_mut(&key) {
