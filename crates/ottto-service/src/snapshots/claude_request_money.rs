@@ -94,10 +94,11 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 /// The shared per-page I/O budget of every shadow reader.
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
-const WORK_MAX_ELAPSED: Duration = Duration::from_millis(250);
-/// The whole page's deadline: enumeration, the census intersections, the
-/// scope, grouping, the bodies and the rows. Past it the page is refused.
-const PAGE_MAX_ELAPSED: Duration = Duration::from_secs(2);
+/// Total synchronous allowance under SNAPSHOT_SYNC_LOCK, in every build.
+/// Includes closing failure rows and handoff; the writer runs separately.
+pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
+/// Leave bounded closing work inside the total, rather than after expiry.
+const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(150);
 /// A growing structure's admission step.
 const GROWTH_STEP_BYTES: usize = 256 * 1024;
 
@@ -1224,6 +1225,28 @@ pub(crate) fn shadow_page_at(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     store::prime_credit_for_test(support_dir, utc_day(now));
+    shadow_page_ready_for_test(
+        support_dir,
+        snapshots,
+        index,
+        api_report,
+        trace_report,
+        census_complete,
+        now,
+    )
+}
+
+/// The actual synchronous page, without the fixture's writer-credit wait.
+#[cfg(test)]
+pub(crate) fn shadow_page_ready_for_test(
+    support_dir: &Path,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+    api_report: &ClaudeLocalOtelLoadReport,
+    trace_report: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    now: u64,
+) -> ClaudeRequestMoneyShadowCounts {
     let coverage = coverage::InterimFamilyCoverage {
         census_complete,
         ..Default::default()
@@ -1252,9 +1275,8 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    // Closing a large page still emits pre-admitted failure metadata. Keep
-    // that work inside the original two-second wall envelope, not after it.
-    let deadline = started + PAGE_MAX_ELAPSED - Duration::from_millis(300);
+    let absolute_deadline = started + PAGE_MAX_ELAPSED;
+    let deadline = absolute_deadline - PAGE_CLOSE_RESERVE;
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us: capture::take_capture_us(),
@@ -1331,11 +1353,7 @@ fn shadow_page_with_coverage(
         drop_certificate(ledger);
     }
     // Telemetry runs first and shares the caller's absolute time bound.
-    let mut work = ClaudeLedgerWork::new(
-        WORK_MAX_BYTES,
-        WORK_MAX_STATS,
-        deadline.min(Instant::now() + WORK_MAX_ELAPSED),
-    );
+    let mut work = ClaudeLedgerWork::new(WORK_MAX_BYTES, WORK_MAX_STATS, deadline);
     let unloaded = roots
         .iter()
         .copied()
@@ -1357,16 +1375,19 @@ fn shadow_page_with_coverage(
         drop_certificate(ledger);
     }
     prune_message_records(ledger, index, &mut counts);
-    let Some((member_keys, indexed_members)) = family_members(index, &roots, deadline) else {
-        counts.refused_deadline = 1;
-        return refuse(&end, Some(ledger), index, roots.len(), counts);
-    };
+    // Global optional work may run out of time too. Its absence closes
+    // every body, while the pre-admitted family failure rows still publish.
+    let (member_keys, indexed_members) =
+        family_members(index, &roots, deadline).unwrap_or_default();
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     let mut captures = BTreeMap::new();
     let mut groups_owned = BTreeSet::new();
     for item in snapshots {
         let root = claude_snapshot_family_root_ref(item);
         by_root.entry(root).or_default().push(item);
+        if Instant::now() >= deadline {
+            continue;
+        }
         if let Some(keys) = member_keys
             .get(&(root.to_owned(), item.source_session_id.clone()))
             .filter(|keys| keys.len() == 1)
@@ -1396,13 +1417,10 @@ fn shadow_page_with_coverage(
     }
     purge_captures(&scope_key, &mut counts);
     let page_groups = groups_owned.iter().map(String::as_str).collect();
-    let Some(scope) =
-        ClaudeLedgerScope::build(index, ledger.census(), &page_groups, &roots, deadline)
-    else {
-        counts.refused_deadline = 1;
-        return refuse(&end, Some(ledger), index, roots.len(), counts);
-    };
-    end.scope = scope.debt;
+    let scope = ClaudeLedgerScope::build(index, ledger.census(), &page_groups, &roots, deadline);
+    if let Some(scope) = &scope {
+        end.scope = scope.debt;
+    }
     let holder_view = ClaudeHolderView::of(coverage_view);
     // Retain cross-root live claims even when another family is oversized.
     let root_keys = roots
@@ -1444,9 +1462,17 @@ fn shadow_page_with_coverage(
     let mut written = 0;
     let mut incomplete = 0;
     for root in order {
+        if Instant::now() >= absolute_deadline {
+            // If exceptional closing work itself exhausts the total, use
+            // whole-page refusal instead of carrying on under the live lock.
+            counts.refused_deadline = 1;
+            drop(families);
+            drop(reservations);
+            return refuse(&end, Some(ledger), index, roots.len(), counts);
+        }
         // Check time before any content walk; remaining roots still flow
         // through the pre-admitted failure publication and memo bookkeeping.
-        let expired = preflight_check(deadline).is_err();
+        let expired = scope.is_none() || preflight_check(deadline).is_err();
         let items = &by_root[root];
         let mut family_captures = BTreeMap::new();
         for item in items.iter().take(if expired { 0 } else { items.len() }) {
@@ -1493,7 +1519,9 @@ fn shadow_page_with_coverage(
                     &page_claims,
                     &first_event,
                     &sessions,
-                    &scope,
+                    scope
+                        .as_ref()
+                        .expect("admitted body requires a complete scope walk"),
                     holder_view,
                     &mut budget,
                     &mut end,
@@ -1584,10 +1612,18 @@ fn shadow_page_with_coverage(
                         && published.epoch == process_epoch()
                         && published.digest == digest
                 });
+        // A row emitted without reaching optional family work does not
+        // consume its scheduling turn. It leads the following page,
+        // while publication metadata still records the actual page time.
+        let scheduling_time = if expired {
+            ledger.get(&key).map_or(0, |record| record.window())
+        } else {
+            now
+        };
         memos.push(PendingMemo {
             key,
             basis: if unchanged { None } else { basis },
-            observed_unix: now,
+            observed_unix: scheduling_time,
             published: ClaudeFamilyPublication {
                 utc_day: utc_day(now),
                 digest,
@@ -2690,7 +2726,15 @@ fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64) -> u64 {
     let stale = ledger
         .census()
         .records_with_prefix(FAMILY_KEY_PREFIX)
-        .filter(|(_, record)| record.family_memo().is_some() && record.window() < cutoff)
+        .filter(|(_, record)| {
+            record.family_memo().is_some_and(|(_, memo)| {
+                // An unreached family's scheduling turn may remain at zero;
+                // retention follows its real last publication, not that priority.
+                memo.published
+                    .map_or(record.window(), |published| published.attempted)
+                    < cutoff
+            })
+        })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for key in &stale {

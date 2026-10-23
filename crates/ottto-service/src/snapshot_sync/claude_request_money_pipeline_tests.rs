@@ -1322,6 +1322,9 @@ fn money_restore_files(dir: &Path, saved: &BTreeMap<PathBuf, Vec<u8>>) {
     }
 }
 
+// Named CI scheduling tolerance, outside the unchanged production deadline.
+const MONEY_P1B_CI_SCHEDULING_TOLERANCE: std::time::Duration = std::time::Duration::from_millis(25);
+
 /// M4-sized mixed page: an oversized family cannot stop smaller families,
 /// and a never-reappearing failed family remains disclosed in the file.
 #[test]
@@ -1351,8 +1354,8 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     let page_row = rows.iter().find(|row| row["row"] == "page").unwrap();
     assert_eq!(page_row["page_families"].as_u64().unwrap(), page_row["written"].as_u64().unwrap() + page_row["failed"].as_u64().unwrap() + page_row["unchanged"].as_u64().unwrap());
     assert!(first.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
-    // Cooperative deadline: allow 100 ms for bounded failure publication.
-    assert!(first.elapsed_us <= 2_100_000, "{first:?}");
+    // Closing work must fit the total deadline; tolerate CI scheduling only.
+    assert!(first.elapsed_us <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros() as u64, "{first:?}");
     assert!(first.capture_us <= 300_000, "{first:?}");
     let (capture_input, capture_comparisons, _) = money::capture::work_for_test(&fixture.support);
     assert!(capture_input <= 8 * 1024 * 1024, "{capture_input}");
@@ -1367,7 +1370,7 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     assert!(rows.iter().any(|row| row["dropped"] == true));
     assert!(rows.iter().any(|row| row["family"] == money::hashed_id_for_test(&root) && row["p1_reasons"] == serde_json::json!(["oversize"])));
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_PAGE rows=70000 peak_transient={} transient_cap={} wall_us={} deadline_us=2000000 capture_us={} writer_us={} save_bytes_today={} daily_cap=67108864 capture_input={capture_input} capture_comparisons={capture_comparisons}",
+    println!("MONEY_P1B_PAGE rows=70000 peak_transient={} transient_cap={} wall_us={} deadline_us=250000 capture_us={} writer_us={} save_bytes_today={} daily_cap=67108864 capture_input={capture_input} capture_comparisons={capture_comparisons}",
         first.admitted_peak_bytes, money::SHADOW_MEMORY_CEILING_BYTES, first.elapsed_us, first.capture_us, next.writer_us, next.save_bytes_today);
 }
 
@@ -1391,21 +1394,48 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(armed.snapshots.len() >= 2048);
     assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
     assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
-    let counts = money::shadow_page_at(&fixture.support, &armed.snapshots, &armed_index,
-        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), armed.census_complete,
-        census_pipeline_window("2026-08-02T08:00:00Z"));
-    money::store::flush();
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    // Credit waits and writer flushes are outside the production sync path.
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    let run = |now| {
+        let started = std::time::Instant::now();
+        let counts = money::shadow_page_ready_for_test(&fixture.support, &armed.snapshots, &armed_index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), armed.census_complete, now);
+        let elapsed = started.elapsed(); // includes closing, emit and handoff
+        assert!(elapsed <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE, "elapsed={elapsed:?}: {counts:?}");
+        money::store::flush();
+        (counts, elapsed)
+    };
+    let (counts, elapsed) = run(now);
+    assert_eq!(counts.refused_deadline, 0, "pre-admitted family failures: {counts:?}");
     assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     let rows = money_jsonl_rows(&fixture.support);
-    assert!(rows.iter().any(|row| row["row"] == "page"));
+    let first_page = rows.iter().find(|row| row["row"] == "page").unwrap();
+    let deadline_families = rows.iter().filter(|row| row["row"] == "family" &&
+        row["p1_reasons"].as_array().is_some_and(|reasons| reasons.iter().any(|reason| reason == "deadline")))
+        .map(|row| row["family"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
+    assert!(!deadline_families.is_empty(), "unreached families need deadline rows");
+    assert_eq!(first_page["page_families"].as_u64().unwrap(), rows.iter().filter(|row| row["row"] == "family").count() as u64);
     assert_eq!(money::reserved_for_test(), 0);
     let (input, comparisons, capture_us) = money::capture::work_for_test(&fixture.support);
-    assert!(counts.elapsed_us <= 2_100_000, "{counts:?}");
     assert!(capture_us <= 300_000, "capture callback overshoot: {capture_us}");
     assert!(input <= 8 * 1024 * 1024, "{input}");
     assert!(comparisons <= 1_048_576, "{comparisons}");
-    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} capture_us={} capture_input={} capture_comparisons={}", armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, capture_us, input, comparisons);
+    let (following, following_elapsed) = run(now + 1);
+    assert_eq!(following.refused_deadline, 0, "{following:?}");
+    let next_rows = money_jsonl_rows(&fixture.support);
+    let next_snapshot = next_rows.iter().filter(|row| row["row"] == "page")
+        .map(|row| row["snapshot"].as_u64().unwrap()).max().unwrap();
+    let next_families = next_rows.iter().filter(|row| row["row"] == "family" && row["snapshot"] == next_snapshot).collect::<Vec<_>>();
+    let next_first = next_families.first().unwrap();
+    assert!(deadline_families.contains(next_first["family"].as_str().unwrap()), "unreached families go first: {next_first}");
+    let progressed = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
+        !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
+    assert!(progressed > 0, "following page must reach deferred families");
+    assert_eq!(money::reserved_for_test(), 0);
+    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_wall_us={}",
+        armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, following_elapsed.as_micros());
 }
 
 #[test]
