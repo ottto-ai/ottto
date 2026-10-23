@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 835,
-  "content_sha256": "32bef5ce24a9e803a5107e4093c28dbd87664c8c0f07ab17c956d231896621a2",
+  "content_sha256": "93f3ef22bbc15f8fd783e5a58c0791e5e5368ea115f0e0150def3e07b634802c",
   "files": [
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "475774c115fa6049028b353a190129757815de01ffd1991762700329ab172575",
-      "size_bytes": 3444489
+      "sha256": "452438bd0e39d687ab888113541a1aa76dd0994f92b3b20639fb8515a737c291",
+      "size_bytes": 3444623
     },
     {
       "executable": false,
@@ -1763,15 +1763,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "82f3f72abcda499bd6cc84ffe6cd2f6859a17195b6a15a497155b628a06ce645",
-      "size_bytes": 212949
+      "sha256": "e5b08614ad696a6220e9c5248bbb6a5a6890732fae77900e7f754c31ad5d577f",
+      "size_bytes": 216851
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census_tests.rs",
-      "sha256": "79d7939ff9a84c374b693f30e71b47ee61662ca2f9cb8933c05280c5c770e422",
-      "size_bytes": 86372
+      "sha256": "d0ab06aa74561c3c57ef19a6172fc9a23c4c3c8b037762cc4f3d1d6047db780c",
+      "size_bytes": 86506
     },
     {
       "executable": false,
@@ -2309,8 +2309,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "9258bc97001b843b76cad8dc8756b0580509d9d8b8f8da059ae7b4590c477218",
-      "size_bytes": 3050
+      "sha256": "24ab8f1a76d54ca876826547934e9f2e3ee9e32a925e52cf41a165dc7b76db73",
+      "size_bytes": 3388
     },
     {
       "executable": false,

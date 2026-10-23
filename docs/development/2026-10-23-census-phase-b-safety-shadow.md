@@ -46,3 +46,5 @@ Production peak counters explicitly mark measurement unavailable; the CI
 allocator receipt measures requested overlap separately from RSS, including
 retained old/new state and pretty-checkpoint decode. Workspace refusals remain
 in the healthy-terminal denominator.
+
+Required safety coverage includes indexed empty files, retained records, walked keys and residue keys. Unindexed keys require a current-terminal record; absent records close D2, and every covered unindexed member participates in family settlement vetoes. The workspace reservation conservatively prices the full union before allocation.

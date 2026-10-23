@@ -1296,7 +1296,7 @@ fn census_unindexed_lossy_member_leaves_its_family_unknown() {
             key,
             ClaudeRequestCensusRecord::synthetic_for_test(
                 &hex_fingerprint(seed),
-                1,
+                rfc3339_unix_seconds(FIRST_WINDOW).unwrap(),
                 shape,
                 vec![hash],
             )
@@ -1728,6 +1728,8 @@ fn census_shadow_counts_encoding_is_bounded() {
         migration_input_bytes_estimated: usize::MAX,
         would_open: false,
         would_open_flips: u64::MAX,
+        unindexed_required_keys: usize::MAX,
+        missing_unindexed_records: usize::MAX,
         family_keys: usize::MAX,
         covered_by_fingerprint: usize::MAX,
         covered_by_window: usize::MAX,

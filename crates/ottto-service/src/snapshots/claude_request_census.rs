@@ -2969,7 +2969,12 @@ pub(crate) fn prepare_claude_request_census_terminal(
         }
     }
     index.claude_request_census.recount();
-    let join = ClaudeRequestCensusJoin::new(index, window, residue_index_keys);
+    let join = ClaudeRequestCensusJoin::new_with_observed(
+        index,
+        window,
+        residue_index_keys,
+        observed_index_keys,
+    );
     let mut counts = join.counts(true);
     let state = &mut index.claude_request_census_shadow;
     if state
@@ -3181,10 +3186,20 @@ pub(crate) struct ClaudeRequestCensusJoin {
 }
 
 impl ClaudeRequestCensusJoin {
+    #[cfg(test)]
     pub(crate) fn new(
         index: &ScanIndex,
         window: u64,
         residue_index_keys: &BTreeSet<String>,
+    ) -> Self {
+        Self::new_with_observed(index, window, residue_index_keys, &BTreeSet::new())
+    }
+
+    fn new_with_observed(
+        index: &ScanIndex,
+        window: u64,
+        residue_index_keys: &BTreeSet<String>,
+        observed_index_keys: &BTreeSet<String>,
     ) -> Self {
         let census = &index.claude_request_census;
         let mut join = Self {
@@ -3249,11 +3264,16 @@ impl ClaudeRequestCensusJoin {
         // ordinary scan decisions and existing resource caps are unchanged.
         if index.files.len() > MAX_DECODE_ENTRIES
             || census.records.len() > MAX_DECODE_ENTRIES
-            || Self::workspace_bound(index).map_or(true, |bytes| bytes > MAX_SHADOW_WORKSPACE_BYTES)
+            || observed_index_keys.len() > MAX_DECODE_ENTRIES
+            || residue_index_keys.len() > MAX_DECODE_ENTRIES
+            || Self::workspace_bound(index, observed_index_keys, residue_index_keys)
+                .map_or(true, |bytes| bytes > MAX_SHADOW_WORKSPACE_BYTES)
             || index
                 .files
                 .keys()
                 .chain(census.records.keys())
+                .chain(observed_index_keys.iter())
+                .chain(residue_index_keys.iter())
                 .any(|key| key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES)
         {
             join.counts.transient_limited = true;
@@ -3394,6 +3414,39 @@ impl ClaudeRequestCensusJoin {
             join.coverage.insert(key.clone(), coverage);
             *path_owners.entry(path_owner).or_default() += 1;
         }
+        // Walked/residue files and retained records are required safety keys
+        // even without a MONEY index entry. Only this terminal's observation
+        // covers such a key; no indexed fingerprint exists to excuse it.
+        for key in census
+            .records
+            .keys()
+            .chain(observed_index_keys.iter())
+            .chain(residue_index_keys.iter())
+        {
+            if join.coverage.contains_key(key) {
+                continue;
+            }
+            let Some(owner) = claude_index_path_family_member(Path::new(key)) else {
+                continue;
+            };
+            let current = census.get(key).is_some_and(|record| {
+                record.current_derivation()
+                    && !record.over_budget()
+                    && window != 0
+                    && record.window == window
+            });
+            join.counts.unindexed_required_keys += 1;
+            join.counts.missing_unindexed_records += usize::from(!current);
+            join.coverage.insert(
+                key.clone(),
+                if current {
+                    ClaudeRequestCensusCoverage::Window
+                } else {
+                    ClaudeRequestCensusCoverage::Migrate
+                },
+            );
+            *path_owners.entry(owner).or_default() += 1;
+        }
         join.observe_workspace(
             crate::heap_layout_bound::completed_bound(&path_owners, usize::MAX)
                 .unwrap_or(usize::MAX),
@@ -3486,13 +3539,27 @@ impl ClaudeRequestCensusJoin {
     /// path bytes for every root/member substring (two for the owner pair),
     /// and double vector capacities
     /// cover coverage/path owners/shared/unknown plus all merge buffers.
-    fn workspace_bound(index: &ScanIndex) -> Option<usize> {
+    fn workspace_bound(
+        index: &ScanIndex,
+        observed: &BTreeSet<String>,
+        residue: &BTreeSet<String>,
+    ) -> Option<usize> {
         use crate::heap_layout_bound::tree_node_bytes;
-        let files = index.files.len();
+        // Overcount overlaps before allocation; all required unindexed keys
+        // can own coverage, path-owner and settled-root rows too.
+        let files = index
+            .files
+            .len()
+            .checked_add(index.claude_request_census.records.len())?
+            .checked_add(observed.len())?
+            .checked_add(residue.len())?;
         let records = index.claude_request_census.records.len();
         let file_keys = index
             .files
             .keys()
+            .chain(index.claude_request_census.records.keys())
+            .chain(observed.iter())
+            .chain(residue.iter())
             .try_fold(0_usize, |bytes, key| bytes.checked_add(key.len()))?;
         let record_keys = index
             .claude_request_census
@@ -3723,6 +3790,7 @@ impl ClaudeRequestCensusJoin {
         census_complete
             && !counts.safety_incomplete
             && counts.missing_confirmed_empty_records == 0
+            && counts.missing_unindexed_records == 0
             && counts.safety_resource_refused_keys == 0
             && counts.shape_lossy_unread == 0
             && counts.retired_safety_missing == 0
@@ -3837,7 +3905,7 @@ impl CensusShadowView {
             .map(|(key, record)| (key.clone(), evidence_digest(record)))
             .collect();
         let mut settled_roots = BTreeMap::new();
-        for key in index.files.keys() {
+        for key in join.coverage.keys() {
             if let Some((root, _)) = claude_index_path_family_member(Path::new(key)) {
                 let settled = matches!(
                     join.member_status(index, key, true),
@@ -5181,5 +5249,31 @@ mod phase_b_tests {
             ClaudeCensusMemberStatus::SharesHash
         );
         assert_eq!(join.counts.missing_confirmed_empty_records, 0);
+    }
+    #[test]
+    fn unindexed_required_keys_close_missing_evidence_and_veto_settlement() {
+        let mut index = index_with(vec![(A, record('a', vec![1]))]);
+        let child = "/census/projects/a/subagents/agent-child.jsonl";
+        let observed = BTreeSet::from([child.to_owned()]);
+        for residue in [&BTreeSet::new(), &observed] {
+            let join = ClaudeRequestCensusJoin::new_with_observed(&index, 7, residue, &observed);
+            assert!(!join.disjointness_complete(true));
+            assert_eq!(join.counts.missing_unindexed_records, 1);
+        }
+        let mut child_record = record('b', vec![2]);
+        child_record.unverified = true;
+        index
+            .claude_request_census
+            .insert_for_test(child, child_record);
+        let join = ClaudeRequestCensusJoin::new_with_observed(&index, 7, &observed, &observed);
+        assert!(join.disjointness_complete(true));
+        assert_eq!(
+            join.member_status(&index, child, true),
+            ClaudeCensusMemberStatus::Unverified
+        );
+        let root = claude_index_path_family_member(Path::new(child)).unwrap().0;
+        let counts = join.counts(true);
+        let view = CensusShadowView::prepare(&index, join, counts, "1970-01-01T00:00:07Z").unwrap();
+        assert!(!view.settled_for(&index, &root));
     }
 }
