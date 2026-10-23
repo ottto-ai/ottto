@@ -6061,13 +6061,12 @@ fn finish_sync_source(
         .inspect_err(log_bootstrap_failure("probe"))?;
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
             .inspect_err(log_bootstrap_failure("apply"))
-            .map_err(|error| {
+            .inspect_err(|_| {
                 upload_progress.finish_reason_reoffers(
                     &attempted_reason_reoffers,
                     false,
                     source.api_slug(),
                 );
-                error
             })?;
         if held > 0 {
             eprintln!(

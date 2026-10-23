@@ -82,8 +82,8 @@ impl crate::heap_layout_bound::HeapLayoutBound for RefusalReoffer {
     }
 }
 
-/// Process-local count of extensions disabled by the decoder or the clock
-/// bound. Count only; never the raw bytes.
+/// Process-local count of extensions disabled by the decoder.
+/// Clock-bound skips have their own per-cycle counter. Never retain raw bytes.
 static INVALID_EXTENSIONS: AtomicU64 = AtomicU64::new(0);
 
 pub(super) fn note_invalid_extension() {

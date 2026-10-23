@@ -715,6 +715,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         .get_mut(&fp(2))
         .unwrap();
     old_timer.disposition = SnapshotQuarantineDisposition::RetryPending;
+    old_timer.failed_reconstruction_count = 1;
     old_timer.retry_after_unix_seconds = 1;
     assert!(!select(&mut old_progress, &old_index, NOW));
     assert_eq!(
