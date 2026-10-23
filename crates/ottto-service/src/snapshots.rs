@@ -2848,6 +2848,7 @@ struct ClaudeUsageAuthorityQuarantineRecord {
 }
 
 include!("snapshots/authority_proof_correction.rs");
+include!("snapshots/load_containment.rs");
 
 #[cfg(test)]
 pub(crate) const MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST: u8 =
@@ -34340,6 +34341,9 @@ mod tests {
     mod authority_proof_correction_tests {
         include!("snapshots/authority_proof_correction_tests.rs");
     }
+    mod load_containment_tests {
+        include!("snapshots/load_containment_tests.rs");
+    }
     mod claude_context_file_birth_tests {
         include!("snapshots/claude_context_file_birth_tests.rs");
     }
@@ -36069,11 +36073,15 @@ mod tests {
     }
 
     #[test]
-    fn scan_index_quarantines_syntactically_valid_corrupt_activity_witness() {
+    fn scan_index_drops_only_a_syntactically_valid_corrupt_activity_witness() {
         let root = temp_dir("scan-index-corrupt-activity");
         let path = root.join("codex-scan-index-v2.json");
         let fingerprint = "a".repeat(64);
         let mut corrupt = ScanIndex {
+            files: BTreeMap::from([(
+                "content-free-key".to_string(),
+                manifest_index_entry(Some(&fingerprint)),
+            )]),
             file_snapshot_fingerprints: BTreeMap::from([(
                 "content-free-key".to_string(),
                 BTreeSet::from([fingerprint.clone()]),
@@ -36087,16 +36095,20 @@ mod tests {
         corrupt.save(&path).expect("persist corrupt semantic clock");
 
         let recovered = ScanIndex::load(&path).expect("corrupt semantic clock should self-heal");
-        assert!(recovered.file_snapshot_fingerprints.is_empty());
+        assert_eq!(recovered.generation, 1);
+        assert_eq!(recovered.file_snapshot_fingerprints.len(), 1);
         assert!(recovered.snapshot_activity_at.is_empty());
-        assert!(!path.exists());
+        assert!(recovered.files["content-free-key"]
+            .source_file_fingerprint
+            .is_empty());
+        assert!(path.exists());
         assert_eq!(
             fs::read_dir(&root)
                 .expect("read quarantine directory")
                 .filter_map(Result::ok)
                 .filter(|entry| entry.file_name().to_string_lossy().contains("corrupt"))
                 .count(),
-            1
+            0
         );
         let _ = fs::remove_dir_all(root);
     }
