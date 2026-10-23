@@ -63,6 +63,7 @@ fn carry_file(index: &mut ScanIndex, root: &str, subagent: Option<&str>) -> Stri
 /// witness matches that pending exactly.
 fn carry_family(index: &mut ScanIndex, root: &str, subagents: &[Option<&str>], witnessed: bool) {
     let mut pending = ClaudeUsageFamilyPending {
+        diagnostic_invalid_causes: 0,
         census_window_end: CARRY_FAILED.to_string(),
         member_request_id_hashes: BTreeMap::new(),
         member_occurrences: BTreeMap::new(),

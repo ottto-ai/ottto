@@ -1625,6 +1625,9 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
 #[test]
 fn census_shadow_counts_encoding_is_bounded() {
     let shadow = ClaudeRequestCensusShadowCounts {
+        shadow_peak_measured: false,
+        shadow_workspace_peak_measured: false,
+        safety_resource_refused_keys: usize::MAX,
         strong_comparison_complete: false,
         safety_incomplete: false,
         safety_incomplete_overflow: false,
@@ -1775,7 +1778,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 5243;
+const CENSUS_SHADOW_WORST_BYTES: usize = 5363;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.

@@ -36,7 +36,9 @@ fn occurrences(
 }
 
 fn current_pending(member: &str, request: &str) -> ClaudeUsageFamilyPending {
+    diagnostic_invalid_causes: 0,
     ClaudeUsageFamilyPending {
+        diagnostic_invalid_causes: 0,
         census_window_end: WINDOW.to_string(),
         member_request_id_hashes: BTreeMap::from([(
             member.to_string(),

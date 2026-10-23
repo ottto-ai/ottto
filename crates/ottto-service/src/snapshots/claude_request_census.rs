@@ -1116,14 +1116,20 @@ impl ClaudeRequestCensus {
                     .as_deref()
                     .expect("indexed retirement buffer");
                 let hash_need = hashes.saturating_sub(MAX_CLAUDE_REQUEST_CENSUS_HASHES);
-                // Reserve the fixed-size key id, refusal flag and base64 rounding
-                // in this admission's byte demand before computing required slots.
-                let byte_need = bytes
-                    .saturating_add(marker_bytes(&marker))
-                    .saturating_add(128)
-                    .saturating_sub(MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES)
-                    .saturating_mul(3)
-                    .div_ceil(32);
+                let mut without_buffer = old.clone();
+                without_buffer.safety_hashes = None;
+                without_buffer
+                    .safety
+                    .get_or_insert_with(Default::default)
+                    .sr = true;
+                let base_total = bytes
+                    .saturating_sub(entry_serialized_bytes(retired_key, old))
+                    .saturating_add(entry_serialized_bytes(retired_key, &without_buffer));
+                let encoded_room = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+                    .saturating_sub(base_total)
+                    .saturating_sub(8);
+                let retain_by_bytes = (encoded_room / 4).saturating_mul(3) / 8;
+                let byte_need = old_hashes.len().saturating_sub(retain_by_bytes);
                 let reclaimed = old_hashes.len().min(hash_need.max(byte_need).max(1));
                 let mut replacement = old.clone();
                 replacement.safety_hashes =
@@ -3180,13 +3186,16 @@ impl ClaudeRequestCensusJoin {
             .map(|(key, _)| key.clone())
             .collect();
         for (key, record) in census.records() {
-            if !record.safety_complete() || !record.current_derivation() {
+            if record.over_budget() || record.safety.as_ref().is_some_and(|safety| safety.sr) {
+                join.counts.safety_resource_refused_keys += 1;
+            } else if !record.safety_complete() || !record.current_derivation() {
                 join.counts.missing_migrate += 1;
             }
             let Some(safety) = &record.safety else {
                 if record.shape == ClaudeRequestCensusShape::Lossy {
                     join.counts.shape_lossy_unread += 1;
                     join.counts.shape_lossy_classification_unknown += 1;
+                    join.counts.unread_liveness_unknown_keys += 1;
                 }
                 if record.twin {
                     join.counts.alias_migrate_keys += 1;
@@ -3309,6 +3318,33 @@ impl ClaudeRequestCensusJoin {
             }
             if let Some((root, _)) = claude_index_path_family_member(Path::new(key)) {
                 join.unknown_roots.insert(root);
+            }
+        }
+        let mut migration = BTreeSet::new();
+        for (key, record) in census.records() {
+            if !record.current_derivation()
+                || (record.retired.is_some() && record.safety.is_none())
+                || (record.twin && record.safety.as_ref().is_none_or(|safety| safety.oc != 1))
+                || (record.shape == ClaudeRequestCensusShape::Lossy && record.safety.is_none())
+            {
+                migration.insert(key);
+            }
+        }
+        for (key, coverage) in &join.coverage {
+            if matches!(coverage, ClaudeRequestCensusCoverage::Migrate) {
+                migration.insert(key);
+            }
+        }
+        join.counts.migration_keys_estimated = migration.len();
+        join.counts.migration_estimate_known = true;
+        for key in migration {
+            if let Some(entry) = index.files.get(key) {
+                join.counts.migration_input_bytes_estimated = join
+                    .counts
+                    .migration_input_bytes_estimated
+                    .saturating_add(usize::try_from(entry.size_bytes).unwrap_or(usize::MAX));
+            } else {
+                join.counts.migration_estimate_known = false;
             }
         }
         join.counts.family_unknown_roots = join.unknown_roots.len();
@@ -3528,6 +3564,7 @@ impl ClaudeRequestCensusJoin {
         let counts = &self.counts;
         census_complete
             && !counts.safety_incomplete
+            && counts.safety_resource_refused_keys == 0
             && counts.shape_lossy_unread == 0
             && counts.retired_safety_missing == 0
             && counts.content_owner_overflow_keys == 0
@@ -3740,8 +3777,14 @@ impl CensusShadowView {
                 uncomparable.insert(root.clone());
                 if self.settled_for(index, root) {
                     counts.d2_settled_pending_invalid_families += 1;
-                    // Older pending lacks a per-root cause: disclose unknown.
-                    counts.d2_settled_pending_other_families += 1;
+                    let cause = evidence.diagnostic_invalid_causes;
+                    counts.d2_settled_pending_identity_families += usize::from(cause & 1 != 0);
+                    counts.d2_settled_pending_occurrence_mismatch_families +=
+                        usize::from(cause & 2 != 0);
+                    counts.d2_settled_pending_cap_families += usize::from(cause & 4 != 0);
+                    counts.d2_settled_pending_member_changed_families +=
+                        usize::from(cause & 8 != 0);
+                    counts.d2_settled_pending_other_families += usize::from(cause == 0);
                 }
                 continue;
             }
@@ -3765,6 +3808,11 @@ impl CensusShadowView {
                         .or_default()
                         .extend(keys.iter().copied());
                 }
+            }
+        }
+        for (root, _) in owner_keys.keys() {
+            if !comparable.contains(root) {
+                uncomparable.insert(root.clone());
             }
         }
         let legacy_shared = legacy_owners
@@ -3831,6 +3879,9 @@ impl CensusShadowView {
         }
         counts.legacy_compare_families = comparable.difference(&uncomparable).count();
         counts.legacy_uncomparable_families = uncomparable.len();
+        counts.shadow_work_units = counts
+            .shadow_work_units
+            .saturating_add(expanded_owners as u64);
         counts.legacy_compare_ready = true;
         counts.shadow_projected_dependent_known = false;
         counts.shadow_compare_heap_bytes = occurrences.saturating_mul(1024);
@@ -3848,6 +3899,7 @@ impl CensusShadowView {
     }
 
     pub(crate) fn qualify_saved(&self, saved: &ScanIndex) -> ClaudeRequestCensusShadowCounts {
+        let started = std::time::Instant::now();
         let slot = self
             .comparison
             .lock()
@@ -3894,6 +3946,9 @@ impl CensusShadowView {
             .saturating_add(usize::from(
                 self.marker != evidence_digest(&saved.claude_request_census.safety_incomplete),
             ));
+        counts.shadow_elapsed_us = counts
+            .shadow_elapsed_us
+            .saturating_add(started.elapsed().as_micros().min(u64::MAX as u128) as u64);
         counts.shadow_post_save_qualified = counts.legacy_compare_ready
             && !counts.legacy_compare_generation_mismatch
             && counts.shadow_post_save_mismatch_keys == 0;
@@ -4630,6 +4685,7 @@ mod phase_b_tests {
         index.claude_usage_family_pending.insert(
             "member".to_owned(),
             crate::snapshots::ClaudeUsageFamilyPending {
+                diagnostic_invalid_causes: 0,
                 census_window_end: WINDOW.to_owned(),
                 invalid: false,
                 member_request_id_hashes: BTreeMap::from([(

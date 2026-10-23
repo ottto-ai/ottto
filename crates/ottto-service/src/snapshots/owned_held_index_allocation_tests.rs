@@ -41,6 +41,7 @@ fn synthetic_index(roots: usize) -> ScanIndex {
     };
     for root in 0..roots {
         let mut pending = ClaudeUsageFamilyPending {
+            diagnostic_invalid_causes: 0,
             census_window_end: WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),

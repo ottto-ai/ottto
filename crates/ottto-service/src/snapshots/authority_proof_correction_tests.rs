@@ -103,6 +103,7 @@ fn apc_terminal_fixture() -> ScanIndex {
     index.claude_usage_family_pending.insert(
         APC_ROOT.to_string(),
         ClaudeUsageFamilyPending {
+            diagnostic_invalid_causes: 0,
             census_window_end: APC_WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
