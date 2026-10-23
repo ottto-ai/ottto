@@ -1252,7 +1252,9 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let deadline = started + PAGE_MAX_ELAPSED;
+    // Closing a large page still emits pre-admitted failure metadata. Keep
+    // that work inside the original two-second wall envelope, not after it.
+    let deadline = started + PAGE_MAX_ELAPSED - Duration::from_millis(300);
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us: capture::take_capture_us(),
@@ -1470,7 +1472,6 @@ fn shadow_page_with_coverage(
             )
         };
         let state = coverage_view.family(root);
-        let digest_state = state.clone();
         let mut basis = None;
         let mut rows;
         let mut owned_reservation = None;
@@ -1547,24 +1548,28 @@ fn shadow_page_with_coverage(
                 rows.row.absent_old_unknown = members.len().saturating_sub(items.len()) as u64;
             }
         }
-        let digest = match semantic_digest_by(&mut rows, Some(deadline)) {
-            Some(digest) => digest,
-            None => {
-                // Digest expiry is an explicit failure, never a partial hash
-                // that could suppress a later complete publication.
-                rows = failure_rows(
-                    root,
-                    "deadline",
-                    digest_state,
-                    now,
-                    snapshot,
-                    ledger,
-                    &mut counts,
-                );
-                basis = None;
-                owned_reservation = None;
-                semantic_digest(&mut rows) // bounded pre-admitted failure row
-            }
+        let digest = if rows.row.p1_reasons.contains(&"deadline") {
+            // Already a bounded failure row: never repeat body construction
+            // or tallying after expiry.
+            semantic_digest(&mut rows)
+        } else if let Some(digest) = semantic_digest_by(&mut rows, Some(deadline)) {
+            digest
+        } else {
+            // The body was built, but its full digest did not finish. Keep
+            // known old totals, publish an explicit failure without grains,
+            // and never install this body as a complete removal basis.
+            counts.families_coverage_complete -= u64::from(rows.row.coverage_complete);
+            rows.row.coverage_complete = false;
+            rows.row.p1_reasons.push("deadline");
+            rows.grains.clear();
+            rows.row.grains = 0;
+            rows.row.removed_change = None;
+            rows.row.removed_change_basis = None;
+            rows.row.removed_change_basis_snapshot = None;
+            rows.row.removed_change_unavailable = Some("body_incomplete");
+            basis = None;
+            owned_reservation = None;
+            semantic_digest(&mut rows)
         };
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);

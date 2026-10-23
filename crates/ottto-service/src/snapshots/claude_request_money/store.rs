@@ -1329,8 +1329,22 @@ pub(crate) fn save_page_for_test(
         support_dir,
         ..policy_for_test(Instant::now() + Duration::from_secs(60))
     };
-    credit_for_test(ledger, policy);
-    let (save, _reservation) = ledger.take_save(policy)?;
+    flush();
+    take_results(support_dir, ledger);
+    if !ledger.credit_pending {
+        credit_for_test(ledger, policy);
+    }
+    let taken = ledger.take_save(policy).or_else(|| {
+        if !ledger.credit_pending {
+            return None;
+        }
+        // A partially spent ticket may not fit the next indivisible shard.
+        // Model the production next page, after the writer grants new credit.
+        flush();
+        take_results(support_dir, ledger);
+        ledger.take_save(policy)
+    });
+    let (save, _reservation) = taken?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
     ledger.restore(&unwritten, meta);
     Some((save.shards(), save.meta_first.is_some(), unwritten.len()))
@@ -1450,27 +1464,29 @@ mod bounded_save_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-write-day");
         let dir = scratch.join(LEDGER_DIR);
         std::fs::create_dir_all(&dir).unwrap();
-        let today = super::super::utc_day(super::super::now_unix());
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let yesterday = super::super::utc_day(midnight - 1);
         let set = |name: &str, day, bytes| {
             assert!(write_atomic(
                 &dir.join(name),
                 format!("{{\"day\":{day},\"bytes\":{bytes}}}").as_bytes()
             ))
         };
-        set(SAVE_BUDGET_FILE, today - 1, SAVE_DAILY_BYTES);
-        set(WRITE_BUDGET_FILE, today - 1, SAVE_DAILY_BYTES - 2);
+        set(SAVE_BUDGET_FILE, yesterday, SAVE_DAILY_BYTES);
+        set(WRITE_BUDGET_FILE, yesterday, SAVE_DAILY_BYTES - 2);
         let save = ClaudeLedgerSave {
             shards: vec![(0, b"{}".to_vec()), (1, b"{}".to_vec())],
             ..Default::default()
         };
-        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400 - 1, today * 86_400].into());
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight - 1, midnight].into());
         let mut state = WriterState::default();
         let (failed, _) = write_save(&dir, &save, &mut state);
         assert!(failed.is_empty());
         assert_eq!(load_counter(&dir, WRITE_BUDGET_FILE), (today, 2));
         // This queued prior-day save cannot spend today's physically used cap.
         set(WRITE_BUDGET_FILE, today, SAVE_DAILY_BYTES - 2);
-        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400, today * 86_400].into());
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight, midnight].into());
         let (failed, _) = write_save(&dir, &save, &mut WriterState::default());
         assert_eq!(failed, vec![1]);
         assert_eq!(
@@ -1478,8 +1494,8 @@ mod bounded_save_tests {
             (today, SAVE_DAILY_BYTES as u64)
         );
         // Drop all writer memory: both counters still prevent rollback credit.
-        assert_eq!(reserve_credit(&scratch, today - 1).bytes, 0);
-        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400 - 1].into());
+        assert_eq!(reserve_credit(&scratch, yesterday).bytes, 0);
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight - 1].into());
         assert!(!write_shard(&dir, 2, b"{}"));
         assert!(!shard_path(&dir, 2).exists());
         assert_eq!(
