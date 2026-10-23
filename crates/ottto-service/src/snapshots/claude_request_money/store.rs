@@ -73,7 +73,7 @@ pub(crate) const LEDGER_RESIDENT_BOUND_BYTES: usize = LEDGER_MAX_RECORDS
 /// over it; the load refuses a file larger than this as damage.
 const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
 /// The load waits this long, in steps, for each shard's admission; then it
-/// gives up (nothing is lost: the next page asks for the load again).
+/// gives up without losing custody; ordinary collection permits a later retry.
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
 const LOAD_ADMIT_WAIT: Duration = Duration::from_millis(20);
 
@@ -461,6 +461,9 @@ enum Job {
 
 enum Slot {
     Loading,
+    /// A completed load could not admit its saved shards. Keep the refusal
+    /// visible until ordinary collection permits another admission attempt.
+    LoadRefused,
     Ready(Box<ClaudeLedger>),
     Busy(bool),
 }
@@ -570,7 +573,7 @@ pub(crate) enum ClaudeLedgerAcquire {
     Ready(ClaudeLedgerGuard),
     /// The writer is loading it: this page has no ledger.
     Loading,
-    /// No writer, or another page holds it.
+    /// No writer, another page holds it, or its load completed with refusal.
     Unavailable,
 }
 
@@ -591,6 +594,10 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
                 support_dir: support_dir.to_path_buf(),
                 ledger: Some(ledger),
             })
+        }
+        Some(Slot::LoadRefused) => {
+            ledgers.insert(support_dir.to_path_buf(), Slot::LoadRefused);
+            ClaudeLedgerAcquire::Unavailable
         }
         Some(slot @ (Slot::Loading | Slot::Busy(_))) => {
             let loading = matches!(slot, Slot::Loading);
@@ -684,10 +691,12 @@ fn run_writer(receiver: Receiver<Job>) {
                         Some(ledger) => {
                             ledgers.insert(support_dir, Slot::Ready(Box::new(ledger)));
                         }
-                        // Not admitted: unloaded again, the next page asks.
+                        // This receipt is terminal, not another pending load.
+                        // Keep disk custody untouched and permit ordinary
+                        // collection before a new live admission attempt.
                         None => {
                             LOADS_REFUSED.fetch_add(1, Ordering::Relaxed);
-                            ledgers.remove(&support_dir);
+                            ledgers.insert(support_dir, Slot::LoadRefused);
                         }
                     }
                 }
@@ -1130,6 +1139,12 @@ pub(crate) enum MoneyReceipt {
 }
 
 impl ClaudeLedger {
+    /// An actual custody change or queued receipt, unlike diagnostic memo
+    /// dirtiness. The initial empty-ledger barrier alone is not a prior job.
+    pub(super) fn unacknowledged_custody(&self) -> bool {
+        self.pending_checkpoint.is_some() || self.custody_epoch != self.durable_custody_epoch
+    }
+
     fn live_refused(&self) -> bool {
         self.live_refused_at.is_some_and(|(records, bytes)| {
             self.census.record_count() >= records && self.census.serialized_total() >= bytes
@@ -1161,13 +1176,17 @@ pub(crate) fn live_refused(support: &Path) -> bool {
     match ledgers.get(support) {
         Some(Slot::Ready(ledger)) => ledger.live_refused(),
         Some(Slot::Busy(refused)) => *refused,
+        Some(Slot::LoadRefused) => true,
         _ => false,
     }
 }
 
 pub(crate) fn allow_live(support: &Path) {
     if let Ok(mut ledgers) = LEDGERS.lock() {
-        if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
+        if matches!(ledgers.get(support), Some(Slot::LoadRefused)) {
+            // The saved ledger remains on disk; next admission loads it anew.
+            ledgers.remove(support);
+        } else if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
             ledger.live_refused_at = None;
         }
     }
@@ -1409,7 +1428,7 @@ pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> boo
     let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
         return pause(1);
     };
-    if ledger.pending_checkpoint.is_some() || ledger.dirty_shards() > 0 || ledger.barrier_needed {
+    if ledger.load_damaged || ledger.unacknowledged_custody() || ledger.barrier_needed {
         return pause(1);
     }
     if ledger
@@ -1446,9 +1465,9 @@ pub(super) fn adoption_probe_due(support_dir: &Path, prefix: &str, now: u64) -> 
     let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
         return false;
     };
-    ledger.pending_checkpoint.is_none()
+    !ledger.load_damaged
+        && !ledger.unacknowledged_custody()
         && !ledger.barrier_needed
-        && ledger.dirty_shards() == 0
         && !ledger
             .get(&format!("{prefix}route"))
             .is_some_and(|record| record.window() > now)
@@ -1546,6 +1565,68 @@ pub(crate) fn stall_writer_for_test() -> WriterStallForTest {
 #[cfg(test)]
 mod refused_intent_tests {
     use super::*;
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn completed_load_refusal_enables_collection_then_recovers_without_losing_debt() {
+        let _flush = flush_timeout_for_test(Duration::from_secs(10));
+        let scratch = crate::test_scratch::ScratchDir::new("money-load-admission-receipt");
+        let support = scratch.join("support");
+        let _live = super::super::LiveForTest::new(&support);
+        let ClaudeLedgerAcquire::Ready(mut ledger) = acquire(&support) else {
+            panic!("new ledger");
+        };
+        assert!(ledger.put_money(
+            "due:sentinel".into(),
+            ClaudeRequestCensusRecord::money_debt([7; 32], 0)
+        ));
+        assert!(checkpoint_for_test(&support, &mut ledger));
+        drop(ledger);
+        forget_for_test(&support);
+        let cap = ShadowReservation::admit(
+            super::super::SHADOW_MEMORY_CEILING_BYTES - super::super::reserved_for_test(),
+        )
+        .unwrap();
+        assert!(matches!(acquire(&support), ClaudeLedgerAcquire::Loading));
+        flush(); // Actual saved-shard load exhausts the existing admission attempts.
+        assert!(matches!(
+            acquire(&support),
+            ClaudeLedgerAcquire::Unavailable
+        ));
+        assert!(
+            !super::super::request_owned_live(&support),
+            "completed refusal selects ordinary collection"
+        );
+        assert_eq!(
+            super::super::reclaim_metadata(&support, &crate::snapshots::ScanIndex::default()),
+            MoneyReceipt::Refused
+        );
+        assert!(
+            matches!(
+                LEDGERS.lock().unwrap().get(&support),
+                Some(Slot::LoadRefused)
+            ),
+            "polling cannot silently enqueue another load"
+        );
+        drop(cap);
+        assert!(
+            !super::super::request_owned_live(&support),
+            "resource release alone does not skip ordinary collection"
+        );
+        allow_live(&support); // The actual finish calls this after ordinary success.
+        assert!(matches!(acquire(&support), ClaudeLedgerAcquire::Loading));
+        flush();
+        let ClaudeLedgerAcquire::Ready(ledger) = acquire(&support) else {
+            panic!("recovered load");
+        };
+        assert_eq!(
+            ledger.get("due:sentinel").unwrap().money_revision(),
+            [7; 32],
+            "refused loading never replaces disk custody with an empty ledger"
+        );
+        drop(ledger);
+        forget_for_test(&support);
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn refused_outbox_jobs_leave_debt_without_caller_disk_io() {
