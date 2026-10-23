@@ -675,6 +675,7 @@ impl ApcFixture {
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
