@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 832,
-  "content_sha256": "bc9259d675c78954673a43788ded55760e2e342437f019d16ca1a0e728ad8f82",
+  "content_sha256": "764c8d71c91af68059db74809a259376840632b2456017b1bc971cdce67b6c18",
   "files": [
     {
       "executable": false,
@@ -2015,8 +2015,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/lenient_decode_tests.rs",
-      "sha256": "b39bccc5f4b538548bf321d94313429bcfa058524bc40295470e456eb4cb9b49",
-      "size_bytes": 94625
+      "sha256": "94c9c581cfbe222392b4db198e8925e9f9b5de1d180763f196cb3f22ca557b4e",
+      "size_bytes": 99540
     },
     {
       "executable": false,

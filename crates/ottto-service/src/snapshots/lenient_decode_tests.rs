@@ -2044,14 +2044,89 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 loaded.candidate_decision_with_reason(&candidate),
                 (CandidateDecision::Skip, None)
             );
-            let rescanned = scan_source_roots(
+            // Inspect real continuations too: selection must never queue a
+            // held group, even if its boot guard would later catch it.
+            let mut owned = OwnedSourceScan::new(
                 source,
                 std::slice::from_ref(&root),
-                &mut loaded,
+                loaded.clone(),
                 "2026-10-22T00:01:00Z",
                 BACKFILL_WINDOW_DAYS,
-            )
-            .unwrap();
+                MAX_BACKFILL_FILES_PER_SOURCE,
+                true,
+                None,
+                &[],
+                false,
+                true,
+            );
+            if source == SnapshotSource::ClaudeCode {
+                // An owed family reparse bypasses the ordinary candidate
+                // decision. The earlier hold guard must stop it independently.
+                owned.forced_claude_family_reparses.insert(session.into());
+            }
+            let mut completed = None;
+            for _ in 0..1000 {
+                assert_eq!(
+                    owned.census.claude_parse_reasons[CandidateParseReason::NewFile as usize],
+                    0
+                );
+                assert!(owned
+                    .codex_join_groups
+                    .iter()
+                    .all(|group| group.members.iter().all(|member| !owned
+                        .index
+                        .decode_holds_file(&local_index_key(&member.path)))));
+                match owned.step(None) {
+                    OwnedSourceScanStep::Pending(next) => owned = next,
+                    OwnedSourceScanStep::Complete { index, scan, .. } => {
+                        completed = Some((index, scan));
+                        break;
+                    }
+                }
+            }
+            let (mut rescanned_index, mut rescanned) = completed.expect("rescan finished");
+            finalize_scan_after_policy(source, &mut rescanned, &mut rescanned_index);
+            loaded = rescanned_index;
+            if source == SnapshotSource::Codex {
+                // A queued continuation must recheck custody at boot as well.
+                // Install the actual disk-decoded hold at that boundary, while
+                // preserving the continuation's live traversal.
+                let mut queued = OwnedSourceScan::new(
+                    source,
+                    std::slice::from_ref(&root),
+                    ScanIndex::default(),
+                    "2026-10-22T00:01:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    MAX_BACKFILL_FILES_PER_SOURCE,
+                    true,
+                    None,
+                    &[],
+                    false,
+                    true,
+                );
+                let mut reached_queue = false;
+                for _ in 0..1000 {
+                    if !queued.codex_join_groups.is_empty() {
+                        reached_queue = true;
+                        break;
+                    }
+                    match queued.step(None) {
+                        OwnedSourceScanStep::Pending(next) => queued = next,
+                        OwnedSourceScanStep::Complete { .. } => panic!("group never queued"),
+                    }
+                }
+                assert!(reached_queue);
+                let traversal = queued.index.traversal.take();
+                queued.index = loaded.clone();
+                queued.index.traversal = traversal;
+                let OwnedSourceScanStep::Pending(after) = queued.step(None) else {
+                    panic!("boot yielded")
+                };
+                assert_eq!(after.scanned_file_count, 0);
+                assert!(after.codex_join_active.is_none());
+                assert!(after.active_file.is_none());
+                assert!(after.snapshots.is_empty());
+            }
             assert!(
                 rescanned.snapshots.is_empty(),
                 "held file/group emitted: {source:?} family={family_slot}"
@@ -2100,6 +2175,36 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 .unwrap();
                 assert!(missing.snapshots.is_empty());
                 assert!(!missing.census_complete);
+                assert!(restarted.files.contains_key(&key));
+                if let Some(traversal) = restarted.traversal.as_mut() {
+                    traversal.observed_index_keys.clear();
+                    traversal.reconciliation_upper_bound = Some(key.clone());
+                    traversal.reconciliation_after = None;
+                } else {
+                    // A fresh scan start owns the existing traversal shape.
+                    let mut context = OwnedSourceScan::new(
+                        source,
+                        std::slice::from_ref(&root),
+                        restarted.clone(),
+                        "2026-10-22T00:03:00Z",
+                        BACKFILL_WINDOW_DAYS,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                        true,
+                        None,
+                        &[],
+                        false,
+                        true,
+                    );
+                    restarted.traversal = context.index.traversal.take();
+                    let traversal = restarted.traversal.as_mut().unwrap();
+                    traversal.observed_index_keys.clear();
+                    traversal.reconciliation_upper_bound = Some(key.clone());
+                    traversal.reconciliation_after = None;
+                }
+                assert!(reconcile_missing_index_entries_with_limit(
+                    &mut restarted,
+                    1
+                ));
                 assert!(restarted.files.contains_key(&key));
                 assert_eq!(restarted.file_snapshot_fingerprints[&key], incidence);
                 restarted.save(&path).unwrap();
