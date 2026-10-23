@@ -3648,6 +3648,246 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
     let _ = fs::remove_dir_all(dir);
 }
 
+/// The open/settled result that D2 will supply cannot authorize copied
+/// markers. Both production grouping routes must withdraw them, even before
+/// D2 exists, on legacy/OFF and default state, and after index reload.
+#[test]
+fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
+    use crate::snapshots::ClaudeDuplicateCensusCounts;
+    let dir = temp_dir("claude-i1b-copied-markers");
+    let org = org_hash(ORG_1);
+    // A copied prefix can contain a perfectly valid marker and request id.
+    // The current census may not have observed its other holder yet.
+    let mut lines = email_session(false, false);
+    for n in 2..=5 {
+        lines.push(owned_response(
+            &format!("req_{n}"),
+            "2026-08-02T07:00:02Z",
+            n * 10,
+            n,
+        ));
+    }
+    let mut paired = complete_api_row(ROOT, "req_3", 3, 30, 3, 0);
+    paired.request_identity = Some(org_identity(&org));
+    let (api, mut trace) = reports(
+        vec![
+            signed(complete_api_row(ROOT, "req_2", 2, 20, 2, 0)),
+            signed(paired),
+        ],
+        vec![
+            complete_trace_row(ROOT, "req_2", ""),
+            complete_trace_row(ROOT, "req_3", ""),
+        ],
+    );
+    trace.evidence.insert(
+        OTHER_ROOT.to_string(),
+        vec![complete_trace_row(OTHER_ROOT, "req_5", "")],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let open = ClaudeDuplicateCensusCounts {
+        census_complete: true,
+        coverage_complete: true,
+        ..Default::default()
+    };
+    let clean = ScanIndex::default();
+    let restarted: ScanIndex =
+        serde_json::from_slice(&serde_json::to_vec(&clean).unwrap()).unwrap();
+    // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
+    // and future D2-open inputs reach the same unconditional boundary.
+    for (state, index, census, compared) in [
+        ("settled-open", &clean, open, true),
+        (
+            "legacy-off-closed",
+            &clean,
+            ClaudeDuplicateCensusCounts {
+                fence_after: true,
+                ..open
+            },
+            true,
+        ),
+        (
+            "default-index",
+            &clean,
+            ClaudeDuplicateCensusCounts::default(),
+            false,
+        ),
+        ("restart-open", &restarted, open, true),
+    ] {
+        let disposition = ClaudeUsageAuthorityDisposition {
+            duplicate_census: census,
+            transcript_ownership_complete: compared,
+            ..Default::default()
+        };
+        let ownership = identity::TranscriptOwnership::after_census(index, &disposition);
+        for reported in [false, true] {
+            let mut item = parse_session(&dir, &lines).remove(0);
+            let groupings = if reported {
+                item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
+                let mut sink =
+                    identity::RequestSink::for_item(&evidence, &item, usize::MAX).unwrap();
+                for (request_id, occurrence) in &item.claude_usage_occurrences {
+                    let (row_key, _, _) = build_row_identity(
+                        occurrence.model.as_deref().unwrap(),
+                        &occurrence.selector,
+                        occurrence.reasoning_effort.as_deref(),
+                    );
+                    let mut usage = occurrence.usage.clone();
+                    usage.request_count = 1;
+                    sink.add(
+                        &item,
+                        identity::Request {
+                            request_id,
+                            occurrence: Some((
+                                occurrence.sequence,
+                                occurrence.event_clock_complete,
+                            )),
+                            timestamp: occurrence.timestamp.as_deref().unwrap(),
+                            bucket_start: "2026-08-02T07:00:00Z",
+                            row_key: &row_key,
+                            usage: &usage,
+                        },
+                    );
+                }
+                let grouping = sink.finish();
+                assert!(grouping.owned_reported_requests(&item));
+                BTreeMap::from([(item.source_session_id.clone(), grouping)])
+            } else {
+                BTreeMap::new()
+            };
+            let before = item.clone();
+            let mut items = vec![item];
+            let outcome =
+                identity::apply_scan_with_ownership(&mut items, &evidence, groupings, &ownership);
+            assert_eq!(outcome.sent, 1, "{state} reported={reported}: {outcome:?}");
+            let item = &items[0];
+            assert_usage_conserved(item, &before);
+            assert_eq!(
+                item.request_identity_refusals, 1,
+                "the foreign-owner refusal survives"
+            );
+            assert_eq!(
+                item.request_evidence
+                    .iter()
+                    .map(|e| (
+                        e.identity_basis.as_str(),
+                        e.provider_workspace_hash.as_deref()
+                    ))
+                    .collect::<BTreeSet<_>>(),
+                BTreeSet::from([
+                    (identity::TELEMETRY, Some(org.as_str())),
+                    (identity::TELEMETRY_LOGIN, None)
+                ]),
+                "{state} reported={reported}"
+            );
+            let parts = contributions_of(item).unwrap();
+            let shares = |basis| {
+                parts.iter().filter(|p| matches!(&p.identity, RequestIdentity::Tagged(key) if key.basis == basis)).collect::<Vec<_>>()
+            };
+            let login = shares(identity::TELEMETRY_LOGIN);
+            assert_eq!(login.len(), 1);
+            assert_eq!(
+                login[0].identity,
+                RequestIdentity::Tagged(AuthorityKey {
+                    login: Some(OWNER_A.into()),
+                    org: None,
+                    basis: identity::TELEMETRY_LOGIN
+                })
+            );
+            assert_eq!(
+                (login[0].usage.request_count, login[0].usage.input_tokens),
+                (1, 20)
+            );
+            let telemetry = shares(identity::TELEMETRY);
+            assert_eq!(telemetry.len(), 1);
+            assert_eq!(
+                (
+                    telemetry[0].usage.request_count,
+                    telemetry[0].usage.input_tokens
+                ),
+                (1, 30)
+            );
+            let untagged = parts
+                .iter()
+                .filter(|p| !matches!(p.identity, RequestIdentity::Tagged(_)))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                untagged.len(),
+                1,
+                "withdrawn marker and refused usage merge"
+            );
+            assert_eq!(
+                (
+                    untagged[0].usage.request_count,
+                    untagged[0].usage.input_tokens
+                ),
+                (3, 100)
+            );
+            // An already tagged re-emission stays byte-identical. It cannot
+            // reclassify old marker evidence or add refusals a second time.
+            let bytes = serde_json::to_vec(&items).unwrap();
+            let again = identity::apply_scan_with_ownership(
+                &mut items,
+                &evidence,
+                BTreeMap::new(),
+                &ownership,
+            );
+            assert_eq!(again, identity::ScanOutcome::default());
+            assert_eq!(serde_json::to_vec(&items).unwrap(), bytes);
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}
+
+/// Non-marker capture-ON bodies retain main's pre-withdrawal wire bytes.
+/// The oracle reproduces tag_item at main 02cad8ab: build the RequestSink
+/// grouping and apply it directly, which a settled pass did on that head.
+#[test]
+fn capture_on_non_marker_body_matches_main_before_withdrawal() {
+    let dir = temp_dir("claude-i1b-non-marker-parity");
+    let lines = vec![owned_response("req_1", "2026-08-02T07:00:01Z", 10, 1)];
+    let (api, trace) = reports(
+        vec![signed(complete_api_row(ROOT, "req_1", 1, 10, 1, 0))],
+        vec![complete_trace_row(ROOT, "req_1", "")],
+    );
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut items = parse_session(&dir, &lines);
+    assert!(items[0].claude_org_markers.is_some(), "capture ON");
+    let mut main = items[0].clone();
+    let occurrence = &main.claude_usage_occurrences["req_1"];
+    let (row_key, _, _) = build_row_identity(
+        occurrence.model.as_deref().unwrap(),
+        &occurrence.selector,
+        occurrence.reasoning_effort.as_deref(),
+    );
+    let mut usage = occurrence.usage.clone();
+    usage.request_count = 1;
+    let mut sink = identity::RequestSink::for_item(&evidence, &main, usize::MAX).unwrap();
+    sink.add(
+        &main,
+        identity::Request {
+            request_id: "req_1",
+            occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+            timestamp: occurrence.timestamp.as_deref().unwrap(),
+            bucket_start: "2026-08-02T07:00:00Z",
+            row_key: &row_key,
+            usage: &usage,
+        },
+    );
+    assert!(matches!(
+        identity::apply_grouped(&mut main, sink.finish()),
+        Ok(Tagged::Sent { .. })
+    ));
+    assert_eq!(
+        identity::apply_scan(&mut items, &evidence, BTreeMap::new()).sent,
+        1
+    );
+    assert_eq!(
+        serde_json::to_vec(&items[0]).unwrap(),
+        serde_json::to_vec(&main).unwrap()
+    );
+    let _ = fs::remove_dir_all(dir);
+}
+
 // --- Zero-usage responses -----------------------------------------------------
 
 /// One owned response of `ROOT` with its own request id.
