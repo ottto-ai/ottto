@@ -49,6 +49,25 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   raw-complete censuses of that index, assuming its RetryPending population
   changes only by these retirements, no restart, and at most 32 alternating
   indexes; so retirement never depends on the priced path.
+- Absence retires only when it is positive (SOURCE Round 11). A raw-complete
+  census keeps every absent family while the #700 re-emission stop latch is
+  set, while its index's history is unverified in this process (the path was
+  loaded missing, quarantined, or as an empty generation-0 index, remembered
+  in a runtime-only memo of at most 64 paths until restart; #712's LoadOrigin
+  and `prior_history_unverified` replace it when both land), or when the
+  traversal recorded any read, permission or symlink error, entry cap,
+  unsettled residue or unfinished page. Traversal counts carry no
+  per-directory attribution, so any such problem anywhere refuses.
+- Each retired root is tombstoned: the index persists the SHA-256 of the root
+  with its retirement unix seconds, at most 1024 entries, the oldest evicted
+  first. The field decodes leniently: a malformed entry drops alone and any
+  other container decodes as empty, each counted, so damage never quarantines
+  the index. A reappearing member of a tombstoned family (a restored file, a
+  re-mounted directory) is held before any open or read on every traversal:
+  never parsed, offered, uploaded, accepted or indexed.
+- Local content-free counters (`absent_families_retired`, `tombstone_hits`,
+  `retirements_refused`, `tombstone_decode_drops`) are logged once per Claude
+  census terminal once any is nonzero.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -98,6 +117,14 @@ family still retires on its first raw-complete census and a present one stays
 held; a unit test walks 40 roots through the fallback cursor in 16-root
 windows, another alternates two 32-root indexes so each keeps its own cursor,
 and a third checks the cursor map evicts only its least recently used entry.
+Round 11 adds one pipeline test per guard: an absent family is kept while the
+re-emission stop is latched and on an index loaded fresh in this process (each
+retires after a simulated restart), and a unit test keeps it after each kind
+of traversal problem. A pipeline test restores a retired family's member and
+shows it is never offered, uploaded, accepted or indexed while each traversal
+counts a tombstone hit and the census completes. Unit tests cover the lenient
+tombstone decode (malformed entries and wrong containers, with the rest of the
+index kept), the 1024 cap, and the fresh-load memo.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and
