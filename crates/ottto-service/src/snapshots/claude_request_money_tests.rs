@@ -1007,7 +1007,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         expected.as_slice()
     );
 
-    // The shared byte budget (the anchor check plus one line) stops inside
+    // The shared byte budget (entry/final anchors plus one line) stops inside
     // the file; the next page resumes there and the sweep does not wrap.
     for number in 3..6 {
         tail.append(
@@ -1019,7 +1019,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         &mut ledger,
         &budget,
         1_800_000_000,
-        &mut money_work(64 + line.len() as u64),
+        &mut money_work(128 + line.len() as u64),
     );
     assert!(counts.budget_stopped);
     assert!(!counts.sweep_wrapped);
@@ -1293,7 +1293,7 @@ fn money_rows_converge_by_tailing_long_sidecars() {
     assert_eq!(roots[session], ClaudeRootTelemetry::Current);
     assert_eq!(
         (counts.files_appended, counts.files_rebuilt, counts.bytes_read),
-        (1, 0, line.len() as u64),
+        (1, 0, line.len() as u64 + 3 * 64),
         "{counts:?}"
     );
     let rows = ClaudeRootRows::from_record(ledger.get(&key).unwrap()).expect("complete rows");

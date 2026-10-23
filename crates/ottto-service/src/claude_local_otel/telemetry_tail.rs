@@ -1020,7 +1020,14 @@ fn read_file(
         counts.files_refused_budget += 1;
         return FileRead::Debt;
     }
-    let read_bytes = remaining.min(work.bytes_left()).min(room_bytes);
+    // Every committed slice needs a final anchor. Do not spend its bytes
+    // on read-ahead, or a bounded page would repeatedly discard its prefix.
+    let readable = work.bytes_left().saturating_sub(ANCHOR_BYTES);
+    if readable == 0 {
+        work.stopped = true;
+        return FileRead::Stopped;
+    }
+    let read_bytes = remaining.min(readable).min(room_bytes);
     // The ledger's room, not the work budget, cut this read.
     let room_cut = room_bytes < remaining.min(work.bytes_left());
     let Some(_admitted) =
