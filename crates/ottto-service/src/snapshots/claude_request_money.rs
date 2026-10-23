@@ -1539,14 +1539,28 @@ async fn build_page_at(
         };
         // The reported family fold can replace the item's physical revision
         // with its joined revision. Capture authority remains the opened file.
-        let physical = by_fingerprint.get(fingerprint).map(|key| (*key).to_owned())
+        let physical = by_fingerprint
+            .get(fingerprint)
+            .map(|key| (*key).to_owned())
             .or_else(|| key_of(root, &item.source_session_id));
-        let Some(key) = physical.as_deref() else { continue };
-        let Some(entry) = index.files.get(key) else { continue };
+        let Some(key) = physical.as_deref() else {
+            continue;
+        };
+        let Some(entry) = index.files.get(key) else {
+            continue;
+        };
         let physical_revision = &entry.source_file_fingerprint;
         if let Some(capture) = capture::take_capture(&scope_key, key, physical_revision) {
             counts.captures_taken += 1;
-            note_message_record(ledger, index, key, physical_revision, &capture, live, &mut counts);
+            note_message_record(
+                ledger,
+                index,
+                key,
+                physical_revision,
+                &capture,
+                live,
+                &mut counts,
+            );
             captures.insert((root.to_owned(), fingerprint.to_owned()), capture);
         }
     }
@@ -2182,6 +2196,12 @@ async fn build_page_at(
 /// Build once, publish the P1 comparison, then apply only certified members.
 /// Protected entities keep the existing body; failed builds become local holds.
 #[allow(clippy::too_many_arguments)] // Shared evidence and identity remain separately owned.
+pub(crate) fn is_protected_item(index: &ScanIndex, item: &SnapshotItem) -> bool {
+    index
+        .claude_reemission_exclusions
+        .protected_root(claude_snapshot_family_root_ref(item))
+}
+
 pub(crate) async fn live_page_resume(
     support_dir: &Path,
     snapshots: &mut Vec<SnapshotItem>,
@@ -3281,7 +3301,7 @@ fn schedule_evidence(
     let key_charge = index
         .claude_request_census
         .records()
-        .map(|(key, record)| (key, custody::RecordRef::from(record)))
+        .map(|(key, record)| (key.clone(), custody::RecordRef::from(record)))
         .chain(ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX))
         .chain(ledger.census().records_with_prefix(MESSAGE_KEY_PREFIX))
         .fold(0_usize, |bytes, (key, _)| {
@@ -3329,7 +3349,7 @@ fn schedule_evidence(
     let missing_charge = ledger
         .census()
         .records_with_prefix("watch:")
-        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(*key))
+        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(key))
         .fold(0_usize, |bytes, (key, _)| {
             bytes.saturating_add(key.len()).saturating_add(128)
         });
@@ -3339,7 +3359,7 @@ fn schedule_evidence(
     let missing = ledger
         .census()
         .records_with_prefix("watch:")
-        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(*key))
+        .filter(|(key, _)| !key.starts_with("watch:trace:") && !present.contains(key))
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
     for watch in missing {
@@ -3859,7 +3879,7 @@ fn reconcile_money_offers(
         if Instant::now() >= deadline {
             return;
         }
-        if current_offers.contains(key) {
+        if current_offers.contains(&key) {
             continue;
         }
         let Some((prefix, fingerprint)) = key.rsplit_once(':') else {
@@ -4089,6 +4109,7 @@ pub(crate) fn adoption_prefix(index: &ScanIndex) -> String {
             index
                 .active_upload_context_fingerprint
                 .as_deref()
+                .or(index.upload_context_fingerprint.as_deref())
                 .unwrap_or("")
                 .as_bytes()
         )
@@ -4556,11 +4577,11 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
                     && ledger.get(&format!("watch:trace:v2:{root}")).is_none()
             });
         let stale_adoption = key.starts_with("adopt:entity:")
-            && key != &format!("{prefix}rates")
-            && key != &format!("{prefix}route")
+            && key != format!("{prefix}rates")
+            && key != format!("{prefix}route")
             || key.starts_with("adopt:member:v1:")
-                && !entities.contains(key)
-                && ledger.census().retirable_entity(key);
+                && !entities.contains(&key)
+                && ledger.census().retirable_entity(&key);
         if stale_trace || stale_adoption {
             obsolete.push(key.clone());
         }

@@ -157,6 +157,17 @@ jobs:
           # Shared targets can reuse the base binary after a worktree switch.
           git worktree add --detach "$RUNNER_TEMP/money-base" dba838f067ed58f8d45f6af1a6cabae1e08fc837
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
+          # Match the test-only observer's fixed storage in both binaries.
+          # Runtime source, measured allocations and overflow assertions stay intact.
+          python3 - "$RUNNER_TEMP/money-base" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1]) / "crates/ottto-service/src/retry_allocation_probe.rs"
+          source = path.read_text()
+          old = "const SLOTS: usize = 262_144;"
+          assert source.count(old) == 1
+          path.write_text(source.replace(old, "const SLOTS: usize = 1_048_576;"))
+          PY
+
           CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" cargo test -p ottto-service --lib --locked --no-run --message-format=json > "$RUNNER_TEMP/money-head-build.jsonl"
           money_head_binary="$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1])]; bins=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("executable")]; assert len(bins)==1, bins; print(bins[0])' "$RUNNER_TEMP/money-head-build.jsonl")"
           # The base test execs the independently built head test after all
@@ -177,6 +188,10 @@ jobs:
           result = {"baseline_release": "0.1.189", "baseline_source": "dba838f067ed58f8d45f6af1a6cabae1e08fc837", "base_rss_bytes": base["rss_median_bytes"], "head_rss_bytes": head["rss_median_bytes"], "delta_bytes": head["rss_median_bytes"] - base["rss_median_bytes"], "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
           (root / "money-rss-comparison.json").write_text(json.dumps(result, indent=2) + "\n")
           print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
+          delta = head["ledger_resident_bytes"] - base["ledger_resident_bytes"]
+          print(f'MONEY_M4_DELTA_VS_189 base_resident={base["ledger_resident_bytes"]} head_off_resident={head["ledger_resident_bytes"]} delta={delta} base_load_peak={base["load_native_peak"]} head_off_load_peak={head["load_native_peak"]} base_save_peak={base["save_native_peak"]} head_off_save_peak={head["save_native_peak"]} base_rss={base["rss_median_bytes"]} head_off_rss={head["rss_median_bytes"]} rss_delta={result["delta_bytes"]} resident_is_structural=true peaks_are_native_usable=true matched_observer_slots=1048576')
+          assert delta <= 0, "gate-OFF resident layout must not grow over 0.1.189"
+
           PY
           diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02

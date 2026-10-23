@@ -132,7 +132,7 @@ pub(crate) fn stage_selection_fingerprints(
     for (key, record) in index
         .claude_request_census
         .records()
-        .map(|(key, record)| (key, super::custody::RecordRef::from(record)))
+        .map(|(key, record)| (key.clone(), super::custody::RecordRef::from(record)))
         .chain(ledger.census().semantic_records())
     {
         if key.starts_with("offer:")

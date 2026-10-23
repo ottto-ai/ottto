@@ -1420,7 +1420,6 @@ fn retire_missing(
         .map(|(key, _)| key)
         .filter(|key| key.as_str() > cursor_key.as_str())
         .take(budget.max_missing_checks)
-        .cloned()
         .collect::<Vec<_>>();
     let mut wrapped = due.len() < budget.max_missing_checks;
     let mut last = cursor;

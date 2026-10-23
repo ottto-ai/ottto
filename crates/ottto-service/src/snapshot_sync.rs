@@ -8600,9 +8600,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         // Protected roots keep their ordinary body, without minting a newly
         // joined accounting contract during the preceding reported fold.
         for item in &mut scan_result.snapshots {
-            if index.claude_reemission_exclusions.protected_root(
-                crate::snapshots::claude_snapshot_family_root_ref(item),
-            ) {
+            if crate::snapshots::claude_request_money::is_protected_item(index, item) {
                 item.usage_accounting_contract = None;
             }
         }

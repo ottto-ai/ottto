@@ -1972,6 +1972,12 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
         assert!(money::store::checkpoint_for_test(&control.support, ledger));
     })
     .unwrap();
+    // Existing carriers can accept more fields at the record ceiling. Force
+    // admission of a new physical carrier to exercise actual aggregate refusal.
+    let denied_root = "00000000-1111-4000-8000-000000000001";
+    let denied = std::fs::read_to_string(control.transcript()).unwrap()
+        .replace(IDENTITY_PIPELINE_ROOT, denied_root);
+    std::fs::write(control.transcript().with_file_name(format!("{denied_root}.jsonl")), denied).unwrap();
     let _refused = control.cycle_changing(|attempt| {
         assert!(
             attempt < 12,

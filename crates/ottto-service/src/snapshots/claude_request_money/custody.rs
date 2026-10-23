@@ -18,11 +18,148 @@ use value::Value;
 pub(super) const CONTROL: &str = "control";
 pub(super) const EVER: &str = "ever-indexed";
 
+// Standard queries are reconstructed from their carrier. Only independent
+// offer/entity/control bindings retain their own spelling.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum QueryKey {
+    Standard(u8),
+    Binding(Box<BindingKey>),
+}
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum BindingKey {
+    Digest(u8, [u8; 32]),
+    Text(String),
+}
+const BINDING_PREFIXES: [&str; 2] = ["adopt:member:v1:", "fam:"];
+impl QueryKey {
+    const PREFIXES: [&'static str; 10] = [
+        "mh:",
+        "otel:",
+        "watch:r:",
+        "watch:m:",
+        "watch:trace:",
+        "union:",
+        "due:",
+        "dirty:",
+        "hold:",
+        "unbuilt:",
+    ];
+    fn new(key: String) -> Self {
+        for (code, prefix) in Self::PREFIXES.iter().enumerate() {
+            if key.starts_with(prefix) {
+                return Self::Standard(code as u8);
+            }
+        }
+        for (code, prefix) in BINDING_PREFIXES.iter().enumerate() {
+            if let Some(hash) = key
+                .strip_prefix(prefix)
+                .and_then(super::super::claude_request_census::decode_fingerprint)
+                .filter(|hash| format!("{prefix}{}", hex_bytes(hash)) == key)
+            {
+                return Self::Binding(Box::new(BindingKey::Digest(code as u8, hash)));
+            }
+        }
+        Self::Binding(Box::new(BindingKey::Text(key)))
+    }
+    fn starts_with(&self, prefix: &str) -> bool {
+        match self {
+            Self::Standard(p) => Self::PREFIXES[*p as usize].starts_with(prefix),
+            Self::Binding(k) => match k.as_ref() {
+                BindingKey::Digest(p, _) => BINDING_PREFIXES[*p as usize].starts_with(prefix),
+                BindingKey::Text(k) => k.starts_with(prefix),
+            },
+        }
+    }
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Standard(_) => 0,
+            Self::Binding(k) => {
+                std::mem::size_of::<BindingKey>()
+                    + match k.as_ref() {
+                        BindingKey::Text(k) => k.capacity(),
+                        _ => 0,
+                    }
+            }
+        }
+    }
+    fn len(&self) -> usize {
+        match self {
+            Self::Standard(p) => Self::PREFIXES[*p as usize].len(),
+            Self::Binding(k) => match k.as_ref() {
+                BindingKey::Digest(p, _) => BINDING_PREFIXES[*p as usize].len() + 64,
+                BindingKey::Text(k) => k.len(),
+            },
+        }
+    }
+    fn expand(&self, carrier: &str, path: Option<&str>) -> String {
+        let Self::Standard(prefix) = self else {
+            return self.to_string();
+        };
+        let telemetry = carrier.strip_prefix("telemetry:");
+        let id = telemetry
+            .or_else(|| carrier.strip_prefix("file:"))
+            .unwrap_or(carrier);
+        match Self::PREFIXES[*prefix as usize] {
+            "mh:" => format!("mh:{}", path.unwrap_or("")),
+            "otel:" => format!("otel:{id}"),
+            "watch:trace:" if telemetry.is_none() && id.starts_with("watch:trace:") => id.into(),
+            "watch:trace:" => format!(
+                "watch:trace:{}:{id}",
+                if telemetry.is_some() { "otel" } else { "file" }
+            ),
+            "hold:" if id.starts_with("hold-body:") => format!("hold:body:{}", &id[10..]),
+            _ => format!(
+                "{}{}{id}",
+                Self::PREFIXES[*prefix as usize],
+                if telemetry.is_some() { "otel:" } else { "" }
+            ),
+        }
+    }
+}
+impl PartialEq<str> for QueryKey {
+    fn eq(&self, key: &str) -> bool {
+        match self {
+            Self::Standard(prefix) => key.starts_with(Self::PREFIXES[*prefix as usize]),
+            Self::Binding(_) => self.to_string() == key,
+        }
+    }
+}
+impl PartialEq<&str> for QueryKey {
+    fn eq(&self, key: &&str) -> bool {
+        self == *key
+    }
+}
+impl PartialEq<String> for QueryKey {
+    fn eq(&self, key: &String) -> bool {
+        self == key.as_str()
+    }
+}
+impl std::fmt::Display for QueryKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Standard(p) => f.write_str(Self::PREFIXES[*p as usize]),
+            Self::Binding(k) => match k.as_ref() {
+                BindingKey::Digest(p, hash) => {
+                    write!(f, "{}{}", BINDING_PREFIXES[*p as usize], hex_bytes(hash))
+                }
+                BindingKey::Text(k) => f.write_str(k),
+            },
+        }
+    }
+}
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        write!(text, "{byte:02x}").unwrap();
+    }
+    text
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Slot {
-    key: String,
+    key: QueryKey,
     value: Value,
-    entity: Option<Box<EntityBinding>>,
+    entity: Option<Box<CompactEntity>>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -31,6 +168,125 @@ pub(super) struct EntityBinding {
     pub(super) member: String,
     pub(super) context: String,
     pub(super) body: String,
+}
+
+// Canonical UUIDs/digests retain every bit, without repeated hex strings.
+// Noncanonical/legacy spellings remain lossless text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackedText {
+    Uuid([u8; 16]),
+    Text(Box<str>),
+}
+impl PackedText {
+    fn new(text: String) -> Self {
+        let compact = text.replace('-', "");
+        if text.len() != 36
+            || compact.len() != 32
+            || !compact.is_ascii()
+            || ![8, 13, 18, 23].iter().all(|i| text.as_bytes()[*i] == b'-')
+        {
+            return Self::Text(text.into_boxed_str());
+        }
+        if let Ok(bytes) = (0..16)
+            .map(|i| u8::from_str_radix(&compact[i * 2..i * 2 + 2], 16))
+            .collect::<Result<Vec<_>, _>>()
+        {
+            let packed = Self::Uuid(bytes.try_into().unwrap());
+            if packed.to_string() == text {
+                return packed;
+            }
+        }
+        Self::Text(text.into_boxed_str())
+    }
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Uuid(_) => 0,
+            Self::Text(text) => text.len(),
+        }
+    }
+}
+impl std::fmt::Display for PackedText {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Uuid(bytes) => {
+                let hex = hex_bytes(bytes);
+                write!(
+                    f,
+                    "{}-{}-{}-{}-{}",
+                    &hex[..8],
+                    &hex[8..12],
+                    &hex[12..16],
+                    &hex[16..20],
+                    &hex[20..]
+                )
+            }
+            Self::Text(text) => f.write_str(text),
+        }
+    }
+}
+impl Serialize for PackedText {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PackedBody {
+    Digest([u8; 32]),
+    Text(Box<str>),
+}
+impl PackedBody {
+    fn new(text: String) -> Self {
+        if let Some(hash) = super::super::claude_request_census::decode_fingerprint(&text)
+            .filter(|hash| hex_bytes(hash) == text)
+        {
+            return Self::Digest(hash);
+        }
+        Self::Text(text.into_boxed_str())
+    }
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Digest(_) => 0,
+            Self::Text(text) => text.len(),
+        }
+    }
+}
+impl std::fmt::Display for PackedBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Digest(hash) => f.write_str(&hex_bytes(hash)),
+            Self::Text(text) => f.write_str(text),
+        }
+    }
+}
+impl Serialize for PackedBody {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_str(self)
+    }
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct CompactEntity {
+    root: PackedText,
+    member: PackedText,
+    context: Box<str>,
+    body: PackedBody,
+}
+impl From<EntityBinding> for CompactEntity {
+    fn from(value: EntityBinding) -> Self {
+        Self {
+            root: PackedText::new(value.root),
+            member: PackedText::new(value.member),
+            context: value.context.into_boxed_str(),
+            body: PackedBody::new(value.body),
+        }
+    }
+}
+impl CompactEntity {
+    fn matches(&self, value: &EntityBinding) -> bool {
+        self.root.to_string() == value.root
+            && self.member.to_string() == value.member
+            && self.context.as_ref() == value.context
+            && self.body.to_string() == value.body
+    }
 }
 
 /// Due and dirty retain separate revision/deadline pairs. Optional slots are
@@ -69,6 +325,10 @@ pub(super) struct FileCustody {
     rebuild_owed: bool,
     indexed: bool,
     current_m: Option<Box<Slot>>,
+    live: Option<Box<FileLive>>,
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct FileLive {
     seen_r: Option<Box<Slot>>,
     seen_m: Option<Box<Slot>>,
     trace: Option<Box<Slot>>,
@@ -76,6 +336,31 @@ pub(super) struct FileCustody {
     delivery: Delivery,
     adoption: Option<Box<Slot>>,
     memo: Option<Box<Slot>>,
+}
+impl std::ops::Deref for FileCustody {
+    type Target = FileLive;
+    fn deref(&self) -> &FileLive {
+        static EMPTY: std::sync::OnceLock<FileLive> = std::sync::OnceLock::new();
+        self.live
+            .as_deref()
+            .unwrap_or_else(|| EMPTY.get_or_init(FileLive::default))
+    }
+}
+impl std::ops::DerefMut for FileCustody {
+    fn deref_mut(&mut self) -> &mut FileLive {
+        self.live.get_or_insert_with(Default::default)
+    }
+}
+impl FileLive {
+    fn is_empty(&self) -> bool {
+        self.seen_r.is_none()
+            && self.seen_m.is_none()
+            && self.trace.is_none()
+            && self.union.is_none()
+            && self.adoption.is_none()
+            && self.memo.is_none()
+            && self.delivery.slots().next().is_none()
+    }
 }
 impl FileCustody {
     fn slots(&self) -> impl Iterator<Item = &Slot> {
@@ -371,25 +656,35 @@ impl Custody {
         };
         slot.map(|slot| slot.value.view())
     }
-    pub(crate) fn records(&self) -> impl Iterator<Item = (&String, RecordRef<'_>)> {
+    pub(crate) fn message_path(&self, query: &str) -> Option<&str> {
+        let path = query.strip_prefix("mh:")?;
         self.files
-            .values()
-            .flat_map(FileCustody::slots)
-            .chain(self.telemetry.values().flat_map(TelemetryCustody::slots))
-            .chain(self.control.slots.iter())
-            .map(|slot| (&slot.key, slot.value.view()))
+            .get(&format!("file:{}", digest(path)))?
+            .path
+            .as_deref()
+    }
+    pub(crate) fn records(&self) -> impl Iterator<Item = (String, RecordRef<'_>)> {
+        self.entries().flat_map(|(key, carrier)| {
+            let path = match carrier {
+                Carrier::File(file) => file.path.as_deref(),
+                _ => None,
+            };
+            carrier
+                .slots()
+                .map(move |slot| (slot.key.expand(key, path), slot.value.view()))
+        })
     }
     pub(crate) fn records_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
-    ) -> impl Iterator<Item = (&'a String, RecordRef<'a>)> + 'a {
+    ) -> impl Iterator<Item = (String, RecordRef<'a>)> + 'a {
         self.records()
             .filter(move |(key, _)| key.starts_with(prefix))
     }
     pub(crate) fn records_after<'a>(
         &'a self,
         cursor: &'a str,
-    ) -> impl Iterator<Item = (&'a String, RecordRef<'a>)> + 'a {
+    ) -> impl Iterator<Item = (String, RecordRef<'a>)> + 'a {
         let mut nearest = std::collections::BinaryHeap::new();
         for (key, record) in self.records().filter(|(key, _)| key.as_str() > cursor) {
             if nearest.len() < 256 {
@@ -413,24 +708,24 @@ impl Custody {
         &'a self,
         cursor: &str,
         limit: usize,
-    ) -> impl Iterator<Item = (&'a String, RecordRef<'a>)> {
+    ) -> impl Iterator<Item = (String, RecordRef<'a>)> {
         let mut nearest = std::collections::BinaryHeap::new();
-        for slot in self
-            .files
-            .values()
-            .filter_map(|file| file.current_m.as_deref())
-        {
-            if slot.key.as_str() <= cursor {
+        for (carrier, file) in &self.files {
+            let Some(slot) = file.current_m.as_deref() else {
+                continue;
+            };
+            let key = slot.key.expand(carrier, file.path.as_deref());
+            if key.as_str() <= cursor {
                 continue;
             }
             if nearest.len() < limit {
-                nearest.push(KeyedRecord(&slot.key, slot.value.view()));
+                nearest.push(KeyedRecord(key, slot.value.view()));
             } else if nearest
                 .peek()
-                .is_some_and(|last: &KeyedRecord<'_>| &slot.key < last.0)
+                .is_some_and(|last: &KeyedRecord<'_>| key < last.0)
             {
                 nearest.pop();
-                nearest.push(KeyedRecord(&slot.key, slot.value.view()));
+                nearest.push(KeyedRecord(key, slot.value.view()));
             }
         }
         nearest
@@ -525,9 +820,20 @@ impl Custody {
                 delivery.offers.push(slot);
                 delivery.offers.sort_by(|a, b| a.key.cmp(&b.key));
             }
+            if let Some(file) = self.files.get_mut(&a.carrier) {
+                if file.live.as_deref().is_some_and(FileLive::is_empty) {
+                    file.live = None;
+                }
+            }
             return old;
         }
-        std::mem::replace(self.slot_mut(a)?, slot.map(Box::new)).map(|slot| *slot)
+        let old = std::mem::replace(self.slot_mut(a)?, slot.map(Box::new)).map(|slot| *slot);
+        if let Some(file) = self.files.get_mut(&a.carrier) {
+            if file.live.as_deref().is_some_and(FileLive::is_empty) {
+                file.live = None;
+            }
+        }
+        old
     }
     fn carrier_size(&self, key: &str) -> (usize, usize) {
         if key == EVER {
@@ -650,8 +956,8 @@ impl Custody {
             &a,
             Some(Slot {
                 value: compact,
-                key,
-                entity,
+                key: QueryKey::new(key),
+                entity: entity.map(|entity| Box::new(CompactEntity::from(*entity))),
             }),
         );
         let prior_path = self
@@ -738,6 +1044,7 @@ impl Custody {
             }
             bytes += key.capacity() + carrier.inline_bytes() + carrier.spare_slot_bytes();
             if let Carrier::File(file) = carrier {
+                bytes += usize::from(file.live.is_some()) * std::mem::size_of::<FileLive>();
                 bytes += file.path.as_ref().map_or(0, String::capacity)
                     + file
                         .logical
@@ -760,7 +1067,15 @@ impl Custody {
                         )?;
                     }
                 }
-                bytes += std::mem::size_of::<Slot>() + slot.key.capacity() + count.bytes;
+                bytes += std::mem::size_of::<Slot>()
+                    + slot.key.capacity()
+                    + count.bytes
+                    + match &slot.value {
+                        Value::Message(v) => v.extra_bytes(),
+                        Value::Memo(_) => std::mem::size_of::<Memo>(),
+                        Value::Sweep(_) => std::mem::size_of::<Sweep>(),
+                        _ => 0,
+                    };
                 let current = match carrier {
                     Carrier::File(file) if slot.key.starts_with("watch:m:") => {
                         file.current_m.as_deref()
@@ -781,10 +1096,10 @@ impl Custody {
                     }
                 }
                 if let Some(entity) = &slot.entity {
-                    bytes += std::mem::size_of::<EntityBinding>()
+                    bytes += std::mem::size_of::<CompactEntity>()
                         + entity.root.capacity()
                         + entity.member.capacity()
-                        + entity.context.capacity()
+                        + entity.context.len()
                         + entity.body.capacity();
                 }
             }
@@ -815,7 +1130,7 @@ impl Custody {
     }
 }
 
-struct KeyedRecord<'a>(&'a String, RecordRef<'a>);
+struct KeyedRecord<'a>(String, RecordRef<'a>);
 impl PartialEq for KeyedRecord<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.0 == other.0
@@ -829,7 +1144,7 @@ impl PartialOrd for KeyedRecord<'_> {
 }
 impl Ord for KeyedRecord<'_> {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        self.0.cmp(other.0)
+        self.0.cmp(&other.0)
     }
 }
 
@@ -840,8 +1155,8 @@ pub(super) enum Carrier<'a> {
     Control(&'a Control),
     Ever(&'a [[u8; 32]]),
 }
-impl Carrier<'_> {
-    fn slots(&self) -> impl Iterator<Item = &Slot> {
+impl<'a> Carrier<'a> {
+    fn slots(&self) -> impl Iterator<Item = &'a Slot> {
         let file = match self {
             Self::File(file) => Some(*file),
             _ => None,
@@ -1012,16 +1327,16 @@ impl Serialize for SlotWire<'_> {
         use serde::ser::SerializeStruct;
         let slot = self.slot;
         let mut out = s.serialize_struct("Field", 2)?;
-        let binding = if slot.key.starts_with("offer:") {
-            slot.key
-                .rsplit_once(':')
-                .map(|(_, fingerprint)| fingerprint)
-        } else if let Some(entity) = slot.key.strip_prefix("adopt:member:v1:") {
+        let rendered = matches!(slot.key, QueryKey::Binding(_)).then(|| slot.key.to_string());
+        let key = rendered.as_deref().unwrap_or("");
+        let binding = if key.starts_with("offer:") {
+            key.rsplit_once(':').map(|(_, fingerprint)| fingerprint)
+        } else if let Some(entity) = key.strip_prefix("adopt:member:v1:") {
             Some(entity)
-        } else if let Some(root) = slot.key.strip_prefix("fam:") {
+        } else if let Some(root) = key.strip_prefix("fam:") {
             Some(root)
-        } else if slot.key.starts_with("sweep:") || slot.key.starts_with("adopt:entity:") {
-            Some(slot.key.as_str())
+        } else if key.starts_with("sweep:") || key.starts_with("adopt:entity:") {
+            Some(key)
         } else {
             None
         };
@@ -1048,8 +1363,8 @@ impl Serialize for SlotWire<'_> {
                         MessageRef {
                             revision: message.revision,
                             observed: message.observed,
-                            known: message.known,
-                            hashes: Hashes(message.hashes.as_deref().unwrap_or(&[])),
+                            known: message.known(),
+                            hashes: Hashes(message.hashes().as_deref().unwrap_or(&[])),
                         }
                         .serialize(s)
                     }
@@ -1510,6 +1825,9 @@ fn hydrate_carrier(key: &str, wire: &mut WireCarrier) -> Option<()> {
 }
 
 fn decoded_slot(wire: WireSlot, current: Option<&Slot>) -> Option<Slot> {
+    if wire.key.len() > 4096 {
+        return None;
+    }
     use super::super::claude_request_census::ClaudeLedgerSweep;
     let key = wire.key.as_str();
     fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::value::RawValue) -> Option<T> {
@@ -1602,16 +1920,20 @@ fn decoded_slot(wire: WireSlot, current: Option<&Slot>) -> Option<Slot> {
         ),
         WireValue::Memo(value) => {
             return Some(Slot {
-                key: wire.key,
-                value: Value::Memo(value),
-                entity: wire.entity,
+                key: QueryKey::new(wire.key),
+                value: Value::Memo(Box::new(value)),
+                entity: wire
+                    .entity
+                    .map(|entity| Box::new(CompactEntity::from(*entity))),
             })
         }
     };
     Some(Slot {
         value: Value::from_record(&wire.key, value),
-        key: wire.key,
-        entity: wire.entity,
+        key: QueryKey::new(wire.key),
+        entity: wire
+            .entity
+            .map(|entity| Box::new(CompactEntity::from(*entity))),
     })
 }
 impl Custody {
@@ -1679,14 +2001,20 @@ impl Custody {
                         rebuild_owed: wire.rebuild_owed?,
                         indexed: wire.indexed?,
                         current_m,
-                        seen_r: decode(wire.seen_r, None)?,
-                        seen_m,
-                        trace: decode(wire.trace, None)?,
-                        union: decode(wire.union, None)?,
-                        delivery,
-                        adoption: decode(wire.adoption, None)?,
-                        memo: decode(wire.memo, None)?,
+                        live: Some(Box::new(FileLive {
+                            seen_r: decode(wire.seen_r, None)?,
+                            seen_m,
+                            trace: decode(wire.trace, None)?,
+                            union: decode(wire.union, None)?,
+                            delivery,
+                            adoption: decode(wire.adoption, None)?,
+                            memo: decode(wire.memo, None)?,
+                        })),
                     };
+                    let mut file = file;
+                    if file.live.as_deref().is_some_and(FileLive::is_empty) {
+                        file.live = None;
+                    }
                     if !file.slots().all(|slot| slot.key.len() <= 4096) {
                         return None;
                     }
@@ -1810,7 +2138,7 @@ impl Custody {
                 for slot in &mut control.slots {
                     if let Some((cursor, start, sweep)) = slot.value.sweep() {
                         slot.value = Value::from_record(
-                            &slot.key,
+                            slot.key.to_string().as_str(),
                             Record::sweep_record(*cursor, start, super::store::zeroed(sweep)),
                         );
                     }
@@ -1865,7 +2193,7 @@ impl Custody {
         self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
         true
     }
-    pub(super) fn semantic_records(&self) -> impl Iterator<Item = (&String, RecordRef<'_>)> {
+    pub(super) fn semantic_records(&self) -> impl Iterator<Item = (String, RecordRef<'_>)> {
         self.records().filter(|(key, _)| {
             ["mh:", "otel:", "watch:", "union:"]
                 .iter()
@@ -2156,15 +2484,16 @@ impl Custody {
                 {
                     let belongs = file.logical.as_ref().is_some_and(|(root, member)| {
                         if slot.key.starts_with("fam:") {
-                            super::super::claude_request_census::family_key(root) == slot.key
+                            super::super::claude_request_census::family_key(root).as_str()
+                                == slot.key.to_string().as_str()
                         } else {
                             super::store::money_key("adopt:member:v1:", &format!("{root}/{member}"))
-                                == slot.key
+                                == slot.key.to_string().as_str()
                         }
                     });
                     if !belongs {
-                        primaries.entry(slot.key.clone()).or_insert((
-                            format!("file:detached:{}", digest(&slot.key)),
+                        primaries.entry(slot.key.to_string()).or_insert((
+                            format!("file:detached:{}", digest(slot.key.to_string().as_str())),
                             (u64::MAX, carrier.clone()),
                         ));
                     }
@@ -2187,7 +2516,7 @@ impl Custody {
                     .map(move |slot| (carrier, slot))
             }))
             .filter_map(|(old, slot)| {
-                let (target, _) = primaries.get(&slot.key)?;
+                let (target, _) = primaries.get(slot.key.to_string().as_str())?;
                 if target == old {
                     return None;
                 }
@@ -2227,7 +2556,7 @@ impl Custody {
                 let address = Address {
                     carrier: target.clone(),
                     field: field.into(),
-                    query: slot.key.clone(),
+                    query: slot.key.to_string(),
                     path: None,
                 };
                 self.replace(&address, Some(ambiguous));
@@ -2261,7 +2590,7 @@ impl Custody {
                 let address = Address {
                     carrier: target.clone(),
                     field: field.into(),
-                    query: slot.key.clone(),
+                    query: slot.key.to_string(),
                     path: None,
                 };
                 let previous = self.replace(&address, Some(slot));
@@ -2283,7 +2612,7 @@ impl Custody {
                 let address = Address {
                     carrier: old.clone(),
                     field: field.into(),
-                    query: slot.key,
+                    query: slot.key.to_string(),
                     path: None,
                 };
                 self.replace(&address, None);
@@ -2330,7 +2659,10 @@ impl Custody {
         slot.is_some_and(|slot| {
             slot.key == key
                 && slot.value.view().matches(value)
-                && slot.entity.as_deref() == Some(entity)
+                && slot
+                    .entity
+                    .as_deref()
+                    .is_some_and(|saved| saved.matches(entity))
         })
     }
     pub(super) fn insert_entity(
@@ -2442,5 +2774,98 @@ impl Custody {
         self.files
             .keys()
             .any(|key| key.starts_with("file:hold-body:"))
+    }
+}
+
+#[cfg(test)]
+mod compact_layout_tests {
+    use super::*;
+    #[test]
+    fn compact_layout_round_trip_and_refused_replacement_keep_exact_custody() {
+        for text in [
+            "opaque",
+            "éééééééééééééééé",
+            "00112233-4455-6677-8899-aabbccddeeff",
+            "00112233-4455-6677-8899-AABBCCDDEEFF",
+        ] {
+            assert_eq!(PackedText::new(text.into()).to_string(), text);
+            assert_eq!(PackedBody::new(text.into()).to_string(), text);
+        }
+        let path = "/fixture/projects/root.jsonl";
+        let message = format!("mh:{path}");
+        let watch = format!("watch:m:{}", digest(path));
+        let mut custody = Custody::default();
+        assert_eq!(
+            custody.insert(
+                message.clone(),
+                Record::custody_message([1; 32], 7, None, true)
+            ),
+            Insert::Stored
+        );
+        assert!(
+            custody.files.values().all(|file| file.live.is_none()),
+            "P1-only carriers have no live slots"
+        );
+        for (key, value) in [
+            (
+                watch.clone(),
+                Record::custody_shared_watch([2; 32], Some(std::sync::Arc::from([1_u64, 2]))),
+            ),
+            (
+                format!("due:{}", digest(path)),
+                Record::money_debt([3; 32], 90),
+            ),
+            (
+                format!("fam:{}", "04".repeat(32)),
+                Record::family_record(
+                    [4; 32],
+                    7,
+                    super::super::super::claude_request_census::ClaudeFamilyMemo {
+                        removed_requests: 2,
+                        removed_tokens: 3,
+                        snapshot: 4,
+                    },
+                ),
+            ),
+            (
+                "sweep:tail".into(),
+                Record::sweep_record(
+                    [0; 32],
+                    7,
+                    super::super::super::claude_request_census::ClaudeLedgerSweep {
+                        complete_through: 6,
+                        debt: 0,
+                    },
+                ),
+            ),
+        ] {
+            assert_eq!(custody.insert(key, value), Insert::Stored);
+        }
+        let queries = |c: &Custody| {
+            c.records()
+                .map(|(key, value)| (key, value.to_owned_record()))
+                .collect::<BTreeMap<_, _>>()
+        };
+        let mut decoded = Custody::default();
+        for (key, carrier) in custody.entries() {
+            assert!(decoded.absorb_entry(
+                key.clone(),
+                &serde_json::to_string(&carrier).unwrap(),
+                65536
+            ));
+        }
+        assert_eq!(queries(&decoded), queries(&custody));
+        assert_eq!(decoded.record_count(), custody.record_count());
+        let before = decoded.clone();
+        let hashes: std::sync::Arc<[u64]> = (0..=MAX_HASHES as u64).collect::<Vec<_>>().into();
+        assert_eq!(
+            decoded.insert(watch, Record::custody_shared_watch([9; 32], Some(hashes))),
+            Insert::Refused
+        );
+        assert_eq!(
+            decoded, before,
+            "refusal retains bindings, clocks, fields and all accounting"
+        );
+        assert_eq!(decoded.get(&message).unwrap().money_revision(), [1; 32]);
     }
 }

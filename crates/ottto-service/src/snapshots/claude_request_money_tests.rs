@@ -2799,6 +2799,7 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         .expect("no deadline");
     // The structural resident bound (records, overhead, payload) holds.
     assert!(ledger_resident <= store::LEDGER_RESIDENT_BOUND_BYTES);
+    assert!(ledger_resident <= 38 * 1024 * 1024, "M4 live custody must fit the design resident range: {ledger_resident}");
     let facts_rows = SIDECARS as u64 * SIDECAR_ROWS;
     let facts_bytes = census
         .records_with_prefix(TELEMETRY_KEY_PREFIX)

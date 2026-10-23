@@ -1495,7 +1495,42 @@ fn money_gate_off_rss_fixture_receipt() {
         *sample = money_fixture_rss_bytes();
     }
     samples.sort_unstable();
-    let receipt = serde_json::json!({"rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
+    // Both source builds use the identical saved M4 ledger and audit the
+    // real load/save routines, independently of fixture creation and RSS.
+    let (mut measured, load_peak) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        money::store::load_for_test(&support)
+    });
+    let ledger_resident = measured
+        .census()
+        .resident_bytes(Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    let keys = measured
+        .census()
+        .records()
+        .map(|(key, _)| key.to_string())
+        .collect::<Vec<_>>();
+    for key in keys {
+        let bytes = serde_json::to_vec(&BTreeMap::from([(
+            key.as_str(),
+            measured.census().get(&key).unwrap(),
+        )]))
+        .unwrap();
+        let decoded = crate::snapshots::claude_request_census::decode_ledger_shard(&bytes).unwrap();
+        let record = decoded.get(&key).unwrap().clone();
+        assert_eq!(
+            measured.insert(key, record),
+            crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+    }
+    let ((), save_peak) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut writer = money::store::WriterState::default();
+        while measured.dirty_shards() > 0 {
+            let (_, _, unwritten) =
+                money::store::save_page_for_test(&support, &mut measured, &mut writer).unwrap();
+            assert_eq!(unwritten, 0);
+        }
+    });
+    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
     std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     eprintln!("MONEY_RSS_OFF_FIXTURE median_bytes={} samples={samples:?} p1_shadow_enabled=true live_gate=false hashes={hashes} matched_source_build_fixture=true release_daemon_rss=false", samples[1]);
 }

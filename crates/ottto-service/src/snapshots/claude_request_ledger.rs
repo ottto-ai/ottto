@@ -119,7 +119,7 @@ pub(crate) struct ClaudeRequestHolders<'a> {
     /// Message-only (`M`) ids by the ledger's `mh:` records of the current
     /// transcript revisions, as transcript keys.
     message: BTreeMap<u64, Vec<&'a str>>,
-    telemetry: BTreeMap<u64, Vec<&'a str>>,
+    telemetry: BTreeMap<u64, Vec<String>>,
     overflow: BTreeSet<u64>,
     /// Record hashes compared (the scan's work, for diagnostics).
     pub(crate) compared: u64,
@@ -211,7 +211,16 @@ pub(crate) fn scan_holders<'a>(
         } = &mut holders;
         if late()
             || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
-                hold(telemetry, overflow, &mut *charge, hash, key)
+                if !charge(HOLD_BYTES.saturating_add(key.len())) {
+                    return false;
+                }
+                let list = telemetry.entry(hash).or_default();
+                if list.len() < MAX_HOLDERS_PER_HASH {
+                    list.push(key.clone());
+                } else {
+                    overflow.insert(hash);
+                }
+                true
             })
         {
             return None;
@@ -222,7 +231,7 @@ pub(crate) fn scan_holders<'a>(
             if late() {
                 return None;
             }
-            let file_key = &key[MESSAGE_KEY_PREFIX.len()..];
+            let file_key = ledger.message_path(&key)?;
             if record.over_budget()
                 || !index
                     .get(file_key)
@@ -278,7 +287,7 @@ impl<'a> ClaudeRequestHolders<'a> {
     }
 
     /// `otel:` keys whose telemetry holds the hash.
-    pub(crate) fn telemetry_holders(&self, hash: u64) -> &[&'a str] {
+    pub(crate) fn telemetry_holders(&self, hash: u64) -> &[String] {
         self.telemetry.get(&hash).map_or(&[][..], Vec::as_slice)
     }
 
@@ -614,7 +623,7 @@ impl ClaudeClassifyContext<'_, '_> {
             .holders
             .telemetry_holders(hash)
             .iter()
-            .copied()
+            .map(String::as_str)
             .chain(self.page_claims.get(&hash).into_iter().flatten().copied())
             .collect::<Vec<_>>();
         claimants.sort_unstable();

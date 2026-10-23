@@ -1179,9 +1179,9 @@ fn recover_legacy(support_dir: &Path, ledger: &mut ClaudeLedger) -> Option<bool>
             unknown = true;
             continue;
         };
-        for (key, record) in records.records() {
+        for (key, record) in records.into_records() {
             if key.starts_with("unbuilt:") {
-                if let Some(current) = ledger.get(key) {
+                if let Some(current) = ledger.get(&key) {
                     let released = (record.window() | current.window()) & super::UNBUILT_RELEASED;
                     let first = (record.window() & !super::UNBUILT_RELEASED)
                         .min(current.window() & !super::UNBUILT_RELEASED);
@@ -1191,13 +1191,13 @@ fn recover_legacy(support_dir: &Path, ledger: &mut ClaudeLedger) -> Option<bool>
                         current.money_revision(),
                         first | released,
                     );
-                    if ledger.insert(key.clone(), merged) != ClaudeRequestCensusInsert::Stored {
+                    if ledger.insert(key, merged) != ClaudeRequestCensusInsert::Stored {
                         unknown = true;
                     }
                     continue;
                 }
             }
-            let replace = match ledger.get(key) {
+            let replace = match ledger.get(&key) {
                 None => true,
                 Some(current) if key.starts_with("unbuilt:") => {
                     (record.window() & !super::UNBUILT_RELEASED)
@@ -1210,9 +1210,7 @@ fn recover_legacy(support_dir: &Path, ledger: &mut ClaudeLedger) -> Option<bool>
                 }
                 _ => false,
             };
-            if replace
-                && ledger.insert(key.clone(), record.clone()) != ClaudeRequestCensusInsert::Stored
-            {
+            if replace && ledger.insert(key, record) != ClaudeRequestCensusInsert::Stored {
                 unknown = true;
             }
         }

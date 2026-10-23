@@ -743,6 +743,14 @@ impl ClaudeRequestCensus {
         self.records.is_empty()
     }
 
+    /// Move bounded legacy ledger records into the versioned custody store;
+    /// no second owner of fact payloads is needed during migration.
+    pub(crate) fn into_records(self) -> impl Iterator<Item = (String, ClaudeRequestCensusRecord)> {
+        self.records
+            .into_iter()
+            .filter(|(_, record)| !record.is_birth_stub())
+    }
+
     /// The key's record; a birth stub is no record.
     pub(crate) fn get(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
         self.records

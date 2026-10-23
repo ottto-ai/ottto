@@ -10,8 +10,29 @@ use std::sync::Arc;
 pub(super) struct Message {
     pub(super) revision: [u8; 32],
     pub(super) observed: u64,
-    pub(super) hashes: Option<Arc<[u64]>>,
-    pub(super) known: bool,
+    payload: Option<Box<MessagePayload>>,
+}
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MessagePayload {
+    hashes: Option<Arc<[u64]>>,
+    known: bool,
+}
+impl Message {
+    pub(super) fn hashes(&self) -> Option<Arc<[u64]>> {
+        self.payload.as_ref().and_then(|p| p.hashes.clone())
+    }
+    fn hash_slice(&self) -> &[u64] {
+        self.payload
+            .as_ref()
+            .and_then(|p| p.hashes.as_deref())
+            .unwrap_or(&[])
+    }
+    pub(super) fn known(&self) -> bool {
+        self.payload.as_ref().is_none_or(|p| p.known)
+    }
+    pub(super) fn extra_bytes(&self) -> usize {
+        usize::from(self.payload.is_some()) * std::mem::size_of::<MessagePayload>()
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Seen {
@@ -24,8 +45,8 @@ pub(super) enum Value {
     Message(Message),
     Scalar(Scalar),
     Seen(Seen),
-    Sweep(Sweep),
-    Memo(Memo),
+    Sweep(Box<Sweep>),
+    Memo(Box<Memo>),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Kind<'a> {
@@ -63,30 +84,32 @@ impl Value {
             return Self::Evidence(Box::new(record));
         }
         if key.starts_with("mh:") {
+            let hashes = record.shared_request_hashes();
+            let known = record.custody_is_current();
             return Self::Message(Message {
                 revision: record.money_revision(),
                 observed: record.window(),
-                hashes: record.shared_request_hashes(),
-                known: record.custody_is_current(),
+                payload: (hashes.is_some() || !known)
+                    .then(|| Box::new(MessagePayload { hashes, known })),
             });
         }
         if let Some((cursor, start, sweep)) = record.sweep() {
-            return Self::Sweep(Sweep {
+            return Self::Sweep(Box::new(Sweep {
                 cursor: *cursor,
                 start,
                 complete: sweep.complete_through,
                 debt: sweep.debt,
-            });
+            }));
         }
         if let Some((revision, memo)) = record.family_memo() {
-            return Self::Memo(Memo {
+            return Self::Memo(Box::new(Memo {
                 revision: *revision,
                 observed: record.window(),
                 requests: memo.removed_requests,
                 tokens: memo.removed_tokens,
                 snapshot: memo.snapshot,
                 ambiguous: false,
-            });
+            }));
         }
         if key.starts_with("watch:r:") || key.starts_with("watch:m:") {
             return Self::Seen(Seen {
@@ -157,7 +180,7 @@ impl<'a> RecordRef<'a> {
     pub(crate) fn request_hashes(self) -> &'a [u64] {
         match self.kind {
             Kind::Evidence(v) => v.request_hashes(),
-            Kind::Message(v) => v.hashes.as_deref().unwrap_or(&[]),
+            Kind::Message(v) => v.hash_slice(),
             Kind::Seen(v) => v.hashes.as_deref().unwrap_or(&[]),
             _ => &[],
         }
@@ -165,7 +188,7 @@ impl<'a> RecordRef<'a> {
     pub(crate) fn shared_request_hashes(self) -> Option<Arc<[u64]>> {
         match self.kind {
             Kind::Evidence(v) => v.shared_request_hashes(),
-            Kind::Message(v) => v.hashes.clone(),
+            Kind::Message(v) => v.hashes(),
             Kind::Seen(v) => v.hashes.clone(),
             _ => None,
         }
@@ -195,7 +218,7 @@ impl<'a> RecordRef<'a> {
     pub(crate) fn over_budget(self) -> bool {
         match self.kind {
             Kind::Evidence(v) => v.over_budget(),
-            Kind::Message(v) => !v.known,
+            Kind::Message(v) => !v.known(),
             _ => false,
         }
     }
@@ -209,7 +232,7 @@ impl<'a> RecordRef<'a> {
         match self.kind {
             Kind::Evidence(v) => v.current_for(fingerprint),
             Kind::Message(v) => {
-                v.known
+                v.known()
                     && super::super::super::claude_request_census::decode_fingerprint(fingerprint)
                         == Some(v.revision)
             }
@@ -253,7 +276,7 @@ impl<'a> RecordRef<'a> {
             Kind::Message(value) => {
                 value.revision == record.money_revision()
                     && value.observed == record.window()
-                    && value.known == record.custody_is_current()
+                    && value.known() == record.custody_is_current()
                     && self.request_hashes() == record.request_hashes()
             }
             Kind::Scalar(value) => {
@@ -299,8 +322,8 @@ impl<'a> RecordRef<'a> {
             Kind::Message(value) => Record::custody_message(
                 value.revision,
                 value.observed,
-                value.hashes.clone(),
-                value.known,
+                value.hashes(),
+                value.known(),
             ),
             Kind::Scalar(value) => Record::money_debt(value.revision, value.time),
             Kind::Seen(value) => Record::custody_shared_watch(value.revision, value.hashes.clone()),
