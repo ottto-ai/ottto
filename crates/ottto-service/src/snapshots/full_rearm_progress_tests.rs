@@ -956,12 +956,20 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
     let rearm = Rearm::new();
     let mut baseline = rearm.index();
     rearm.establish(&mut baseline, &rearm.items);
-    for cause in ["absent", "unpaired", "malformed-pair", "request-gap"] {
+    for cause in [
+        "absent",
+        "matched",
+        "unpaired",
+        "malformed-pair",
+        "request-gap",
+        "client-mismatch",
+        "invalid-api",
+    ] {
         let support = temp_dir("full-rearm-filtered-sidecars");
         if cause != "absent" {
             let digest = format!("{:x}", Sha256::digest(rearm.parent.as_bytes()));
             let mut kinds = vec!["claude-code-effort"];
-            if cause == "malformed-pair" || cause == "request-gap" {
+            if cause != "unpaired" {
                 kinds.push("claude-code-trace-ownership");
             }
             for kind in kinds {
@@ -970,20 +978,36 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
                     .join(kind)
                     .join(format!("{digest}.jsonl"));
                 fs::create_dir_all(path.parent().unwrap()).unwrap();
-                let row = if cause == "request-gap" {
+                let row = if !matches!(cause, "unpaired" | "malformed-pair") {
                     if kind == "claude-code-effort" {
-                        serde_json::to_string(&complete_api_row(
-                            &rearm.parent,
-                            "req_1",
-                            0,
-                            10,
-                            10,
-                            0,
-                        ))
-                        .unwrap()
+                        let mut row = complete_api_row(&rearm.parent, "req_1", 0, 10, 10, 0);
+                        if cause == "invalid-api" {
+                            row.request_count = 2;
+                            row.fingerprint.clear();
+                            row.fingerprint = format!(
+                                "sha256:{:x}",
+                                Sha256::digest(serde_json::to_vec(&row).unwrap())
+                            );
+                            assert!(!validate_claude_api_row(&row, &rearm.parent));
+                        }
+                        serde_json::to_string(&row).unwrap()
                     } else {
-                        serde_json::to_string(&complete_trace_row(&rearm.parent, "req_gap", ""))
-                            .unwrap()
+                        let request = if cause == "request-gap" {
+                            "req_gap"
+                        } else {
+                            "req_1"
+                        };
+                        let mut row = complete_trace_row(&rearm.parent, request, "");
+                        if cause == "client-mismatch" {
+                            row.client_request_id = "different-nonempty-client".to_string();
+                            row.fingerprint.clear();
+                            row.fingerprint = format!(
+                                "sha256:{:x}",
+                                Sha256::digest(serde_json::to_vec(&row).unwrap())
+                            );
+                            assert!(claude_trace_evidence_fingerprint_is_valid(&row));
+                        }
+                        serde_json::to_string(&row).unwrap()
                     }
                 } else {
                     "not json".to_string()
@@ -991,8 +1015,126 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
                 fs::write(path, format!("{row}\n")).unwrap();
             }
         }
-        // Obtain a real empty scan envelope, independently of the index whose
-        // baseline is under test, then supply this window's parsed fixture.
+        let mut index = baseline.clone();
+        // A second terminal uses the exact same source revisions and sidecar
+        // bytes, so a change-triggered reread cannot mask semantic qualification.
+        for _ in 0..2 {
+            // Obtain a real empty scan envelope, independently of the index whose
+            // baseline is under test, then supply this window's parsed fixture.
+            let mut scan = scan_source_roots_with_test_limit(
+                SnapshotSource::ClaudeCode,
+                &[],
+                &mut ScanIndex::default(),
+                WINDOW,
+                7,
+                100,
+                false,
+            )
+            .unwrap();
+            scan.snapshots = rearm.items.clone();
+            scan.census_complete = true;
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            let record = index.claude_full_rearm_progress.structural_record.clone();
+            let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+                &support, &mut scan, &mut index,
+            );
+            if cause == "request-gap" {
+                assert_eq!(stats.api_incomplete_root_count, 0);
+                assert_eq!(stats.trace_incomplete_root_count, 0);
+                assert_eq!(stats.request_set_mismatch_root_count, 1);
+            }
+            if matches!(cause, "matched" | "client-mismatch" | "invalid-api") {
+                assert_eq!(stats.api_incomplete_root_count, 0, "{cause}");
+                assert_eq!(stats.trace_incomplete_root_count, 0, "{cause}");
+                assert_eq!(stats.exact_request_set_root_count, 1, "{cause}");
+                assert_eq!(stats.request_set_mismatch_root_count, 0, "{cause}");
+            }
+            let run = rearm.reread(&mut index, &disposition);
+            assert!(
+                run.counts.fence_before && run.counts.fence_after,
+                "{cause}: {run:?}"
+            );
+            if matches!(cause, "absent" | "matched") {
+                assert!(
+                    run.suppression.full_rearm_suppressed,
+                    "healthy control: {run:?}"
+                );
+                assert!(!run.counts.full_rearm);
+                assert_eq!(run.rearmed_files, 0);
+            } else {
+                assert!(run.counts.full_rearm, "{cause}: {run:?}");
+                assert!(!run.suppression.full_rearm_suppressed, "{cause}");
+                assert_eq!(run.rearmed_files, 2, "{cause}");
+                assert_eq!(
+                    index.claude_full_rearm_progress.structural_record, record,
+                    "semantic refusals do not replace the structural baseline"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(support);
+    }
+}
+
+/// The real rebuild produces BadClock for an auxiliary row in this pass,
+/// before final identity application installs its refusal counter on the item.
+#[test]
+fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
+    let mut rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.add_other_family(&mut index);
+    index.claude_request_identity_contract =
+        Some(claude_request_identity::cycle_contract(true).to_string());
+    let other = rearm.other_family(false);
+    assert_eq!(other.request_identity_refusals, 0);
+    assert!(other
+        .claude_usage_occurrences
+        .values()
+        .all(|occurrence| occurrence.event_clock_complete));
+    let mut items = rearm.items.clone();
+    items.push(other.clone());
+    let support = temp_dir("full-rearm-auxiliary-bad-clock");
+    let digest = format!("{:x}", Sha256::digest(OTHER_ROOT.as_bytes()));
+    let mut api = other
+        .claude_usage_request_ids
+        .iter()
+        .enumerate()
+        .map(|(sequence, request)| {
+            complete_api_row(OTHER_ROOT, request, sequence as u64, 10, 10, 0)
+        })
+        .collect::<Vec<_>>();
+    let mut trace = other
+        .claude_usage_request_ids
+        .iter()
+        .map(|request| complete_trace_row(OTHER_ROOT, request, ""))
+        .collect::<Vec<_>>();
+    let write_rows =
+        |api: &[crate::claude_local_otel::ClaudeLocalOtelEvidence],
+         trace: &[crate::claude_local_otel::ClaudeTraceOwnershipEvidence]| {
+            for (kind, rows) in [
+                (
+                    "claude-code-effort",
+                    api.iter()
+                        .map(|row| serde_json::to_string(row).unwrap())
+                        .collect::<Vec<_>>(),
+                ),
+                (
+                    "claude-code-trace-ownership",
+                    trace
+                        .iter()
+                        .map(|row| serde_json::to_string(row).unwrap())
+                        .collect::<Vec<_>>(),
+                ),
+            ] {
+                let path = support
+                    .join("local-otel")
+                    .join(kind)
+                    .join(format!("{digest}.jsonl"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, rows.join("\n") + "\n").unwrap();
+            }
+        };
+    write_rows(&api, &trace);
+    let terminal = |index: &mut ScanIndex| {
         let mut scan = scan_source_roots_with_test_limit(
             SnapshotSource::ClaudeCode,
             &[],
@@ -1003,35 +1145,108 @@ fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
             false,
         )
         .unwrap();
-        scan.snapshots = rearm.items.clone();
+        scan.snapshots = items.clone();
         scan.census_complete = true;
-        let mut index = baseline.clone();
         index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
-        let (disposition, _, stats) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
-            &support, &mut scan, &mut index,
-        );
-        if cause == "request-gap" {
-            assert_eq!(stats.api_incomplete_root_count, 0);
-            assert_eq!(stats.trace_incomplete_root_count, 0);
-            assert_eq!(stats.request_set_mismatch_root_count, 1);
-        }
-        let run = rearm.reread(&mut index, &disposition);
-        assert!(
-            run.counts.fence_before && run.counts.fence_after,
-            "{cause}: {run:?}"
-        );
-        if cause == "absent" {
-            assert!(
-                run.suppression.full_rearm_suppressed,
-                "healthy control: {run:?}"
+        let permit = claude_request_identity::emission_permit(
+            SnapshotSource::ClaudeCode,
+            Some(claude_request_identity::COHORT_HINT_TOKEN),
+        )
+        .unwrap();
+        let (disposition, _, stats) =
+            crate::snapshot_sync::apply_claude_local_evidence_to_scan_with_permit(
+                &support,
+                &mut scan,
+                index,
+                Some(permit),
             );
-            assert!(!run.counts.full_rearm);
-            assert_eq!(run.rearmed_files, 0);
-        } else {
-            assert!(run.counts.full_rearm, "{cause}: {run:?}");
-            assert!(!run.suppression.full_rearm_suppressed, "{cause}");
-            assert_eq!(run.rearmed_files, 2, "{cause}");
-        }
-        let _ = fs::remove_dir_all(support);
+        assert_eq!(stats.api_incomplete_root_count, 0);
+        assert_eq!(stats.trace_incomplete_root_count, 0);
+        assert_eq!(stats.exact_request_set_root_count, 1);
+        assert_eq!(stats.request_set_mismatch_root_count, 0);
+        let reported = scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == OTHER_ROOT)
+            .unwrap();
+        assert_eq!(
+            reported.usage_accounting_contract.as_deref(),
+            Some("session_exclusive_reported_usage:v1")
+        );
+        assert_eq!(
+            reported.provenance.collector,
+            claude_request_identity::COLLECTOR
+        );
+        assert!(!index.claude_request_identity_contract_changed);
+        assert!(index.claude_account_deferred_holds.is_empty());
+        assert!(index.claude_owned_start_census.is_empty());
+        let run = rearm.reread(index, &disposition);
+        (run, reported.clone())
+    };
+    // Establish the structural baseline and healthy matched-pair control
+    // under this same permit contract, with every source revision unchanged.
+    let (first, reported) = terminal(&mut index);
+    assert!(first.counts.full_rearm);
+    assert_eq!(reported.request_identity_refusals, 0);
+    let (healthy, _) = terminal(&mut index);
+    assert!(healthy.suppression.full_rearm_suppressed, "{healthy:?}");
+    assert!(!healthy.counts.full_rearm);
+    let record = index.claude_full_rearm_progress.structural_record.clone();
+    assert!(record.is_some());
+
+    let auxiliary = "auxiliary-no-transcript-clock";
+    assert!(!other.claude_usage_request_ids.contains(auxiliary));
+    api.push(complete_api_row(OTHER_ROOT, auxiliary, 10, 17, 3, 0));
+    trace.push(complete_trace_row(OTHER_ROOT, auxiliary, ""));
+    // Validate the exact canonical refusal independently of the scheduling
+    // assertion; every paired row is otherwise valid and fully decodable.
+    let api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport {
+        evidence: BTreeMap::from([(OTHER_ROOT.to_string(), api.clone())]),
+        ..Default::default()
+    };
+    let trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(OTHER_ROOT.to_string(), trace.clone())]),
+        ..Default::default()
+    };
+    assert!(claude_legacy_request_owners(&api_report, &trace_report).is_some());
+    let evidence = claude_request_identity::ScanEvidence::new(
+        &api_report,
+        &trace_report,
+        BTreeSet::new(),
+        None,
+    );
+    assert_eq!(
+        claude_request_identity::classify(
+            &evidence,
+            &claude_request_identity::RequestFacts {
+                root: OTHER_ROOT,
+                source_session_id: OTHER_ROOT,
+                request_id: auxiliary,
+                terminal_unix_seconds: None,
+                event_clock_complete: false,
+                marker: claude_request_identity::MarkerVerdict::None,
+                desktop: false,
+                scan_unix_seconds: Some(CENSUS_CLOCK),
+                email_home: None,
+                session_start_unix_seconds: None,
+                duplicated_elsewhere: false,
+            }
+        ),
+        claude_request_identity::RequestIdentity::Refused(
+            claude_request_identity::Refusal::BadClock
+        )
+    );
+    write_rows(&api, &trace);
+    // Repeat the same evidence to exercise the steady state too; no contract
+    // change, prior item counter, sidecar change or structural change pays it.
+    for _ in 0..2 {
+        let (run, reported) = terminal(&mut index);
+        assert_eq!(reported.request_count, 5);
+        assert!(reported.request_identity_refusals > 0);
+        assert!(run.counts.full_rearm, "{run:?}");
+        assert!(!run.suppression.full_rearm_suppressed, "{run:?}");
+        assert_eq!(run.rearmed_files, 3);
+        assert_eq!(index.claude_full_rearm_progress.structural_record, record);
     }
+    let _ = fs::remove_dir_all(support);
 }

@@ -135,6 +135,14 @@ correction and the contract-5 latch (which an unrecorded contract sets) need
 it, but the next due re-arm waits the capped delay (24 hours) instead of
 ramping from one hour. An opening fence resets the attempt as before.
 
+The suppression qualification consumes canonical semantic ownership results,
+not just sidecar file health or matching request-id sets. A reducer/proof or
+rebuild rejection keeps the due re-arm enabled. Under an emission permit it
+also consumes this pass's RequestSink refusals before the terminal scheduling
+decision, including auxiliary rows that lack a transcript clock. The veto is
+sticky for the census window. Missing telemetry remains a healthy absence;
+identity tagging and ownership settlement retain their existing order.
+
 ## Tests
 
 - `snapshots/full_rearm_progress_tests.rs` covers:
@@ -147,7 +155,10 @@ ramping from one hour. An opening fence resets the attempt as before.
   - a latch flip and an unrecorded contract;
   - a basis bump and the first-proof veto;
   - malformed persisted values that still load and then re-arm;
-  - the rebuild seed against the base delay.
+  - the rebuild seed against the base delay;
+  - real local-evidence terminals with readable client mismatches, semantically
+    invalid API rows, and newly refused auxiliary BadClock rows under the same
+    settled permit contract, alongside absent and matched evidence controls.
 - `snapshots/stale_family_carry_tests.rs` covers:
   - the window carry at a clean follow-up, and the one-per-deadline cap;
   - a new deadline;

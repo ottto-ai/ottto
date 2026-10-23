@@ -6966,7 +6966,13 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
-    let other_evidence_cause = !reports_healthy
+    // The canonical ownership reducer validates semantic evidence too (row
+    // fingerprints/revisions/clocks and paired clients), beyond file health.
+    // No evidence is healthy: the reducer returns Some(empty), not a refusal.
+    let legacy_request_owners = reports_healthy
+        .then(|| claude_legacy_request_owners(api_report, trace_report))
+        .flatten();
+    let other_evidence_cause = legacy_request_owners.is_none()
         || identity.is_some_and(|evidence| !evidence.unhealthy_roots.is_empty())
         || rfc3339_unix_seconds(census_window_end).is_none()
         || (census_complete
@@ -6990,9 +6996,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         BTreeMap::new()
     };
     let mut proven = BTreeMap::new();
-    let legacy_request_owners = reports_healthy
-        .then(|| claude_legacy_request_owners(api_report, trace_report))
-        .flatten();
+    let mut semantic_evidence_refused = false;
     let mut reconstructed = BTreeMap::new();
     let witness_roots_before = index
         .claude_usage_family_witnesses
@@ -7059,6 +7063,8 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 trace_report.evidence.get(root_session_id),
                 legacy_exclusions.get(root_session_id),
             ) else {
+                semantic_evidence_refused |= api_report.evidence.contains_key(root_session_id)
+                    || trace_report.evidence.contains_key(root_session_id);
                 continue;
             };
             // Only page-item roots consume these rows below. Keep every
@@ -7079,14 +7085,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 item_roots.contains(*root_session_id) && !proven.contains_key(*root_session_id)
             })
             .filter_map(|(root_session_id, witness)| {
-                reconstruct_claude_usage_family(
+                let family = reconstruct_claude_usage_family(
                     root_session_id,
                     witness,
                     api_report,
                     trace_report,
                     legacy_request_owners.as_ref(),
-                )
-                .map(|family| (root_session_id.clone(), family))
+                );
+                semantic_evidence_refused |= family.is_none()
+                    && (api_report.evidence.contains_key(root_session_id)
+                        || trace_report.evidence.contains_key(root_session_id));
+                family.map(|family| (root_session_id.clone(), family))
             })
             .collect();
         index
@@ -7118,14 +7127,17 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             .iter()
             .filter(|(root_session_id, _)| item_roots.contains(*root_session_id))
             .filter_map(|(root_session_id, witness)| {
-                reconstruct_claude_usage_family(
+                let family = reconstruct_claude_usage_family(
                     root_session_id,
                     witness,
                     api_report,
                     trace_report,
                     legacy_request_owners.as_ref(),
-                )
-                .map(|family| (root_session_id.clone(), family))
+                );
+                semantic_evidence_refused |= family.is_none()
+                    && (api_report.evidence.contains_key(root_session_id)
+                        || trace_report.evidence.contains_key(root_session_id));
+                family.map(|family| (root_session_id.clone(), family))
             })
             .collect();
     }
@@ -7140,6 +7152,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
         let Some(family) = family else { continue };
         let Some((rows, excluded_request_hashes)) = claude_reported_usage_inputs(item, family)
         else {
+            semantic_evidence_refused = true;
             continue;
         };
         // The rebuild mirrors each of its rows into the grouping, so groups
@@ -7155,7 +7168,27 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
             item.usage_accounting_contract =
                 Some("session_exclusive_reported_usage:v1".to_string());
             item.snapshot_fingerprint = snapshot_fingerprint(SnapshotSource::ClaudeCode, item);
+        } else {
+            semantic_evidence_refused = true;
         }
+    }
+
+    // Refusals produced by this pass must veto scheduling before the
+    // terminal can suppress its due rearm. Reported groupings include auxiliary
+    // rows without transcript clocks; counters on items are installed later.
+    if semantic_evidence_refused
+        || identity.is_some_and(|evidence| {
+            snapshots.iter().any(|item| {
+                claude_request_identity::full_rearm_requests_refused(
+                    item,
+                    evidence,
+                    request_groupings.get(&item.source_session_id),
+                    &index.claude_duplicate_request_owners,
+                )
+            })
+        })
+    {
+        index.note_claude_full_rearm_evidence_gap(census_window_end);
     }
 
     // The complete local transcript census can disprove ownership through a
