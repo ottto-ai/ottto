@@ -25006,8 +25006,9 @@ impl OwnedSourceScan {
                 let census_complete = raw_census_complete && !needs_clean_followup;
                 // Slice D1: prune and measure only, before any fold.
                 let mut claude_request_census_view = None;
-                let claude_request_census_shadow =
-                    (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
+                let claude_request_census_shadow = (source == SnapshotSource::ClaudeCode
+                    && census_complete)
+                    .then(|| {
                         claude_request_census::prepare_claude_request_census_terminal(
                             index,
                             &traversal_snapshot.observed_index_keys,
@@ -25015,7 +25016,8 @@ impl OwnedSourceScan {
                             &census_window_end,
                             &mut claude_request_census_view,
                         )
-                    });
+                    })
+                    .filter(|_| claude_request_census::d2_shadow_enabled());
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation

@@ -1,7 +1,7 @@
 # Activation-off census safety shadow
 
 Fix 3 phase B separates transcript retirement safety from money-visible request
-hashes. Retirement moves the shared hash buffer; money getters remain empty.
+hashes. With the explicit shadow switch enabled, retirement creates shared bounded chunks; money getters remain empty.
 A maintained oldest-retired queue lets an incoming active record reclaim only
 the safety slots it needs. Active hashes are never reclaimed. Optional safety
 metadata is best effort under serialized pressure; loss retains global safety
@@ -48,3 +48,34 @@ retained old/new state and pretty-checkpoint decode. Workspace refusals remain
 in the healthy-terminal denominator.
 
 Required safety coverage includes indexed empty files, retained records, walked keys and residue keys. Unindexed keys require a current-terminal record; absent records close D2, and every covered unindexed member participates in family settlement vetoes. The workspace reservation conservatively prices the full union before allocation.
+
+
+Round 3 gates phase-B-only work behind `OTTTO_CLAUDE_D2_SHADOW=1`, sampled once
+at process start; the unset/default mode is OFF. This is a diagnostic switch,
+never a D2 decision or money activation switch. OFF creates no optional safety
+fields or retired buffer, uses main's in-place MONEY retirement, emits no new
+shadow line, and skips joins, digests, owner-pair work and extra serialization.
+Previously persisted safety still receives safe reclamation/marker handling.
+Missing old safety remains closed when shadow diagnostics are later enabled.
+
+Retired safety is a persistent chain of immutable 256-hash chunks. Reclaim
+advances the head, copies no retained hash, and preserves old checkpoint clones.
+Physical accounting includes the partially consumed first chunk (at most255
+unused slots per buffer); serialization and hash budget use its logical suffix.
+A streamed codec preserves the existing `sb` wire format. Counting its serialized
+size uses the exact base64 length without encoding the remaining buffer.
+
+A view never returns a cached settled boolean. Consumption supplies the current
+terminal completeness and window; the view checks generation, a unique evidence
+mutation stamp, current indexed fingerprints, the incomplete marker and drift,
+then checks each current family member. Removed/invalidated records or downgraded
+completeness cannot reuse a prior true. Holder certificates stay independent.
+
+Test-only frozen main admission and record encoding provide independent hash
+and byte boundary controls, both with and without reclaim, including full scoped
+MONEY-debt byte comparisons. The OFF fixture uses12,400 files/700,000 hashes and
+prints actual retained bytes, census save delta, inline record-layout delta and
+CPU delta against frozen main MONEY maintenance (D1 shadow comparison excluded
+from both timing arms). CPU measurements are observations, not timing assertions.
+The128/64 MiB synthetic overlap assertions are retained and require an executed
+CI receipt; their existence alone is not evidence that a limit was met.
