@@ -926,3 +926,119 @@ fn absent_take_is_inert_and_replacement_keeps_physical_binding() {
     ));
     assert_eq!(ledger.census(), &before);
 }
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn recovery_takes_current_empty_parse_capture_without_a_snapshot_item() {
+    let scratch = crate::test_scratch::ScratchDir::new("custody-empty-capture");
+    let support = scratch.join("support");
+    let path = scratch.join("projects/-repo/a1111111-1111-4111-8111-111111111111.jsonl");
+    let key = path.to_str().unwrap();
+    legacy_input(
+        &support,
+        vec![(
+            message_key(key),
+            ClaudeRequestCensusRecord::message_record(&record(Vec::new()), Vec::new()),
+        )],
+    );
+    store::reload_for_test(&support).unwrap();
+    let _live = LiveForTest::new(&support);
+    let mut index = ScanIndex::default();
+    let mut entry = crate::snapshots::tests::manifest_index_entry(None);
+    entry.source_file_fingerprint = "b".repeat(64);
+    index.files.insert(key.into(), entry);
+    index.confirmed_empty_files.insert(key.into());
+    index.claude_request_census.insert(
+        key.into(),
+        ClaudeRequestCensusRecord::synthetic_for_test(
+            &"b".repeat(64),
+            8,
+            ClaudeRequestCensusShape::Empty,
+            Vec::new(),
+        ),
+    );
+    let page = || {
+        live_page_for_test(
+            &support,
+            &mut Vec::new(),
+            &index,
+            &Default::default(),
+            &Default::default(),
+            false,
+            None,
+            &mut BTreeMap::new(),
+        )
+    };
+    // Stale captures and the confirmed-empty marker are insufficient.
+    ClaudeResponseCapture::begin(&path)
+        .unwrap()
+        .deposit(key.into(), "a".repeat(64));
+    page();
+    store::with_ledger_for_test(&support, |ledger| {
+        assert!(ledger.census().rebuild_needed(key));
+        assert!(!ledger.census().rebuild_complete(&index));
+        assert!(
+            !claude_request_ledger::message_known(
+                &index.claude_request_census,
+                ledger.census(),
+                key
+            ),
+            "stale or pruned M is still unknown"
+        );
+    })
+    .unwrap();
+    // The same no-snapshot page must consume a current opened parse's capture.
+    ClaudeResponseCapture::begin(&path)
+        .unwrap()
+        .deposit(key.into(), "b".repeat(64));
+    page();
+    store::with_ledger_for_test(&support, |ledger| {
+        assert_eq!(
+            ledger.get(&message_key(key)).unwrap().money_revision(),
+            [0xbb; 32]
+        );
+        assert!(!ledger.census().rebuild_needed(key));
+        assert!(ledger.census().rebuild_complete(&index));
+        ledger.finish_rebuild(&index, true);
+        assert!(!ledger.recovering());
+    })
+    .unwrap();
+}
+
+#[test]
+fn recovery_does_not_require_messages_from_protected_or_other_source_files() {
+    let scratch = crate::test_scratch::ScratchDir::new("custody-rebuild-domain");
+    let support = scratch.join("support");
+    let root = "a1111111-1111-4111-8111-111111111111";
+    let protected = format!("/custody/projects/-repo/{root}.jsonl");
+    let other = "/custody/codex/session.jsonl";
+    let mut index = ScanIndex::default();
+    for path in [protected.as_str(), other] {
+        index.files.insert(
+            path.into(),
+            crate::snapshots::tests::manifest_index_entry(Some("body")),
+        );
+    }
+    std::fs::create_dir_all(support.join("snapshots")).unwrap();
+    std::fs::write(
+        support.join("snapshots/claude_code-reemission-exclusions.txt"),
+        format!("{:x}\n", Sha256::digest(root.as_bytes())),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    assert!(index.claude_reemission_exclusions.protected_root(root));
+    let mut custody = custody::Custody::default();
+    custody.mark_recovery(false);
+    assert!(custody.rebuild_complete(&index));
+    assert!(
+        custody.get(&message_key(&protected)).is_none(),
+        "exemption never fabricates M evidence or an ACK"
+    );
+    // An eligible Claude member still requires an actual current rebuild.
+    let eligible = "/custody/projects/-repo/b1111111-1111-4111-8111-111111111111.jsonl";
+    index.files.insert(
+        eligible.into(),
+        crate::snapshots::tests::manifest_index_entry(Some("body")),
+    );
+    assert!(!custody.rebuild_complete(&index));
+}

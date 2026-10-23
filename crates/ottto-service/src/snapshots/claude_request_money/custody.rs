@@ -2302,6 +2302,17 @@ impl Custody {
     }
     pub(super) fn rebuild_complete(&self, index: &super::super::ScanIndex) -> bool {
         index.files.iter().all(|(path, entry)| {
+            let logical = super::logical_family_member(index, path);
+            // Non-Claude files are outside this store. Protected families stay
+            // on their ordinary path; unknown M there remains unknown to the
+            // classifier, but cannot park unrelated adoption in global recovery.
+            if logical
+                .as_ref()
+                .is_some_and(|(root, _)| index.claude_reemission_exclusions.protected_root(root))
+                || logical.is_none() && index.claude_request_census.get(path).is_none()
+            {
+                return true;
+            }
             if index
                 .claude_request_census
                 .get(path)

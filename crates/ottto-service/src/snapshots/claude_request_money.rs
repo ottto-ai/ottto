@@ -1564,6 +1564,34 @@ async fn build_page_at(
             captures.insert((root.to_owned(), fingerprint.to_owned()), capture);
         }
     }
+    // A verified parse can produce no SnapshotItem (for example a user-only
+    // transcript). Its actual capture is still the authority for M; the empty
+    // index marker alone never manufactures a known-empty message census.
+    if live {
+        for key in &index.confirmed_empty_files {
+            if Instant::now() >= deadline {
+                counts.refused_deadline = 1;
+                break;
+            }
+            let Some(entry) = index.files.get(key) else {
+                continue;
+            };
+            if let Some(capture) =
+                capture::take_capture(&scope_key, key, &entry.source_file_fingerprint)
+            {
+                counts.captures_taken += 1;
+                note_message_record(
+                    ledger,
+                    index,
+                    key,
+                    &entry.source_file_fingerprint,
+                    &capture,
+                    live,
+                    &mut counts,
+                );
+            }
+        }
+    }
     if let Ok(mut last) = LAST_SHADOW.lock() {
         if let Some(previous) = last.insert(scope_key.clone(), Instant::now()) {
             counts.captures_purged = capture::purge_before(&scope_key, previous);
