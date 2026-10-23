@@ -2,6 +2,8 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$SCRIPT_DIR/public_repo_temp_cleanup.sh"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$DEFAULT_REPO_ROOT"
 STAGED_OUTPUT_DIR=""
@@ -35,11 +37,13 @@ require_command() {
 }
 
 cleanup() {
+  local status=$?
   if [[ -n "$TMP_DIR" && "$KEEP_TEMP" -eq 0 ]]; then
-    rm -rf "$TMP_DIR"
+    public_repo_remove_temp_dir "public-surface-ci" "$TMP_DIR" || true
   elif [[ -n "$TMP_DIR" ]]; then
     echo "public-surface-ci: kept temporary checkout at $TMP_DIR"
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -170,6 +174,7 @@ run_step "test public manifest check" bash scripts/test_public_repo_manifest_che
 run_step "run public manifest check" bash scripts/public_repo_manifest_check.sh
 run_step "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
 run_step "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
+run_step "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
 run_step "test public contract check" bash scripts/test_public_repo_contract_check.sh
 run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
