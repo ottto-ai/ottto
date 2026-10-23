@@ -2786,3 +2786,28 @@ fn money_p1b_large_holder_record_checks_inner_deadline() {
     assert!(started.elapsed() < Duration::from_secs(1));
     println!("MONEY_P1B_HOLDER hashes=1000000 wall_us={} check_interval=4096", started.elapsed().as_micros());
 }
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn money_p1b_raced_verification_respects_remaining_physical_read_budget() {
+    let tail = MoneyTail::new("money-verification-physical-budget");
+    let session = "money-verify-root";
+    let text = (0..64).map(|at| money_api_line(session, &format!("req_{at}"), "2026-08-02T09:00:00Z")).collect::<String>();
+    tail.append(session, &text);
+    let limit = text.len() as u64 + text.len() as u64 / 2;
+    let append = money_api_line(session, "req_late", "2026-08-02T09:00:00Z");
+    race_reads_for_test(Some(Box::new(move |path: &Path| {
+        std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(append.as_bytes()).unwrap();
+    })));
+    let mut ledger = ClaudeLedger::new_for_test();
+    let budget = ClaudeTelemetryTailBudget { max_files: 0, ..Default::default() };
+    let mut work = money_work(limit);
+    let (counts, roots) = tail.page(&mut ledger, &budget, 1_800_000_000, &mut work, &[session]);
+    race_reads_for_test(None);
+    assert_eq!(counts.files_reread_proven, 0, "{counts:?}");
+    assert!(counts.files_raced > 0 && counts.budget_stopped, "{counts:?}");
+    assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
+    assert!(ledger.get(&telemetry_key(session)).is_none(), "short verification never commits");
+    assert_eq!(counts.bytes_read, limit, "verification consumes the remaining physical bytes");
+    println!("MONEY_P1B_READ first_pass={} bytes_read={} physical_budget={limit} committed=0", text.len(), counts.bytes_read);
+}
