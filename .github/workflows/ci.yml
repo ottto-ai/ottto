@@ -157,8 +157,12 @@ jobs:
           # Shared targets can reuse the base binary after a worktree switch.
           git worktree add --detach "$RUNNER_TEMP/money-base" dba838f067ed58f8d45f6af1a6cabae1e08fc837
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
-          CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
-          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" cargo test -p ottto-service --lib --locked --no-run --message-format=json > "$RUNNER_TEMP/money-head-build.jsonl"
+          money_head_binary="$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1])]; bins=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("executable")]; assert len(bins)==1, bins; print(bins[0])' "$RUNNER_TEMP/money-head-build.jsonl")"
+          # The base test execs the independently built head test after all
+          # assertions pass. A fresh image preserves only the PID, avoiding
+          # nondeterministic serialized census-witness digit counts.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" OTTTO_MONEY_PARITY_NEXT_BINARY="$money_head_binary" OTTTO_MONEY_PARITY_NEXT_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
           # Isolated processes measure current RSS with the same pre-generated
           # M4 input and armed P1 resident; allocator audits stay inactive.
           CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_RSS_OUTPUT="$RUNNER_TEMP/money-base-rss.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_rss_fixture_receipt -- --nocapture

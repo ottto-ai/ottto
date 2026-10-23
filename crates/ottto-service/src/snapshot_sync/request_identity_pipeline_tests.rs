@@ -799,6 +799,9 @@ fn money_gate_off_saved_fixture_receipt() {
     ) else {
         return;
     };
+    if let Ok(expected_pid) = std::env::var("OTTTO_MONEY_PARITY_EXPECTED_PID") {
+        assert_eq!(std::process::id().to_string(), expected_pid);
+    }
     let base = PathBuf::from(root);
     std::fs::create_dir_all(&base).unwrap();
     let home = base.join("home");
@@ -969,6 +972,14 @@ fn money_gate_off_saved_fixture_receipt() {
         "device-secret",
     )
     .unwrap();
+    // Each independently compiled caller starts fresh. Keep the ordinary
+    // history=0 -> history=20,000 progression within each caller, but never
+    // inherit the preceding source build's completed historical replay.
+    let backfill = crate::backfill::backfill_state_path(&support);
+    if backfill.exists() {
+        std::fs::remove_file(&backfill).unwrap();
+    }
+    assert!(!backfill.exists());
     let mut receipts = Vec::new();
     for history in [0, 20_000] {
         let _cadence = IdentityPipelineCadence::new();
@@ -1169,8 +1180,16 @@ fn money_gate_off_saved_fixture_receipt() {
         );
         let saved_value = serde_json::to_value(&saved).unwrap();
         if history == 0 {
-            let field_bytes = saved_value.as_object().unwrap().iter().map(|(key, value)| (key, serde_json::to_vec(value).unwrap().len())).collect::<BTreeMap<_, _>>();
-            eprintln!("MONEY_GATE_OFF_INDEX_FIELDS {}", serde_json::to_string(&field_bytes).unwrap());
+            let field_bytes = saved_value
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key, serde_json::to_vec(value).unwrap().len()))
+                .collect::<BTreeMap<_, _>>();
+            eprintln!(
+                "MONEY_GATE_OFF_INDEX_FIELDS {}",
+                serde_json::to_string(&field_bytes).unwrap()
+            );
         }
         if let Ok(output) = std::env::var("OTTTO_MONEY_PARITY_OUTPUT") {
             let path = format!("{output}.index-{history}.json");
@@ -1195,6 +1214,29 @@ fn money_gate_off_saved_fixture_receipt() {
                 serde_json::json!({"path":path,"bytes":bytes,"sha256":digest})).collect::<Vec<_>>()}));
     }
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
+    #[cfg(unix)]
+    if let Ok(next_binary) = std::env::var("OTTTO_MONEY_PARITY_NEXT_BINARY") {
+        use std::os::unix::process::CommandExt;
+        // Replacing the process clears every runtime/global while retaining
+        // the PID serialized by DesktopCensusWitness. Both source trees were
+        // compiled independently; neither saved bytes nor receipts are edited.
+        let next_output = std::env::var("OTTTO_MONEY_PARITY_NEXT_OUTPUT").unwrap();
+        eprintln!(
+            "MONEY_GATE_OFF_EXEC_HANDOFF base_assertions_passed=true pid={}",
+            std::process::id()
+        );
+        let error = std::process::Command::new(next_binary)
+            .args(["money_gate_off_saved_fixture_receipt", "--nocapture"])
+            .env("OTTTO_MONEY_PARITY_OUTPUT", next_output)
+            .env(
+                "OTTTO_MONEY_PARITY_EXPECTED_PID",
+                std::process::id().to_string(),
+            )
+            .env_remove("OTTTO_MONEY_PARITY_NEXT_BINARY")
+            .env_remove("OTTTO_MONEY_PARITY_NEXT_OUTPUT")
+            .exec();
+        panic!("independent head caller exec failed: {error}");
+    }
 }
 
 // Kept in this file because CI copies it unchanged into the pinned main tree.

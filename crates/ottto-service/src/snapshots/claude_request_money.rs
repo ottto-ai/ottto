@@ -3651,10 +3651,11 @@ pub(crate) fn prepare_money_offers_receipt(
                 store::money_key("offer:", key),
                 item.snapshot_fingerprint
             );
-            if ledger
-                .get(&offer)
-                .is_some_and(|old| old.money_revision() == revision)
-            {
+            // A re-offer after server pacing covers debt at this new time.
+            // Keep future maturity and newer revisions behind their guards.
+            if ledger.get(&offer).is_some_and(|old| {
+                old.money_revision() == revision && old.window() >= page_now(support_dir)
+            }) {
                 continue;
             }
             let new_offer = ledger.get(&offer).is_none();
@@ -4932,6 +4933,103 @@ fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
 mod scheduling_reconciliation_tests {
     use super::super::claude_request_census::ClaudeTelemetryTailState;
     use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn first_covering_ack_clears_paced_debt_but_preserves_newer_obligations() {
+        for newer_debt in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-paced-ack");
+            let _live = LiveForTest::new(&scratch);
+            store::reload_for_test(&scratch).unwrap();
+            let _clock = PageClockForTest::new(&scratch, 100);
+            let key = "/fixture/.claude/projects/group/a.jsonl".to_owned();
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
+            item.source_file_fingerprint = Some("01".repeat(32));
+            item.snapshot_fingerprint = "03".repeat(32);
+            item.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+            let body = super::super::snapshot_upload_body_witness(&item);
+            let singleton = |domain: &[u8], value: &str| {
+                let mut hash = Sha256::new();
+                super::super::update_length_prefixed(&mut hash, domain);
+                super::super::update_length_prefixed(&mut hash, value.as_bytes());
+                format!("{:x}", hash.finalize())
+            };
+            let mut index = ScanIndex::default();
+            index.files.insert(key.clone(), serde_json::from_value(serde_json::json!({
+                "size_bytes":1, "modified_unix_seconds":1,
+                "source_file_fingerprint":item.source_file_fingerprint,
+                "last_snapshot_fingerprint":singleton(b"snapshot_file_entity_set:v1", &item.snapshot_fingerprint),
+                "last_upload_body_witness":singleton(b"snapshot_file_upload_body_set:v1", &body)
+            })).unwrap());
+            let dirty = store::money_key("dirty:", &key);
+            let due = store::money_key("due:", &key);
+            store::with_ledger_for_test(&scratch, |ledger| {
+                assert!(ledger.put_money(
+                    dirty.clone(),
+                    ClaudeRequestCensusRecord::money_debt([9; 32], 100)
+                ));
+                assert!(store::checkpoint_for_test(&scratch, ledger));
+            })
+            .unwrap();
+            let prepare = || {
+                assert!((0..16).any(|_| {
+                    let ready = prepare_money_offers(
+                        &scratch,
+                        &index,
+                        std::slice::from_ref(&item),
+                        &BTreeSet::new(),
+                    );
+                    store::flush();
+                    ready
+                }));
+            };
+            prepare();
+            pace_money_debt(&scratch, &index, std::slice::from_ref(&item), |_| Some(200));
+            store::reload_for_test(&scratch).unwrap();
+            let _retry_clock = PageClockForTest::new(&scratch, 200);
+            prepare();
+            store::with_ledger_for_test(&scratch, |ledger| {
+                let offer = format!(
+                    "{}:{}",
+                    store::money_key("offer:", &key),
+                    item.snapshot_fingerprint
+                );
+                assert_eq!(ledger.get(&offer).unwrap().window(), 200);
+                assert_eq!(ledger.census().offer_count_for(&key), 1);
+                if newer_debt {
+                    assert!(ledger.put_money(
+                        dirty.clone(),
+                        ClaudeRequestCensusRecord::money_debt([8; 32], 201)
+                    ));
+                    assert!(ledger.put_money(
+                        due.clone(),
+                        ClaudeRequestCensusRecord::money_debt([9; 32], 300)
+                    ));
+                }
+                assert!(store::checkpoint_for_test(&scratch, ledger));
+            })
+            .unwrap();
+            index.save(&scratch.join("selected-index.json")).unwrap();
+            settle_money_acks(
+                &scratch,
+                &index,
+                std::slice::from_ref(&item),
+                &BTreeSet::from([item.snapshot_fingerprint.clone()]),
+                &BTreeMap::from([(item.snapshot_fingerprint.clone(), body)]),
+            );
+            store::reload_for_test(&scratch).unwrap();
+            store::with_ledger_for_test(&scratch, |ledger| {
+                assert_eq!(ledger.get(&dirty).is_some(), newer_debt);
+                assert_eq!(ledger.get(&due).is_some(), newer_debt);
+                assert_eq!(ledger.census().offer_count_for(&key), 0);
+                if newer_debt {
+                    assert_eq!(ledger.get(&dirty).unwrap().money_revision(), [8; 32]);
+                    assert_eq!(ledger.get(&due).unwrap().window(), 300);
+                }
+            })
+            .unwrap();
+        }
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
