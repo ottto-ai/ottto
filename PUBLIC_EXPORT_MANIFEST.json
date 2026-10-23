@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 827,
-  "content_sha256": "1f17f445915e450c976a34c5948c25989ecab191ab3953ecb8c2c9cc46fe3214",
+  "content_sha256": "4cdf9c55ef24da51eeb3b34158fc86f5ac249e92aee8affb66d6a3ef3d3f4ec5",
   "files": [
     {
       "executable": false,
@@ -636,8 +636,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/active_sessions.rs",
-      "sha256": "b51c2a0bde01cf0bd2a7693333b67848427bc9b1eb145641329da1a705d2d883",
-      "size_bytes": 115067
+      "sha256": "4989e855e6e9f91545861e04ecf918dbf66bbf16e6a0ce89d744a6661b23db8f",
+      "size_bytes": 115112
     },
     {
       "executable": false,
@@ -755,8 +755,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/backfill.rs",
-      "sha256": "3b369674839f59f377422a8bc5dae3447a26e12e15299f5a1f9076d0f19cbde2",
-      "size_bytes": 41131
+      "sha256": "adeb879a17d33a3f185b8e4966c426e16d6a1e9ba0e4102eacfc9eadd5217614",
+      "size_bytes": 41176
     },
     {
       "executable": false,
@@ -1147,8 +1147,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_posture.rs",
-      "sha256": "95fc47835c32bf8053eb83098ce1882a705bd6e747175da5b897029d8291d06e",
-      "size_bytes": 32452
+      "sha256": "ad0480bb29a5735baa569eb68d5dbf3128043e761012efb7df831d558192c030",
+      "size_bytes": 32497
     },
     {
       "executable": false,
@@ -1168,8 +1168,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/detected_uses.rs",
-      "sha256": "94204b675f4e9d14b0eb692fca1337422e01780d071138373a5e27d2253a79dd",
-      "size_bytes": 31244
+      "sha256": "aff70c8468f57c8c27575f7e60087dc5673abdbc6a4e66a2843fd5815d5840b6",
+      "size_bytes": 31289
     },
     {
       "executable": false,
@@ -1413,8 +1413,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/retry_retention_bound.rs",
-      "sha256": "425d9513a09a96fb49674199306aa3c57b5514bfce68390a509f5aaf269fdd94",
-      "size_bytes": 8812
+      "sha256": "6ba553d5ca99735ecf691ed45c3832d0c595f39af76eb41251164708b4b67cd3",
+      "size_bytes": 8838
     },
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "7398eaedb20143c9742cdc9110c6a5b244d5289d49077d26f056878c4653234d",
-      "size_bytes": 916094
+      "sha256": "1452336b2cde5db7d8097afdfc52dcc8ac0e0eebc78b8d521f0793c531a05bf0",
+      "size_bytes": 916163
     },
     {
       "executable": false,
@@ -1602,8 +1602,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs",
-      "sha256": "370994272fbbf63bc159351c7f46426d8b0e143390dd81ea3a88a1245aa00b35",
-      "size_bytes": 33457
+      "sha256": "4c208a68928d6af3356fcd3f4a9398fa88cf4a92a51cafe86e271dbcfc7a5e36",
+      "size_bytes": 33584
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b577c78cf153dc700038a828130bf8816e3f275630157257a54bc9c6972ba4a6",
-      "size_bytes": 3367581
+      "sha256": "0203678deddbc2442c819d5e539d546052ac3f3759e3554d6fa304d3467f517f",
+      "size_bytes": 3369329
     },
     {
       "executable": false,
@@ -1672,22 +1672,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "c7bf8642e1898698d4b19063680f96115d5225d3cb407c5dd1484fee7ed898db",
-      "size_bytes": 47377
+      "sha256": "223e2f09376532069a75b188900a22c34fd7e9473a644918e1d7684408531775",
+      "size_bytes": 47569
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth.rs",
-      "sha256": "1c65c9e0d459bdf6ea4f57a3fdfca82a0ed13bf837276e66786cd529bce474a6",
-      "size_bytes": 42676
+      "sha256": "b05f871a1d71240e950ade74e48b87920c055422affa93a79428bd0e1bd93ee3",
+      "size_bytes": 43490
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_context_file_birth_tests.rs",
-      "sha256": "af5b259382711f144d127d0410890d6768308355f6e6e1aac75505f85e93a08d",
-      "size_bytes": 120941
+      "sha256": "66e62834612a4c07f03836a015d38e6b81528b3e490afe2f99a98507053f21cc",
+      "size_bytes": 129322
     },
     {
       "executable": false,
@@ -1756,15 +1756,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity.rs",
-      "sha256": "1866c65548c332036f5236ce02cbae53719c99e2a72f62496f27eb1dcdd30053",
-      "size_bytes": 84614
+      "sha256": "523aca257e03e02930203a776b24d72d0e7604ecbd1319ccf6199b1c926497d9",
+      "size_bytes": 85407
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_identity_tests.rs",
-      "sha256": "ecc0e2c564fb4b832f6c4a311e477399479a1c11afc7b0b8ccbe40c8810e3e54",
-      "size_bytes": 172735
+      "sha256": "513e4bb26445d3b452445d43c40e7d05564b87de98a6fc789b9040dca9cc3c6d",
+      "size_bytes": 162598
     },
     {
       "executable": false,
@@ -1959,8 +1959,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/context_curve.rs",
-      "sha256": "cc6b9e5f199514cd5577503df3443538e7b1b9cf04ccfa1d949ad6336cf1ac33",
-      "size_bytes": 27993
+      "sha256": "fb97926e3804071c87bfd1c745a7ffeba9616519ac0338e18f2e76789f88453d",
+      "size_bytes": 28037
     },
     {
       "executable": false,
@@ -5792,7 +5792,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T14:01:30+00:00",
+  "generated_at": "2026-10-23T15:22:46+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 828,
   "public_roots": [
@@ -5831,5 +5831,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d0ae4d72a2443617790b7c0ce8ee945dae1af1c9"
+  "source_commit": "c2eea35a9a55886eb59c4d121c0bf2f0cbe846d0"
 }
