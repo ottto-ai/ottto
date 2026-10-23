@@ -1397,17 +1397,17 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     // Credit waits and writer flushes are outside the production sync path.
     money::store::prime_credit_for_test(&fixture.support, 0);
-    let run = |now| {
+    let run = |scan: &crate::snapshots::SourceScanResult, index: &ScanIndex, now| {
         let started = std::time::Instant::now();
-        let counts = money::shadow_page_ready_for_test(&fixture.support, &armed.snapshots, &armed_index,
+        let counts = money::shadow_page_ready_for_test(&fixture.support, &scan.snapshots, index,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
-            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), armed.census_complete, now);
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
         let elapsed = started.elapsed(); // includes closing, emit and handoff
         assert!(elapsed <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE, "elapsed={elapsed:?}: {counts:?}");
         money::store::flush();
         (counts, elapsed)
     };
-    let (counts, elapsed) = run(now);
+    let (counts, elapsed) = run(&armed, &armed_index, now);
     assert_eq!(counts.refused_deadline, 0, "pre-admitted family failures: {counts:?}");
     assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     let rows = money_jsonl_rows(&fixture.support);
@@ -1422,7 +1422,14 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(capture_us <= 300_000, "capture callback overshoot: {capture_us}");
     assert!(input <= 8 * 1024 * 1024, "{input}");
     assert!(comparisons <= 1_048_576, "{comparisons}");
-    let (following, following_elapsed) = run(now + 1);
+    // Reproduce a native Full rearm. It uses fresh current captures, not the
+    // old page's consumed capture or a cached completed money body.
+    money::capture::begin_page(&fixture.support);
+    let mut following_index = ScanIndex::default();
+    let reread = scan(&mut following_index);
+    assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&reread.snapshots).unwrap());
+    assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&following_index).unwrap());
+    let (following, following_elapsed) = run(&reread, &following_index, now + 1);
     assert_eq!(following.refused_deadline, 0, "{following:?}");
     let next_rows = money_jsonl_rows(&fixture.support);
     let next_snapshot = next_rows.iter().filter(|row| row["row"] == "page")
@@ -1433,9 +1440,16 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let progressed = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
     assert!(progressed > 0, "following page must reach deferred families");
+    let built = next_families.iter().filter(|row| row["category"] != "unbuilt").count();
+    assert!(built > 0, "the next Full page must build money bodies, not merely change failure reason: {following:?}");
+    assert!(following.families_unbuilt < following.families, "{following:?}");
+    let (skip, skip_elapsed) = run(&reread, &following_index, now + 2);
+    assert_eq!(skip.refused_deadline, 0, "{skip:?}");
+    assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_wall_us={}",
-        armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, following_elapsed.as_micros());
+    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
+        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    money::disable_shadow_for_test(&fixture.support);
 }
 
 #[test]

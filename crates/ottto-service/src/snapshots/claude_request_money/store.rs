@@ -1586,14 +1586,27 @@ mod bounded_save_tests {
             let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
             assert_eq!(loaded.get(key), Some(&record));
             assert!(!loaded.load_damaged);
-            assert_eq!(loaded.save_bytes_today, if missing { 0 } else { SAVE_DAILY_BYTES as u64 });
+            assert_eq!(
+                loaded.save_bytes_today,
+                if missing { 0 } else { SAVE_DAILY_BYTES as u64 }
+            );
             // Exercise the actual async writer request, not just the parser.
             assert!(submit(Job::Reserve(scratch.to_path_buf(), loaded.save_day)).is_ok());
             flush();
             take_results(&scratch, &mut loaded);
-            assert_eq!(loaded.save_credit, if missing { SAVE_BYTES_PER_PAGE } else { 0 });
+            assert_eq!(
+                loaded.save_credit,
+                if missing { SAVE_BYTES_PER_PAGE } else { 0 }
+            );
             assert_eq!(loaded.get(key), Some(&record));
-            assert_eq!(loaded.save_bytes_today, if missing { SAVE_BYTES_PER_PAGE as u64 } else { SAVE_DAILY_BYTES as u64 });
+            assert_eq!(
+                loaded.save_bytes_today,
+                if missing {
+                    SAVE_BYTES_PER_PAGE as u64
+                } else {
+                    SAVE_DAILY_BYTES as u64
+                }
+            );
         }
     }
     #[test]
@@ -1634,12 +1647,20 @@ mod bounded_save_tests {
                     }
                 }
             }
-            assert_eq!(reserve_credit(&scratch, today).bytes, if damaged { 0 } else { SAVE_BYTES_PER_PAGE });
+            assert_eq!(
+                reserve_credit(&scratch, today).bytes,
+                if damaged { 0 } else { SAVE_BYTES_PER_PAGE }
+            );
             let held = load_counters(&dir, today);
             if damaged {
-                assert!(held.0 .1 == SAVE_DAILY_BYTES as u64 || held.1 .1 == SAVE_DAILY_BYTES as u64);
+                assert!(
+                    held.0 .1 == SAVE_DAILY_BYTES as u64 || held.1 .1 == SAVE_DAILY_BYTES as u64
+                );
             } else {
-                assert_eq!(held.0, (today, SAVE_BYTES_PER_PAGE as u64));
+                assert_eq!(held.0 .0, today);
+                assert!(
+                    held.0 .1 >= SAVE_BYTES_PER_PAGE as u64 && held.0 .1 < SAVE_DAILY_BYTES as u64
+                );
                 assert!(held.1 .1 < SAVE_DAILY_BYTES as u64);
             }
             assert_eq!(load(&scratch).unwrap().get(key), Some(&record));

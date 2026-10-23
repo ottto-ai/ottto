@@ -61,6 +61,46 @@ const PAGE_COMPARISONS: usize = 1_048_576;
 const PAGE_CAPTURE_US: u64 = 250_000;
 static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 
+/// After a cold page, focus the next Full parse on the oldest 64 family
+/// turns. Gating optional capture leaves native file/finalizer order alone.
+/// All members of a chosen family remain eligible, within the original caps.
+pub(crate) const NEXT_PAGE_FAMILIES: usize = 64;
+struct Plan {
+    keys: BTreeMap<String, bool>,
+    _funds: Funds,
+    created: Instant,
+}
+static PLANS: Mutex<BTreeMap<PathBuf, Plan>> = Mutex::new(BTreeMap::new());
+
+pub(super) fn plan_next_page<'a>(scope: &Path, keys: impl Iterator<Item = &'a str>) {
+    forget_plan(scope);
+    let mut funds = Funds::default();
+    let mut selected = BTreeMap::new();
+    for (at, key) in keys.enumerate() {
+        if !funds.spend(key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>()) {
+            return;
+        }
+        selected.insert(key.to_owned(), at < NEXT_PAGE_FAMILIES);
+    }
+    if let Ok(mut plans) = PLANS.lock() {
+        plans.retain(|_, plan| plan.created.elapsed() < CAPTURE_TTL);
+        plans.insert(
+            scope.to_path_buf(),
+            Plan {
+                keys: selected,
+                _funds: funds,
+                created: Instant::now(),
+            },
+        );
+    }
+}
+
+pub(super) fn forget_plan(scope: &Path) {
+    if let Ok(mut plans) = PLANS.lock() {
+        plans.remove(scope);
+    }
+}
+
 pub(crate) fn begin_page(scope: &Path) {
     if let Ok(mut work) = WORK.lock() {
         work.insert(scope.to_path_buf(), Work::default());
@@ -193,10 +233,28 @@ impl ClaudeResponseCapture {
     pub(crate) fn begin(path: &Path) -> Option<Self> {
         let mut scope = None;
         super::guarded(|| scope = super::capture_armed(path));
-        scope.map(|scope| Self {
-            scope,
-            ..Self::default()
-        })
+        scope
+            .filter(|scope| {
+                PLANS.lock().is_ok_and(|plans| {
+                    plans
+                        .get(scope)
+                        .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
+                        .map_or(true, |plan| {
+                            super::super::claude_index_path_member_ref(path).is_some_and(|member| {
+                                // A different native page must not be gated by the
+                                // previous page's plan. Only its known roots rotate.
+                                plan.keys
+                                    .get(&super::family_key(member.root))
+                                    .copied()
+                                    .unwrap_or(true)
+                            })
+                        })
+                })
+            })
+            .map(|scope| Self {
+                scope,
+                ..Self::default()
+            })
     }
 
     /// Every entry point the live finalizer calls runs here (StateMissing
@@ -626,6 +684,38 @@ pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn planned_capture_rotates_known_roots_without_gating_a_different_native_page() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-turns");
+        let support = scratch.join("support");
+        super::super::enable_shadow_for_test(&support);
+        let keys = (0..NEXT_PAGE_FAMILIES + 1)
+            .map(|at| super::super::family_key(&format!("root-{at}")))
+            .collect::<Vec<_>>();
+        plan_next_page(&support, keys.iter().map(String::as_str));
+        assert!(ClaudeResponseCapture::begin(&scratch.join("root-0.jsonl")).is_some());
+        assert!(
+            ClaudeResponseCapture::begin(&scratch.join("root-0/subagents/agent-one.jsonl"))
+                .is_some()
+        );
+        assert!(ClaudeResponseCapture::begin(
+            &scratch.join(format!("root-{NEXT_PAGE_FAMILIES}.jsonl"))
+        )
+        .is_none());
+        assert!(
+            ClaudeResponseCapture::begin(&scratch.join("different-native-page.jsonl")).is_some()
+        );
+        // Rotate eligibility to the formerly skipped root, without parsing
+        // files or changing a native candidate's ordering or identity.
+        plan_next_page(&support, keys.iter().rev().map(String::as_str));
+        assert!(ClaudeResponseCapture::begin(
+            &scratch.join(format!("root-{NEXT_PAGE_FAMILIES}.jsonl"))
+        )
+        .is_some());
+        super::super::disable_shadow_for_test(&support);
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]

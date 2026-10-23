@@ -381,6 +381,7 @@ pub(crate) fn enable_shadow_for_test(support_dir: &Path) {
 
 #[cfg(test)]
 pub(crate) fn disable_shadow_for_test(support_dir: &Path) {
+    capture::forget_plan(support_dir);
     SHADOW_ENABLED_FOR_TEST
         .lock()
         .expect("shadow control")
@@ -484,6 +485,7 @@ fn shadow_off(support_dir: &Path, now: u64) -> bool {
     });
     if off {
         capture::purge_before(&scope, Instant::now());
+        capture::forget_plan(&scope);
     }
     if first_today {
         guarded(|| publish_off(support_dir, now));
@@ -838,7 +840,7 @@ fn hashed_id(value: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"claude_request_money_shadow:v1\0");
     digest.update(value.as_bytes());
-    format!("{:x}", digest.finalize())[..16].to_owned()
+    hex_bytes(&digest.finalize()[..8])
 }
 
 /// One side of a B1 grain row.
@@ -1100,10 +1102,6 @@ fn next_snapshot() -> u64 {
     LAST.fetch_max(now, Ordering::AcqRel);
     LAST.fetch_add(1, Ordering::AcqRel) + 1
 }
-
-/// When each scope's previous shadow ran: captures deposited before it and
-/// still not taken belonged to an earlier page and are dropped.
-static LAST_SHADOW: Mutex<BTreeMap<PathBuf, Instant>> = Mutex::new(BTreeMap::new());
 
 // ---------------------------------------------------------------- shadow
 
@@ -1379,13 +1377,24 @@ fn shadow_page_with_coverage(
     // every body, while the pre-admitted family failure rows still publish.
     let (member_keys, indexed_members) =
         family_members(index, &roots, deadline).unwrap_or_default();
+    let mut order = roots.iter().copied().collect::<Vec<_>>();
+    order.sort_by_cached_key(|root| {
+        ledger
+            .get(&family_key(root))
+            .map_or(0, |record| record.window())
+    });
+    let capture_turns = order
+        .iter()
+        .take(capture::NEXT_PAGE_FAMILIES)
+        .copied()
+        .collect::<BTreeSet<_>>();
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     let mut captures = BTreeMap::new();
     let mut groups_owned = BTreeSet::new();
     for item in snapshots {
         let root = claude_snapshot_family_root_ref(item);
         by_root.entry(root).or_default().push(item);
-        if Instant::now() >= deadline {
+        if Instant::now() >= deadline || !capture_turns.contains(root) {
             continue;
         }
         if let Some(keys) = member_keys
@@ -1449,12 +1458,6 @@ fn shadow_page_with_coverage(
             }
         }
     }
-    let mut order = roots.iter().copied().collect::<Vec<_>>();
-    order.sort_by_key(|root| {
-        ledger
-            .get(&family_key(root))
-            .map_or(0, |record| record.window())
-    });
     let mut families = Vec::with_capacity(roots.len());
     let mut memos = Vec::with_capacity(roots.len());
     let mut reservations = vec![base, root_funds];
@@ -1651,6 +1654,19 @@ fn shadow_page_with_coverage(
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
     counts.family_memos_dropped = drop_old_family_memos(ledger, now, deadline);
+    // This only selects optional captures; it grants no publication or
+    // coverage evidence. Reached turns yield to deferred turns on a Full
+    // reread, without changing native file order or retaining old captures.
+    if memos.len() > capture::NEXT_PAGE_FAMILIES {
+        let mut next_capture = memos.iter().collect::<Vec<_>>();
+        next_capture.sort_by_key(|memo| memo.observed_unix);
+        capture::plan_next_page(
+            &scope_key,
+            next_capture.iter().map(|memo| memo.key.as_str()),
+        );
+    } else {
+        capture::forget_plan(&scope_key);
+    }
     let page_complete = incomplete == 0 && telemetry_certified(ledger) && holder_view.complete();
     counts.coverage_complete = u64::from(page_complete);
     let page = CoverageRow {
@@ -2204,7 +2220,17 @@ fn family_rows(
 }
 
 fn hex_revision(revision: &[u8; 32]) -> String {
-    revision.iter().map(|byte| format!("{byte:02x}")).collect()
+    hex_bytes(revision)
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        result.push(char::from(DIGITS[usize::from(byte >> 4)]));
+        result.push(char::from(DIGITS[usize::from(byte & 15)]));
+    }
+    result
 }
 
 fn failure_rows(
@@ -2243,17 +2269,29 @@ fn semantic_digest(rows: &mut FamilyRows) -> u64 {
 }
 
 fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Option<u64> {
-    struct HashWriter(Sha256, Option<Instant>);
+    // Serde writes punctuation and numbers in tiny chunks. Feeding each one
+    // into SHA independently made closing thousands of bounded failure rows
+    // dominate the page. Buffer without changing a single canonical byte;
+    // keep deadline checks at every serialization write, not just each flush.
+    struct HashWriter {
+        hash: Sha256,
+        deadline: Option<Instant>,
+        buffer: [u8; 4096],
+        used: usize,
+    }
     impl Write for HashWriter {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-            if self.1.is_some_and(|deadline| Instant::now() >= deadline) {
+            if self
+                .deadline
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::TimedOut,
                     "money digest deadline",
                 ));
             }
             #[cfg(test)]
-            if self.1.is_some()
+            if self.deadline.is_some()
                 && DIGEST_WRITES_FOR_TEST.with(|left| match left.get() {
                     Some(0) => true,
                     Some(n) => {
@@ -2268,10 +2306,22 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
                     "synthetic digest deadline",
                 ));
             }
-            self.0.update(bytes);
+            let mut remaining = bytes;
+            while !remaining.is_empty() {
+                let len = remaining.len().min(self.buffer.len() - self.used);
+                self.buffer[self.used..self.used + len].copy_from_slice(&remaining[..len]);
+                self.used += len;
+                remaining = &remaining[len..];
+                if self.used == self.buffer.len() {
+                    self.hash.update(self.buffer);
+                    self.used = 0;
+                }
+            }
             Ok(bytes.len())
         }
         fn flush(&mut self) -> std::io::Result<()> {
+            self.hash.update(&self.buffer[..self.used]);
+            self.used = 0;
             Ok(())
         }
     }
@@ -2286,7 +2336,12 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
     );
     row.snapshot = 0;
     row.observed_unix = 0;
-    let mut hash = HashWriter(Sha256::new(), deadline);
+    let mut hash = HashWriter {
+        hash: Sha256::new(),
+        deadline,
+        buffer: [0; 4096],
+        used: 0,
+    };
     let result = serde_json::to_writer(&mut hash, &*row).and_then(|()| {
         for (key, (old, new)) in &rows.grains {
             serde_json::to_writer(&mut hash, &grain_row(row, key, old, new))?;
@@ -2302,8 +2357,9 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
         row.removed_change_unavailable,
     ) = saved;
     result.ok()?;
+    hash.flush().ok()?;
     Some(u64::from_be_bytes(
-        hash.0.finalize()[..8].try_into().expect("digest"),
+        hash.hash.finalize()[..8].try_into().expect("digest"),
     ))
 }
 
@@ -2312,14 +2368,10 @@ thread_local! {
     static DIGEST_WRITES_FOR_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
 }
 
-/// A page whose shadow does not take its captures: they are dropped by the
-/// next page (deposited before this one), and older ones now.
+/// Captures not selected for this page have no cross-page body lifetime.
+/// Drop them now so they cannot crowd the next Full page's selected turns.
 fn purge_captures(scope_key: &Path, counts: &mut ClaudeRequestMoneyShadowCounts) {
-    if let Ok(mut last) = LAST_SHADOW.lock() {
-        if let Some(previous) = last.insert(scope_key.to_path_buf(), Instant::now()) {
-            counts.captures_purged = capture::purge_before(scope_key, previous);
-        }
-    }
+    counts.captures_purged += capture::purge_before(scope_key, Instant::now());
 }
 
 /// A refused page: a false coverage row (and the ledger's own progress) go
