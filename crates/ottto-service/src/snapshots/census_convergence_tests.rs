@@ -1712,6 +1712,82 @@ fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
     let _ = fs::remove_dir_all(&dir);
 }
 
+// #705/#712 composition: both daemon and general loads share freshness,
+// retain guard (b) after the index fills, and repair a lost tombstone set.
+#[test]
+fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
+    forget_claude_unverified_history_indexes_for_test();
+    let dir = temp_dir("patha-history-origin-composition");
+    let support = dir.join("support");
+    for (name, origin) in [
+        ("missing", ScanIndexLoadOrigin::Missing),
+        ("quarantined", ScanIndexLoadOrigin::Quarantined),
+        ("generation-zero", ScanIndexLoadOrigin::Loaded),
+    ] {
+        let path = dir.join(format!("{name}.json"));
+        match origin {
+            ScanIndexLoadOrigin::Missing => {}
+            ScanIndexLoadOrigin::Quarantined => fs::write(&path, b"{ not json").unwrap(),
+            ScanIndexLoadOrigin::Loaded => {
+                fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+            }
+        }
+        let (mut index, actual_origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::ClaudeCode,
+            &support,
+        )
+        .unwrap();
+        assert_eq!(actual_origin, origin, "{name}");
+        assert!(actual_origin.is_fresh(&index), "{name}");
+        assert!(index.claude_history_unverified_in_process, "{name}");
+        assert!(index.claude_retired_family_tombstones_initialized, "{name}");
+        save_through_generation(&mut index, &path, 3);
+        let (filled, filled_origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::ClaudeCode,
+            &support,
+        )
+        .unwrap();
+        assert_eq!(filled_origin, ScanIndexLoadOrigin::Loaded, "{name}");
+        assert!(!filled_origin.is_fresh(&filled), "{name}");
+        assert!(
+            filled.claude_history_unverified_in_process,
+            "{name}: guard b stays"
+        );
+        assert!(
+            ScanIndex::load(&path)
+                .unwrap()
+                .claude_history_unverified_in_process
+        );
+    }
+
+    let path = dir.join("lost-tombstones.json");
+    let (mut historic, _) = retry_pending_roots_index("gone", 1, |_| false);
+    historic.generation = 7;
+    let mut raw = serde_json::to_value(&historic).unwrap();
+    raw["claude_retired_family_tombstones_initialized"] = true.into();
+    raw.as_object_mut()
+        .unwrap()
+        .remove("claude_retired_family_tombstones");
+    fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
+    let (repaired, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+        &path,
+        SnapshotSource::ClaudeCode,
+        &support,
+    )
+    .unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
+    assert!(!origin.is_fresh(&repaired));
+    assert!(!repaired.claude_history_unverified_in_process);
+    assert!(repaired.claude_family_tombstoned_for_test("gone-00"));
+    assert!(!repaired.claude_retired_family_tombstones_uncertain);
+    assert!(repaired
+        .claude_authority_record_for_test("gone-00")
+        .is_some());
+    let _ = fs::remove_dir_all(&dir);
+}
+
 // SOURCE Round 11 tombstone decode: malformed entries drop one by one, a
 // wrong container type decodes as empty, each counted; the index and all its
 // other state still load, never quarantined.

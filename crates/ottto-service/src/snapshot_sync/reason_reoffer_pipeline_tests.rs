@@ -1263,3 +1263,444 @@ fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
         "the return re-enters the authority path: settled={settled} held={held}"
     );
 }
+
+/// The Claude scan index this pipeline's destination uses.
+fn claude_index_path(support: &Path) -> PathBuf {
+    std::fs::read_dir(support.join("snapshots/destinations"))
+        .unwrap()
+        .flatten()
+        .map(|destination| destination.path().join("claude_code-scan-index-v3.json"))
+        .find(|path| path.exists())
+        .expect("the Claude scan index")
+}
+
+/// The local Claude re-emission list.
+fn reemission_list_path(support: &Path) -> PathBuf {
+    support.join("snapshots/claude_code-reemission-exclusions.txt")
+}
+
+/// #712 held-body control for #706: a history-held file (stored revision
+/// below the active one, no list, a saved history cutoff after its birth; the
+/// refusal in the ledger is prior history) with a due original-pair re-offer
+/// lease is not re-offered. Where no list is intended, only an unverified
+/// Mac or a move under a non-`full` claim still holds history (StateMissing
+/// N1); the index's durable move marker stands for that hold here. The lease is granted but
+/// never delivered: no body reaches the server, the refusal and its
+/// original-pair extension stay, nothing is accepted and the hold stays
+/// terminal. Once an installed list lets the upgrade through, the same lease
+/// delivers the exact refused body, so the hold is what blocked it.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
+    if !supported("history_held_file_is_not_reoffered_and_its_lease_is_not_delivered") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-history-held", Answer::Refuse(ORIGINAL_PAIR), t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(pipeline.server.offered().len(), 1);
+    let fingerprint = fingerprint_of(&pipeline.server.offered()[0]);
+    let refused_body = first.progress.permanent_rejections[&fingerprint]
+        .body_witness
+        .clone();
+
+    // History-held: every Claude entry stored below the active revision, and
+    // a saved history cutoff at or after every fixture birth.
+    let index_path = claude_index_path(&pipeline.support);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).unwrap()).unwrap();
+    let files = saved["files"].as_object_mut().expect("indexed files");
+    assert!(!files.is_empty());
+    for entry in files.values_mut() {
+        entry["effective_upload_body_witness_revision"] = 1.into();
+    }
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
+    std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
+
+    pipeline.server.answer(Answer::Accept);
+    for day in 1..=2 {
+        let due = pipeline.cycle(t0 + day * (DAY + 60));
+        assert!(due.result.is_ok(), "day {day}: {:?}", due.result);
+        assert_eq!(due.leased_offers, 1, "day {day}: the lease is granted");
+        assert_eq!(
+            pipeline.server.offered().len(),
+            1,
+            "day {day}: a history-held body is never re-offered"
+        );
+        let refusal = &due.progress.permanent_rejections[&fingerprint];
+        assert_eq!(refusal.body_witness, refused_body, "day {day}");
+        assert_eq!(
+            reoffer_json(&due, &fingerprint)["reason"],
+            ORIGINAL_PAIR,
+            "day {day}: the lease is not settled"
+        );
+        assert!(!due.progress.accepted_fingerprints.contains(&fingerprint));
+        assert!(!due
+            .index
+            .accepted_snapshot_fingerprint_recorded(&fingerprint));
+        assert_eq!(
+            due.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::UnprovenTerminal,
+            "day {day}"
+        );
+        assert!(due
+            .index
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 1));
+    }
+
+    // Positive control: an installed (empty) list paces the upgrade, and the
+    // next due lease delivers the exact refused body.
+    std::fs::write(reemission_list_path(&pipeline.support), "# synthetic\n").unwrap();
+    let permitted = pipeline.cycle(t0 + 3 * (DAY + 60));
+    assert!(permitted.result.is_ok(), "{:?}", permitted.result);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "the permitted upgrade delivers the lease");
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert!(permitted
+        .index
+        .accepted_snapshot_fingerprint_recorded(&fingerprint));
+}
+
+/// StateMissing H1 through the real replay decision, and N2: after a
+/// completed bootstrap, an unreadable backfill state arms no Claude replay
+/// in `prepare_sync_source` (the replay claim, the entries and the server
+/// all stay as they were), and the Claude census that cycle completes under
+/// the history gate clears the marker.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
+    if !supported("unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-unverified", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered().len();
+    assert!(offered > 0);
+    let state_path = crate::backfill::backfill_state_path(&pipeline.support);
+    assert!(
+        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
+        "the bootstrap completed with a readable state"
+    );
+    std::fs::write(&state_path, b"{\"completed_destination_namespaces\":")
+        .expect("corrupt the backfill state");
+    assert!(crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified);
+
+    let second = pipeline.cycle(t0 + 60);
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered,
+        "no replay re-sent anything"
+    );
+    assert_eq!(
+        second.progress_json["historical_replay_generation"],
+        first.progress_json["historical_replay_generation"],
+        "no replay claimed a generation"
+    );
+    assert_eq!(
+        second.index.files.keys().collect::<Vec<_>>(),
+        first.index.files.keys().collect::<Vec<_>>(),
+        "no replay dropped the entries"
+    );
+    assert!(second
+        .index
+        .files
+        .iter()
+        .all(|(key, entry)| entry.source_file_fingerprint
+            == first.index.files[key].source_file_fingerprint));
+    assert!(
+        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
+        "N2: the gated census cleared the marker"
+    );
+}
+
+/// StateMissing N1 (b) through the real pipeline: a fresh install whose
+/// upload ledger claimed a replay generation before the scan, but was killed
+/// before its first index save and before any server answer was recorded,
+/// is still a fresh install. The next cycle uploads its history as new: it
+/// is not held, and no history cutoff is recorded.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
+    if !supported("ledger_claim_alone_after_a_killed_first_cycle_uploads_history") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-killed-install", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert!(!offered.is_empty());
+    // Back to what a killed first cycle leaves: the ledger's own claim of a
+    // replay generation, saved before the scan, but no server answer, no
+    // index and no completed bootstrap.
+    // A settled bootstrap leaves no ledger file, so write the claim itself.
+    let mut claim = SnapshotUploadProgress::load(
+        &first.progress_path,
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .expect("load the ledger");
+    claim.historical_replay_generation = Some("claude_code:killed-first-cycle".into());
+    claim.accepted_fingerprints.clear();
+    claim.accepted_body_witnesses.clear();
+    claim.accepted_cache_states.clear();
+    claim.accepted_cache_heads.clear();
+    claim.pending_cache_heads.clear();
+    claim.quarantined_fingerprints.clear();
+    claim.permanent_rejections.clear();
+    claim
+        .save(&first.progress_path)
+        .expect("write the claim-only ledger");
+    assert!(!claim.records_server_attested_upload());
+    std::fs::remove_file(claude_index_path(&pipeline.support)).expect("lose the index");
+    let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
+
+    let second = pipeline.cycle(t0 + 60);
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    let resent = pipeline.server.offered();
+    assert_eq!(resent.len(), 2 * offered.len(), "the history is uploaded");
+    assert_eq!(
+        resent[offered.len()..]
+            .iter()
+            .map(fingerprint_of)
+            .collect::<BTreeSet<_>>(),
+        offered.iter().map(fingerprint_of).collect::<BTreeSet<_>>()
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(claude_index_path(&pipeline.support)).unwrap())
+            .unwrap();
+    assert!(
+        saved.get("claude_history_cutoff_unix_seconds").is_none(),
+        "a fresh install records no history cutoff"
+    );
+}
+
+/// H727-1: the M4 incident shape, through real prepare/finish (including
+/// bootstrap completion and N2 clearing), after BOTH list and .seen are lost.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn durable_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("durable_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-set", true, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn absent_list_intent_paces_quarantined_history() {
+    if !supported("absent_list_intent_paces_quarantined_history") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-absent", false, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn malformed_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("malformed_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-malformed", false, true);
+}
+
+fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
+    use crate::backfill::{backfill_state_path, load_backfill_state, ClaudeHistoryListIntent};
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(name, Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let initial = pipeline.server.offered().len();
+    assert!(initial > 0, "prior uploads");
+    assert_eq!(
+        load_backfill_state(&pipeline.support).claude_history_list_intent,
+        ClaudeHistoryListIntent::Absent
+    );
+    let seen = crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support);
+    if set {
+        // Even an empty well-formed list sets independent intent (M1).
+        std::fs::write(
+            reemission_list_path(&pipeline.support),
+            "# installed empty list\n",
+        )
+        .unwrap();
+        let installed = pipeline.cycle(t0 + 60);
+        assert!(installed.result.is_ok(), "{:?}", installed.result);
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        assert!(seen.exists());
+        std::fs::remove_file(reemission_list_path(&pipeline.support)).unwrap();
+        std::fs::remove_file(&seen).unwrap();
+    }
+    if malformed {
+        let state_path = backfill_state_path(&pipeline.support);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        saved["claude_history_list_intent"] = serde_json::json!({"damaged": true});
+        std::fs::write(state_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable
+        );
+    }
+    let index_path = claude_index_path(&pipeline.support);
+    std::fs::write(&index_path, b"{not json").unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    assert!(!seen.exists());
+    let (second, lines) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::with_body_witness_adoption_page_budget(1, || pipeline.cycle(t0 + 120))
+    });
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    if set || malformed {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "no history body leaves after quarantine"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["stage"] == "claude_reemission_list_missing_after_install"),
+            "missing-list alarm: {lines:?}"
+        );
+        let third = pipeline.cycle(t0 + 180);
+        assert!(third.result.is_ok(), "{:?}", third.result);
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "hold survives real completion/marker clearing and reload"
+        );
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            if set {
+                ClaudeHistoryListIntent::Set
+            } else {
+                ClaudeHistoryListIntent::Unreadable
+            }
+        );
+    } else {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial + 1,
+            "positive Absent policy paces one history body"
+        );
+    }
+    assert!(
+        std::fs::read_dir(index_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "index was quarantined"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
+    if !supported("first_nonempty_list_read_records_durable_intent_through_prepare_finish") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-intent-first-list", Answer::Accept, t0);
+    let snapshots = pipeline.support.join("snapshots");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    std::fs::write(
+        reemission_list_path(&pipeline.support),
+        format!("{}\n", "a".repeat(64)),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Absent
+    );
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Set
+    );
+    assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
+}
+
+/// #705's returning tombstoned member remains held by #712 when its
+/// pre-cutoff history belongs to a move without an explicit full claim.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn tombstoned_returning_history_obeys_the_move_hold() {
+    if !supported("tombstoned_returning_history_obeys_the_move_hold") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-return-history-held", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
+    std::fs::write(&absent.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    let offered_before = pipeline.server.offered().len();
+    std::fs::write(&transcript, bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered_before,
+        "history stays held"
+    );
+    assert!(returned.index.claude_family_tombstoned_for_test(root));
+    assert_eq!(
+        returned.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+}
