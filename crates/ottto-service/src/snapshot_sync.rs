@@ -301,6 +301,7 @@ fn with_retained_refusal_conflicts(
     result: ResumableUploadResult,
     index: &ScanIndex,
     progress: &SnapshotUploadProgress,
+    reoffer_now: u64,
 ) -> ResumableUploadResult {
     let retained = index
         .current_snapshot_fingerprint_refs()
@@ -310,8 +311,16 @@ fn with_retained_refusal_conflicts(
                     .permanent_rejections
                     .get(*fingerprint)
                     .is_some_and(|refusal| {
-                        !index
-                            .reason_reoffer_conflict_is_deferred(fingerprint, &refusal.body_witness)
+                        // The I/O view also holds due records waiting for
+                        // budget. Only a still-future reservation grants the
+                        // settlement exception; at D that debt blocks again.
+                        !(index.reason_reoffer_conflict_is_deferred(
+                            fingerprint,
+                            &refusal.body_witness,
+                        ) && refusal
+                            .reoffer
+                            .and_then(reason_reoffer::RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline > reoffer_now))
                             && progress
                                 .quarantined_fingerprints
                                 .get(*fingerprint)
@@ -6294,6 +6303,7 @@ fn finish_sync_source(
             with_bootstrap_deferred(result, bootstrap_deferred),
             &index,
             &upload_progress,
+            reason_reoffer::now_unix_seconds(),
         )
     });
     // The logical offer ends here; normal bounded HTTP retries happened inside.

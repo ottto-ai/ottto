@@ -718,11 +718,11 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     )
     .unwrap();
     assert_eq!(
-        with_retained_refusal_conflicts(result, &index, &progress),
+        with_retained_refusal_conflicts(result, &index, &progress, NOW),
         ResumableUploadResult::Deferred { count: 1 }
     );
     assert_eq!(
-        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress),
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
         ResumableUploadResult::Deferred { count: 1 },
         "an empty frozen delta still owes retry debt"
     );
@@ -730,7 +730,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred { count: 2 },
             &index,
-            &progress
+            &progress,
+            NOW,
         ),
         ResumableUploadResult::Deferred { count: 3 },
         "ordinary and retained conflicts are distinct"
@@ -740,7 +741,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred { count: 1 },
             &index,
-            &progress
+            &progress,
+            NOW,
         ),
         ResumableUploadResult::Deferred { count: 1 },
         "a fresh re-offer conflict was already counted once"
@@ -994,7 +996,7 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
     index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
     assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
     assert_eq!(
-        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress),
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
         ResumableUploadResult::Completed
     );
     assert!(
@@ -1005,7 +1007,8 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred { count: 2 },
             &index,
-            &progress
+            &progress,
+            NOW,
         ),
         ResumableUploadResult::Deferred { count: 2 },
         "new unrelated conflicts stay blocking"
@@ -1015,4 +1018,46 @@ fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts(
         SnapshotQuarantineDisposition::RetryPending
     );
     assert!(progress.permanent_rejections.contains_key(&fp(1)));
+}
+
+/// The I/O skip also covers a due record waiting for the shared budget, but
+/// that is no longer future cooldown debt. Keep its original blocking result
+/// at the deadline without granting another ordinary re-read or a lease.
+#[test]
+fn due_unleased_conflict_still_blocks_after_the_cooldown_deadline() {
+    let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
+    progress.quarantine_retryable_body(&fp(1), &body(1));
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
+    index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert_eq!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
+        ResumableUploadResult::Completed,
+        "future cooldown is non-blocking"
+    );
+    for now in [NOW + DAY, NOW + DAY + 1] {
+        index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(now));
+        assert_eq!(
+            index.reason_reoffer_cooldown_deferred_count(),
+            1,
+            "a due record without budget still has its I/O deferral"
+        );
+        assert_eq!(
+            with_retained_refusal_conflicts(
+                ResumableUploadResult::Completed,
+                &index,
+                &progress,
+                now
+            ),
+            ResumableUploadResult::Deferred { count: 1 },
+            "due-time settlement is unchanged"
+        );
+        assert!(progress.active_reason_reoffers.is_empty());
+        assert!(progress.contains_body(&fp(1), &body(1)));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp(1)].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+    }
 }
