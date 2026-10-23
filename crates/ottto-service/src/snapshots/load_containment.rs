@@ -153,7 +153,11 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         .context("scan index has no file stem")?
         .to_string_lossy();
     let prefix = format!("{stem}.corrupt.");
-    for entry in fs::read_dir(path.parent().unwrap_or_else(|| Path::new(".")))? {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    for entry in fs::read_dir(parent)? {
         let entry = entry?;
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };

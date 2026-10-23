@@ -2010,17 +2010,35 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 .map(|s| s.snapshot_fingerprint.clone())
                 .collect();
             index.record_accepted_snapshot_fingerprints(&accepted);
-            index.save(&path).unwrap();
             let key = local_index_key(&transcript_paths[0]);
+            if family_slot {
+                // A prior, valid native family witness exists on disk before
+                // corruption. The real scan supplies its member revision;
+                // this fixture does not construct a hold or infer authority.
+                index.claude_account_family_witnesses.insert(
+                    session.into(),
+                    ClaudeAccountFamilyWitness {
+                        account_identifier_hash: "a".repeat(64),
+                        evidence_request_count: 1,
+                        members: BTreeMap::from([(
+                            session.into(),
+                            index.files[&key].modified_unix_seconds,
+                        )]),
+                        member_request_id_fingerprints: BTreeMap::new(),
+                    },
+                );
+            }
+            index.save(&path).unwrap();
             let (field, held_key) = if family_slot {
-                ("claude_usage_family_witnesses", session.to_owned())
+                ("claude_account_family_witnesses", session.to_owned())
             } else {
                 ("files", key.clone())
             };
             let mut value = serde_json::to_value(&index).unwrap();
-            if value.get(field).is_none() {
-                value[field] = serde_json::json!({});
-            }
+            assert!(
+                value[field].get(&held_key).is_some(),
+                "corrupt an existing persisted slot"
+            );
             value[field][&held_key] = serde_json::json!({"members": [false], "opaque": "future"});
             let bytes = serde_json::to_vec_pretty(&value).unwrap();
             let original = raw_slot(&bytes, field, &held_key);
@@ -2136,6 +2154,10 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                 "no parse, including NewFile, may begin"
             );
             assert_eq!(rescanned.scanned_session_count, 0);
+            // The selection guard must disclose the known held group before
+            // generic missing-owner recovery can misclassify it as new loss.
+            assert_eq!(rescanned.ownership_incomplete_file_count, 0);
+            assert_eq!(rescanned.unreadable_path_count, 0);
             assert!(!rescanned.census_complete);
             assert!(
                 !crate::snapshot_sync::decode_hold_manifest_published_for_test(
