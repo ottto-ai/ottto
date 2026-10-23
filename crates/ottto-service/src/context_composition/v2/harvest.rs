@@ -33,21 +33,29 @@ use super::super::harvest::{
     read_marker, write_marker,
 };
 use super::aggregate::{day_of, Aggregate, Day, StoredContribution, Window};
+use super::audit::AuditRun;
 use super::checkpoint::{
     birth_secs, born_secs, file_identity, fingerprints, fingerprints_match, install_path,
     prefix_matches, read_json, stamp, write_json, write_packed, Checkpoint, Index, InstallRecord,
     Pin, RunRecord, Stamp, Status, StoredParse, COLD_AFTER_SECS,
 };
-use super::file::{head_cwds, new_parse_state, read_lines, LineSink, LineStats, Names, Source};
+use super::file::{
+    head_cwds, new_audit_parse_state, new_parse_state, new_parse_state_before, read_lines,
+    LineSink, LineStats, Names, Source,
+};
+use super::health::{HealthEntry, HealthLog, HealthPoster, PostCounts, WorkerCounts};
 use super::scope::{
     checkpoint_members, highest_generation, linked_worktrees, load_scope, resolved_missing,
     save_scope, scope_file_stem, scope_files, scope_path, set_aside, shard_id, update_members,
     verify_commit, GitScopeResolver, Scope, ScopeInfo, ScopeResolver,
 };
-use super::upload::{upload_scope, UploadOutcome, UploadResult, UploadTarget, Uploader};
+use super::upload::{
+    upload_scope, UploadOutcome, UploadReceipt, UploadResult, UploadTarget, Uploader,
+};
 use super::{
-    COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, LIVE_AT_INSTALL, MIN_UPTIME, PARSER_VERSION,
-    REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
+    AUDIT_BYTES_PER_DAY, COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, LIVE_AT_INSTALL,
+    MIN_UPTIME, PARSER_VERSION, REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA,
+    WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
@@ -114,9 +122,98 @@ fn run_wake(worktrees: &mut WorktreeCache) -> Result<()> {
         _ if result.is_err() => (0, 1, 0),
         _ => (0, 0, 0),
     };
-    eprintln!("context_composition_v2_metrics source=parent worker_timeouts={timeouts} worker_failures={failures} worker_lock_busy={locked}");
+    // After the worker exited, so its scopes have committed (or it died).
+    let health = post_run_health(WorkerCounts { timeouts, failures });
+    eprintln!("context_composition_v2_metrics source=parent worker_timeouts={timeouts} worker_failures={failures} worker_lock_busy={locked} health_sent={} health_failed={}", health.sent, health.failed);
     *worktrees = result?;
     Ok(())
+}
+
+/// Send the last daily run's health once (see `health`). Credentials are
+/// loaded only when a run left an unsent record.
+fn post_run_health(worker: WorkerCounts) -> PostCounts {
+    let dir = state_dir(&ottto_core::default_support_dir());
+    let today = day_of(OffsetDateTime::now_utc().date());
+    let Some(record) = take_run_health(&dir, today) else {
+        return PostCounts::default();
+    };
+    let mut poster = match ClientHealthPoster::load() {
+        Ok(poster) => poster,
+        Err(error) => {
+            eprintln!(
+                "context composition run health not sent: {}",
+                crate::snapshot_sync::safe_error(&error)
+            );
+            return PostCounts {
+                sent: 0,
+                failed: record.entries.len() as u64,
+            };
+        }
+    };
+    let (destination, machine_id) = (poster.destination.clone(), poster.machine_id.clone());
+    super::health::send(&record, &destination, &machine_id, worker, &mut poster)
+}
+
+/// Mark the daily record while holding the state lease, then release it
+/// before credentials, DNS or network work can block another worker.
+pub(super) fn take_run_health(dir: &Path, today: Day) -> Option<super::health::HealthRecord> {
+    // SIGKILL is asynchronous: allow the OS to release the dead worker's
+    // lease without turning an optional health report into an unbounded wait.
+    let until = Instant::now() + std::time::Duration::from_secs(1);
+    let _lease = loop {
+        if let Some(lease) = lock_state(dir).ok()? {
+            break lease;
+        }
+        if Instant::now() >= until {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+    super::health::take_pending(dir, today)
+}
+
+/// Posts with the composition upload's credentials: a relay token per agent.
+struct ClientHealthPoster {
+    client: SnapshotApiClient,
+    device: ottto_core::LocalDeviceBinding,
+    device_secret: String,
+    machine_id: String,
+    destination: String,
+}
+
+impl ClientHealthPoster {
+    fn load() -> Result<Self> {
+        let (device, device_secret) = load_snapshot_device_credentials()?;
+        let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
+            return Err(anyhow!("machine identity is missing"));
+        };
+        let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
+        Ok(Self {
+            client: SnapshotApiClient::new(api_base_url.clone()),
+            destination: destination_identity(&device, &machine_id, &api_base_url),
+            device,
+            device_secret,
+            machine_id,
+        })
+    }
+}
+
+impl HealthPoster for ClientHealthPoster {
+    fn post(&mut self, agent_source: &str, body: &Value) -> Result<()> {
+        let source = [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+            .into_iter()
+            .find(|source| agent_source_label(*source) == agent_source)
+            .ok_or_else(|| anyhow!("unknown agent source"))?;
+        let token = self.client.issue_composition_health_relay_token(
+            &self.device,
+            &self.device_secret,
+            source,
+            std::time::Duration::from_secs(10),
+        )?;
+        self.client
+            .post_context_composition_run_health(&token, body)
+            .map(|_| ())
+    }
 }
 
 // A marker lets the same runner be exercised by the Rust test harness,
@@ -334,11 +431,7 @@ pub fn run_context_composition_worker() -> Result<()> {
     start_watchdog(WORKER_CAP);
     let mut worktrees: WorktreeCache = serde_json::from_reader(std::io::stdin().lock())?;
     let home = crate::snapshot_sync::home_dir()?;
-    if !local_harvest_disabled(&support_dir) {
-        let today = day_of(OffsetDateTime::now_utc().date());
-        map_worktrees(&state_dir(&support_dir), today, &mut worktrees);
-    }
-    if let Err(error) = run_if_due(&home, &support_dir) {
+    if let Err(error) = run_if_due(&home, &support_dir, &mut worktrees) {
         eprintln!(
             "context composition run skipped: {}",
             crate::snapshot_sync::safe_error(&error)
@@ -392,32 +485,60 @@ pub(super) fn source_order(today: Day) -> [(SnapshotSource, Source); 2] {
 }
 
 /// Run once if today's run has not started yet.
-fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
+fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) -> Result<()> {
     if local_harvest_disabled(support_dir) {
         return Ok(());
     }
     let now = OffsetDateTime::now_utc();
     let dir = state_dir(support_dir);
+    let today = day_of(now.date());
     let Some(mut record) = begin_run(&dir, now)? else {
+        map_worktrees(&dir, today, worktrees);
         return Ok(());
     };
-    let (device, device_secret) = load_snapshot_device_credentials()?;
+    // Read only the non-secret destination metadata needed to fence health.
+    // Keychain access and all scanning setup follow the durable attempts.
+    let device = ottto_core::FileDeviceStore::default()
+        .load()?
+        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
     let Some(machine_id) = crate::snapshot_sync::snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
     };
     let api_base_url = crate::snapshot_sync::snapshot_api_base_url();
-    let client = SnapshotApiClient::new(api_base_url.clone());
     let enabled = crate::snapshot_sync::enabled_snapshot_sources(&device);
     let destination = destination_identity(&device, &machine_id, &api_base_url);
+    // Persist attempts before root discovery, identity-state loading or network
+    // setup. A worker killed there must still leave a report for the parent.
+    let mut health = begin_run_health(support_dir, &dir, today, &destination, &enabled, now);
+    map_worktrees(&dir, today, worktrees);
+    let (current_device, device_secret) = load_snapshot_device_credentials()?;
+    if current_device != device {
+        return Err(anyhow!("relay device binding changed during setup"));
+    }
+    let client = SnapshotApiClient::new(api_base_url.clone());
     let mut resolver = GitScopeResolver;
+    let start_destination = crate::snapshots::start_verdict_store::destination(
+        &crate::snapshot_sync::snapshot_upload_destination_namespace(&device, &device_secret),
+        &api_base_url,
+        &machine_id,
+    );
     let mut run = Run {
+        start_verdicts: crate::snapshots::start_verdict_store::load(
+            support_dir,
+            &start_destination,
+            now.unix_timestamp(),
+        ),
         state_dir: dir.clone(),
         now,
         deadline: Instant::now() + RUN_WALL_CAP,
         resolver: &mut resolver,
         repair_left: REPAIR_BYTES_PER_DAY.saturating_sub(record.repair_used),
+        audit: AuditRun::with_budget(
+            AUDIT_BYTES_PER_DAY.saturating_sub(record.audit_used),
+            std::mem::take(&mut record.audit_after),
+        ),
     };
-    for (snapshot_source, source) in source_order(day_of(now.date())) {
+    for (snapshot_source, source) in source_order(today) {
         if !enabled.contains(&snapshot_source) || Instant::now() >= run.deadline {
             continue;
         }
@@ -443,16 +564,21 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
                     write_marker(&marker, &destination);
+                    health.remove(agent_source_label(snapshot_source));
                     continue;
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
                     labels_enabled = hint.workspace_labels_enabled;
                 }
-                Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => continue,
+                Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
+                    health.remove(agent_source_label(snapshot_source));
+                    continue;
+                }
                 Err(_) => {}
             }
         } else if read_marker(&marker).as_deref() == Some(destination.as_str()) {
+            health.remove(agent_source_label(snapshot_source));
             continue;
         }
         let mut uploader = relay_token.map(|token| ClientUploader {
@@ -465,12 +591,48 @@ fn run_if_due(home: &Path, support_dir: &Path) -> Result<()> {
             destination: &destination,
             labels_enabled,
         });
+        let agent = agent_source_label(snapshot_source);
+        health.set(HealthEntry::started(agent, OffsetDateTime::now_utc()));
         let stats = run_source(&mut run, source, &roots, target);
+        let growth_days = record
+            .backlog
+            .entry(source.label().to_string())
+            .or_default()
+            .record(today, stats.full_read_backlog_bytes);
+        health.set(HealthEntry::finished(
+            agent,
+            &stats,
+            growth_days,
+            OffsetDateTime::now_utc(),
+        ));
         print_metrics(source, &stats, now);
     }
     record.repair_used = REPAIR_BYTES_PER_DAY.saturating_sub(run.repair_left);
+    record.audit_used = AUDIT_BYTES_PER_DAY.saturating_sub(run.audit.left);
+    record.audit_after = std::mem::take(&mut run.audit.after);
     let _ = write_json(&dir.join("run.json"), &record);
     Ok(())
+}
+
+/// Seed enabled attempts, excluding the destination's known organization opt-outs.
+pub(super) fn begin_run_health(
+    support_dir: &Path,
+    dir: &Path,
+    today: Day,
+    destination: &str,
+    enabled: &[SnapshotSource],
+    now: OffsetDateTime,
+) -> HealthLog {
+    let mut entries = Vec::new();
+    for (source, _) in source_order(today) {
+        if enabled.contains(&source)
+            && read_marker(&org_disabled_marker_path(support_dir, source)).as_deref()
+                != Some(destination)
+        {
+            entries.push(HealthEntry::started(agent_source_label(source), now));
+        }
+    }
+    HealthLog::begin_attempts(dir, today, destination, entries)
 }
 
 /// Start today's run: `None` when it already started. The day is saved
@@ -493,6 +655,10 @@ pub(super) fn begin_run(dir: &Path, now: OffsetDateTime) -> Result<Option<RunRec
         record.repair_day = today;
         record.repair_used = 0;
     }
+    if record.audit_day != today {
+        record.audit_day = today;
+        record.audit_used = 0;
+    }
     write_json(&path, &record)
         .map_err(|error| anyhow!("save composition run day failed: {error}"))?;
     Ok(Some(record))
@@ -504,10 +670,17 @@ struct ClientUploader<'a> {
 }
 
 impl Uploader for ClientUploader<'_> {
-    fn upload(&mut self, request: &Value) -> Result<()> {
-        self.client
-            .upload_context_composition(&self.relay_token, request)
-            .map(|_| ())
+    fn upload(&mut self, request: &Value) -> Result<UploadReceipt> {
+        let body = serde_json::to_vec(request)?;
+        let response = self
+            .client
+            .upload_context_composition_body(&self.relay_token, &body)?;
+        Ok(UploadReceipt {
+            payload_bytes: body.len() as u64,
+            rows_written: response
+                .get("daily_rollup_rows_written")
+                .and_then(Value::as_u64),
+        })
     }
 }
 
@@ -515,7 +688,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_skipped_undated={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -526,6 +699,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.quarantined,
         stats.new_files,
         stats.dormant_found,
+        stats.verdict_deferred,
         lines.lines,
         lines.prefix_skipped,
         lines.classifier_skipped,
@@ -560,6 +734,18 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.upload_failed,
         stats.upload_dropped_non_v2,
         stats.upload_dropped_unsafe,
+        stats.upload_payload_bytes,
+        stats.upload_rows_written,
+        stats.bytes_audit,
+        stats.audit_files,
+        stats.audit_differences,
+        stats.audit_skipped,
+        stats.audit_skipped_undated,
+        stats.audit_failed,
+        stats.files_checked,
+        stats.full_read_waiting_files,
+        stats.full_read_backlog_bytes,
+        stats.bytes_new + stats.bytes_repair + stats.bytes_head + stats.bytes_failed + stats.bytes_audit,
         stats.cut,
         stats.cpu_micros / 1000,
         stats.wall_micros / 1000,
@@ -689,6 +875,8 @@ pub(super) struct Run<'a> {
     pub(super) resolver: &'a mut dyn ScopeResolver,
     /// Full-read bytes left today (shared by the sources).
     pub(super) repair_left: u64,
+    pub(super) start_verdicts: crate::snapshots::start_verdict_store::Verdicts,
+    pub(super) audit: AuditRun,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -700,12 +888,28 @@ pub(super) struct SourceStats {
     pub(super) bytes_head: u64,
     /// Bytes read by reads that then failed (their lines did not count).
     pub(super) bytes_failed: u64,
+    /// Audit re-reads (see `audit`).
+    pub(super) bytes_audit: u64,
+    pub(super) audit_files: u64,
+    /// Audited files whose re-read differed (the re-read replaced them).
+    pub(super) audit_differences: u64,
+    /// Ineligible picks or samples whose retained history cannot be compared.
+    pub(super) audit_skipped: u64,
+    pub(super) audit_skipped_undated: u64,
+    pub(super) audit_failed: u64,
+    /// Transcripts the walk found (one per copy key and copy).
+    pub(super) files_checked: u64,
+    /// Files waiting for a full read at the end of the run, and their bytes.
+    pub(super) full_read_waiting_files: u64,
+    pub(super) full_read_backlog_bytes: u64,
     pub(super) files_read: u64,
     pub(super) files_failed: u64,
     /// Files quarantined in this run (failed twice in a row).
     pub(super) quarantined: u64,
     pub(super) new_files: u64,
     pub(super) dormant_found: u64,
+    /// Fresh openings left unread while their snapshot verdict is pending.
+    pub(super) verdict_deferred: u64,
     pub(super) moved: u64,
     /// A larger copy holding the same read bytes took over a pin.
     pub(super) switched: u64,
@@ -737,6 +941,10 @@ pub(super) struct SourceStats {
     pub(super) upload_failed: u64,
     pub(super) upload_dropped_non_v2: u64,
     pub(super) upload_dropped_unsafe: u64,
+    /// Request bytes of the uploads sent, and the daily rows the server
+    /// reported written for them.
+    pub(super) upload_payload_bytes: u64,
+    pub(super) upload_rows_written: u64,
     /// File-name lookups not made because the scan's folder cache was full
     /// (those files keep their basename).
     pub(super) name_lookups_skipped: u64,
@@ -784,6 +992,9 @@ enum Mode {
     Full,
     /// From its current end, keeping its earlier contribution.
     RestartAtEnd,
+    /// The audit sample: from its start to its checkpoint, compared with
+    /// its stored share (see `audit`).
+    Audit,
 }
 
 struct Work {
@@ -821,6 +1032,7 @@ fn copy_key_text(path: &Path) -> String {
 /// Stream directory entries. Unchanged files update their pin in place;
 /// only files needing work retain a path/metadata row after the visit.
 fn walk(
+    source: Source,
     roots: &[PathBuf],
     index: &mut Index,
     today: Day,
@@ -863,6 +1075,11 @@ fn walk(
     let mut archived = BTreeSet::new();
     let mut seen = BTreeSet::new();
     let mut callback = |path: PathBuf, metadata: Metadata, compressed: bool| {
+        if source == Source::Claude
+            && crate::snapshots::claude_transcript_excluded_from_snapshots(&path)
+        {
+            return;
+        }
         let key = copy_key_text(&path);
         if compressed {
             archived.insert(key);
@@ -1009,6 +1226,7 @@ fn reconcile_pins(
             pin.mtime = checkpoint.mtime;
             pin.head = checkpoint.head;
             pin.tail = checkpoint.tail;
+            pin.origin = checkpoint.origin;
             pin.waiting = false;
             rebuilt += 1;
         }
@@ -1121,15 +1339,15 @@ fn run_source_inner(
     } else if valid {
         stats.pins_rebuilt = reconcile_pins(run, source, &mut index, today, &mut stats);
     }
-    // The start of the last scan whose pins were saved. A file born at or
-    // after it did not exist then, so none of its bytes can have been
-    // counted from these pins; a checkpoint a later crashed run committed
-    // for it is adopted by reconciliation or read on from its offset.
+    // The last saved discovery boundary, held at a deferred opening's birth
+    // until it can be read. Files born at or after it are new bytes unless
+    // pins or crash-recovered checkpoints already account for them.
     let previous_scan = index.last_scan_started.filter(|_| valid);
     index.last_scan_started = Some(now_secs);
 
     // Discovery: pick one copy per key and decide what needs reading.
-    let (found, archived, seen) = walk(roots, &mut index, today, &mut stats);
+    let (found, archived, seen) = walk(source, roots, &mut index, today, &mut stats);
+    stats.files_checked = seen.len() as u64 + stats.duplicates;
     let mut work: Vec<Work> = Vec::new();
     let mut present: BTreeMap<String, Found> = BTreeMap::new();
     for (key, mut copies) in found {
@@ -1164,6 +1382,7 @@ fn run_source_inner(
         // Duplicate entries were counted while streaming the walk.
         present.insert(key, chosen);
     }
+    let mut pending_openings = false;
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
@@ -1176,6 +1395,46 @@ fn run_source_inner(
                     .zip(previous_scan)
                     .is_some_and(|(born, last)| born >= last);
                 let new = live || born_later;
+                if new && !agent_reset {
+                    let pending = opening_verdict_pending(run, source, file, &mut stats);
+                    if pending != Some(false) {
+                        // No pin or checkpoint is created. Preserve new-byte
+                        // eligibility for the next daily run, even at install;
+                        // it reads Forward from zero without a repair grant.
+                        index.last_scan_started = Some(
+                            index
+                                .last_scan_started
+                                .unwrap_or(now_secs)
+                                .min(file.born.unwrap()),
+                        );
+                        pending_openings = true;
+                        if pending == Some(true) {
+                            stats.verdict_deferred += 1;
+                            // A previously unseen workspace can disappear
+                            // before tomorrow. Cache its scope while it still
+                            // exists, without creating a file pin/checkpoint.
+                            match head_cwds(&file.path, run.deadline) {
+                                Ok((cwds, bytes)) => {
+                                    stats.bytes_head += bytes;
+                                    if matches!(
+                                        find_scope(run.resolver, &mut index, &cwds, today),
+                                        Scoping::Failed
+                                    ) {
+                                        stats.scan_errors += 1;
+                                    }
+                                }
+                                Err(error) => {
+                                    if error.kind() == std::io::ErrorKind::TimedOut {
+                                        stats.cut = true;
+                                    } else {
+                                        stats.scan_errors += 1;
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+                }
                 let start = if new { 0 } else { file.size };
                 let waiting = live;
                 if !new {
@@ -1465,6 +1724,15 @@ fn run_source_inner(
         !waiting || item.mode != Mode::Forward
     });
 
+    let busy: BTreeSet<&str> = work.iter().map(|item| item.key.as_str()).collect();
+    let picks = super::audit::pick(&mut run.audit, source.label(), &index, &busy, now_secs);
+    drop(busy);
+    for (key, path, metadata) in picks {
+        let mut item = Work::new(key, Found::new(path, &metadata), Mode::Audit);
+        item.reserved = Some(metadata.len());
+        work.push(item);
+    }
+
     let mut by_scope: BTreeMap<String, Vec<Work>> = BTreeMap::new();
     for item in work {
         let scope = index
@@ -1508,7 +1776,7 @@ fn run_source_inner(
         };
         if let Some(target) = target.as_mut() {
             let result = upload_scope(&run.state_dir, source, &scope, target, run.now, window);
-            count_upload(result, &mut stats);
+            count_upload(source, result, &mut stats);
             uploaded.insert(scope_id);
         }
         #[cfg(test)]
@@ -1518,7 +1786,17 @@ fn run_source_inner(
         }
     }
     stats.name_lookups_skipped = names.skipped();
-    tidy_index(&mut index, today);
+    tidy_index(&mut index, today, pending_openings);
+    for (key, pin) in index
+        .files
+        .iter()
+        .filter(|(_, pin)| pin.waiting && !pin.done && !pin.quarantined)
+    {
+        // Its size now (a waiting file is always found by the walk); the
+        // pin keeps the size of its last commit.
+        stats.full_read_waiting_files += 1;
+        stats.full_read_backlog_bytes += present.get(key).map_or(pin.size, |file| file.size);
+    }
 
     if let Some(target) = target.as_mut() {
         upload_other_scopes(
@@ -1612,7 +1890,7 @@ fn known_scope(index: &Index, cwd: &str) -> Option<String> {
 /// End of a run: note the scopes pins still name, and drop folder entries
 /// nothing needs any more (their scope has no pins, or the folder is gone
 /// and no file waits to be scoped).
-fn tidy_index(index: &mut Index, today: Day) {
+fn tidy_index(index: &mut Index, today: Day, pending_openings: bool) {
     let Index {
         files,
         cwd_scopes,
@@ -1634,6 +1912,11 @@ fn tidy_index(index: &mut Index, today: Day) {
     }
     for scope in &pinned {
         scope_last_pinned.insert((*scope).to_string(), today);
+    }
+    // Deferred openings have no pins yet. Retain cached worktree mappings
+    // until they can be scoped, including worktrees deleted before reading.
+    if pending_openings {
+        return;
     }
     cwd_scopes.retain(|folder, scope| {
         pinned.contains(scope.as_str()) && (waiting_for_scope || Path::new(folder).is_dir())
@@ -1662,6 +1945,42 @@ fn grant(run: &mut Run, stats: &mut SourceStats, size: u64) -> Mode {
     stats.repair_waiting += 1;
     stats.repair_waiting_bytes += size;
     Mode::Forward
+}
+
+/// Wait only before an opening is first classified. A missing verdict may
+/// delay it for less than six hours from birth, never from its last deferral.
+/// Once counted, later verdict transitions do not reconcile contributions:
+/// the reader moves forward and never rereads history for a verdict change.
+fn opening_verdict_pending(
+    run: &Run,
+    source: Source,
+    file: &Found,
+    stats: &mut SourceStats,
+) -> Option<bool> {
+    let now = run.now.unix_timestamp();
+    if !file
+        .born
+        .is_some_and(|born| born <= now && now - born < 6 * 3600)
+    {
+        return Some(false);
+    }
+    let (state, bytes) = match new_parse_state_before(source, &file.path, run.deadline) {
+        Ok(head) => head,
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::TimedOut {
+                stats.cut = true;
+            } else {
+                stats.scan_errors += 1;
+            }
+            return None;
+        }
+    };
+    stats.bytes_head += bytes;
+    Some(
+        run.start_verdicts
+            .lookup(source.label(), &state.session, now)
+            .is_none(),
+    )
 }
 
 /// Failed reads in a row that quarantine a file.
@@ -1727,6 +2046,9 @@ fn process_scope(
     };
     let generation = scope.generation.max(highest_generation(&path)) + 1;
     let legacy = std::mem::take(&mut scope.files);
+    // A scope visited only for audit samples commits only when one differed.
+    let mut audit_only =
+        reset.is_none() && legacy.is_empty() && items.iter().all(|item| item.mode == Mode::Audit);
     let mut groups: BTreeMap<u16, Vec<Work>> = BTreeMap::new();
     for item in items.drain(..) {
         groups.entry(shard_id(&item.key)).or_default().push(item);
@@ -1772,6 +2094,7 @@ fn process_scope(
             scope.files.clear();
             continue;
         }
+        let audit_group = !migrating && items.iter().all(|item| item.mode == Mode::Audit);
         let held = scope.accounted_bytes();
         stats.peak_accounted_bytes = stats.peak_accounted_bytes.max(held);
         // Oldest transcript first (a stable order).
@@ -1816,6 +2139,9 @@ fn process_scope(
                     }
                 }
                 Ok(None) => {}
+                // A failed audit leaves the file as it was; it is no fault
+                // of the file's own reading.
+                Err(ReadFailed) if item.mode == Mode::Audit => stats.audit_failed += 1,
                 Err(ReadFailed) => {
                     // Nothing of this read counted; the rest of the scope
                     // commits. Retried the next day, then quarantined.
@@ -1831,6 +2157,12 @@ fn process_scope(
             }
         }
 
+        if audit_group && read_files.is_empty() {
+            // Every sample matched: nothing in this shard changed.
+            scope.files.clear();
+            continue;
+        }
+        audit_only = false;
         let read_keys: Vec<String> = read_files.iter().map(|(key, _)| key.clone()).collect();
         scope.files.extend(read_files);
         // Files unchanged for `COLD_AFTER_SECS` and not read now go cold.
@@ -1882,6 +2214,8 @@ fn process_scope(
                 pin.path = checkpoint.path.clone();
                 pin.head = checkpoint.head;
                 pin.tail = checkpoint.tail;
+                // Where counting started: a restart at the end moves it.
+                pin.origin = checkpoint.origin;
                 pin.waiting = false;
                 pin.restart_at_end = false;
                 pin.failures = 0;
@@ -1896,6 +2230,10 @@ fn process_scope(
             }
         }
         scope.files.clear();
+    }
+    if audit_only {
+        // Nothing changed: no new generation, no commit, no upload.
+        return None;
     }
     update_members(&mut scope.file_sessions, removed, added, window.floor);
     scope.agg.prune(window);
@@ -2031,6 +2369,8 @@ fn read_file(
     stats: &mut SourceStats,
 ) -> Result<Option<Outcome>, ReadFailed> {
     #[cfg(test)]
+    let _audit_reads = (item.mode == Mode::Audit).then(tests::AuditReads::begin);
+    #[cfg(test)]
     tests::before_open(&item.found.path);
     let opened = File::open(&item.found.path)
         .and_then(|file| Ok((file.metadata()?, file.try_clone()?, file)));
@@ -2047,6 +2387,25 @@ fn read_file(
     if mode == Mode::RestartAtEnd {
         stats.checkpoint_restarts += 1;
     }
+    // An audit re-reads exactly the bytes its checkpoint counted, under the
+    // verdict request 1 was counted with.
+    let audit = if mode == Mode::Audit {
+        let checked = existing.as_ref().and_then(|checkpoint| {
+            let measured = super::audit::eligible(checkpoint, item.reserved?)?;
+            // Both fingerprint passes were reserved with the sample. Account
+            // their maximum I/O even when a probe fails partway through.
+            stats.bytes_head += u64::from(checkpoint.head.len) + u64::from(checkpoint.tail.len);
+            (size >= checkpoint.offset && fingerprints_match(&file, checkpoint))
+                .then_some((measured, checkpoint.offset))
+        });
+        let Some(checked) = checked else {
+            stats.audit_skipped += 1;
+            return Ok(None);
+        };
+        Some(checked)
+    } else {
+        None
+    };
     let mut reserved = item.reserved;
     if let Some(checkpoint) = existing
         .as_mut()
@@ -2100,8 +2459,9 @@ fn read_file(
     }
     // A full read stops at its granted end; later appends are read forward
     // by the next run.
-    let end_at = match (mode, reserved) {
-        (Mode::Full, Some(reserved)) => reserved.min(size),
+    let end_at = match (mode, reserved, audit) {
+        (Mode::Full, Some(reserved), _) => reserved.min(size),
+        (Mode::Audit, _, Some((_, end))) => end,
         _ => size,
     };
     let created = existing.as_ref().map_or_else(
@@ -2124,19 +2484,19 @@ fn read_file(
         }
         (mode, existing) => {
             let offset = match mode {
-                Mode::Full => 0,
+                Mode::Full | Mode::Audit => 0,
                 Mode::RestartAtEnd => size,
                 Mode::Forward => pin_start.min(size),
             };
             // Where this file's counting started, kept with the checkpoint.
             let origin = match (mode, &existing) {
-                (Mode::Full, _) => Some(0),
+                (Mode::Full | Mode::Audit, _) => Some(0),
                 (_, Some(old)) => old.origin,
                 (_, None) => Some(offset),
             };
             let mut contribution = StoredContribution::default();
             if let Some(old) = existing {
-                if mode == Mode::Full {
+                if matches!(mode, Mode::Full | Mode::Audit) {
                     // Replaced once the read succeeds (the days still in the
                     // window; older days stay in all-history totals).
                     let mut share = old.contribution;
@@ -2151,6 +2511,10 @@ fn read_file(
             }
             let (state, head_bytes) = match restart_state {
                 Some(state) => (state, 0),
+                None if mode == Mode::Audit => {
+                    new_audit_parse_state(source, &item.found.path, end_at, run.deadline)
+                        .map_err(|_| ReadFailed)?
+                }
                 None => new_parse_state(source, &item.found.path, offset),
             };
             stats.bytes_head += head_bytes;
@@ -2178,6 +2542,16 @@ fn read_file(
             )
         }
     };
+    state.start_measured = match audit {
+        Some((measured, _)) => measured,
+        None => {
+            run.start_verdicts
+                .get(source.label(), &state.session, run.now.unix_timestamp())
+                == crate::snapshots::StartVerdict::Measured
+        }
+    };
+    let request1_open = !state.request1_closed;
+    let undated_before = stats.lines.undated;
     let mut contribution = std::mem::take(&mut checkpoint.contribution)
         .into_share()
         .unwrap_or_default();
@@ -2218,10 +2592,21 @@ fn read_file(
         }
     };
     out.sink.session_start(&state.session, state.min_ts);
+    if request1_open && end.offset > checkpoint.offset {
+        if checkpoint.offset > 0 && state.request1_start_measured.is_none() {
+            // An older checkpoint did not record the prefix's verdict.
+            // The current read cannot establish that prefix's provenance.
+            state.request1_verdict_mixed = true;
+        }
+        state.note_request1_verdict(state.start_measured);
+    }
     #[cfg(test)]
     if tests::fail_read(&item.found.path) {
         stats.bytes_failed += end.bytes;
         return Err(ReadFailed);
+    }
+    if mode == Mode::Audit {
+        stats.bytes_head += 2 * end.offset.min(super::checkpoint::FINGERPRINT_BYTES);
     }
     let Ok((head, tail)) = fingerprints(&file, end.offset) else {
         stats.scan_errors += 1;
@@ -2232,16 +2617,58 @@ fn read_file(
     stats.peak_accounted_bytes = stats
         .peak_accounted_bytes
         .max(held + end.buffer_bytes + state.accounted_bytes() + delta.accounted_bytes());
+    #[cfg(test)]
+    if mode == Mode::Forward {
+        tests::skew(&item.found.path, &mut contribution, &mut delta);
+    }
+    #[cfg(test)]
+    let end = tests::cut_audit(&item.found.path, end);
+    if let Some((_, audited_end)) = audit {
+        stats.bytes_audit += end.bytes;
+        stats.audit_files += 1;
+        if end.cut {
+            // Stopped by the wall cap: an incomplete re-read proves nothing,
+            // and the stored checkpoint stays as it was.
+            stats.cut = true;
+            stats.audit_failed += 1;
+            return Ok(None);
+        }
+        let undated = stats.lines.undated > undated_before;
+        if undated {
+            // Without original per-record day provenance, a reread cannot
+            // compare or replace any part of this file without moving days.
+            stats.audit_skipped += 1;
+            stats.audit_skipped_undated += 1;
+            return Ok(None);
+        }
+        let same_end = end.offset == audited_end;
+        if same_end && !super::audit::differs(old_share.as_ref(), &contribution) {
+            // Same numbers: the stored checkpoint stays as it was.
+            return Ok(None);
+        }
+        stats.audit_differences += 1;
+        if !same_end {
+            // The re-read did not end where the checkpoint did, so it does
+            // not cover the same bytes: counted, but it cannot replace them.
+            return Ok(None);
+        }
+        // Use the re-read's result for this file (as a full read would).
+    }
     // The read succeeded: only now does it change the scope's totals.
     if let Some(old) = old_share {
         scope.agg.subtract(&old, generation);
     }
     scope.agg.merge(delta);
-    stats.files_read += 1;
-    if mode == Mode::Full {
-        stats.bytes_repair += end.bytes;
-    } else {
-        stats.bytes_new += end.bytes;
+    match mode {
+        Mode::Audit => {}
+        Mode::Full => {
+            stats.files_read += 1;
+            stats.bytes_repair += end.bytes;
+        }
+        Mode::Forward | Mode::RestartAtEnd => {
+            stats.files_read += 1;
+            stats.bytes_new += end.bytes;
+        }
     }
     stats.cut |= end.cut;
     state.open.retain(|(day, _, _)| *day >= window.floor);
@@ -2269,9 +2696,24 @@ fn forget_upload(state_dir: &Path, source: Source, scope_id: &str) {
     let _ = fs::remove_file(super::upload::ack_path(state_dir, source, scope_id));
 }
 
-fn count_upload(result: UploadResult, stats: &mut SourceStats) {
+fn count_upload(source: Source, result: UploadResult, stats: &mut SourceStats) {
     match result.outcome {
-        UploadOutcome::Uploaded => stats.uploaded += 1,
+        UploadOutcome::Uploaded => {
+            stats.uploaded += 1;
+            let receipt = result.receipt.unwrap_or_default();
+            stats.upload_payload_bytes += receipt.payload_bytes;
+            stats.upload_rows_written += receipt.rows_written.unwrap_or(0);
+            // One line per upload: request size and the rows the server
+            // wrote for it (absent when the response did not say).
+            eprintln!(
+                "context_composition_v2_upload source={} payload_bytes={} daily_rollup_rows_written={}",
+                source.label(),
+                receipt.payload_bytes,
+                receipt
+                    .rows_written
+                    .map_or_else(|| "unknown".to_string(), |rows| rows.to_string()),
+            );
+        }
         UploadOutcome::Unchanged => stats.upload_unchanged += 1,
         UploadOutcome::Failed => stats.upload_failed += 1,
     }
@@ -2324,7 +2766,7 @@ fn upload_other_scopes(
         };
         scope.agg.prune(window);
         let result = upload_scope(&run.state_dir, source, &scope, target, run.now, window);
-        count_upload(result, stats);
+        count_upload(source, result, stats);
     }
 }
 
@@ -2334,10 +2776,73 @@ pub(super) mod tests {
     use std::path::{Path, PathBuf};
 
     thread_local! {
+        pub(in super::super) static AUDIT_READ_BYTES: Cell<u64> = const { Cell::new(0) };
         static FAIL_SCOPE_COMMIT: Cell<bool> = const { Cell::new(false) };
         static FAIL_READ: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
         static CRASH_AFTER: Cell<Option<u64>> = const { Cell::new(None) };
         static GROW: RefCell<Option<(PathBuf, Vec<u8>)>> = const { RefCell::new(None) };
+        static SKEW: RefCell<Option<(PathBuf, u64)>> = const { RefCell::new(None) };
+        static CUT_AUDIT: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) struct AuditReads(u64);
+    impl AuditReads {
+        pub(super) fn begin() -> Self {
+            Self(super::super::checkpoint::IO_BYTES.with(|io| io.get().0))
+        }
+    }
+    impl Drop for AuditReads {
+        fn drop(&mut self) {
+            let read = super::super::checkpoint::IO_BYTES.with(|io| io.get().0) - self.0;
+            AUDIT_READ_BYTES.with(|total| total.set(total.get() + read));
+        }
+    }
+
+    /// Simulate the wall cap stopping a read of `path` (meant for audits).
+    pub(in super::super) fn set_cut_audit(path: Option<&Path>) {
+        CUT_AUDIT.with(|cell| *cell.borrow_mut() = path.map(Path::to_path_buf));
+    }
+
+    pub(super) fn cut_audit(
+        path: &Path,
+        mut end: super::super::file::ReadEnd,
+    ) -> super::super::file::ReadEnd {
+        if CUT_AUDIT.with(|cell| cell.borrow().as_deref() == Some(path)) {
+            end.cut = true;
+        }
+        end
+    }
+
+    /// Simulate a reader fault: a forward read of `path` counts `tokens`
+    /// more on one of its parts than its lines hold.
+    pub(in super::super) fn set_skew_forward(path: Option<&Path>, tokens: u64) {
+        SKEW.with(|cell| *cell.borrow_mut() = path.map(|path| (path.to_path_buf(), tokens)));
+    }
+
+    pub(super) fn skew(
+        path: &Path,
+        share: &mut super::super::aggregate::Contribution,
+        delta: &mut super::super::aggregate::Aggregate,
+    ) {
+        let Some(tokens) = SKEW.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .filter(|(skewed, _)| skewed == path)
+                .map(|(_, tokens)| *tokens)
+        }) else {
+            return;
+        };
+        let Some(((day, slot), bucket)) = share.parts.iter_mut().next_back() else {
+            return;
+        };
+        bucket.tokens += tokens;
+        delta.days.entry((*day, slot.kind)).or_default().tokens += tokens;
+        delta
+            .day_parts
+            .entry((*day, slot.clone()))
+            .or_default()
+            .tokens += tokens;
+        delta.all_parts.entry(slot.clone()).or_default().tokens += tokens;
     }
 
     /// Simulate a crash (no pins write) once `commits` scopes committed.

@@ -10,7 +10,7 @@
 //! prompt-snapshot and deferred-tools records are never counted, and copied
 //! history is found by its timestamp, not its record id.
 
-use super::super::measure::{basename, basename_stem, python_json_dumps, serialize_attachment};
+use super::super::measure::{basename_stem, python_json_dumps, serialize_attachment};
 use super::super::IMAGE_NOMINAL_TOKENS;
 use super::aggregate::{Day, Slot};
 use super::checkpoint::{LastAssistant, ParseState};
@@ -29,7 +29,6 @@ use std::path::Path;
 pub(super) fn head_identity(lines: &[&str], path: &Path) -> (String, bool) {
     let mut session: Option<String> = None;
     let mut sidechain: Option<bool> = None;
-    let mut agent_id: Option<String> = None;
     for text in lines {
         let owned: Option<String>;
         let Some(view) = decode_view!(text, owned, ClaudeLine) else {
@@ -41,9 +40,6 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> (String, bool) {
         if sidechain.is_none() {
             sidechain = view.is_sidechain.bool();
         }
-        if agent_id.is_none() {
-            agent_id = view.agent_id.str().map(|id| id.into_owned());
-        }
     }
     let in_subagents_dir = path
         .parent()
@@ -51,12 +47,13 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> (String, bool) {
         .is_some_and(|name| name == "subagents");
     let is_sub = in_subagents_dir || sidechain == Some(true);
     let session = session.unwrap_or_else(|| basename_stem(path));
-    if is_sub {
-        let agent_id = agent_id.unwrap_or_else(|| basename(path));
-        (format!("{session} (subagent:{agent_id})"), true)
-    } else {
-        (session, false)
-    }
+    let canonical = crate::snapshots::snapshot_source_session_id(
+        crate::snapshots::SnapshotSource::ClaudeCode,
+        path,
+        session.clone(),
+    );
+    let is_sub = is_sub || canonical != session;
+    (canonical, is_sub)
 }
 
 /// Handle one Claude Code line.
@@ -91,6 +88,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
     let ts_secs = ts.map(|ts| ts.unix_timestamp());
     state.note_ts(ts_secs);
     let day: Day = ts.map_or(out.fallback_day, |ts| ts.date().to_julian_day());
+    out.stats.undated += u64::from(ts.is_none());
     let line_type = view.kind.str();
     let line_type = line_type.as_deref().unwrap_or("");
 
@@ -112,11 +110,21 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         }
     }
 
-    // A compaction ends the residency of everything before it.
-    let compaction = view.is_compact_summary.truthy()
-        || line_type == "summary"
-        || view.subtype.str().as_deref() == Some("compact_boundary");
-    if compaction {
+    // Keep the pair across checkpoint chunks: a linked summary belongs to
+    // the boundary that already cleared residency, even far apart in time.
+    let uuid = view.uuid.str();
+    let parent = view.parent_uuid.str();
+    let subtype = view.subtype.str();
+    let timestamp = view.timestamp.str().or_else(|| view.ts.str());
+    if state.compactions.observe(
+        line_type,
+        subtype.as_deref(),
+        view.is_compact_summary.truthy(),
+        uuid.as_deref(),
+        parent.as_deref(),
+        timestamp.as_deref(),
+    ) || line_type == "summary"
+    {
         state.open.clear();
     }
 

@@ -10,10 +10,10 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 
 #[cfg(not(test))]
-type ReaderFile = File;
+type ReaderFile = std::io::Take<File>;
 
 #[cfg(test)]
-struct ReaderFile(File);
+struct ReaderFile(std::io::Take<File>);
 #[cfg(test)]
 impl Read for ReaderFile {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
@@ -70,6 +70,8 @@ impl LineReader {
         capacity: usize,
     ) -> std::io::Result<Self> {
         file.seek(SeekFrom::Start(offset))?;
+        // Bound prefetch too: a file may grow after the length was pinned.
+        let file = file.take(end.saturating_sub(offset));
         #[cfg(test)]
         let file = ReaderFile(file);
         Ok(Self {

@@ -94,14 +94,22 @@ pub(super) fn head_identity(lines: &[&str], path: &Path) -> HeadIdentity {
                 CopiedMode::UntilTrigger
             };
         return HeadIdentity {
-            session,
+            session: crate::snapshots::snapshot_source_session_id(
+                crate::snapshots::SnapshotSource::Codex,
+                path,
+                session,
+            ),
             copied,
             agent_author: is_subagent || thread_source == Some("agent_created_thread"),
             cwd: meta.cwd.str().map(Cow::into_owned),
         };
     }
     HeadIdentity {
-        session: basename_stem(path),
+        session: crate::snapshots::snapshot_source_session_id(
+            crate::snapshots::SnapshotSource::Codex,
+            path,
+            basename_stem(path),
+        ),
         copied: CopiedMode::Own,
         agent_author: false,
         cwd: None,
@@ -234,6 +242,7 @@ pub(super) fn handle_line(out: &mut LineSink, state: &mut ParseState, line: &[u8
         }
     }
     let day: Day = ts.map_or(out.fallback_day, |ts| ts.date().to_julian_day());
+    out.stats.undated += u64::from(ts.is_none());
     let cwd = state.cwd.clone();
     let author = if state.agent_author {
         Author::Agent

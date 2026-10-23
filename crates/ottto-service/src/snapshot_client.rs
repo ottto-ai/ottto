@@ -1648,6 +1648,7 @@ impl SnapshotApiClient {
             device_secret,
             source,
             SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
         )
     }
 
@@ -1659,7 +1660,34 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<String> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        self.issue_relay_token_with_agent(&agent, device, device_secret, source, request_timeout)
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
     }
 
     fn issue_relay_token_with_agent(
@@ -1669,6 +1697,7 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
         timeout: Duration,
+        response_cap: Option<usize>,
     ) -> Result<String> {
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
@@ -1698,10 +1727,13 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?;
-        let response: RelayTokenResponse =
-            require_cloud_session_success(response, "relay token request", "relay_token")?
-                .into_json()
-                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
     }
 
@@ -1945,6 +1977,11 @@ impl SnapshotApiClient {
                             enforce_head_cas,
                             retry.is_some(),
                         );
+                        self.record_composition_start_verdicts(
+                            request,
+                            &response,
+                            enforce_head_cas,
+                        );
                         Ok(response)
                     }
                     Err(_) => {
@@ -2039,6 +2076,66 @@ impl SnapshotApiClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_composition_start_verdicts(
+        &self,
+        request: &SnapshotBatchRequest,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(support) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        let Some(namespace) = self.receipt_destination_namespace.as_deref() else {
+            return;
+        };
+        let destination = crate::snapshots::start_verdict_store::destination(
+            namespace,
+            &self.api_base_url,
+            &request.machine_id,
+        );
+        if response.disabled
+            || response
+                .validate_entity_ack_with_head_cas(request, enforce_head_cas)
+                .is_err()
+        {
+            return;
+        }
+        // This is the final folded, budget-trimmed wire item. A well-formed
+        // ACK can still reject or conflict individual items: record only the
+        // accepted/unchanged bodies, never those other outcomes.
+        let acknowledged: std::collections::BTreeSet<_> = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .map(|r| {
+                (
+                    r.source_session_id.as_str(),
+                    r.snapshot_fingerprint.as_str(),
+                )
+            })
+            .collect();
+        let items = request.snapshots.iter().filter(|item| {
+            response.entity_ack_contract.is_none()
+                || acknowledged.contains(&(
+                    item.source_session_id.as_str(),
+                    item.snapshot_fingerprint.as_str(),
+                ))
+        });
+        match crate::snapshots::start_verdict_store::record(
+            support,
+            &destination,
+            &request.source,
+            items,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ) {
+            Ok(bytes) if bytes > 0 => {
+                eprintln!("ottto-service: composition_start_verdict bytes_appended={bytes}")
+            }
+            Ok(_) => {}
+            Err(_) => eprintln!("ottto-service: composition start verdict persistence failed"),
+        }
+    }
+
     fn record_batch_success(
         &self,
         request: &SnapshotBatchRequest,
@@ -2527,6 +2624,69 @@ impl SnapshotApiClient {
                 Err(anyhow!("backend rejected context composition: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The composition upload from its serialized body, so the bytes the
+    /// run counts are the bytes sent (the same body `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context composition: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        self.post_context_composition_run_health_with_timeout(
+            relay_token,
+            body,
+            Duration::from_secs(10),
+        )
+    }
+
+    pub(crate) fn post_context_composition_run_health_with_timeout(
+        &self,
+        relay_token: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        match agent
+            .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+        {
+            Ok(response) => bounded_response_json(response, 64 * 1024)
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
         }
     }
 
@@ -4027,6 +4187,67 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn composition_start_verdict_records_only_final_acknowledged_items() {
+        use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
+        let support = crate::test_scratch::private_dir("composition-ack-verdict");
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        item.cache_observations = None;
+        item.session_account_evidence = None;
+        item.session_start = Some(Box::new(SnapshotSessionStart {
+            user_turn_count: Some(1),
+            ..Default::default()
+        }));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![item],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client = SnapshotApiClient::new("https://example.invalid")
+            .with_receipt_state_dir(&support)
+            .with_receipt_destination_namespace("synthetic-namespace".into());
+        let id = &request.snapshots[0].source_session_id;
+        let destination = start_verdict_store::destination(
+            "synthetic-namespace",
+            "https://example.invalid",
+            &request.machine_id,
+        );
+        let get = || {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            start_verdict_store::load(&support, &destination, now).get("codex", id, now)
+        };
+        let mut conflict = entity_ack(0, vec![]);
+        conflict.conflict_entities.push(entity_ref(
+            id,
+            &request.snapshots[0].snapshot_fingerprint,
+            1,
+        ));
+        conflict.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &conflict, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let mut disabled = entity_ack(0, vec![]);
+        disabled.disabled = true;
+        client.record_composition_start_verdicts(&request, &disabled, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        // Legacy all-accepted ACK; the final wire body measures this start.
+        let mut accepted = entity_ack(1, vec![]);
+        accepted.entity_ack_contract = None;
+        client.record_composition_start_verdicts(&request, &accepted, false);
+        assert_eq!(get(), StartVerdict::Measured);
+        // A later final-body clear (including a payload-budget clear) must
+        // replace the verdict, not retain the earlier folded start.
+        let mut cleared = request.clone();
+        cleared.snapshots[0].session_start = None;
+        client.record_composition_start_verdicts(&cleared, &accepted, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]

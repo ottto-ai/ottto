@@ -23,7 +23,7 @@ use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Sourc
 use super::harvest::{begin_run, run_source, Run, SourceStats};
 use super::reader::{LineEvent, LineReader};
 use super::scope::{load_scope, scope_path, ScopeInfo, ScopeResolver};
-use super::upload::{UploadTarget, Uploader};
+use super::upload::{UploadReceipt, UploadTarget, Uploader};
 use super::*;
 use crate::composition_kinds::{GitRootCache, Kind, KindsVersion};
 use crate::context_footprint::sha256_hex;
@@ -848,12 +848,12 @@ struct Capture {
 }
 
 impl Uploader for Capture {
-    fn upload(&mut self, request: &Value) -> anyhow::Result<()> {
+    fn upload(&mut self, request: &Value) -> anyhow::Result<UploadReceipt> {
         if self.fail {
             anyhow::bail!("offline");
         }
         self.payloads.push(request.clone());
-        Ok(())
+        Ok(UploadReceipt::default())
     }
 }
 
@@ -904,11 +904,17 @@ impl Env {
         resolver: &mut dyn ScopeResolver,
     ) -> SourceStats {
         let mut run = Run {
+            start_verdicts: crate::snapshots::start_verdict_store::load(
+                &self.state,
+                "synthetic-destination",
+                now.unix_timestamp(),
+            ),
             state_dir: self.state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left,
+            audit: Default::default(),
         };
         let target = capture.map(|capture| UploadTarget {
             uploader: capture as &mut dyn Uploader,
@@ -961,6 +967,411 @@ fn base_now() -> OffsetDateTime {
 
 fn total_tokens(agg: &Aggregate) -> u64 {
     agg.days.values().map(|bucket| bucket.tokens).sum()
+}
+
+/// Real birth time with synthetic lines dated at creation, so these
+/// tests exercise the age boundary without modifying the host clock.
+fn opening_verdict_fixture(env: &Env, source: Source) -> (PathBuf, OffsetDateTime, Vec<Value>) {
+    let at = OffsetDateTime::now_utc();
+    let (claude, codex) = every_family(&env.cwd(), at.date());
+    let mut records = if source == Source::Claude {
+        claude
+    } else {
+        codex
+    };
+    let path = if source == Source::Claude {
+        env.root.join("p/s1.jsonl")
+    } else {
+        env.root.join("2026/rollout-2026-10-22T00-00-00-c1.jsonl")
+    };
+    write_records(&path, &records);
+    let born = super::checkpoint::born_secs(&fs::metadata(&path).unwrap()).unwrap();
+    let born = OffsetDateTime::from_unix_timestamp(born).unwrap();
+    for row in &mut records {
+        row["timestamp"] = json!(born
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap());
+    }
+    write_records(&path, &records);
+    (path, born, records)
+}
+
+fn opening_tokens(agg: &Aggregate) -> u64 {
+    agg.all_parts
+        .iter()
+        .filter(|(slot, _)| slot.part == crate::composition_kinds::Part::StartNotMeasured)
+        .map(|(_, bucket)| bucket.tokens)
+        .sum()
+}
+
+fn record_opening_verdict(
+    env: &Env,
+    source: Source,
+    path: &Path,
+    now: OffsetDateTime,
+    measured: bool,
+) {
+    let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    item.source_session_id = new_parse_state(source, path, 0).0.session.to_string();
+    item.session_start = Some(Box::new(crate::snapshots::SnapshotSessionStart {
+        user_turn_count: measured.then_some(1),
+        ..Default::default()
+    }));
+    fs::create_dir_all(&env.state).unwrap();
+    crate::snapshots::start_verdict_store::record(
+        &env.state,
+        "synthetic-destination",
+        source.label(),
+        [&item],
+        now.unix_timestamp(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn fresh_opening_without_verdict_waits_then_reads_all_new_bytes() {
+    for source in [Source::Claude, Source::Codex] {
+        for installed in [false, true] {
+            let env = Env::new(&format!("composition-verdict-wait-{source:?}-{installed}"));
+            if installed {
+                env.run(
+                    source,
+                    OffsetDateTime::now_utc() - time::Duration::minutes(1),
+                    None,
+                );
+            }
+            let (path, born, mut records) = opening_verdict_fixture(&env, source);
+            let mut capture = Capture::default();
+            let stats = env.run(
+                source,
+                born + time::Duration::seconds(1),
+                Some(&mut capture),
+            );
+            assert_eq!(stats.verdict_deferred, 1);
+            assert_eq!(
+                (
+                    stats.files_read,
+                    stats.bytes_new,
+                    stats.bytes_repair,
+                    stats.lines.lines
+                ),
+                (0, 0, 0, 0)
+            );
+            assert!(capture.payloads.is_empty());
+            let index = read_index(&env.state, source);
+            assert!(index.files.is_empty(), "no pin on deferral");
+            assert!(
+                index.scope_generations.is_empty(),
+                "no checkpoint on deferral"
+            );
+            assert_eq!(index.last_scan_started, Some(born.unix_timestamp()));
+            // Bytes arriving while the opening waits are included tomorrow.
+            let extra = json!({"type":"unused","timestamp":(born + time::Duration::hours(1)).format(&time::format_description::well_known::Rfc3339).unwrap()});
+            append_records(&path, std::slice::from_ref(&extra));
+            records.push(extra);
+            let stats = env.run_with(
+                source,
+                born + time::Duration::days(1),
+                Some(&mut capture),
+                0,
+                &mut FolderResolver::default(),
+            );
+            assert_eq!(
+                (stats.verdict_deferred, stats.files_read, stats.new_files),
+                (0, 1, 1)
+            );
+            assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+            assert_eq!((stats.bytes_repair, stats.repair_waiting), (0, 0));
+            assert_eq!(stats.lines.lines, records.len() as u64);
+            let scope = env.scope(source);
+            assert!(opening_tokens(&scope.agg) > 0);
+            let checkpoint = scope.files.values().next().unwrap();
+            assert_eq!(
+                (checkpoint.origin, checkpoint.offset),
+                (Some(0), stats.bytes_new)
+            );
+            assert_eq!(capture.payloads.len(), 1);
+            // Late activity keeps its original day when read tomorrow.
+            assert!(scope
+                .agg
+                .days
+                .keys()
+                .any(|(day, _)| *day == day_of(born.date())));
+            env.cleanup();
+        }
+    }
+}
+
+#[test]
+fn missing_opening_verdict_wait_ends_at_six_hours() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-six-hours-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        for age in [1, 3600, 6 * 3600 - 1] {
+            let stats = env.run(source, born + time::Duration::seconds(age), None);
+            assert_eq!((stats.verdict_deferred, stats.files_read), (1, 0));
+            assert!(read_index(&env.state, source).files.is_empty());
+        }
+        let stats = env.run_with(
+            source,
+            born + time::Duration::hours(6),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        );
+        assert_eq!((stats.verdict_deferred, stats.files_read), (0, 1));
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        assert!(opening_tokens(&env.scope(source).agg) > 0);
+        let stats = env.run(source, born + time::Duration::days(1), None);
+        assert_eq!((stats.verdict_deferred, stats.files_read), (0, 0));
+        env.cleanup();
+    }
+}
+
+#[test]
+fn old_opening_without_verdict_is_not_measured() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-old-{source:?}"));
+        env.run(
+            source,
+            OffsetDateTime::now_utc() - time::Duration::minutes(1),
+            None,
+        );
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        let stats = env.run(source, born + time::Duration::hours(7), None);
+        assert_eq!((stats.verdict_deferred, stats.files_read), (0, 1));
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        assert!(opening_tokens(&env.scope(source).agg) > 0);
+        env.cleanup();
+    }
+}
+
+#[test]
+fn explicit_opening_verdict_does_not_defer_fresh_files() {
+    for source in [Source::Claude, Source::Codex] {
+        for measured in [false, true] {
+            let env = Env::new(&format!(
+                "composition-verdict-explicit-{source:?}-{measured}"
+            ));
+            let (path, born, _) = opening_verdict_fixture(&env, source);
+            record_opening_verdict(&env, source, &path, born, measured);
+            let stats = env.run(source, born + time::Duration::seconds(1), None);
+            assert_eq!((stats.verdict_deferred, stats.files_read), (0, 1));
+            assert_eq!(opening_tokens(&env.scope(source).agg) == 0, measured);
+            env.cleanup();
+        }
+    }
+}
+
+#[test]
+fn deferred_opening_uses_verdict_that_arrives_before_next_run() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-arrival-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        assert_eq!(env.run(source, born, None).verdict_deferred, 1);
+        record_opening_verdict(&env, source, &path, born + time::Duration::hours(1), true);
+        let stats = env.run(source, born + time::Duration::days(1), None);
+        assert_eq!(
+            (stats.verdict_deferred, stats.files_read, stats.bytes_repair),
+            (0, 1, 0)
+        );
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        assert_eq!(opening_tokens(&env.scope(source).agg), 0);
+        env.cleanup();
+    }
+}
+
+#[test]
+fn missing_verdict_does_not_defer_later_bytes_of_a_fresh_file() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-opening-only-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        record_opening_verdict(&env, source, &path, born, true);
+        assert_eq!(env.run(source, born, None).files_read, 1);
+        fs::remove_file(env.state.join("composition-start-verdicts.jsonl")).unwrap();
+        let mut extra = if source == Source::Claude {
+            json!({"type":"user","sessionId":"s1","uuid":"later-prompt","cwd":env.cwd(),"message":{"content":"a later prompt"}})
+        } else {
+            json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"a later prompt"}]}})
+        };
+        extra["timestamp"] = json!(born
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap());
+        append_records(&path, std::slice::from_ref(&extra));
+        let stats = env.run(source, born + time::Duration::hours(1), None);
+        assert_eq!(
+            (stats.verdict_deferred, stats.files_read, stats.bytes_repair),
+            (0, 1, 0)
+        );
+        assert_eq!(stats.bytes_new, body(&[extra]).len() as u64);
+        assert_eq!(opening_tokens(&env.scope(source).agg), 0);
+        env.cleanup();
+    }
+}
+
+#[test]
+fn deferred_opening_preserves_a_cached_deleted_folder_scope() {
+    let env = Env::new("composition-verdict-gone-folder");
+    let source = Source::Claude;
+    write_records(
+        &env.root.join("p/older.jsonl"),
+        &claude_turn(&env.cwd(), base_now().date(), 1),
+    );
+    env.run(source, base_now(), None);
+    // Same map used for a linked worktree removed before its first read.
+    let old_index = read_index(&env.state, source);
+    let scope_id = old_index.files["older.jsonl"].scope.clone().unwrap();
+    assert_eq!(old_index.cwd_scopes.get(&env.cwd()), Some(&scope_id));
+    fs::remove_dir_all(&env.workspace).unwrap();
+    let (path, born, _) = opening_verdict_fixture(&env, source);
+    let stats = env.run(source, born, None);
+    assert_eq!(stats.verdict_deferred, 1);
+    let index = read_index(&env.state, source);
+    assert_eq!(index.cwd_scopes.get(&env.cwd()), Some(&scope_id));
+    assert!(!index.files.contains_key("s1.jsonl"));
+    let stats = env.run(source, born + time::Duration::days(1), None);
+    assert_eq!(
+        (stats.verdict_deferred, stats.unscoped, stats.files_read),
+        (0, 0, 1)
+    );
+    assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+    let index = read_index(&env.state, source);
+    assert_eq!(index.files["s1.jsonl"].scope.as_ref(), Some(&scope_id));
+    assert_eq!(index.scope_info.len(), 1);
+    assert!(
+        !index.cwd_scopes.contains_key(&env.cwd()),
+        "mapping pruned once no opening waits"
+    );
+    env.cleanup();
+}
+
+#[test]
+fn deferred_opening_caches_an_unseen_workspace_before_removal() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-unseen-workspace-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        let stats = env.run(source, born, None);
+        assert_eq!((stats.verdict_deferred, stats.files_read), (1, 0));
+        let index = read_index(&env.state, source);
+        assert!(index.files.is_empty(), "no file pin for a deferred opening");
+        assert!(
+            index.scope_generations.is_empty(),
+            "no checkpoint committed"
+        );
+        let scope_id = index.cwd_scopes.get(&env.cwd()).unwrap().clone();
+        assert_eq!(index.scope_info.len(), 1);
+        fs::remove_dir_all(&env.workspace).unwrap();
+        let stats = env.run_with(
+            source,
+            born + time::Duration::days(1),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        );
+        assert_eq!(
+            (
+                stats.verdict_deferred,
+                stats.files_read,
+                stats.unscoped,
+                stats.scan_errors
+            ),
+            (0, 1, 0, 0)
+        );
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        let index = read_index(&env.state, source);
+        assert_eq!(
+            index.files.values().next().unwrap().scope.as_ref(),
+            Some(&scope_id)
+        );
+        assert!(opening_tokens(&env.scope(source).agg) > 0);
+        env.cleanup();
+    }
+}
+
+#[test]
+fn opening_verdict_probe_respects_expired_deadline_and_keeps_new_bytes() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::new(&format!("composition-verdict-deadline-{source:?}"));
+        let (path, born, _) = opening_verdict_fixture(&env, source);
+        let deadline = Instant::now() - Duration::from_secs(1);
+        // Deadline check precedes opening even a nonexistent path.
+        assert_eq!(
+            super::file::new_parse_state_before(source, &path.with_extension("missing"), deadline)
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+        let mut resolver = FolderResolver::default();
+        let mut run = Run {
+            state_dir: env.state.clone(),
+            now: born,
+            deadline,
+            resolver: &mut resolver,
+            repair_left: 0,
+            audit: Default::default(),
+            start_verdicts: Default::default(),
+        };
+        let stats = run_source(&mut run, source, std::slice::from_ref(&env.root), None);
+        assert!(stats.cut);
+        assert_eq!(
+            (
+                stats.verdict_deferred,
+                stats.files_read,
+                stats.bytes_head,
+                stats.bytes_new,
+                stats.bytes_repair
+            ),
+            (0, 0, 0, 0, 0)
+        );
+        assert_eq!(resolver.calls, 0);
+        let index = read_index(&env.state, source);
+        assert!(index.files.is_empty());
+        assert_eq!(index.last_scan_started, Some(born.unix_timestamp()));
+        let stats = env.run_with(
+            source,
+            born + time::Duration::days(1),
+            None,
+            0,
+            &mut FolderResolver::default(),
+        );
+        assert_eq!(
+            (stats.verdict_deferred, stats.files_read, stats.bytes_repair),
+            (0, 1, 0)
+        );
+        assert_eq!(stats.bytes_new, fs::metadata(&path).unwrap().len());
+        env.cleanup();
+    }
+}
+
+#[test]
+fn later_opening_verdict_transitions_do_not_reread_counted_bytes() {
+    let env = Env::new("composition-verdict-forward-only");
+    let source = Source::Claude;
+    env.run(
+        source,
+        OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        None,
+    );
+    let (path, born, _) = opening_verdict_fixture(&env, source);
+    env.run(source, born + time::Duration::hours(7), None);
+    let before = env.scope(source).agg;
+    assert!(opening_tokens(&before) > 0);
+    for (day, measured) in [(1, true), (2, false)] {
+        let now = born + time::Duration::days(day);
+        record_opening_verdict(&env, source, &path, now, measured);
+        let stats = env.run(source, now, None);
+        assert_eq!(
+            (
+                stats.verdict_deferred,
+                stats.files_read,
+                stats.bytes_new,
+                stats.bytes_repair
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(env.scope(source).agg, before);
+    }
+    env.cleanup();
 }
 
 #[test]
@@ -1752,11 +2163,13 @@ fn scope_key_is_stable_across_worktrees() {
     );
     let run = |now: OffsetDateTime, resolver: &mut dyn ScopeResolver| {
         let mut run = Run {
+            start_verdicts: Default::default(),
             state_dir: state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
             resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
+            audit: Default::default(),
         };
         run_source(
             &mut run,
@@ -2437,11 +2850,13 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     let run = |now: OffsetDateTime| {
         let mut resolver = super::scope::GitScopeResolver;
         let mut run = Run {
+            start_verdicts: Default::default(),
             state_dir: state.clone(),
             now,
             deadline: Instant::now() + Duration::from_secs(120),
             resolver: &mut resolver,
             repair_left: REPAIR_BYTES_PER_DAY,
+            audit: Default::default(),
         };
         run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
     };
@@ -4337,9 +4752,8 @@ fn composition_lock_fixture() {
     let dir = PathBuf::from(dir);
     if let Some(parent_ready) = std::env::var_os("COMPOSITION_LOCK_PARENT") {
         // This parent is killed on purpose: its orphaned child is the
-        // worker under test.
-        #[allow(clippy::zombie_processes)]
-        let child = std::process::Command::new(std::env::current_exe().unwrap())
+        // worker under test. If it survives, it reaps the child below.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "context_composition::v2::tests::composition_lock_fixture",
@@ -4352,6 +4766,9 @@ fn composition_lock_fixture() {
             .unwrap();
         fs::write(parent_ready, child.id().to_string()).unwrap();
         std::thread::sleep(Duration::from_secs(60));
+        // The parent-death test kills this process before this point. If it
+        // survives, reap its child rather than leave fixture cleanup to init.
+        child.wait().unwrap();
         return;
     }
     let Some(_lock) = harvest::lock_state(&dir).unwrap() else {
@@ -4603,3 +5020,9 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
     assert_eq!(total_tokens(&env.scope(Source::Claude).agg), before);
     env.cleanup();
 }
+
+#[path = "tests/a34.rs"]
+mod a34;
+
+#[path = "tests/a2.rs"]
+mod a2;
