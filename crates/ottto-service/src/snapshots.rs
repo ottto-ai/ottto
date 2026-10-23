@@ -5089,6 +5089,92 @@ pub struct ClaudeDuplicateCensusCounts {
 /// `missing_*` name, first match wins, why the other keys are not covered.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
 pub struct ClaudeRequestCensusShadowCounts {
+    pub strong_comparison_complete: bool,
+    pub safety_incomplete: bool,
+    pub safety_incomplete_overflow: bool,
+    pub safety_incomplete_alarm: bool,
+    pub d2_hash_budget_alarm: bool,
+    pub legacy_compare_ready: bool,
+    pub legacy_compare_generation_mismatch: bool,
+    pub legacy_compare_budget_refused: bool,
+    pub shadow_post_save_equality_checked: bool,
+    pub shadow_post_save_qualified: bool,
+    pub shadow_projected_dependent_known: bool,
+    pub shadow_refusal_rate_known: bool,
+    pub migration_estimate_known: bool,
+    pub d2_active: bool,
+    pub debt_scheduler_active: bool,
+    pub safety_reclaimed: u64,
+    pub safety_incomplete_since: u64,
+    pub unread_oldest_age_seconds: u64,
+    pub unread_last_progress_age_seconds: u64,
+    pub unread_max_complete_terminals: u64,
+    pub shadow_elapsed_us: u64,
+    pub shadow_work_units: u64,
+    pub shadow_healthy_terminals_attempted: u64,
+    pub shadow_healthy_terminals_memory_refused: u64,
+    pub shadow_healthy_terminal_refusal_rate_ppm: u64,
+    pub census_read_bytes: u64,
+    pub census_evidence_bytes: u64,
+    pub shadow_spec_version: usize,
+    pub safety_reclaimed_keys: usize,
+    pub shape_lossy_unread: usize,
+    pub shape_lossy_dropped: usize,
+    pub shape_multi_item: usize,
+    pub shape_lossy_classification_unknown: usize,
+    pub shape_all_read_residue: usize,
+    pub unread_age_alarm_keys: usize,
+    pub unread_terminal_alarm_keys: usize,
+    pub unread_liveness_unknown_keys: usize,
+    pub retired_records: usize,
+    pub active_hash_total: usize,
+    pub retired_hash_total: usize,
+    pub retired_safety_missing: usize,
+    pub alias_migrate_keys: usize,
+    pub content_owner_pairs: usize,
+    pub content_owner_overflow_keys: usize,
+    pub shares_hash_with_retired_owner_keys: usize,
+    pub strong_admissions_via_excusal: usize,
+    pub dirty_unparsed_keys: usize,
+    pub decode_ambiguous_keys: usize,
+    pub producer_refused_keys: usize,
+    pub shadow_post_save_mismatch_keys: usize,
+    pub legacy_compare_families: usize,
+    pub legacy_compare_keys: usize,
+    pub legacy_uncomparable_families: usize,
+    pub legacy_dup_not_d2_shared: usize,
+    pub legacy_dup_not_d2_shared_families: usize,
+    pub d2_shared_not_legacy: usize,
+    pub d2_shared_not_legacy_families: usize,
+    pub shadow_diff_old_families: usize,
+    pub shadow_diff_inert_families: usize,
+    pub shadow_diff_retired_families: usize,
+    pub shadow_diff_alias_families: usize,
+    pub shadow_diff_unclassified_families: usize,
+    pub d2_settled_pending_invalid_families: usize,
+    pub d2_settled_pending_cap_families: usize,
+    pub d2_settled_pending_identity_families: usize,
+    pub d2_settled_pending_member_changed_families: usize,
+    pub d2_settled_pending_occurrence_mismatch_families: usize,
+    pub d2_settled_pending_other_families: usize,
+    pub shadow_unexplained_positive_admissions: usize,
+    pub shadow_protected_contract_violations: usize,
+    pub shadow_d2_protected_offers: usize,
+    pub shadow_cutover_history_offers: usize,
+    pub shadow_cutover_newfile_offers: usize,
+    pub shadow_projected_dependent_keys: usize,
+    pub shadow_projected_dependent_bytes: usize,
+    pub shadow_projected_dependent_protected: usize,
+    pub shadow_join_builds: usize,
+    pub shadow_keys_visited: usize,
+    pub shadow_hashes_visited: usize,
+    pub shadow_work_limited: usize,
+    pub shadow_compare_heap_bytes: usize,
+    pub shadow_peak_heap_bytes: usize,
+    pub shadow_workspace_peak_bytes: usize,
+    pub migration_keys_estimated: usize,
+    pub migration_input_bytes_estimated: usize,
+
     pub would_open: bool,
     pub would_open_flips: u64,
     pub family_keys: usize,
@@ -5310,6 +5396,8 @@ pub struct SourceScanResult {
     /// Slice D1 shadow, measured by a complete Claude terminal scan before
     /// any fold. Count-only; the usage fold copies it into its counters.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
+    pub(crate) claude_request_census_view:
+        Option<std::sync::Arc<claude_request_census::CensusShadowView>>,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
@@ -6322,6 +6410,7 @@ fn apply_claude_reported_usage_with_index_and_limits(
         None,
         None,
         &BTreeMap::new(),
+        None,
     )
 }
 
@@ -6433,10 +6522,13 @@ pub(crate) fn apply_claude_reported_usage_to_scan_with_comparison(
         observations,
         comparison,
         veto_api_rows,
+        scan.claude_request_census_view.as_deref(),
     );
     // Slice D1: report only. The shadow was measured by the scan; no fold
     // input above read it.
-    disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
+    if disposition.duplicate_census.request_census.is_none() {
+        disposition.duplicate_census.request_census = scan.claude_request_census_shadow;
+    }
     disposition
 }
 
@@ -6455,6 +6547,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     observations: Option<ClaudeNativeObservations>,
     comparison: Option<claude_native_comparison::FoldView<'_>>,
     veto_api_rows: &ClaudeVetoApiRows,
+    shadow: Option<&claude_request_census::CensusShadowView>,
 ) -> ClaudeUsageAuthorityDisposition {
     let (negatives, diagnostic) = comparison.map_or((None, None), |view| {
         (view.negatives, view.lease.map(|lease| &lease.diagnostic))
@@ -6483,6 +6576,9 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     };
     duplicate_census.census_complete = census_complete;
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
+    if let Some(shadow) = shadow {
+        duplicate_census.request_census = Some(shadow.compare_legacy(index, census_window_end));
+    }
 
     let complete_families = if census_complete {
         complete_claude_usage_family_members(index)
@@ -24258,6 +24354,13 @@ impl OwnedSourceScan {
                                 source_file_fingerprint: &source_file_fingerprint,
                                 census_window_end: &census_window_end,
                                 complete: parse_complete,
+                                acquired_eof: cursor_fragment.is_none()
+                                    && attempt_read_end
+                                        .is_none_or(|end| end >= candidate.size_bytes),
+                                acquired: attempt_read_end
+                                    .unwrap_or(candidate.size_bytes)
+                                    .min(candidate.size_bytes),
+                                extent: candidate.size_bytes,
                                 lossy: dropped_usage_record_count > 0
                                     || recognized_usage_drop_count > 0
                                     || report.over_line_cap_count > 0,
@@ -24886,13 +24989,15 @@ impl OwnedSourceScan {
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
                 let census_complete = raw_census_complete && !needs_clean_followup;
                 // Slice D1: prune and measure only, before any fold.
+                let mut claude_request_census_view = None;
                 let claude_request_census_shadow =
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
-                        claude_request_census::settle_claude_request_census_terminal(
+                        claude_request_census::prepare_claude_request_census_terminal(
                             index,
                             &traversal_snapshot.observed_index_keys,
                             &traversal_snapshot.residue.index_keys,
                             &census_window_end,
+                            &mut claude_request_census_view,
                         )
                     });
                 let reconciliation_pending = traversal_discovery_done
@@ -25078,6 +25183,7 @@ impl OwnedSourceScan {
                     pending_finalization,
                     codex_legacy_join_baselines,
                     claude_request_census_shadow,
+                    claude_request_census_view,
                     codex_join_validation: codex_join_inventory
                         .filter(|_| !codex_join_completed.is_empty())
                         .map(|inventory| codex_file_join::Validation {
@@ -77813,7 +77919,7 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; strong_comparison_complete, safety_incomplete, safety_incomplete_overflow, safety_incomplete_alarm, d2_hash_budget_alarm, legacy_compare_ready, legacy_compare_generation_mismatch, legacy_compare_budget_refused, shadow_post_save_equality_checked, shadow_post_save_qualified, shadow_projected_dependent_known, shadow_refusal_rate_known, migration_estimate_known, d2_active, debt_scheduler_active, safety_reclaimed, safety_incomplete_since, unread_oldest_age_seconds, unread_last_progress_age_seconds, unread_max_complete_terminals, shadow_elapsed_us, shadow_work_units, shadow_healthy_terminals_attempted, shadow_healthy_terminals_memory_refused, shadow_healthy_terminal_refusal_rate_ppm, census_read_bytes, census_evidence_bytes, shadow_spec_version, safety_reclaimed_keys, shape_lossy_unread, shape_lossy_dropped, shape_multi_item, shape_lossy_classification_unknown, shape_all_read_residue, unread_age_alarm_keys, unread_terminal_alarm_keys, unread_liveness_unknown_keys, retired_records, active_hash_total, retired_hash_total, retired_safety_missing, alias_migrate_keys, content_owner_pairs, content_owner_overflow_keys, shares_hash_with_retired_owner_keys, strong_admissions_via_excusal, dirty_unparsed_keys, decode_ambiguous_keys, producer_refused_keys, shadow_post_save_mismatch_keys, legacy_compare_families, legacy_compare_keys, legacy_uncomparable_families, legacy_dup_not_d2_shared, legacy_dup_not_d2_shared_families, d2_shared_not_legacy, d2_shared_not_legacy_families, shadow_diff_old_families, shadow_diff_inert_families, shadow_diff_retired_families, shadow_diff_alias_families, shadow_diff_unclassified_families, d2_settled_pending_invalid_families, d2_settled_pending_cap_families, d2_settled_pending_identity_families, d2_settled_pending_member_changed_families, d2_settled_pending_occurrence_mismatch_families, d2_settled_pending_other_families, shadow_unexplained_positive_admissions, shadow_protected_contract_violations, shadow_d2_protected_offers, shadow_cutover_history_offers, shadow_cutover_newfile_offers, shadow_projected_dependent_keys, shadow_projected_dependent_bytes, shadow_projected_dependent_protected, shadow_join_builds, shadow_keys_visited, shadow_hashes_visited, shadow_work_limited, shadow_compare_heap_bytes, shadow_peak_heap_bytes, shadow_workspace_peak_bytes, migration_keys_estimated, migration_input_bytes_estimated, would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;

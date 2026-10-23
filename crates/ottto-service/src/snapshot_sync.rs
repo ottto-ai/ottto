@@ -6930,6 +6930,12 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if let Some(view) = scan_result.claude_request_census_view.as_ref() {
+        let qualified = view.qualify_saved(&index);
+        if let Ok(line) = serde_json::to_string(&qualified) {
+            eprintln!("local snapshot sync: request_census post_save={line}");
+        }
+    }
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     if upload_fully_settled
         && native_comparison_lease

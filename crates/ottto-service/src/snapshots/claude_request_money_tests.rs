@@ -500,7 +500,8 @@ fn money_transcript_records_retire_after_35_days() {
         assert_eq!(record.retired_for_test(), None, "{name}");
         assert_eq!(record.request_hashes_for_test(), &[1, 2, 3], "{name}");
     }
-    assert_eq!(census.hash_total_for_test(), 9);
+    assert_eq!(census.records().map(|(_, record)| record.request_hashes().len()).sum::<usize>(), 9);
+    assert_eq!(census.hash_total_for_test(), 15, "nine active plus six retired-safety hashes");
 }
 
 /// A telemetry record's facts for `count` synthetic rows of `session`.
@@ -2768,13 +2769,11 @@ fn census_hashes(support: &Path) -> usize {
         .unwrap_or(0)
 }
 
-/// Retaining retirement hashes in the shared D1 budget needs an admission
-/// policy before it can be added without changing MONEY. This is a pressure
-/// reproduction, not a safety-buffer implementation: the second census
-/// reserves the proposed safety slots with an ordinary synthetic hash list.
-/// The live pipeline and retirement implementation remain unchanged.
+/// The #722 pressure reproducer, now using actual retirement safety and
+/// bounded reclaim. The control uses main's unchanged MONEY retirement.
+/// Admission, scoped debt and completeness must remain byte-identical.
 #[test]
-fn money_retired_safety_reservation_can_displace_an_active_transcript() {
+fn money_retired_safety_reclaim_preserves_main_active_admission() {
     const OLD: &str = "/money/projects/old.jsonl";
     const CURRENT: &str = "/money/projects/current.jsonl";
     const NEW: &str = "/money/projects/new.jsonl";
@@ -2813,17 +2812,30 @@ fn money_retired_safety_reservation_can_displace_an_active_transcript() {
         new.request_hashes()
     );
 
-    // Charging the same old slots as safety leaves no slot for the new record.
-    // No extra safety allowance, metadata or serialization pressure is needed
-    // to trigger this: the existing combined hash limit alone is sufficient.
+    // Actual phase-B retirement: safety stays charged, MONEY hashes empty.
     let mut reserved = before;
+    let mut retained = reserved.take(OLD).expect("retired original");
+    retained.retire_transcript_preserving_safety();
+    assert!(retained.request_hashes().is_empty());
+    assert_eq!(retained.duplicate_safety_hashes().len(), half);
+    assert_eq!(
+        reserved.insert_for_test(OLD, retained),
+        ClaudeRequestCensusInsert::Stored
+    );
     assert_eq!(reserved.hash_headroom(), 0);
     assert_eq!(
-        reserved.insert_for_test(NEW, new),
-        ClaudeRequestCensusInsert::Tombstone
+        reserved.insert_for_test(NEW, new.clone()),
+        ClaudeRequestCensusInsert::Stored
     );
-    assert!(reserved.get(NEW).unwrap().over_budget());
-    assert!(reserved.get(NEW).unwrap().request_hashes().is_empty());
+    assert!(!reserved.get(NEW).unwrap().over_budget());
+    assert_eq!(
+        reserved.get(NEW).unwrap().request_hashes(),
+        new.request_hashes()
+    );
+    assert_eq!(
+        reserved.get(OLD).unwrap().duplicate_safety_hashes().len(),
+        half - 1
+    );
     assert_eq!(reserved.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
 
     // Show the resulting existing MONEY decision, not just a budget statistic.
@@ -2835,23 +2847,34 @@ fn money_retired_safety_reservation_can_displace_an_active_transcript() {
     let mut reserved_index = main_index.clone();
     *reserved_index.claude_request_census_mut_for_test() = reserved;
     let ledger = ClaudeRequestCensus::default();
-    let family_complete = |index: &ScanIndex| {
-        ClaudeLedgerScope::build(
+    let scope = |index: &ScanIndex| {
+        let scope = ClaudeLedgerScope::build(
             index,
             &ledger,
             &BTreeSet::new(),
             &BTreeSet::from(["new"]),
             Instant::now() + Duration::from_secs(10),
         )
-        .expect("scope admitted")
-        .family_complete("new")
+        .expect("scope admitted");
+        (
+            scope.family_complete("new"),
+            serde_json::to_vec(&scope.debt).expect("scoped MONEY debt"),
+        )
     };
-    assert!(
-        family_complete(&main_index),
-        "main admits the active transcript"
+    let main_scope = scope(&main_index);
+    assert!(main_scope.0, "main admits the active transcript");
+    assert_eq!(
+        scope(&reserved_index),
+        main_scope,
+        "MONEY completeness and scoped-debt bytes equal main"
     );
-    assert!(
-        !family_complete(&reserved_index),
-        "a shared safety reservation changes MONEY"
+    assert!(!claude_census_disjointness_complete(
+        &reserved_index,
+        MONEY_WINDOW,
+        true
+    ));
+    assert_eq!(
+        claude_census_member_status(&reserved_index, NEW, MONEY_WINDOW, true),
+        ClaudeCensusMemberStatus::SafetyIncomplete
     );
 }

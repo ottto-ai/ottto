@@ -1182,7 +1182,11 @@ fn census_retired_record_survives_an_unchanged_reparse() {
         .record_for_test(&key)
         .expect("record")
         .clone();
-    assert_eq!(retired.retired_for_test(), Some(1), "retired at the terminal");
+    assert_eq!(
+        retired.retired_for_test(),
+        Some(1),
+        "retired at the terminal"
+    );
     let hashes = index.claude_request_census_for_test().totals_for_test().0;
     index
         .files
@@ -1621,6 +1625,91 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
 #[test]
 fn census_shadow_counts_encoding_is_bounded() {
     let shadow = ClaudeRequestCensusShadowCounts {
+        strong_comparison_complete: false,
+        safety_incomplete: false,
+        safety_incomplete_overflow: false,
+        safety_incomplete_alarm: false,
+        d2_hash_budget_alarm: false,
+        legacy_compare_ready: false,
+        legacy_compare_generation_mismatch: false,
+        legacy_compare_budget_refused: false,
+        shadow_post_save_equality_checked: false,
+        shadow_post_save_qualified: false,
+        shadow_projected_dependent_known: false,
+        shadow_refusal_rate_known: false,
+        migration_estimate_known: false,
+        d2_active: false,
+        debt_scheduler_active: false,
+        safety_reclaimed: u64::MAX,
+        safety_incomplete_since: u64::MAX,
+        unread_oldest_age_seconds: u64::MAX,
+        unread_last_progress_age_seconds: u64::MAX,
+        unread_max_complete_terminals: u64::MAX,
+        shadow_elapsed_us: u64::MAX,
+        shadow_work_units: u64::MAX,
+        shadow_healthy_terminals_attempted: u64::MAX,
+        shadow_healthy_terminals_memory_refused: u64::MAX,
+        shadow_healthy_terminal_refusal_rate_ppm: u64::MAX,
+        census_read_bytes: u64::MAX,
+        census_evidence_bytes: u64::MAX,
+        shadow_spec_version: usize::MAX,
+        safety_reclaimed_keys: usize::MAX,
+        shape_lossy_unread: usize::MAX,
+        shape_lossy_dropped: usize::MAX,
+        shape_multi_item: usize::MAX,
+        shape_lossy_classification_unknown: usize::MAX,
+        shape_all_read_residue: usize::MAX,
+        unread_age_alarm_keys: usize::MAX,
+        unread_terminal_alarm_keys: usize::MAX,
+        unread_liveness_unknown_keys: usize::MAX,
+        retired_records: usize::MAX,
+        active_hash_total: usize::MAX,
+        retired_hash_total: usize::MAX,
+        retired_safety_missing: usize::MAX,
+        alias_migrate_keys: usize::MAX,
+        content_owner_pairs: usize::MAX,
+        content_owner_overflow_keys: usize::MAX,
+        shares_hash_with_retired_owner_keys: usize::MAX,
+        strong_admissions_via_excusal: usize::MAX,
+        dirty_unparsed_keys: usize::MAX,
+        decode_ambiguous_keys: usize::MAX,
+        producer_refused_keys: usize::MAX,
+        shadow_post_save_mismatch_keys: usize::MAX,
+        legacy_compare_families: usize::MAX,
+        legacy_compare_keys: usize::MAX,
+        legacy_uncomparable_families: usize::MAX,
+        legacy_dup_not_d2_shared: usize::MAX,
+        legacy_dup_not_d2_shared_families: usize::MAX,
+        d2_shared_not_legacy: usize::MAX,
+        d2_shared_not_legacy_families: usize::MAX,
+        shadow_diff_old_families: usize::MAX,
+        shadow_diff_inert_families: usize::MAX,
+        shadow_diff_retired_families: usize::MAX,
+        shadow_diff_alias_families: usize::MAX,
+        shadow_diff_unclassified_families: usize::MAX,
+        d2_settled_pending_invalid_families: usize::MAX,
+        d2_settled_pending_cap_families: usize::MAX,
+        d2_settled_pending_identity_families: usize::MAX,
+        d2_settled_pending_member_changed_families: usize::MAX,
+        d2_settled_pending_occurrence_mismatch_families: usize::MAX,
+        d2_settled_pending_other_families: usize::MAX,
+        shadow_unexplained_positive_admissions: usize::MAX,
+        shadow_protected_contract_violations: usize::MAX,
+        shadow_d2_protected_offers: usize::MAX,
+        shadow_cutover_history_offers: usize::MAX,
+        shadow_cutover_newfile_offers: usize::MAX,
+        shadow_projected_dependent_keys: usize::MAX,
+        shadow_projected_dependent_bytes: usize::MAX,
+        shadow_projected_dependent_protected: usize::MAX,
+        shadow_join_builds: usize::MAX,
+        shadow_keys_visited: usize::MAX,
+        shadow_hashes_visited: usize::MAX,
+        shadow_work_limited: usize::MAX,
+        shadow_compare_heap_bytes: usize::MAX,
+        shadow_peak_heap_bytes: usize::MAX,
+        shadow_workspace_peak_bytes: usize::MAX,
+        migration_keys_estimated: usize::MAX,
+        migration_input_bytes_estimated: usize::MAX,
         would_open: false,
         would_open_flips: u64::MAX,
         family_keys: usize::MAX,
@@ -1662,7 +1751,7 @@ fn census_shadow_counts_encoding_is_bounded() {
     );
     assert_eq!(
         encoded.len(),
-        CENSUS_SHADOW_MAX_BYTES,
+        CENSUS_SHADOW_WORST_BYTES,
         "longest scalar spellings"
     );
     let without = ClaudeDuplicateCensusCounts::default();
@@ -1685,7 +1774,8 @@ fn census_shadow_counts_encoding_is_bounded() {
         .contains("request_census"));
 }
 
-const CENSUS_SHADOW_MAX_BYTES: usize = 1_238;
+const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
+const CENSUS_SHADOW_WORST_BYTES: usize = 5243;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
