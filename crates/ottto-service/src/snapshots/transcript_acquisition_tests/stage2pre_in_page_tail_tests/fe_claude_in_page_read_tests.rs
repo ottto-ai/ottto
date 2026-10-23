@@ -1616,3 +1616,119 @@ fn fe_claude_lossy_tail_cannot_inherit_complete_provenance_for_d1_proof() {
     assert!(!mints_v1(&mut index, &result, 0..9));
     assert!(!index.claude_usage_family_witnesses.contains_key(SESSION));
 }
+
+/// c22 G1 (control): an ordinary unsampled parse that is not verified (a
+/// terminal oversized line) and stages no obligation re-records a
+/// replay-reset (`None`) or legacy non-stem entry as the clean identity. It
+/// mints no `p` tag, no deadline-0 audit debt, and counts no tag clear.
+#[test]
+fn fe_g1_ordinary_unverified_rerecord_never_mints_prefix_provenance() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for (source, reset) in [
+        (CLAUDE, None),
+        (CLAUDE, Some("semantic_sync:v1")),
+        (SnapshotSource::Codex, None),
+    ] {
+        let id = format!("{source:?}/{reset:?}");
+        let fixture = ScanFixture::new(source);
+        fixture.file.append(&usage(source, 100, 0, "fixture-model"));
+        let (mut index, _, _) = production_scan(&fixture, source, ScanIndex::default(), None, "g1");
+        let key = local_index_key(&fixture.file.0);
+        index.files.get_mut(&key).unwrap().scan_identity_version = reset.map(Into::into);
+        assert!(
+            index.files[&key].has_prefix_provenance(),
+            "{id}: the read side fails closed until re-recorded"
+        );
+        fixture
+            .file
+            .append(&json!({"type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)}));
+        fixture.file.append(&usage(source, 140, 1, "fixture-model"));
+        let ((index, result, _), counts) =
+            observe(|| production_scan(&fixture, source, index, None, "g1"));
+        assert!(
+            result.over_line_cap_count > 0,
+            "{id}: precondition: not loss-free, so not source-verified"
+        );
+        let entry = &index.files[&key];
+        assert_eq!(
+            entry.scan_identity_version.as_deref(),
+            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION),
+            "{id}"
+        );
+        assert!(!entry.has_prefix_provenance(), "{id}");
+        assert!(!entry.has_unverified_source(), "{id}: no audit debt");
+        assert!(entry.audit_obligation(0).is_none(), "{id}");
+        assert_eq!(counts.prefix_tag_clears, 0, "{id}");
+    }
+}
+
+/// c22 G1 (control): FE marks its grown prefix after `record` in the same
+/// completion, so a prefix still ends `p` from a clean, replay-reset or
+/// legacy prior entry, and stays excluded.
+#[test]
+fn fe_g1_grown_prefix_still_marks_prefix_after_ordinary_record() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for reset in [
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION),
+        None,
+        Some("semantic_sync:v1"),
+    ] {
+        let mut base = baseline(CLAUDE, 4, 2);
+        base.cache.clear();
+        let path = base.path.clone();
+        let mut index = std::mem::take(&mut base.index);
+        index
+            .files
+            .get_mut(&base.key)
+            .unwrap()
+            .scan_identity_version = reset.map(Into::into);
+        let (mut index, result, seen, read) =
+            page_injecting(&base.fixture, CLAUDE, index, &base.cache, is_full, |_| {
+                append_raw(&path, &row_bytes(CLAUDE, 6..9))
+            });
+        assert!(
+            is_full(read.mode),
+            "{reset:?}: precondition: an in-page Full"
+        );
+        assert_eq!(seen.unreadable, 0, "{reset:?}: causes={:?}", seen.causes);
+        let entry = &index.files[&base.key];
+        assert!(entry.has_unverified_source(), "{reset:?}");
+        assert!(entry.has_prefix_provenance(), "{reset:?}");
+        assert!(
+            entry
+                .scan_identity_version
+                .as_deref()
+                .unwrap()
+                .ends_with(":p"),
+            "{reset:?}"
+        );
+        assert!(!mints_v1(&mut index, &result, 0..9), "{reset:?}");
+    }
+}
+
+/// c22 N1 (narrower): only loss-free, identity-complete D1 shapes may bind a
+/// recomposed body. An identity-incomplete record keeps its root excluded
+/// until a Full audit verifies it.
+#[test]
+fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
+    use crate::snapshots::claude_request_census::{
+        ClaudeRequestCensusRecord, ClaudeRequestCensusShape as Shape,
+    };
+    let fingerprint = "a".repeat(64);
+    for (shape, hashes, binds) in [
+        (Shape::Exact, vec![1], true),
+        (Shape::Empty, vec![], true),
+        (Shape::IdentityIncomplete, vec![1], false),
+        (Shape::Lossy, vec![1], false),
+        (Shape::OverBudget, vec![], false),
+    ] {
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(&fingerprint, 1, shape, hashes)
+            .with_unverified_for_test(true);
+        assert!(record.unverified_or_twin(), "{shape:?}");
+        assert_eq!(record.can_bind_recomposed_body(), binds, "{shape:?}");
+    }
+}

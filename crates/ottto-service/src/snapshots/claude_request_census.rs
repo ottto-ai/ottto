@@ -389,15 +389,15 @@ impl ClaudeRequestCensusRecord {
     /// A current native body can supersede an unverified D1 record only if
     /// the record describes a complete, loss-free parse of that revision.
     /// Terminal oversized-line settlement is NOT complete proof evidence.
+    /// Identity-incomplete records wait for a Full audit: saved-witness
+    /// reconstruction does not itself refuse their bodies.
     pub(crate) fn can_bind_recomposed_body(&self) -> bool {
         self.current_derivation()
             && !self.twin
             && self.retired.is_none()
             && matches!(
                 self.shape,
-                ClaudeRequestCensusShape::Exact
-                    | ClaudeRequestCensusShape::Empty
-                    | ClaudeRequestCensusShape::IdentityIncomplete
+                ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
             )
     }
 

@@ -81,8 +81,11 @@ impl ScanIndexEntry {
     pub(super) fn set_unverified_deadline(&mut self, due: u64) {
         self.scan_identity_version = Some(provenance_marker(due, self.has_prefix_provenance()));
     }
+    /// Only an existing sampled stem carries provenance. A missing or legacy
+    /// identity still reads as prefix until re-recorded, but an ordinary
+    /// record never mints `p`; FE marks its prefix after `record`.
     pub(super) fn carried_audit_version(&self) -> String {
-        if self.has_unverified_source() || self.has_prefix_provenance() {
+        if self.has_unverified_source() {
             provenance_marker(
                 self.unverified_deadline().unwrap_or(0),
                 self.has_prefix_provenance(),
@@ -527,6 +530,52 @@ mod provenance_tests {
             assert!(tag.capacity() <= MAX_MARKER_BYTES);
             assert!(tag.capacity() <= budget);
             assert_eq!(decode_marker(&tag), Some((u64::MAX, prefix)));
+        }
+    }
+    /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
+    /// or legacy entry re-recorded without verification or obligation becomes
+    /// the clean identity; the same completion's FE mark still tags `p`.
+    #[test]
+    fn ordinary_record_never_mints_prefix_but_fe_mark_after_record_does() {
+        let candidate = CandidateFile {
+            scan_root: PathBuf::from("/synthetic"),
+            path: PathBuf::from("/synthetic/session.jsonl"),
+            size_bytes: 1,
+            modified_unix_seconds: 1,
+            modified_unix_nanos: 1,
+            source_file_fingerprint: "source".into(),
+            legacy_source_file_fingerprint: "legacy".into(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: "opened".into(),
+        };
+        let key = local_index_key(&candidate.path);
+        for reset in [None, Some("semantic_sync:v1"), Some("unknown-provenance")] {
+            let mut entry = index().files.remove("file").unwrap();
+            entry.scan_identity_version = reset.map(Into::into);
+            assert!(
+                entry.has_prefix_provenance(),
+                "{reset:?}: read side fails closed"
+            );
+            let mut ordinary = ScanIndex::default();
+            ordinary.files.insert(key.clone(), entry);
+            let mut marked = ordinary.clone();
+            let ((), counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+                ordinary.record(candidate.clone(), None, ScanParseOutcome::ConfirmedEmpty)
+            });
+            let entry = &ordinary.files[&key];
+            assert_eq!(
+                entry.scan_identity_version.as_deref(),
+                Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION),
+                "{reset:?}"
+            );
+            assert!(!entry.has_prefix_provenance(), "{reset:?}");
+            assert!(!entry.has_unverified_source(), "{reset:?}: no audit debt");
+            assert!(entry.audit_obligation(100).is_none(), "{reset:?}");
+            assert_eq!(counts.prefix_tag_clears, 0, "{reset:?}");
+            marked.record(candidate.clone(), None, ScanParseOutcome::ConfirmedEmpty);
+            assert!(marked.mark_sealed_prefix(&key, "source"));
+            assert!(marked.files[&key].has_unverified_source(), "{reset:?}");
+            assert!(marked.files[&key].has_prefix_provenance(), "{reset:?}");
         }
     }
 }
