@@ -782,6 +782,10 @@ pub struct SourceHealth {
 /// only the sessions whose activity advanced in the latest scan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActiveSessionReconciliation {
+    /// Start of the completed Claude activity scan. Absent for other sources,
+    /// cleared lists, and older caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_started_at: Option<Rfc3339Timestamp>,
     pub reconciled_at: Rfc3339Timestamp,
     pub changed_session_count: u64,
     #[serde(default)]
@@ -8249,8 +8253,23 @@ mod tests {
     }
 
     #[test]
+    fn old_active_session_reconciliation_without_scan_start_still_parses() {
+        let reconciliation: ActiveSessionReconciliation =
+            serde_json::from_value(serde_json::json!({
+                "reconciled_at": "2026-07-19T18:00:00Z",
+                "changed_session_count": 0,
+                "sessions": []
+            }))
+            .expect("older reconciliation");
+        assert_eq!(reconciliation.scan_started_at, None);
+        let value = serde_json::to_value(reconciliation).unwrap();
+        assert!(value.get("scan_started_at").is_none());
+    }
+
+    #[test]
     fn active_session_reconciliation_serializes_to_swift_contract_keys() {
         let reconciliation = ActiveSessionReconciliation {
+            scan_started_at: Some("2026-07-19T17:55:00Z".to_string()),
             reconciled_at: "2026-07-19T18:00:00Z".to_string(),
             changed_session_count: 1,
             sessions: vec![ActiveSession {
@@ -8305,6 +8324,7 @@ mod tests {
         };
 
         let value = serde_json::to_value(&reconciliation).expect("serialize reconciliation");
+        assert_eq!(value["scan_started_at"], "2026-07-19T17:55:00Z");
         assert_eq!(value["changed_session_count"], 1);
         assert_eq!(value["sessions"][0]["source_session_id"], "session-a");
         assert_eq!(value["sessions"][0]["compaction_count"], 2);
