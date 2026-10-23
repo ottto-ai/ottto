@@ -80,7 +80,13 @@ terminal owed a clean follow-up that the same debt could never satisfy.
 - Lost tombstones fail closed (Round 13, SOURCE). Every save writes the set
   with a `claude_retired_family_tombstones_initialized` marker. An index
   without the marker predates the bridge, so its empty set is safe: it never
-  retired a family. A marked index whose set is missing, wrongly typed,
+  retired a family. Round 14 (SOURCE, downgrade): an older writer drops the
+  marker, the set and the fence, so an unmarked index that holds a witnessed
+  root with no indexed member, authority record, pending proof or tombstone
+  (what a retirement leaves) raises the fence instead. A pre-bridge index in
+  that state for another reason (a removed family whose witness no complete
+  census has pruned yet) fences too. An older writer whose complete census
+  already pruned the retired root's witness cannot be detected. A marked index whose set is missing, wrongly typed,
   damaged in an entry, or over its cap (trimmed at decode) raises a durable
   `claude_retired_family_tombstones_uncertain` fence. Decoding stays lenient
   (each drop counted, a non-boolean marker or fence read as set) and the rest
@@ -88,10 +94,20 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   up, every unindexed Claude member is read through the authority path,
   never as a new file, and every witness and authority record is kept as if
   its root were tombstoned. A load that can tombstone every witnessed root
-  with no indexed member within the cap does so and lowers the fence: those
-  roots are a superset of any lost tombstone, because a tombstoned root keeps
-  its witness and has no indexed member until its proof settles. Otherwise
-  the fence stays until settled proofs free enough slots.
+  within the cap does so and lowers the fence: a tombstoned root keeps its
+  witness until its proof settles, so those roots are a superset of any lost
+  tombstone. Indexed presence never waives a slot (Round 14, H729-1): a
+  partial checkpoint restores a retired member's old entry beside the
+  retirement, and a returning member that parses empty is indexed while its
+  proof is unsettled. Otherwise the fence stays until settled proofs free
+  enough slots. The repair is bounded (Round 14, H729-2): it counts
+  untombstoned witnessed roots only until one more than it may tombstone (at
+  most cap + 1 witness visits), keeps nothing but the entries it inserts, and
+  prices those against the parked budget first; a refused price falls back
+  to at most 16 roots, and a larger loss keeps the fence. The cost is
+  liveness: re-tombstoned healthy roots hold their slots until a page reads
+  them again, and while more than the free slots stay witnessed the fence
+  stays up and witnesses are not pruned.
 - Local content-free process counters appear on each Claude traversal's
   `retiring` transition row: `absent_retry_pending_retired`,
   `absent_family_tombstone_hits`, `retirements_refused`,
@@ -167,7 +183,12 @@ cover the marker (pre-bridge index versus lost set, with save and reload),
 the durable fence when lost roots cannot fit, the capacity refusal on both
 retirement paths, the lenient decode (malformed entries and wrong
 containers, with the rest of the index kept), the retiring-row names and
-values, and the fresh-load memo.
+values, and the fresh-load memo. Round 14 adds a pipeline test where a
+partial checkpoint restores the retired member's entry, the set is lost, the
+complete census keeps the witness and the return is held; unit tests for an
+indexed empty returning member, the bounded and refused fence repair, and a
+downgrade that drops the marker and set (including the intermediate
+binary's evicted entry and a healthy unmarked control).
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

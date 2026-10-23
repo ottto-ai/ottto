@@ -2912,9 +2912,9 @@ pub struct ScanIndex {
     claude_retired_family_tombstones: ClaudeRetiredFamilyTombstones,
     /// SOURCE Round 13 marker: this index keeps the tombstone map above, so a
     /// missing or damaged map under it is lost retirement evidence. Absent on
-    /// an index from before the bridge, whose empty map is safe: it never
-    /// retired a family. Every save sets it. A non-boolean value decodes as
-    /// set.
+    /// an index from before the bridge, whose empty map is safe unless a
+    /// witnessed root shows a retirement whose set an older writer dropped
+    /// (Round 14). Every save sets it. A non-boolean value decodes as set.
     #[serde(default, deserialize_with = "deserialize_fail_closed_flag")]
     claude_retired_family_tombstones_initialized: bool,
     /// SOURCE Round 13 uncertainty fence: the marked tombstone map was lost,
@@ -2922,9 +2922,9 @@ pub struct ScanIndex {
     /// tombstone. While set, every unindexed Claude member is read through
     /// the authority path (never as a new file), and every witness and
     /// authority record is kept as if its root were tombstoned. A load that
-    /// can tombstone every witnessed root with no indexed member within the
-    /// cap replaces the fence with those tombstones. A non-boolean value
-    /// decodes as set.
+    /// can tombstone every witnessed root, indexed or not (Round 14), within
+    /// the cap and its repair budget replaces the fence with those
+    /// tombstones. A non-boolean value decodes as set.
     #[serde(
         default,
         skip_serializing_if = "is_false",
@@ -8731,6 +8731,104 @@ fn claude_root_tombstoned_in(
     uncertain
         || (!tombstones.is_empty()
             && tombstones.contains_key(&claude_retired_family_digest(root_session_id)))
+}
+
+/// Most witnessed roots one tombstone fence repair materializes when its
+/// scratch is not admitted (an unsupported heap layout, or a refused price):
+/// the fixed-size fallback, so a small loss still lowers the fence. A larger
+/// one keeps the durable fence up until a later load is admitted.
+const MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS: usize = 16;
+
+/// Hex length of one `claude_retired_family_digest`.
+const CLAUDE_RETIRED_FAMILY_DIGEST_HEX_BYTES: usize = 64;
+
+#[cfg(test)]
+thread_local! {
+    static REFUSE_CLAUDE_TOMBSTONE_REPAIR_SCRATCH_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// While alive, this thread refuses the tombstone repair scratch at load: the
+/// fence repair falls back to its fixed size and the downgrade check fails
+/// closed.
+#[cfg(test)]
+pub(crate) struct RefuseClaudeTombstoneRepairScratchForTest(bool);
+
+#[cfg(test)]
+impl RefuseClaudeTombstoneRepairScratchForTest {
+    pub(crate) fn new() -> Self {
+        Self(REFUSE_CLAUDE_TOMBSTONE_REPAIR_SCRATCH_FOR_TEST.with(|cell| cell.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RefuseClaudeTombstoneRepairScratchForTest {
+    fn drop(&mut self) {
+        REFUSE_CLAUDE_TOMBSTONE_REPAIR_SCRATCH_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Price one load's tombstone repair scratch against the existing parked
+/// overlap budget, with the absence retirement's full-node pricing:
+/// `new_tombstones` map entries with their digests, plus one borrowed root
+/// per candidate of the downgrade check. An unsupported layout or a refused
+/// price is a refusal.
+fn claude_tombstone_repair_scratch_admitted(new_tombstones: usize, candidate_roots: usize) -> bool {
+    #[cfg(test)]
+    if REFUSE_CLAUDE_TOMBSTONE_REPAIR_SCRATCH_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    if !crate::heap_layout_bound::layout_supported() {
+        return false;
+    }
+    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    crate::heap_layout_bound::tree_nodes::<String, u64>(new_tombstones, &mut cost).is_some()
+        && new_tombstones
+            .checked_mul(CLAUDE_RETIRED_FAMILY_DIGEST_HEX_BYTES)
+            .and_then(|bytes| cost.add(bytes))
+            .is_some()
+        && crate::heap_layout_bound::tree_nodes::<&str, ()>(candidate_roots, &mut cost).is_some()
+}
+
+/// Counts witnessed roots without a tombstone, in root order, stopping at
+/// `limit`. Returns how many it found and how many witnesses it visited.
+/// Every witness is either tombstoned or found, so the count visits at most
+/// `tombstones.len() + limit` witnesses, whatever the witness count. Each
+/// visit hashes one root id into a transient digest; nothing is retained.
+fn count_untombstoned_claude_witnessed_roots(
+    witnesses: &BTreeMap<String, ClaudeUsageFamilyWitness>,
+    tombstones: &BTreeMap<String, u64>,
+    limit: usize,
+) -> (usize, usize) {
+    let (mut found, mut visited) = (0, 0);
+    for root_session_id in witnesses.keys() {
+        if found >= limit {
+            break;
+        }
+        visited += 1;
+        if !tombstones.contains_key(&claude_retired_family_digest(root_session_id)) {
+            found += 1;
+        }
+    }
+    (found, visited)
+}
+
+/// What one load's tombstone fence repair did (SOURCE Round 14).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClaudeTombstoneFenceRepair {
+    NotFenced,
+    /// Every untombstoned witnessed root was tombstoned; the fence is down.
+    Lowered {
+        tombstoned: usize,
+        visited: usize,
+    },
+    /// More untombstoned witnessed roots than this load may tombstone: free
+    /// slots, or the fixed-size fallback when the scratch is refused. The
+    /// fence stays up.
+    Kept {
+        scratch_admitted: bool,
+        visited: usize,
+    },
 }
 
 /// Proven families of one complete closed-fence terminal whose earlier-page
@@ -36615,12 +36713,14 @@ impl ScanIndex {
     }
 
     /// SOURCE Round 13, at load: a marked index whose tombstone map is
-    /// missing, damaged or over its cap raises the durable uncertainty fence;
-    /// an unmarked index (from before the bridge) starts empty, safely. Then
-    /// a raised fence is replaced by tombstones when they fit. Never fails
-    /// or quarantines the index.
+    /// missing, damaged or over its cap raises the durable uncertainty fence.
+    /// An unmarked index starts empty only when it shows no sign of a lost
+    /// set (SOURCE Round 14, downgrade): see
+    /// `claude_tombstones_lost_without_marker`. Then a raised fence is
+    /// replaced by tombstones when they fit. Never fails or quarantines the
+    /// index.
     fn settle_claude_retired_family_tombstone_decode(&mut self) {
-        let tombstones = &mut self.claude_retired_family_tombstones;
+        let tombstones = &self.claude_retired_family_tombstones;
         let lost = self.claude_retired_family_tombstones_initialized && !tombstones.decoded;
         if lost {
             // A marked index without its set: one drop, as a wrong container.
@@ -36628,58 +36728,158 @@ impl ScanIndex {
                 counters.tombstone_decode_drops = counters.tombstone_decode_drops.saturating_add(1);
             });
         }
-        if (tombstones.damaged || lost) && !self.claude_retired_family_tombstones_uncertain {
+        let damaged = tombstones.damaged;
+        let downgraded = !self.claude_retired_family_tombstones_initialized
+            && !self.claude_retired_family_tombstones_uncertain
+            && self.claude_tombstones_lost_without_marker();
+        if (damaged || lost || downgraded) && !self.claude_retired_family_tombstones_uncertain {
             self.claude_retired_family_tombstones_uncertain = true;
             eprintln!(
                 "local snapshot index raised the retired Claude family tombstone uncertainty \
-                 fence: its tombstone set was missing, damaged or over its cap"
+                 fence: its tombstone set was missing, damaged, over its cap, or lost by an \
+                 older writer"
             );
         }
+        let tombstones = &mut self.claude_retired_family_tombstones;
         tombstones.decoded = true;
         tombstones.damaged = false;
         self.claude_retired_family_tombstones_initialized = true;
-        self.lower_claude_retired_family_tombstone_fence();
+        match self.lower_claude_retired_family_tombstone_fence() {
+            ClaudeTombstoneFenceRepair::NotFenced => {}
+            ClaudeTombstoneFenceRepair::Lowered {
+                tombstoned,
+                visited,
+            } => eprintln!(
+                "local snapshot index lowered the retired Claude family tombstone uncertainty \
+                 fence: {tombstoned} witnessed root(s) tombstoned ({visited} witness visit(s))"
+            ),
+            ClaudeTombstoneFenceRepair::Kept {
+                scratch_admitted,
+                visited,
+            } => eprintln!(
+                "local snapshot index kept the retired Claude family tombstone uncertainty \
+                 fence: more witnessed roots without a tombstone than this load may tombstone \
+                 (scratch admitted: {scratch_admitted}; {visited} witness visit(s))"
+            ),
+        }
     }
 
-    /// Replaces a raised uncertainty fence with a tombstone for every
-    /// witnessed root that has no indexed member, when they all fit under the
-    /// cap: a superset of the roots whose tombstone could have been lost,
-    /// since a tombstoned root keeps its witness and has no indexed member
-    /// until its proof settles. Otherwise the fence stays. Runs on a loaded
-    /// (committed) index only, never mid-page. One pass over the indexed
-    /// keys into borrowed roots; returns whether the fence came down.
-    fn lower_claude_retired_family_tombstone_fence(&mut self) -> bool {
-        if !self.claude_retired_family_tombstones_uncertain {
-            return false;
-        }
-        let indexed = self
-            .files
-            .keys()
-            .filter_map(|index_key| claude_index_path_member_ref(Path::new(index_key)))
-            .map(|member| member.root)
-            .collect::<BTreeSet<_>>();
-        let tombstones = &mut self.claude_retired_family_tombstones;
-        let digests = self
+    /// SOURCE Round 14 (d): an index without the marker is either from before
+    /// the bridge, or was written by an older binary that dropped the marker
+    /// and the set (a downgrade round trip, or the intermediate binary that
+    /// knew the set but not the marker). A witnessed root with no indexed
+    /// member, no authority record, no pending proof and no tombstone is what
+    /// a retirement leaves behind once its set is gone, so any such root
+    /// raises the fence (fail closed). A pre-bridge index holding one for
+    /// another reason (a removed family whose witness no complete census has
+    /// pruned yet) fences too; the cost is tombstoning its witnessed roots.
+    /// Not detectable: an older writer whose complete census already pruned
+    /// the retired root's witness. The candidate scratch (one borrowed root
+    /// per unaccounted witnessed root) is priced first; a refused price also
+    /// fails closed. One pass over witnesses and indexed keys. Runs only on
+    /// an unmarked load, which the next save marks.
+    fn claude_tombstones_lost_without_marker(&self) -> bool {
+        let unaccounted = |root_session_id: &str| {
+            !self
+                .claude_usage_authority_quarantine
+                .contains_key(root_session_id)
+                && !self
+                    .claude_usage_family_pending
+                    .contains_key(root_session_id)
+                && !claude_root_tombstoned_in(
+                    &self.claude_retired_family_tombstones,
+                    false,
+                    root_session_id,
+                )
+        };
+        let candidates = self
             .claude_usage_family_witnesses
             .keys()
-            .filter(|root_session_id| !indexed.contains(root_session_id.as_str()))
-            .map(|root_session_id| claude_retired_family_digest(root_session_id.as_str()))
-            .filter(|digest| !tombstones.contains_key(digest))
-            .collect::<Vec<_>>();
-        if tombstones.len().saturating_add(digests.len()) > MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES {
+            .filter(|root_session_id| unaccounted(root_session_id.as_str()))
+            .count();
+        if candidates == 0 {
             return false;
         }
+        if !claude_tombstone_repair_scratch_admitted(0, candidates) {
+            eprintln!(
+                "local snapshot index could not check an unmarked tombstone set within its \
+                 scratch budget; failing closed"
+            );
+            return true;
+        }
+        // One borrowed root per candidate; one pass over the indexed keys
+        // strikes every candidate with an indexed member.
+        let mut unindexed = self
+            .claude_usage_family_witnesses
+            .keys()
+            .filter(|root_session_id| unaccounted(root_session_id.as_str()))
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        for index_key in self.files.keys() {
+            if unindexed.is_empty() {
+                break;
+            }
+            if let Some(member) = claude_index_path_member_ref(Path::new(index_key)) {
+                unindexed.remove(member.root);
+            }
+        }
+        !unindexed.is_empty()
+    }
+
+    /// Replaces a raised uncertainty fence with a tombstone for EVERY
+    /// witnessed root without one, indexed or not, when they all fit under
+    /// the cap (SOURCE Round 14, H729-1). Indexed presence never waives a
+    /// slot: a partial checkpoint restores a retired root's old entry, and a
+    /// returning member that parsed empty is indexed while its proof is still
+    /// unsettled, and neither is distinguishable from a settled root here.
+    /// Otherwise the fence stays.
+    ///
+    /// Bounded (H729-2): with `slots` free, the first pass counts untombstoned
+    /// witnessed roots and stops after `limit + 1`, so it visits at most
+    /// `MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES + 1` witnesses; the second
+    /// inserts them. Nothing but the inserted entries is kept, and those are
+    /// priced first: `limit` is the free slots when admitted, else the
+    /// fixed-size fallback. Runs on a loaded (committed) index only.
+    fn lower_claude_retired_family_tombstone_fence(&mut self) -> ClaudeTombstoneFenceRepair {
+        if !self.claude_retired_family_tombstones_uncertain {
+            return ClaudeTombstoneFenceRepair::NotFenced;
+        }
+        let slots = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES
+            .saturating_sub(self.claude_retired_family_tombstones.len());
+        let scratch_admitted = claude_tombstone_repair_scratch_admitted(slots, 0);
+        let limit = if scratch_admitted {
+            slots
+        } else {
+            slots.min(MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS)
+        };
+        let witnesses = &self.claude_usage_family_witnesses;
+        let tombstones = &mut self.claude_retired_family_tombstones.entries;
+        let (found, counted) =
+            count_untombstoned_claude_witnessed_roots(witnesses, tombstones, limit + 1);
+        if found > limit {
+            return ClaudeTombstoneFenceRepair::Kept {
+                scratch_admitted,
+                visited: counted,
+            };
+        }
         let tombstoned_at = unix_seconds(SystemTime::now()).unwrap_or(0);
-        let tombstoned = digests.len();
-        for digest in digests {
-            tombstones.insert(digest, tombstoned_at);
+        let (mut inserted, mut visited) = (0, counted);
+        for root_session_id in witnesses.keys() {
+            if inserted >= found {
+                break;
+            }
+            visited += 1;
+            let digest = claude_retired_family_digest(root_session_id);
+            if !tombstones.contains_key(&digest) {
+                tombstones.insert(digest, tombstoned_at);
+                inserted += 1;
+            }
         }
         self.claude_retired_family_tombstones_uncertain = false;
-        eprintln!(
-            "local snapshot index lowered the retired Claude family tombstone uncertainty \
-             fence: {tombstoned} witnessed root(s) without an indexed member tombstoned"
-        );
-        true
+        ClaudeTombstoneFenceRepair::Lowered {
+            tombstoned: found,
+            visited,
+        }
     }
 
     /// Path-(a) bridge: retire every RetryPending family that a raw-complete

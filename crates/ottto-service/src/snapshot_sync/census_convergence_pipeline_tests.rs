@@ -3180,42 +3180,157 @@ fn returning_member_after_a_lost_tombstone_set_is_held_not_new() {
         )
         .expect("restore the retired family's member");
         let pages = fixture.walk(16, &ABSENCE_CYCLE);
-        for page in &pages {
-            for item in page
-                .scan
+        assert_returning_member_held(&pages, session, &witness, shape);
+    }
+}
+
+/// A retired family's returning member, on the walk that reads it: nothing
+/// of it is uploaded or accepted, its record re-forms bound to the retained
+/// witness after one failed reconstruction, and its tombstone stays.
+fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: &str, shape: &str) {
+    for page in pages {
+        for item in page
+            .scan
+            .snapshots
+            .iter()
+            .filter(|item| item.source_session_id == session)
+        {
+            assert!(
+                !page.uploaded.contains(&item.snapshot_fingerprint),
+                "{shape}: nothing is uploaded before a proof"
+            );
+            assert!(
+                !page
+                    .progress
+                    .accepted_fingerprints
+                    .contains(&item.snapshot_fingerprint),
+                "{shape}: nothing is accepted before a proof"
+            );
+        }
+    }
+    let last = pages.last().expect("terminal page");
+    let record = last
+        .index
+        .claude_authority_record_for_test(session)
+        .unwrap_or_else(|| panic!("{shape}: the returning member re-forms its record"));
+    assert!(
+        record.bound_to_retained_witness && !record.terminal,
+        "{shape}"
+    );
+    assert_eq!(record.proven_witness_fingerprint, witness, "{shape}");
+    assert_eq!(record.failed_reconstruction_count, 1, "{shape}");
+    assert!(
+        last.index.claude_family_tombstoned_for_test(session),
+        "{shape}"
+    );
+}
+
+/// SOURCE Round 14 H729-1: a partial checkpoint (a shed upload of the
+/// retiring page) restores the retired member's old entry beside the
+/// retirement, so the retired root is indexed with no settled proof. Its set
+/// is then lost. Indexed presence never waives the root's slot: the load
+/// re-tombstones it, so the next complete census, which removes the stale
+/// entry, keeps its witness, and the returning member is held, never new.
+#[test]
+#[serial(source_manifests)]
+fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let session = PIPELINE_SESSIONS[2];
+    let shape = "partial-checkpoint";
+    let mut fixture = PipelineFixture::new("patha-h729-restored-stale-member");
+    let baseline = fixture.absent_retry_pending_family(session);
+    let removed_key = PipelineFixture::key(&baseline, session);
+    let committed = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    assert!(committed.files.contains_key(&removed_key));
+    let witness = committed
+        .claude_usage_family_witness_digest_for_test(session)
+        .expect("the seeded family keeps its witness");
+    let traversals = walk_until_census_complete(&fixture, 9, 3);
+    assert_absent_family_retired(&traversals, &baseline, session, shape);
+
+    // The retiring page's upload is shed: the partial checkpoint selects
+    // against the committed index, restoring the removed member's entry
+    // while it keeps the retirement, its tombstone and the witness.
+    let retired = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    let mut checkpoint = retired.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+    checkpoint.mark_bounded_sweep_unsettled();
+    assert!(
+        checkpoint.files.contains_key(&removed_key),
+        "the stale member is restored"
+    );
+    assert!(checkpoint.claude_family_tombstoned_for_test(session));
+    assert!(checkpoint
+        .claude_authority_record_for_test(session)
+        .is_none());
+    assert_eq!(
+        checkpoint.claude_usage_family_witness_digest_for_test(session),
+        Some(witness.clone())
+    );
+    checkpoint
+        .save(&fixture.index_path)
+        .expect("save the partial checkpoint");
+
+    // The set is lost; the marker stays.
+    let mut index_json: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).unwrap()).unwrap();
+    assert_eq!(
+        index_json["claude_retired_family_tombstones_initialized"],
+        serde_json::json!(true)
+    );
+    index_json
+        .as_object_mut()
+        .unwrap()
+        .remove("claude_retired_family_tombstones");
+    std::fs::write(
+        &fixture.index_path,
+        serde_json::to_vec(&index_json).unwrap(),
+    )
+    .unwrap();
+    let loaded = ScanIndex::load(&fixture.index_path).expect("a lost set still loads");
+    assert!(
+        loaded.files.contains_key(&removed_key),
+        "the stale member is still indexed"
+    );
+    assert!(
+        loaded.claude_family_tombstoned_for_test(session),
+        "indexed presence never waives the retired root's slot"
+    );
+    assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
+
+    // Still absent: the complete census removes the stale entry and keeps
+    // the witness and the tombstone.
+    let absent = walk_until_census_complete(&fixture, 12, 4);
+    let last = absent
+        .last()
+        .and_then(|pages| pages.last())
+        .expect("terminal page");
+    assert!(last.scan.census_complete);
+    assert!(!last.index.files.contains_key(&removed_key));
+    assert_eq!(
+        last.index
+            .claude_usage_family_witness_digest_for_test(session),
+        Some(witness.clone()),
+        "the witness survives the complete census"
+    );
+    assert!(last.index.claude_family_tombstoned_for_test(session));
+    for page in absent.iter().flatten() {
+        assert!(
+            page.scan
                 .snapshots
                 .iter()
-                .filter(|item| item.source_session_id == session)
-            {
-                assert!(
-                    !page.uploaded.contains(&item.snapshot_fingerprint),
-                    "{shape}: nothing is uploaded before a proof"
-                );
-                assert!(
-                    !page
-                        .progress
-                        .accepted_fingerprints
-                        .contains(&item.snapshot_fingerprint),
-                    "{shape}: nothing is accepted before a proof"
-                );
-            }
-        }
-        let last = pages.last().expect("terminal page");
-        let record = last
-            .index
-            .claude_authority_record_for_test(session)
-            .unwrap_or_else(|| panic!("{shape}: the returning member re-forms its record"));
-        assert!(
-            record.bound_to_retained_witness && !record.terminal,
-            "{shape}"
-        );
-        assert_eq!(record.proven_witness_fingerprint, witness, "{shape}");
-        assert_eq!(record.failed_reconstruction_count, 1, "{shape}");
-        assert!(
-            last.index.claude_family_tombstoned_for_test(session),
-            "{shape}"
+                .all(|snapshot| snapshot.source_session_id != session),
+            "the absent member is never offered"
         );
     }
+
+    // The member returns: held against its witness until a proof.
+    std::fs::write(
+        fixture.root.join(format!("{session}.jsonl")),
+        pipeline_transcript_line(session, "req_2_1", 0),
+    )
+    .expect("restore the retired family's member");
+    let pages = fixture.walk(17, &ABSENCE_CYCLE);
+    assert_returning_member_held(&pages, session, &witness, shape);
 }
 
 /// SOURCE Round 13 F2, on the priced fast path and the bounded fallback: with
