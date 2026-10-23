@@ -21296,6 +21296,14 @@ impl OwnedSourceScan {
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();
                     let mut missing_unknown_owner = false;
+                    for owner in index.decode_held_codex_owners() {
+                        match owner {
+                            Some(owner) => {
+                                missing_protected_owners.insert(owner.to_owned());
+                            }
+                            None => missing_unknown_owner = true,
+                        }
+                    }
                     for (key, entry) in &index.files {
                         let repurposed = entry.codex_history_is_protected()
                             && entry
@@ -36142,17 +36150,17 @@ impl ScanIndex {
                 .map_err(anyhow::Error::from),
             }
             .context("parse current local snapshot scan index for compare-and-swap")?;
-            if !current.decode_holds.same_as(&self.decode_holds)
-                || !current.decode_repairs_match(self)
-            {
-                return Err(anyhow::anyhow!("current_index_requires_reload"));
-            }
             if current.schema_version != SCAN_INDEX_SCHEMA_VERSION
                 || current.generation != self.generation
             {
                 return Err(anyhow::anyhow!(
                     "local snapshot scan index changed concurrently"
                 ));
+            }
+            if !current.decode_holds.same_as(&self.decode_holds)
+                || !current.decode_repairs_match(self)
+            {
+                return Err(anyhow::anyhow!("current_index_requires_reload"));
             }
         } else if self.generation != 0 {
             return Err(anyhow::anyhow!(

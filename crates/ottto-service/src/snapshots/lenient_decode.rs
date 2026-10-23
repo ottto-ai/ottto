@@ -10,13 +10,14 @@ use std::sync::Arc;
 const HOLD_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const HOLD_COUNT_MAX: usize = 4096;
 
+type HeldSlots = BTreeMap<String, Arc<HeldRaw>>;
 #[derive(Debug, Clone, Default)]
 pub(super) struct Holds(
-    BTreeMap<&'static str, BTreeMap<String, Arc<HeldRaw>>>,
+    BTreeMap<&'static str, HeldSlots>,
     BTreeMap<&'static str, BTreeSet<String>>,
 );
 #[derive(Debug)]
-struct HeldRaw(Box<RawValue>);
+struct HeldRaw(Box<RawValue>, Option<String>);
 impl HeldRaw {
     fn get(&self) -> &str {
         self.0.get()
@@ -25,7 +26,8 @@ impl HeldRaw {
 impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(self.get().len())
+        c.add(self.get().len())?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)
     }
 }
 impl Holds {
@@ -58,10 +60,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     }
 }
 
-struct WireMap<'a, T>(
-    &'a BTreeMap<String, T>,
-    Option<&'a BTreeMap<String, Arc<HeldRaw>>>,
-);
+struct WireMap<'a, T>(&'a BTreeMap<String, T>, Option<&'a HeldSlots>);
 impl<T: Serialize> Serialize for WireMap<'_, T> {
     fn serialize<S: Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
         let mut map = serializer.serialize_map(None)?;
@@ -461,11 +460,14 @@ impl<R: BufRead + Seek> Decoder<R> {
         let raw = self.raw(span)?;
         self.held_bytes += span.len;
         self.held_count += 1;
+        let owner = (field == "files")
+            .then(|| held_file_owner(&raw, &key))
+            .flatten();
         self.holds
             .0
             .entry(field)
             .or_default()
-            .insert(key, Arc::new(HeldRaw(raw)));
+            .insert(key, Arc::new(HeldRaw(raw, owner)));
         self.counts.held += 1;
         if field == "files" {
             self.counts.files += 1;
@@ -604,8 +606,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn index(&mut self) -> std::result::Result<ScanIndex, Error> {
-        let mut index = ScanIndex::default();
-        index.accepted_snapshot_fingerprint_ledger_version = 0; // legacy serde default, not Default's current version
+        let mut index = ScanIndex {
+            accepted_snapshot_fingerprint_ledger_version: 0,
+            ..ScanIndex::default()
+        }; // legacy serde default
         let array = self.ws()? == Some(b'[');
         self.eat(if array { b'[' } else { b'{' })?;
         let mut seen = BTreeSet::new();
@@ -634,9 +638,14 @@ impl<R: BufRead + Seek> Decoder<R> {
             };
             let value = self.span()?;
             if let Some(name) = name {
-                if name.starts_with("claude_")
-                    && (name.contains("family_") || name == "claude_usage_authority_quarantine")
-                {
+                if matches!(
+                    name,
+                    "claude_account_family_witnesses"
+                        | "claude_account_family_pending"
+                        | "claude_usage_family_witnesses"
+                        | "claude_usage_family_pending"
+                        | "claude_usage_authority_quarantine"
+                ) {
                     self.family_spans.insert(name, value);
                 }
                 if !seen.insert(name) {
@@ -856,9 +865,14 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 self.typed(value)?
                         }
                         "legacy_settlement_reconcile_after_fingerprint" => {
-                            index.legacy_settlement_reconcile_after_fingerprint = self
-                                .typed(value)
-                                .unwrap_or_else(|_| Some(lowest_legacy_settlement_cursor()))
+                            index.legacy_settlement_reconcile_after_fingerprint =
+                                match self.typed(value) {
+                                    Ok(cursor) => cursor,
+                                    Err(_) => {
+                                        self.counts.drops.cursor += 1;
+                                        Some(lowest_legacy_settlement_cursor())
+                                    }
+                                }
                         }
                         "quarantined_snapshot_fingerprints" => {
                             index.quarantined_snapshot_fingerprints = self.quarantines(value)?
@@ -907,6 +921,14 @@ impl<R: BufRead + Seek> Decoder<R> {
                 let value = self.span()?;
                 if roots.contains(&key) && !self.holds.contains(field, &key) {
                     self.hold(field, key.clone(), value)?;
+                    if self
+                        .holds
+                        .1
+                        .get_mut(field)
+                        .is_some_and(|keys| keys.remove(&key))
+                    {
+                        self.counts.authority_repairs -= 1;
+                    }
                     match field {
                         "claude_account_family_witnesses" => {
                             index.claude_account_family_witnesses.remove(&key);
@@ -1001,6 +1023,10 @@ impl ScanIndex {
         self.decode_holds
             .contains("quarantined_snapshot_fingerprints", fingerprint)
             || self
+                .codex_state_only_snapshot_fingerprints
+                .iter()
+                .any(|(id, body)| body == fingerprint && self.decode_holds_codex_owner(id))
+            || self
                 .file_snapshot_fingerprints
                 .iter()
                 .any(|(key, members)| members.contains(fingerprint) && self.decode_holds_file(key))
@@ -1008,6 +1034,19 @@ impl ScanIndex {
                 entry.last_snapshot_fingerprint.as_deref() == Some(fingerprint)
                     && self.decode_holds_file(key)
             })
+    }
+    pub(super) fn decode_held_codex_owners(&self) -> impl Iterator<Item = Option<&str>> {
+        self.decode_holds
+            .0
+            .get("files")
+            .into_iter()
+            .flat_map(|slots| slots.values())
+            .map(|raw| raw.1.as_deref())
+    }
+    fn decode_holds_codex_owner(&self, id: &str) -> bool {
+        let owner = codex_protected_owner(id);
+        self.decode_held_codex_owners()
+            .any(|held| held.is_none_or(|held| held == owner))
     }
     pub(super) fn decode_holds_snapshot(
         &self,
@@ -1025,7 +1064,7 @@ impl ScanIndex {
         if source == SnapshotSource::Codex && item.source_file_fingerprint.is_none() {
             // An opaque file may have lost the only logical-owner disclosure.
             // Preserve the state-only domain fence until protected history is understood.
-            return self.decode_holds.0.contains_key("files");
+            return self.decode_holds_codex_owner(&item.source_session_id);
         }
         false
     }
@@ -1168,14 +1207,14 @@ fn repaired_authority(raw: &RawValue) -> Option<ClaudeUsageAuthorityQuarantineRe
             MAX_CLAUDE_USAGE_AUTHORITY_FAILURES - 1
         })
     });
-    let record = ClaudeUsageAuthorityQuarantineRecord {
+    let mut record = ClaudeUsageAuthorityQuarantineRecord {
         contract: wire.contract,
         proven_witness_fingerprint: wire.proven_witness_fingerprint,
         member_source_file_fingerprints: wire.member_source_file_fingerprints,
         failed_reconstruction_count: if terminal {
             MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
         } else {
-            count.min(MAX_CLAUDE_USAGE_AUTHORITY_FAILURES - 1).max(1)
+            count.clamp(1, MAX_CLAUDE_USAGE_AUTHORITY_FAILURES - 1)
         },
         disposition: wire.disposition,
         proof_correction: wire.proof_correction,
@@ -1185,5 +1224,25 @@ fn repaired_authority(raw: &RawValue) -> Option<ClaudeUsageAuthorityQuarantineRe
             serde_json::from_str(wire.retry_after_unix_seconds.get()).unwrap_or(0)
         },
     };
+    if record.retry_after_unix_seconds
+        > sampled_scan::now_seconds()
+            .saturating_add(CLAUDE_USAGE_AUTHORITY_RETRY_SECONDS.saturating_mul(2))
+    {
+        record.retry_after_unix_seconds = 0;
+    }
     claude_authority_record_contract_is_valid(&record).then_some(record)
+}
+
+fn held_file_owner(raw: &RawValue, key: &str) -> Option<String> {
+    #[derive(Deserialize)]
+    struct Owner<'a> {
+        #[serde(default, borrow)]
+        codex_protected_owner: Option<&'a str>,
+    }
+    let owner: Owner<'_> = serde_json::from_str(raw.get()).ok()?;
+    if let Some(owner) = owner.codex_protected_owner {
+        return valid_codex_protected_owner(owner).then(|| owner.to_owned());
+    }
+    let names = codex_session_id_candidates_from_path(Path::new(key));
+    (names.len() == 1).then(|| codex_protected_owner(&names[0]))
 }

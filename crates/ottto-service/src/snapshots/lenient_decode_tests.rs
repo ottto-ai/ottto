@@ -448,3 +448,126 @@ fn lenient_legacy_defaults_duplicate_headers_and_generation_refusals() {
         .contains("generation overflow"));
     assert_eq!(fs::read(&path).unwrap(), bytes);
 }
+
+#[test]
+fn lenient_authority_scalar_repair_and_held_family_correction_custody() {
+    for terminal in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-authority");
+        let path = scratch.as_ref().join("index.json");
+        let mut index = fixture();
+        if terminal {
+            index.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+        } else {
+            index.insert_retry_pending_claude_authority_for_test("family");
+        }
+        if terminal {
+            let record = index
+                .claude_usage_authority_quarantine
+                .get_mut("family")
+                .unwrap();
+            record.contract = CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.into();
+            record.proof_correction = Some(ClaudeAuthorityProofCorrection {
+                proof_witness_fingerprint: record.proven_witness_fingerprint.clone(),
+                owed_member_ids: BTreeSet::from(["family".into()]),
+            });
+        }
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["claude_usage_authority_quarantine"]["family"]["failed_reconstruction_count"] =
+            serde_json::json!(300);
+        value["claude_usage_authority_quarantine"]["family"]["retry_after_unix_seconds"] =
+            serde_json::json!(u64::MAX);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded.decode_holds.is_empty());
+        let record = &loaded.claude_usage_authority_quarantine["family"];
+        assert_eq!(
+            record.failed_reconstruction_count,
+            if terminal {
+                MAX_CLAUDE_USAGE_AUTHORITY_FAILURES
+            } else {
+                MAX_CLAUDE_USAGE_AUTHORITY_FAILURES - 1
+            }
+        );
+        assert_eq!(record.retry_after_unix_seconds, 0);
+        assert_eq!(
+            record.proof_correction,
+            index.claude_usage_authority_quarantine["family"].proof_correction
+        );
+        loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        // Losing a family witness must also freeze its intact correction debt.
+        let mut value = serde_json::to_value(&loaded).unwrap();
+        value["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
+            serde_json::json!([17]);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let original = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
+        fs::write(&path, &bytes).unwrap();
+        let mut held = ScanIndex::load(&path).unwrap();
+        assert!(held.decode_holds_family("family"));
+        held.drop_unbound_claude_authority_records("test");
+        held.save(&path).unwrap();
+        assert_eq!(
+            raw_slot(
+                &fs::read(&path).unwrap(),
+                "claude_usage_authority_quarantine",
+                "family"
+            ),
+            original
+        );
+        assert_sibling(&held);
+    }
+}
+
+#[test]
+fn lenient_shape_caps_and_hold_count_preserve_original_disk() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-limits");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["unknown_large_shape"] =
+        Value::Array(vec![Value::Null; crate::snapshot_retry::STATE_NODES]);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(index.save_with_read_limit(&path, bytes.len() - 1).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["unknown_padding"] = Value::String("p".repeat(1024 * 1024));
+    for n in 0..4097 {
+        value["files"][format!("held-{n}")] = Value::Bool(false);
+    }
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    assert!(index.save(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(ScanIndex::load(&path).unwrap().files.is_empty());
+    assert_eq!(corrupt_count(scratch.as_ref()), 1);
+}
+
+#[test]
+fn lenient_load_and_selected_cas_allocation_receipt() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-allocations");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    for n in 0..64 {
+        value["quarantined_snapshot_fingerprints"][format!("{n:064x}")] =
+            serde_json::json!({"unknown": 1});
+    }
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let (loaded, load) = crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
+    assert!(!loaded.decode_holds.is_empty());
+    let ((working, committed, subset), cas) = crate::retry_allocation_probe::measure(|| {
+        let working = ScanIndex::load(&path).unwrap();
+        let committed = working.clone();
+        let mut subset = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+        subset.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        (working, committed, subset)
+    });
+    assert!(working.decode_holds.same_as(&committed.decode_holds));
+    assert!(subset.decode_holds.same_as(&loaded.decode_holds));
+    eprintln!("lenient_decode_allocation_receipt load_requested_peak={} load_usable_peak={} selected_cas_with_three_graphs_requested_peak={} selected_cas_with_three_graphs_usable_peak={}", load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak);
+}
