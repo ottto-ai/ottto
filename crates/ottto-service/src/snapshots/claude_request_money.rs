@@ -68,7 +68,7 @@ use body::{
     ClaudeGrainSide, ClaudeRequestBody,
 };
 pub(crate) use capture::ClaudeResponseCapture;
-use coverage::{ClaudeHolderView, FamilyCensus, FamilyCoverage, InterimFamilyCoverage};
+use coverage::{ClaudeHolderView, FamilyCensus, FamilyCoverage};
 use rows::{ClaudeRootRows, ClaudeRowCounts};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
