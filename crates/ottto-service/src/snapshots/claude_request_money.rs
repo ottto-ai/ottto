@@ -1537,12 +1537,16 @@ async fn build_page_at(
         let Some(fingerprint) = item.source_file_fingerprint.as_deref() else {
             continue;
         };
-        let Some(key) = by_fingerprint.get(fingerprint).copied() else {
-            continue;
-        };
-        if let Some(capture) = capture::take_capture(&scope_key, key, fingerprint) {
+        // The reported family fold can replace the item's physical revision
+        // with its joined revision. Capture authority remains the opened file.
+        let physical = by_fingerprint.get(fingerprint).map(|key| (*key).to_owned())
+            .or_else(|| key_of(root, &item.source_session_id));
+        let Some(key) = physical.as_deref() else { continue };
+        let Some(entry) = index.files.get(key) else { continue };
+        let physical_revision = &entry.source_file_fingerprint;
+        if let Some(capture) = capture::take_capture(&scope_key, key, physical_revision) {
             counts.captures_taken += 1;
-            note_message_record(ledger, index, key, fingerprint, &capture, live, &mut counts);
+            note_message_record(ledger, index, key, physical_revision, &capture, live, &mut counts);
             captures.insert((root.to_owned(), fingerprint.to_owned()), capture);
         }
     }

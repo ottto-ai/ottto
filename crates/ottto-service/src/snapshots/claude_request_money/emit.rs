@@ -8,7 +8,7 @@ use super::{ClaudeMoneyTokens, REQUEST_OWNED_CONTRACT};
 use std::collections::BTreeMap;
 
 fn dollars(micros: u64) -> String {
-    super::super::usd_picos_string(u128::from(micros) * 1_000_000)
+    super::usd_string(micros)
 }
 fn removed(tokens: ClaudeMoneyTokens) -> ClaudeRemovedUsage {
     ClaudeRemovedUsage {

@@ -2429,7 +2429,7 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
     for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
         let path = scratch.join(format!("progress-{kind:?}.json"));
         let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
-        let mut progress = SnapshotUploadProgress::new("held-transient".into(), witness.clone());
+        let mut progress = SnapshotUploadProgress::new("04".repeat(32), witness.clone());
         progress.quarantine_held_body(fingerprint.as_str(), body.as_str(), kind);
         let record = progress
             .quarantined_fingerprints
@@ -2450,7 +2450,7 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
             assert!(!record.hold.as_ref().unwrap().allowance(now));
         }
         progress.save(&path).unwrap();
-        let mut restored = SnapshotUploadProgress::load(&path, "held-transient", witness).unwrap();
+        let mut restored = SnapshotUploadProgress::load(&path, &"04".repeat(32), witness).unwrap();
         let record = &restored.quarantined_fingerprints[fingerprint.as_str()];
         assert_eq!(record.hold.as_ref(), Some(&expected));
         assert_eq!(record.retry_after_unix_seconds, deadline);
