@@ -886,3 +886,92 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
         "only the session active after the cutoff"
     );
 }
+
+/// SOURCE F1a (AutoReview): any record of an earlier upload in this
+/// destination's ledger is prior history, not only a replay generation or a
+/// refusal. It is weak evidence: it records a cutoff only when entries are
+/// lost.
+#[test]
+fn any_upload_ledger_record_is_prior_history() {
+    let fixture = HistoryFixture::new("history-upgrade-ledger");
+    let backfill = crate::backfill::BackfillState::default();
+    let mut progress = test_upload_progress();
+    let prior = |progress: &SnapshotUploadProgress| {
+        claude_prior_history(
+            &backfill,
+            HISTORY_DESTINATION,
+            progress,
+            &fixture.index_path,
+            &fixture.support,
+        )
+    };
+    assert_eq!(prior(&progress), ClaudePriorHistory::default());
+    progress.accepted_fingerprints.insert("f".repeat(64));
+    assert_eq!(
+        prior(&progress),
+        ClaudePriorHistory {
+            bootstrapped: false,
+            any: true,
+        }
+    );
+}
+
+/// SOURCE F1b, StateMissing M3 (AutoReview): a re-pair resuming a partial
+/// index that a pre-gate daemon saved for the new destination loads as
+/// `Loaded`, drops no entries and has no cutoff. Another destination's
+/// completed bootstrap still records the cutoff on this first gated load, so
+/// history not yet indexed is held, not sent as fresh.
+#[test]
+fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
+    let fixture = HistoryFixture::new("history-upgrade-resumed-pre-gate");
+    let destination_b = Some("history-upgrade-destination-b");
+    let partial = fixture.cycle(
+        "2026-08-02T08:00:00Z",
+        HistoryCycle {
+            destination: destination_b,
+            ..HISTORY_BASELINE
+        },
+    );
+    assert_eq!(partial.uploaded.len(), HISTORY_SESSIONS.len());
+    let mut state = crate::backfill::BackfillState::default();
+    crate::backfill::mark_backfill_complete_for_destination(
+        &mut state,
+        SnapshotSource::ClaudeCode,
+        HISTORY_DESTINATION,
+    );
+    crate::backfill::save_backfill_state(&fixture.support, &state).expect("save claim state");
+    // As a pre-gate daemon saved it: no gate marker and no cutoff.
+    let index_path = fixture.index_path_for(destination_b);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&index_path).expect("read saved index"))
+            .expect("decode saved index");
+    let object = saved.as_object_mut().expect("index object");
+    assert!(object.remove("claude_history_gate_loaded").is_some());
+    object.remove("claude_history_cutoff_unix_seconds");
+    std::fs::write(
+        &index_path,
+        serde_json::to_vec(&saved).expect("encode index"),
+    )
+    .expect("write pre-gate index");
+    let newcomer = "a8888888-8888-4888-8888-888888888888";
+    std::fs::write(
+        fixture.root.join(format!("{newcomer}.jsonl")),
+        history_line(newcomer, "req_new_1", 0),
+    )
+    .expect("write history the partial index has not reached");
+    let resumed = fixture.cycle(
+        "2026-08-02T09:00:00Z",
+        HistoryCycle {
+            destination: destination_b,
+            ..HISTORY_REVISION_2
+        },
+    );
+    assert!(resumed.uploaded.is_empty(), "{:?}", resumed.uploaded);
+    assert!(
+        !std::fs::read_dir(&fixture.base)
+            .expect("list fixture")
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "the index loaded; nothing was quarantined"
+    );
+}

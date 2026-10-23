@@ -345,10 +345,14 @@ const _: () = assert!(
 /// It must survive index loss, so none of it lives in the index.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ClaudePriorHistory {
-    /// This destination completed its Claude history bootstrap, or the state
-    /// that would say so is unreadable (fail closed).
-    here: bool,
-    /// Any evidence at all (fail closed, SOURCE F1a/F1b, StateMissing H1).
+    /// Evidence that history was already sent from this Mac whatever this
+    /// index holds: a completed Claude bootstrap for any destination (no
+    /// different-user cutoff), an unreadable backfill state, a quarantined
+    /// sibling of this index or the seen-marker. On the first gated load of
+    /// an index with no cutoff it records one (StateMissing M3, re-pairs).
+    bootstrapped: bool,
+    /// Any evidence at all, the upload ledger included (fail closed, SOURCE
+    /// F1a/F1b, StateMissing H1). It records a cutoff when entries are lost.
     any: bool,
 }
 
@@ -356,9 +360,9 @@ struct ClaudePriorHistory {
 /// is any of: this destination's completed bootstrap; an unreadable backfill
 /// state; a Claude bootstrap completed for another destination or recorded
 /// by a legacy state, unless a claim recorded a different-user cutoff (that
-/// history stays excluded by the cutoff, as before); an upload ledger that
-/// holds a replay generation or a permanent refusal; a quarantined
-/// (`.corrupt.`) sibling of this index; or the re-emission seen-marker.
+/// history stays excluded by the cutoff, as before); an upload ledger with any
+/// record of an earlier upload; a quarantined (`.corrupt.`) sibling of this
+/// index; or the re-emission seen-marker.
 fn claude_prior_history(
     backfill_state: &crate::backfill::BackfillState,
     destination_namespace: &str,
@@ -379,8 +383,7 @@ fn claude_prior_history(
             || backfill_state.completed_parser_versions.contains_key(slug)
             || backfill_state.completed_replay_revisions.contains_key(slug)
             || backfill_state.last_completed_at.is_some());
-    let ledger = upload_progress.historical_replay_generation.is_some()
-        || !upload_progress.permanent_rejections.is_empty();
+    let ledger = upload_progress.records_prior_upload();
     let quarantined_sibling = || {
         let Some(prefix) = index_path
             .file_stem()
@@ -407,14 +410,14 @@ fn claude_prior_history(
         ))
         .is_ok()
     };
+    let bootstrapped = here
+        || backfill_state.prior_history_unverified
+        || earlier_bootstrap
+        || quarantined_sibling()
+        || seen_marker();
     ClaudePriorHistory {
-        here: here || backfill_state.prior_history_unverified,
-        any: here
-            || backfill_state.prior_history_unverified
-            || earlier_bootstrap
-            || ledger
-            || quarantined_sibling()
-            || seen_marker(),
+        bootstrapped,
+        any: bootstrapped || ledger,
     }
 }
 
@@ -430,7 +433,7 @@ fn note_claude_history_cutoff_for_cycle(
     if source != SnapshotSource::ClaudeCode {
         return;
     }
-    index.note_claude_history_cutoff(prior_history.any, prior_history.here, entries_lost);
+    index.note_claude_history_cutoff(prior_history.any, prior_history.bootstrapped, entries_lost);
 }
 
 fn exclude_held_effective_body_witness_revision(
@@ -988,6 +991,21 @@ struct SnapshotUploadProgress {
 }
 
 impl SnapshotUploadProgress {
+    /// Any record of an earlier upload to this destination: a saved
+    /// generation, a replay claim, an accepted, quarantined or refused body,
+    /// or cache evidence (SOURCE F1a prior history).
+    fn records_prior_upload(&self) -> bool {
+        self.generation > 0
+            || self.historical_replay_generation.is_some()
+            || !self.accepted_fingerprints.is_empty()
+            || !self.accepted_body_witnesses.is_empty()
+            || !self.accepted_cache_states.is_empty()
+            || !self.accepted_cache_heads.is_empty()
+            || !self.pending_cache_heads.is_empty()
+            || !self.quarantined_fingerprints.is_empty()
+            || !self.permanent_rejections.is_empty()
+    }
+
     fn new(
         destination_namespace_hash: String,
         active_quarantine_witness: SnapshotQuarantineWitness,
