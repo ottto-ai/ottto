@@ -1486,6 +1486,65 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
+/// Reaching an uncaptured family must not spend its capture turn. These
+/// small pages exercise the stable-sort tie that deadline-only tests miss.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
+    for family_count in [65_usize, 129] {
+        let fixture = PipelineFixture::new("money-p1b-small-full-rotation");
+        for session in PIPELINE_SESSIONS {
+            std::fs::remove_file(fixture.root.join(format!("{session}.jsonl"))).unwrap();
+        }
+        let mut expected = BTreeSet::new();
+        for at in 0..family_count {
+            let session = format!("{at:08x}-1234-4567-890a-123456789abc");
+            std::fs::write(fixture.root.join(format!("{session}.jsonl")),
+                pipeline_transcript_line(&session, &format!("req-{at}"), 7)).unwrap();
+            expected.insert(money::hashed_id_for_test(&session));
+        }
+        let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index,
+            "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+        let mut baseline_index = ScanIndex::default();
+        let baseline = scan(&mut baseline_index);
+        money::enable_shadow_for_test(&fixture.support);
+        money::store::prime_credit_for_test(&fixture.support, 0);
+        let pages = family_count.div_ceil(money::capture::NEXT_PAGE_FAMILIES);
+        let mut built = BTreeSet::new();
+        let mut max_wall_us = 0;
+        for page in 0..pages {
+            money::capture::begin_page(&fixture.support);
+            let mut index = ScanIndex::default(); // every page is genuinely Full
+            let full = scan(&mut index);
+            assert_eq!(full.scanned_file_count, family_count);
+            assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), serde_json::to_vec(&baseline.snapshots).unwrap());
+            assert_eq!(serde_json::to_vec(&index).unwrap(), serde_json::to_vec(&baseline_index).unwrap());
+            let started = std::time::Instant::now();
+            let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
+                &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+                &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete,
+                census_pipeline_window("2026-08-02T08:00:00Z") + page as u64);
+            let elapsed = started.elapsed();
+            assert!(elapsed <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE, "{counts:?}");
+            max_wall_us = max_wall_us.max(elapsed.as_micros());
+            assert_eq!(counts.refused_deadline, 0, "{counts:?}");
+            assert_eq!(counts.families, family_count as u64);
+            money::store::flush();
+            for row in money_jsonl_rows(&fixture.support) {
+                if row["row"] == "family" && row["category"] != "unbuilt"
+                    && row["members_built"].as_u64().is_some_and(|members| members > 0)
+                    && !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline") {
+                    built.insert(row["family"].as_str().unwrap().to_owned());
+                }
+            }
+        }
+        assert_eq!(built, expected, "all {family_count} families must build within {pages} Full pages");
+        println!("MONEY_P1B_ROTATION families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", built.len());
+        money::disable_shadow_for_test(&fixture.support);
+    }
+}
+
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {

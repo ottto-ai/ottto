@@ -1531,6 +1531,7 @@ fn shadow_page_with_coverage(
                 family_captures.insert(key, capture);
             }
         }
+        let capture_consumed = !family_captures.is_empty();
         let scratch = family_preflight(
             root,
             items,
@@ -1658,13 +1659,13 @@ fn shadow_page_with_coverage(
                         && published.epoch == process_epoch()
                         && published.digest == digest
                 });
-        // A row emitted without reaching optional family work does not
-        // consume its scheduling turn. It leads the following page,
-        // while publication metadata still records the actual page time.
+        // Publication and capture scheduling are distinct. A reached
+        // family denied capture keeps its old turn too, otherwise small
+        // pages repeatedly pick the same first 64 despite reaching all roots.
         memos.push(PendingMemo {
             key,
             basis: if unchanged { None } else { basis },
-            observed_unix: now,
+            observed_unix: if capture_consumed { now } else { turn },
             published: ClaudeFamilyPublication {
                 utc_day: utc_day(now),
                 digest,
