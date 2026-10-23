@@ -807,8 +807,8 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     index.save(&index_path).unwrap();
     let quiet = pipeline.cycle(t1 + 3_600);
     assert!(
-        quiet.result.is_err(),
-        "a suppressed body still owes its newer conflict follow-up"
+        quiet.result.is_ok(),
+        "a quiet traversal may settle exactly bound cooldown debt"
     );
     assert_eq!(
         quiet.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
@@ -818,10 +818,11 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
         quiet.progress.quarantined_fingerprints[&fingerprint].disposition,
         SnapshotQuarantineDisposition::RetryPending
     );
-    assert!(quiet.index.bounded_sweep_had_unsettled_upload());
+    assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(quiet.cooldown_deferred, 1);
     assert_eq!(
         pipeline.server.last_terminal()["last_error_code"],
-        "server_error"
+        "backend_validation_error"
     );
     assert_eq!(
         reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
@@ -1264,11 +1265,11 @@ fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_j
     (pipeline, fingerprint, t1, deadline)
 }
 
-/// O1 (I/O half): quiet cycles before the reserved daily re-offer re-read
+/// O1: quiet cycles before the reserved daily re-offer re-read
 /// nothing for an unchanged file whose only selection is its already
 /// refused exact body, across a restart that rebuilds the runtime view.
-/// The refusal, conflict and deadline stay; the source stays unsettled
-/// exactly as #706 requires. At the due time: one re-read and one offer.
+/// The refusal, conflict and deadline stay disclosed while the quiet traversal
+/// settles. At the due time: one re-read and one offer.
 #[test]
 #[serial]
 #[serial(source_cadences)]
@@ -1295,12 +1296,12 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         assert_eq!(pipeline.server.offered().len(), 2, "no POST before the day");
         assert_eq!(quiet.leased_offers, 0);
         assert_eq!(quiet.cooldown_deferred, 1, "counted once per entity");
-        // Settlement is unchanged: the newer conflict still owes follow-up.
-        assert!(quiet.result.is_err());
-        assert!(quiet.index.bounded_sweep_had_unsettled_upload());
+        // Only the normal clean-traversal boundary settles the cooldown debt.
+        assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
         assert_eq!(
             pipeline.server.last_terminal()["last_error_code"],
-            "server_error"
+            "backend_validation_error"
         );
         assert!(quiet.progress.contains_body(
             &fingerprint,
@@ -1361,7 +1362,8 @@ fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
     assert_eq!((parsed, bytes), (0, 0));
     assert_eq!(pipeline.server.offered().len(), 2);
     assert_eq!(rollback.cooldown_deferred, 1);
-    assert!(rollback.result.is_err());
+    assert!(rollback.result.is_ok(), "{:?}", rollback.result);
+    assert!(!rollback.index.bounded_sweep_had_unsettled_upload());
     assert_eq!(
         reoffer_json(&rollback, &fingerprint)["retry_after_unix_seconds"],
         rolled_back + DAY
@@ -1395,4 +1397,153 @@ fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
     assert!(changed
         .index
         .accepted_snapshot_fingerprint_recorded(&fingerprint_of(&offered[2])));
+}
+
+/// A previously settled cooldown is no permission once its current witness or
+/// durable reservation is lost. The retained conflict blocks immediately.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn cooldown_conflict_broken_bound_blocks_again() {
+    if !supported("cooldown_conflict_broken_bound_blocks_again") {
+        return;
+    }
+    for broken in ["witness", "reservation", "file"] {
+        let (mut pipeline, fingerprint, t1, _) =
+            refused_then_conflicted(&format!("reoffer-broken-{broken}"));
+        let quiet = pipeline.cycle(t1 + 3_600);
+        assert!(quiet.result.is_ok(), "{broken}: {:?}", quiet.result);
+        assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(quiet.cooldown_deferred, 1);
+        pipeline.make_conflict_retry_due(&fingerprint);
+        match broken {
+            "witness" => {
+                let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+                    &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
+                    &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+                ));
+                let mut index = ScanIndex::load(&index_path).unwrap();
+                index
+                    .quarantined_snapshot_fingerprints
+                    .get_mut(&fingerprint)
+                    .unwrap()
+                    .witness
+                    .parser_version
+                    .push_str("-older");
+                index.save(&index_path).unwrap();
+            }
+            "reservation" => {
+                let mut json = quiet.progress_json.clone();
+                json["permanent_rejections"][&fingerprint]["reoffer"] =
+                    serde_json::json!({"version": 999, "reason": "corrupt"});
+                std::fs::write(&quiet.progress_path, serde_json::to_vec(&json).unwrap()).unwrap();
+            }
+            "file" => {
+                // A byte change without changing semantic usage still invalidates
+                // the unchanged-file proof; it cannot erase the retained debt.
+                std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(pipeline.transcript())
+                    .unwrap()
+                    .write_all(b"\n")
+                    .unwrap();
+                write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+            }
+            _ => unreachable!(),
+        }
+        let (broken_cycle, parsed, _) = pipeline.measured_cycle(t1 + 7_200, true);
+        assert_eq!(parsed, 1, "{broken}: ordinary invalidation reconstructs");
+        assert!(
+            broken_cycle.result.is_err(),
+            "{broken}: retained debt blocks again"
+        );
+        assert!(
+            broken_cycle.index.bounded_sweep_had_unsettled_upload(),
+            "{broken}"
+        );
+        assert_eq!(broken_cycle.cooldown_deferred, 0, "{broken}");
+        assert_eq!(
+            pipeline.server.last_terminal()["last_error_code"],
+            "server_error",
+            "{broken}"
+        );
+        assert_eq!(
+            pipeline.server.offered().len(),
+            2,
+            "{broken}: no early offer"
+        );
+        assert_eq!(
+            broken_cycle.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            broken_cycle.progress.quarantined_fingerprints[&fingerprint].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert!(broken_cycle
+            .progress
+            .permanent_rejections
+            .contains_key(&fingerprint));
+    }
+}
+
+/// The quiet-debt disclosure/settlement applies throughout the cooldown, not
+/// only after the ordinary conflict timer would have selected the file.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn cooldown_conflict_before_ordinary_retry_is_counted_and_settles() {
+    if !supported("cooldown_conflict_before_ordinary_retry_is_counted_and_settles") {
+        return;
+    }
+    let (mut pipeline, fingerprint, t1, deadline) = refused_then_conflicted("reoffer-before-retry");
+    let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+        &snapshot_index_path(&pipeline.support, SnapshotSource::ClaudeCode),
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+    ));
+    let mut index = ScanIndex::load(&index_path).unwrap();
+    index
+        .quarantined_snapshot_fingerprints
+        .get_mut(&fingerprint)
+        .unwrap()
+        .retry_after_unix_seconds = u64::MAX;
+    index.save(&index_path).unwrap();
+    let (quiet, parsed, bytes) = pipeline.measured_cycle(t1 + 600, true);
+    assert_eq!((parsed, bytes), (0, 0));
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert!(!quiet.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(quiet.cooldown_deferred, 1);
+    assert_eq!(quiet.leased_offers, 0);
+    assert_eq!(pipeline.server.offered().len(), 2);
+    assert_eq!(
+        pipeline.server.last_terminal()["last_error_code"],
+        "backend_validation_error"
+    );
+    assert_eq!(
+        pipeline.server.last_terminal()["last_census_complete"],
+        true
+    );
+    assert_eq!(
+        reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+        deadline
+    );
+    for record in [
+        &quiet.index.quarantined_snapshot_fingerprints[&fingerprint],
+        &quiet.progress.quarantined_fingerprints[&fingerprint],
+    ] {
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert_eq!(
+            record.upload_body_witness.as_deref(),
+            Some(
+                quiet.progress.permanent_rejections[&fingerprint]
+                    .body_witness
+                    .as_str()
+            )
+        );
+    }
 }
