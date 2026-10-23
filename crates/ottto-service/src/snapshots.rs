@@ -62533,6 +62533,8 @@ mod tests {
             index.claude_reemission_exclusions.state(),
             ListState::NotInstalled
         );
+        // The no-list hold applies on an unverified Mac (StateMissing N1).
+        index.claude_no_list_policy = NoListPolicy::HoldUnverified;
         let stamps = |index: &ScanIndex| {
             index
                 .files
@@ -62563,6 +62565,14 @@ mod tests {
             changed_scan.scanned_file_count >= 1,
             "the hold only gates adoption, never a changed file"
         );
+        // Where no list is intended on a verified Mac, the same old
+        // entities are paced through the budget instead (N1).
+        let mut paced = index.clone();
+        paced.claude_no_list_policy = NoListPolicy::Pace;
+        let paced_scan = with_no_list_cutoff(u64::MAX, || {
+            claude_context_backfill_scan(&root, &mut paced, MAX_BACKFILL_FILES_PER_SOURCE)
+        });
+        assert_eq!(paced_scan.scanned_file_count, 4, "paced, not held");
 
         // A cutoff before them makes every entity new: they adopt.
         let previous = index.clone();

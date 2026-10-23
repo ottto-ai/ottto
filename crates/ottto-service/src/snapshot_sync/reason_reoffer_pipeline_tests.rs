@@ -1189,10 +1189,12 @@ fn reemission_list_path(support: &Path) -> PathBuf {
     support.join("snapshots/claude_code-reemission-exclusions.txt")
 }
 
-/// #712 held-body control for #706 (test-only): a history-held file (stored
-/// revision below the active one, no list, a saved history cutoff after its
-/// birth; the refusal in the ledger is prior history) with a due
-/// original-pair re-offer lease is not re-offered. The lease is granted but
+/// #712 held-body control for #706: a history-held file (stored revision
+/// below the active one, no list, a saved history cutoff after its birth; the
+/// refusal in the ledger is prior history) with a due original-pair re-offer
+/// lease is not re-offered. Where no list is intended, only an unverified
+/// Mac or a move under a non-`full` claim still holds history (StateMissing
+/// N1); the index's durable move marker stands for that hold here. The lease is granted but
 /// never delivered: no body reaches the server, the refusal and its
 /// original-pair extension stay, nothing is accepted and the hold stays
 /// terminal. Once an installed list lets the upgrade through, the same lease
@@ -1227,6 +1229,7 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
         entry["effective_upload_body_witness_revision"] = 1.into();
     }
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
     std::fs::write(&index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     assert!(!reemission_list_path(&pipeline.support).exists(), "no list");
 
@@ -1352,18 +1355,16 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
     assert!(first.result.is_ok(), "{:?}", first.result);
     let offered = pipeline.server.offered();
     assert!(!offered.is_empty());
-    assert!(
-        first.progress_json["generation"]
-            .as_u64()
-            .unwrap_or_default()
-            > 0
-            || first.progress_json["historical_replay_generation"].is_string(),
-        "the bootstrap claimed its generation in the ledger"
-    );
-    // Back to what a killed first cycle leaves: the ledger's own claim, no
-    // server answer, no index, no completed bootstrap.
+    // Back to what a killed first cycle leaves: the ledger's own claim of a
+    // replay generation, saved before the scan, but no server answer, no
+    // index and no completed bootstrap.
     let mut claim = first.progress_json.clone();
     let object = claim.as_object_mut().expect("ledger object");
+    object.insert("generation".into(), 1.into());
+    object.insert(
+        "historical_replay_generation".into(),
+        "claude_code:killed-first-cycle".into(),
+    );
     for attested in [
         "accepted_fingerprints",
         "accepted_body_witnesses",

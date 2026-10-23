@@ -706,8 +706,9 @@ fn no_list_policy_follows_the_prior_history_evidence() {
         !lifted.claude_history_move_not_full,
         "a partial commit keeps it lifted"
     );
-    lifted.save(&path).unwrap();
-    let mut again = ScanIndex::load(&path).unwrap();
+    let lifted_path = scratch.join("lifted.json");
+    lifted.save(&lifted_path).unwrap();
+    let mut again = ScanIndex::load(&lifted_path).unwrap();
     again.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
 
@@ -719,8 +720,9 @@ fn no_list_policy_follows_the_prior_history_evidence() {
     assert_eq!(moving.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
     moving.note_claude_history_cutoff(PriorHistory::Moved, true, false);
     assert_eq!(moving.claude_no_list_policy, NoListPolicy::Pace);
-    moving.save(&path).unwrap();
-    let mut reloaded = ScanIndex::load(&path).unwrap();
+    let moving_path = scratch.join("moving.json");
+    moving.save(&moving_path).unwrap();
+    let mut reloaded = ScanIndex::load(&moving_path).unwrap();
     for entries_lost in [false, true] {
         reloaded.note_claude_history_cutoff(PriorHistory::Moved, false, entries_lost);
         assert_eq!(reloaded.claude_no_list_policy, NoListPolicy::Pace);
