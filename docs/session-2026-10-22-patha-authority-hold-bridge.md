@@ -73,7 +73,11 @@ holds are bound RetryPending; it is not an UnprovenTerminal-only count.
 When the unsettled-cause bits (#691) compose with this change, the
 authority-only census stamp stays removed (no `AuthorityCensusWithheld` cause
 at that site), and the debt gate at the scanner terminal is a census reason,
-not an unsettled-upload cause.
+not an unsettled-upload cause. This branch composes #691 and #706 (merge
+of `c2e5fbf6`) that way: `AuthorityCensusWithheld` stays in the cause enum
+so recorded bits still decode, but no path produces it; #691's transition-line
+test pairs the RetryPending debt with a server deferral and expects only
+`deferred_conflict`.
 
 ## Regression coverage
 

@@ -128,6 +128,17 @@ impl PipelineFixture {
         upload: PipelineUpload,
         before_classify: impl FnOnce(&mut ScanIndex),
     ) -> PipelinePage {
+        self.page_with_reoffers(collected_at, cycle, upload, before_classify, false)
+    }
+
+    fn page_with_reoffers(
+        &self,
+        collected_at: &str,
+        cycle: &PipelineCycle<'_>,
+        upload: PipelineUpload,
+        before_classify: impl FnOnce(&mut ScanIndex),
+        reoffers: bool,
+    ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {
@@ -205,12 +216,62 @@ impl PipelineFixture {
             },
         );
         before_classify(&mut index);
+        if reoffers {
+            // Inject due, exact server refusals after the real policy/body
+            // finalization. Even a lease for the held revision must pass the
+            // production authority gates below.
+            for item in &scan.snapshots {
+                progress.quarantine_permanent_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item),
+                    reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+                );
+                progress
+                    .permanent_rejections
+                    .get_mut(&item.snapshot_fingerprint)
+                    .unwrap()
+                    .reoffer = Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                    retry_after_unix_seconds: 0,
+                });
+                index.quarantined_snapshot_fingerprints.insert(
+                    item.snapshot_fingerprint.clone(),
+                    progress.quarantined_fingerprints[&item.snapshot_fingerprint].clone(),
+                );
+            }
+            let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+                .unwrap()
+                .unix_timestamp() as u64;
+            let scope = reason_reoffer::Scope {
+                index: &index,
+                now,
+                window_start_unix_seconds: now - 183 * 86_400,
+            };
+            progress.prepare_quarantine_and_reason_retries(
+                &index.quarantined_snapshot_fingerprints,
+                Some(&scope),
+            );
+            assert_eq!(
+                progress.reason_reoffer_counts.selected,
+                scan.snapshots.len()
+            );
+            progress
+                .save(&progress_path)
+                .expect("save lease before synthetic upload");
+        }
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
             &mut scan,
             &disposition,
         );
+        if reoffers {
+            progress
+                .extend_reason_reoffers_before_upload(&scan.snapshots, &holds.held_fingerprints);
+            progress
+                .save(&progress_path)
+                .expect("save pre-send cooldown");
+        }
+        let leased_reoffers = progress.active_reason_reoffers.clone();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
@@ -258,6 +319,13 @@ impl PipelineFixture {
             },
         )
         .expect("in-process upload");
+        if reoffers {
+            progress.finish_reason_reoffers(
+                &leased_reoffers,
+                false,
+                SnapshotSource::ClaudeCode.api_slug(),
+            );
+        }
         if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
             assert_eq!(result, ResumableUploadResult::Completed);
         }
@@ -704,6 +772,105 @@ fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete(
             );
         } else {
             assert!(last.index.bounded_sweep_had_unsettled_upload());
+        }
+    }
+}
+
+fn transition_row(rows: &[serde_json::Value], event: &str) -> Option<serde_json::Value> {
+    rows.iter()
+        .find(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == event
+        })
+        .cloned()
+}
+
+fn cause_names(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .as_array()
+        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Diagnostics only: the page that leaves a Claude sweep unsettled names its
+/// path; the terminal's retiring line names it beside the withheld census;
+/// the clean follow-up's starting line names it as prior, and that start
+/// clears it together with the flag.
+#[test]
+#[serial(source_manifests)]
+fn unsettled_cause_is_named_on_the_claude_transition_lines() {
+    use crate::local_resource_diagnostics::capture;
+    let _source_manifests = SourceManifestTestGuard::new();
+    // Path-(a) bridge: RetryPending debt elsewhere names no cause of its own
+    // (it neither blocks the page nor stamps the withheld census), so beside
+    // the same server deferral the sweep names only that deferral.
+    for (retry_pending, first_page_causes) in [
+        (false, &["deferred_conflict"][..]),
+        (true, &["deferred_conflict"][..]),
+    ] {
+        let cause = first_page_causes[0];
+        let fixture = PipelineFixture::new(if retry_pending {
+            "claude-unsettled-cause-retry-pending"
+        } else {
+            "claude-unsettled-cause-server-deferred"
+        });
+        fixture.baseline();
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        if retry_pending {
+            fixture.inject_retry_pending_family();
+        }
+        let cycle = PipelineCycle {
+            first_page_upload: PipelineUpload::ServerDeferred,
+            ..PIPELINE_HOLD_CYCLE
+        };
+        let first = fixture.page("2026-08-02T09:00:00Z", &cycle, cycle.first_page_upload);
+        assert!(first.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            first.index.bounded_sweep_unsettled_cause_names(),
+            first_page_causes,
+            "retry_pending={retry_pending}"
+        );
+
+        let retiring = (1..PIPELINE_MAX_PAGES)
+            .find_map(|minute| {
+                let (page, rows) = capture(|| {
+                    fixture.page(
+                        &format!("2026-08-02T09:{minute:02}:00Z"),
+                        &cycle,
+                        PipelineUpload::Accept,
+                    )
+                });
+                let retiring = transition_row(&rows, "retiring");
+                assert!(retiring.is_none() || !page.scan.census_complete);
+                retiring
+            })
+            .expect("the traversal retires within the page bound");
+        assert_eq!(retiring["source"], "claude_code");
+        assert_eq!(
+            retiring["counts"]["reason"],
+            "complete_needs_clean_followup"
+        );
+        assert!(
+            cause_names(&retiring["counts"]["unsettled_causes"]).contains(&cause),
+            "retry_pending={retry_pending}: {retiring}"
+        );
+
+        let (next, rows) =
+            capture(|| fixture.page("2026-08-02T10:00:00Z", &cycle, PipelineUpload::Accept));
+        let starting = transition_row(&rows, "starting").expect("the clean follow-up starts");
+        assert_eq!(starting["counts"]["prior_unsettled_upload"], true);
+        assert!(
+            cause_names(&starting["counts"]["prior_unsettled_causes"]).contains(&cause),
+            "retry_pending={retry_pending}: {starting}"
+        );
+        // The start cleared the prior causes with the flag; any cause left
+        // was marked again by this page, never without the flag.
+        let next_causes = next.index.bounded_sweep_unsettled_cause_names();
+        assert_eq!(
+            next.index.bounded_sweep_had_unsettled_upload(),
+            !next_causes.is_empty()
+        );
+        if !retry_pending {
+            assert!(!next_causes.contains(&cause), "{next_causes:?}");
         }
     }
 }
@@ -2216,6 +2383,10 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
         assert!(!page.progress_blocking);
         assert!(!page.index.bounded_sweep_had_unsettled_upload());
         assert!(
+            page.index.bounded_sweep_unsettled_cause_names().is_empty(),
+            "the debt alone names no unsettled cause"
+        );
+        assert!(
             !page.fully_settled,
             "the debt keeps full completion pending"
         );
@@ -2666,5 +2837,79 @@ fn persistently_refused_absence_scratch_keeps_a_present_family_held() {
         let last = pages.last().expect("terminal page");
         assert!(last.index.files.contains_key(&key), "walk {hour}");
         assert_present_family_held(last, session, &format!("refused scratch, walk {hour}"));
+    }
+}
+
+/// F3/#690: a due re-offer on a Rejected page cannot bypass either a bound
+/// terminal authority hold or a RetryPending family. Only the terminal-bound
+/// case may use H1's restorable-hold settlement; real retry debt stays owed.
+#[test]
+#[serial(source_manifests)]
+fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    for retry_pending in [false, true] {
+        let fixture = PipelineFixture::new(if retry_pending {
+            "reoffer-h1-retry-pending"
+        } else {
+            "reoffer-h1-terminal"
+        });
+        let baseline = fixture.baseline();
+        fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
+        let upload = PipelineUpload::EntityAckRejected {
+            session: PIPELINE_SESSIONS[1],
+            reason: reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+        };
+        let cycle = PipelineCycle {
+            proven_owner_session: Some(PIPELINE_HELD_SESSION),
+            first_page_upload: upload,
+            ..PIPELINE_HOLD_CYCLE
+        };
+        let settled_before = terminal_hold_settlement_count();
+        let first = fixture.page_with_reoffers(
+            "2026-08-02T09:00:00Z",
+            &cycle,
+            upload,
+            |index| {
+                if retry_pending {
+                    // The same held family has RetryPending debt at the
+                    // upload boundary, rather than an unrelated pending root.
+                    index.insert_retry_pending_claude_authority_for_test(PIPELINE_HELD_SESSION);
+                }
+            },
+            true,
+        );
+        assert!(matches!(
+            first.result,
+            ResumableUploadResult::Rejected { .. }
+        ));
+        assert_eq!(first.held.len(), 1);
+        assert!(
+            first.held.is_disjoint(&first.uploaded),
+            "a leased held body was never transmitted"
+        );
+        assert_eq!(first.progress.reason_reoffer_counts.selected, 2);
+        assert_eq!(first.progress.reason_reoffer_counts.attempted, 1);
+        assert_eq!(first.progress.reason_reoffer_counts.refused_same, 1);
+        assert_eq!(first.progress.reason_reoffer_counts.gate_held, 1);
+        assert_eq!(first.progress_blocking, retry_pending);
+        assert_eq!(
+            first.index.bounded_sweep_had_unsettled_upload(),
+            retry_pending
+        );
+        assert_eq!(
+            terminal_hold_settlement_count(),
+            settled_before + u64::from(!retry_pending)
+        );
+        let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+        assert_eq!(
+            first.index.files[&held_key].last_snapshot_fingerprint,
+            baseline.files[&held_key].last_snapshot_fingerprint
+        );
+        let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        assert_eq!(last.scan.census_complete, !retry_pending);
+        assert_eq!(last.backfill_succeeded, !retry_pending);
+        assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     }
 }
