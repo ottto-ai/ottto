@@ -976,3 +976,99 @@ fn bounded_retry_native_tls_trickle_cannot_extend_token_or_batch_deadline() {
         );
     }
 }
+
+// #660 D2: Codex side state that enlarges the index past `RESPONSE_BYTES`
+// must not loosen any cap. Bounded retry declines before any copy (the
+// caller's existing `None` → ordinary path), and the ordinary unbounded
+// checkpoint then settles the ACK and keeps the side state.
+fn bounded_native_enlarged_by_side_state() -> SameSourceAckFixture {
+    let mut f = SameSourceAckFixture::new();
+    f.baseline.add_codex_side_state_for_test(100);
+    f.baseline.save(&f.index_path).unwrap();
+    f.working.add_codex_side_state_for_test(100);
+    f.working.generation = f.baseline.generation;
+    assert!(
+        std::fs::metadata(&f.index_path).unwrap().len()
+            > crate::snapshot_retry::RESPONSE_BYTES as u64
+    );
+    assert!(!crate::snapshot_retry::json_fits(
+        &f.working,
+        crate::snapshot_retry::RESPONSE_BYTES
+    ));
+    f
+}
+
+#[test]
+fn bounded_retry_declines_an_index_enlarged_by_side_state_and_ordinary_checkpoint_keeps_it() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = bounded_native_enlarged_by_side_state();
+    assert!(PreparedRetry::capture(
+        SnapshotSource::Codex,
+        &"a".repeat(64),
+        SnapshotUploadPolicy::default(),
+        [1; 32],
+        std::slice::from_ref(&f.items[0]),
+        &f.working,
+        &f.baseline,
+        &f.progress,
+        &f.index_path,
+        &f.progress_path,
+        Instant::now() - Duration::from_secs(61),
+        Duration::from_secs(60),
+        4 * 1024 * 1024,
+    )
+    .is_none());
+    f.send(0, same_source_fixture_ack).unwrap();
+    assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
+    assert!(f.baseline.files.contains_key(&f.keys[0]));
+    let reloaded = ScanIndex::load(&f.index_path).unwrap();
+    assert!(reloaded.files.contains_key(&f.keys[0]));
+    assert_eq!(reloaded.codex_side_state_len_for_test(), (100, 100));
+}
+
+// #660 D2: the bounded checkpoint's capped read refuses the enlarged index
+// with an error: the index and progress files are byte-identical (no
+// truncation), and the durable ACK is still settled by the ordinary
+// checkpoint afterwards (no ACK or debt loss).
+#[test]
+fn bounded_checkpoint_cap_refuses_an_enlarged_index_without_truncation_or_ack_loss() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut f = bounded_native_enlarged_by_side_state();
+    f.send(0, same_source_fixture_ack).unwrap();
+    let accepted = f.progress.accepted_fingerprints.len();
+    let index = std::fs::read(&f.index_path).unwrap();
+    let progress = std::fs::read(&f.progress_path).unwrap();
+    let result = checkpoint_partial_snapshot_index_with_read_limit(
+        &f.working,
+        &f.baseline,
+        &f.progress,
+        &f.items,
+        None,
+        &BTreeSet::new(),
+        &f.index_path,
+        &f.progress_path,
+        || Ok(()),
+        Some(crate::snapshot_retry::RESPONSE_BYTES),
+    );
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&f.index_path).unwrap(), index);
+    assert_eq!(std::fs::read(&f.progress_path).unwrap(), progress);
+
+    assert_eq!(f.checkpoint_boundary(|| Ok(())).unwrap(), 1);
+    f.restart_preparation();
+    assert_eq!(f.progress.accepted_fingerprints.len(), accepted);
+    assert!(f.baseline.files.contains_key(&f.keys[0]));
+    assert_eq!(f.baseline.codex_side_state_len_for_test(), (100, 100));
+}

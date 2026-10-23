@@ -234,7 +234,10 @@ impl ClaudeFileBirth {
 
 /// Replace the item's first/peak/last and compaction scalars with the own-only
 /// values. One source for every branch that ships parser scalars.
-pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
+pub(super) fn apply_own_context_scalars(
+    item: &mut SnapshotItem,
+    counts: &mut ClaudeContextFileBirthCounts,
+) {
     let birth = item.claude_file_birth;
     item.first_turn_context_tokens = birth.own_first_context;
     item.peak_context_fill_tokens = (birth.own_peak_context > 0).then_some(birth.own_peak_context);
@@ -245,17 +248,50 @@ pub(super) fn apply_own_context_scalars(item: &mut SnapshotItem) {
         .filter(|observation| birth.owned_boundary(observation))
         .cloned()
         .collect::<Vec<_>>();
-    let (count, timestamps, metrics) = claude_compaction_summary(&owned);
-    item.compaction_count = Some(count);
-    item.compaction_timestamps = timestamps;
-    item.compaction_total_pre_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_pre_tokens);
-    item.compaction_total_post_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_post_tokens);
-    item.compaction_total_cumulative_dropped_tokens =
-        (metrics.metrics_count > 0).then_some(metrics.total_cumulative_dropped_tokens);
-    item.compaction_total_duration_ms =
-        (metrics.metrics_count > 0).then_some(metrics.total_duration_ms);
+    // The own requests are the responses `observe_response` counted as own
+    // (an untimed one counts as own there too), minus id-less responses,
+    // which carry no occurrence. Moved out for the call, never cloned.
+    let occurrences = std::mem::take(&mut item.claude_usage_occurrences);
+    let (id_less, points_refused) =
+        set_claude_compaction_scalars(item, &owned, occurrences.values(), false, |occurrence| {
+            birth.copied(occurrence.timestamp.as_deref()) != Some(true)
+        });
+    item.claude_usage_occurrences = occurrences;
+    counts.local_context_points_work_refused_session_count = counts
+        .local_context_points_work_refused_session_count
+        .saturating_add(u64::from(points_refused));
+    counts.id_less_response_before_compaction_count = counts
+        .id_less_response_before_compaction_count
+        .saturating_add(id_less.before);
+    counts.id_less_response_after_compaction_count = counts
+        .id_less_response_after_compaction_count
+        .saturating_add(id_less.after);
+}
+
+/// When the session's first own request ended (SOURCE ruling on
+/// `first_own_request_at`): only for a root file whose birth was measured and
+/// whose first own request follows no copied record. Read from values the
+/// fold already holds; `None` when that request carried no request id (no
+/// occurrence), any of its records was unstamped (the kept timestamp may be
+/// an earlier partial's, not its end) or its timestamp is not RFC 3339 UTC.
+/// Never a guess.
+fn measured_first_own_request_at(item: &SnapshotItem) -> Option<String> {
+    let birth = &item.claude_file_birth;
+    if !birth.root_with_birth() || birth.partially_pre_birth(&item.claude_context_curve_boundaries)
+    {
+        return None;
+    }
+    let first_own = birth.first_own_sequence?;
+    let timestamp = item
+        .claude_usage_occurrences
+        .values()
+        .find(|occurrence| occurrence.sequence == first_own)
+        .filter(|occurrence| occurrence.event_clock_complete)?
+        .timestamp
+        .as_deref()?;
+    let utc = OffsetDateTime::parse(timestamp, &Rfc3339)
+        .is_ok_and(|at| at.offset() == time::UtcOffset::UTC);
+    (utc && birth.copied(Some(timestamp)) == Some(false)).then(|| timestamp.to_string())
 }
 
 /// Why an item without a provider-proven start kept or lost its scalars.
@@ -702,6 +738,15 @@ pub struct ClaudeContextFileBirthCounts {
     /// The remembered-veto list was full when this fold judged a file-birth
     /// item: every later file-birth admission withholds until restart.
     pub remembered_veto_overflowed: bool,
+    /// Shipped compactions whose response just before had no request id, so
+    /// their `before` came from an earlier request or is absent. Local only.
+    pub id_less_response_before_compaction_count: u64,
+    /// Shipped compactions whose response just after had no request id, so
+    /// their `after` comes from a later request. Local only.
+    pub id_less_response_after_compaction_count: u64,
+    /// Recent sessions whose unordered request map exceeded the LOCAL points
+    /// work budget. Does not withhold posture or affect upload/backfill.
+    pub local_context_points_work_refused_session_count: u64,
 }
 
 impl ClaudeContextFileBirthCounts {
@@ -920,7 +965,8 @@ pub(super) fn admit_claude_file_birth_posture(
     counts.remembered_veto_overflowed |= remembered.overflowed;
     match verdict {
         ClaudeFileBirthVerdict::Admitted => {
-            apply_own_context_scalars(item);
+            apply_own_context_scalars(item, counts);
+            item.first_own_request_at = measured_first_own_request_at(item);
             if birth.tagged_in_opening {
                 // A copied opening did not start fresh here: keep the
                 // version only. A second file for the id withholds above.

@@ -241,6 +241,7 @@ fn integrated_send(
                             return Err(anyhow::Error::new(crate::snapshot_client::UploadShed {
                                 status: 503,
                                 retry_after: Some(Duration::from_secs(60)),
+                                code: None,
                             }));
                         }
                         IntegratedScript::AuthReplay => {
