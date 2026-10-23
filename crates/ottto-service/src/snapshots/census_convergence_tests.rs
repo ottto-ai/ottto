@@ -1532,3 +1532,294 @@ fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
         assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
     }
 }
+
+/// A clean terminal traversal that observed `observed`.
+fn clean_terminal_traversal(observed: BTreeSet<String>) -> ScanTraversalCheckpoint {
+    ScanTraversalCheckpoint {
+        observed_index_keys: observed,
+        unhealthy_retry_attempt: 0,
+        unhealthy_retry_not_before_unix_seconds: None,
+        counts: ScanTraversalCounts::default(),
+        ..terminal_unhealthy_traversal(String::new())
+    }
+}
+
+// SOURCE Round 11 guard (c): traversal counts carry no per-directory
+// attribution, so any read, permission or symlink error, entry cap, or
+// unfinished directory or candidate page anywhere in the traversal keeps
+// every absent family. The clean control retires and tombstones it.
+#[test]
+fn absence_retirement_keeps_every_family_after_any_traversal_problem() {
+    restart_claude_reemission_stop_for_test();
+    let pending_path = || ScanTraversalPath {
+        scan_root: PathBuf::from("/synthetic/projects"),
+        path: PathBuf::from("/synthetic/projects/elsewhere"),
+        census_member: true,
+        watcher_hint: false,
+    };
+    let problems: [(&str, fn(&mut ScanTraversalCheckpoint)); 7] = [
+        ("symlink", |traversal| {
+            traversal.counts.symlink_rejected_count = 1
+        }),
+        ("unreadable", |traversal| {
+            traversal
+                .counts
+                .record_unreadable(UnreadableCause::OpenRead, 1)
+        }),
+        ("entry cap", |traversal| {
+            traversal.counts.directory_entry_cap_exceeded_count = 1
+        }),
+        ("disappeared", |traversal| {
+            traversal.counts.disappeared_file_count = 1
+        }),
+        ("unsettled residue", |traversal| {
+            traversal.counts.ownership_incomplete_file_count = 1
+        }),
+        ("partial directory page", |_| {}),
+        ("partial candidate page", |_| {}),
+    ];
+    for (shape, problem) in problems {
+        let (mut index, observed) = retry_pending_roots_index("gone", 1, |_| false);
+        let mut traversal = clean_terminal_traversal(observed);
+        problem(&mut traversal);
+        match shape {
+            "partial directory page" => traversal.pending_directories.push_back(pending_path()),
+            "partial candidate page" => traversal.pending_candidates.push_back(pending_path()),
+            _ => {}
+        }
+        let before = claude_absence_counters_for_test();
+        assert_eq!(
+            index.retire_positively_absent_claude_families(&traversal, ""),
+            Err(ClaudeAbsenceRetirementRefusal::TraversalProblem),
+            "{shape}"
+        );
+        assert!(
+            index.claude_authority_record_for_test("gone-00").is_some(),
+            "{shape}: the family is kept"
+        );
+        assert!(
+            index.claude_usage_family_pending_retained_for_test("gone-00"),
+            "{shape}"
+        );
+        assert!(
+            !index.claude_family_tombstoned_for_test("gone-00"),
+            "{shape}"
+        );
+        let after = claude_absence_counters_for_test();
+        assert_eq!(
+            after.retirements_refused,
+            before.retirements_refused + 1,
+            "{shape}"
+        );
+        assert_eq!(
+            after.absent_families_retired, before.absent_families_retired,
+            "{shape}"
+        );
+    }
+    let (mut index, observed) = retry_pending_roots_index("gone", 1, |_| false);
+    let before = claude_absence_counters_for_test();
+    assert_eq!(
+        index.retire_positively_absent_claude_families(&clean_terminal_traversal(observed), ""),
+        Ok(1)
+    );
+    assert!(index.claude_authority_record_for_test("gone-00").is_none());
+    assert!(!index.claude_usage_family_pending_retained_for_test("gone-00"));
+    assert!(index.claude_family_tombstoned_for_test("gone-00"));
+    assert_eq!(
+        claude_absence_counters_for_test().absent_families_retired,
+        before.absent_families_retired + 1
+    );
+}
+
+// SOURCE Round 11 guards (a) and (b) at the unit seam: the latch and an
+// unverified-history index each refuse with their own reason.
+#[test]
+fn absence_retirement_names_the_latch_and_unverified_history_refusals() {
+    restart_claude_reemission_stop_for_test();
+    let (mut index, observed) = retry_pending_roots_index("gone", 1, |_| false);
+    let traversal = clean_terminal_traversal(observed);
+    index.claude_history_unverified_in_process = true;
+    assert_eq!(
+        index.retire_positively_absent_claude_families(&traversal, ""),
+        Err(ClaudeAbsenceRetirementRefusal::UnverifiedHistory)
+    );
+    index.claude_history_unverified_in_process = false;
+    latch_claude_reemission_stop_for_test();
+    assert_eq!(
+        index.retire_positively_absent_claude_families(&traversal, ""),
+        Err(ClaudeAbsenceRetirementRefusal::ReemissionStopLatched)
+    );
+    assert!(index.claude_authority_record_for_test("gone-00").is_some());
+    restart_claude_reemission_stop_for_test();
+    assert_eq!(
+        index.retire_positively_absent_claude_families(&traversal, ""),
+        Ok(1)
+    );
+}
+
+// SOURCE Round 11 guard (b) at load: a missing, quarantined or empty
+// generation-0 load marks its path unverified for the rest of the process;
+// a load with history does not, until a restart forgets the fresh load.
+#[test]
+fn fresh_index_loads_leave_their_path_unverified_until_a_restart() {
+    forget_claude_unverified_history_indexes_for_test();
+    let dir = temp_dir("patha-unverified-history-load");
+    let fresh = dir.join("fresh-index.json");
+    assert!(
+        ScanIndex::load(&fresh)
+            .unwrap()
+            .claude_history_unverified_in_process
+    );
+    let mut index = ScanIndex::default();
+    index.generation = 3;
+    index.save(&fresh).unwrap();
+    assert!(
+        ScanIndex::load(&fresh)
+            .unwrap()
+            .claude_history_unverified_in_process,
+        "a fresh load stays unverified for the process"
+    );
+    let corrupt = dir.join("corrupt-index.json");
+    fs::write(&corrupt, b"{ not json").unwrap();
+    assert!(
+        ScanIndex::load(&corrupt)
+            .unwrap()
+            .claude_history_unverified_in_process
+    );
+    let historic = dir.join("historic-index.json");
+    let mut index = ScanIndex::default();
+    index.generation = 3;
+    index.save(&historic).unwrap();
+    assert!(
+        !ScanIndex::load(&historic)
+            .unwrap()
+            .claude_history_unverified_in_process
+    );
+    forget_claude_unverified_history_indexes_for_test();
+    assert!(
+        !ScanIndex::load(&fresh)
+            .unwrap()
+            .claude_history_unverified_in_process,
+        "after a restart only the history on disk counts"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// SOURCE Round 11 tombstone decode: malformed entries drop one by one, a
+// wrong container type decodes as empty, each counted; the index and all its
+// other state still load, never quarantined.
+#[test]
+fn malformed_tombstones_never_fail_the_index_decode() {
+    let dir = temp_dir("patha-malformed-tombstones");
+    let path = dir.join("scan-index.json");
+    let kept = claude_retired_family_digest("kept-root");
+    let mut index = ScanIndex::default();
+    index.generation = 7;
+    index.insert_retry_pending_claude_authority_for_test("held-root");
+    index.save(&path).unwrap();
+    let saved = || serde_json::from_slice::<serde_json::Value>(&fs::read(&path).unwrap()).unwrap();
+    let write_tombstones = |tombstones: serde_json::Value| {
+        let mut value = saved();
+        value["claude_retired_family_tombstones"] = tombstones;
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    };
+    let assert_rest_kept = |loaded: &ScanIndex, shape: &str| {
+        assert_eq!(loaded.generation, 7, "{shape}: not quarantined");
+        assert!(
+            loaded
+                .claude_authority_record_for_test("held-root")
+                .is_some(),
+            "{shape}: other state kept"
+        );
+        assert_eq!(loaded.claude_usage_authority_pending_count(), 1, "{shape}");
+    };
+    write_tombstones(serde_json::Value::Object(
+        [
+            (kept.clone(), json!(1_700_000_000_u64)),
+            ("not-a-digest".to_string(), json!(1_700_000_001_u64)),
+            (hex64('a'), json!("yesterday")),
+            (hex64('b'), json!(-5)),
+            (hex64('c'), json!([1, 2])),
+            (hex64('d'), serde_json::Value::Null),
+        ]
+        .into_iter()
+        .collect(),
+    ));
+    let before = claude_absence_counters_for_test();
+    let loaded = ScanIndex::load(&path).expect("malformed entries still load");
+    assert_rest_kept(&loaded, "malformed entries");
+    assert_eq!(
+        loaded.claude_retired_family_tombstones_for_test(),
+        &BTreeMap::from([(kept.clone(), 1_700_000_000_u64)])
+    );
+    assert_eq!(
+        claude_absence_counters_for_test().tombstone_decode_drops,
+        before.tombstone_decode_drops + 5
+    );
+    for (shape, container) in [
+        ("array", json!([kept.clone(), 1])),
+        ("string", json!("tombstones")),
+        ("number", json!(12)),
+        ("bool", json!(true)),
+        ("null", serde_json::Value::Null),
+    ] {
+        write_tombstones(container);
+        let before = claude_absence_counters_for_test();
+        let loaded = ScanIndex::load(&path).expect("a wrong container still loads");
+        assert_rest_kept(&loaded, shape);
+        assert!(
+            loaded
+                .claude_retired_family_tombstones_for_test()
+                .is_empty(),
+            "{shape}"
+        );
+        assert_eq!(
+            claude_absence_counters_for_test().tombstone_decode_drops,
+            before.tombstone_decode_drops + 1,
+            "{shape}"
+        );
+    }
+    // A well-formed set round-trips through save and load.
+    let mut index = ScanIndex::load(&path).unwrap();
+    tombstone_retired_claude_family(&mut index.claude_retired_family_tombstones, "kept-root", 9);
+    index.save(&path).unwrap();
+    assert!(ScanIndex::load(&path)
+        .unwrap()
+        .claude_family_tombstoned_for_test("kept-root"));
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// SOURCE Round 11 tombstone bound: at the cap the oldest retirement (then
+// the lowest digest) is evicted; an over-cap persisted set keeps its newest.
+#[test]
+fn retired_family_tombstones_evict_the_oldest_at_the_cap() {
+    let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
+    assert_eq!(cap, 1024);
+    let mut tombstones = BTreeMap::new();
+    for number in 0..cap {
+        tombstone_retired_claude_family(
+            &mut tombstones,
+            &format!("root-{number:04}"),
+            1_000 + number as u64,
+        );
+    }
+    assert_eq!(tombstones.len(), cap);
+    tombstone_retired_claude_family(&mut tombstones, "root-newest", 5_000);
+    assert_eq!(tombstones.len(), cap);
+    assert!(!tombstones.contains_key(&claude_retired_family_digest("root-0000")));
+    assert!(tombstones.contains_key(&claude_retired_family_digest("root-0001")));
+    assert!(tombstones.contains_key(&claude_retired_family_digest("root-newest")));
+    let mut over = (0..cap + 10)
+        .map(|number| (hex64_number(number), number as u64))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        evict_oldest_claude_retired_family_tombstones(&mut over, cap),
+        10
+    );
+    assert_eq!(over.len(), cap);
+    assert!(over.values().all(|retired_at| *retired_at >= 10));
+}
+
+fn hex64_number(number: usize) -> String {
+    format!("{number:064x}")
+}
