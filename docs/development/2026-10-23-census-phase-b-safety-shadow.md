@@ -79,3 +79,12 @@ CPU delta against frozen main MONEY maintenance (D1 shadow comparison excluded
 from both timing arms). CPU measurements are observations, not timing assertions.
 The128/64 MiB synthetic overlap assertions are retained and require an executed
 CI receipt; their existence alone is not evidence that a limit was met.
+
+The original12,400-file refusal control remains unchanged. A second admitted
+scale control uses1,024 files/700,000 hashes, including retirement buffers,
+and requires a completed join, view digests, per-family legacy comparison and
+post-save equality. Its overlap includes checkpoint serialization/decode plus
+the original shadow heap and checkpoint delta beyond main; it asserts the same
+128/64 MiB limits. The test-only allocator pointer inventory accommodates the
+full overlap, with a control above its former65,536-pointer capacity. This does
+not change any runtime cap or production measurement availability.

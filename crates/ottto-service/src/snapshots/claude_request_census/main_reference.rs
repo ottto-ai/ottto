@@ -2,6 +2,10 @@
 //! Test-only independence: never calls HEAD insert, charge, admission_bytes or
 //! its record serializer. Types/getters are shared; MONEY getters are unchanged.
 use super::*;
+// Freeze main's limits too: changing HEAD limits must not move this reference.
+const MAX_CLAUDE_REQUEST_CENSUS_HASHES: usize = 2_097_152;
+const MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES: usize = 48 * 1024 * 1024;
+const TOMBSTONE_RESERVE_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Default)]
 pub(crate) struct MainAdmission {
     records: BTreeMap<String, ClaudeRequestCensusRecord>,

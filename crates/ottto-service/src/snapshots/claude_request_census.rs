@@ -5730,4 +5730,107 @@ mod phase_b_tests {
             scoped_money_bytes(baseline.into_census(), B, 'b', "b")
         );
     }
+    #[test]
+    fn admitted_scale_receipt_covers_view_comparison_and_saved_equality() {
+        const FILES: usize = 1024;
+        const HASHES: usize = 700000;
+        let mut index = ScanIndex::default();
+        let mut next = 0_u64;
+        for file in 0..FILES {
+            let root = format!("admitted-{file}");
+            let key = format!("/phase-b/projects/{root}.jsonl");
+            let count = HASHES / FILES + usize::from(file < HASHES % FILES);
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+            entry.source_file_fingerprint = "a".repeat(64);
+            index.files.insert(key.clone(), entry);
+            let first = next;
+            let mut evidence = record('a', (next..next + count as u64).collect());
+            next += count as u64;
+            if file % 2 == 0 {
+                evidence.retire_transcript_preserving_safety();
+            }
+            assert_eq!(
+                index.claude_request_census.insert_for_test(&key, evidence),
+                ClaudeRequestCensusInsert::Stored
+            );
+            index.claude_usage_family_pending.insert(
+                root.clone(),
+                crate::snapshots::ClaudeUsageFamilyPending {
+                    diagnostic_invalid_causes: 0,
+                    census_window_end: WINDOW.to_owned(),
+                    invalid: false,
+                    member_request_id_hashes: BTreeMap::from([(
+                        root,
+                        BTreeSet::from([format!("{first:016x}{}", "0".repeat(48))]),
+                    )]),
+                    member_occurrences: BTreeMap::new(),
+                },
+            );
+        }
+        assert_eq!(index.claude_request_census.hash_total, HASHES);
+        prepare_safety_checkpoint(&mut index);
+        // Account for shadow allocations already present before the born-in-
+        // scope audit: retained safety/metadata, inline layout, checkpoint delta.
+        let reference = main_reference::MainAdmission::from_census(&index.claude_request_census);
+        let reference_bytes = serde_json::to_vec(&reference).unwrap().len();
+        let baseline = reference.into_census();
+        let original_extra =
+            crate::heap_layout_bound::completed_bound(&index.claude_request_census, usize::MAX)
+                .unwrap()
+                .saturating_sub(
+                    crate::heap_layout_bound::completed_bound(&baseline, usize::MAX).unwrap(),
+                )
+                + FILES
+                    * std::mem::size_of::<ClaudeRequestCensusRecord>()
+                        .saturating_sub(std::mem::size_of::<main_reference::MainRecordLayout>());
+        let checkpoint_extra = serde_json::to_vec(&index.claude_request_census)
+            .unwrap()
+            .len()
+            .saturating_sub(reference_bytes);
+        drop(baseline);
+        let ((qualified, workspace), allocation) =
+            crate::retry_allocation_probe::measure_caller_thread(|| {
+                let old = index.clone();
+                let working = index.clone();
+                let (view, workspace) = crate::retry_allocation_probe::measure(|| {
+                    let join = ClaudeRequestCensusJoin::new(&working, 7, &BTreeSet::new());
+                    assert!(
+                        !join.counts.transient_limited,
+                        "an admitted path is required"
+                    );
+                    assert!(join.disjointness_complete(true));
+                    let counts = join.counts(true);
+                    let view = CensusShadowView::prepare(&working, join, counts, WINDOW).unwrap();
+                    let compared = view.compare_legacy(&working, WINDOW);
+                    assert!(compared.legacy_compare_ready);
+                    assert!(!compared.legacy_compare_budget_refused);
+                    assert_eq!(compared.legacy_compare_families, FILES);
+                    view
+                });
+                let mut to_save = working.clone();
+                to_save.generation = to_save.generation.saturating_add(1);
+                let checkpoint = serde_json::to_vec_pretty(&to_save).unwrap();
+                let saved = decode_index(checkpoint.as_slice()).unwrap();
+                assert_eq!(old.claude_request_census.hash_total, HASHES);
+                assert_eq!(saved.claude_request_census.hash_total, HASHES);
+                let qualified = view.qualify_saved(&saved);
+                assert!(qualified.shadow_post_save_equality_checked);
+                assert!(qualified.shadow_post_save_qualified);
+                (qualified, workspace.requested_peak_with_overlap)
+            });
+        let additional = allocation
+            .requested_peak_with_overlap
+            .saturating_add(original_extra)
+            .saturating_add(checkpoint_extra);
+        assert!(
+            workspace <= 64 * 1024 * 1024,
+            "admitted workspace {workspace}"
+        );
+        assert!(
+            additional <= 128 * 1024 * 1024,
+            "admitted additional overlap {additional}"
+        );
+        assert_eq!(qualified.shadow_healthy_terminals_memory_refused, 0);
+        eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families);
+    }
 }
