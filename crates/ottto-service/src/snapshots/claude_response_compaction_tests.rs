@@ -1417,10 +1417,40 @@ fn x_out_input<'a>(
     }
 }
 
+/// For the `position`-th assistant row of `rows` (its response record),
+/// `edit(position, row)`.
+fn edit_records(mut rows: Vec<Value>, mut edit: impl FnMut(usize, &mut Value)) -> Vec<Value> {
+    let mut position = 0;
+    for row in &mut rows {
+        if row["type"] == "assistant" {
+            edit(position, row);
+            position += 1;
+        }
+    }
+    rows
+}
+
+/// What a finished item holds from its responses, the outputs X_out family
+/// R bounds: request ids, occurrences, cache requests, tool usage, model and
+/// bucket rows. The rows also carry text `finish_output_bound` charges
+/// outside R (account hash, cost text), so this over-measures R.
+fn family_r_measured(item: &SnapshotItem) -> Option<usize> {
+    completed_heap_only(&item.claude_usage_request_ids)?
+        .checked_add(completed_heap_only(&item.claude_usage_occurrences)?)?
+        .checked_add(completed_heap_only(&item.cache_requests)?)?
+        .checked_add(completed_heap_only(&item.tool_usage)?)?
+        .checked_add(completed_heap_only(&item.model_usage)?)?
+        .checked_add(completed_heap_only(&item.usage_buckets)?)
+}
+
 /// T1, T4, T5, T6 for one file: read it natively, take X_out exactly as the
 /// proof site does (warm U3 identity), then finish inside a born-pointer
-/// allocation audit.
-fn assert_x_out_covers_finish(label: &str, rows: &[Value], title: &ClaudeTitleMetadata) {
+/// allocation audit. Returns the finished items.
+fn assert_x_out_covers_finish(
+    label: &str,
+    rows: &[Value],
+    title: &ClaudeTitleMetadata,
+) -> Vec<SnapshotItem> {
     let fixture = TempJsonl::new(label);
     fixture.append(rows);
     let (mut parser, expected) = native_parser(&fixture.path);
@@ -1442,6 +1472,12 @@ fn assert_x_out_covers_finish(label: &str, rows: &[Value], title: &ClaudeTitleMe
         .claude_responses
         .decode_peak_bound(usize::MAX)
         .unwrap();
+    let family_r = parser
+        .accumulator
+        .claude_responses
+        .completion_bounds(usize::MAX)
+        .and_then(|bounds| bounds.output)
+        .unwrap_or_else(|| panic!("{label}: family R refused"));
     let moved_before = (
         completed_heap_only(&parser.accumulator.claude_file_birth),
         completed_heap_only(&parser.accumulator.claude_compaction_observations),
@@ -1508,13 +1544,24 @@ fn assert_x_out_covers_finish(label: &str, rows: &[Value], title: &ClaudeTitleMe
             "{label}: T5 after={after:?} before={moved_before:?}"
         );
     }
-    // T1: the finished value is within X_out.
+    // T1: the finished value is within X_out, and what it holds from its
+    // responses is within family R.
+    eprintln!("X_OUT_T1 case={label} family=composed measured={output} bound={x_out}");
+    if let [item] = parsed.snapshots.as_slice() {
+        let measured = family_r_measured(item).expect("finished item measured");
+        eprintln!("X_OUT_T1 case={label} family=R measured={measured} bound={family_r}");
+        assert!(
+            measured <= family_r,
+            "{label}: family R measured={measured} > bound={family_r}"
+        );
+    }
     assert!(output <= x_out, "{label}: output={output} > x_out={x_out}");
     // T6: everything born in finish coexists within X_out plus the decode peak.
     assert!(
         born <= x_out + peak,
         "{label}: born_finish_peak={born} > x_out={x_out} + decode_peak={peak}"
     );
+    parsed.snapshots
 }
 
 /// T1 (adversarial sweep, R1a R8 union cases), with T4-T6 per case.
@@ -1538,22 +1585,66 @@ fn x_out_t1_bounds_the_finished_claude_file() {
             realistic_rows(0..count, &[SHELL, CHROME[0]]),
         );
     }
-    // One response whose records differ in selector and tool, and whose
-    // first model is carried by its third record.
-    let mut geo = 0usize;
-    case(
-        "union-late-model",
-        edit_assistant(
-            realistic_turn(0, &[SHELL, CHROME[0], CHROME[1]]),
-            |index, row| {
-                if index <= 2 {
-                    row["message"].as_object_mut().unwrap().remove("model");
-                }
-                geo += 1;
-                row["message"]["usage"]["inference_geo"] = json!(format!("geo-{geo}"));
-            },
+    // R1a R8 union cases: one multi-record response (thinking, text, one
+    // record per tool) whose records differ in (i) selectors, (ii) tool uses,
+    // (iii) whether they carry `model` (the third record is the first to);
+    // then all three at once beside a second response. Selectors differ by
+    // key per record, never by one key's value: a conflicting value fails the
+    // whole response (`merge_claude_response_selector`), which finishes
+    // nothing.
+    const UNION_TOOLS: [&str; 4] = [SHELL, CHROME[0], CHROME[1], CHROME[2]];
+    let distinct_selectors = |position: usize, row: &mut Value| {
+        let usage = row["message"]["usage"].as_object_mut().unwrap();
+        usage.remove("service_tier");
+        usage.remove("speed");
+        let (key, value) = [
+            ("service_tier", "standard"),
+            ("speed", "standard"),
+            ("inference_geo", "us"),
+        ][position % 3];
+        usage.insert(key.to_string(), json!(value));
+    };
+    let late_model = |position: usize, row: &mut Value| {
+        if position < 2 {
+            row["message"].as_object_mut().unwrap().remove("model");
+        }
+    };
+    let mut union_all = edit_records(realistic_turn(0, &UNION_TOOLS), |position, row| {
+        distinct_selectors(position, row);
+        late_model(position, row);
+    });
+    union_all.extend(realistic_turn(1, &[SHELL]));
+    for (label, rows, responses) in [
+        (
+            "union-selectors",
+            edit_records(realistic_turn(0, &UNION_TOOLS), distinct_selectors),
+            1,
         ),
-    );
+        ("union-tools", realistic_turn(0, &UNION_TOOLS), 1),
+        (
+            "union-late-model",
+            edit_records(realistic_turn(0, &UNION_TOOLS), late_model),
+            1,
+        ),
+        ("union-all", union_all, 2),
+    ] {
+        let items = case(label, rows);
+        let [item] = items.as_slice() else {
+            panic!(
+                "{label}: {} items, the union must finish into one",
+                items.len()
+            );
+        };
+        assert_eq!(
+            item.claude_usage_request_ids.len(),
+            responses,
+            "{label}: every response resolved"
+        );
+        assert!(
+            !item.model_usage.is_empty() && item.model_usage.iter().all(|row| row.model == MODEL),
+            "{label}: rows take the late model"
+        );
+    }
     let tools: Vec<String> = (0..201)
         .map(|tool| format!("mcp__x-out__tool_{tool:03}"))
         .collect();

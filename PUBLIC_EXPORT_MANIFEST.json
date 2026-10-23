@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 817,
-  "content_sha256": "0989072b20730c8aafa361ff9d3d1ae005fe82e89dfc5070e26d419baff1cbc7",
+  "content_sha256": "6a0acf1d7173a1b5417395773c397eb3e2b50d0fb48e3c14d614f28e7b15e4ab",
   "files": [
     {
       "executable": false,
@@ -1777,8 +1777,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_response_compaction_tests.rs",
-      "sha256": "030b18c2186fb82e586f8a1f56f4cfc1af5b1ec797f28a903e8e819abc1ab572",
-      "size_bytes": 63060
+      "sha256": "41a82804ed9730926096663bfdaf15c3da5c9ff15cb3da95947f82c0093f6667",
+      "size_bytes": 66785
     },
     {
       "executable": false,
