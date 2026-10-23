@@ -1147,3 +1147,62 @@ fn admitted_unknown_main_values_cross_serde_native_recursion_threshold() {
         assert_sibling(&ScanIndex::load(&path).unwrap());
     }
 }
+
+#[test]
+fn optional_resource_classification_precedes_earlier_bad_numeric_token() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-resource-before-syntax");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.save(&path).unwrap();
+    let prefix = fs::read(&path).unwrap();
+    let mut bytes = prefix[..prefix.len() - 1].to_vec();
+    bytes.extend_from_slice(b",\"claude_request_census\":[01,");
+    bytes.extend(std::iter::repeat(b'[').take(1000));
+    bytes.push(b'0');
+    bytes.extend(std::iter::repeat(b']').take(1000));
+    bytes.extend_from_slice(b"]}");
+    for bounded in [false, true] {
+        fs::write(&path, &bytes).unwrap();
+        let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
+        assert!(native.claude_request_census.is_empty());
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_sibling(&loaded);
+        assert!(loaded.claude_request_census.is_empty());
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        if bounded {
+            loaded.save_with_read_limit(&path, bytes.len()).unwrap();
+        } else {
+            loaded.save(&path).unwrap();
+        }
+        assert_sibling(&ScanIndex::load(&path).unwrap());
+    }
+}
+
+#[test]
+fn optional_raw_cap_counts_object_field_leading_whitespace() {
+    use std::io::Write;
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-census-leading-whitespace");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.save(&path).unwrap();
+    let prefix = fs::read(&path).unwrap();
+    let mut file = BufWriter::new(File::create(&path).unwrap());
+    file.write_all(&prefix[..prefix.len() - 1]).unwrap();
+    file.write_all(b",\"claude_request_census_shadow\":")
+        .unwrap();
+    let spaces = claude_request_census::MAX_RAW_BYTES + 1;
+    let chunk = [b' '; 8192];
+    for _ in 0..spaces / chunk.len() {
+        file.write_all(&chunk).unwrap();
+    }
+    file.write_all(&chunk[..spaces % chunk.len()]).unwrap();
+    file.write_all(b"{\"o\":true}}").unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
+    assert!(native.claude_request_census_shadow.is_empty());
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.claude_request_census_shadow.is_empty());
+    assert_sibling(&loaded);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+}

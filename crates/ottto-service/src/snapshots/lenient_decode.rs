@@ -356,6 +356,7 @@ struct Decoder<R> {
     holds: Holds,
     counts: Counts,
     family_spans: BTreeMap<&'static str, Span>,
+    census_resources: [bool; 2],
 }
 #[derive(Clone, Copy)]
 struct Span {
@@ -435,11 +436,62 @@ impl NumberState {
         Ok(())
     }
 }
+fn lexical_optional_span<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<Span, Error> {
+    // Match CensusRead's complete field drain, including leading/trailing
+    // whitespace. Defer grammar until resource classification is final: an
+    // early bad token must not quarantine later over-limit optional evidence.
+    let start = reader.stream_position()?;
+    let mut len = 0u64;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut resource = false;
+    while let Some(byte) = peek(reader)? {
+        if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
+            break;
+        }
+        reader.consume(1);
+        len += 1;
+        resource |= len > claude_request_census::MAX_RAW_BYTES as u64;
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            match byte {
+                b'"' => quoted = true,
+                b'{' | b'[' => {
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or(Error::Refused("nesting resource cap"))?;
+                    resource |= depth > MAX_JSON_DEPTH;
+                }
+                b'}' | b']' => depth = depth.saturating_sub(1),
+                _ => {}
+            }
+        }
+    }
+    if quoted || depth != 0 {
+        return Err(syntax());
+    }
+    Ok(Span {
+        start,
+        len,
+        resource,
+    })
+}
 fn lexical_span<R: BufRead + Seek>(
     reader: &mut R,
     optional: bool,
     base_depth: usize,
 ) -> std::result::Result<Span, Error> {
+    if optional {
+        return lexical_optional_span(reader);
+    }
     let first = whitespace(reader)?.ok_or_else(syntax)?;
     if matches!(first, b',' | b'}' | b']' | b':') {
         return Err(syntax());
@@ -450,7 +502,6 @@ fn lexical_span<R: BufRead + Seek>(
     let mut depth = 0usize;
     let mut quoted = false;
     let mut escaped = false;
-    let mut resource = false;
     let mut number = NumberState::None;
     loop {
         let Some(byte) = peek(reader)? else {
@@ -465,7 +516,6 @@ fn lexical_span<R: BufRead + Seek>(
         }
         reader.consume(1);
         len += 1;
-        resource |= optional && len > claude_request_census::MAX_RAW_BYTES as u64;
         if quoted {
             if escaped {
                 escaped = false;
@@ -475,9 +525,7 @@ fn lexical_span<R: BufRead + Seek>(
                 quoted = false;
             }
         } else {
-            if !resource {
-                number.byte(byte)?;
-            }
+            number.byte(byte)?;
             match byte {
                 b'"' => {
                     quoted = true;
@@ -487,17 +535,11 @@ fn lexical_span<R: BufRead + Seek>(
                     depth = depth
                         .checked_add(1)
                         .ok_or(Error::Refused("nesting resource cap"))?;
-                    if depth.saturating_add(if optional { 0 } else { base_depth }) > MAX_JSON_DEPTH
-                    {
-                        if !optional {
-                            return Err(Error::Refused("main document nesting resource cap"));
-                        }
-                        resource = true;
+                    if depth.saturating_add(base_depth) > MAX_JSON_DEPTH {
+                        return Err(Error::Refused("main document nesting resource cap"));
                     }
                 }
-                b'}' | b']' => {
-                    depth = depth.checked_sub(1).ok_or_else(syntax)?;
-                }
+                b'}' | b']' => depth = depth.checked_sub(1).ok_or_else(syntax)?,
                 _ => {}
             }
         }
@@ -505,13 +547,11 @@ fn lexical_span<R: BufRead + Seek>(
             break;
         }
     }
-    if !resource {
-        number.finish()?;
-    }
+    number.finish()?;
     Ok(Span {
         start,
         len,
-        resource,
+        resource: false,
     })
 }
 fn checked_grammar<R: BufRead + Seek>(
@@ -535,7 +575,7 @@ fn checked_grammar<R: BufRead + Seek>(
     reader.seek(SeekFrom::Start(span.start + span.len))?;
     Ok(())
 }
-fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<(), Error> {
+fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<[bool; 2], Error> {
     reader.seek(SeekFrom::Start(0))?;
     let first = whitespace(reader)?.ok_or_else(syntax)?;
     let array = first == b'[';
@@ -550,6 +590,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<(
     reader.consume(1);
     let close = if array { b']' } else { b'}' };
     let mut position = 0;
+    let mut resources = [false; 2];
     if whitespace(reader)? != Some(close) {
         loop {
             let name = if array {
@@ -576,9 +617,18 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<(
                 name
             };
             let optional = optional_census(name);
+            // CensusRead streams positional-array separator whitespace before
+            // capture; object-field evidence starts immediately after ':'.
+            if array {
+                whitespace(reader)?;
+            }
             let value = lexical_span(reader, optional, 1)?;
-            if optional && !value.resource {
-                checked_grammar(reader, value)?;
+            if optional {
+                resources[usize::from(name == Some("claude_request_census_shadow"))] |=
+                    value.resource;
+                if !value.resource {
+                    checked_grammar(reader, value)?;
+                }
             }
             position += 1;
             match whitespace(reader)? {
@@ -606,7 +656,7 @@ fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<(
         }
     })?;
     reader.seek(SeekFrom::Start(0))?;
-    Ok(())
+    Ok(resources)
 }
 fn optional_census(name: Option<&str>) -> bool {
     matches!(
@@ -624,7 +674,7 @@ pub(super) fn read<R: BufRead + Seek>(
     let _side_request_counts = SideRequestCountGuard;
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
-    validate_original(&mut reader)?;
+    let census_resources = validate_original(&mut reader)?;
     let mut decoder = Decoder {
         reader,
         input_len,
@@ -633,6 +683,7 @@ pub(super) fn read<R: BufRead + Seek>(
         holds: Holds::default(),
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
+        census_resources,
     };
     // Controls are checked before any record can exhaust hold admission.
     // Otherwise a future ledger placed after damaged records could be renamed
@@ -1428,7 +1479,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn census(&mut self, span: Span, field: &str) -> std::result::Result<ScanIndex, Error> {
-        if span.resource {
+        if span.resource
+            || (optional_census(Some(field))
+                && self.census_resources[usize::from(field == "claude_request_census_shadow")])
+        {
             return Ok(ScanIndex::default());
         }
         self.reader.seek(SeekFrom::Start(span.start))?;
