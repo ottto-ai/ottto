@@ -1873,7 +1873,18 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    let mut index = crate::snapshot_retry::decode_state(&normalized)?;
+    let mut decoded = crate::snapshot_retry::decode_state::<ScanIndex>(&normalized);
+    if decoded.is_err() && !reader.normalize {
+        // The bounded shape parser visits numbers before record-local tolerant
+        // decoders. Normalize only this failed optional-state case, using the
+        // same in-memory bytes: no new file read, no changed shape/node cap.
+        reader = CensusRead::new(bytes);
+        reader.normalize = true;
+        normalized.clear();
+        reader.read_to_end(&mut normalized)?;
+        decoded = crate::snapshot_retry::decode_state::<ScanIndex>(&normalized);
+    }
+    let mut index = decoded?;
     reader.invalidate_duplicates(&mut index);
     index.claude_request_census.safety_incomplete = index
         .claude_request_census_shadow
@@ -1958,6 +1969,7 @@ struct CensusRead<R> {
     duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
+    normalize: bool,
     capture: bool,
     #[cfg(test)]
     read_calls: usize,
@@ -1985,6 +1997,7 @@ impl<R: std::io::Read> CensusRead<R> {
             duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
+            normalize: phase_b::enabled(),
             capture: false,
             #[cfg(test)]
             read_calls: 0,
@@ -2136,7 +2149,7 @@ impl<R: std::io::Read> CensusRead<R> {
         if overflow {
             return Ok(b"null".to_vec());
         }
-        if !phase_b::enabled() {
+        if !self.normalize {
             return Ok(bytes);
         }
         // Parsing is isolated from the enclosing index, including numeric
@@ -5473,6 +5486,63 @@ mod phase_b_tests {
     }
 
     #[test]
+    fn off_bounded_partial_save_isolates_nonfinite_optional_safety() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let mut original = index_with(vec![(A, record('a', vec![1]))]);
+        prepare_safety_checkpoint(&mut original);
+        let good = serde_json::to_string(&original).unwrap();
+        let broken = good.replacen("\"x\":{", "\"x\":1e400,\"ignored_old_x\":{", 1);
+        assert_ne!(good, broken);
+        let _mode = phase_b::ShadowMode::set(false);
+        let loaded = decode_bounded_index(broken.as_bytes())
+            .expect("optional overflow never blocks a partial checkpoint");
+        assert_eq!(
+            loaded
+                .claude_request_census
+                .get(A)
+                .unwrap()
+                .request_hashes(),
+            &[1]
+        );
+        assert!(
+            loaded
+                .claude_request_census
+                .safety_get(A)
+                .unwrap()
+                .safety
+                .unwrap()
+                .sr
+        );
+        assert!(
+            !ClaudeRequestCensusJoin::new(&loaded, 7, &BTreeSet::new()).disjointness_complete(true)
+        );
+        let scratch = crate::test_scratch::ScratchDir::new("off-bounded-safety-overflow");
+        let path = scratch.join("index.json");
+        std::fs::write(&path, broken.as_bytes()).unwrap();
+        let mut working = ScanIndex::load(&path).unwrap();
+        working
+            .save_with_read_limit(&path, broken.len() * 2)
+            .expect("bounded CAS saves the valid index");
+        let reloaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            reloaded
+                .claude_request_census
+                .get(A)
+                .unwrap()
+                .request_hashes(),
+            &[1]
+        );
+        assert!(
+            !ClaudeRequestCensusJoin::new(&reloaded, 7, &BTreeSet::new())
+                .disjointness_complete(true)
+        );
+        let outside = good.replacen('{', "{\"ordinary\":1e400,", 1);
+        assert!(
+            decode_bounded_index(outside.as_bytes()).is_err(),
+            "the ordinary shape guard remains strict"
+        );
+    }
+    #[test]
     fn off_decode_preserves_retained_safety_and_refuses_actual_decode_loss() {
         let _mode = phase_b::ShadowMode::set(true);
         let mut index = index_with(vec![(A, record('a', vec![1]))]);
@@ -6218,7 +6288,8 @@ mod phase_b_tests {
             7,
             ClaudeRequestCensusShape::OverBudget,
             vec![],
-        );
+        )
+        .with_acquired_eof_for_test(true);
         let entry_base = entry_serialized_bytes("", &filler);
         let min_bytes = entry_base + 32;
         let full_bytes = entry_base + KEY_BYTES;
@@ -6254,18 +6325,54 @@ mod phase_b_tests {
             candidate.serialized_total,
             MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
         );
-        let compact = serde_json::to_vec(&candidate).unwrap();
-        assert!(compact.len() <= MAX_RAW_BYTES);
-        let pretty_core = serde_json::to_vec_pretty(&candidate.records).unwrap();
-        assert!(
-            pretty_core.len() > MAX_RAW_BYTES,
-            "boundary fixture must exceed main raw envelope"
-        );
-        let main_empty: ClaudeRequestCensus = serde_json::from_slice(&pretty_core).unwrap();
-        assert!(main_empty.records.is_empty());
-        let recovered: ClaudeRequestCensus = serde_json::from_slice(&compact).unwrap();
-        assert!(!recovered.records.is_empty());
-        assert!(recovered.compact_decode_recovered);
+        {
+            // Persisted tombstones may fill the 48 MiB reserve. Fill the core
+            // itself before comparing the frozen main pretty writer with raw
+            // compact rows; retained sb alone cannot force main's decode cap.
+            let mut boundary = main_reference::MainAdmission::from_census(&candidate).into_census();
+            let core = ClaudeRequestCensusRecord::synthetic_for_test(
+                &"f".repeat(64),
+                7,
+                ClaudeRequestCensusShape::OverBudget,
+                vec![],
+            );
+            let core_base = entry_serialized_bytes("", &core);
+            let full = core_base + KEY_BYTES;
+            let minimum = core_base + 32;
+            let mut boundary_row = row + 1;
+            while MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - boundary.serialized_total
+                > full + minimum
+            {
+                assert!(boundary.insert_decoded(key(boundary_row, KEY_BYTES), core.clone().into()));
+                boundary_row += 1;
+            }
+            let mut spare = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - boundary.serialized_total;
+            if spare > full {
+                assert!(boundary.insert_decoded(key(boundary_row, 32), core.clone().into()));
+                boundary_row += 1;
+                spare = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - boundary.serialized_total;
+            }
+            assert!(spare >= minimum);
+            assert!(boundary.insert_decoded(key(boundary_row, spare - core_base), core.into()));
+            assert_eq!(
+                boundary.serialized_total,
+                MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+            );
+            let compact = serde_json::to_vec(&boundary).unwrap();
+            assert!(compact.len() <= MAX_RAW_BYTES);
+            let pretty_core =
+                serde_json::to_vec_pretty(&main_reference::MainAdmission::from_census(&boundary))
+                    .unwrap();
+            assert!(
+                pretty_core.len() > MAX_RAW_BYTES,
+                "boundary fixture must exceed main raw envelope"
+            );
+            let main_empty: ClaudeRequestCensus = serde_json::from_slice(&pretty_core).unwrap();
+            assert!(main_empty.records.is_empty());
+            let recovered: ClaudeRequestCensus = serde_json::from_slice(&compact).unwrap();
+            assert!(!recovered.records.is_empty());
+            assert!(recovered.compact_decode_recovered);
+        }
         let main = main_reference::MainAdmission::from_census(&candidate);
         let scope = |census: ClaudeRequestCensus, path: &str, fingerprint: char, root: &str| {
             let mut index = ScanIndex::default();
@@ -6334,6 +6441,56 @@ mod phase_b_tests {
                 scope(control.clone().into_census(), path, fingerprint, root)
             );
         }
+        // With no reclaimable retiree safety, strip oldest active metadata
+        // only. Main admits the same core and every active hash survives.
+        let mut all_active = candidate.clone();
+        let mut active = all_active.take_safety(A).unwrap();
+        active.core.retired = None;
+        active.core.window = 1;
+        active.core.request_hashes = shared_hashes((0..200000).collect());
+        active.extra.safety_hashes = None;
+        assert_eq!(
+            all_active.insert_for_test(A, active),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert!(all_active.retired_order.is_empty());
+        let reclaimed_before = all_active.safety_incomplete.reclaimed;
+        let mut reference = main_reference::MainAdmission::from_census(&all_active);
+        let mut incoming = record('c', vec![200000]);
+        incoming.window = 8;
+        assert_eq!(
+            reference.insert_for_test(NEW, incoming.clone()),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
+            all_active.insert_for_test(NEW, incoming),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert!(
+            all_active.safety_get(A).unwrap().safety.is_none(),
+            "oldest active x stripped first"
+        );
+        assert!(
+            all_active.safety_get(NEW).unwrap().safety.is_some(),
+            "newer incoming x is not stripped before old peers"
+        );
+        assert!(all_active.safety_incomplete.metadata_active > 0);
+        assert_eq!(
+            all_active.safety_incomplete.metadata_active as usize,
+            all_active.safety_incomplete.keys.len()
+        );
+        assert_eq!(all_active.safety_incomplete.reclaimed, reclaimed_before);
+        assert_eq!(all_active.get(A).unwrap().request_hashes().len(), 200000);
+        assert_eq!(all_active.active_hash_total, 200001);
+        assert_eq!(all_active.safety_hash_total(), 0);
+        assert_eq!(
+            main_reference::MainAdmission::from_census(&all_active).bytes(),
+            reference.bytes()
+        );
+        assert_eq!(
+            scope(all_active, NEW, 'c', "new"),
+            scope(reference.into_census(), NEW, 'c', "new")
+        );
     }
     #[test]
     fn confirmed_empty_file_is_never_a_recordless_safety_excusal() {
