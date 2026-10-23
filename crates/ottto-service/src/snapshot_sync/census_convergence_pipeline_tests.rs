@@ -680,6 +680,111 @@ fn server_deferred_and_retry_pending_holds_keep_the_claude_traversal_incomplete(
     }
 }
 
+fn transition_row(rows: &[serde_json::Value], event: &str) -> Option<serde_json::Value> {
+    rows.iter()
+        .find(|row| {
+            row["stage"] == "bounded_traversal_transition" && row["counts"]["event"] == event
+        })
+        .cloned()
+}
+
+fn cause_names(value: &serde_json::Value) -> Vec<&str> {
+    value
+        .as_array()
+        .map(|names| names.iter().filter_map(serde_json::Value::as_str).collect())
+        .unwrap_or_default()
+}
+
+/// Diagnostics only: the page that leaves a Claude sweep unsettled names its
+/// path; the terminal's retiring line names it beside the withheld census;
+/// the clean follow-up's starting line names it as prior, and that start
+/// clears it together with the flag.
+#[test]
+#[serial(source_manifests)]
+fn unsettled_cause_is_named_on_the_claude_transition_lines() {
+    use crate::local_resource_diagnostics::capture;
+    let _source_manifests = SourceManifestTestGuard::new();
+    // A RetryPending family both blocks the completed page and withholds its
+    // authority census.
+    for (retry_pending, first_page_causes) in [
+        (false, &["deferred_conflict"][..]),
+        (
+            true,
+            &["completed_blocking_holds", "authority_census_withheld"][..],
+        ),
+    ] {
+        let cause = first_page_causes[0];
+        let fixture = PipelineFixture::new(if retry_pending {
+            "claude-unsettled-cause-retry-pending"
+        } else {
+            "claude-unsettled-cause-server-deferred"
+        });
+        fixture.baseline();
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        if retry_pending {
+            fixture.inject_retry_pending_family();
+        }
+        let cycle = PipelineCycle {
+            first_page_upload: if retry_pending {
+                PipelineUpload::Accept
+            } else {
+                PipelineUpload::ServerDeferred
+            },
+            ..PIPELINE_HOLD_CYCLE
+        };
+        let first = fixture.page("2026-08-02T09:00:00Z", &cycle, cycle.first_page_upload);
+        assert!(first.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            first.index.bounded_sweep_unsettled_cause_names(),
+            first_page_causes,
+            "retry_pending={retry_pending}"
+        );
+
+        let retiring = (1..PIPELINE_MAX_PAGES)
+            .find_map(|minute| {
+                let (page, rows) = capture(|| {
+                    fixture.page(
+                        &format!("2026-08-02T09:{minute:02}:00Z"),
+                        &cycle,
+                        PipelineUpload::Accept,
+                    )
+                });
+                let retiring = transition_row(&rows, "retiring");
+                assert!(retiring.is_none() || !page.scan.census_complete);
+                retiring
+            })
+            .expect("the traversal retires within the page bound");
+        assert_eq!(retiring["source"], "claude_code");
+        assert_eq!(
+            retiring["counts"]["reason"],
+            "complete_needs_clean_followup"
+        );
+        assert!(
+            cause_names(&retiring["counts"]["unsettled_causes"]).contains(&cause),
+            "retry_pending={retry_pending}: {retiring}"
+        );
+
+        let (next, rows) =
+            capture(|| fixture.page("2026-08-02T10:00:00Z", &cycle, PipelineUpload::Accept));
+        let starting = transition_row(&rows, "starting").expect("the clean follow-up starts");
+        assert_eq!(starting["counts"]["prior_unsettled_upload"], true);
+        assert!(
+            cause_names(&starting["counts"]["prior_unsettled_causes"]).contains(&cause),
+            "retry_pending={retry_pending}: {starting}"
+        );
+        // The start cleared the prior causes with the flag; any cause left
+        // was marked again by this page, never without the flag.
+        let next_causes = next.index.bounded_sweep_unsettled_cause_names();
+        assert_eq!(
+            next.index.bounded_sweep_had_unsettled_upload(),
+            !next_causes.is_empty()
+        );
+        if !retry_pending {
+            assert!(!next_causes.contains(&cause), "{next_causes:?}");
+        }
+    }
+}
+
 /// A historical replay reset clears ordinary committed Claude file entries but
 /// keeps family witnesses and authority quarantines. A bound terminal authority
 /// hold met on an earlier bounded page then has no committed entry to restore;

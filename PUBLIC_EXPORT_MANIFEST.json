@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 821,
-  "content_sha256": "8c982c8be7c5a0d91474bcc48abc1688163c26b49a7bb7de0fc7418907220d1d",
+  "content_sha256": "21e624a382fbafc274bd0e5c1394ec755efb5310e8e6e37c385429266ecaa167",
   "files": [
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "6a6158f3202363e1b3bd17e686a313c2c8b4df4b8f3e8b2664d190f266a900e7",
-      "size_bytes": 909183
+      "sha256": "47069790697f03325c71a4a38bb7fdebb7580b17a060e934e94239747ee073aa",
+      "size_bytes": 915994
     },
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "d9735abd62b839462633e52f5fb70709dde7b14f14f0f346f57a4943babdeb49",
-      "size_bytes": 83995
+      "sha256": "7e722cebb7dab6fa052606fd5e8d461448a486a95d8f920e767b9867fc09faf3",
+      "size_bytes": 88104
     },
     {
       "executable": false,
@@ -1518,8 +1518,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p12_pipeline_original_tests.rs",
-      "sha256": "76ad1675127e65c902484bd36c4623e488054f4c070769a0ee4967abba6b881c",
-      "size_bytes": 111970
+      "sha256": "7c4c22a15d6005f4051c6925651041da8f1bf20072831342e4004050c43f63c7",
+      "size_bytes": 112020
     },
     {
       "executable": false,
@@ -1602,8 +1602,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "c24ead6479c18b38235746a67448f9a81885a5cb9b58fa3fc2024106851d7616",
-      "size_bytes": 3356965
+      "sha256": "4b4dd57f47fdb460464d98f4f4bfbdc4cd58649407793f749bc349131276f8da",
+      "size_bytes": 3367819
     },
     {
       "executable": false,
@@ -2015,8 +2015,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/provider_envelope_experiment_tests.rs",
-      "sha256": "208875aa7c6a5b04cd5aafea6451aa91418095627ba2f8d076da7425cd45d4d3",
-      "size_bytes": 178998
+      "sha256": "067bad797ad58bd024d1ac489865f7e6a3e7503e52163ed6c51b6172896cb427",
+      "size_bytes": 180304
     },
     {
       "executable": false,
@@ -2099,8 +2099,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "87c07daec4aa433c0d8388e42cca4a1cb61bfc0c99b163e6e9b4b396d1c6f540",
-      "size_bytes": 20451
+      "sha256": "3ee940a9a78a7d5b320abc740d49bbe2e116822b6c79145826bdecbc66ac3a82",
+      "size_bytes": 35372
     },
     {
       "executable": false,
@@ -5750,7 +5750,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T05:55:15+00:00",
+  "generated_at": "2026-10-23T07:21:38+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 822,
   "public_roots": [
@@ -5789,5 +5789,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "59f6394a9285c7515f6b0dfb41c75f7f4a064227"
+  "source_commit": "f78fc7a55aced6e218e23df87ba6c9fd4c7ef934"
 }
