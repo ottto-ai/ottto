@@ -81,6 +81,7 @@ fn actual_batches(
         |item| item.fingerprint.clone(),
         |_| None,
         |item| item.class,
+        &mut InplaceRetryBudget::default(),
         |batch| {
             batches.push(batch.iter().map(|item| item.ordinal).collect());
             Ok(accepted_batch(batch.len()))
@@ -227,6 +228,7 @@ fn snapshot_packing_count_serialization_failure_keeps_local_error_and_no_upload(
         |item| item.fingerprint.clone(),
         |_| None,
         |_| false,
+        &mut InplaceRetryBudget::default(),
         |_| {
             uploads += 1;
             Ok(accepted_batch(0))
