@@ -2109,6 +2109,17 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         serde_json::json!(false),
         serde_json::json!([]),
         serde_json::json!({}),
+        // U1a-2a (#660): the side/proof fields after the parent ledgers
+        // (`serde(skip)` RAM fields take no slot).
+        serde_json::json!({}),
+        serde_json::json!({}),
+        serde_json::json!(0),
+        serde_json::json!(0),
+        serde_json::json!({}),
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(""),
         serde_json::json!({}),
         serde_json::json!({}),
         serde_json::json!({}),
