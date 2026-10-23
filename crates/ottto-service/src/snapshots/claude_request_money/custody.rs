@@ -407,6 +407,37 @@ impl Custody {
             .into_iter()
             .map(|item| (item.0, item.1))
     }
+    /// Resume by query key rather than physical carrier digest. The bounded
+    /// heap is temporary; no second resident owner/message index is kept.
+    pub(super) fn message_records_after<'a>(
+        &'a self,
+        cursor: &str,
+        limit: usize,
+    ) -> impl Iterator<Item = (&'a String, RecordRef<'a>)> {
+        let mut nearest = std::collections::BinaryHeap::new();
+        for slot in self
+            .files
+            .values()
+            .filter_map(|file| file.current_m.as_deref())
+        {
+            if slot.key.as_str() <= cursor {
+                continue;
+            }
+            if nearest.len() < limit {
+                nearest.push(KeyedRecord(&slot.key, slot.value.view()));
+            } else if nearest
+                .peek()
+                .is_some_and(|last: &KeyedRecord<'_>| &slot.key < last.0)
+            {
+                nearest.pop();
+                nearest.push(KeyedRecord(&slot.key, slot.value.view()));
+            }
+        }
+        nearest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|item| (item.0, item.1))
+    }
     pub(super) fn offer_count_for(&self, owner: &str) -> usize {
         if let Some(root) = owner.strip_prefix("synthetic:") {
             self.telemetry
@@ -516,9 +547,11 @@ impl Custody {
         value.map_or((0, 0), |value| (entry_bytes(key, &value), value.hashes()))
     }
     fn prune_empty(&mut self, a: &Address) {
-        if self.files.get(&a.carrier).is_some_and(|file| {
-            file.slots().next().is_none() && (file.path.is_none() || !file.indexed)
-        }) {
+        if self
+            .files
+            .get(&a.carrier)
+            .is_some_and(|file| file.slots().next().is_none())
+        {
             self.files.remove(&a.carrier);
         }
         if self

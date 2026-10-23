@@ -3195,9 +3195,17 @@ fn validation_rejection(status: u16, response: ureq::Response) -> anyhow::Error 
         .is_ok();
     let skew = read && status == 422 && literal_version_skew_body(&raw);
     let excerpt = if read {
-        std::str::from_utf8(&raw)
-            .ok()
-            .and_then(safe_response_body_excerpt)
+        let prefix = match std::str::from_utf8(&raw) {
+            Ok(text) => Some(text),
+            // The bounded read may end within the final UTF-8 character.
+            // Preserve its valid prefix, but keep rejecting invalid interior
+            // bytes as before; diagnostics still undergo normal redaction.
+            Err(error) if error.error_len().is_none() => {
+                std::str::from_utf8(&raw[..error.valid_up_to()]).ok()
+            }
+            Err(_) => None,
+        };
+        prefix.and_then(safe_response_body_excerpt)
     } else {
         None
     };
@@ -3833,6 +3841,34 @@ mod tests {
         );
         assert!(error.downcast_ref::<RequestOwnedVersionSkew>().is_none());
         assert_eq!(error.downcast_ref::<BatchRejected>().unwrap().status, 422);
+    }
+
+    #[test]
+    fn validation_excerpt_survives_a_utf8_character_split_at_the_raw_limit() {
+        let start = r#"{"detail":[{"loc":["body","snapshots",0,"removed_request_count"],"type":"greater_than_equal","msg":""#;
+        let mut raw = format!(
+            "{start}{}€ trailing validator detail",
+            "x".repeat(64 * 1024 - 1 - start.len())
+        );
+        raw.push_str("\"}]}");
+        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        assert!(std::str::from_utf8(&raw.as_bytes()[..64 * 1024]).is_err());
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(error.downcast_ref::<RequestOwnedVersionSkew>().is_none());
+        let excerpt = error
+            .downcast_ref::<BatchRejected>()
+            .unwrap()
+            .body_excerpt
+            .as_deref()
+            .unwrap();
+        assert!(
+            excerpt.contains(r#""loc":["body","snapshots""#),
+            "keep the existing per-item isolation evidence"
+        );
+        assert!(excerpt.chars().count() <= 503);
     }
 
     #[test]

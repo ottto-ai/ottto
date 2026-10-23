@@ -2675,9 +2675,7 @@ fn prune_message_records(
     let cursor = std::mem::take(&mut ledger.message_cursor);
     let due = ledger
         .census()
-        .records_with_prefix(MESSAGE_KEY_PREFIX)
-        .filter(|(key, _)| key.as_str() > cursor.as_str())
-        .take(MESSAGE_PRUNE_PER_PAGE)
+        .message_records_after(&cursor, MESSAGE_PRUNE_PER_PAGE)
         .map(|(key, record)| {
             let file = &key[MESSAGE_KEY_PREFIX.len()..];
             let current = index.claude_request_census.get(file).is_some_and(|file| {

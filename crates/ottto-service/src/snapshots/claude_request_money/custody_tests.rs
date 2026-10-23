@@ -849,3 +849,51 @@ fn old_witness_revision_can_rebuild_while_adoption_is_paused() {
         "scheduling is never an adopted stamp"
     );
 }
+
+#[test]
+fn message_pruning_visits_every_path_and_releases_gate_off_empty_carriers() {
+    let mut ledger = ClaudeLedger::new_for_test();
+    let total = 2 * MESSAGE_PRUNE_PER_PAGE + 17;
+    for number in 0..total {
+        let path =
+            format!("/custody/projects/-repo/{number:08x}-0000-4000-8000-000000000000.jsonl");
+        assert!(ledger.bind_file(&path, "root".into(), "member".into(), None));
+        stored(
+            &mut ledger,
+            message_key(&path),
+            ClaudeRequestCensusRecord::message_record(&record(vec![number as u64]), Vec::new()),
+        );
+    }
+    let mut cursor = String::new();
+    let mut visited = BTreeSet::new();
+    loop {
+        let page = ledger
+            .census()
+            .message_records_after(&cursor, MESSAGE_PRUNE_PER_PAGE)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        if page.is_empty() {
+            break;
+        }
+        assert!(page.windows(2).all(|pair| pair[0] < pair[1]));
+        for key in &page {
+            assert!(visited.insert(key.clone()), "no key revisited before wrap");
+        }
+        cursor = page.last().unwrap().clone();
+    }
+    assert_eq!(
+        visited.len(),
+        total,
+        "digest ordering must not starve a lexicographically earlier path"
+    );
+    let mut counts = ClaudeRequestMoneyShadowCounts::default();
+    for _ in 0..4 {
+        prune_message_records(&mut ledger, &ScanIndex::default(), &mut counts);
+    }
+    assert_eq!(counts.message_records_pruned as usize, total);
+    assert_eq!(
+        ledger.census().record_count(),
+        2,
+        "gate-OFF pruning releases empty bound carriers without live housekeeping"
+    );
+}
