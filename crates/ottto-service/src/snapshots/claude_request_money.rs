@@ -587,6 +587,15 @@ impl ShadowReservation {
     pub(crate) fn bytes(&self) -> usize {
         self.0
     }
+
+    /// Transfer already admitted bytes without releasing their charge.
+    pub(super) fn split(&mut self, bytes: usize) -> Option<Self> {
+        if bytes > self.0 {
+            return None;
+        }
+        self.0 -= bytes;
+        Some(Self(bytes))
+    }
 }
 
 impl Drop for ShadowReservation {
@@ -1259,6 +1268,14 @@ fn shadow_page_with_coverage(
         return refuse(&end, None, index, snapshots.len(), counts);
     }
     let scope_key = shadow_scope(support_dir);
+    let Some(root_funds) = ShadowReservation::admit(snapshots.len().saturating_mul(64)) else {
+        counts.refused_budget = 1;
+        return refuse(&end, None, index, snapshots.len(), counts);
+    };
+    let roots = snapshots
+        .iter()
+        .map(claude_snapshot_family_root_ref)
+        .collect::<BTreeSet<_>>();
     // Pre-admit metadata, every failure row, memos and writer buffer. No
     // family-specific scratch is charged until that family's turn.
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
@@ -1267,10 +1284,7 @@ fn shadow_page_with_coverage(
         .records()
         .map(|(key, _)| key.len())
         .sum::<usize>();
-    let page_claim_rows = snapshots
-        .iter()
-        .map(claude_snapshot_family_root_ref)
-        .collect::<BTreeSet<_>>()
+    let page_claim_rows = roots
         .iter()
         .filter_map(|root| api_report.evidence.get(*root))
         .map(Vec::len)
@@ -1295,10 +1309,6 @@ fn shadow_page_with_coverage(
         purge_captures(&scope_key, &mut counts);
         return refuse(&end, None, index, snapshots.len(), counts);
     };
-    let roots = snapshots
-        .iter()
-        .map(claude_snapshot_family_root_ref)
-        .collect::<BTreeSet<_>>();
     let mut guard = match store::acquire(support_dir) {
         ClaudeLedgerAcquire::Ready(guard) => guard,
         acquired => {
@@ -1424,7 +1434,7 @@ fn shadow_page_with_coverage(
     });
     let mut families = Vec::with_capacity(roots.len());
     let mut memos = Vec::with_capacity(roots.len());
-    let mut reservations = vec![base];
+    let mut reservations = vec![base, root_funds];
     let mut failed = 0;
     let mut written = 0;
     let mut incomplete = 0;
@@ -1502,6 +1512,7 @@ fn shadow_page_with_coverage(
         let state = coverage_view.family(root);
         let mut basis = None;
         let mut rows;
+        let mut owned_reservation = None;
         let slice = if Instant::now() >= deadline {
             Err("deadline")
         } else if scratch > SHADOW_MEMORY_CEILING_BYTES {
@@ -1552,7 +1563,7 @@ fn shadow_page_with_coverage(
                         // Scratch remains funded during handoff overlap.
                         if !rows.grains.is_empty() {
                             if let Some(owned) = ShadowReservation::admit(rows.owned_bytes()) {
-                                reservations.push(owned);
+                                owned_reservation = Some(owned);
                             } else {
                                 rows.grains.clear();
                                 rows.row.grains = 0;
@@ -1603,6 +1614,9 @@ fn shadow_page_with_coverage(
         } else {
             failed += u64::from(is_failed);
             written += u64::from(!is_failed);
+            if let Some(owned) = owned_reservation {
+                reservations.push(owned);
+            }
             families.push(rows);
         }
     }
@@ -1690,7 +1704,7 @@ fn build_slice(
         let rows = match api_report.evidence.get(root) {
             Some(evidence) => {
                 end.rows.roots_live += 1;
-                let (rows, refused) = ClaudeRootRows::from_live(evidence, root);
+                let (rows, refused) = ClaudeRootRows::from_live(evidence, root, deadline);
                 end.rows.rows_refused += refused;
                 rows
             }
@@ -1701,7 +1715,7 @@ fn build_slice(
                 }
                 Some(ClaudeRootTelemetry::Current) => match ledger.get(&telemetry_key(root)) {
                     Some(record) if budget.charge(row_charge(record.request_hashes().len())) => {
-                        match ClaudeRootRows::from_record(record) {
+                        match ClaudeRootRows::from_record_by(record, deadline) {
                             Some(rows) => {
                                 end.rows.roots_from_facts += 1;
                                 end.rows.rows_decoded += rows.len() as u64;
@@ -2383,6 +2397,10 @@ fn note_message_record(
         .get(key)
         .filter(|record| fingerprint_matches(record, fingerprint) && record.retired().is_none())
     else {
+        return;
+    };
+    let Some(_scratch) = ShadowReservation::admit(capture.units().len().saturating_mul(24)) else {
+        counts.message_records_refused += 1;
         return;
     };
     let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());

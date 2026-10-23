@@ -515,6 +515,8 @@ pub(crate) struct WriteResult {
     meta_unwritten: Option<bool>,
     /// The writer's time on the batch.
     pub(crate) writer_us: u64,
+    // Acknowledgement memos stay funded until the producer takes them.
+    _reservation: Option<ShadowReservation>,
 }
 
 enum Job {
@@ -742,13 +744,10 @@ fn run_writer(receiver: Receiver<Job>) {
     loop {
         let job = match receiver.try_recv() {
             Ok(job) => job,
-            Err(TryRecvError::Empty) => {
-                settle_runs(&mut failed);
-                match receiver.recv() {
-                    Ok(job) => job,
-                    Err(_) => break,
-                }
-            }
+            Err(TryRecvError::Empty) => match receiver.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            },
             Err(TryRecvError::Disconnected) => break,
         };
         match job {
@@ -778,8 +777,6 @@ fn run_writer(receiver: Receiver<Job>) {
             }
             #[cfg(test)]
             Job::Flush(done) => {
-                // Idle as far as the caller is concerned: settled first.
-                settle_runs(&mut failed);
                 let _ = done.send(());
             }
             #[cfg(test)]
@@ -789,10 +786,6 @@ fn run_writer(receiver: Receiver<Job>) {
         }
     }
 }
-
-// Intent is persisted by the producer before admission. The writer must not
-// remove it while a producer may be queueing or refusing work.
-fn settle_runs(_states: &mut BTreeMap<PathBuf, WriterState>) {}
 
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
     let staged = path.with_extension("json.tmp");
@@ -823,8 +816,15 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         mut jsonl,
         mut memos,
         save,
-        reservations,
+        mut reservations,
     } = job;
+    let ack_bytes = memos
+        .iter()
+        .map(|memo| memo.key.capacity() + 256)
+        .sum::<usize>();
+    let acknowledgement = reservations
+        .first_mut()
+        .and_then(|funds| funds.split(ack_bytes));
     let outcome = super::write_jsonl(&support_dir, &mut jsonl);
     for (memo, family) in memos
         .iter_mut()
@@ -846,6 +846,7 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         failed_shards,
         meta_unwritten,
         writer_us: started.elapsed().as_micros() as u64,
+        _reservation: acknowledgement,
     };
     drop(reservations);
     (support_dir, result)

@@ -2773,11 +2773,11 @@ fn census_hashes(support: &Path) -> usize {
 
 #[test]
 fn money_p1b_large_holder_record_checks_inner_deadline() {
-    let deadline = Instant::now() + Duration::from_millis(1);
     let mut ledger = MoneyLedger::new(&[], &[], &[]);
     let hashes = (0..1_000_000).collect::<Vec<u64>>();
     ledger.ledger.insert_for_test("otel:large", money_record('a', hashes.clone()));
     let started = Instant::now();
+    let deadline = started + Duration::from_millis(1);
     let result = crate::snapshots::claude_request_ledger::scan_holders(
         ledger.index.claude_request_census_for_test(), &ledger.ledger,
         &hashes, &[], deadline, &mut |_| true);

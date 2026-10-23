@@ -151,7 +151,7 @@ fn intersect(
     };
     for hash in short {
         *compared += 1;
-        if *compared % INTERSECT_CHECK_EVERY == 0 && Instant::now() >= deadline {
+        if (*compared).is_multiple_of(INTERSECT_CHECK_EVERY) && Instant::now() >= deadline {
             return false;
         }
         if long.binary_search(hash).is_ok() && !found(*hash) {
