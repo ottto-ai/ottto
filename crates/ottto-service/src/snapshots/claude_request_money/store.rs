@@ -507,6 +507,9 @@ pub(crate) struct PendingMemo {
     pub(crate) published: ClaudeFamilyPublication,
     /// The batch carries a row of the family (else it was unchanged).
     pub(crate) row: bool,
+    /// Pre-admitted unreached family. The writer renders its deadline row
+    /// and computes the full canonical digest before publication/ack.
+    pub(crate) deferred: Option<(String, super::FamilyCensus)>,
 }
 
 /// One page's batch for the writer.
@@ -907,6 +910,23 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         save,
         reservations,
     } = job;
+    if memos.iter().any(|memo| memo.deferred.is_some()) {
+        let empty = ClaudeLedger::empty(false);
+        let mut ignored = super::ClaudeRequestMoneyShadowCounts::default();
+        for memo in &mut memos {
+            if let Some((root, state)) = memo.deferred.take() {
+                jsonl.families.push(super::failure_rows(
+                    &root,
+                    "deadline",
+                    state,
+                    jsonl.now,
+                    jsonl.coverage.snapshot,
+                    &empty,
+                    &mut ignored,
+                ));
+            }
+        }
+    }
     let ready = match failed.run_days {
         Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
         previous => {

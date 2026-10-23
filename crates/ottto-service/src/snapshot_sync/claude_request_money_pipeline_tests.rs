@@ -1408,14 +1408,35 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         (counts, elapsed)
     };
     let (counts, elapsed) = run(&armed, &armed_index, now);
-    assert_eq!(counts.refused_deadline, 0, "pre-admitted family failures: {counts:?}");
+    assert_eq!(counts.refused_deadline, 0, "whole-page refusal loses family accounting: {counts:?}");
     assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     let rows = money_jsonl_rows(&fixture.support);
     let first_page = rows.iter().find(|row| row["row"] == "page").unwrap();
+    let expected_families = armed.snapshots.iter().map(|item| money::hashed_id_for_test(
+        item.attribution_facts.iter().find(|fact| fact.field == "root_session_ref")
+            .map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id)))
+        .collect::<BTreeSet<_>>();
+    let first_families = rows.iter().filter(|row| row["row"] == "family").collect::<Vec<_>>();
+    assert_eq!(first_families.len(), expected_families.len());
+    assert_eq!(first_families.iter().map(|row| row["family"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>(), expected_families,
+        "every input root is accounted once, with no duplicate or silent omission");
+    assert_eq!(counts.families, expected_families.len() as u64);
+    assert!(counts.families_deadline_deferred > 0, "dense page must exercise pre-admitted deferred output");
+    let unreached = first_families.iter().rev().take(counts.families_deadline_deferred as usize).collect::<Vec<_>>();
+    assert_eq!(unreached.len() as u64, counts.families_deadline_deferred);
+    assert!(unreached.iter().all(|row| row["p1_reasons"] == serde_json::json!(["deadline"]) &&
+        row["category"] == "unbuilt" && row["old_available"] == false && row["grains"] == 0 && row["coverage_complete"] == false),
+        "every unreached family has one explicit deadline failure, with no partial body or digest basis");
+    assert_eq!(first_page["written"].as_u64().unwrap() + first_page["failed"].as_u64().unwrap() +
+        first_page["unchanged"].as_u64().unwrap(), expected_families.len() as u64);
+    assert_eq!(first_page["refused"], false);
+    assert!(first_families.iter().all(|row| row["category"] != "unbuilt" ||
+        !row["p1_reasons"].as_array().unwrap().is_empty()), "unbuilt needs a reason");
     let deadline_families = rows.iter().filter(|row| row["row"] == "family" &&
         row["p1_reasons"].as_array().is_some_and(|reasons| reasons.iter().any(|reason| reason == "deadline")))
         .map(|row| row["family"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>();
     assert!(!deadline_families.is_empty(), "unreached families need deadline rows");
+    assert!(deadline_families.len() as u64 >= counts.families_deadline_deferred);
     assert_eq!(first_page["page_families"].as_u64().unwrap(), rows.iter().filter(|row| row["row"] == "family").count() as u64);
     assert_eq!(money::reserved_for_test(), 0);
     let (input, comparisons, capture_us) = money::capture::work_for_test(&fixture.support);
@@ -1449,8 +1470,8 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
-        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
+        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
     money::disable_shadow_for_test(&fixture.support);
 }
 

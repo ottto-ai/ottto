@@ -660,7 +660,10 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) families_differ_grains: u64,
     pub(crate) families_union_partial: u64,
     pub(crate) families_unbuilt: u64,
+    /// Unreached families whose pre-admitted deadline rows the writer renders.
+    pub(crate) families_deadline_deferred: u64,
     pub(crate) families_coverage_complete: u64,
+    /// Includes missing/unbuilt certificates, not only compared mismatches.
     pub(crate) certificate_mismatch: u64,
     pub(crate) units_counted: u64,
     pub(crate) units_owned: u64,
@@ -1274,8 +1277,7 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let absolute_deadline = started + PAGE_MAX_ELAPSED;
-    let deadline = absolute_deadline - PAGE_CLOSE_RESERVE;
+    let deadline = started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE;
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us: capture::take_capture_us(),
@@ -1383,16 +1385,19 @@ fn shadow_page_with_coverage(
     // every body, while the pre-admitted family failure rows still publish.
     let (member_keys, indexed_members) =
         family_members(index, &roots, deadline).unwrap_or_default();
-    let mut order = roots.iter().copied().collect::<Vec<_>>();
-    order.sort_by_cached_key(|root| {
-        ledger
-            .get(&family_key(root))
-            .map_or(0, |record| record.window())
-    });
+    let mut order = roots
+        .iter()
+        .map(|root| {
+            let key = family_key(root);
+            let turn = ledger.get(&key).map_or(0, |record| record.window());
+            (*root, key, turn)
+        })
+        .collect::<Vec<_>>();
+    order.sort_by_key(|(_, _, turn)| *turn);
     let capture_turns = order
         .iter()
         .take(capture::NEXT_PAGE_FAMILIES)
-        .copied()
+        .map(|(root, _, _)| *root)
         .collect::<BTreeSet<_>>();
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     let mut captures = BTreeMap::new();
@@ -1471,21 +1476,40 @@ fn shadow_page_with_coverage(
     let mut written = 0;
     let mut incomplete = 0;
     let mut failure_digest = DeadlineDigest::default();
-    for root in order {
-        if Instant::now() >= absolute_deadline {
-            // If exceptional closing work itself exhausts the total, use
-            // whole-page refusal instead of carrying on under the live lock.
-            counts.refused_deadline = 1;
-            drop(families);
-            drop(reservations);
-            return refuse(&end, Some(ledger), index, roots.len(), counts);
+    let mut order = order.into_iter();
+    while let Some((root, key, turn)) = order.next() {
+        if scope.is_none() || preflight_check(deadline).is_err() {
+            // No body or digest work after expiry. The same funded batch
+            // carries every remaining identity to the writer, which emits
+            // exactly one deadline failure and a complete digest per root.
+            let deferred = order.len() as u64 + 1;
+            for (root, key, turn) in std::iter::once((root, key, turn)).chain(order) {
+                memos.push(PendingMemo {
+                    key,
+                    basis: None,
+                    observed_unix: turn,
+                    published: ClaudeFamilyPublication {
+                        utc_day: utc_day(now),
+                        digest: 0,
+                        epoch: process_epoch(),
+                        attempted: now,
+                    },
+                    row: true,
+                    deferred: Some((root.to_owned(), coverage_view.family(root))),
+                });
+            }
+            counts.families += deferred;
+            counts.families_unbuilt += deferred;
+            counts.families_deadline_deferred += deferred;
+            counts.certificate_mismatch += deferred;
+            counts.removed_change_unavailable += deferred;
+            failed += deferred;
+            incomplete += deferred;
+            break;
         }
-        // Check time before any content walk; remaining roots still flow
-        // through the pre-admitted failure publication and memo bookkeeping.
-        let expired = scope.is_none() || preflight_check(deadline).is_err();
         let items = &by_root[root];
         let mut family_captures = BTreeMap::new();
-        for item in items.iter().take(if expired { 0 } else { items.len() }) {
+        for item in items {
             if Instant::now() >= deadline {
                 break;
             }
@@ -1494,19 +1518,15 @@ fn shadow_page_with_coverage(
                 family_captures.insert(key, capture);
             }
         }
-        let scratch = if expired {
-            Err("deadline")
-        } else {
-            family_preflight(
-                root,
-                items,
-                &family_captures,
-                ledger,
-                api_report,
-                trace_report,
-                deadline,
-            )
-        };
+        let scratch = family_preflight(
+            root,
+            items,
+            &family_captures,
+            ledger,
+            api_report,
+            trace_report,
+            deadline,
+        );
         let state = coverage_view.family(root);
         let mut basis = None;
         let mut rows;
@@ -1615,7 +1635,6 @@ fn shadow_page_with_coverage(
         };
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);
-        let key = family_key(root);
         let unchanged = !ledger.in_flight(&key)
             && ledger
                 .get(&key)
@@ -1629,15 +1648,10 @@ fn shadow_page_with_coverage(
         // A row emitted without reaching optional family work does not
         // consume its scheduling turn. It leads the following page,
         // while publication metadata still records the actual page time.
-        let scheduling_time = if expired {
-            ledger.get(&key).map_or(0, |record| record.window())
-        } else {
-            now
-        };
         memos.push(PendingMemo {
             key,
             basis: if unchanged { None } else { basis },
-            observed_unix: scheduling_time,
+            observed_unix: now,
             published: ClaudeFamilyPublication {
                 utc_day: utc_day(now),
                 digest,
@@ -1645,6 +1659,7 @@ fn shadow_page_with_coverage(
                 attempted: now,
             },
             row: !unchanged,
+            deferred: None,
         });
         if unchanged {
             counts.unchanged += 1;
@@ -2591,7 +2606,9 @@ fn hand_off_reserved_buffer(
         counts.save_bytes_today = ledger.save_bytes_today;
     }
     counts.ledger_loads_refused = store::loads_refused();
-    counts.jsonl_queued = families.iter().map(FamilyRows::rows).sum::<u64>() + 1;
+    counts.jsonl_queued = families.iter().map(FamilyRows::rows).sum::<u64>()
+        + memos.iter().filter(|memo| memo.deferred.is_some()).count() as u64
+        + 1;
     let job = WriteJob {
         support_dir: end.support_dir.to_path_buf(),
         jsonl: JsonlBatch {
@@ -3609,6 +3626,7 @@ mod round3_tests {
                     attempted: 11,
                 },
                 row: false,
+                deferred: None,
             },
             &mut counts,
         );
