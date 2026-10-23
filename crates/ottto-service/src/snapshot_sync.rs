@@ -8910,51 +8910,23 @@ fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadEr
 }
 
 fn is_literal_version_skew(error: &anyhow::Error) -> bool {
-    let Some(body) = error
+    if error
+        .downcast_ref::<crate::snapshot_client::RequestOwnedVersionSkew>()
+        .is_some()
+    {
+        return true;
+    }
+    // Synthetic transport fixtures historically construct BatchRejected
+    // directly. Production only trusts the raw-response marker above.
+    #[cfg(test)]
+    if let Some(body) = error
         .downcast_ref::<BatchRejected>()
         .filter(|error| error.status == 422)
         .and_then(|error| error.body_excerpt.as_deref())
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(body).ok())
-    else {
-        return false;
-    };
-    // Explicit unknown-field/contract-enum errors indicate an older schema.
-    // A field name alone also occurs in genuine per-item validation failures;
-    // those must keep the existing singleton isolation and poison handling.
-    body.get("detail")
-        .or_else(|| body.get("errors"))
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|errors| {
-            errors.iter().any(|error| {
-                let kind = error.get("type").and_then(serde_json::Value::as_str);
-                let Some(location) = error.get("loc").and_then(serde_json::Value::as_array) else {
-                    return false;
-                };
-                let literal_field =
-                    location
-                        .iter()
-                        .filter_map(serde_json::Value::as_str)
-                        .any(|field| {
-                            matches!(
-                                field,
-                                "usage_accounting_contract"
-                                    | "removed_request_count"
-                                    | "removed_usage"
-                                    | "telemetry_owned_complete"
-                                    | "request_usage_origin"
-                            )
-                        });
-                let enum_field = location
-                    .last()
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|field| {
-                        matches!(field, "usage_accounting_contract" | "request_usage_origin")
-                    });
-                literal_field
-                    && (kind == Some("extra_forbidden")
-                        || kind == Some("literal_error") && enum_field)
-            })
-        })
+    {
+        return crate::snapshot_client::literal_version_skew_body(body.as_bytes());
+    }
+    false
 }
 
 fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {

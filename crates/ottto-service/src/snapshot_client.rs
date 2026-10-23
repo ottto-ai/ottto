@@ -2135,10 +2135,7 @@ impl SnapshotApiClient {
                     None,
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(BatchRejected {
-                    status: code,
-                    body_excerpt: response_body_excerpt(response),
-                }))
+                Err(validation_rejection(code, response))
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.record_batch_http_failure(
@@ -3178,6 +3175,121 @@ fn response_has_request_id(response: &ureq::Response) -> bool {
     .any(|header| response.header(header).is_some())
 }
 
+/// Content-free marker derived before any diagnostic redaction/truncation.
+#[derive(Debug)]
+pub(crate) struct RequestOwnedVersionSkew;
+impl std::fmt::Display for RequestOwnedVersionSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("backend request-owned schema version skew")
+    }
+}
+impl std::error::Error for RequestOwnedVersionSkew {}
+
+fn validation_rejection(status: u16, response: ureq::Response) -> anyhow::Error {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    let read = response
+        .into_reader()
+        .take(64 * 1024)
+        .read_to_end(&mut raw)
+        .is_ok();
+    let skew = read && status == 422 && literal_version_skew_body(&raw);
+    let excerpt = if read {
+        std::str::from_utf8(&raw)
+            .ok()
+            .and_then(safe_response_body_excerpt)
+    } else {
+        None
+    };
+    let error = anyhow::Error::new(BatchRejected {
+        status,
+        body_excerpt: excerpt,
+    });
+    if skew {
+        error.context(RequestOwnedVersionSkew)
+    } else {
+        error
+    }
+}
+
+/// Inspect complete error entries inside a bounded raw prefix. Stop as soon
+/// as one exact type/location pair proves schema skew, even if the backend
+/// returns more errors than the prefix can hold. Never retain raw input.
+pub(crate) fn literal_version_skew_body(raw: &[u8]) -> bool {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use std::cell::Cell;
+    fn matches_error(error: &serde_json::Value) -> bool {
+        let kind = error.get("type").and_then(serde_json::Value::as_str);
+        let Some(location) = error.get("loc").and_then(serde_json::Value::as_array) else {
+            return false;
+        };
+        let literal_field = location
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|field| {
+                matches!(
+                    field,
+                    "usage_accounting_contract"
+                        | "removed_request_count"
+                        | "removed_usage"
+                        | "telemetry_owned_complete"
+                        | "request_usage_origin"
+                )
+            });
+        let enum_field = location
+            .last()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|field| {
+                matches!(field, "usage_accounting_contract" | "request_usage_origin")
+            });
+        literal_field
+            && (kind == Some("extra_forbidden") || kind == Some("literal_error") && enum_field)
+    }
+    struct Errors<'a>(&'a Cell<bool>);
+    impl<'de> Visitor<'de> for Errors<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("validator errors")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(error) = seq.next_element::<serde_json::Value>()? {
+                if matches_error(&error) {
+                    self.0.set(true);
+                    return Err(serde::de::Error::custom("schema marker found"));
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Errors<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+    struct Body<'a>(&'a Cell<bool>);
+    impl<'de> Visitor<'de> for Body<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("validator response")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "detail" || key == "errors" {
+                    map.next_value_seed(Errors(self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    let found = Cell::new(false);
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    let _ = serde::de::Deserializer::deserialize_map(&mut decoder, Body(&found));
+    found.get()
+}
+
 fn response_body_excerpt(response: ureq::Response) -> Option<String> {
     response
         .into_string()
@@ -3684,6 +3796,43 @@ mod tests {
                 String::from_utf8_lossy(&body[..body.len().min(80)])
             );
         }
+    }
+
+    #[test]
+    fn literal_schema_marker_uses_bounded_raw_response_before_truncated_diagnostics() {
+        let errors=["removed_usage","removed_request_count","telemetry_owned_complete","usage_accounting_contract"].map(|field| {
+            serde_json::json!({"type":"extra_forbidden","loc":["body","snapshots",0,field],"msg":"Extra inputs are not permitted","input":"synthetic validator detail ".repeat(100),"url":"https://errors.example/extra_forbidden"})
+        });
+        let raw = serde_json::json!({"detail":errors,"padding":"x".repeat(128*1024)}).to_string();
+        assert!(raw.len() > 64 * 1024);
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(
+            error.downcast_ref::<RequestOwnedVersionSkew>().is_some(),
+            "complete first error classifies even when later errors exceed the bounded prefix"
+        );
+        let rejected = error.downcast_ref::<BatchRejected>().unwrap();
+        assert_eq!(rejected.status, 422);
+        let excerpt = rejected.body_excerpt.as_deref().unwrap();
+        assert!(excerpt.chars().count() <= 503);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(excerpt).is_err(),
+            "the diagnostic is deliberately not classification input"
+        );
+    }
+
+    #[test]
+    fn long_genuine_literal_validation_still_uses_item_isolation() {
+        let raw=serde_json::json!({"detail":[{"type":"greater_than_equal","loc":["body","snapshots",0,"removed_request_count"],"msg":"Input should be greater than or equal to zero ".repeat(100),"input":-1}]}).to_string();
+        assert!(raw.len() > 500);
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(error.downcast_ref::<RequestOwnedVersionSkew>().is_none());
+        assert_eq!(error.downcast_ref::<BatchRejected>().unwrap().status, 422);
     }
 
     #[test]

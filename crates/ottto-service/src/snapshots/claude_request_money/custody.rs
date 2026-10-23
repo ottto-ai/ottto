@@ -1704,23 +1704,25 @@ impl Custody {
             return false;
         }
         let (bytes, hashes) = self.carrier_size(&key);
-        // The two globals replace empty defaults; data carriers are new.
+        let entry_offers = self
+            .files
+            .get(&key)
+            .map(|file| file.delivery.offers.len())
+            .or_else(|| {
+                self.telemetry
+                    .get(&key)
+                    .map(|file| file.delivery.offers.len())
+            })
+            .unwrap_or(0);
+        // Only globals replace defaults. New data carriers contribute their
+        // own count; never walk all preceding carriers for each decoded row.
         if key == CONTROL || key == EVER {
             self.recount_globals();
         } else {
             self.bytes = self.bytes.saturating_add(bytes);
             self.hashes = self.hashes.saturating_add(hashes);
+            self.offers = self.offers.saturating_add(entry_offers);
         }
-        self.offers = self
-            .files
-            .values()
-            .map(|file| file.delivery.offers.len())
-            .sum::<usize>()
-            + self
-                .telemetry
-                .values()
-                .map(|file| file.delivery.offers.len())
-                .sum::<usize>();
         let valid = self.bytes <= MAX_BYTES
             && self.hashes <= MAX_HASHES
             && self.record_count() <= max_records
@@ -1728,13 +1730,19 @@ impl Custody {
         if !valid {
             self.files.remove(&key);
             self.telemetry.remove(&key);
-            if key == CONTROL {
-                self.control = Control::default();
+            if key == CONTROL || key == EVER {
+                if key == CONTROL {
+                    self.control = Control::default();
+                }
+                if key == EVER {
+                    self.ever.clear();
+                }
+                self.recount_globals();
+            } else {
+                self.bytes = self.bytes.saturating_sub(bytes);
+                self.hashes = self.hashes.saturating_sub(hashes);
+                self.offers = self.offers.saturating_sub(entry_offers);
             }
-            if key == EVER {
-                self.ever.clear();
-            }
-            self.recount_globals();
         }
         valid
     }
