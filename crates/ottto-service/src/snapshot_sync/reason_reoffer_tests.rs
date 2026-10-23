@@ -503,7 +503,7 @@ fn unanswered_reoffer_keeps_refusal_and_counts_failure() {
         .attempted_reason_reoffers
         .extend(attempted.keys().cloned());
     progress.record_body(&fp(2), &body(2));
-    progress.finish_reason_reoffers(&attempted, false, SnapshotSource::Codex);
+    progress.finish_reason_reoffers(&attempted, false, SnapshotSource::Codex.api_slug());
     let counts = progress.reason_reoffer_counts;
     assert_eq!((counts.failed, counts.accepted), (1, 1));
     assert!(progress.active_reason_reoffers.is_empty());
@@ -613,7 +613,7 @@ fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
     let leased = progress.active_reason_reoffers.clone();
     progress.attempted_reason_reoffers.insert(fp(2));
     progress.quarantine_retryable_body(&fp(2), &body(2));
-    progress.finish_reason_reoffers(&leased, false, SnapshotSource::Codex);
+    progress.finish_reason_reoffers(&leased, false, SnapshotSource::Codex.api_slug());
     let counts = progress.reason_reoffer_counts;
     assert_eq!(
         (
@@ -677,4 +677,137 @@ fn materialized_cache_probe_matches_only_its_own_refusal_witness() {
         "another body's lease cannot release this probe"
     );
     std::fs::remove_dir_all(root).unwrap();
+}
+
+/// A RetryPending fact in the same ledger is newer than the retained refusal.
+/// An older index-only timer remains dominated by the permanent answer.
+#[test]
+fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
+    let (mut progress, index) = refused(&[(1, original_pair(0))]);
+    assert!(select(&mut progress, &index, NOW));
+    progress.quarantine_retryable_body(&fp(1), &body(1));
+    let retry = progress.quarantined_fingerprints[&fp(1)].clone();
+    assert!(!select(&mut progress, &index, NOW + 300));
+    assert_eq!(progress.quarantined_fingerprints[&fp(1)], retry);
+    assert!(progress.contains_body(&fp(1), &body(1)));
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_body_witness(
+        &[fp(1)],
+        &unique_poison_scope(),
+        &mut progress,
+        &mut accepted,
+        String::as_str,
+        |_| body(1),
+        |_| panic!("no early transmission"),
+        |_| Ok(()),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(progress.quarantined_fingerprints[&fp(1)], retry);
+    assert_eq!(
+        progress.permanent_rejections[&fp(1)].reoffer,
+        original_pair(NOW + DAY)
+    );
+
+    let (mut old_progress, mut old_index) = refused(&[(2, original_pair(NOW + DAY))]);
+    let old_timer = old_index
+        .quarantined_snapshot_fingerprints
+        .get_mut(&fp(2))
+        .unwrap();
+    old_timer.disposition = SnapshotQuarantineDisposition::RetryPending;
+    old_timer.retry_after_unix_seconds = 1;
+    assert!(!select(&mut old_progress, &old_index, NOW));
+    assert_eq!(
+        old_progress.quarantined_fingerprints[&fp(2)].disposition,
+        SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+}
+
+/// Bootstrap errors must finish the logical-offer counters just as main-page
+/// errors do. Exhausted short sheds count once despite three physical sends.
+#[test]
+#[serial(client_report)]
+fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
+    for failure in ["shed", "network", "invalid_ack", "checkpoint"] {
+        let root = cache_effective_wire_fixture_root();
+        let mut index = ScanIndex::default();
+        let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+        let probe = cache_head_probe(&scan.snapshots.remove(0));
+        let fingerprint = &probe.snapshot_fingerprint;
+        let body = snapshot_upload_body_witness(&probe);
+        let mut progress = ledger();
+        progress.quarantine_permanent_body(
+            fingerprint,
+            &body,
+            reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+        );
+        progress.reserve_reason_reoffer(fingerprint, body, NOW);
+        let mut posts = 0;
+        let mut budget = InplaceRetryBudget::default();
+        let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
+            bootstrap_cache_heads_with_budget(
+                std::slice::from_ref(&probe),
+                "codex",
+                &mut progress,
+                false,
+                &mut budget,
+                |items, _| {
+                    posts += 1;
+                    match failure {
+                        "shed" => Err(anyhow::Error::new(UploadShed {
+                            status: 503,
+                            retry_after: Some(Duration::from_secs(1)),
+                            code: None,
+                        })),
+                        "network" => Err(anyhow!("synthetic upload failure")),
+                        "invalid_ack" => Ok(accepted_batch(0)),
+                        "checkpoint" => Ok(accepted_batch(items.len())),
+                        _ => unreachable!(),
+                    }
+                },
+                |_| {
+                    if failure == "checkpoint" {
+                        Err(anyhow!("synthetic checkpoint failure"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+        });
+        assert!(result.is_err(), "{failure}");
+        let counts = progress.reason_reoffer_counts;
+        assert_eq!((counts.selected, counts.attempted), (1, 1), "{failure}");
+        assert_eq!(
+            counts.attempted_bytes,
+            snapshot_packing_json_length(&probe).unwrap(),
+            "{failure}"
+        );
+        assert!(
+            progress.active_reason_reoffers.is_empty(),
+            "{failure}: logical offer finalized"
+        );
+        if failure == "shed" {
+            assert_eq!((counts.shed, counts.failed, counts.accepted), (1, 0, 0));
+            assert_eq!(posts, 3);
+            assert_eq!(waits.len(), 2);
+        } else if failure == "checkpoint" {
+            assert_eq!(
+                counts.accepted, 1,
+                "validated server ACK is known even though checkpoint failed"
+            );
+        } else {
+            assert_eq!((counts.failed, counts.shed), (1, 0), "{failure}");
+        }
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -740,7 +740,27 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     }
     index.save(&index_path).unwrap();
     let quiet = pipeline.cycle(t1 + 3_600);
-    let _ = quiet.result;
+    assert!(
+        quiet.result.is_err(),
+        "a suppressed body still owes its newer conflict follow-up"
+    );
+    assert_eq!(
+        quiet.index.quarantined_snapshot_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert_eq!(
+        quiet.progress.quarantined_fingerprints[&fingerprint].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(quiet.index.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        pipeline.server.last_terminal()["last_census_complete"],
+        false
+    );
+    assert_eq!(
+        reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],
+        reoffer_json(&day1, &fingerprint)["retry_after_unix_seconds"]
+    );
     assert_eq!(
         pipeline.server.offered().len(),
         2,
@@ -1133,7 +1153,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
         saved.borrow()["permanent_rejections"][&fingerprint]["reoffer"]["reason"],
         "classified"
     );
-    progress.finish_reason_reoffers(&leased, false, SnapshotSource::ClaudeCode);
+    progress.finish_reason_reoffers(&leased, false, SnapshotSource::ClaudeCode.api_slug());
     let counts = progress.reason_reoffer_counts;
     assert_eq!(
         (

@@ -150,55 +150,64 @@ fn bootstrap_cache_heads_with_budget(
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
-    let mut deferred = 0usize;
-    let stages: &[bool] = if ordinary_bootstrap {
-        &[false, true]
-    } else {
-        &[true]
-    };
-    for &enforce_head_cas in stages {
-        // A prior ordinary body ACK has no head proof. Force the exact probe
-        // even when delivery of these bytes was previously acknowledged.
-        if enforce_head_cas {
-            for probe in probes {
-                progress
-                    .accepted_fingerprints
-                    .remove(&probe.snapshot_fingerprint);
-                progress
-                    .accepted_body_witnesses
-                    .remove(&probe.snapshot_fingerprint);
+    let leased = progress.active_reason_reoffers.clone();
+    let mut shed = false;
+    let result = (|| -> Result<usize> {
+        let mut deferred = 0usize;
+        let stages: &[bool] = if ordinary_bootstrap {
+            &[false, true]
+        } else {
+            &[true]
+        };
+        for &enforce_head_cas in stages {
+            // A prior ordinary body ACK has no head proof. Force the exact probe
+            // even when delivery of these bytes was previously acknowledged.
+            if enforce_head_cas {
+                for probe in probes {
+                    progress
+                        .accepted_fingerprints
+                        .remove(&probe.snapshot_fingerprint);
+                    progress
+                        .accepted_body_witnesses
+                        .remove(&probe.snapshot_fingerprint);
+                }
+            }
+            let mut accepted = 0;
+            let outcome = upload_resumable_batches_with_body_witness_partitioned(
+                probes,
+                poison_scope,
+                progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |item| Some(item.source_session_id.as_str()),
+                |_| false,
+                inplace_retry,
+                |items| upload(items, enforce_head_cas),
+                |progress| persist(progress),
+            )?;
+            match outcome {
+                ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+                // The partitioned uploader persisted each conflicting probe's exact
+                // body quarantine. Carry that hold into the normal upload rather
+                // than discarding every unrelated file's progress.
+                ResumableUploadResult::Deferred { count } => {
+                    deferred = deferred.saturating_add(count);
+                }
+                outcome => {
+                    shed = matches!(outcome, ResumableUploadResult::Shed { .. });
+                    return Err(anyhow::Error::new(SnapshotAckRejected {
+                        reason: "cache head probe did not settle exact predecessor evidence",
+                    }));
+                }
             }
         }
-        let mut accepted = 0;
-        let outcome = upload_resumable_batches_with_body_witness_partitioned(
-            probes,
-            poison_scope,
-            progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |item| Some(item.source_session_id.as_str()),
-            |_| false,
-            inplace_retry,
-            |items| upload(items, enforce_head_cas),
-            |progress| persist(progress),
-        )?;
-        match outcome {
-            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
-            // The partitioned uploader persisted each conflicting probe's exact
-            // body quarantine. Carry that hold into the normal upload rather
-            // than discarding every unrelated file's progress.
-            ResumableUploadResult::Deferred { count } => {
-                deferred = deferred.saturating_add(count);
-            }
-            _ => {
-                return Err(anyhow::Error::new(SnapshotAckRejected {
-                    reason: "cache head probe did not settle exact predecessor evidence",
-                }));
-            }
-        }
+        Ok(deferred)
+    })();
+    if result.is_err() {
+        progress.finish_reason_reoffers(&leased, shed, poison_scope);
     }
-    Ok(deferred)
+    result
 }
 
 fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
@@ -989,6 +998,21 @@ impl SnapshotUploadProgress {
         // stale index-owned obligation.
         self.quarantined_fingerprints
             .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
+        let newer_retryable_refusals = self
+            .quarantined_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && self
+                        .permanent_rejections
+                        .get(*fingerprint)
+                        .is_some_and(|refusal| {
+                            record.upload_body_witness.as_deref()
+                                == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<BTreeSet<_>>();
         for (fingerprint, record) in index_quarantine {
             if !self.accepted_fingerprints.contains(fingerprint) {
                 // The durable index claims a bounded admission re-offer before
@@ -1012,6 +1036,12 @@ impl SnapshotUploadProgress {
         // The server-permanent exact-body fact dominates an older index timer.
         // Keep the index-facing disposition truthful as well as suppressing I/O.
         for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            // A conflict recorded alongside the retained refusal is newer:
+            // permanent refusal recording itself always writes terminal. Keep
+            // that retry debt while the old refusal still suppresses early I/O.
+            if newer_retryable_refusals.contains(fingerprint) {
+                continue;
+            }
             if self
                 .permanent_rejections
                 .get(fingerprint)
@@ -1301,7 +1331,7 @@ impl SnapshotUploadProgress {
         &mut self,
         attempted: &BTreeMap<String, String>,
         shed: bool,
-        source: SnapshotSource,
+        source: &str,
     ) {
         let counts = &mut self.reason_reoffer_counts;
         for fingerprint in attempted.keys() {
@@ -1322,8 +1352,8 @@ impl SnapshotUploadProgress {
         counts.invalid_extension = counts
             .invalid_extension
             .max(reason_reoffer::take_logged_invalid_extensions());
-        if reason_reoffer::should_log(source.api_slug(), counts) {
-            eprintln!("{}", counts.line(source.api_slug()));
+        if reason_reoffer::should_log(source, counts) {
+            eprintln!("{}", counts.line(source));
         }
     }
 
@@ -6030,7 +6060,15 @@ fn finish_sync_source(
         )
         .inspect_err(log_bootstrap_failure("probe"))?;
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-            .inspect_err(log_bootstrap_failure("apply"))?;
+            .inspect_err(log_bootstrap_failure("apply"))
+            .map_err(|error| {
+                upload_progress.finish_reason_reoffers(
+                    &attempted_reason_reoffers,
+                    false,
+                    source.api_slug(),
+                );
+                error
+            })?;
         if held > 0 {
             eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -6127,7 +6165,7 @@ fn finish_sync_source(
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
         matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
-        source,
+        source.api_slug(),
     );
 
     // Exact progress is durable before this seam. The same subsequent index
@@ -8347,7 +8385,11 @@ where
                     .get(*fingerprint)
                     .is_some_and(|record| {
                         record.upload_body_witness.as_deref() == Some(body.as_str())
-                            && record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                            && matches!(
+                                record.disposition,
+                                SnapshotQuarantineDisposition::UnprovenTerminal
+                                    | SnapshotQuarantineDisposition::RetryPending
+                            )
                     })
         })
         .map(|(fingerprint, body)| (fingerprint.clone(), body.clone()))
@@ -8425,6 +8467,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut conflicts_this_pass = BTreeSet::new();
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -8469,6 +8512,22 @@ where
             }
             Ok(SnapshotPageOutcome::Settled { conflicted }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
+                if conflicted > 0 {
+                    for index in &indices {
+                        let item = &items[*index];
+                        if progress
+                            .quarantined_fingerprints
+                            .get(fingerprint(item))
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(body_witness(item).as_str())
+                            })
+                        {
+                            conflicts_this_pass.insert(fingerprint(item));
+                        }
+                    }
+                }
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -8592,6 +8651,23 @@ where
         }
     }
 
+    conflicted_entities += current_body_witnesses
+        .iter()
+        .filter(|(fingerprint, body)| {
+            !conflicts_this_pass.contains(fingerprint.as_str())
+                && progress
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|refusal| refusal.body_witness == **body)
+                && progress
+                    .quarantined_fingerprints
+                    .get(*fingerprint)
+                    .is_some_and(|record| {
+                        record.disposition == SnapshotQuarantineDisposition::RetryPending
+                            && record.upload_body_witness.as_deref() == Some(body.as_str())
+                    })
+        })
+        .count();
     if conflicted_entities > 0 {
         // Every conflicting entity is durably quarantined with the same
         // bounded backoff a rejection gets, and every sibling in the page is

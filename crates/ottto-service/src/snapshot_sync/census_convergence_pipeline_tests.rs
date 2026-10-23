@@ -320,7 +320,11 @@ impl PipelineFixture {
         )
         .expect("in-process upload");
         if reoffers {
-            progress.finish_reason_reoffers(&leased_reoffers, false, SnapshotSource::ClaudeCode);
+            progress.finish_reason_reoffers(
+                &leased_reoffers,
+                false,
+                SnapshotSource::ClaudeCode.api_slug(),
+            );
         }
         if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
             assert_eq!(result, ResumableUploadResult::Completed);
