@@ -128,6 +128,17 @@ impl PipelineFixture {
         upload: PipelineUpload,
         before_classify: impl FnOnce(&mut ScanIndex),
     ) -> PipelinePage {
+        self.page_with_reoffers(collected_at, cycle, upload, before_classify, false)
+    }
+
+    fn page_with_reoffers(
+        &self,
+        collected_at: &str,
+        cycle: &PipelineCycle<'_>,
+        upload: PipelineUpload,
+        before_classify: impl FnOnce(&mut ScanIndex),
+        reoffers: bool,
+    ) -> PipelinePage {
         let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
         index.activate_upload_context(cycle.upload_context.to_string());
         if cycle.historical_replay {
@@ -205,12 +216,62 @@ impl PipelineFixture {
             },
         );
         before_classify(&mut index);
+        if reoffers {
+            // Inject due, exact server refusals after the real policy/body
+            // finalization. Even a lease for the held revision must pass the
+            // production authority gates below.
+            for item in &scan.snapshots {
+                progress.quarantine_permanent_body(
+                    &item.snapshot_fingerprint,
+                    &snapshot_upload_body_witness(item),
+                    reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+                );
+                progress
+                    .permanent_rejections
+                    .get_mut(&item.snapshot_fingerprint)
+                    .unwrap()
+                    .reoffer = Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                    retry_after_unix_seconds: 0,
+                });
+                index.quarantined_snapshot_fingerprints.insert(
+                    item.snapshot_fingerprint.clone(),
+                    progress.quarantined_fingerprints[&item.snapshot_fingerprint].clone(),
+                );
+            }
+            let now = OffsetDateTime::parse(collected_at, &Rfc3339)
+                .unwrap()
+                .unix_timestamp() as u64;
+            let scope = reason_reoffer::Scope {
+                index: &index,
+                now,
+                window_start_unix_seconds: now - 183 * 86_400,
+            };
+            progress.prepare_quarantine_and_reason_retries(
+                &index.quarantined_snapshot_fingerprints,
+                Some(&scope),
+            );
+            assert_eq!(
+                progress.reason_reoffer_counts.selected,
+                scan.snapshots.len()
+            );
+            progress
+                .save(&progress_path)
+                .expect("save lease before synthetic upload");
+        }
         let holds = LocalHoldSettlement::classify(
             SnapshotSource::ClaudeCode,
             &mut index,
             &mut scan,
             &disposition,
         );
+        if reoffers {
+            progress
+                .extend_reason_reoffers_before_upload(&scan.snapshots, &holds.held_fingerprints);
+            progress
+                .save(&progress_path)
+                .expect("save pre-send cooldown");
+        }
+        let leased_reoffers = progress.active_reason_reoffers.clone();
         let mut uploaded = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
@@ -258,6 +319,13 @@ impl PipelineFixture {
             },
         )
         .expect("in-process upload");
+        if reoffers {
+            progress.finish_reason_reoffers(
+                &leased_reoffers,
+                false,
+                SnapshotSource::ClaudeCode.api_slug(),
+            );
+        }
         if !matches!(upload, PipelineUpload::EntityAckRejected { .. }) {
             assert_eq!(result, ResumableUploadResult::Completed);
         }
@@ -1982,5 +2050,79 @@ fn no_hold_rejected_and_deferred_pages_never_increment_the_terminal_hold_counter
             upload == PipelineUpload::ServerDeferred
         );
         assert_eq!(terminal_hold_settlement_count(), before, "{upload:?}");
+    }
+}
+
+/// F3/#690: a due re-offer on a Rejected page cannot bypass either a bound
+/// terminal authority hold or a RetryPending family. Only the terminal-bound
+/// case may use H1's restorable-hold settlement; real retry debt stays owed.
+#[test]
+#[serial(source_manifests)]
+fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    for retry_pending in [false, true] {
+        let fixture = PipelineFixture::new(if retry_pending {
+            "reoffer-h1-retry-pending"
+        } else {
+            "reoffer-h1-terminal"
+        });
+        let baseline = fixture.baseline();
+        fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
+        fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+        fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
+        let upload = PipelineUpload::EntityAckRejected {
+            session: PIPELINE_SESSIONS[1],
+            reason: reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+        };
+        let cycle = PipelineCycle {
+            proven_owner_session: Some(PIPELINE_HELD_SESSION),
+            first_page_upload: upload,
+            ..PIPELINE_HOLD_CYCLE
+        };
+        let settled_before = terminal_hold_settlement_count();
+        let first = fixture.page_with_reoffers(
+            "2026-08-02T09:00:00Z",
+            &cycle,
+            upload,
+            |index| {
+                if retry_pending {
+                    // The same held family has RetryPending debt at the
+                    // upload boundary, rather than an unrelated pending root.
+                    index.insert_retry_pending_claude_authority_for_test(PIPELINE_HELD_SESSION);
+                }
+            },
+            true,
+        );
+        assert!(matches!(
+            first.result,
+            ResumableUploadResult::Rejected { .. }
+        ));
+        assert_eq!(first.held.len(), 1);
+        assert!(
+            first.held.is_disjoint(&first.uploaded),
+            "a leased held body was never transmitted"
+        );
+        assert_eq!(first.progress.reason_reoffer_counts.selected, 2);
+        assert_eq!(first.progress.reason_reoffer_counts.attempted, 1);
+        assert_eq!(first.progress.reason_reoffer_counts.refused_same, 1);
+        assert_eq!(first.progress.reason_reoffer_counts.gate_held, 1);
+        assert_eq!(first.progress_blocking, retry_pending);
+        assert_eq!(
+            first.index.bounded_sweep_had_unsettled_upload(),
+            retry_pending
+        );
+        assert_eq!(
+            terminal_hold_settlement_count(),
+            settled_before + u64::from(!retry_pending)
+        );
+        let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+        assert_eq!(
+            first.index.files[&held_key].last_snapshot_fingerprint,
+            baseline.files[&held_key].last_snapshot_fingerprint
+        );
+        let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+        assert_eq!(last.scan.census_complete, !retry_pending);
+        assert_eq!(last.backfill_succeeded, !retry_pending);
+        assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     }
 }

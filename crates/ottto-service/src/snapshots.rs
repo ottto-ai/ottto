@@ -3085,6 +3085,11 @@ pub struct ScanIndex {
     /// read from the local list each cycle. Empty for other sources.
     #[serde(skip)]
     claude_reemission_exclusions: ReemissionExclusions,
+    /// Runtime-only exact refusal re-offer leases (fingerprint -> refused body
+    /// witness) granted by the upload ledger for this cycle. Never persisted;
+    /// scheduling permission only, never acceptance evidence.
+    #[serde(skip)]
+    reason_reoffer_retries: BTreeMap<String, String>,
 }
 
 /// The production paths that set `bounded_sweep_had_unsettled_upload`.
@@ -3304,6 +3309,7 @@ impl Default for ScanIndex {
             active_effective_upload_body_witness_revision_monotone: false,
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
             claude_reemission_exclusions: ReemissionExclusions::default(),
+            reason_reoffer_retries: BTreeMap::new(),
         }
     }
 }
@@ -35230,7 +35236,6 @@ impl ScanIndex {
         UnsettledUploadCause::names(self.unsettled_cause_bits())
     }
 
-    #[cfg(test)]
     pub(crate) fn accepted_snapshot_fingerprint_recorded(&self, fingerprint: &str) -> bool {
         self.accepted_snapshot_fingerprints.contains(fingerprint)
     }
@@ -35924,6 +35929,9 @@ impl ScanIndex {
     }
 
     fn quarantine_requires_retry(&self, fingerprint: &str) -> bool {
+        if self.reason_reoffer_retries.contains_key(fingerprint) {
+            return true;
+        }
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -35935,6 +35943,30 @@ impl ScanIndex {
                 persisted.disposition == SnapshotQuarantineDisposition::RetryPending
                     && (&persisted.witness != active || persisted.retry_after_unix_seconds <= now)
             })
+    }
+
+    /// Arm this cycle's exact refusal re-offer leases and return the indexed
+    /// files that hold them, for the bounded watcher-hint queue. Paths come
+    /// only from the committed file/entity incidence table; the scan
+    /// revalidates each one like any other hint. Family/account holds keep
+    /// their own earlier gates in `candidate_decision`.
+    pub(crate) fn activate_reason_reoffer_retries(
+        &mut self,
+        leases: BTreeMap<String, String>,
+    ) -> Vec<PathBuf> {
+        self.reason_reoffer_retries = leases;
+        if self.reason_reoffer_retries.is_empty() {
+            return Vec::new();
+        }
+        self.file_snapshot_fingerprints
+            .iter()
+            .filter(|(_, fingerprints)| {
+                fingerprints
+                    .iter()
+                    .any(|fingerprint| self.reason_reoffer_retries.contains_key(fingerprint))
+            })
+            .map(|(key, _)| PathBuf::from(key))
+            .collect()
     }
 
     fn quarantine_requires_retry_body(&self, fingerprint: &str, body_witness: &str) -> bool {
@@ -37180,6 +37212,7 @@ impl ScanIndex {
                 .effective_upload_body_witness_revision_excluded_source_files
                 .clone(),
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
+            reason_reoffer_retries: self.reason_reoffer_retries.clone(),
         };
         for key in &safe_keys {
             match self.terminal_jsonl_dispositions.get(key) {
@@ -74534,6 +74567,85 @@ mod tests {
         );
     }
 
+    /// R11/R12: an exact refusal re-offer lease re-reads an unchanged,
+    /// already-passed file through the ordinary retry predicate, but a
+    /// Claude family hold keeps its own earlier gate.
+    #[test]
+    fn reason_reoffer_lease_reparses_unchanged_file_but_never_bypasses_a_family_hold() {
+        let root = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
+        let key = format!("/opaque/{root}.jsonl");
+        let mut index = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("old-entity"));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        // A family hold binds a well-formed source revision.
+        entry.source_file_fingerprint = "a".repeat(64);
+        index.files.insert(key.clone(), entry.clone());
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["old-entity".to_string()]));
+        index
+            .snapshot_activity_at
+            .insert("old-entity".into(), Some("2026-10-14T10:00:00Z".into()));
+        // The exact refusal's terminal record, as the uploader leaves it.
+        index.quarantined_snapshot_fingerprints.insert(
+            "old-entity".into(),
+            SnapshotQuarantineRecord {
+                witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                retry_after_unix_seconds: 0,
+                upload_body_witness: Some("old-body".into()),
+                failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+                disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+            },
+        );
+        let mut candidate = test_candidate(PathBuf::from(&key));
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+        assert!(!index.quarantine_requires_retry_body("old-entity", "old-body"));
+
+        let hinted = index.activate_reason_reoffer_retries(BTreeMap::from([(
+            "old-entity".to_string(),
+            "old-body".to_string(),
+        )]));
+        assert_eq!(hinted, vec![PathBuf::from(&key)], "only the leased file");
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::ActivityOrQuarantineRetry)
+            )
+        );
+        assert!(
+            index.quarantine_requires_retry_body("old-entity", "old-body"),
+            "finalization keeps the leased body instead of a semantic no-op"
+        );
+        // Runtime only: neither a save nor a committable subset persists it.
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert_eq!(
+            saved.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+
+        index.insert_unproven_terminal_claude_authority_for_test(
+            root,
+            &candidate.source_file_fingerprint,
+        );
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip,
+            "a lease is scheduling permission only, never a family-hold bypass"
+        );
+        assert!(index
+            .activate_reason_reoffer_retries(BTreeMap::new())
+            .is_empty());
+    }
+
     #[test]
     fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
         let key = "/opaque/rearmed.jsonl".to_string();
@@ -75894,7 +76006,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, reason_reoffer_retries);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
