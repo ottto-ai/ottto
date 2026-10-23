@@ -288,6 +288,37 @@ pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) 
         counts,
     );
 }
+static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct HistoryProofCorrectionDeferred {
+    history_proof_correction_deferred: u64,
+    history_proof_correction_deferred_total: u64,
+}
+
+/// Local counter (StateMissing M2, SOURCE h695 N6): proof-correction members
+/// the history gate holds, deferred instead of blocking settlement. This
+/// settlement's count and a saturating process total. Counts only; no path,
+/// id or wire event.
+pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
+    let members = u64::try_from(members).unwrap_or(u64::MAX);
+    let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_history_proof_correction_deferred",
+        "claude_code",
+        &HistoryProofCorrectionDeferred {
+            history_proof_correction_deferred: members,
+            history_proof_correction_deferred_total: previous.saturating_add(members),
+        },
+    );
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
@@ -804,6 +835,27 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_proof_correction_deferral_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_history_proof_correction_deferred(2);
+            claude_history_proof_correction_deferred(3);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_history_proof_correction_deferred"
+        );
+        assert_eq!(lines[1]["counts"]["history_proof_correction_deferred"], 3);
+        let first = lines[0]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 2 && second >= first + 3, "{first} {second}");
+    }
     fn max_read_counts() -> ReadCounts {
         let gate = AssessedBool {
             assessed: usize::MAX,

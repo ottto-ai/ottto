@@ -63,6 +63,13 @@ pub struct BackfillState {
     /// re-claims without meaning "resurrect pre-cutoff history").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_cutoff_user_id: Option<String>,
+    /// The destination of the claim that set the cutoff: the first Claude
+    /// bootstrap completed after it. Until then it is unset. Claude history
+    /// recorded for another destination is left to the cutoff (not the
+    /// history gate) only on this destination, so a later same-user re-claim
+    /// that keeps the cutoff on a new destination is gated (SOURCE h695 N1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_cutoff_destination_namespace: Option<String>,
     /// Set when this state stands in for a present but unreadable state file
     /// (SOURCE F1a, StateMissing H1). Its history is unknown, so it counts as
     /// prior history and arms no bootstrap or replay. Any writer that loads,
@@ -169,6 +176,13 @@ pub fn apply_claim_backfill_policy(
         _ => None,
     };
     if let Some(cutoff) = new_cutoff {
+        // A new cutoff belongs to this claim's destination, bound by its
+        // first Claude bootstrap; re-applying the same claim keeps it.
+        if state.backfill_cutoff_at.as_deref() != Some(cutoff.as_str())
+            || state.backfill_cutoff_user_id.as_deref() != Some(user_id)
+        {
+            state.backfill_cutoff_destination_namespace = None;
+        }
         state.backfill_cutoff_at = Some(cutoff);
         state.backfill_cutoff_user_id = Some(user_id.to_string());
     } else if state.backfill_cutoff_user_id.as_deref() != Some(user_id) {
@@ -176,6 +190,7 @@ pub fn apply_claim_backfill_policy(
         // different-user one.
         state.backfill_cutoff_at = None;
         state.backfill_cutoff_user_id = None;
+        state.backfill_cutoff_destination_namespace = None;
     }
     if state == before {
         return Ok(());
@@ -359,6 +374,12 @@ pub fn mark_backfill_complete_for_destination(
         source.api_slug().to_string(),
         destination_namespace_hash.to_string(),
     );
+    if source == SnapshotSource::ClaudeCode
+        && state.backfill_cutoff_at.is_some()
+        && state.backfill_cutoff_destination_namespace.is_none()
+    {
+        state.backfill_cutoff_destination_namespace = Some(destination_namespace_hash.to_string());
+    }
 }
 
 /// Walks historical JSONLs for every source that needs reconciliation. Backend
@@ -824,6 +845,57 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    /// SOURCE h695 N1: the cutoff belongs to the destination of the claim
+    /// that set it, bound by the first Claude bootstrap after it. A same-user
+    /// re-claim keeps the cutoff and that binding; a new cutoff or a
+    /// different-user `full` claim clears it.
+    #[test]
+    fn the_cutoff_binds_the_first_claude_bootstrap_after_its_claim() {
+        let dir = temp_dir("cutoff-destination");
+        let cutoff = "2026-07-06T10:00:00Z";
+        let mut state = BackfillState::default();
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-a");
+        save_backfill_state(&dir, &state).expect("save the previous user's bootstrap");
+        apply_claim_backfill_policy(&dir, Some("from"), Some(cutoff), "user_b").expect("from");
+        let mut state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_destination_namespace, None);
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::Codex, "dest-b");
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace, None,
+            "Claude only"
+        );
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-b");
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-c");
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b"),
+            "the first Claude bootstrap after the claim binds it"
+        );
+        save_backfill_state(&dir, &state).expect("save the binding");
+        apply_claim_backfill_policy(&dir, Some("from"), Some(cutoff), "user_b").expect("retry");
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("same-user");
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at.as_deref(), Some(cutoff));
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-07T10:00:00Z"), "user_c")
+            .expect("a new cutoff");
+        assert_eq!(
+            load_backfill_state(&dir).backfill_cutoff_destination_namespace,
+            None
+        );
+        let mut state = load_backfill_state(&dir);
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-d");
+        save_backfill_state(&dir, &state).expect("bind dest-d");
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_d").expect("other user");
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at, None);
+        assert_eq!(state.backfill_cutoff_destination_namespace, None);
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[test]
     fn different_destination_full_policy_rearms_completed_backfill() {
         let dir = temp_dir("destination-full-policy");
@@ -1100,6 +1172,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, prior_history_unverified, claim_backfill_policy_full);
+crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

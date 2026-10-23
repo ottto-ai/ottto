@@ -952,23 +952,28 @@ fn explicit_full_move_paces_history_born_before_the_claim() {
     );
 }
 
-/// SOURCE F1b: a claim that recorded a different-user cutoff keeps that
-/// history excluded by the cutoff, as before, not by the history gate: a
-/// session with activity after the cutoff is still sent whole.
+/// SOURCE F1b: on the destination of the claim that recorded a
+/// different-user cutoff, the previous user's history stays excluded by the
+/// cutoff, as before, not by the history gate: a session with activity after
+/// the cutoff is still sent whole. (The previous user's bootstrap completed
+/// before that claim, so the cutoff is not yet bound to a destination.)
 #[test]
 fn different_user_cutoff_excludes_history_without_the_gate() {
     let fixture = HistoryFixture::new("history-upgrade-different-user");
-    let mut state = crate::backfill::BackfillState {
-        backfill_cutoff_at: Some("2026-08-02T07:00:15Z".to_string()),
-        backfill_cutoff_user_id: Some("user-b".to_string()),
-        ..Default::default()
-    };
+    let mut state = crate::backfill::BackfillState::default();
     crate::backfill::mark_backfill_complete_for_destination(
         &mut state,
         SnapshotSource::ClaudeCode,
         HISTORY_DESTINATION,
     );
-    crate::backfill::save_backfill_state(&fixture.support, &state).expect("save claim state");
+    crate::backfill::save_backfill_state(&fixture.support, &state).expect("save user A state");
+    crate::backfill::apply_claim_backfill_policy(
+        &fixture.support,
+        Some("from"),
+        Some("2026-08-02T07:00:15Z"),
+        "user-b",
+    )
+    .expect("user B's claim records the cutoff");
     // The previous destination's Claude index stays behind, as in production.
     let previous = fixture.support.join("snapshots/destinations/destination-a");
     std::fs::create_dir_all(&previous).expect("create previous destination");
@@ -987,6 +992,130 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
         moved.uploaded,
         BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
         "only the session active after the cutoff"
+    );
+}
+
+/// SOURCE h695 N1: a same-user re-claim keeps the cutoff (the server answers
+/// `full`) but mints a new destination. The cutoff belongs to the destination
+/// of the claim that set it, so on the new one the history already sent to
+/// that destination is prior history: gated and paced, never re-sent
+/// ungated.
+#[test]
+fn same_user_reclaim_keeps_the_cutoff_but_gates_the_new_destination() {
+    let fixture = HistoryFixture::new("history-upgrade-same-user-reclaim");
+    fixture.baseline();
+    fixture.cycle(
+        "2026-08-02T08:30:00Z",
+        HistoryCycle {
+            bootstrapped: true,
+            ..HISTORY_BASELINE
+        },
+    );
+    crate::backfill::apply_claim_backfill_policy(
+        &fixture.support,
+        Some("from"),
+        Some("2026-08-02T07:00:15Z"),
+        "user-b",
+    )
+    .expect("user B's claim records the cutoff");
+    fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+    let claimed = fixture.cycle(
+        "2026-08-02T09:00:00Z",
+        HistoryCycle {
+            destination: Some("history-upgrade-destination-b"),
+            bootstrapped: false,
+            ..HISTORY_REVISION_2
+        },
+    );
+    assert_eq!(
+        claimed.uploaded,
+        BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
+        "the claim's own destination keeps the cutoff exception"
+    );
+    // Its bootstrap completes there, which binds the cutoff to it.
+    fixture.cycle(
+        "2026-08-02T09:30:00Z",
+        HistoryCycle {
+            destination: Some("history-upgrade-destination-b"),
+            bootstrapped: true,
+            ..HISTORY_REVISION_2
+        },
+    );
+    let state = crate::backfill::load_backfill_state(&fixture.support);
+    assert_eq!(
+        state.backfill_cutoff_destination_namespace.as_deref(),
+        Some("history-upgrade-destination-b")
+    );
+
+    crate::backfill::apply_claim_backfill_policy(&fixture.support, Some("full"), None, "user-b")
+        .expect("user B re-claims");
+    let state = crate::backfill::load_backfill_state(&fixture.support);
+    assert!(
+        state.backfill_cutoff_at.is_some(),
+        "a same-user cutoff is kept"
+    );
+    let reclaimed = |hour: u32, budget: usize| {
+        crate::snapshots::with_body_witness_adoption_page_budget(budget, || {
+            fixture
+                .cycle(
+                    &format!("2026-08-02T{hour:02}:00:00Z"),
+                    HistoryCycle {
+                        destination: Some("history-upgrade-destination-c"),
+                        bootstrapped: false,
+                        ..HISTORY_REVISION_2
+                    },
+                )
+                .uploaded
+        })
+    };
+    assert!(
+        reclaimed(10, 0).is_empty(),
+        "history already sent before the re-claim is gated"
+    );
+    assert_eq!(
+        reclaimed(11, HISTORY_SESSIONS.len()),
+        BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
+        "and paced: the re-claim was an explicit full claim"
+    );
+}
+
+/// SOURCE h695 N2: a quarantined ledger of this index, a quarantined legacy
+/// Claude index and an unreadable seen-marker path are prior history (fail
+/// closed); a clean support state is not.
+#[test]
+fn quarantined_ledger_and_unreadable_marker_are_prior_history() {
+    use crate::snapshots::PriorHistory;
+    let fixture = HistoryFixture::new("history-upgrade-probes");
+    let backfill = crate::backfill::BackfillState::default();
+    let progress = test_upload_progress();
+    let index_path = fixture.index_path_for(None);
+    let prior = || {
+        claude_prior_history(
+            &backfill,
+            HISTORY_DESTINATION,
+            &progress,
+            &index_path,
+            &fixture.support,
+        )
+    };
+    assert_eq!(prior(), PriorHistory::None);
+    for quarantined in [
+        "claude-scan-index-upload-progress.corrupt.1.2.json",
+        "claude_code-scan-index-v2.corrupt.1.2.json",
+    ] {
+        let path = index_path.with_file_name(quarantined);
+        std::fs::write(&path, b"{").expect("write quarantined copy");
+        assert_eq!(prior(), PriorHistory::Here, "{quarantined}");
+        std::fs::remove_file(&path).expect("remove quarantined copy");
+    }
+    assert_eq!(prior(), PriorHistory::None);
+    let snapshots = fixture.support.join("snapshots");
+    std::fs::remove_dir_all(&snapshots).expect("remove snapshots directory");
+    std::fs::write(&snapshots, b"").expect("a file where the marker's directory is");
+    assert_eq!(
+        prior(),
+        PriorHistory::Here,
+        "a marker probe that cannot tell is prior history"
     );
 }
 

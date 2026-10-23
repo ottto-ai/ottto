@@ -376,25 +376,25 @@ fn claude_prior_history(
         .get(slug)
         .map(String::as_str)
         == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty (SOURCE h695 N2).
     let quarantined_sibling = || {
-        let Some(prefix) = index_path
-            .file_stem()
-            .and_then(|stem| stem.to_str())
-            .map(|stem| format!("{stem}.corrupt."))
-        else {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
             return false;
         };
-        index_path
-            .parent()
-            .and_then(|parent| std::fs::read_dir(parent).ok())
-            .is_some_and(|entries| {
-                entries.flatten().any(|entry| {
-                    entry
-                        .file_name()
-                        .to_str()
-                        .is_some_and(|name| name.starts_with(&prefix))
+        match std::fs::read_dir(parent) {
+            Ok(entries) => entries.flatten().any(|entry| {
+                entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
                 })
-            })
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     };
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
@@ -421,11 +421,12 @@ fn claude_prior_history(
                 Err(error) => error.kind() != std::io::ErrorKind::NotFound,
             }
     };
-    let seen_marker = || {
-        std::fs::symlink_metadata(crate::snapshots::claude_reemission_seen_marker_path(
-            support_dir,
-        ))
-        .is_ok()
+    // Fails closed: only a positively missing marker is absent (h695 N2).
+    let seen_marker = || match std::fs::symlink_metadata(
+        crate::snapshots::claude_reemission_seen_marker_path(support_dir),
+    ) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
     };
     if here
         || upload_progress.records_server_attested_upload()
@@ -435,8 +436,14 @@ fn claude_prior_history(
         return PriorHistory::Here;
     }
     // A claim that recorded a different-user cutoff keeps the other
-    // destinations' history excluded by that cutoff, not by the gate.
-    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some();
+    // destinations' history excluded by that cutoff, not by the gate, but
+    // only on that claim's own destination: a later same-user re-claim keeps
+    // the cutoff on a new destination (SOURCE h695 N1).
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
+        && backfill_state
+            .backfill_cutoff_destination_namespace
+            .as_deref()
+            .is_none_or(|bound| bound == destination_namespace);
     // Claude's own entries only: `last_completed_at` is stamped by any
     // source's bootstrap, so a Codex or Pi completion is not Claude history.
     let earlier_bootstrap = backfill_state
@@ -796,6 +803,7 @@ fn settle_upload_corrections_after_selection(
             "local snapshot proof corrections deferred to the history gate for {}: members={deferred}",
             scan.source.api_slug()
         );
+        crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
     }
     transport_fully_settled && !blocking
 }
