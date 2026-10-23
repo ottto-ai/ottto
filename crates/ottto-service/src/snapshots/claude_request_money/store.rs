@@ -1175,12 +1175,19 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
         let path = dir.join(name);
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadCounter::Missing,
-            Ok(meta) if meta.file_type().is_file() && meta.len() <= 256 => std::fs::read(path)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Budget>(&bytes).ok())
-                .map_or(ReadCounter::Damaged, |budget| {
-                    ReadCounter::Valid((budget.day, budget.bytes.min(SAVE_DAILY_BYTES as u64)))
-                }),
+            Ok(meta) if meta.file_type().is_file() && meta.len() <= 256 => {
+                std::fs::File::open(path)
+                    .ok()
+                    .and_then(|file| {
+                        let mut bytes = Vec::with_capacity(257);
+                        file.take(257).read_to_end(&mut bytes).ok()?;
+                        (bytes.len() <= 256)
+                            .then(|| serde_json::from_slice::<Budget>(&bytes).ok())?
+                    })
+                    .map_or(ReadCounter::Damaged, |budget| {
+                        ReadCounter::Valid((budget.day, budget.bytes.min(SAVE_DAILY_BYTES as u64)))
+                    })
+            }
             _ => ReadCounter::Damaged,
         }
     };
