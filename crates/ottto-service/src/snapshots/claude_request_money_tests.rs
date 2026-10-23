@@ -1199,7 +1199,7 @@ fn money_telemetry_retires_only_under_pressure() {
         );
     }
     assert_eq!(
-        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger),
+        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger, Instant::now() + Duration::from_secs(30)),
         0
     );
     ledger.insert(
@@ -1210,7 +1210,7 @@ fn money_telemetry_retires_only_under_pressure() {
         ),
     );
     assert_eq!(
-        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger),
+        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger, Instant::now() + Duration::from_secs(30)),
         1
     );
     // The oldest last append (root-1) went first.

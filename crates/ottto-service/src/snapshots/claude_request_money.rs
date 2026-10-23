@@ -1370,7 +1370,7 @@ fn shadow_page_with_coverage(
     end.tail = tail;
     counts.work_stopped = u64::from(work.stopped);
     counts.telemetry_retired_pressure =
-        claude_request_ledger::retire_telemetry_under_pressure(ledger);
+        claude_request_ledger::retire_telemetry_under_pressure(ledger, deadline);
     if counts.telemetry_retired_pressure > 0 {
         drop_certificate(ledger);
     }
@@ -1650,7 +1650,7 @@ fn shadow_page_with_coverage(
         drop(reservations);
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
-    counts.family_memos_dropped = drop_old_family_memos(ledger, now);
+    counts.family_memos_dropped = drop_old_family_memos(ledger, now, deadline);
     let page_complete = incomplete == 0 && telemetry_certified(ledger) && holder_view.complete();
     counts.coverage_complete = u64::from(page_complete);
     let page = CoverageRow {
@@ -2721,11 +2721,12 @@ fn union_revision_by(members: &BTreeSet<String>, deadline: Instant) -> Option<[u
 }
 
 /// Drop family memos no page rebuilt within the retention window.
-fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64) -> u64 {
+fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64, deadline: Instant) -> u64 {
     let cutoff = now.saturating_sub(FAMILY_MEMO_RETENTION_SECONDS);
     let stale = ledger
         .census()
         .records_with_prefix(FAMILY_KEY_PREFIX)
+        .take_while(|_| Instant::now() < deadline)
         .filter(|(_, record)| {
             record.family_memo().is_some_and(|(_, memo)| {
                 // An unreached family's scheduling turn may remain at zero;
@@ -2737,10 +2738,15 @@ fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64) -> u64 {
         })
         .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
+    let mut dropped = 0;
     for key in &stale {
+        if Instant::now() >= deadline {
+            break;
+        }
         ledger.remove(key);
+        dropped += 1;
     }
-    stale.len() as u64
+    dropped
 }
 
 fn day_stamp(unix: u64) -> Option<String> {

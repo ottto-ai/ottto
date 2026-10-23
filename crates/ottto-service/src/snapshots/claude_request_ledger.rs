@@ -987,25 +987,26 @@ fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
 /// copy of one falls back to policy. Records are retired in place (taken and
 /// reinserted without copying a hash). Returns how many; the caller drops
 /// the telemetry certificate when any had claims.
-pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 {
-    if !pressure(ledger, PRESSURE_START_PERCENT) {
+pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger, deadline: Instant) -> u64 {
+    if Instant::now() >= deadline || !pressure(ledger, PRESSURE_START_PERCENT) {
         return 0;
     }
-    let mut candidates = ledger
-        .census()
-        .records_with_prefix(TELEMETRY_KEY_PREFIX)
-        .filter(|(_, record)| !record.request_hashes().is_empty())
-        .map(|(key, record)| {
-            (
+    let mut candidates = Vec::new();
+    for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        if Instant::now() >= deadline {
+            return 0;
+        }
+        if !record.request_hashes().is_empty() {
+            candidates.push((
                 record.tail().map_or(0, |tail| tail.last_append_unix),
                 key.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     candidates.sort_unstable();
     let mut retired = 0;
     for (_, key) in candidates {
-        if !pressure(ledger, PRESSURE_TARGET_PERCENT) {
+        if Instant::now() >= deadline || !pressure(ledger, PRESSURE_TARGET_PERCENT) {
             break;
         }
         if let Some(mut record) = ledger.take(&key) {
