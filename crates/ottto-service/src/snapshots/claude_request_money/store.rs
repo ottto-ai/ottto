@@ -1173,7 +1173,7 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
     }
     let read = |name: &str| {
         let path = dir.join(name);
-        match std::fs::metadata(&path) {
+        match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadCounter::Missing,
             Ok(meta) if meta.len() <= 256 => std::fs::read(path)
                 .ok()
@@ -1709,6 +1709,18 @@ mod bounded_save_tests {
         assert_eq!(reserve_credit(&scratch, tomorrow).bytes, 0);
         let later = super::super::utc_day(midnight + 2 * 86_400);
         assert_eq!(reserve_credit(&scratch, later).bytes, SAVE_BYTES_PER_PAGE);
+        #[cfg(unix)]
+        {
+            // An existing but unreadable entry is damage, not upgrade absence.
+            std::fs::remove_file(dir.join(WRITE_BUDGET_FILE)).unwrap();
+            std::os::unix::fs::symlink(dir.join("absent-target"), dir.join(WRITE_BUDGET_FILE))
+                .unwrap();
+            assert_eq!(reserve_credit(&scratch, later).bytes, 0);
+            assert_eq!(
+                load_counters(&dir, later).1,
+                (later, SAVE_DAILY_BYTES as u64)
+            );
+        }
         // A failed atomic repair cannot be treated as a fresh allowance.
         std::fs::write(dir.join(WRITE_BUDGET_FILE), b"broken").unwrap();
         let staged = dir.join(WRITE_BUDGET_FILE).with_extension("json.tmp");
