@@ -36098,9 +36098,10 @@ mod tests {
         assert_eq!(recovered.generation, 1);
         assert_eq!(recovered.file_snapshot_fingerprints.len(), 1);
         assert!(recovered.snapshot_activity_at.is_empty());
-        assert!(recovered.files["content-free-key"]
-            .source_file_fingerprint
-            .is_empty());
+        assert_eq!(
+            recovered.files["content-free-key"].source_file_fingerprint, "source",
+            "the candidate gate re-reads a missing clock without a re-arm"
+        );
         assert!(path.exists());
         assert_eq!(
             fs::read_dir(&root)
