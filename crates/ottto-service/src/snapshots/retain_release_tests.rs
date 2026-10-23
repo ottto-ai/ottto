@@ -1073,6 +1073,7 @@ fn r0_unknown_resident_evicts_nothing() {
 fn x_out_coverage_witness_names_every_finished_field() {
     let _parsed = |file: ParsedJsonlFile| {
         let ParsedJsonlFile {
+            census_source_unchanged: _,                 // I (bound revision boolean)
             snapshots: _,                               // I (Vec slot) + per-item fields below
             report: _,                                  // M
             recognized_usage_drop_count: _,             // I
