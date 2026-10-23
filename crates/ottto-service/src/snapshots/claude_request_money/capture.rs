@@ -664,6 +664,18 @@ pub(crate) fn purge_scope_for_test(scope: &Path) {
     }
 }
 
+/// Current, fingerprint-bound store entries, without consuming any capture.
+#[cfg(test)]
+pub(crate) fn keys_for_test(scope: &Path) -> Vec<(String, String)> {
+    STORE
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|((entry_scope, _), _)| entry_scope == scope)
+        .map(|((_, key), entry)| (key.clone(), entry.fingerprint.clone()))
+        .collect()
+}
+
 pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
 }

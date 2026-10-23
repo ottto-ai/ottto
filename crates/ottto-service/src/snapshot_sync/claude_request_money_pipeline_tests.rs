@@ -1448,6 +1448,17 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     money::capture::begin_page(&fixture.support);
     let mut following_index = ScanIndex::default();
     let reread = scan(&mut following_index);
+    assert_eq!(reread.scanned_file_count, armed.scanned_file_count, "fresh index must Full-reparse every selected file");
+    let following_captures = money::capture::keys_for_test(&fixture.support);
+    assert!(!following_captures.is_empty(), "following page is Full with captures, not Skip");
+    let captured_roots = following_captures.iter().map(|(key, fingerprint)| {
+        assert_eq!(following_index.files[key].source_file_fingerprint, *fingerprint,
+            "following captures are bound to this Full reparse");
+        // This dense corpus uses one root transcript per session (no agents).
+        money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap())
+    }).collect::<BTreeSet<_>>();
+    let captured_deferred = captured_roots.intersection(&deadline_families).count();
+    assert!(captured_deferred > 0, "Full capture plan must include prior deferred families");
     assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&reread.snapshots).unwrap());
     assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&following_index).unwrap());
     let (following, following_elapsed) = run(&reread, &following_index, now + 1);
@@ -1460,7 +1471,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(deadline_families.contains(next_first["family"].as_str().unwrap()), "unreached families go first: {next_first}");
     let progressed = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
-    assert!(progressed > 0, "following page must reach deferred families");
+    assert!(progressed > 0, "following Full page must reach deferred families: captures={} captured_deferred={} result_apply_us={} counts={following:?}", following_captures.len(), captured_deferred, following.result_apply_us);
     let built = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
         row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
@@ -1470,8 +1481,8 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
-        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} next_type=Full next_captures={} next_captured_deferred={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
+        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), following_captures.len(), captured_deferred, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
     money::disable_shadow_for_test(&fixture.support);
 }
 

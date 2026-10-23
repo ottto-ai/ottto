@@ -687,6 +687,7 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) unchanged: u64,
     pub(crate) capture_us: u64,
     pub(crate) writer_us: u64,
+    pub(crate) result_apply_us: u64,
     pub(crate) save_bytes_today: u64,
     pub(crate) units_immature: u64,
     pub(crate) units_matched: u64,
@@ -1349,7 +1350,9 @@ fn shadow_page_with_coverage(
         }
     };
     let ledger: &mut ClaudeLedger = &mut guard;
+    let applying = Instant::now();
     apply_results(support_dir, ledger, &mut counts);
+    counts.result_apply_us = applying.elapsed().as_micros() as u64;
     if std::mem::take(&mut ledger.load_damaged) {
         counts.ledger_load_damaged = 1;
         drop_certificate(ledger);
