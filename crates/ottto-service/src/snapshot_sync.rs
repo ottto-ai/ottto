@@ -82,6 +82,20 @@ const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+// A short, explicitly transient batch failure is resent in place rather than
+// abandoning the page and marking the bounded sweep unsettled: a 429/503 whose
+// Retry-After is at most 5 s (cursor allocation and shared-lock timeouts send
+// 1 s) or a fast 500/502. The wait holds the sync lock, so each source page
+// gets at most two resends and 10 s of waiting, shared by its cache-head
+// bootstrap stages and its main upload. A failure that took 15 s or longer is
+// overload and is never resent; the identity deferral, recognized by its code,
+// keeps its backoff whatever its Retry-After.
+const SNAPSHOT_INPLACE_RETRY_LIMIT: usize = 2;
+const SNAPSHOT_INPLACE_RETRY_MAX_WAIT: Duration = Duration::from_secs(5);
+const SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(10);
+const SNAPSHOT_INPLACE_RETRY_FAST_FAILURE: Duration = Duration::from_secs(15);
+const SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT: Duration = Duration::from_secs(2);
+const SNAPSHOT_INPLACE_RETRY_MIN_WAIT: Duration = Duration::from_millis(250);
 // A pre-ledger checkpoint with ambiguous settlement is re-entered through the
 // existing entity-ACK upload machine. Arm at most one normal 50-entity page per
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
@@ -98,13 +112,37 @@ pub(crate) fn status_test_scan_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Bootstrap only through existing ordinary authority followed by an exact
-/// CAS repeat. Both settlements share the normal atomic ACK progress seam.
+/// Bootstrap a fresh source page's cache heads under its own in-place resend
+/// budget.
+#[cfg(test)]
 fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     ordinary_bootstrap: bool,
+    upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    bootstrap_cache_heads_with_budget(
+        probes,
+        poison_scope,
+        progress,
+        ordinary_bootstrap,
+        &mut InplaceRetryBudget::default(),
+        upload,
+        persist,
+    )
+}
+
+/// Bootstrap only through existing ordinary authority followed by an exact
+/// CAS repeat. Both settlements share the normal atomic ACK progress seam and
+/// the source page's in-place resend budget.
+fn bootstrap_cache_heads_with_budget(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    ordinary_bootstrap: bool,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
         bool,
@@ -140,6 +178,7 @@ fn bootstrap_cache_heads(
             snapshot_upload_body_witness,
             |item| Some(item.source_session_id.as_str()),
             |_| false,
+            inplace_retry,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
@@ -5549,6 +5588,10 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    // One in-place resend budget for the whole source page: both bootstrap
+    // stages and the main upload draw on it, so the page never waits more
+    // than two resends and 10 s under the sync lock.
+    let mut inplace_retry = InplaceRetryBudget::default();
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only
         // the existing typed, content-free cause and the fixed failing role.
@@ -5567,11 +5610,12 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
             ordinary_bootstrap,
+            &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -5619,6 +5663,7 @@ fn finish_sync_source(
         snapshot_upload_body_witness,
         |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+        &mut inplace_retry,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -7411,6 +7456,113 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
         .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
 }
 
+/// The wait before resending a failed batch in place, with the HTTP status
+/// that earned it, or `None` when the failure keeps its existing path. The
+/// wait is never earlier than the server's own `Retry-After`.
+fn transient_inplace_retry_wait(error: &anyhow::Error) -> Option<(u16, Duration)> {
+    let (status, base) = if let Some(shed) = error.downcast_ref::<UploadShed>() {
+        // The identity deferral waits on the identity, not on this request:
+        // excluded by its code before any admission, even with a short
+        // Retry-After.
+        if shed.is_original_identity_unavailable() {
+            return None;
+        }
+        // No Retry-After keeps the jittered ladder; a long one is not worth
+        // holding the sync lock for.
+        let retry_after = shed
+            .retry_after
+            .filter(|wait| *wait <= SNAPSHOT_INPLACE_RETRY_MAX_WAIT)?;
+        (shed.status, retry_after)
+    } else {
+        let status = error
+            .downcast_ref::<UploadFailureDiagnostics>()?
+            .transient_batch_status()?;
+        (status, SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT)
+    };
+    let base = base.max(SNAPSHOT_INPLACE_RETRY_MIN_WAIT);
+    let wait = (base + uniform_duration(base.mul_f64(0.2))).min(SNAPSHOT_INPLACE_RETRY_MAX_WAIT);
+    Some((status, wait))
+}
+
+/// In-place resends spent by one source page: every batch of its cache-head
+/// bootstrap stages and of its main upload draws on the same budget.
+#[derive(Default)]
+struct InplaceRetryBudget {
+    resends: usize,
+    waited: Duration,
+}
+
+impl InplaceRetryBudget {
+    fn admit(&self, error: &anyhow::Error, failed_after: Duration) -> Option<(u16, Duration)> {
+        if self.resends >= SNAPSHOT_INPLACE_RETRY_LIMIT
+            || failed_after >= SNAPSHOT_INPLACE_RETRY_FAST_FAILURE
+        {
+            return None;
+        }
+        transient_inplace_retry_wait(error)
+            .filter(|(_, wait)| self.waited + *wait <= SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET)
+    }
+}
+
+fn inplace_retry_failed_after(started: Instant) -> Duration {
+    #[cfg(test)]
+    if let Some(failed_after) = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow().as_ref().and_then(|clock| clock.failed_after))
+    {
+        return failed_after;
+    }
+    started.elapsed()
+}
+
+fn inplace_retry_sleep(wait: Duration) {
+    #[cfg(test)]
+    if INPLACE_RETRY_TEST_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some(clock) => {
+            clock.waits.push(wait);
+            true
+        }
+        None => false,
+    }) {
+        return;
+    }
+    std::thread::sleep(wait);
+}
+
+/// Test-only stand-in for the in-place resend clock: it records every wait
+/// instead of sleeping and may override how long a failed POST took.
+#[cfg(test)]
+struct InplaceRetryTestClock {
+    failed_after: Option<Duration>,
+    waits: Vec<Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPLACE_RETRY_TEST_CLOCK: std::cell::RefCell<Option<InplaceRetryTestClock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with this thread's in-place resend clock replaced. Returns the
+/// result and every wait the uploader asked for, in order.
+#[cfg(test)]
+fn with_inplace_retry_test_clock<R>(
+    failed_after: Option<Duration>,
+    body: impl FnOnce() -> R,
+) -> (R, Vec<Duration>) {
+    INPLACE_RETRY_TEST_CLOCK.with(|clock| {
+        *clock.borrow_mut() = Some(InplaceRetryTestClock {
+            failed_after,
+            waits: Vec::new(),
+        });
+    });
+    let result = body();
+    let waits = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow_mut().take())
+        .map(|clock| clock.waits)
+        .unwrap_or_default();
+    (result, waits)
+}
+
 /// Upload changed snapshots in bounded pages while durably checkpointing every
 /// accepted page. Item-specific validation failures are bisected so one poison
 /// snapshot cannot replay or block its valid siblings; pages that exceed the
@@ -7473,6 +7625,7 @@ where
         body_witness,
         |_| None,
         |_| false,
+        &mut InplaceRetryBudget::default(),
         upload,
         persist,
     )
@@ -7711,6 +7864,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     body_witness: BodyWitness,
     session_id: SessionId,
     batch_class: BatchClass,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -7867,7 +8021,8 @@ where
             }
             adaptive_attempts += 1;
         }
-        match attempt_snapshot_page(
+        let attempt_started = Instant::now();
+        let attempt = attempt_snapshot_page(
             items,
             &indices,
             poison_scope,
@@ -7878,7 +8033,11 @@ where
             &session_id,
             &mut upload,
             &mut persist,
-        ) {
+        );
+        let inplace_wait = attempt.as_ref().err().and_then(|error| {
+            inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
+        });
+        match attempt {
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
@@ -7964,6 +8123,27 @@ where
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
+            }
+            Err(_) if inplace_wait.is_some() => {
+                // A short, explicitly transient failure: wait briefly and
+                // resend the same page. Each resend re-runs the whole upload
+                // boundary (lease, authority, fresh relay token), and the
+                // loop-top filter drops anything settled meanwhile. When the
+                // budget runs out the failure takes the arms below unchanged.
+                let (status, wait) = inplace_wait.expect("admitted in-place retry");
+                inplace_retry.resends += 1;
+                inplace_retry.waited += wait;
+                eprintln!(
+                    "local snapshot upload transient status={status} for {poison_scope}; \
+                     retrying the batch in place after {} ms (source page resend {}/{SNAPSHOT_INPLACE_RETRY_LIMIT}; \
+                     {} of {} ms source page in-place wait budget held under the sync lock)",
+                    wait.as_millis(),
+                    inplace_retry.resends,
+                    inplace_retry.waited.as_millis(),
+                    SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET.as_millis(),
+                );
+                inplace_retry_sleep(wait);
+                batches.push_front((indices, adaptive));
             }
             Err(error) if error.downcast_ref::<UploadShed>().is_some() => {
                 let shed = error
@@ -10902,6 +11082,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |_| Ok(()),
@@ -13833,6 +14014,7 @@ mod tests {
                     Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     }))
                 }
             },
@@ -13860,6 +14042,10 @@ mod tests {
         }
         assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
         reset_for_test();
+    }
+
+    mod inplace_retry_tests {
+        include!("snapshot_sync/inplace_retry_tests.rs");
     }
 
     #[test]
@@ -15061,6 +15247,7 @@ mod tests {
             |item| item.clone(),
             |_| None,
             |item| reconcile_class.contains(item),
+            &mut InplaceRetryBudget::default(),
             |batch| {
                 let is_reconcile = batch
                     .iter()
@@ -20723,6 +20910,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |state| state.save(&path),
