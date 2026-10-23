@@ -1354,6 +1354,9 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     // Cooperative deadline: allow 100 ms for bounded failure publication.
     assert!(first.elapsed_us <= 2_100_000, "{first:?}");
     assert!(first.capture_us <= 300_000, "{first:?}");
+    let (capture_input, capture_comparisons, _) = money::capture::work_for_test(&fixture.support);
+    assert!(capture_input <= 8 * 1024 * 1024, "{capture_input}");
+    assert!(capture_comparisons <= 1_048_576, "{capture_comparisons}");
     // Simulate a crash between slices: durable intent survives lost memory.
     money::store::restart_for_test(&fixture.support);
     money::forget_owed_coverage_for_test(&fixture.support);
@@ -1364,7 +1367,7 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     assert!(rows.iter().any(|row| row["dropped"] == true));
     assert!(rows.iter().any(|row| row["family"] == money::hashed_id_for_test(&root) && row["p1_reasons"] == serde_json::json!(["oversize"])));
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_PAGE rows=70000 peak_transient={} transient_cap={} wall_us={} deadline_us=2000000 capture_us={} writer_us={} save_bytes_today={} daily_cap=67108864",
+    println!("MONEY_P1B_PAGE rows=70000 peak_transient={} transient_cap={} wall_us={} deadline_us=2000000 capture_us={} writer_us={} save_bytes_today={} daily_cap=67108864 capture_input={capture_input} capture_comparisons={capture_comparisons}",
         first.admitted_peak_bytes, money::SHADOW_MEMORY_CEILING_BYTES, first.elapsed_us, first.capture_us, next.writer_us, next.save_bytes_today);
 }
 

@@ -10,8 +10,9 @@
 //! Only changed shards are rewritten. Saves are coalesced (at most one per
 //! `SAVE_MIN_INTERVAL`, each at most `SAVE_BYTES_PER_PAGE`) and capped per
 //! UTC day at `SAVE_DAILY_BYTES` of attempted bytes (data shards, both metas
-//! and every retry), counted in `save-budget.json` before each save is
-//! written so a restart resumes the day's count. Past the cap, dirty state
+//! and every retry), counted in `write-budget.json` before each physical
+//! attempt. Separate `save-budget.json` tickets pre-admit producer saves.
+//! Both survive restart and retain the maximum seen day. Past the cap, dirty state
 //! stays resident (within the ledger's bound) until the next day; a crash
 //! then loses only unsaved progress, which errs toward rereading and
 //! rewriting.
