@@ -506,6 +506,26 @@ fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
         (false, 1),
         "the held member's correction is deferred, not blocking"
     );
+    // A re-armed member (cleared fingerprint) is still found by identity.
+    let member_key = index
+        .files
+        .keys()
+        .find(|key| {
+            claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(root, member)| root == family && member != family)
+        })
+        .unwrap()
+        .clone();
+    index
+        .files
+        .get_mut(&member_key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    assert_eq!(
+        index.claude_authority_proof_correction_blocking(),
+        (false, 1)
+    );
     let _ = fs::remove_dir_all(home);
 }
 

@@ -38192,34 +38192,36 @@ impl ScanIndex {
     /// it is deferred (disclosed), not blocking. A member with no indexed file
     /// blocks.
     pub(crate) fn claude_authority_proof_correction_blocking(&self) -> (bool, usize) {
-        let mut owed = BTreeSet::new();
-        for record in self.claude_usage_authority_quarantine.values() {
-            let Some(correction) = record.proof_correction.as_ref() else {
-                continue;
-            };
-            for member in &correction.owed_member_ids {
-                match record.member_source_file_fingerprints.get(member) {
-                    Some(source_file_fingerprint) => {
-                        owed.insert(source_file_fingerprint.as_str());
-                    }
-                    None => return (true, 0),
-                }
-            }
-        }
-        if owed.is_empty() {
+        let owed = self
+            .claude_usage_authority_quarantine
+            .values()
+            .filter_map(|record| record.proof_correction.as_ref())
+            .map(|correction| correction.owed_member_ids.len())
+            .sum::<usize>();
+        if owed == 0 {
             return (false, 0);
         }
-        let mut deferred = 0;
+        // By family member identity, not source fingerprint: a re-armed
+        // entry keeps its member path with a cleared fingerprint.
         let mut found = 0;
-        for (key, entry) in &self.files {
-            if owed.contains(entry.source_file_fingerprint.as_str()) {
+        let mut deferred = 0;
+        for key in self.files.keys() {
+            let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
+                continue;
+            };
+            let owes = self
+                .claude_usage_authority_quarantine
+                .get(&root)
+                .and_then(|record| record.proof_correction.as_ref())
+                .is_some_and(|correction| correction.owed_member_ids.contains(&member));
+            if owes {
                 found += 1;
                 if self.effective_upload_body_witness_revision_requires_adoption(key) {
                     deferred += 1;
                 }
             }
         }
-        (found < owed.len() || deferred < found, deferred)
+        (found < owed || deferred < found, deferred)
     }
 
     fn claude_usage_authority_candidate_requires_family_reparse(
