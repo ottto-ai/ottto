@@ -625,3 +625,56 @@ fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
         (1, 1, 0, 0)
     );
 }
+
+/// F1: the cache-enriched upload and its stripped head probe have different
+/// witnesses. Only the refusal's own recorded probe lease may pass its hold.
+#[test]
+fn materialized_cache_probe_matches_only_its_own_refusal_witness() {
+    let root = cache_effective_wire_fixture_root();
+    let mut index = ScanIndex::default();
+    let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&root),
+        &mut index,
+        "2026-09-30T10:05:00Z",
+        crate::snapshots::BACKFILL_WINDOW_DAYS,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        true,
+    )
+    .unwrap();
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
+    let mut item = scan.snapshots.remove(0);
+    let mut progress = ledger();
+    prepare_snapshot_cache_for_upload(&mut item, &progress, true, false, &BTreeSet::new());
+    assert!(item.cache_observations.is_some());
+    assert!(item.cache_base_head_etag.is_none());
+    let probe = cache_head_probe(&item);
+    let probe_body = snapshot_upload_body_witness(&probe);
+    let full_body = snapshot_upload_body_witness(&item);
+    assert_ne!(full_body, probe_body);
+    progress.quarantine_permanent_body(
+        &item.snapshot_fingerprint,
+        &probe_body,
+        reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+    );
+    assert!(cache_head_probe_held(&progress, &probe));
+    progress.reserve_reason_reoffer(&item.snapshot_fingerprint, probe_body.clone(), NOW);
+    progress.extend_reason_reoffers_before_upload(std::slice::from_ref(&item), &BTreeSet::new());
+    assert_eq!(
+        progress
+            .active_reason_reoffers
+            .get(&item.snapshot_fingerprint),
+        Some(&probe_body)
+    );
+    assert_eq!(progress.reason_reoffer_counts.not_materialized, 0);
+    assert!(!cache_head_probe_held(&progress, &probe));
+    assert!(!progress.contains_body(&item.snapshot_fingerprint, &probe_body));
+    progress
+        .active_reason_reoffers
+        .insert(item.snapshot_fingerprint.clone(), full_body);
+    assert!(
+        cache_head_probe_held(&progress, &probe),
+        "another body's lease cannot release this probe"
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}

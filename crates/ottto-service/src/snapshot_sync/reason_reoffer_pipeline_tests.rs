@@ -240,7 +240,7 @@ impl Drop for ReofferServer {
 struct CycleResult {
     result: Result<()>,
     leased_offers: usize,
-    cache_enriched_items: usize,
+    cache_enabled: bool,
     index: ScanIndex,
     progress: SnapshotUploadProgress,
     /// The saved upload ledger as JSON, to read the exact disk form.
@@ -346,11 +346,7 @@ impl ReofferPipeline {
         .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         assert!(scan.census_complete, "synthetic census is complete");
-        let cache_enriched_items = scan
-            .snapshots
-            .iter()
-            .filter(|item| item.cache_observations.is_some())
-            .count();
+        let cache_enabled = preparation.cache_observations_enabled;
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
@@ -378,7 +374,7 @@ impl ReofferPipeline {
         CycleResult {
             result,
             leased_offers,
-            cache_enriched_items,
+            cache_enabled,
             index: ScanIndex::load(&index_path).unwrap(),
             progress: SnapshotUploadProgress::load(
                 &progress_path,
@@ -1024,8 +1020,8 @@ fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
     let first = pipeline.cycle(t0);
     assert!(first.result.is_ok(), "{:?}", first.result);
     assert!(
-        first.cache_enriched_items > 0,
-        "fixture must rebuild cache-enriched bodies"
+        first.cache_enabled,
+        "the real preparation negotiated the cache contract"
     );
     let offered = pipeline.server.offered();
     assert_eq!(offered.len(), 1);
@@ -1039,7 +1035,7 @@ fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
     let due = pipeline.cycle(t0 + DAY + 60);
     assert!(due.result.is_ok(), "{:?}", due.result);
     assert_eq!(due.leased_offers, 1);
-    assert!(due.cache_enriched_items > 0);
+    assert!(due.cache_enabled);
     let offered = pipeline.server.offered();
     assert_eq!(offered.len(), 2, "the rebuilt probe must reach SOURCE");
     assert_eq!(fingerprint_of(&offered[1]), fingerprint);
