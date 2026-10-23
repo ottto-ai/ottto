@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 827,
-  "content_sha256": "0ce7c052cff611fad14b8bf16be7dd8d980099eddde7228def1578c0c2e9a8ec",
+  "content_sha256": "0c216fd35832430c377a158922bec60730cf7d132b263a945b37e59576cfabbb",
   "files": [
     {
       "executable": false,
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/reason_reoffer_pipeline_tests.rs",
-      "sha256": "cf79ffa161bd1309b7917660cfff33fbb1c18cc47d58188ed0f9c1470514dfa0",
-      "size_bytes": 62562
+      "sha256": "c0d164a10f04741b8e061b04461eb7e649c8087a50309fbc2027ca58bd3ac729",
+      "size_bytes": 62779
     },
     {
       "executable": false,

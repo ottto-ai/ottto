@@ -1454,12 +1454,12 @@ fn cooldown_conflict_broken_bound_blocks_again() {
             "file" => {
                 // A byte change without changing semantic usage still invalidates
                 // the unchanged-file proof; it cannot erase the retained debt.
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(pipeline.transcript())
-                    .unwrap()
-                    .write_all(b"\n")
-                    .unwrap();
+                // Keep every line valid JSON for the sidecar fixture reader:
+                // trailing whitespace changes bytes, not the decoded event.
+                let transcript = std::fs::read_to_string(pipeline.transcript()).unwrap();
+                let edited = transcript.replacen('\n', " \n", 1);
+                assert_ne!(edited.len(), transcript.len());
+                std::fs::write(pipeline.transcript(), edited).unwrap();
                 write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
             }
             _ => unreachable!(),
