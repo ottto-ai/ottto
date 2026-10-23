@@ -88,8 +88,18 @@ time, money, identity, upload decisions and tuple-clear rules stay unchanged.
   without an owned boundary: no request work.
 - Per fold, recent items only: unordered points use one fixed 4,096-entry
   window (96 KiB for 24-byte reference tuples on 64-bit targets), at most
-  eight complete map traversals (`work <= 8*n` entry visits). No empty final
-  pass. Above the cap: zero point visits or scratch allocation. The strict
+  eight complete map traversals (`visits <= 8*n`). Each window selects with
+  a fixed-capacity max-heap, replacing its largest total `(sequence, position)`
+  key, then sorts the selected entries once in place. Selection costs
+  O(n log W) comparisons per pass and O(log W) tuple moves per heap update,
+  without shifting a window-sized suffix. The same allocation is reused
+  across windows. Operation-count regressions include every key comparison
+  (cutoff, root check, heap sift and sort) and pin `P*n*L + P*W*L`, where
+  W=4096, P=8 and L=ceil(log2 W)=12: 3,538,944 at n=32768, plus at most
+  `2*L+3=27` tuple writes per heap update (a conservative bound from the
+  single sift path). Reverse, increasing and seeded random orders with ties
+  must match the previous stable-sort output. No empty final pass.
+  Above the cap: zero point visits, comparisons or scratch allocation. The strict
   path consumes its already ordered slice once, without ordering scratch or
   this cap. At most 64 points of 8 bytes are retained and charged as before.
   Fold transients have no heap charging site; scratch capacity is structurally
