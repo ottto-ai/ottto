@@ -404,7 +404,8 @@ impl ClaudeRequestCensusRecord {
             && (self.retired.is_none() || self.safety.as_ref().is_some_and(|safety| safety.sc == 1))
     }
 
-    /// Move the existing Arc; no duplicate hash allocation at retirement.
+    /// Build bounded chunks only in shadow mode. Retirement copies once;
+    /// later reclaim and checkpoint clones share the remaining chunks.
     pub(crate) fn retire_transcript_preserving_safety(&mut self) {
         if self.retired.is_none() {
             if !phase_b::enabled() {
@@ -3791,7 +3792,7 @@ impl ClaudeRequestCensusJoin {
         )?;
         bytes = bytes.checked_add(file_keys.checked_mul(4)?)?;
         bytes = bytes.checked_add(record_keys.checked_mul(2)?)?;
-        // Two retired-owner sets, the post-save digest basis and settled roots.
+        // Two retired-owner sets, the record digests and indexed fingerprint basis.
         bytes = bytes.checked_add(
             records
                 .checked_add(1)?
