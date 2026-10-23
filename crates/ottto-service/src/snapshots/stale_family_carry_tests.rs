@@ -1907,3 +1907,91 @@ fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn fix2_cap_keeps_the_full_retry_that_can_reopen_the_fence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = window_index();
+    index.files.remove(&carry_key(CARRY_OTHER, None));
+    let before = index.files.clone();
+    let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(first["rearmed_index_files"], 3);
+    assert_eq!(first["carried_pending_families"], 0);
+    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
+    // Both families were read successfully but an unrelated transient page
+    // error requires another walk. The consumed allowance cannot hold them.
+    for (key, entry) in &mut index.files {
+        entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+    }
+    for pending in index.claude_usage_family_pending.values_mut() {
+        pending.census_window_end = CARRY_RETRY.to_string();
+    }
+    window_needs_clean_followup(&mut index);
+    let mut base = index.clone();
+    let base_row = {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        carry_start(&mut base, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS)
+    };
+    let row = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(row["rearmed_index_files"], base_row["rearmed_index_files"]);
+    assert_eq!(row["carried_pending_families"], 0);
+    assert!(row.get("stale_rearm_capped_families").is_none());
+    for (key, entry) in &index.files {
+        assert!(entry.source_file_fingerprint.is_empty(), "{key}");
+        assert_eq!(
+            entry.source_file_fingerprint,
+            base.files[key].source_file_fingerprint
+        );
+    }
+}
+
+#[test]
+fn fix2_budget_refusal_precedes_digest_and_cap_allocations() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for allowance_consumed in [false, true] {
+        let mut index = window_index();
+        if allowance_consumed {
+            let key = carry_key(CARRY_UNWITNESSED, None);
+            let revision = index.files[&key].source_file_fingerprint.clone();
+            let calls = CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST.with(std::cell::Cell::get);
+            let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+            assert_eq!(first["rearm_window_rearmed_files"], 1);
+            assert!(CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST.with(std::cell::Cell::get) > calls);
+            index.files.get_mut(&key).unwrap().source_file_fingerprint = revision;
+            index
+                .claude_usage_family_pending
+                .get_mut(CARRY_UNWITNESSED)
+                .unwrap()
+                .census_window_end = CARRY_RETRY.to_string();
+            window_needs_clean_followup(&mut index);
+        }
+        let calls = CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST.with(std::cell::Cell::get);
+        let row = {
+            let _refuse = RefuseClaudeStaleFamilyCarryBudgetForTest::new();
+            carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS)
+        };
+        assert_eq!(row["rearmed_index_files"], 3);
+        assert_eq!(row["carried_pending_families"], 0);
+        assert!(row.get("stale_rearm_capped_families").is_none());
+        assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
+        assert_eq!(
+            CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST.with(std::cell::Cell::get),
+            calls,
+            "refusal constructs no nonempty member-digest map"
+        );
+        for key in carry_family_keys()
+            .into_iter()
+            .chain([carry_key(CARRY_UNWITNESSED, None)])
+        {
+            assert!(
+                index.files[&key].source_file_fingerprint.is_empty(),
+                "{key}"
+            );
+        }
+    }
+}

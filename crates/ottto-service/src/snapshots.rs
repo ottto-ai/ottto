@@ -4198,13 +4198,21 @@ fn claude_stale_family_carry_scratch_admitted(
     stale: &BTreeSet<String>,
     legacy_witnesses: usize,
 ) -> bool {
+    claude_stale_family_carry_scratch_cost(index, stale, legacy_witnesses).is_some()
+}
+
+fn claude_stale_family_carry_scratch_cost(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+    legacy_witnesses: usize,
+) -> Option<crate::heap_layout_bound::Counter> {
     use crate::heap_layout_bound::tree_nodes;
     #[cfg(test)]
     if REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get) {
-        return false;
+        return None;
     }
     if !crate::heap_layout_bound::layout_supported() {
-        return false;
+        return None;
     }
     let mut stale_paths = 0_usize;
     let mut stale_path_bytes = 0_usize;
@@ -4228,10 +4236,10 @@ fn claude_stale_family_carry_scratch_admitted(
         legacy_witnesses.checked_mul(std::mem::size_of::<&ClaudeUsageFamilyWitness>()),
         stale_path_bytes.checked_mul(3),
     ) else {
-        return false;
+        return None;
     };
     let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
-    tree_nodes::<&str, ()>(families, &mut cost).is_some()
+    let admitted = tree_nodes::<&str, ()>(families, &mut cost).is_some()
         && cost.add(legacy_bytes).is_some()
         && tree_nodes::<String, BTreeMap<String, usize>>(families, &mut cost).is_some()
         && tree_nodes::<String, usize>(family_paths, &mut cost).is_some()
@@ -4241,7 +4249,99 @@ fn claude_stale_family_carry_scratch_admitted(
         && tree_nodes::<&str, &str>(stale_request_hashes, &mut cost).is_some()
         && tree_nodes::<String, ()>(families, &mut cost).is_some()
         && tree_nodes::<&str, (usize, usize)>(families, &mut cost).is_some()
-        && cost.add(string_bytes).is_some()
+        && cost.add(string_bytes).is_some();
+    admitted.then_some(cost)
+}
+
+/// Fix 2 allocates beside C1b's scratch: window/carried/capped/retained
+/// root sets, digest keys and SHA state/results, a second funding map and
+/// its replay reserve. Price that whole overlap before cloning any window
+/// collection. Unknown layout, overflow or refusal retains BASE.
+fn claude_full_rearm_window_scratch_admitted(index: &ScanIndex, stale: &BTreeSet<String>) -> bool {
+    use crate::heap_layout_bound::{tree_nodes, HeapLayoutBound};
+    let legacy = index
+        .claude_usage_family_witnesses
+        .values()
+        .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
+        .count();
+    let Some(mut cost) = claude_stale_family_carry_scratch_cost(index, stale, legacy) else {
+        return false;
+    };
+    let families = stale.len();
+    let root_bytes = stale
+        .iter()
+        .try_fold(0usize, |sum, root| sum.checked_add(root.len()));
+    let mut paths = 0usize;
+    let mut path_bytes = 0usize;
+    for key in index.files.keys() {
+        if claude_index_path_member_ref(Path::new(key))
+            .is_some_and(|member| stale.contains(member.root))
+        {
+            paths = paths.saturating_add(1);
+            path_bytes = path_bytes.saturating_add(key.len());
+        }
+    }
+    let Some(strings) = root_bytes
+        .and_then(|bytes| bytes.checked_mul(6))
+        .and_then(|bytes| path_bytes.checked_mul(4)?.checked_add(bytes))
+        .and_then(|bytes| families.checked_mul(256)?.checked_add(bytes))
+        .and_then(|bytes| bytes.checked_add(64))
+    else {
+        return false;
+    };
+    let Some(replay_slots) = paths
+        .checked_mul(2)
+        .and_then(|slots| slots.checked_mul(std::mem::size_of::<ScanTraversalPath>()))
+    else {
+        return false;
+    };
+    if cost.add(strings).is_none() || cost.add(replay_slots).is_none() {
+        return false;
+    }
+    for _ in 0..6 {
+        if tree_nodes::<String, ()>(families, &mut cost).is_none() {
+            return false;
+        }
+    }
+    tree_nodes::<String, Option<Sha256>>(families, &mut cost).is_some()
+        && tree_nodes::<String, Option<String>>(families, &mut cost).is_some()
+        && tree_nodes::<&str, ()>(families, &mut cost).is_some()
+        && tree_nodes::<&str, (usize, usize)>(families, &mut cost).is_some()
+        && index
+            .claude_full_rearm_progress
+            .full_rearm_window
+            .as_ref()
+            .map_or(true, |window| {
+                window.window_ends.heap_bound(&mut cost).is_some()
+                    && window.member_digests.heap_bound(&mut cost).is_some()
+            })
+}
+
+/// A full stale retry must remain enabled when it can observe every member
+/// and no retained pending is invalid. Shared by C1b and the window cap.
+fn claude_stale_rearm_can_reopen_fence(index: &ScanIndex, stale: &BTreeSet<String>) -> bool {
+    !stale.is_empty()
+        && stale.iter().all(|root| {
+            index
+                .claude_usage_family_pending
+                .get(root)
+                .is_some_and(|pending| !pending.invalid)
+        })
+        && index.files.iter().all(|(key, entry)| {
+            let Some(member) = claude_index_path_member_ref(Path::new(key)) else {
+                return true;
+            };
+            stale.contains(member.root)
+                || entry.source_file_fingerprint.is_empty()
+                || index.confirmed_empty_files.contains(key)
+                || index
+                    .claude_usage_authority_quarantine
+                    .get(member.root)
+                    .zip(index.claude_usage_family_witnesses.get(member.root))
+                    .is_some_and(|(quarantine, witness)| {
+                        claude_usage_authority_preserves_pending(quarantine, witness)
+                    })
+        })
 }
 
 /// The start-wide checks every stale-family carry shares: the duplicate
@@ -4305,16 +4405,9 @@ fn claude_fence_closed_retry_carry(
         );
         return ClaudeStaleFamilyCarry::default();
     }
-    let quarantine_preserves = |root_session_id: &str| {
-        index
-            .claude_usage_authority_quarantine
-            .get(root_session_id)
-            .zip(index.claude_usage_family_witnesses.get(root_session_id))
-            .is_some_and(|(quarantine, witness)| {
-                claude_usage_authority_preserves_pending(quarantine, witness)
-            })
-    };
-    let mut rearm_reaches_every_member = true;
+    if claude_stale_rearm_can_reopen_fence(index, stale) {
+        return ClaudeStaleFamilyCarry::default();
+    }
     let mut blocked = BTreeSet::new();
     for (index_key, entry) in &index.files {
         let Some(member_ref) = claude_index_path_member_ref(Path::new(index_key)) else {
@@ -4323,13 +4416,6 @@ fn claude_fence_closed_retry_carry(
         let root_session_id = member_ref.root;
         let confirmed_empty = index.confirmed_empty_files.contains(index_key.as_str());
         if !stale.contains(root_session_id) {
-            if rearm_reaches_every_member
-                && !entry.source_file_fingerprint.is_empty()
-                && !confirmed_empty
-                && !quarantine_preserves(root_session_id)
-            {
-                rearm_reaches_every_member = false;
-            }
             continue;
         }
         if entry.source_file_fingerprint.is_empty()
@@ -4340,16 +4426,6 @@ fn claude_fence_closed_retry_carry(
         {
             blocked.insert(root_session_id);
         }
-    }
-    if rearm_reaches_every_member
-        && stale.iter().all(|root_session_id| {
-            index
-                .claude_usage_family_pending
-                .get(root_session_id)
-                .is_some_and(|pending| !pending.invalid)
-        })
-    {
-        return ClaudeStaleFamilyCarry::default();
     }
     let mut legacy_witnesses = Vec::with_capacity(legacy_witness_count);
     legacy_witnesses.extend(
@@ -5282,6 +5358,11 @@ fn claude_full_rearm_record_basis(identity_contract: &str) -> String {
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// The member digest of every indexed Claude family whose root digest is in
 /// `roots`: its (index key, source file fingerprint) pairs in key order.
 /// `None` for a family with an unread member (empty fingerprint).
@@ -5292,6 +5373,9 @@ fn claude_full_rearm_member_digests(
     if roots.is_empty() {
         return BTreeMap::new();
     }
+    #[cfg(test)]
+    CLAUDE_FULL_REARM_NONEMPTY_DIGESTS_FOR_TEST
+        .with(|calls| calls.set(calls.get().saturating_add(1)));
     let mut hashers = BTreeMap::<String, Option<Sha256>>::new();
     for (index_key, entry) in &index.files {
         let Some(member) = claude_index_path_member_ref(Path::new(index_key)) else {
@@ -33944,6 +34028,13 @@ fn ensure_bounded_traversal(
         // families it cannot carry are re-read whole at most
         // `CLAUDE_STALE_FULL_REARM_WINDOW_REARMS_PER_DEADLINE` times per
         // fence deadline. Every other stale family keeps BASE's re-arm.
+        let window_scratch_admitted = index.claude_full_rearm_progress.full_rearm_window.is_none()
+            || claude_full_rearm_window_scratch_admitted(index, &stale_pending_roots);
+        if !window_scratch_admitted {
+            index.claude_full_rearm_progress.full_rearm_window = None;
+            index.claude_full_rearm_progress.full_rearm_window_next = false;
+        }
+        let retry_can_reopen = claude_stale_rearm_can_reopen_fence(index, &stale_pending_roots);
         let full_rearm_window_roots =
             claude_full_rearm_window_at_start(index, &context_fingerprint, collected_at)
                 .map(|window_ends| {
@@ -33961,7 +34052,9 @@ fn ensure_bounded_traversal(
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-        let carry = if full_rearm_window_roots.is_empty() {
+        let carry = if !window_scratch_admitted || retry_can_reopen {
+            ClaudeStaleFamilyCarry::default()
+        } else if full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry(
                 index,
                 &stale_pending_roots,
@@ -33972,12 +34065,15 @@ fn ensure_bounded_traversal(
             claude_fence_closed_retry_carry(index, &full_rearm_window_roots, true, false)
         };
         let mut carried_roots = carry.roots.clone();
-        let mut capped_roots =
-            claude_full_rearm_window_capped(index, &full_rearm_window_roots, &carried_roots);
+        drop(carry); // Release its first funded buffer before cap/digest scratch.
+        let mut capped_roots = if window_scratch_admitted && !retry_can_reopen {
+            claude_full_rearm_window_capped(index, &full_rearm_window_roots, &carried_roots)
+        } else {
+            BTreeSet::new()
+        };
         // Capped pending credits no evidence either, but must still cancel
         // when M1 selects a changed member. Fund both sets under C1b's budget.
         let mut retained_roots = carried_roots.union(&capped_roots).cloned().collect();
-        drop(carry);
         let replay = fund_claude_family_carry_cancellations(index, &mut retained_roots);
         carried_roots.retain(|root| retained_roots.contains(root));
         capped_roots.retain(|root| retained_roots.contains(root));

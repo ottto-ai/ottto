@@ -114,6 +114,12 @@ malformed provenance (including an older decoder's rewrite), a lost window
 record, or another process/context clears the retained member revisions and
 restarts the traversal before refund or candidate selection.
 
+A full retry that can observe every indexed member and has no invalid pending
+always keeps BASE rearming, even after the stale allowance was consumed.
+Window collections, SHA state/results and funding overlap are admitted under
+the existing parked scratch budget before construction; refusal drops the
+window optimization and keeps BASE without building its digest maps.
+
 The traversal start row reports `rearm_window_families`,
 `rearm_window_carried_families`, `rearm_window_rearmed_families`,
 `rearm_window_rearmed_files`,
