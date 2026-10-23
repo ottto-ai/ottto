@@ -2202,6 +2202,9 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
         (fixture, baseline, revision, pages)
     };
     let (_debt_fixture, baseline, revision, debt) = run("patha-bridge-debt-elsewhere", true);
+    // The withheld census publishes no manifest. Check before the control,
+    // whose complete census publishes to the same process-wide cache.
+    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
     let (_control_fixture, _, _, control) = run("patha-bridge-debt-elsewhere-control", false);
     let control_last = control.last().expect("control terminal");
     assert!(control_last.scan.census_complete && control_last.fully_settled);
@@ -2271,5 +2274,4 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
             .get(PIPELINE_SESSIONS[2]),
         revision.as_ref()
     );
-    assert!(cached_source_manifest(PIPELINE_DESTINATION, SnapshotSource::ClaudeCode).is_none());
 }
