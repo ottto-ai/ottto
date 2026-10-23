@@ -2742,7 +2742,13 @@ fn apply_published_memo(
         },
     ));
     basis.published = Some(memo.published);
-    let record = ClaudeRequestCensusRecord::family_record(revision, memo.observed_unix, basis);
+    // An interrupted earlier acknowledgement may land before a later
+    // no-capture memo built from stale producer state. Never roll back a
+    // capture turn that has already been durably published in between.
+    let turn = ledger.get(&memo.key).map_or(memo.observed_unix, |record| {
+        record.window().max(memo.observed_unix)
+    });
+    let record = ClaudeRequestCensusRecord::family_record(revision, turn, basis);
     let fits = ledger.census().serialized_headroom() >= memo.key.len() + 1024;
     let stored = fits && ledger.insert(memo.key, record) == ClaudeRequestCensusInsert::Stored;
     counts.family_memos_withheld += u64::from(!stored);

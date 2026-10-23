@@ -1707,7 +1707,7 @@ mod bounded_save_tests {
         };
         ledger.insert(
             keys[3].clone(),
-            ClaudeRequestCensusRecord::family_record([7; 32], 1, old_basis),
+            ClaudeRequestCensusRecord::family_record([7; 32], 5, old_basis),
         );
         let memos = keys
             .iter()
@@ -1793,6 +1793,11 @@ mod bounded_save_tests {
         let (_, basis) = ledger.get(&keys[3]).unwrap().family_memo().unwrap();
         assert_eq!(basis.removed_tokens, 42);
         assert_eq!(basis.published.unwrap().digest, 3);
+        assert_eq!(
+            ledger.get(&keys[3]).unwrap().window(),
+            5,
+            "a later no-capture acknowledgement cannot roll back a newer consumed turn"
+        );
         assert!(!RESULTS.lock().unwrap().contains_key(&*scratch));
         println!("MONEY_P1B_ACK memos=4096 expired_applied=0 interrupted_applied=3 resumed_applied={} outcomes={outcomes} pending=0", applied.get());
     }
