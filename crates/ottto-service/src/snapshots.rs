@@ -30296,17 +30296,6 @@ fn valid_snapshot_activity(value: &Option<String>) -> bool {
     }
 }
 
-fn quarantine_invalid_scan_index(path: &Path) -> Result<ScanIndex> {
-    // The index is only a local incremental-scan optimization. A crash or
-    // corrupt semantic-clock witness must not permanently block collection,
-    // but never overwrite the unreadable witness in place.
-    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
-    fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
-    sync_checkpoint_parent(path)?;
-    eprintln!("local snapshot scan index was invalid and quarantined; rebuilding");
-    Ok(ScanIndex::default())
-}
-
 fn canonicalize_codex_identity_set(values: &mut BTreeSet<String>) {
     *values = std::mem::take(values)
         .into_iter()
@@ -31384,51 +31373,35 @@ impl ScanIndex {
         let file =
             File::open(path).with_context(|| format!("open scan index {}", path.display()))?;
         match claude_request_census::decode_index(file) {
-            Ok(mut index)
-                if index.schema_version == SCAN_INDEX_SCHEMA_VERSION
-                    && index
-                        .snapshot_activity_at
-                        .values()
-                        .all(valid_snapshot_activity)
-                    && index
-                        .accepted_snapshot_fingerprints
-                        .iter()
-                        .all(|fingerprint| {
-                            fingerprint.len() == 64
-                                && fingerprint.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-                    && index.accepted_snapshot_fingerprint_ledger_version
-                        <= SNAPSHOT_ACCEPTED_LEDGER_VERSION
-                    && index
-                        .legacy_settlement_reconcile_after_fingerprint
-                        .as_deref()
-                        .map_or(true, |fingerprint| {
-                            fingerprint.len() == 64
-                                && fingerprint.bytes().all(|byte| {
-                                    byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
-                                })
-                        })
-                    && index
-                        .quarantined_snapshot_fingerprints
-                        .values()
-                        .all(snapshot_quarantine_deadline_is_bounded) =>
-            {
-                if index.canonicalize_codex_identity_keys() {
-                    index.drop_unbound_claude_authority_records("load");
-                    Ok(index)
-                } else {
-                    quarantine_invalid_scan_index(path)
-                }
-            }
-            Ok(index) if index.schema_version == SCAN_INDEX_SCHEMA_VERSION => {
-                quarantine_invalid_scan_index(path)
-            }
-            Ok(_) => Err(anyhow::anyhow!(
+            Ok(index) if index.schema_version != SCAN_INDEX_SCHEMA_VERSION => Err(anyhow::anyhow!(
                 "unsupported local snapshot scan index schema"
             )),
-            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path),
+            // Written by a newer build: future state, refused like a schema
+            // mismatch and never rebuilt over.
+            Ok(index)
+                if index.accepted_snapshot_fingerprint_ledger_version
+                    > SNAPSHOT_ACCEPTED_LEDGER_VERSION =>
+            {
+                Err(anyhow::anyhow!(
+                    "unsupported local snapshot scan index accepted-ledger version {}",
+                    index.accepted_snapshot_fingerprint_ledger_version
+                ))
+            }
+            Ok(mut index) => {
+                let drops = index.drop_invalid_index_records();
+                if !index.canonicalize_codex_identity_keys() {
+                    let discarded = index.files.len();
+                    return quarantine_invalid_scan_index(
+                        path,
+                        "codex_identity_collision",
+                        Some(discarded),
+                    );
+                }
+                note_scan_index_record_drops("load", drops);
+                index.drop_unbound_claude_authority_records("load");
+                Ok(index)
+            }
+            Err(error) if !error.is_io() => quarantine_invalid_scan_index(path, "decode", None),
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
             }
@@ -31444,6 +31417,8 @@ impl ScanIndex {
     fn save_internal(&mut self, path: &Path, read_limit: Option<usize>) -> Result<()> {
         // Fails closed for the one record, in debug and release; never the save.
         self.drop_unbound_claude_authority_records("save");
+        let drops = self.drop_invalid_index_records();
+        note_scan_index_record_drops("save", drops);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;

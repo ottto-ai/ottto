@@ -269,7 +269,7 @@ fn load_keeps_index_with_one_unbounded_retry_pending_quarantine_record() {
         value["quarantined_snapshot_fingerprints"][lc_hex('e')]["retry_after_unix_seconds"] =
             json!(far);
     });
-    let before_load = lc_now();
+    let after_load = lc_now();
     let (mut index, drops) = lc_assert_kept(&scratch, load);
     let record = &index.quarantined_snapshot_fingerprints[&lc_hex('e')];
     assert_eq!(
@@ -278,7 +278,7 @@ fn load_keeps_index_with_one_unbounded_retry_pending_quarantine_record() {
     );
     assert_eq!(record.failed_reconstruction_count, 1);
     assert!(record.retry_after_unix_seconds <= lc_now());
-    assert!(record.retry_after_unix_seconds + 60 >= before_load);
+    assert!(record.retry_after_unix_seconds + 60 >= after_load);
     assert!(snapshot_quarantine_deadline_is_bounded(record));
     assert_eq!(index.snapshot_unproven_terminal_count(), 1);
     assert_eq!(index.snapshot_activity_at.len(), 4);
