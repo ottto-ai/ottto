@@ -386,6 +386,21 @@ impl ClaudeRequestCensusRecord {
         self.unverified || self.twin
     }
 
+    /// A current native body can supersede an unverified D1 record only if
+    /// the record describes a complete, loss-free parse of that revision.
+    /// Terminal oversized-line settlement is NOT complete proof evidence.
+    /// Identity-incomplete records wait for a Full audit: saved-witness
+    /// reconstruction does not itself refuse their bodies.
+    pub(crate) fn can_bind_recomposed_body(&self) -> bool {
+        self.current_derivation()
+            && !self.twin
+            && self.retired.is_none()
+            && matches!(
+                self.shape,
+                ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
+            )
+    }
+
     /// Both records were produced at the same file fingerprint (a ledger
     /// `mh:` record and the transcript record it describes).
     pub(crate) fn same_fingerprint(&self, other: &Self) -> bool {

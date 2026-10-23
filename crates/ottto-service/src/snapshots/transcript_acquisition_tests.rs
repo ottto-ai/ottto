@@ -2751,6 +2751,8 @@ fn side_certificate_reports_unsealed_without_cache_events() {
     assert_eq!(completed.checkpoint.sealed_offset(), len);
 }
 
+mod stage2pre_in_page_tail_tests;
+
 /// Codex rollout with two compaction shapes: a marker followed by an exact
 /// repeat of the last record (not counted) and a zero-size record (skipped)
 /// before the next counted request, then two markers with no request between.

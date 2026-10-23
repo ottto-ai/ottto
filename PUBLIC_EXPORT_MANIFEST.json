@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 816,
-  "content_sha256": "42148088e00740211900ce7a828831cecd8a4ca33472b5c21477ead6140f19da",
+  "candidate_file_count": 819,
+  "content_sha256": "187f6faf69cbb5e7a8bfc60b887cce0c960e67f7674fded964e0be6ac38c5e97",
   "files": [
     {
       "executable": false,
@@ -1252,8 +1252,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_resource_diagnostics/cache_lifecycle.rs",
-      "sha256": "c8f3df27ef69a26f48654035d0c79ac46cf14666b09dc8856a65945a3644a944",
-      "size_bytes": 4672
+      "sha256": "6af73c043772115972a7bd7a6c3f815f240edf25cdeea88a1f70466308dc33aa",
+      "size_bytes": 4831
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "4414a47bae78e7f6e64fc4576a49e6a87f59633118b0349de86dad30b209d036",
-      "size_bytes": 3333191
+      "sha256": "b536a163b2488cf790cc2f5c818cae9aab5b49781dcb85646c81ab274b71969c",
+      "size_bytes": 3349020
     },
     {
       "executable": false,
@@ -1693,8 +1693,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "eb25a120d36f04d6079f2e72b988baae4a9b6e38067f1caa41704007dab7503a",
-      "size_bytes": 129985
+      "sha256": "ab4e5dfc31d6d1f8c43c5717530e13a13c7e971687b3204ec1ef49e4f5677a40",
+      "size_bytes": 130658
     },
     {
       "executable": false,
@@ -1994,8 +1994,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_audit.rs",
-      "sha256": "d4b7c871ef65dd80a44481315576f6d3e6e957ada07e1aca4c2abe982fec1513",
-      "size_bytes": 12369
+      "sha256": "6ae3a69a30f9e8abc5a5cda890e264e52bff5216515841de0370711dd87df3db",
+      "size_bytes": 22477
     },
     {
       "executable": false,
@@ -2015,8 +2015,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "d5f7050184cac666b2b84bd9c8bf3dc98d9bcc9d9893579d1edc82095961665f",
-      "size_bytes": 221789
+      "sha256": "5ac6dd205e16461c51af9840baf01ef2edb59f3b8431d5f363101b9ebc303af5",
+      "size_bytes": 222007
     },
     {
       "executable": false,
@@ -2064,8 +2064,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests.rs",
-      "sha256": "0c32f1121ea735d0842a2d948a9448976364756c4660aff3b5e7b4391b92b093",
-      "size_bytes": 116341
+      "sha256": "26661d780c99f047218ab6577927ae9145bf1a2fb65aa1929222a1790e697314",
+      "size_bytes": 116376
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests.rs",
+      "sha256": "ff86b8732c569b0ff6f290b9dc2392a378d798f17dfde31e7a08e0dc650e25db",
+      "size_bytes": 12324
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/transcript_acquisition_tests/stage2pre_in_page_tail_tests/fe_claude_in_page_read_tests.rs",
+      "sha256": "0e19795bc0d9d13d3bcb29c26da099acdc119d8aa5f19323ab7c18042230b7c5",
+      "size_bytes": 67791
     },
     {
       "executable": false,
@@ -3886,6 +3900,13 @@
       "path": "docs/session-2026-10-21-tls-webpki-advisory-repair.md",
       "sha256": "ef62b022edc9e5a419dcd1e24d4509ae26d04a99355d05799cc8e87178ccd083",
       "size_bytes": 3566
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "docs/session-2026-10-22-claude-frozen-extent.md",
+      "sha256": "ba6ef6433f8ae7e8838f479771c7b41a7d3577ebda4b70f843c2c2a54f72c253",
+      "size_bytes": 4444
     },
     {
       "executable": false,
@@ -5715,9 +5736,9 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T00:17:51+00:00",
+  "generated_at": "2026-10-23T02:44:26+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 817,
+  "output_file_count": 820,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5754,5 +5775,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "dd7a4f216343962357e86bf49d3aaa27bf430bb2"
+  "source_commit": "d2b912d97910aa7a8ca2bba78c0b10069ad4be3c"
 }
