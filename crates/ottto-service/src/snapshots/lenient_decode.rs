@@ -9,6 +9,14 @@ use std::sync::Arc;
 // No parser-copy/census credit is consumed. Check before allocating raw bytes.
 const HOLD_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const HOLD_COUNT_MAX: usize = 4096;
+// Inline bookkeeping retained for each slot: key/map entries, shared payload
+// and Arc counters, and both fixed-size scope keys. Tree-node slack remains
+// O(1) per hold, as in the native typed maps; no corpus-sized metadata credit.
+const HOLD_RECORD_OVERHEAD: u64 = (std::mem::size_of::<(String, Arc<HeldRaw>)>()
+    + std::mem::size_of::<HeldRaw>()
+    + 2 * std::mem::size_of::<usize>()
+    + 2 * std::mem::size_of::<[u8; 32]>()
+    + std::mem::size_of::<(&str, HeldSlots)>()) as u64;
 
 type HeldSlots = BTreeMap<String, Arc<HeldRaw>>;
 #[derive(Debug, Clone, Default)]
@@ -49,7 +57,7 @@ impl RepairProvenance {
     }
 }
 #[derive(Debug)]
-struct HeldRaw(Box<RawValue>, Option<String>);
+struct HeldRaw(Box<RawValue>, Option<String>, u64); // admitted key/value/bookkeeping charge
 impl HeldRaw {
     fn get(&self) -> &str {
         self.0.get()
@@ -713,8 +721,15 @@ pub(super) fn read<R: BufRead + Seek>(
     decoder.reader.seek(SeekFrom::Start(0))?;
     let result = decoder.index(false);
     if matches!(result, Err(Error::HoldBudget)) {
+        let fallback = if stage == "load" {
+            // Landing dependency: #712 makes this existing whole-index rebuild
+            // classify prior files as history, never freshly discovered usage.
+            "prior_history_gated_rebuild_requires_712"
+        } else {
+            "cas_refusal_without_rewrite"
+        };
         emit_scan_index_containment_line(format!(
-            "local snapshot scan index {stage}: source={source} lenient_hold_budget_exceeded=1"
+            "local snapshot scan index {stage}: source={source} lenient_hold_budget_exceeded=1 fallback={fallback}"
         ));
     }
     let mut index = result?;
@@ -814,17 +829,40 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.reader.seek(SeekFrom::Start(span.start + span.len))?;
         result
     }
-    fn raw(&mut self, span: Span) -> std::result::Result<Box<RawValue>, Error> {
-        if self.held_count >= HOLD_COUNT_MAX
-            || span.len > self.input_len / 8
-            || self
-                .held_bytes
-                .checked_add(span.len)
-                .map_or(true, |bytes| bytes > HOLD_BYTES_MAX.min(self.input_len / 8))
+    fn check_hold_bytes(&self, bytes: u64) -> std::result::Result<(), Error> {
+        if self
+            .held_bytes
+            .checked_add(bytes)
+            .map_or(true, |total| total > HOLD_BYTES_MAX.min(self.input_len / 8))
         {
             return Err(Error::HoldBudget);
         }
-        // The lexical length and running admission are checked before allocation.
+        Ok(())
+    }
+    fn record_key(&mut self, span: Span) -> std::result::Result<String, Error> {
+        // A decoded key cannot exceed its original lexical length. Never let
+        // serde allocate an oversized key/unescape buffer. For a damaged record
+        // the caller also admits its full key/value charge before this call;
+        // healthy native records do not spend the corruption allowance.
+        if span.len > HOLD_BYTES_MAX {
+            return Err(Error::HoldBudget);
+        }
+        self.typed(span)
+    }
+    fn hold_charge(field: &str, key: Span, value: Span) -> std::result::Result<u64, Error> {
+        key.len
+            .checked_add(value.len)
+            .and_then(|bytes| bytes.checked_add(HOLD_RECORD_OVERHEAD))
+            .and_then(|bytes| bytes.checked_add(if field == "files" { value.len } else { 0 }))
+            .ok_or(Error::HoldBudget)
+    }
+    fn raw(&mut self, span: Span, charge: u64) -> std::result::Result<Box<RawValue>, Error> {
+        self.check_hold_bytes(charge)?;
+        if self.held_count >= HOLD_COUNT_MAX {
+            return Err(Error::HoldBudget);
+        }
+        // Key, value, optional owner copy and bookkeeping have all been checked
+        // before retaining either raw bytes or the already bounded record key.
         self.reader.seek(SeekFrom::Start(span.start))?;
         let mut bytes = String::with_capacity(span.len as usize);
         (&mut self.reader)
@@ -836,6 +874,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         &mut self,
         field: &'static str,
         key: String,
+        key_span: Span,
         span: Span,
     ) -> std::result::Result<(), Error> {
         if (field == "quarantined_snapshot_fingerprints" && !is_snapshot_fingerprint(&key))
@@ -843,15 +882,19 @@ impl<R: BufRead + Seek> Decoder<R> {
         {
             return Err(Error::Refused("unaddressable held identity"));
         }
-        let raw = self.raw(span)?;
-        self.held_bytes += span.len;
+        // Retain the lexical key charge, including escapes, so canonical output
+        // can never require a larger restart admission. A file may also retain
+        // an owner copied out of its raw slot; its size is <= that raw span.
+        let charge = Self::hold_charge(field, key_span, span)?;
+        let raw = self.raw(span, charge)?;
+        self.held_bytes += charge;
         self.held_count += 1;
         let owner = (field == "files").then(|| held_file_owner(&raw)).flatten();
         self.holds
             .0
             .entry(field)
             .or_default()
-            .insert(key, Arc::new(HeldRaw(raw, owner)));
+            .insert(key, Arc::new(HeldRaw(raw, owner, charge)));
         self.counts.held += 1;
         if field == "files" {
             self.counts.files += 1;
@@ -887,13 +930,22 @@ impl<R: BufRead + Seek> Decoder<R> {
         let mut values = BTreeMap::new();
         while self.ws()? != Some(b'}') {
             let key_span = self.span()?;
-            let key: String = self.typed(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
+            // Decode the value first: only actual opaque debt spends hold
+            // admission. Its full charge is checked before allocating the key.
+            let decoded = self.typed(value);
+            if debt && decoded.is_err() {
+                self.check_hold_bytes(Self::hold_charge(field, key_span, value)?)?;
+                if self.held_count >= HOLD_COUNT_MAX {
+                    return Err(Error::HoldBudget);
+                }
+            }
+            let key = self.record_key(key_span)?;
             if values.contains_key(&key) || self.holds.contains(field, &key) {
                 return Err(Error::Refused("duplicate record key"));
             }
-            match self.typed(value) {
+            match decoded {
                 Ok(decoded) => {
                     if repaired(&decoded) {
                         let hash = self.hash_span(value)?;
@@ -901,7 +953,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                     }
                     values.insert(key, decoded);
                 }
-                Err(_) if debt => self.hold(field, key, value)?,
+                Err(_) if debt => self.hold(field, key, key_span, value)?,
                 Err(_) => {
                     self.counts.drops.activity += 1;
                 }
@@ -978,7 +1030,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                     self.holds.1.add(field, &key, repair_key(raw.get()));
                     values.insert(key, value);
                     self.held_count -= 1;
-                    self.held_bytes -= raw.get().len() as u64;
+                    self.held_bytes -= raw.2;
                     self.counts.held -= 1;
                     if field == "quarantined_snapshot_fingerprints" {
                         self.counts.drops.quarantine += 1;
@@ -1333,7 +1385,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.eat(b'{')?;
         while self.ws()? != Some(b'}') {
             let key_span = self.span()?;
-            let key: String = self.typed(key_span)?;
+            let key = self.record_key(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
             let unbound = index
@@ -1356,7 +1408,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.holds.1.remove(field, &key, hash);
                 self.counts.authority_repairs -= 1;
                 index.claude_usage_authority_quarantine.remove(&key);
-                self.hold(field, key, value)?;
+                self.hold(field, key, key_span, value)?;
             }
             self.reader.seek(SeekFrom::Start(value.start + value.len))?;
             if self.ws()? == Some(b',') {
@@ -1396,7 +1448,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             self.eat(b'{')?;
             while self.ws()? != Some(b'}') {
                 let key_span = self.span()?;
-                let key: String = self.typed(key_span)?;
+                let key = self.record_key(key_span)?;
                 self.eat(b':')?;
                 let value = self.span()?;
                 let root_held = roots.contains(key.as_str());
@@ -1438,7 +1490,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         _ => unreachable!(),
                     }
-                    self.hold(field, key, value)?;
+                    self.hold(field, key, key_span, value)?;
                 }
                 self.reader.seek(SeekFrom::Start(value.start + value.len))?;
                 if self.ws()? == Some(b',') {
@@ -1467,7 +1519,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.eat(b'{')?;
         while self.ws()? != Some(b'}') {
             let key_span = self.span()?;
-            let key: String = self.typed(key_span)?;
+            let key = self.record_key(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
             if index
@@ -1550,6 +1602,12 @@ impl ScanIndex {
             .into_iter()
             .flat_map(|slots| slots.keys())
             .map(String::as_str)
+    }
+    // Missing incidence is UNKNOWN, not an empty set. Keep existing ACKs as
+    // possible prior members without inventing membership for emission/manifests.
+    pub(super) fn decode_has_opaque_file_incidence(&self) -> bool {
+        self.decode_held_file_keys()
+            .any(|key| !self.file_snapshot_fingerprints.contains_key(key))
     }
     // Exact entity holds and file/family holds have separate keyed queries.
     // Consumers with a file key must retain that context rather than reverse
@@ -1666,8 +1724,10 @@ impl ScanIndex {
 // Extension contract for MONEY's independently owned field: its record codec
 // must drop/count only the bad selection and leave that file recensus-due.
 // Ledger/version/decode errors return Err with the file unchanged. Add the
-// field policy here when MONEY composes its codec; never default a failed ledger
-// read, quarantine its file, or borrow census/parser-copy credit for it.
+// field policy here when MONEY composes its codec, together with the ScanIndex
+// serializer, FIELDS registry and index() dispatch; census sequence_fields()
+// asserts their agreement. Never default a failed ledger read, quarantine its
+// file, or borrow census/parser-copy credit for it.
 
 pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     // Preserve the caller byte bound and the existing census normalization and
@@ -1866,7 +1926,7 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
         .0
         .values()
         .flat_map(|slots| slots.values())
-        .map(|raw| raw.get().len() as u64)
+        .map(|raw| raw.2)
         .sum::<u64>();
     let mut output = Count(0);
     serde_json::to_writer_pretty(&mut output, index)?;

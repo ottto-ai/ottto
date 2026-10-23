@@ -35729,6 +35729,11 @@ impl ScanIndex {
         if self.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             return (BTreeSet::new(), false);
         }
+        // Opaque incidence cannot prove the migration complete, nor justify
+        // clearing intact ACKs while reopening an old ledger.
+        if self.decode_has_opaque_file_incidence() {
+            return (BTreeSet::new(), false);
+        }
         self.reopen_unproven_accepted_snapshot_ledger(source);
 
         let pending = self.legacy_settlement_reconciliation_pending_fingerprints();
@@ -35846,7 +35851,7 @@ impl ScanIndex {
         // `legacy_settlement_ledger_is_unproven` carries the exact scope,
         // including the cursor condition that limits the pre-ledger leg to
         // never-armed ledgers, and the two ways the state is left.
-        if self.legacy_settlement_ledger_is_unproven() {
+        if self.decode_has_opaque_file_incidence() || self.legacy_settlement_ledger_is_unproven() {
             return;
         }
         if self
@@ -35882,9 +35887,10 @@ impl ScanIndex {
             }
         }
         let current = self.current_snapshot_fingerprints();
+        let opaque_incidence = self.decode_has_opaque_file_incidence();
         let mut retained = std::mem::take(&mut self.accepted_snapshot_fingerprints);
         retained.retain(|fingerprint| {
-            current.contains(fingerprint)
+            (opaque_incidence || current.contains(fingerprint))
                 && !self
                     .quarantined_snapshot_fingerprints
                     .contains_key(fingerprint)
@@ -37386,8 +37392,9 @@ impl ScanIndex {
                 .entry(fingerprint)
                 .or_insert(record);
         }
+        let opaque_incidence = self.decode_has_opaque_file_incidence();
         self.accepted_snapshot_fingerprints.retain(|fingerprint| {
-            current.contains(fingerprint)
+            (opaque_incidence || current.contains(fingerprint))
                 && !self
                     .quarantined_snapshot_fingerprints
                     .contains_key(fingerprint)

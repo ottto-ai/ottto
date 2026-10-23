@@ -1241,3 +1241,233 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
+
+#[test]
+fn streamed_64_mib_record_key_refuses_before_key_allocation() {
+    use std::io::{Read, Write};
+    fn digest(path: &Path) -> [u8; 32] {
+        let mut file = File::open(path).unwrap();
+        let mut hash = Sha256::new();
+        let mut bytes = [0; 8192];
+        loop {
+            let count = file.read(&mut bytes).unwrap();
+            if count == 0 {
+                return hash.finalize().into();
+            }
+            hash.update(&bytes[..count]);
+        }
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-oversize-record-key");
+    let path = scratch.as_ref().join("index.json");
+    let mut working = fixture();
+    working.save(&path).unwrap();
+    let generation = working.generation;
+    let mut file = BufWriter::new(File::create(&path).unwrap());
+    write!(file, "{{\"generation\":{generation},\"files\":{{\"").unwrap();
+    let block = [b'k'; 8192];
+    for _ in 0..64 * 1024 * 1024 / block.len() {
+        file.write_all(&block).unwrap();
+    }
+    file.write_all(b"\":false}}").unwrap();
+    file.flush().unwrap();
+    drop(file);
+    let input_len = fs::metadata(&path).unwrap().len() as usize;
+    let original = digest(&path);
+    let (result, cas) = crate::retry_allocation_probe::measure(|| working.save(&path));
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert!(cas.requested_peak < 256 * 1024);
+    assert!(cas.usable_peak < 512 * 1024);
+    assert_eq!(working.generation, generation);
+    assert_eq!(digest(&path), original);
+    assert_sibling(&working);
+    // Selected CAS retains its preexisting input and normalization buffers.
+    // Price those independently; no additional 64-MiB key String is allowed.
+    let (input, input_read) = crate::retry_allocation_probe::measure(|| {
+        crate::snapshot_retry::read_state(&path, input_len).unwrap()
+    });
+    let (normalized, normalization) = crate::retry_allocation_probe::measure(|| {
+        claude_request_census::normalized_bounded_bytes(&input).unwrap()
+    });
+    drop(normalized);
+    drop(input);
+    let (result, selected) =
+        crate::retry_allocation_probe::measure(|| working.save_with_read_limit(&path, input_len));
+    assert!(format!("{:#}", result.unwrap_err()).contains("lenient_hold_budget_exceeded"));
+    assert!(
+        selected.requested_peak
+            <= input_read.requested_peak + normalization.requested_peak + 256 * 1024
+    );
+    assert!(
+        selected.usable_peak <= input_read.usable_peak + normalization.usable_peak + 512 * 1024
+    );
+    assert_eq!(working.generation, generation);
+    assert_eq!(digest(&path), original);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    let before = scan_index_containment_lines_for_test().len();
+    let (loaded, load) = crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
+    assert!(loaded.files.is_empty());
+    assert!(!path.exists());
+    assert_eq!(corrupt_count(scratch.as_ref()), 1);
+    let quarantined = fs::read_dir(scratch.as_ref())
+        .unwrap()
+        .filter_map(std::result::Result::ok)
+        .find(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+        .unwrap();
+    assert_eq!(digest(&quarantined.path()), original);
+    assert!(load.requested_peak < 256 * 1024);
+    assert!(load.usable_peak < 512 * 1024);
+    assert!(scan_index_containment_lines_for_test()[before..]
+        .iter()
+        .any(|line| line.contains("lenient_hold_budget_exceeded=1")
+            && line.contains("fallback=prior_history_gated_rebuild_requires_712")));
+    eprintln!("lenient_oversize_key_receipt key_bytes={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} normalization_requested={} selected_requested={} selected_usable={}", 64 * 1024 * 1024, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, normalization.requested_peak, selected.requested_peak, selected.usable_peak);
+}
+
+#[test]
+fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
+    for records in [1, 3] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-key-charge");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        seed.save(&path).unwrap();
+        let mut value = serde_json::to_value(&seed).unwrap();
+        for n in 0..records {
+            value["files"][format!("{n}{}", "k".repeat(4096))] = Value::Bool(false);
+        }
+        value["unknown_padding"] = Value::String("p".repeat(48 * 1024));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        if records == 3 {
+            let error = lenient_decode::read(std::io::Cursor::new(&bytes), "cas", "unattributed")
+                .unwrap_err();
+            assert!(matches!(error, lenient_decode::Error::HoldBudget));
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+        } else {
+            let mut loaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(loaded.decode_held_file_keys().count(), 1);
+            assert_sibling(&loaded);
+            // The original padding funded this key; canonical output does not.
+            for bounded in [false, true] {
+                let error = if bounded {
+                    loaded.save_with_read_limit(&path, 1024 * 1024)
+                } else {
+                    loaded.save(&path)
+                }
+                .unwrap_err();
+                assert!(format!("{error:#}").contains("lenient_hold_budget_exceeded"));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+            }
+        }
+    }
+}
+
+#[test]
+fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restart() {
+    for exact_empty in [false, true] {
+        for bounded in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-incidence-ack");
+            let path = scratch.as_ref().join("index.json");
+            let mut seed = fixture();
+            let key = "/synthetic/0.jsonl";
+            let ack = format!("{:064x}", 0);
+            seed.file_snapshot_fingerprints.remove(key);
+            if exact_empty {
+                seed.file_snapshot_fingerprints
+                    .insert(key.into(), BTreeSet::new());
+            }
+            seed.save(&path).unwrap();
+            let mut value = serde_json::to_value(&seed).unwrap();
+            value["files"][key] = Value::Bool(false);
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let mut loaded = ScanIndex::load(&path).unwrap();
+            assert!(loaded.decode_holds_file(key));
+            assert_eq!(loaded.decode_has_opaque_file_incidence(), !exact_empty);
+            assert!(loaded.accepted_snapshot_fingerprints.contains(&ack));
+            loaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprints.contains(&ack),
+                !exact_empty
+            );
+            loaded.retain_quarantined_fingerprints(&BTreeMap::new());
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprints.contains(&ack),
+                !exact_empty
+            );
+            let subset = loaded.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(
+                subset.accepted_snapshot_fingerprints.contains(&ack),
+                !exact_empty
+            );
+            assert!(!loaded
+                .eligible_snapshot_fingerprint_refs()
+                .any(|fp| fp == ack));
+            if bounded {
+                loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+            } else {
+                loaded.save(&path).unwrap();
+            }
+            let restarted = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                restarted.accepted_snapshot_fingerprints.contains(&ack),
+                !exact_empty
+            );
+            assert_eq!(restarted.decode_has_opaque_file_incidence(), !exact_empty);
+            assert_sibling(&restarted);
+        }
+    }
+}
+
+#[test]
+fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
+    for version in [0, SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-opaque-legacy-seal");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        seed.accepted_snapshot_fingerprint_ledger_version = version;
+        seed.legacy_settlement_reconcile_after_fingerprint = Some(format!("{:064x}", 0));
+        seed.file_snapshot_fingerprints.remove("/synthetic/0.jsonl");
+        seed.save(&path).unwrap();
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["files"]["/synthetic/0.jsonl"] = Value::Bool(false);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        let accepted = loaded.accepted_snapshot_fingerprints.clone();
+        let cursor = loaded.legacy_settlement_reconcile_after_fingerprint.clone();
+        assert!(loaded
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty());
+        let (armed, changed) =
+            loaded.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+        assert!(armed.is_empty());
+        assert!(!changed);
+        assert_eq!(loaded.accepted_snapshot_fingerprint_ledger_version, version);
+        loaded.finish_legacy_settlement_reconciliation();
+        assert_eq!(loaded.accepted_snapshot_fingerprint_ledger_version, version);
+        assert_eq!(loaded.accepted_snapshot_fingerprints, accepted);
+        assert_eq!(loaded.legacy_settlement_reconcile_after_fingerprint, cursor);
+        loaded.save(&path).unwrap();
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert!(restarted.decode_has_opaque_file_incidence());
+        assert_eq!(
+            restarted.accepted_snapshot_fingerprint_ledger_version,
+            version
+        );
+        assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
+        if version == 0 {
+            // Exact empty incidence resolves UNKNOWN even while the file is
+            // held; it does not invent a fingerprint or automatic retry.
+            loaded
+                .file_snapshot_fingerprints
+                .insert("/synthetic/0.jsonl".into(), BTreeSet::new());
+            assert!(!loaded.decode_has_opaque_file_incidence());
+            let (armed, changed) =
+                loaded.prepare_legacy_settlement_reconciliation(SnapshotSource::Codex, 50);
+            assert!(armed.is_empty());
+            assert!(changed);
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprint_ledger_version,
+                SNAPSHOT_ACCEPTED_LEDGER_VERSION
+            );
+        }
+    }
+}
