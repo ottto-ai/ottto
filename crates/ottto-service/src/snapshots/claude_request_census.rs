@@ -2068,71 +2068,6 @@ impl Serialize for LowerHex<'_> {
     }
 }
 
-#[cfg(test)]
-mod memo_accounting_tests {
-    use super::*;
-
-    #[test]
-    fn batched_hex_keeps_canonical_bytes_for_all_values_and_chunk_edges() {
-        let bytes = (0..=255).collect::<Vec<u8>>();
-        for len in [0, 1, 31, 32, 33, 63, 64, 255, 256] {
-            let expected = bytes[..len]
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect::<String>();
-            assert_eq!(LowerHex(&bytes[..len]).to_string(), expected);
-            assert_eq!(
-                serde_json::to_vec(&LowerHex(&bytes[..len])).unwrap(),
-                serde_json::to_vec(&expected).unwrap()
-            );
-        }
-    }
-
-    #[test]
-    fn dense_memo_insert_replace_remove_keeps_exact_serialized_accounting() {
-        let mut census = ClaudeRequestCensus::default();
-        for generation in 0..2 {
-            for at in 0..2051_u64 {
-                let key = family_key(&format!("family-{at}"));
-                let memo = ClaudeFamilyMemo {
-                    removed_requests: if generation == 0 { u64::MAX } else { at },
-                    removed_tokens: at * 100,
-                    snapshot: at + generation * 2051,
-                    published: Some(ClaudeFamilyPublication {
-                        utc_day: 20261024,
-                        digest: u64::MAX - at,
-                        epoch: 123456789,
-                        attempted: 1792790000 + generation,
-                    }),
-                };
-                assert_eq!(
-                    census.insert(
-                        key,
-                        ClaudeRequestCensusRecord::family_record([at as u8; 32], at, memo)
-                    ),
-                    ClaudeRequestCensusInsert::Stored
-                );
-            }
-            let exact = census
-                .records
-                .iter()
-                .map(|(key, record)| {
-                    serde_json::to_vec(key).unwrap().len()
-                        + serde_json::to_vec(record).unwrap().len()
-                        + 2
-                })
-                .sum::<usize>();
-            assert_eq!(census.serialized_total, exact);
-            assert_eq!(census.hash_total, 0);
-        }
-        for at in 0..2051 {
-            census.remove(&family_key(&format!("family-{at}")));
-        }
-        assert_eq!(census.serialized_total, 0);
-        assert_eq!(census.hash_total, 0);
-    }
-}
-
 /// Base64 (standard, padded) of the big-endian bytes of each hash, streamed
 /// three hashes (24 bytes, 32 characters) at a time without a whole buffer.
 struct HashBase64<'a>(&'a [u64]);
@@ -3412,5 +3347,70 @@ mod reader_regression_tests {
             assert!(source.interruptions > 0);
             assert_eq!(serde_json::to_value(decoded).expect("decoded"), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod memo_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn batched_hex_keeps_canonical_bytes_for_all_values_and_chunk_edges() {
+        let bytes = (0..=255).collect::<Vec<u8>>();
+        for len in [0, 1, 31, 32, 33, 63, 64, 255, 256] {
+            let expected = bytes[..len]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(LowerHex(&bytes[..len]).to_string(), expected);
+            assert_eq!(
+                serde_json::to_vec(&LowerHex(&bytes[..len])).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn dense_memo_insert_replace_remove_keeps_exact_serialized_accounting() {
+        let mut census = ClaudeRequestCensus::default();
+        for generation in 0..2 {
+            for at in 0..2051_u64 {
+                let key = family_key(&format!("family-{at}"));
+                let memo = ClaudeFamilyMemo {
+                    removed_requests: if generation == 0 { u64::MAX } else { at },
+                    removed_tokens: at * 100,
+                    snapshot: at + generation * 2051,
+                    published: Some(ClaudeFamilyPublication {
+                        utc_day: 20261024,
+                        digest: u64::MAX - at,
+                        epoch: 123456789,
+                        attempted: 1792790000 + generation,
+                    }),
+                };
+                assert_eq!(
+                    census.insert(
+                        key,
+                        ClaudeRequestCensusRecord::family_record([at as u8; 32], at, memo)
+                    ),
+                    ClaudeRequestCensusInsert::Stored
+                );
+            }
+            let exact = census
+                .records
+                .iter()
+                .map(|(key, record)| {
+                    serde_json::to_vec(key).unwrap().len()
+                        + serde_json::to_vec(record).unwrap().len()
+                        + 2
+                })
+                .sum::<usize>();
+            assert_eq!(census.serialized_total, exact);
+            assert_eq!(census.hash_total, 0);
+        }
+        for at in 0..2051 {
+            census.remove(&family_key(&format!("family-{at}")));
+        }
+        assert_eq!(census.serialized_total, 0);
+        assert_eq!(census.hash_total, 0);
     }
 }
