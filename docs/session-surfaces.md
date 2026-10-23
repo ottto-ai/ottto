@@ -32,11 +32,19 @@ a listed session rebuilds its row under the current upload policy and account
 evidence. A row that was not re-read is kept only under the same upload policy,
 and loses its account attribution if current evidence (account or workspace)
 contradicts it.
-Recency is judged on
-the clock when the scan finishes, so a long scan does not reject activity it
-read after it started. `changed_session_count` still counts only the sessions
-whose activity advanced in the latest scan. A source that stops collecting
-(policy tombstone or reconciliation disabled) empties the list.
+For Claude, recency is judged relative to the scan start (bounded by the
+reconciliation clock), and future activity is bounded by the clock when the scan
+finishes. This keeps activity seen early in a long scan without rejecting activity
+written after the scan started. Other sources judge recency at reconciliation.
+`changed_session_count` still counts only the sessions whose activity advanced in
+the latest scan. A source that stops collecting (policy tombstone or
+reconciliation disabled) empties the list.
+
+Claude limit reads judge the 30-minute in-use window against `scan_started_at`
+from the last completed Claude scan. An in-use binding keeps its 5-minute slot
+while the next scan lags. When the completed scan's start is more than two hours
+old, or the start is unknown, the window uses the wall clock. A fresh scan with
+no new activity therefore returns the binding to its usual idle cadence.
 
 ## Account attribution
 
