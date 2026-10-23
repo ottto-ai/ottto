@@ -2033,23 +2033,19 @@ fn x_out_fact_limit_scratch_covers_adversarial_facts() {
     let bound = fact_limit_scratch_bound(4, NOW.len()).unwrap();
     let pre_trim = count * per_fact;
 
-    // One `to_vec` buffer at the count cap: maximal escaping, inside the
-    // term's JSON share.
+    // One `to_vec` buffer at the count cap: maximal escaping, and the
+    // doubling the term derives (its last buffer is exactly `128 * 2^k`).
     let buffer = serde_json::to_vec(&facts[..MAX_SESSION_ATTRIBUTION_FACTS]).unwrap();
-    let json_share =
-        ((6 * per_fact + FACT_JSON_SYNTAX_BYTES) * MAX_SESSION_ATTRIBUTION_FACTS + 2) * 2;
+    let json_len = (6 * per_fact + FACT_JSON_SYNTAX_BYTES) * MAX_SESSION_ATTRIBUTION_FACTS + 2;
+    let last = json_len.div_ceil(128).next_power_of_two() * 128;
     assert!(
         buffer.len() >= MAX_SESSION_ATTRIBUTION_FACTS * 6 * per_fact,
         "precondition: every text byte escapes to six ({} B)",
         buffer.len()
     );
-    assert!(buffer.len() * 2 <= json_share, "syntax: {} B", buffer.len());
-    assert!(
-        buffer.capacity() <= json_share,
-        "capacity {}",
-        buffer.capacity()
-    );
-    assert!(buffer.capacity() <= bound - pre_trim);
+    assert!(buffer.len() <= json_len, "syntax: {} B", buffer.len());
+    assert_eq!(buffer.capacity(), last, "len {}", buffer.len());
+    assert!(last + last / 2 <= bound - pre_trim);
     drop(buffer);
 
     let ((), scratch) = crate::retry_allocation_probe::measure_caller_thread(|| {
@@ -2057,16 +2053,17 @@ fn x_out_fact_limit_scratch_covers_adversarial_facts() {
     });
     let born = scratch.requested_peak_with_overlap;
     eprintln!(
-        "X_OUT_FACTS facts={count} kept={} per_fact={per_fact} pre_trim={pre_trim} born_scratch={born} json_share={json_share} term={} term_off={} slack={}",
+        "X_OUT_FACTS facts={count} kept={} per_fact={per_fact} pre_trim={pre_trim} born_scratch={born} json_len={json_len} json_last={last} term={} term_off={} slack={}",
         facts.len(),
         bound,
         fact_limit_scratch_bound(2, NOW.len()).unwrap(),
         bound - (pre_trim + born).min(bound),
     );
-    assert_eq!(
-        facts.len(),
-        1,
-        "precondition: the budget loop popped to one"
+    // Two escaped facts (about 7.5 KB) fit the 8,192-byte budget; three do not.
+    assert_eq!(facts.len(), 2, "precondition: the budget loop popped 22");
+    assert!(
+        born >= last + last / 2,
+        "precondition: the last growth's old and new buffers were measured"
     );
     assert!(
         pre_trim + born <= bound,

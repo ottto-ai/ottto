@@ -15923,18 +15923,24 @@ const FACT_JSON_SYNTAX_BYTES: usize = 192;
 /// value (128, :31, checked at 1506), the label (96, :34, at 1518), the label
 /// source (32, :35, at 1521), the source version (32, :32, at 1507), the
 /// evidence ref (96, :33, at 1512) and `observed_at` (`collected_at`, 1535).
-/// Charged together, though the phases do not all coexist:
+/// A growing `Vec` briefly holds its old and new buffers (the allocation
+/// probe's overlap). Charged together, though the phases do not all coexist:
 /// - every pre-trim fact's text (K's `facts` term charges only the kept
 ///   facts' text);
-/// - `dropped_fields`: at most `24 * producers` names in a vector at most
-///   doubled, the cloned names (at most `FACT_LITERAL_BYTES` each), the
-///   stable sort's scratch (at most `max(len, 48)` slots) and the `join`
-///   text with its ", " separators;
+/// - `dropped_fields`: at most `24 * producers` names in slots grown by
+///   doubling (old and new at most 3 slots per name), the cloned names (at
+///   most `FACT_LITERAL_BYTES` each), the stable sort's scratch (at most
+///   `max(len, 48)` slots) and the `join` text with its ", " separators;
 /// - one `serde_json::to_vec` buffer (only one is live per loop step) of at
 ///   most 24 facts (the count cap truncates first, 1378-1385): each text byte
 ///   escapes to at most 6 bytes (`\u00XX`), plus `FACT_JSON_SYNTAX_BYTES` per
-///   fact and the array's brackets, in a `Vec` grown from 128 bytes to at
-///   most twice its length.
+///   fact and the array's brackets. `to_vec` starts at 128 bytes, and each
+///   write is one string's unescaped run, a 6-byte escape or punctuation
+///   (serde_json 1.0.149 `format_escaped_str_contents`), so while every
+///   string fits in 128 bytes each growth doubles: the last buffer is
+///   `128 * 2^k`, with half of it alongside during the copy. A longer
+///   `collected_at` falls back to three times the length (a previous buffer
+///   shorter than the length and a next at most twice that, or the length).
 fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usize> {
     use crate::session_attribution::{
         MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
@@ -15953,17 +15959,24 @@ fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usi
     let facts = producers.checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?;
     let pre_trim = facts.checked_mul(text)?;
     let dropped = facts
-        .checked_mul(2 * size_of::<String>())? // slots, at most doubled
+        .checked_mul(3 * size_of::<String>())? // slots, old and new
         .checked_add(facts.checked_mul(FACT_LITERAL_BYTES)?)? // cloned names
         .checked_add(facts.max(48).checked_mul(size_of::<String>())?)? // sort
         .checked_add(facts.checked_mul(FACT_LITERAL_BYTES + 2)?)?; // `join`
-    let json = text
+    let json_len = text
         .checked_mul(6)?
         .checked_add(FACT_JSON_SYNTAX_BYTES)?
         .checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?
-        .checked_add(2)?
-        .checked_mul(2)?
-        .max(128);
+        .checked_add(2)?;
+    let json = if collected_at <= MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES {
+        let last = json_len
+            .div_ceil(128)
+            .checked_next_power_of_two()?
+            .checked_mul(128)?;
+        last.checked_add(if last > 128 { last / 2 } else { 0 })?
+    } else {
+        json_len.checked_mul(3)?
+    };
     pre_trim.checked_add(dropped)?.checked_add(json)
 }
 
