@@ -9,8 +9,14 @@ PRIVATE_ROOT="$(cd "$ROOT/../.." && pwd)"
 source "$ROOT/scripts/public_repo_temp_cleanup.sh"
 
 tmp_dir="$(mktemp -d)"
+script_completed=0
 cleanup_tmp_dir() {
   local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "test_public_repo_contract_check: exited before completion" >&2
+    status=1
+  fi
   public_repo_remove_temp_dir "test_public_repo_contract_check" "$tmp_dir" || true
   exit "$status"
 }
@@ -2081,3 +2087,4 @@ grep -q "private backend registry loader must read root connectors/registry.gene
 grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
 
 echo "public_repo_contract_check tests passed"
+script_completed=1

@@ -5,7 +5,8 @@
 # A plain `rm -rf "$tmp_dir"` as the last command of an EXIT trap replaces the
 # script's exit status, so one "Directory not empty" race turns a passing run
 # into a failure. Callers capture `$?` first, call this helper, then
-# `exit "$status"` so the original result always wins.
+# `exit "$status"` to preserve failures. They also check a completion marker
+# because bash 3.2 can report status 0 in an EXIT trap after a nounset abort.
 #
 # Retries up to 5 times with fixed short sleeps (0.2+0.4+0.8+1.6 = 3.0 s of
 # sleep at most). Returns 0 when the directory is gone and 1 when it refused an

@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 HELPER="$ROOT/scripts/public_repo_temp_cleanup.sh"
 SURFACE_SCRIPT="$ROOT/scripts/public_repo_surface_ci.sh"
+CONTRACT_TEST="$ROOT/scripts/test_public_repo_contract_check.sh"
 # shellcheck source=scripts/public_repo_temp_cleanup.sh
 source "$HELPER"
 
@@ -18,7 +19,8 @@ trap cleanup_tmp_dir EXIT
 stub_bin="$tmp_dir/bin"
 mkdir -p "$stub_bin"
 REAL_RM="$(command -v rm)"
-export REAL_RM
+REAL_MKTEMP="$(command -v mktemp)"
+export REAL_RM REAL_MKTEMP
 
 # Busy-directory stand-in: for the first STUB_RM_FAILURES calls, really remove
 # the target, then recreate a late file under it (as a background git writer
@@ -47,27 +49,46 @@ cat > "$stub_bin/sleep" <<'SH'
 #!/usr/bin/env bash
 echo "$1" >> "$STUB_SLEEP_LOG"
 SH
-chmod +x "$stub_bin/rm" "$stub_bin/sleep"
+# Keep the real surface script's checkout under this test's owned case root.
+# BSD mktemp -d without a template does not honor TMPDIR.
+cat > "$stub_bin/mktemp" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ "$#" -eq 1 && "$1" == -d ]]
+exec "$REAL_MKTEMP" -d "$STUB_TEMP_ROOT/tmp.XXXXXXXXXX"
+SH
+chmod +x "$stub_bin/rm" "$stub_bin/sleep" "$stub_bin/mktemp"
 
-# Same trap shape as the scripts that own mktemp dirs.
-harness="$tmp_dir/trap-harness.sh"
-cat > "$harness" <<'SH'
+# Exercise the actual cleanup functions AND trap installations, rather than a
+# copied shape that could stay green if either real trap regressed.
+write_trap_harness() {
+  local script="$1"
+  local function_name="$2"
+  local harness_path="$3"
+  grep -Fxq "trap $function_name EXIT" "$script"
+  cat > "$harness_path" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
 source "$1"
-target="$2"
+tmp_dir="$2"
+TMP_DIR="$2"
+KEEP_TEMP=0
+script_completed=0
 mode="$3"
-cleanup_tmp_dir() {
-  local status=$?
-  public_repo_remove_temp_dir "harness" "$target" || true
-  exit "$status"
-}
-trap cleanup_tmp_dir EXIT
+SH
+  sed -n "/^$function_name() {$/,/^trap $function_name EXIT$/p" "$script" >> "$harness_path"
+  cat >> "$harness_path" <<'SH'
 case "$mode" in
-  pass) echo "harness checks passed" ;;
+  pass) echo "harness checks passed"; script_completed=1 ;;
   fail) exit 7 ;;
+  nounset) unset missing_value; echo "$missing_value" ;;
 esac
 SH
+}
+harness="$tmp_dir/contract-trap-harness.sh"
+surface_harness="$tmp_dir/surface-trap-harness.sh"
+write_trap_harness "$CONTRACT_TEST" cleanup_tmp_dir "$harness"
+write_trap_harness "$SURFACE_SCRIPT" cleanup "$surface_harness"
 
 case_index=0
 run_case() {
@@ -84,6 +105,7 @@ run_case() {
     STUB_RM_FAILURES="$failures" \
     STUB_RM_COUNT="$STUB_RM_COUNT" \
     STUB_SLEEP_LOG="$STUB_SLEEP_LOG" \
+    STUB_TEMP_ROOT="$case_dir" \
     "$@" >"$case_out" 2>&1; then
     case_status=0
   else
@@ -131,7 +153,7 @@ expect_status 0 "transient cleanup failure after passing run"
 expect_rm_calls 3 "transient cleanup failure"
 expect_sleeps "0.2 0.4 " "transient cleanup failure"
 [[ ! -e "$target" ]] || { echo "Expected transient target to be removed" >&2; exit 1; }
-grep -Fq "harness: removed temp dir $target after 3 attempts" "$case_out"
+grep -Fq "test_public_repo_contract_check: removed temp dir $target after 3 attempts" "$case_out"
 if grep -Fq "::warning::" "$case_out"; then
   echo "Expected no warning when a retry removed the temp dir" >&2
   exit 1
@@ -144,7 +166,7 @@ expect_status 0 "clean cleanup after passing run"
 expect_rm_calls 1 "clean cleanup"
 expect_sleeps "" "clean cleanup"
 [[ ! -e "$target" ]] || { echo "Expected clean target to be removed" >&2; exit 1; }
-if grep -Fq "harness:" "$case_out"; then
+if grep -Fq "test_public_repo_contract_check:" "$case_out"; then
   echo "Expected no cleanup output when the first attempt succeeds" >&2
   exit 1
 fi
@@ -154,7 +176,7 @@ target="$(new_target failing)"
 run_case 99 bash "$harness" "$HELPER" "$target" fail
 expect_status 7 "failing run with exhausted cleanup"
 expect_rm_calls 5 "failing run with exhausted cleanup"
-grep -Fq "::warning::harness: temp dir cleanup incomplete after 5 attempts; left $target in place" "$case_out"
+grep -Fq "::warning::test_public_repo_contract_check: temp dir cleanup incomplete after 5 attempts; left $target in place" "$case_out"
 
 # Exhausted retries after a passing run: status stays 0, diagnostic names the
 # path and the last rm error, and nothing claims the dir was removed.
@@ -164,12 +186,42 @@ expect_status 0 "passing run with exhausted cleanup"
 expect_rm_calls 5 "passing run with exhausted cleanup"
 expect_sleeps "0.2 0.4 0.8 1.6 " "passing run with exhausted cleanup"
 [[ -e "$target" ]] || { echo "Expected exhausted target to remain" >&2; exit 1; }
-grep -Fq "::warning::harness: temp dir cleanup incomplete after 5 attempts; left $target in place (script exit status unchanged)" "$case_out"
-grep -Fq "harness: last rm error: rm: $target/public-git/.git/objects: Directory not empty" "$case_out"
+grep -Fq "::warning::test_public_repo_contract_check: temp dir cleanup incomplete after 5 attempts; left $target in place (script exit status unchanged)" "$case_out"
+grep -Fq "test_public_repo_contract_check: last rm error: rm: $target/public-git/.git/objects: Directory not empty" "$case_out"
 if grep -Fq "removed temp dir" "$case_out"; then
   echo "Expected exhausted cleanup not to report success" >&2
   exit 1
 fi
+
+# Use the same bash command as CI (and /bin/bash explicitly on macOS) to cover
+# the 3.2 nounset bug, completed success, and an exact nonzero failure in both
+# real traps. Exhausted cleanup must not change any of those decisions.
+for shell in bash /bin/bash; do
+  for trap_harness in "$harness" "$surface_harness"; do
+    for failures in 0 99; do
+      target="$(new_target nounset)"
+      run_case "$failures" "$shell" "$trap_harness" "$HELPER" "$target" nounset
+      expect_status 1 "nounset abort ($shell, $trap_harness, $failures)"
+      grep -Fq "unbound variable" "$case_out"
+      if [[ "$OSTYPE" == darwin* && "$shell" == /bin/bash ]]; then
+        grep -Fq "exited before completion" "$case_out"
+      fi
+
+      target="$(new_target completed)"
+      run_case "$failures" "$shell" "$trap_harness" "$HELPER" "$target" pass
+      expect_status 0 "completed success ($shell, $trap_harness, $failures)"
+
+      target="$(new_target exact-failure)"
+      run_case "$failures" "$shell" "$trap_harness" "$HELPER" "$target" fail
+      expect_status 7 "exact failure ($shell, $trap_harness, $failures)"
+    done
+  done
+done
+
+# --help is the surface script's other legitimate successful exit.
+run_case 0 bash "$SURFACE_SCRIPT" --help
+expect_status 0 "surface CI help"
+expect_rm_calls 0 "surface CI help"
 
 # Unsafe paths are refused without invoking rm.
 for unsafe in "" "/" "//" "relative/dir"; do
@@ -184,6 +236,10 @@ done
 # staged output) while cleanup of its mktemp checkout is exhausted.
 run_case 99 bash "$SURFACE_SCRIPT" --staged-output "$tmp_dir/missing-staged-output"
 surface_target="$(head -n 1 "$STUB_RM_COUNT.targets")"
+[[ "$surface_target" == /* && "${surface_target%/*}" == "$case_dir" && "${surface_target##*/}" == tmp.* ]] || {
+  echo "Refusing unexpected surface checkout path: $surface_target" >&2
+  exit 1
+}
 public_repo_remove_temp_dir "test_public_repo_temp_cleanup" "$surface_target"
 expect_status 2 "surface CI failure with exhausted cleanup"
 expect_rm_calls 5 "surface CI failure with exhausted cleanup"

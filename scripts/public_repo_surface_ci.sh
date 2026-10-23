@@ -9,6 +9,7 @@ REPO_ROOT="$DEFAULT_REPO_ROOT"
 STAGED_OUTPUT_DIR=""
 KEEP_TEMP=0
 TMP_DIR=""
+script_completed=0
 
 usage() {
   cat <<'USAGE'
@@ -38,6 +39,11 @@ require_command() {
 
 cleanup() {
   local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "public-surface-ci: exited before completion" >&2
+    status=1
+  fi
   if [[ -n "$TMP_DIR" && "$KEEP_TEMP" -eq 0 ]]; then
     public_repo_remove_temp_dir "public-surface-ci" "$TMP_DIR" || true
   elif [[ -n "$TMP_DIR" ]]; then
@@ -65,6 +71,7 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     -h|--help)
       usage
+      script_completed=1
       exit 0
       ;;
     *)
@@ -204,3 +211,4 @@ run_step "verify self-exported public contracts" \
   bash scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto
 
 echo "public-surface-ci: completed public surface checks at $REPO_ROOT"
+script_completed=1

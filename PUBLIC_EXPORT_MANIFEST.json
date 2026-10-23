@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "85cafe84dc6034bb7d7d00cb19652df36120952806fae4bede293e851757b39c",
+  "content_sha256": "b65865615cc16f9cb0db6f4a50bff2f34acdfd5acc1eeab0b418ec9f0eff5341",
   "files": [
     {
       "executable": false,
@@ -5585,15 +5585,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "17b1ecee833b3cce1194e49106db661e23abf269facc0b6b40a6fe4823534b9a",
-      "size_bytes": 7864
+      "sha256": "a75dc375c5ec2dc958b1cd9c7ba2425cd04675c01642a7ef0dc4febc6db98871",
+      "size_bytes": 8132
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "scripts/public_repo_temp_cleanup.sh",
-      "sha256": "19cb7f746c0ae5eee9d3e847f24004c9e82ddf5d46ce421ceca3901462cf6dc6",
-      "size_bytes": 1824
+      "sha256": "3ab3f0b2b5feb17baba64e825cb1fce8f525d98cb1481bf658aa870a1cb5102c",
+      "size_bytes": 1924
     },
     {
       "executable": false,
@@ -5746,8 +5746,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "872be0a2fe5aabe126531e9defc2eb4ad09d869cc230e8bc4a230d6d85e90745",
-      "size_bytes": 100002
+      "sha256": "04262798b32f6d7503b7fb027da6bb5ad84aa468d07d541ec1fd9f883da50651",
+      "size_bytes": 100259
     },
     {
       "executable": true,
@@ -5802,11 +5802,11 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_temp_cleanup.sh",
-      "sha256": "3576c1c2306761d1d6df14614a8e67d7da67a88258025923e970abf7bd78a6c1",
-      "size_bytes": 6932
+      "sha256": "55fa91fd491a927c138c82aba7626174b41bb9cc4f69a4d639a5719d82886624",
+      "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-23T12:41:23+00:00",
+  "generated_at": "2026-10-23T13:30:15+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "5b6281ca1cfb37efe62c6ed4ab191a0e58129329"
+  "source_commit": "d81ba6ab3cae2c4604dfa1c8e0df8d3c2fb67370"
 }
