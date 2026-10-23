@@ -748,6 +748,7 @@ impl RearmFixture {
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             )
             .expect("checkpoint shed page");
             return RearmPage {
