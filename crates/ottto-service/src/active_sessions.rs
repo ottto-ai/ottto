@@ -2837,6 +2837,7 @@ mod tests {
             compaction_count: Some(1),
             compaction_timestamps: vec!["2026-07-19T09:59:00Z".to_string()],
             compaction_events: Vec::new(),
+            first_own_request_at: None,
             local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
