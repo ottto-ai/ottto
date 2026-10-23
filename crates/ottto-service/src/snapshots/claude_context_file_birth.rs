@@ -308,6 +308,21 @@ pub(crate) enum ClaudeFileBirthVerdict {
     EvidenceBound,
 }
 
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeFileBirthVerdict {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+impl SnapshotItem {
+    /// Local design E decision for this fold, independent of strict ownership.
+    pub(crate) fn claude_file_birth_verdict(&self) -> Option<ClaudeFileBirthVerdict> {
+        self.claude_file_birth_verdict
+    }
+}
+
 enum TelemetryOwner<'r> {
     One(&'r str),
     Several,
@@ -723,6 +738,10 @@ enum ContextBasisOutcome {
 pub struct ClaudeContextFileBirthCounts {
     #[serde(flatten)]
     pub total: ClaudeContextBasisCounts,
+    /// Final advertised curve coverage after the ownership fold. Local only;
+    /// these bodies may still be held by the existing upload quarantine.
+    pub curve_scalars_file_birth_only_session_count: usize,
+    pub curve_ownership_unresolved_session_count: usize,
     pub by_claude_code_version: BTreeMap<String, ClaudeContextBasisCounts>,
     /// Sessions the family demotion quarantine held back this fold (R7): the
     /// hold is unchanged, so their scalars wait with the rest of the body.
@@ -979,6 +998,7 @@ pub(super) fn admit_claude_file_birth_posture(
         }
         _ => clear_claude_context_posture(item),
     }
+    item.claude_file_birth_verdict = Some(verdict);
     verdict
 }
 
