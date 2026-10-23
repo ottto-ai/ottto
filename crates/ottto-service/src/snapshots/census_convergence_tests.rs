@@ -1419,7 +1419,7 @@ fn bounded_absence_fallback_checks_every_retry_pending_root_through_its_cursor()
     let mut retired_per_census = Vec::new();
     for _ in 0..4 {
         retired_per_census
-            .push(index.retire_absent_retry_pending_claude_families(&observed, &residue));
+            .push(index.retire_absent_retry_pending_claude_families(&observed, &residue, ""));
     }
     assert_eq!(retired_per_census, vec![15, 15, 7, 0]);
     assert!(retired_per_census.iter().all(|retired| *retired <= window));
@@ -1440,4 +1440,95 @@ fn bounded_absence_fallback_checks_every_retry_pending_root_through_its_cursor()
     assert!(index
         .claude_authority_record_for_test("terminal-root")
         .is_some_and(|record| record.terminal));
+}
+
+/// `count` RetryPending roots named `{prefix}-NN`, each with pending, and the
+/// observed paths of those whose number `present` accepts.
+fn retry_pending_roots_index(
+    prefix: &str,
+    count: usize,
+    present: impl Fn(usize) -> bool,
+) -> (ScanIndex, BTreeSet<String>) {
+    let mut index = ScanIndex::default();
+    let mut observed = BTreeSet::new();
+    for number in 0..count {
+        let root = format!("{prefix}-{number:02}");
+        index.insert_retry_pending_claude_authority_for_test(&root);
+        index.insert_claude_usage_family_pending_for_test(&root, OLDER_WINDOW);
+        if present(number) {
+            observed.insert(format!("/synthetic/projects/{prefix}/{root}.jsonl"));
+        }
+    }
+    (index, observed)
+}
+
+// Re-review r4 (path-(a) bridge): fallback cursors are scoped per index. Two
+// stable indexes, each with 32 RetryPending roots, alternate under a
+// persistent scratch refusal. With one shared cursor, A would always check
+// its roots 00-15 and B its roots 16-31, so A's absent root 31 would never
+// be examined. Scoped, A's root 31 retires on A's second census, and B (all
+// present) is untouched.
+#[test]
+fn bounded_absence_fallback_cursor_is_scoped_per_index() {
+    let _refuse = RefuseClaudeAbsentFamilyScratchForTest::new();
+    let (mut a, a_observed) = retry_pending_roots_index("a", 32, |number| number != 31);
+    let (mut b, b_observed) = retry_pending_roots_index("b", 32, |_| true);
+    let residue = BTreeSet::new();
+    let mut a_retired = Vec::new();
+    let mut b_retired = Vec::new();
+    for _ in 0..2 {
+        a_retired.push(a.retire_absent_retry_pending_claude_families(
+            &a_observed,
+            &residue,
+            "index-a",
+        ));
+        b_retired.push(b.retire_absent_retry_pending_claude_families(
+            &b_observed,
+            &residue,
+            "index-b",
+        ));
+    }
+    assert_eq!(
+        a_retired,
+        vec![0, 1],
+        "A's absent root retires on A's second census"
+    );
+    assert!(a.claude_authority_record_for_test("a-31").is_none());
+    assert!(!a.claude_usage_family_pending_retained_for_test("a-31"));
+    assert_eq!(a.claude_usage_authority_pending_count(), 31);
+    assert_eq!(b_retired, vec![0, 0]);
+    assert_eq!(b.claude_usage_authority_pending_count(), 32);
+    for number in 0..32 {
+        let root = format!("b-{number:02}");
+        assert!(
+            b.claude_authority_record_for_test(&root).is_some(),
+            "{root}"
+        );
+        assert!(
+            b.claude_usage_family_pending_retained_for_test(&root),
+            "{root}"
+        );
+    }
+}
+
+// Re-review r4: the per-index cursor map is capped. A new index at the cap
+// evicts only the least recently used cursor; every other cursor survives.
+#[test]
+fn bounded_absence_fallback_cursors_evict_only_the_least_recently_used() {
+    let cap = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS;
+    assert_eq!(cap, 32);
+    let mut cursors = ClaudeAbsentFamilyFallbackCursors::new();
+    for scope in 0..cap {
+        cursors.set(&format!("index-{scope:02}"), scope + 1);
+    }
+    // Touch index-00, so index-01 is now the least recently used.
+    assert_eq!(cursors.cursor("index-00"), 1);
+    cursors.set("index-new", 7);
+    assert_eq!(cursors.by_index.len(), cap);
+    assert_eq!(cursors.cursor("index-01"), 0, "the evicted index restarts");
+    assert_eq!(cursors.cursor("index-new"), 7);
+    assert_eq!(cursors.cursor("index-00"), 1);
+    for scope in 2..cap {
+        assert_eq!(cursors.cursor(&format!("index-{scope:02}")), scope + 1);
+    }
 }

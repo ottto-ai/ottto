@@ -7762,43 +7762,106 @@ fn claude_absent_family_scratch_admitted(retry_pending_roots: usize) -> bool {
 /// scratch is not admitted (an unsupported heap layout, which also disables
 /// native comparison, or a price over the parked budget). Retirement is a
 /// liveness repair, so it cannot depend on that optional fast path alone.
-/// With P RetryPending roots, every root is checked within ceil(P / 16)
-/// raw-complete censuses of one process.
+/// With P RetryPending roots in one index, every root is checked within
+/// ceil(P / 16) raw-complete censuses of that index, assuming its RetryPending
+/// population changes only by these retirements, the process does not
+/// restart, and at most `MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS` indexes
+/// alternate in the process.
 const MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS: usize = 16;
 
-/// Runtime-only resume position of the fallback: the ordinal, in root order
-/// among RetryPending records, at which the next raw-complete census starts
-/// checking. Never persisted or serialized, and no index field: a restart
-/// starts again at the first root, and progress resumes from there. An
-/// ordinal rather than a root key keeps the cursor free of any owned copy.
+/// Most indexes whose fallback cursors one process keeps, comfortably above
+/// the sources times upload destinations a daemon scans.
+const MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS: usize = 32;
+
+/// Runtime-only resume positions of the fallback, one per index. Each cursor
+/// is the ordinal, in root order among that index's RetryPending records, at
+/// which its next raw-complete census starts checking. The cursors are never
+/// persisted or serialized and live in no index field: a restart starts every
+/// index again at its first root, and progress resumes from there. An
+/// ordinal rather than a root key keeps a cursor free of any owned copy; the
+/// only owned allocation is the index's scope key, once per new index.
+///
+/// Cursors are scoped per index because indexes order different root sets:
+/// one shared position alternating between two indexes can keep handing each
+/// the same half of its roots forever. At the cap, a new index evicts the
+/// least recently used cursor (that index restarts at its first root), so
+/// coverage is guaranteed while at most the cap of indexes alternate.
+struct ClaudeAbsentFamilyFallbackCursors {
+    /// Index scope key to (cursor, last-use tick).
+    by_index: BTreeMap<String, (usize, u64)>,
+    tick: u64,
+}
+
+impl ClaudeAbsentFamilyFallbackCursors {
+    const fn new() -> Self {
+        Self {
+            by_index: BTreeMap::new(),
+            tick: 0,
+        }
+    }
+
+    fn next_tick(&mut self) -> u64 {
+        self.tick = self.tick.saturating_add(1);
+        self.tick
+    }
+
+    fn cursor(&mut self, scope: &str) -> usize {
+        let tick = self.next_tick();
+        self.by_index.get_mut(scope).map_or(0, |(cursor, used)| {
+            *used = tick;
+            *cursor
+        })
+    }
+
+    fn set(&mut self, scope: &str, cursor: usize) {
+        let tick = self.next_tick();
+        if let Some(entry) = self.by_index.get_mut(scope) {
+            *entry = (cursor, tick);
+            return;
+        }
+        if self.by_index.len() >= MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS {
+            // Ticks are unique, so this evicts exactly the least recently
+            // used cursor without copying its key.
+            if let Some(oldest) = self.by_index.values().map(|(_, used)| *used).min() {
+                self.by_index.retain(|_, (_, used)| *used != oldest);
+            }
+        }
+        self.by_index.insert(scope.to_owned(), (cursor, tick));
+    }
+}
+
 #[cfg(not(test))]
-static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS: std::sync::Mutex<ClaudeAbsentFamilyFallbackCursors> =
+    std::sync::Mutex::new(ClaudeAbsentFamilyFallbackCursors::new());
 
 #[cfg(test)]
 thread_local! {
-    static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+    static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS_FOR_TEST: std::cell::RefCell<
+        ClaudeAbsentFamilyFallbackCursors,
+    > = const { std::cell::RefCell::new(ClaudeAbsentFamilyFallbackCursors::new()) };
 }
 
+/// Every critical section reads or writes one whole cursor entry, so a
+/// poisoned lock's map is consistent and is recovered at once.
 #[cfg(not(test))]
-fn claude_absent_family_fallback_cursor() -> usize {
-    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR.load(std::sync::atomic::Ordering::Relaxed)
+fn with_claude_absent_family_fallback_cursors<T>(
+    use_cursors: impl FnOnce(&mut ClaudeAbsentFamilyFallbackCursors) -> T,
+) -> T {
+    let mut cursors = CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS
+        .lock()
+        .unwrap_or_else(|poisoned| {
+            CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS.clear_poison();
+            poisoned.into_inner()
+        });
+    use_cursors(&mut cursors)
 }
 
 #[cfg(test)]
-fn claude_absent_family_fallback_cursor() -> usize {
-    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST.with(std::cell::Cell::get)
-}
-
-#[cfg(not(test))]
-fn set_claude_absent_family_fallback_cursor(cursor: usize) {
-    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR.store(cursor, std::sync::atomic::Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn set_claude_absent_family_fallback_cursor(cursor: usize) {
-    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST.with(|cell| cell.set(cursor));
+fn with_claude_absent_family_fallback_cursors<T>(
+    use_cursors: impl FnOnce(&mut ClaudeAbsentFamilyFallbackCursors) -> T,
+) -> T {
+    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSORS_FOR_TEST
+        .with(|cursors| use_cursors(&mut cursors.borrow_mut()))
 }
 
 /// Proven families of one complete closed-fence terminal whose earlier-page
@@ -24028,9 +24091,17 @@ impl OwnedSourceScan {
                 // RetryPending family it proves wholly absent, so a vanished
                 // family's debt cannot withhold the census below forever.
                 if raw_census_complete && source == SnapshotSource::ClaudeCode {
+                    // The fallback cursor's index scope: the sampled-acquisition
+                    // namespace, a digest of this index's path, upload
+                    // destination namespace and scan mode. A scan without one
+                    // shares the empty scope.
+                    let cursor_scope = sampling
+                        .as_ref()
+                        .map_or("", |context| context.namespace.0.as_str());
                     let retired = index.retire_absent_retry_pending_claude_families(
                         &traversal_snapshot.observed_index_keys,
                         &traversal_snapshot.residue.index_keys,
+                        cursor_scope,
                     );
                     if retired > 0 {
                         eprintln!(
@@ -35511,6 +35582,7 @@ impl ScanIndex {
         &mut self,
         observed_index_keys: &BTreeSet<String>,
         residue_index_keys: &BTreeSet<String>,
+        cursor_scope: &str,
     ) -> usize {
         let retry_pending = self.claude_usage_authority_pending_count();
         if retry_pending == 0 {
@@ -35521,6 +35593,7 @@ impl ScanIndex {
                 retry_pending,
                 observed_index_keys,
                 residue_index_keys,
+                cursor_scope,
             );
         }
         let quarantine = &self.claude_usage_authority_quarantine;
@@ -35565,10 +35638,12 @@ impl ScanIndex {
     /// same mutation (only an absent root's record and pending entry, removed
     /// in place), over a bounded window of at most
     /// `MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS` RetryPending roots that
-    /// starts at the runtime cursor and wraps around.
+    /// starts at this index's runtime cursor (scoped by `cursor_scope`) and
+    /// wraps around.
     ///
-    /// No heap allocation: the window's borrowed roots and their presence
-    /// flags live in fixed-size stack arrays. CPU per census is one pass over
+    /// No scratch heap allocation: the window's borrowed roots and their
+    /// presence flags live in fixed-size stack arrays. The only allocation is
+    /// this index's cursor entry (its scope key), once per new index. CPU per census is one pass over
     /// the quarantine to fill the window, one pass over the F + O + R
     /// membership keys (one borrowed path parse each, compared with at most K
     /// window roots, so O(K x (F + O + R)) comparisons), and one retain pass.
@@ -35580,8 +35655,11 @@ impl ScanIndex {
         retry_pending: usize,
         observed_index_keys: &BTreeSet<String>,
         residue_index_keys: &BTreeSet<String>,
+        cursor_scope: &str,
     ) -> usize {
-        let start = claude_absent_family_fallback_cursor() % retry_pending;
+        let start =
+            with_claude_absent_family_fallback_cursors(|cursors| cursors.cursor(cursor_scope))
+                % retry_pending;
         let checks = retry_pending.min(MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS);
         let next = (start + checks) % retry_pending;
         // Window position of a RetryPending ordinal, if this census checks it.
@@ -35642,7 +35720,7 @@ impl ScanIndex {
             });
         // The next census starts at the first root this one did not check,
         // in the order left after these retirements.
-        set_claude_absent_family_fallback_cursor(resume);
+        with_claude_absent_family_fallback_cursors(|cursors| cursors.set(cursor_scope, resume));
         retired
     }
 

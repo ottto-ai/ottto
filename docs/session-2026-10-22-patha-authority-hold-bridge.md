@@ -41,9 +41,14 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   heap layout, which also disables native comparison, or an over-budget
   count), an allocation-free fallback applies the same rule to at most 16
   RetryPending roots per raw-complete census, using fixed-size stack arrays,
-  and resumes from a runtime-only cursor (never persisted; a restart begins
-  at the first root). Every root is checked within ceil(P / 16) raw-complete
-  censuses of one process, so retirement never depends on the priced path.
+  and resumes from a runtime-only cursor scoped to that index (keyed by the
+  scan's sampled-acquisition namespace, a digest of the index path, upload
+  destination and scan mode; never persisted; a restart begins at the first
+  root). The cursor map holds at most 32 indexes and evicts the least
+  recently used one. Every root of an index is checked within ceil(P / 16)
+  raw-complete censuses of that index, assuming its RetryPending population
+  changes only by these retirements, no restart, and at most 32 alternating
+  indexes; so retirement never depends on the priced path.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -87,7 +92,8 @@ left, and when its only member is observed but unindexed residue after a replay
 reset. With the retirement scratch refused for the whole test, an absent
 family still retires on its first raw-complete census and a present one stays
 held; a unit test walks 40 roots through the fallback cursor in 16-root
-windows.
+windows, another alternates two 32-root indexes so each keeps its own cursor,
+and a third checks the cursor map evicts only its least recently used entry.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and
