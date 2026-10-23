@@ -148,6 +148,14 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// unless evicting all of them fits `limit` by their stored `heap_bytes`
     /// alone, a lower bound on what each eviction frees.
     pub(crate) fn release_older_until(&mut self, limit: usize, rank: (i64, i64)) -> bool {
+        self.older_release_fits(limit, rank)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// `release_older_until`'s fit-or-nothing test, evicting nothing: the
+    /// cache fits `limit` already, or evicting every entry ranked strictly
+    /// below `rank` fits it by their stored `heap_bytes` alone (U1a-2a
+    /// D6(e): a suspended proof is retired only where Path A can fit).
+    pub(crate) fn older_release_fits(&self, limit: usize, rank: (i64, i64)) -> bool {
         if heap_layout_bound::bound(self, limit).is_some() {
             return true;
         }
@@ -158,7 +166,6 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             .fold(0usize, |sum, entry| sum.saturating_add(entry.heap_bytes));
         heap_layout_bound::bound(self, usize::MAX)
             .is_some_and(|resident| resident.saturating_sub(older) <= limit)
-            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
     }
     /// Evict in victim order, only entries ranked strictly below `below`
     /// when given, until the resident state fits `limit`.

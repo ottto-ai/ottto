@@ -2682,6 +2682,75 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
     }
 }
 
+/// U1a-2a: `unsealed` is set on both `retain_reduction` returns, and a side
+/// certificate carries the same bit without a retained copy or any
+/// `cache_lifecycle` event (U-T64(d)).
+#[test]
+fn side_certificate_reports_unsealed_without_cache_events() {
+    use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
+    let certify = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        assert!(matches!(
+            parser.prepare_acquisition(None, &scope, None, 100).unwrap(),
+            ReadMode::Full(_)
+        ));
+        while !parser.step().unwrap() {}
+        observe(|| parser.certify_without_retention(&scope, 100).unwrap())
+    };
+    let retain = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+        while !parser.step().unwrap() {}
+        observe(|| {
+            parser
+                .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+                .unwrap()
+                .unwrap()
+        })
+    };
+    let len = fixture.0.metadata().unwrap().len();
+    let (sealed, sealed_events) = retain(&fixture);
+    assert!(!sealed.unsealed);
+    assert_eq!(sealed_events.retention_unsealed_eof, 0);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("a complete loss-free read is certified");
+    };
+    assert_eq!(held, len);
+    assert!(!completed.unsealed);
+    assert!(completed.reduction.is_none());
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+
+    // A valid final row without its newline is applied at native EOF.
+    let mut file = OpenOptions::new().append(true).open(&fixture.0).unwrap();
+    serde_json::to_writer(&mut file, &usage(SnapshotSource::Codex, 140, 1, "gpt-5.5")).unwrap();
+    drop(file);
+    let grown = fixture.0.metadata().unwrap().len();
+    let (unsealed, unsealed_events) = retain(&fixture);
+    assert!(unsealed.unsealed);
+    assert!(unsealed.reduction.is_none());
+    assert_eq!(unsealed_events.retention_unsealed_eof, 1);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("an unsealed read is still certified through its sealed prefix");
+    };
+    assert_eq!(held, grown);
+    assert!(completed.unsealed);
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+}
+
 /// Codex rollout with two compaction shapes: a marker followed by an exact
 /// repeat of the last record (not counted) and a zero-size record (skipped)
 /// before the next counted request, then two markers with no request between.
