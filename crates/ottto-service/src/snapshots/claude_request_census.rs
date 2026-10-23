@@ -864,6 +864,9 @@ fn entry_serialized_bytes(key: &str, record: &ClaudeRequestCensusRecord) -> usiz
 
 /// Main's admission form. Safety-only fields cannot displace a money record.
 fn admission_bytes(key: &str, record: &ClaudeRequestCensusRecord) -> usize {
+    if record.safety.is_none() && record.safety_hashes.is_none() {
+        return entry_serialized_bytes(key, record);
+    }
     let mut legacy = record.clone();
     legacy.safety = None;
     legacy.safety_hashes = None;
