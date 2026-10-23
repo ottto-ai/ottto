@@ -1399,3 +1399,160 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
         "a fresh install records no history cutoff"
     );
 }
+
+/// H727-1: the M4 incident shape, through real prepare/finish (including
+/// bootstrap completion and N2 clearing), after BOTH list and .seen are lost.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn durable_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("durable_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-set", true, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn absent_list_intent_paces_quarantined_history() {
+    if !supported("absent_list_intent_paces_quarantined_history") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-absent", false, false);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn malformed_list_intent_holds_quarantined_history_without_list_or_seen() {
+    if !supported("malformed_list_intent_holds_quarantined_history_without_list_or_seen") {
+        return;
+    }
+    lost_list_intent_pipeline("history-intent-malformed", false, true);
+}
+
+fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
+    use crate::backfill::{backfill_state_path, load_backfill_state, ClaudeHistoryListIntent};
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new(name, Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let initial = pipeline.server.offered().len();
+    assert!(initial > 0, "prior uploads");
+    assert_eq!(
+        load_backfill_state(&pipeline.support).claude_history_list_intent,
+        ClaudeHistoryListIntent::Absent
+    );
+    let seen = crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support);
+    if set {
+        // Even an empty well-formed list sets independent intent (M1).
+        std::fs::write(
+            reemission_list_path(&pipeline.support),
+            "# installed empty list\n",
+        )
+        .unwrap();
+        let installed = pipeline.cycle(t0 + 60);
+        assert!(installed.result.is_ok(), "{:?}", installed.result);
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        assert!(seen.exists());
+        std::fs::remove_file(reemission_list_path(&pipeline.support)).unwrap();
+        std::fs::remove_file(&seen).unwrap();
+    }
+    if malformed {
+        let state_path = backfill_state_path(&pipeline.support);
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&state_path).unwrap()).unwrap();
+        saved["claude_history_list_intent"] = serde_json::json!({"damaged": true});
+        std::fs::write(state_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable
+        );
+    }
+    let index_path = claude_index_path(&pipeline.support);
+    std::fs::write(&index_path, b"{not json").unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    assert!(!seen.exists());
+    let (second, lines) = crate::local_resource_diagnostics::capture(|| {
+        crate::snapshots::with_body_witness_adoption_page_budget(1, || pipeline.cycle(t0 + 120))
+    });
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    if set || malformed {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "no history body leaves after quarantine"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line["stage"] == "claude_reemission_list_missing_after_install"),
+            "missing-list alarm: {lines:?}"
+        );
+        let third = pipeline.cycle(t0 + 180);
+        assert!(third.result.is_ok(), "{:?}", third.result);
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial,
+            "hold survives real completion/marker clearing and reload"
+        );
+        assert_eq!(
+            load_backfill_state(&pipeline.support).claude_history_list_intent,
+            if set {
+                ClaudeHistoryListIntent::Set
+            } else {
+                ClaudeHistoryListIntent::Unreadable
+            }
+        );
+    } else {
+        assert_eq!(
+            pipeline.server.offered().len(),
+            initial + 1,
+            "positive Absent policy paces one history body"
+        );
+    }
+    assert!(
+        std::fs::read_dir(index_path.parent().unwrap())
+            .unwrap()
+            .flatten()
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "index was quarantined"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
+    if !supported("first_nonempty_list_read_records_durable_intent_through_prepare_finish") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-intent-first-list", Answer::Accept, t0);
+    let snapshots = pipeline.support.join("snapshots");
+    std::fs::create_dir_all(&snapshots).unwrap();
+    std::fs::write(
+        reemission_list_path(&pipeline.support),
+        format!("{}\n", "a".repeat(64)),
+    )
+    .unwrap();
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Absent
+    );
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert_eq!(
+        crate::backfill::load_backfill_state(&pipeline.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Set
+    );
+    assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
+}

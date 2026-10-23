@@ -3132,7 +3132,7 @@ pub struct ScanIndex {
     #[serde(
         default,
         skip_serializing_if = "std::ops::Not::not",
-        deserialize_with = "deserialize_lenient_true"
+        deserialize_with = "deserialize_lenient_move_hold"
     )]
     claude_history_move_not_full: bool,
     /// Claude only: an explicit `full` claim was seen for this destination,
@@ -34999,6 +34999,18 @@ where
     Ok(matches!(
         Value::deserialize(deserializer)?,
         Value::Bool(true)
+    ))
+}
+
+/// K4: a malformed move hold must not release history after bootstrap.
+/// Missing fields keep the legacy default; explicit booleans keep their value.
+fn deserialize_lenient_move_hold<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(!matches!(
+        Value::deserialize(deserializer)?,
+        Value::Bool(false)
     ))
 }
 

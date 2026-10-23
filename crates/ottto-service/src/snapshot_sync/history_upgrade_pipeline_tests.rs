@@ -449,12 +449,16 @@ fn historical_replay_after_bootstrap_paces_history_without_a_list() {
 }
 
 /// StateMissing N1: the incident shape on a verified Mac where no list is
-/// intended (no list, no seen-marker; this destination's own bootstrap): the
+/// intended (durable intent Absent, no list, no seen-marker; this destination's own bootstrap): the
 /// rebuilt history is paced through the budget, not held for good.
 #[test]
 fn quarantined_index_without_an_intended_list_paces_history() {
     let fixture = HistoryFixture::new("history-upgrade-quarantine-paced");
     fixture.baseline();
+    assert_eq!(
+        crate::backfill::load_backfill_state(&fixture.support).claude_history_list_intent,
+        crate::backfill::ClaudeHistoryListIntent::Absent
+    );
     fixture.corrupt_index();
     let mut sent = Vec::new();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {

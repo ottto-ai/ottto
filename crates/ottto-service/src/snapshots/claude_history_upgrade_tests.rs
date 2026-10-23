@@ -766,7 +766,37 @@ fn malformed_history_gate_fields_decode_leniently() {
         );
         assert_eq!(loaded.claude_history_cutoff_unix_seconds, None);
         assert!(!loaded.claude_history_gate_loaded, "re-derived");
-        assert!(!loaded.claude_history_move_not_full);
+        assert!(
+            loaded.claude_history_move_not_full,
+            "malformed hold fails closed (K4)"
+        );
         assert!(!loaded.claude_history_move_released);
     }
+}
+
+/// K4: after bootstrap, only the persisted move flag remembers the hold.
+/// Keep an intact cutoff and gate marker, so nothing can re-derive the hold.
+#[test]
+fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
+    let scratch = crate::test_scratch::ScratchDir::new("history-move-hold-malformed");
+    let path = scratch.join("index.json");
+    let mut index = ScanIndex::default();
+    index.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    index.save(&path).unwrap();
+    let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    saved["claude_history_move_not_full"] = json!("damaged");
+    fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    let cutoff = loaded.claude_history_cutoff_unix_seconds;
+    loaded.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(loaded.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
+    assert_eq!(loaded.claude_history_cutoff_unix_seconds, cutoff);
+    loaded.save(&path).unwrap();
+    let mut reloaded = ScanIndex::load(&path).unwrap();
+    reloaded.note_claude_history_cutoff(PriorHistory::Here, true, false);
+    assert_eq!(
+        reloaded.claude_no_list_policy,
+        NoListPolicy::Pace,
+        "explicit full still releases"
+    );
 }

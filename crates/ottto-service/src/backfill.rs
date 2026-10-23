@@ -26,6 +26,57 @@ use crate::snapshots::{
 
 const BACKFILL_STATE_FILENAME: &str = "snapshot_backfill_state.json";
 
+/// Explicit protected-list intent, kept outside the rebuildable scan index.
+/// Malformed values and an unreadable backfill file are never positive absence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClaudeHistoryListIntent {
+    #[default]
+    Absent,
+    Set,
+    Unreadable,
+}
+
+impl ClaudeHistoryListIntent {
+    fn is_absent(&self) -> bool {
+        *self == Self::Absent
+    }
+}
+
+impl Serialize for ClaudeHistoryListIntent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Absent => serializer.serialize_bool(false),
+            Self::Set => serializer.serialize_bool(true),
+            // Preserve unknown intent through load-modify-save and census clearing.
+            Self::Unreadable => serializer.serialize_str("unreadable"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaudeHistoryListIntent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(true) => Self::Set,
+            serde_json::Value::Bool(false) => Self::Absent,
+            _ => Self::Unreadable,
+        })
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeHistoryListIntent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 /// Persisted bookkeeping: which parser versions have been retroactively
 /// reconciled. The daemon stores one entry per source slug.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -83,6 +134,10 @@ pub struct BackfillState {
     /// unknown policy holds it (SOURCE ruling, cross-org `full` move).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub claim_backfill_policy_full: bool,
+    /// Set only by a well-formed protected-list read, including an empty list.
+    /// Never automatically cleared by a claim, index rebuild or census.
+    #[serde(default, skip_serializing_if = "ClaudeHistoryListIntent::is_absent")]
+    pub(crate) claude_history_list_intent: ClaudeHistoryListIntent,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -114,6 +169,7 @@ pub fn load_backfill_state(state_dir: &Path) -> BackfillState {
     let path = backfill_state_path(state_dir);
     let unverified = || BackfillState {
         prior_history_unverified: true,
+        claude_history_list_intent: ClaudeHistoryListIntent::Unreadable,
         ..BackfillState::default()
     };
     match File::open(&path) {
@@ -123,20 +179,49 @@ pub fn load_backfill_state(state_dir: &Path) -> BackfillState {
     }
 }
 
+// Serializes the monotone intent merge with publication. A writer holding a
+// pre-list-read state cannot erase intent recorded by another local writer.
+static BACKFILL_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()> {
+    let _save = BACKFILL_SAVE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("backfill save lock poisoned"))?;
+    let mut state = state.clone();
+    let previous_intent = load_backfill_state(state_dir).claude_history_list_intent;
+    state.claude_history_list_intent = match (previous_intent, state.claude_history_list_intent) {
+        (ClaudeHistoryListIntent::Set, _) | (_, ClaudeHistoryListIntent::Set) => {
+            ClaudeHistoryListIntent::Set
+        }
+        (ClaudeHistoryListIntent::Unreadable, _) | (_, ClaudeHistoryListIntent::Unreadable) => {
+            ClaudeHistoryListIntent::Unreadable
+        }
+        _ => ClaudeHistoryListIntent::Absent,
+    };
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("create backfill state dir {}", state_dir.display()))?;
     let path = backfill_state_path(state_dir);
-    let payload = serde_json::to_vec_pretty(state).context("serialize backfill state to JSON")?;
+    let payload = serde_json::to_vec_pretty(&state).context("serialize backfill state to JSON")?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = File::create(&temp_path)
         .with_context(|| format!("create backfill temp {}", temp_path.display()))?;
     temp.write_all(&payload)
         .with_context(|| format!("write backfill temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
+    temp.sync_all().context("sync backfill state")?;
     std::fs::rename(&temp_path, &path)
         .with_context(|| format!("rename backfill state into place {}", path.display()))?;
+    File::open(state_dir)
+        .and_then(|directory| directory.sync_all())
+        .context("sync backfill state directory")?;
     Ok(())
+}
+
+/// A good list read is the only automatic transition to Set. Save even when
+/// already set: success attests that the durable file and its parent synced.
+pub(crate) fn record_claude_history_list_intent(state_dir: &Path) -> Result<()> {
+    let mut state = load_backfill_state(state_dir);
+    state.claude_history_list_intent = ClaudeHistoryListIntent::Set;
+    save_backfill_state(state_dir, &state)
 }
 
 /// Apply the server-issued backfill policy from a claim/switch completion.
@@ -836,6 +921,62 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn durable_list_intent_is_tristate_and_survives_stale_writers_and_claims() {
+        let dir = temp_dir("list-intent-tristate");
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Absent
+        );
+        let stale = load_backfill_state(&dir);
+        record_claude_history_list_intent(&dir).unwrap();
+        save_backfill_state(&dir, &stale).unwrap();
+        apply_claim_backfill_policy(&dir, Some("full"), None, "new-user").unwrap();
+        clear_prior_history_unverified(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("yes"),
+            serde_json::json!({"x":true}),
+        ] {
+            let state: BackfillState = serde_json::from_value(
+                serde_json::json!({"claude_history_list_intent": malformed}),
+            )
+            .unwrap();
+            assert_eq!(
+                state.claude_history_list_intent,
+                ClaudeHistoryListIntent::Unreadable
+            );
+            let roundtrip: BackfillState =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(
+                roundtrip.claude_history_list_intent,
+                ClaudeHistoryListIntent::Unreadable
+            );
+        }
+        std::fs::write(backfill_state_path(&dir), b"{").unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable
+        );
+        clear_prior_history_unverified(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable,
+            "N2 clearing cannot turn unreadable intent into Absent"
+        );
+        record_claude_history_list_intent(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
     /// SOURCE ruling (cross-org move): each claim records whether its policy
     /// was an explicit `full`; any other or unknown policy clears it.
     #[test]
@@ -1187,6 +1328,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full);
+crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

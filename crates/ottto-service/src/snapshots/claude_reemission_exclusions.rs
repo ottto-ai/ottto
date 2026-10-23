@@ -20,6 +20,10 @@
 //!   rebuildable scan index, so an index rebuild or a restart keeps it. Until
 //!   the marker is written, adoption pauses, so a later missing file can
 //!   never be mistaken for a list that was never installed.
+//! - A well-formed read also persists explicit intent in the backfill state,
+//!   before writing the seen-marker. That intent is never automatically cleared.
+//!   If both list and marker disappear, Set or Unreadable intent still pauses
+//!   owed history; Absent intent keeps normal Macs on the paced policy.
 //! - Marker present and file missing: adoption pauses, the status reason says
 //!   so, and a local alarm is raised every cycle until the file is back.
 //! - Unreadable, oversized or malformed: adoption pauses.
@@ -56,7 +60,7 @@ pub(crate) enum ListState {
     MissingAfterInstall,
     /// Unreadable, oversized or malformed file, or an unreadable marker: paused.
     Unreadable,
-    /// A well-formed list whose seen-marker could not be written: paused.
+    /// A well-formed list whose durable intent or seen-marker could not be written: paused.
     MarkerUnwritable,
     /// Closing the list over family roots would pass `MAX_CLOSED_DIGESTS`:
     /// paused, never a partial closure.
@@ -109,7 +113,17 @@ impl ReemissionExclusions {
                     match std::fs::symlink_metadata(Self::seen_marker_path(support_dir)) {
                         Ok(_) => ListState::MissingAfterInstall,
                         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                            ListState::NotInstalled
+                            match crate::backfill::load_backfill_state(support_dir)
+                                .claude_history_list_intent
+                            {
+                                crate::backfill::ClaudeHistoryListIntent::Absent => {
+                                    ListState::NotInstalled
+                                }
+                                crate::backfill::ClaudeHistoryListIntent::Set
+                                | crate::backfill::ClaudeHistoryListIntent::Unreadable => {
+                                    ListState::MissingAfterInstall
+                                }
+                            }
                         }
                         Err(_) => ListState::Unreadable,
                     },
@@ -123,9 +137,10 @@ impl ReemissionExclusions {
             _ => Self::with_state(ListState::Unreadable),
         };
         if loaded.state == ListState::Installed
-            && write_seen_marker(&Self::seen_marker_path(support_dir)).is_err()
+            && (crate::backfill::record_claude_history_list_intent(support_dir).is_err()
+                || write_seen_marker(&Self::seen_marker_path(support_dir)).is_err())
         {
-            // Retried next cycle. Adoption waits for a durable marker.
+            // Retried next cycle. Adoption waits for durable intent and marker.
             loaded.state = ListState::MarkerUnwritable;
         }
         loaded
