@@ -1275,3 +1275,127 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
         .index
         .accepted_snapshot_fingerprint_recorded(&fingerprint));
 }
+
+/// StateMissing H1 through the real replay decision, and N2: after a
+/// completed bootstrap, an unreadable backfill state arms no Claude replay
+/// in `prepare_sync_source` (the replay claim, the entries and the server
+/// all stay as they were), and the Claude census that cycle completes under
+/// the history gate clears the marker.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
+    if !supported("unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-unverified", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered().len();
+    assert!(offered > 0);
+    let state_path = crate::backfill::backfill_state_path(&pipeline.support);
+    assert!(
+        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
+        "the bootstrap completed with a readable state"
+    );
+    std::fs::write(&state_path, b"{\"completed_destination_namespaces\":")
+        .expect("corrupt the backfill state");
+    assert!(crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified);
+
+    let second = pipeline.cycle(t0 + 60);
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered,
+        "no replay re-sent anything"
+    );
+    assert_eq!(
+        second.progress_json["historical_replay_generation"],
+        first.progress_json["historical_replay_generation"],
+        "no replay claimed a generation"
+    );
+    assert_eq!(
+        second.index.files.keys().collect::<Vec<_>>(),
+        first.index.files.keys().collect::<Vec<_>>(),
+        "no replay dropped the entries"
+    );
+    assert!(second
+        .index
+        .files
+        .iter()
+        .all(|(key, entry)| entry.source_file_fingerprint
+            == first.index.files[key].source_file_fingerprint));
+    assert!(
+        !crate::backfill::load_backfill_state(&pipeline.support).prior_history_unverified,
+        "N2: the gated census cleared the marker"
+    );
+}
+
+/// StateMissing N1 (b) through the real pipeline: a fresh install whose
+/// upload ledger claimed a replay generation before the scan, but was killed
+/// before its first index save and before any server answer was recorded,
+/// is still a fresh install. The next cycle uploads its history as new: it
+/// is not held, and no history cutoff is recorded.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
+    if !supported("ledger_claim_alone_after_a_killed_first_cycle_uploads_history") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("history-killed-install", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let offered = pipeline.server.offered();
+    assert!(!offered.is_empty());
+    assert!(
+        first.progress_json["generation"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+            || first.progress_json["historical_replay_generation"].is_string(),
+        "the bootstrap claimed its generation in the ledger"
+    );
+    // Back to what a killed first cycle leaves: the ledger's own claim, no
+    // server answer, no index, no completed bootstrap.
+    let mut claim = first.progress_json.clone();
+    let object = claim.as_object_mut().expect("ledger object");
+    for attested in [
+        "accepted_fingerprints",
+        "accepted_body_witnesses",
+        "accepted_cache_states",
+        "accepted_cache_heads",
+        "pending_cache_heads",
+        "quarantined_fingerprints",
+        "permanent_rejections",
+    ] {
+        object.remove(attested);
+    }
+    std::fs::write(&first.progress_path, serde_json::to_vec(&claim).unwrap())
+        .expect("write the claim-only ledger");
+    std::fs::remove_file(claude_index_path(&pipeline.support)).expect("lose the index");
+    let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
+
+    let second = pipeline.cycle(t0 + 60);
+    assert!(second.result.is_ok(), "{:?}", second.result);
+    let resent = pipeline.server.offered();
+    assert_eq!(resent.len(), 2 * offered.len(), "the history is uploaded");
+    assert_eq!(
+        resent[offered.len()..]
+            .iter()
+            .map(fingerprint_of)
+            .collect::<BTreeSet<_>>(),
+        offered.iter().map(fingerprint_of).collect::<BTreeSet<_>>()
+    );
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(claude_index_path(&pipeline.support)).unwrap())
+            .unwrap();
+    assert!(
+        saved.get("claude_history_cutoff_unix_seconds").is_none(),
+        "a fresh install records no history cutoff"
+    );
+}

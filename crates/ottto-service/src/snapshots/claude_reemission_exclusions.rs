@@ -159,7 +159,7 @@ impl ReemissionExclusions {
         }
     }
 
-    fn with_state(state: ListState) -> Self {
+    pub(super) fn with_state(state: ListState) -> Self {
         Self {
             digests: BTreeSet::new(),
             state,

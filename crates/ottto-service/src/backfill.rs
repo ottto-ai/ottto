@@ -70,6 +70,12 @@ pub struct BackfillState {
     /// default.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub prior_history_unverified: bool,
+    /// The last claim completion returned an explicit `full` policy. Claude
+    /// history recorded only for another destination (a re-pair or account
+    /// move) is paced through the history gate only then; any other or
+    /// unknown policy holds it (SOURCE ruling, cross-org `full` move).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claim_backfill_policy_full: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,6 +143,9 @@ pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()
 ///   `full` on same-user re-claims precisely because the daemon must not
 ///   resurrect pre-cutoff history it skipped earlier.
 ///
+/// Every claim also records whether its policy was an explicit `full`
+/// (`claim_backfill_policy_full`).
+///
 /// Idempotent: re-applying the same completion (daemon restart, retried
 /// confirm) converges on the same persisted state.
 pub fn apply_claim_backfill_policy(
@@ -146,6 +155,8 @@ pub fn apply_claim_backfill_policy(
     user_id: &str,
 ) -> Result<()> {
     let mut state = load_backfill_state(state_dir);
+    let before = state.clone();
+    state.claim_backfill_policy_full = policy == Some("full");
     let parsed_cutoff = cutoff_at.and_then(parse_rfc3339);
     let new_cutoff = match (policy, parsed_cutoff) {
         (Some("from"), Some(_)) => cutoff_at.map(str::to_string),
@@ -158,24 +169,31 @@ pub fn apply_claim_backfill_policy(
         _ => None,
     };
     if let Some(cutoff) = new_cutoff {
-        if state.backfill_cutoff_at.as_deref() == Some(cutoff.as_str())
-            && state.backfill_cutoff_user_id.as_deref() == Some(user_id)
-        {
-            return Ok(());
-        }
         state.backfill_cutoff_at = Some(cutoff);
         state.backfill_cutoff_user_id = Some(user_id.to_string());
-        return save_backfill_state(state_dir, &state);
+    } else if state.backfill_cutoff_user_id.as_deref() != Some(user_id) {
+        // Full-backfill policy: keep a same-user cutoff, clear a
+        // different-user one.
+        state.backfill_cutoff_at = None;
+        state.backfill_cutoff_user_id = None;
     }
-    // Full-backfill policy: keep a same-user cutoff, clear a different-user one.
-    if state.backfill_cutoff_at.is_none() && state.backfill_cutoff_user_id.is_none() {
+    if state == before {
         return Ok(());
     }
-    if state.backfill_cutoff_user_id.as_deref() == Some(user_id) {
+    save_backfill_state(state_dir, &state)
+}
+
+/// StateMissing N2: a Claude census completed under the history gate clears
+/// the unverified marker. The gate's cutoff then keeps the rebuilt history
+/// gated, so the marker no longer has to suppress Claude's bootstrap and
+/// replay. Reloads first, as the completion writer does, so a concurrent
+/// claim is not clobbered.
+pub fn clear_prior_history_unverified(state_dir: &Path) -> Result<()> {
+    let mut state = load_backfill_state(state_dir);
+    if !state.prior_history_unverified {
         return Ok(());
     }
-    state.backfill_cutoff_at = None;
-    state.backfill_cutoff_user_id = None;
+    state.prior_history_unverified = false;
     save_backfill_state(state_dir, &state)
 }
 
@@ -295,17 +313,17 @@ pub fn pending_backfill_sources_for_destination(
     state: &BackfillState,
     destination_namespace_hash: &str,
 ) -> Vec<SnapshotSource> {
-    // An unreadable state arms no bootstrap or replay (StateMissing H1): its
-    // history is unknown, and a replay would drop the index's entries.
-    if state.prior_history_unverified {
-        return Vec::new();
-    }
+    // An unreadable state arms no Claude bootstrap or replay (StateMissing
+    // H1): its Claude history is unknown, and a replay would drop the index's
+    // entries before the history gate's cutoff exists. Codex and Pi are not
+    // gated by it (N2).
     [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
         SnapshotSource::Pi,
     ]
     .into_iter()
+    .filter(|source| !(state.prior_history_unverified && *source == SnapshotSource::ClaudeCode))
     .filter(|source| {
         source_needs_backfill(state, *source, current_historical_replay(*source))
             || state
@@ -752,7 +770,12 @@ mod tests {
         .expect("write a truncated state");
         let unreadable = load_backfill_state(&dir);
         assert!(unreadable.prior_history_unverified);
-        assert!(pending_backfill_sources_for_destination(&unreadable, "destination-a").is_empty());
+        let codex_and_pi = vec![SnapshotSource::Codex, SnapshotSource::Pi];
+        assert_eq!(
+            pending_backfill_sources_for_destination(&unreadable, "destination-a"),
+            codex_and_pi,
+            "only Claude is suppressed (N2)"
+        );
 
         apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_a")
             .expect("a claim rewrites the state");
@@ -762,7 +785,42 @@ mod tests {
             rewritten.backfill_cutoff_at.as_deref(),
             Some("2026-07-06T10:00:00Z")
         );
-        assert!(pending_backfill_sources_for_destination(&rewritten, "destination-a").is_empty());
+        assert_eq!(
+            pending_backfill_sources_for_destination(&rewritten, "destination-a"),
+            codex_and_pi
+        );
+
+        // N2: the marker clears, and keeps the rest of the state.
+        clear_prior_history_unverified(&dir).expect("clear the marker");
+        let cleared = load_backfill_state(&dir);
+        assert!(!cleared.prior_history_unverified);
+        assert_eq!(
+            cleared.backfill_cutoff_at.as_deref(),
+            Some("2026-07-06T10:00:00Z")
+        );
+        assert!(
+            pending_backfill_sources_for_destination(&cleared, "destination-a")
+                .contains(&SnapshotSource::ClaudeCode)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// SOURCE ruling (cross-org move): each claim records whether its policy
+    /// was an explicit `full`; any other or unknown policy clears it.
+    #[test]
+    fn each_claim_records_whether_its_policy_was_full() {
+        let dir = temp_dir("claim-policy-full");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("full claim");
+        assert!(load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, None, None, "user_b").expect("old backend");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_c").expect("full again");
+        apply_claim_backfill_policy(&dir, Some("from"), None, "user_c")
+            .expect("from without a cutoff");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("future"), None, "user_c").expect("unknown");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -1042,6 +1100,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, prior_history_unverified);
+crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, prior_history_unverified, claim_backfill_policy_full);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

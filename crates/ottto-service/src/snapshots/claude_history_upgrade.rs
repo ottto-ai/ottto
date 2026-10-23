@@ -14,7 +14,12 @@
 //!
 //! An owed upgrade passes only the protected-list state, the listed-family
 //! skip, the no-list birth hold, the Amendment 10/11 stop latch and the page
-//! budget, in that order. A held file may still be parsed for its other
+//! budget, in that order. The no-list birth hold applies only where the
+//! list is not intended (no list file and no seen-marker) and the Mac's
+//! history is unverified or was recorded for another destination under a
+//! claim policy other than an explicit `full` (`NoListPolicy`); everywhere
+//! else without a list, owed history is paced through the budget (SOURCE
+//! Amendment 16, StateMissing N1). A held file may still be parsed for its other
 //! reason (census records, proofs, index identity), but none of its new
 //! bodies reaches an upload path, and its upload tuple (revision, semantic
 //! group, body witness, membership) stays as it was. A file that only owes
@@ -79,6 +84,57 @@ pub(super) enum HistoryKind {
     Owed,
 }
 
+/// Where a destination's Claude prior-history evidence comes from. It is read
+/// before scanning from state outside the index, so it survives index loss
+/// (SOURCE F1a/F1b).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PriorHistory {
+    /// A positively fresh support state.
+    None,
+    /// This destination's own history (its completed bootstrap, a
+    /// server-attested ledger record, a quarantined copy of its index), or
+    /// the re-emission seen-marker.
+    Here,
+    /// History only another destination or a legacy layout recorded: a
+    /// re-pair or an account move.
+    Moved,
+    /// The backfill state is unreadable, so this Mac's history is unknown.
+    Unverified,
+}
+
+impl PriorHistory {
+    pub(crate) fn any(self) -> bool {
+        self != Self::None
+    }
+}
+
+/// What owed history does where the protected list is not intended: no list
+/// file and no seen-marker (`ListState::NotInstalled`). An intended list
+/// (present, or its marker written once) applies the list rules instead.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum NoListPolicy {
+    /// Paced through the page budget: this destination's own history, a
+    /// fresh install, or another destination's history under an explicit
+    /// `full` claim (StateMissing N1; SOURCE ruling on a cross-org move).
+    #[default]
+    Pace,
+    /// Held up to the later of 2026-10-21 and the history cutoff (SOURCE
+    /// F4a): the backfill state is unreadable, so the Mac fails closed.
+    HoldUnverified,
+    /// Held likewise: history recorded for another destination (a re-pair
+    /// or account move) under any claim policy but an explicit `full`. The
+    /// named policy row for SOURCE's cross-org move ruling.
+    HoldMoveNotFull,
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for NoListPolicy {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 /// Size and mtime of a file, as the index entry or the candidate holds them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct FileExtent {
@@ -132,9 +188,13 @@ pub(crate) enum HistoryHold {
     ListPaused,
     /// The list names the family.
     Listed,
-    /// No list was ever installed and the file was born before the cutoff,
-    /// or at an unknown time.
+    /// No list is intended, the Mac's history is unverified, and the file
+    /// was born before the cutoff, or at an unknown time.
     NoListBirth,
+    /// No list is intended, the history was recorded for another
+    /// destination under a claim policy other than an explicit `full`, and
+    /// the file was born before the cutoff, or at an unknown time.
+    MoveNotFull,
     /// The stop latch is set (evidence bound or index rebuild).
     Latched,
     /// This page's history budget is spent.
@@ -150,6 +210,7 @@ impl HistoryHold {
             Self::ListPaused => "list_paused",
             Self::Listed => "listed",
             Self::NoListBirth => "no_list_birth",
+            Self::MoveNotFull => "move_not_full",
             Self::Latched => "latched",
             Self::Budget => "budget",
             Self::ListedChanged => "listed_changed",
@@ -185,6 +246,8 @@ pub(super) struct PolicyInputs<'a> {
     pub(super) active_revision: u64,
     /// The index's history cutoff (rebuilt or prior-install history).
     pub(super) history_cutoff_unix_seconds: Option<u64>,
+    /// What owed history does where no list is intended.
+    pub(super) no_list_policy: NoListPolicy,
 }
 
 /// Apply the list, the birth hold, the family skip, the latch, the budget
@@ -214,12 +277,8 @@ pub(super) fn decide(
                 Some(HistoryHold::ListPaused)
             } else if inputs.listed {
                 Some(HistoryHold::Listed)
-            } else if inputs
-                .exclusions
-                .holds_without_list(inputs.birth_unix_seconds)
-                || holds_until_history_cutoff(inputs)
-            {
-                Some(HistoryHold::NoListBirth)
+            } else if let Some(hold) = no_list_hold(inputs) {
+                Some(hold)
             } else if inputs.latched {
                 Some(HistoryHold::Latched)
             } else if !page.reserve(index_key, size_bytes) {
@@ -234,10 +293,24 @@ pub(super) fn decide(
     decision
 }
 
-/// SOURCE F4a: with no list, rebuilt or prior-install history is held up to
-/// the later of the fixed no-list cutoff and the saved history cutoff, so
-/// history born after 2026-10-21 cannot be paced out without a list. Unknown
-/// birth is history.
+/// SOURCE F4a, narrowed by Amendment 16: where no list is intended and the
+/// policy holds, owed history is held up to the later of the fixed no-list
+/// cutoff and the saved history cutoff. Unknown birth is history. Under
+/// `Pace` nothing is held here; the budget paces it.
+fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
+    let hold = match inputs.no_list_policy {
+        NoListPolicy::Pace => return None,
+        NoListPolicy::HoldUnverified => HistoryHold::NoListBirth,
+        NoListPolicy::HoldMoveNotFull => HistoryHold::MoveNotFull,
+    };
+    (inputs
+        .exclusions
+        .holds_without_list(inputs.birth_unix_seconds)
+        || holds_until_history_cutoff(inputs))
+    .then_some(hold)
+}
+
+/// The saved-cutoff half of the no-list hold.
 fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
     inputs.exclusions.state() == ListState::NotInstalled
         && inputs.history_cutoff_unix_seconds.is_some_and(|cutoff| {
@@ -491,6 +564,7 @@ mod tests {
             latched: false,
             active_revision: active,
             history_cutoff_unix_seconds: None,
+            no_list_policy: NoListPolicy::Pace,
         }
     }
 
@@ -596,6 +670,7 @@ mod tests {
         // or before the saved history cutoff is still held without a list.
         let not_installed = ReemissionExclusions::default();
         let mut cutoff = inputs(&not_installed, false, 2);
+        cutoff.no_list_policy = NoListPolicy::HoldUnverified;
         cutoff.history_cutoff_unix_seconds = Some(u64::MAX - 1);
         for (birth, held) in [
             (Some(u64::MAX - 1), true),
@@ -630,6 +705,68 @@ mod tests {
             ),
             HistoryDecision::Owed
         );
+    }
+
+    /// SOURCE Amendment 16 and addendum 8, StateMissing N1: where no list is
+    /// intended, old and unknown-birth history is paced unless the Mac is
+    /// unverified (`no_list_birth`) or the history was moved under a claim
+    /// policy other than `full` (`move_not_full`). An intended list (an
+    /// installed list, or a marker with the list gone) applies its own rules
+    /// whatever the policy.
+    #[test]
+    fn no_list_policy_paces_unless_unverified_or_a_move_not_full() {
+        let not_installed = ReemissionExclusions::default();
+        let list = installed("");
+        let missing = ReemissionExclusions::with_state(ListState::MissingAfterInstall);
+        for (policy, expected) in [
+            (NoListPolicy::Pace, HistoryDecision::Owed),
+            (
+                NoListPolicy::HoldUnverified,
+                HistoryDecision::Held(HistoryHold::NoListBirth),
+            ),
+            (
+                NoListPolicy::HoldMoveNotFull,
+                HistoryDecision::Held(HistoryHold::MoveNotFull),
+            ),
+        ] {
+            for birth in [None, Some(1), Some(u64::MAX - 1)] {
+                let mut old = inputs(&not_installed, false, 2);
+                old.birth_unix_seconds = birth;
+                old.history_cutoff_unix_seconds = Some(u64::MAX - 1);
+                old.no_list_policy = policy;
+                assert_eq!(
+                    decide(HistoryKind::Owed, &old, &mut HistoryPage::default(), "k", 1),
+                    expected,
+                    "{policy:?} {birth:?}"
+                );
+                let mut intended = inputs(&list, false, 2);
+                intended.birth_unix_seconds = birth;
+                intended.no_list_policy = policy;
+                assert_eq!(
+                    decide(
+                        HistoryKind::Owed,
+                        &intended,
+                        &mut HistoryPage::default(),
+                        "k",
+                        1
+                    ),
+                    HistoryDecision::Owed,
+                    "an installed list paces unlisted history: {policy:?}"
+                );
+                let mut paused = inputs(&missing, false, 2);
+                paused.no_list_policy = policy;
+                assert_eq!(
+                    decide(
+                        HistoryKind::Owed,
+                        &paused,
+                        &mut HistoryPage::default(),
+                        "k",
+                        1
+                    ),
+                    HistoryDecision::Held(HistoryHold::ListPaused)
+                );
+            }
+        }
     }
 
     #[test]
@@ -685,6 +822,7 @@ mod tests {
         let mut page = HistoryPage::default();
         let mut old = inputs(&not_installed, false, 2);
         old.birth_unix_seconds = None;
+        old.no_list_policy = NoListPolicy::HoldUnverified;
         assert_eq!(
             decide(HistoryKind::Owed, &old, &mut page, "a", 1),
             HistoryDecision::Held(HistoryHold::NoListBirth)

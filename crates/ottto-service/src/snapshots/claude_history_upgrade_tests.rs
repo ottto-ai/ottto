@@ -165,14 +165,17 @@ fn listed_family_selected_for_another_reason_emits_nothing() {
     let _ = fs::remove_dir_all(home);
 }
 
-/// Group 3: no list. Old or unknown births are held whatever the reason;
-/// newer births pass. A malformed list, a list missing after install and an
-/// unrecordable install hold everything even with budget available.
+/// Group 3: no list on an unverified Mac (SOURCE F4a as narrowed by
+/// Amendment 16). Old or unknown births are held whatever the reason; newer
+/// births pass. A malformed list, a list missing after install and an
+/// unrecordable install hold everything even with budget available. On a
+/// verified Mac without a list, old history is paced instead (N1).
 #[test]
 fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
     let (home, root, index) = families("history-gate-no-list", 2);
-    let held = |support: &Path, cutoff: u64| {
+    let held_under = |policy: NoListPolicy, support: &Path, cutoff: u64| {
         let mut index = index.clone();
+        index.claude_no_list_policy = policy;
         index.load_claude_reemission_exclusions(support);
         let state = index.claude_reemission_exclusions.state();
         let mut result = with_no_list_cutoff(cutoff, || scan(&root, &mut index, "ctx-2", 2));
@@ -180,10 +183,21 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
         finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
         (state, result.snapshots.len(), revisions(&index))
     };
+    let held =
+        |support: &Path, cutoff: u64| held_under(NoListPolicy::HoldUnverified, support, cutoff);
     let never = support("history-gate-never");
     assert_eq!(
         held(&never, u64::MAX),
         (ListState::NotInstalled, 0, vec![1; 4])
+    );
+    assert_eq!(
+        held_under(NoListPolicy::HoldMoveNotFull, &never, u64::MAX),
+        (ListState::NotInstalled, 0, vec![1; 4])
+    );
+    assert_eq!(
+        held_under(NoListPolicy::Pace, &never, u64::MAX),
+        (ListState::NotInstalled, 4, vec![2; 4]),
+        "a verified Mac without a list paces old history"
     );
     assert_eq!(
         held(&never, 0),
@@ -264,16 +278,24 @@ fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
     assert_eq!(per_page, vec![1, 1, 1, 1, 0, 0]);
     assert_eq!(revisions(&index), vec![2; 4]);
 
-    let (home_missing, root_missing, mut missing_index) = families("history-gate-missing-list", 2);
+    let (home_missing, root_missing, missing_index) = families("history-gate-missing-list", 2);
     let never = support("history-gate-missing-list-support");
-    missing_index.load_claude_reemission_exclusions(&never);
-    let mut result = with_no_list_cutoff(u64::MAX, || {
-        with_body_witness_adoption_page_budget(1, || {
-            scan(&root_missing, &mut missing_index, "ctx-2", 2)
-        })
-    });
-    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut missing_index);
-    assert_eq!(result.snapshots.len(), 0, "absence is not an empty list");
+    for (policy, expected) in [(NoListPolicy::HoldUnverified, 0), (NoListPolicy::Pace, 1)] {
+        let mut missing_index = missing_index.clone();
+        missing_index.claude_no_list_policy = policy;
+        missing_index.load_claude_reemission_exclusions(&never);
+        let mut result = with_no_list_cutoff(u64::MAX, || {
+            with_body_witness_adoption_page_budget(1, || {
+                scan(&root_missing, &mut missing_index, "ctx-2", 2)
+            })
+        });
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut missing_index);
+        assert_eq!(
+            result.snapshots.len(),
+            expected,
+            "{policy:?}: absence is not an empty list, and only holds an unverified Mac"
+        );
+    }
     let _ = fs::remove_dir_all(home);
     let _ = fs::remove_dir_all(home_missing);
 }
@@ -329,6 +351,7 @@ fn the_shared_stamp_never_downgrades_and_refuses_held_files() {
     // A held file never stamps, whatever path settles it.
     let never = support("history-gate-stamp-support");
     index.load_claude_reemission_exclusions(&never);
+    index.claude_no_list_policy = NoListPolicy::HoldUnverified;
     index
         .files
         .get_mut(&key)
@@ -382,7 +405,7 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
     )
     .unwrap();
     let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(true, true);
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
     fresh.load_claude_reemission_exclusions(&support);
     let mut result = scan(&root, &mut fresh, "ctx-1", 2);
     assert_eq!(result.scanned_file_count, 4, "new files parse locally");
@@ -419,7 +442,7 @@ fn unreadable_member_directory_holds_its_root() {
     let subagents = root.join(session(1)).join("subagents");
     fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
     let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(true, true);
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
     fresh.load_claude_reemission_exclusions(&support);
     let mut result = scan(&root, &mut fresh, "ctx-1", 2);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
@@ -540,24 +563,170 @@ fn history_cutoff_is_bounded_by_the_clock() {
             .as_secs()
     };
     let mut index = ScanIndex::default();
-    index.note_claude_history_cutoff(false, true);
+    index.note_claude_history_cutoff(PriorHistory::None, false, true);
     assert_eq!(
         index.claude_history_cutoff_unix_seconds, None,
         "fresh install"
     );
-    index.note_claude_history_cutoff(true, false);
+    index.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(index.claude_history_cutoff_unix_seconds, None);
-    index.claude_history_cutoff_unix_seconds = Some(u64::MAX);
-    index.note_claude_history_cutoff(false, false);
+    index.claude_history_cutoff_unix_seconds = Some(u64::MAX - 1);
+    index.note_claude_history_cutoff(PriorHistory::None, false, false);
     assert!(index.claude_history_cutoff_unix_seconds.unwrap() <= now());
     // StateMissing M3: prior history records a cutoff on the first gated
     // load of an index without one, never on an index a gated daemon already
     // loaded (a fresh install's after its bootstrap).
     let mut pre_gate = ScanIndex::default();
-    pre_gate.note_claude_history_cutoff(true, false);
+    pre_gate.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert!(pre_gate.claude_history_cutoff_unix_seconds.is_some());
     let mut gated = ScanIndex::default();
-    gated.note_claude_history_cutoff(false, false);
-    gated.note_claude_history_cutoff(true, false);
+    gated.note_claude_history_cutoff(PriorHistory::None, false, false);
+    gated.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(gated.claude_history_cutoff_unix_seconds, None);
+}
+
+/// StateMissing N1: the first gated load of an intact index records the last
+/// moment it shows this destination receiving history (the newest valid
+/// activity clock among its accepted entities), so sessions created after it
+/// are new. A fresh index, a replay drop, or an index with no accepted
+/// activity records now.
+#[test]
+fn history_cutoff_is_the_last_received_activity() {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let received = |activity: &[(&str, Option<&str>, bool)]| {
+        let mut index = ScanIndex::default();
+        for (fingerprint, at, accepted) in activity {
+            index
+                .snapshot_activity_at
+                .insert(fingerprint.repeat(64), at.map(str::to_owned));
+            if *accepted {
+                index
+                    .accepted_snapshot_fingerprints
+                    .insert(fingerprint.repeat(64));
+            }
+        }
+        index
+    };
+    let activity = [
+        ("a", Some("2026-08-02T07:00:00Z"), true),
+        ("b", Some("2026-08-02T07:30:00Z"), true),
+        ("c", Some("2026-08-02T09:00:00Z"), false),
+        ("d", Some("not a clock"), true),
+        ("e", None, true),
+    ];
+    let mut pre_gate = received(&activity);
+    pre_gate.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert_eq!(
+        pre_gate.claude_history_cutoff_unix_seconds,
+        Some(1_785_655_800),
+        "2026-08-02T07:30:00Z: the newest accepted activity, not an unaccepted one"
+    );
+    let mut lost = received(&activity);
+    lost.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    assert!(lost.claude_history_cutoff_unix_seconds.unwrap() >= now);
+    let mut unknown = received(&[("a", Some("2026-08-02T07:00:00Z"), false)]);
+    unknown.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert!(unknown.claude_history_cutoff_unix_seconds.unwrap() >= now);
+    let mut future = received(&[("a", Some("2999-01-01T00:00:00Z"), true)]);
+    future.note_claude_history_cutoff(PriorHistory::Here, false, false);
+    assert!(future.claude_history_cutoff_unix_seconds.unwrap() <= now + 60);
+}
+
+/// SOURCE Amendment 16 and its cross-org move ruling: the cycle's no-list
+/// policy. An unverified Mac holds; a move under a claim policy other than
+/// an explicit `full` holds, and its index keeps that after its own
+/// bootstrap until a `full` claim; everything else is paced.
+#[test]
+fn no_list_policy_follows_the_prior_history_evidence() {
+    let policy = |prior: PriorHistory, full: bool, index: &mut ScanIndex| {
+        index.note_claude_history_cutoff(prior, full, true);
+        index.claude_no_list_policy
+    };
+    let mut index = ScanIndex::default();
+    assert_eq!(
+        policy(PriorHistory::None, false, &mut index),
+        NoListPolicy::Pace
+    );
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::Pace
+    );
+    assert_eq!(
+        policy(PriorHistory::Unverified, true, &mut index),
+        NoListPolicy::HoldUnverified
+    );
+    assert_eq!(
+        policy(PriorHistory::Moved, true, &mut index),
+        NoListPolicy::Pace
+    );
+    assert!(!index.claude_history_move_not_full);
+    assert_eq!(
+        policy(PriorHistory::Moved, false, &mut index),
+        NoListPolicy::HoldMoveNotFull
+    );
+    assert!(index.claude_history_move_not_full);
+    assert_eq!(
+        policy(PriorHistory::Here, false, &mut index),
+        NoListPolicy::HoldMoveNotFull,
+        "the moved history stays held after this destination's bootstrap"
+    );
+    assert_eq!(
+        policy(PriorHistory::Here, true, &mut index),
+        NoListPolicy::Pace,
+        "an explicit full claim lifts it"
+    );
+    let scratch = crate::test_scratch::ScratchDir::new("history-gate-move-kept");
+    let path = scratch.join("index.json");
+    let mut moved = ScanIndex::default();
+    moved.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    moved.save(&path).unwrap();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert!(reloaded.claude_history_move_not_full, "persisted");
+    assert!(
+        reloaded
+            .committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new())
+            .claude_history_move_not_full
+    );
+}
+
+/// StateMissing M3 (lenient decode): a malformed gate marker, move marker or
+/// cutoff never fails the whole index decode. The cutoff and the gate marker
+/// drop together, so the next gated load re-derives them (fail closed).
+#[test]
+fn malformed_history_gate_fields_decode_leniently() {
+    let scratch = crate::test_scratch::ScratchDir::new("history-gate-lenient");
+    let path = scratch.join("index.json");
+    let mut gated = ScanIndex::default();
+    gated.note_claude_history_cutoff(PriorHistory::Moved, false, true);
+    gated.save(&path).unwrap();
+    let kept = ScanIndex::load(&path).unwrap();
+    assert!(kept.claude_history_gate_loaded);
+    assert!(kept.claude_history_move_not_full);
+    assert!(kept.claude_history_cutoff_unix_seconds.is_some());
+    for (gate, cutoff, moved) in [
+        (json!("yes"), json!("soon"), json!(1)),
+        (json!(true), json!(-5), json!({"x": 1})),
+        (json!(null), json!(1.5), json!(null)),
+    ] {
+        let mut saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        saved["claude_history_gate_loaded"] = gate;
+        saved["claude_history_cutoff_unix_seconds"] = cutoff;
+        saved["claude_history_move_not_full"] = moved;
+        let malformed = scratch.join("malformed.json");
+        fs::write(&malformed, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&malformed).unwrap();
+        assert!(
+            !fs::read_dir(&*scratch)
+                .unwrap()
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+            "not quarantined"
+        );
+        assert_eq!(loaded.claude_history_cutoff_unix_seconds, None);
+        assert!(!loaded.claude_history_gate_loaded, "re-derived");
+        assert!(!loaded.claude_history_move_not_full);
+    }
 }

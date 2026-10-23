@@ -100,8 +100,10 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
-pub(crate) use claude_history_upgrade::MAX_GATED_CLAUDE_REVISION;
-use claude_history_upgrade::{HistoryDecision, HistoryEmission, HistoryHold, HistoryPage};
+use claude_history_upgrade::{
+    HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
+};
+pub(crate) use claude_history_upgrade::{PriorHistory, MAX_GATED_CLAUDE_REVISION};
 use claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
@@ -3097,16 +3099,42 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
-    /// Claude only: when this destination, after completing its history
-    /// bootstrap, loaded a fresh index or a historical replay dropped its
-    /// entries. A new file born before it (or at an unknown time) is history.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Claude only: the last moment this destination is known to have
+    /// received history, recorded when a Mac with prior history loads a fresh
+    /// index, a replay drops its entries, or a pre-gate index is first loaded
+    /// by the gate. A new file born before it (or at an unknown time) is
+    /// history. A malformed value decodes as `MALFORMED_CLAUDE_HISTORY_CUTOFF`
+    /// and is dropped on load with the gate marker (lenient decode).
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_lenient_claude_history_cutoff"
+    )]
     claude_history_cutoff_unix_seconds: Option<u64>,
     /// Claude only: a daemon with the history gate has loaded this index
     /// (StateMissing M3). Without it, an index a pre-gate daemon built, or
-    /// rebuilt only partly, gets its cutoff on the first gated load.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    /// rebuilt only partly, gets its cutoff on the first gated load. Any
+    /// stored value but `true` reads as `false` (lenient decode, fail closed).
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "deserialize_lenient_true"
+    )]
     claude_history_gate_loaded: bool,
+    /// Claude only: this index's cutoff was recorded for history another
+    /// destination received, under a claim policy other than an explicit
+    /// `full` (SOURCE ruling, cross-org move). Kept, so the hold outlives this
+    /// destination's own bootstrap; only an explicit `full` claim lifts it.
+    #[serde(
+        default,
+        skip_serializing_if = "std::ops::Not::not",
+        deserialize_with = "deserialize_lenient_true"
+    )]
+    claude_history_move_not_full: bool,
+    /// Runtime-only, Claude only: what owed history does this cycle where no
+    /// list is intended, set with the cutoff before scanning.
+    #[serde(skip)]
+    claude_no_list_policy: NoListPolicy,
     /// Runtime-only history-gate decisions of this cycle, by source file.
     #[serde(skip)]
     claude_history_emission: HistoryEmission,
@@ -3332,6 +3360,8 @@ impl Default for ScanIndex {
             reason_reoffer_retries: BTreeMap::new(),
             claude_history_cutoff_unix_seconds: None,
             claude_history_gate_loaded: false,
+            claude_history_move_not_full: false,
+            claude_no_list_policy: NoListPolicy::Pace,
             claude_history_emission: HistoryEmission::default(),
         }
     }
@@ -23921,7 +23951,8 @@ impl OwnedSourceScan {
                             HistoryHold::Budget,
                         ]),
                         history_upgrade.denied_for(&[HistoryHold::Listed]),
-                        history_upgrade.denied_for(&[HistoryHold::NoListBirth]),
+                        history_upgrade
+                            .denied_for(&[HistoryHold::NoListBirth, HistoryHold::MoveNotFull]),
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
                         index.claude_reemission_exclusions.state().as_str(),
                         claude_reemission_stop_reason(),
@@ -34798,7 +34829,7 @@ fn claude_reemission_stop_withheld_folds() -> u64 {
 
 /// Test seam: a daemon restart, the only reset of the latch.
 #[cfg(test)]
-fn restart_claude_reemission_stop_for_test() {
+pub(crate) fn restart_claude_reemission_stop_for_test() {
     with_claude_reemission_stop(|stop| *stop = ClaudeReemissionStop::new());
 }
 
@@ -34903,6 +34934,37 @@ fn unique_checkpoint_sibling(path: &Path, kind: &str) -> PathBuf {
         .map(|duration| duration.as_nanos())
         .unwrap_or_default();
     path.with_extension(format!("{kind}.{}.{nanos}.json", std::process::id()))
+}
+
+/// A malformed stored Claude history cutoff decodes as this; the load drops
+/// it with the gate marker (`drop_malformed_claude_history_cutoff`). A real
+/// cutoff is clamped to the clock, so it never reaches this value.
+const MALFORMED_CLAUDE_HISTORY_CUTOFF: u64 = u64::MAX;
+
+/// Lenient decode (StateMissing M3): a non-number cutoff never fails the
+/// whole index decode.
+fn deserialize_lenient_claude_history_cutoff<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<u64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(match Value::deserialize(deserializer)? {
+        Value::Null => None,
+        value => Some(value.as_u64().unwrap_or(MALFORMED_CLAUDE_HISTORY_CUTOFF)),
+    })
+}
+
+/// Lenient decode (StateMissing M3): any stored value but `true` is `false`,
+/// never a failed index decode.
+fn deserialize_lenient_true<'de, D>(deserializer: D) -> std::result::Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(matches!(
+        Value::deserialize(deserializer)?,
+        Value::Bool(true)
+    ))
 }
 
 fn valid_snapshot_activity(value: &Option<String>) -> bool {
@@ -35252,15 +35314,30 @@ impl ScanIndex {
 
     /// Claude only, before scanning, every cycle. With prior history on this
     /// Mac (SOURCE F1a), a fresh index, a replay that dropped entries or the
-    /// first gated load of an index with no cutoff records the history cutoff
-    /// at now; a new file born before it (or at an unknown time) is history
-    /// (SOURCE P1). The first-load rule covers an index a pre-gate daemon
-    /// built, rebuilt or replayed only partly, re-pairs included (StateMissing
-    /// M3, SOURCE F1b); an index a gated daemon built, such as a fresh
-    /// install's after its bootstrap, records none. A stored cutoff ahead of
-    /// the clock is pulled back to now, so a forward clock jump is not kept
-    /// (L1). A fresh install records none.
-    pub(crate) fn note_claude_history_cutoff(&mut self, prior_history: bool, entries_lost: bool) {
+    /// first gated load of an index with no cutoff records the history
+    /// cutoff; a new file born before it (or at an unknown time) is history
+    /// (SOURCE P1). The cutoff is the last moment this destination is known
+    /// to have received history (StateMissing N1): on the first gated load of
+    /// an intact index, the newest activity clock among its accepted
+    /// entities, so a session created while a pre-gate daemon was down is
+    /// new, not history. A fresh index or a replay drop re-reads files this
+    /// destination did receive, and an index with no accepted activity knows
+    /// no better, so those record now. The first-load rule covers an index a
+    /// pre-gate daemon built, rebuilt or replayed only partly, re-pairs
+    /// included (StateMissing M3, SOURCE F1b); an index a gated daemon built,
+    /// such as a fresh install's after its bootstrap, records none. A stored
+    /// cutoff ahead of the clock is pulled back to now, so a forward clock
+    /// jump is not kept (L1). A fresh install records none.
+    ///
+    /// It also sets this cycle's `NoListPolicy`: an unverified Mac holds, a
+    /// move under a claim policy other than an explicit `full` holds (and the
+    /// index keeps that until a `full` claim), everything else is paced.
+    pub(crate) fn note_claude_history_cutoff(
+        &mut self,
+        prior_history: PriorHistory,
+        claim_policy_full: bool,
+        entries_lost: bool,
+    ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -35269,11 +35346,46 @@ impl ScanIndex {
             *cutoff = (*cutoff).min(now);
         }
         let first_gated_load = !std::mem::replace(&mut self.claude_history_gate_loaded, true);
-        if prior_history
+        let moved_not_full = prior_history == PriorHistory::Moved && !claim_policy_full;
+        if prior_history.any()
             && (entries_lost
                 || (first_gated_load && self.claude_history_cutoff_unix_seconds.is_none()))
         {
-            self.claude_history_cutoff_unix_seconds = Some(now);
+            // No entry was dropped on this path, so the index is as loaded.
+            let received = (!entries_lost)
+                .then(|| self.last_received_activity_unix_seconds())
+                .flatten();
+            self.claude_history_cutoff_unix_seconds =
+                Some(received.map_or(now, |received| received.min(now)));
+            self.claude_history_move_not_full |= moved_not_full;
+        }
+        self.claude_no_list_policy = if prior_history == PriorHistory::Unverified {
+            NoListPolicy::HoldUnverified
+        } else if moved_not_full || (self.claude_history_move_not_full && !claim_policy_full) {
+            NoListPolicy::HoldMoveNotFull
+        } else {
+            NoListPolicy::Pace
+        };
+    }
+
+    /// The newest valid activity clock among this index's accepted entities,
+    /// in unix seconds: the last moment the index records this destination
+    /// receiving history (StateMissing N1). `None` when it records none.
+    fn last_received_activity_unix_seconds(&self) -> Option<u64> {
+        self.accepted_snapshot_fingerprints
+            .iter()
+            .filter_map(|fingerprint| self.snapshot_activity_at.get(fingerprint)?.as_deref())
+            .filter_map(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+            .filter_map(|at| u64::try_from(at.unix_timestamp()).ok())
+            .max()
+    }
+
+    /// Lenient decode (StateMissing M3): a malformed stored cutoff is dropped
+    /// with the gate marker, so the next gated load re-derives both.
+    fn drop_malformed_claude_history_cutoff(&mut self) {
+        if self.claude_history_cutoff_unix_seconds == Some(MALFORMED_CLAUDE_HISTORY_CUTOFF) {
+            self.claude_history_cutoff_unix_seconds = None;
+            self.claude_history_gate_loaded = false;
         }
     }
 
@@ -35321,6 +35433,7 @@ impl ScanIndex {
                 latched: claude_reemission_stop_latched(),
                 active_revision: self.active_effective_upload_body_witness_revision,
                 history_cutoff_unix_seconds: self.claude_history_cutoff_unix_seconds,
+                no_list_policy: self.claude_no_list_policy,
             },
             page,
             &key,
@@ -36453,6 +36566,7 @@ impl ScanIndex {
             }
             Ok(mut index) => {
                 let drops = index.drop_invalid_index_records();
+                index.drop_malformed_claude_history_cutoff();
                 index.retain_decodable_codex_parent_state();
                 if !index.canonicalize_codex_identity_keys() {
                     let discarded = index.files.len();
@@ -37616,6 +37730,9 @@ impl ScanIndex {
                 .or(previous.claude_history_cutoff_unix_seconds),
             claude_history_gate_loaded: self.claude_history_gate_loaded
                 || previous.claude_history_gate_loaded,
+            claude_history_move_not_full: self.claude_history_move_not_full
+                || previous.claude_history_move_not_full,
+            claude_no_list_policy: self.claude_no_list_policy,
             claude_history_emission: self.claude_history_emission.clone(),
         };
         for key in &safe_keys {
@@ -76479,7 +76596,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_emission, reason_reoffer_retries);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_no_list_policy, claude_history_emission, reason_reoffer_retries);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

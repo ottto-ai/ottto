@@ -341,42 +341,41 @@ const _: () = assert!(
         <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
 );
 
-/// A fresh install is only a positively empty support state. Prior history
-/// is any of: this destination's completed bootstrap; an unreadable backfill
-/// state; a Claude bootstrap completed for another destination or recorded
-/// by a legacy state, unless a claim recorded a different-user cutoff (that
-/// history stays excluded by the cutoff, as before); an upload ledger with any
-/// record of an earlier upload; a quarantined (`.corrupt.`) sibling of this
-/// index; any Claude index, ledger or quarantined copy another destination
-/// or a legacy layout left in the support directory (an interrupted
-/// bootstrap before a re-pair), again unless a different-user cutoff was
-/// recorded; or the re-emission seen-marker. Read before scanning; none of it
-/// lives in the index, so it survives index loss (fail closed, SOURCE
-/// F1a/F1b, StateMissing H1).
+/// Where this destination's Claude prior history comes from (SOURCE
+/// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
+/// support state.
+/// - `Unverified`: the backfill state is unreadable.
+/// - `Here`: this destination's completed bootstrap; a server-attested record
+///   in its upload ledger (an accepted, quarantined or refused body or
+///   accepted cache evidence; a generation or replay claim alone is saved
+///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
+///   sibling of this index; or the re-emission seen-marker.
+/// - `Moved`: only a Claude bootstrap completed for another destination or
+///   recorded by a legacy state, or a Claude index, ledger or quarantined
+///   copy another destination or a legacy layout left in the support
+///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   recorded a different-user cutoff, which keeps that history excluded by
+///   the cutoff, as before.
+///
+/// Read before scanning; none of it lives in the index, so it survives index
+/// loss (fail closed).
 fn claude_prior_history(
     backfill_state: &crate::backfill::BackfillState,
     destination_namespace: &str,
     upload_progress: &SnapshotUploadProgress,
     index_path: &Path,
     support_dir: &Path,
-) -> bool {
+) -> crate::snapshots::PriorHistory {
+    use crate::snapshots::PriorHistory;
+    if backfill_state.prior_history_unverified {
+        return PriorHistory::Unverified;
+    }
     let slug = SnapshotSource::ClaudeCode.api_slug();
     let here = backfill_state
         .completed_destination_namespaces
         .get(slug)
         .map(String::as_str)
         == Some(destination_namespace);
-    // A claim that recorded a different-user cutoff keeps the other
-    // destinations' history excluded by that cutoff, not by the gate.
-    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some();
-    let earlier_bootstrap = !other_user_cutoff
-        && (backfill_state
-            .completed_destination_namespaces
-            .contains_key(slug)
-            || backfill_state.completed_parser_versions.contains_key(slug)
-            || backfill_state.completed_replay_revisions.contains_key(slug)
-            || backfill_state.last_completed_at.is_some());
-    let ledger = upload_progress.records_prior_upload();
     let quarantined_sibling = || {
         let Some(prefix) = index_path
             .file_stem()
@@ -428,12 +427,28 @@ fn claude_prior_history(
         ))
         .is_ok()
     };
-    here || backfill_state.prior_history_unverified
-        || earlier_bootstrap
-        || ledger
+    if here
+        || upload_progress.records_server_attested_upload()
         || quarantined_sibling()
-        || (!other_user_cutoff && other_destination())
         || seen_marker()
+    {
+        return PriorHistory::Here;
+    }
+    // A claim that recorded a different-user cutoff keeps the other
+    // destinations' history excluded by that cutoff, not by the gate.
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some();
+    // Claude's own entries only: `last_completed_at` is stamped by any
+    // source's bootstrap, so a Codex or Pi completion is not Claude history.
+    let earlier_bootstrap = backfill_state
+        .completed_destination_namespaces
+        .contains_key(slug)
+        || backfill_state.completed_parser_versions.contains_key(slug)
+        || backfill_state.completed_replay_revisions.contains_key(slug);
+    if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
+        PriorHistory::Moved
+    } else {
+        PriorHistory::None
+    }
 }
 
 /// Claude only, before scanning: with prior history, a fresh index (missing
@@ -443,13 +458,59 @@ fn claude_prior_history(
 fn note_claude_history_cutoff_for_cycle(
     index: &mut ScanIndex,
     source: SnapshotSource,
-    prior_history: bool,
+    prior_history: crate::snapshots::PriorHistory,
+    backfill_state: &crate::backfill::BackfillState,
     entries_lost: bool,
 ) {
     if source != SnapshotSource::ClaudeCode {
         return;
     }
-    index.note_claude_history_cutoff(prior_history, entries_lost);
+    index.note_claude_history_cutoff(
+        prior_history,
+        backfill_state.claim_backfill_policy_full,
+        entries_lost,
+    );
+}
+
+/// The historical replays one cycle arms (StateMissing H1, N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayArming {
+    /// The source's bootstrap for this destination is pending.
+    backfill_pending: bool,
+    /// The index needs the current context-curve replay.
+    curve_replay_pending: bool,
+}
+
+impl ReplayArming {
+    /// One decision for production and the history pipeline tests. An
+    /// unreadable backfill state arms no Claude replay of either kind (its
+    /// history is unknown, and a replay would drop the index's entries);
+    /// Codex and Pi replays are not affected.
+    fn decide(
+        source: SnapshotSource,
+        backfill_state: &crate::backfill::BackfillState,
+        destination_namespace: &str,
+        curve_replay_needed: bool,
+    ) -> Self {
+        Self {
+            backfill_pending: pending_backfill_sources_for_destination(
+                backfill_state,
+                destination_namespace,
+            )
+            .contains(&source),
+            curve_replay_pending: curve_replay_needed
+                && !claude_replay_suppressed(source, backfill_state),
+        }
+    }
+}
+
+/// Claude only: the unreadable backfill state suppresses replays until a
+/// Claude census under the history gate clears it (N2).
+fn claude_replay_suppressed(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+) -> bool {
+    source == SnapshotSource::ClaudeCode && backfill_state.prior_history_unverified
 }
 
 fn exclude_held_effective_body_witness_revision(
@@ -1007,17 +1068,16 @@ struct SnapshotUploadProgress {
 }
 
 impl SnapshotUploadProgress {
-    /// Any record of an earlier upload to this destination: a saved
-    /// generation, a replay claim, an accepted, quarantined or refused body,
-    /// or cache evidence (SOURCE F1a prior history).
-    fn records_prior_upload(&self) -> bool {
-        self.generation > 0
-            || self.historical_replay_generation.is_some()
-            || !self.accepted_fingerprints.is_empty()
+    /// A server-attested record of an earlier upload to this destination: an
+    /// accepted, quarantined or refused body, or accepted cache evidence
+    /// (SOURCE F1a prior history). A saved generation, a replay claim or a
+    /// pending cache head is this daemon's own claim, saved before any upload,
+    /// so it is not evidence (StateMissing N1).
+    fn records_server_attested_upload(&self) -> bool {
+        !self.accepted_fingerprints.is_empty()
             || !self.accepted_body_witnesses.is_empty()
             || !self.accepted_cache_states.is_empty()
             || !self.accepted_cache_heads.is_empty()
-            || !self.pending_cache_heads.is_empty()
             || !self.quarantined_fingerprints.is_empty()
             || !self.permanent_rejections.is_empty()
     }
@@ -5421,9 +5481,6 @@ fn prepare_sync_source(
         index.mark_context_curve_capability_disabled();
     }
     let backfill_state = load_backfill_state(support_dir);
-    let backfill_pending =
-        pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
-            .contains(&source);
     // Read before this cycle's replay claims a generation in the upload
     // ledger: only a generation an earlier cycle left there is evidence.
     let prior_claude_history = (source == SnapshotSource::ClaudeCode).then(|| {
@@ -5456,11 +5513,17 @@ fn prepare_sync_source(
             upload_destination_namespace
         )
     };
-    // An unreadable backfill state arms no replay of either kind, and no
-    // replay-wide scan window (StateMissing H1).
-    let curve_replay_pending = context_curve_enabled
-        && index.context_curve_replay_needed(&replay_generation)
-        && !backfill_state.prior_history_unverified;
+    // An unreadable backfill state arms no Claude replay of either kind, and
+    // no replay-wide scan window (StateMissing H1, N2).
+    let ReplayArming {
+        backfill_pending,
+        curve_replay_pending,
+    } = ReplayArming::decide(
+        source,
+        &backfill_state,
+        &upload_destination_namespace,
+        context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
+    );
     let historical_replay_pending = backfill_pending || curve_replay_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
@@ -5532,6 +5595,7 @@ fn prepare_sync_source(
             &mut index,
             source,
             prior_history,
+            &backfill_state,
             claude_index_loaded_fresh || replay_dropped_entries,
         );
     }
@@ -6827,10 +6891,10 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    // A curve replay an unreadable backfill state suppressed stays pending
-    // (StateMissing H1), so it runs once the state is readable again.
+    // A Claude curve replay an unreadable backfill state suppressed stays
+    // pending (StateMissing H1), so it runs once the marker clears.
     let curve_replay_suppressed = context_curve_enabled
-        && backfill_state.prior_history_unverified
+        && claude_replay_suppressed(source, &backfill_state)
         && index.context_curve_replay_needed(&replay_generation);
     if !curve_replay_suppressed {
         settle_context_curve_replay_state(
@@ -6929,6 +6993,24 @@ fn finish_sync_source(
             "local detected-uses cache update skipped for {}",
             source.api_slug()
         );
+    }
+
+    // StateMissing N2: a Claude census completed and settled under the
+    // history gate clears the unverified marker. A fresh index recorded its
+    // cutoff this cycle and an intact one keeps its entries, so the rebuilt
+    // history stays gated; Claude's bootstrap and replays may then run.
+    if claude_replay_suppressed(source, &backfill_state)
+        && scan_result.census_complete
+        && upload_fully_settled
+    {
+        if let Err(error) = crate::backfill::clear_prior_history_unverified(support_dir) {
+            eprintln!(
+                "local snapshot backfill state save failed for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+            return Err(anyhow!("local snapshot backfill state save failed"));
+        }
     }
 
     if backfill_succeeded {
