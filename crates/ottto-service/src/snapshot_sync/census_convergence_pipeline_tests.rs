@@ -2218,28 +2218,36 @@ fn retry_pending_debt_elsewhere_settles_unrelated_pages_like_no_debt() {
         );
         assert_eq!(page.uploaded.len(), control_page.uploaded.len());
         assert_eq!(
+            page.progress.accepted_fingerprints.len(),
+            control_page.progress.accepted_fingerprints.len()
+        );
+        // Every body the server accepted on this page is recorded and
+        // current, exactly as on a page without the debt.
+        for accepted in &page.progress.accepted_fingerprints {
+            assert!(page.index.accepted_snapshot_fingerprint_recorded(accepted));
+            assert!(page
+                .index
+                .current_snapshot_fingerprints()
+                .contains(accepted));
+        }
+        assert_eq!(
             page.scan.scanned_file_count,
             control_page.scan.scanned_file_count
         );
     }
+    assert!(debt
+        .iter()
+        .any(|page| !page.progress.accepted_fingerprints.is_empty()));
     let last = debt.last().expect("terminal page");
     assert!(!last.scan.census_complete, "withheld");
     assert!(!last.backfill_succeeded);
-    // The revised sibling's body was accepted and is the current head, as in
-    // the control; the held family and the head sibling keep the baseline.
+    // The revised sibling advanced its head, as in the control; the held
+    // family and the head sibling keep the baseline.
     let revised_key = PipelineFixture::key(&baseline, PIPELINE_SESSIONS[1]);
-    let revised = last.index.files[&revised_key]
-        .last_snapshot_fingerprint
-        .clone()
-        .expect("revised head");
     assert_ne!(
-        Some(&revised),
-        baseline.files[&revised_key]
-            .last_snapshot_fingerprint
-            .as_ref()
+        last.index.files[&revised_key].last_snapshot_fingerprint,
+        baseline.files[&revised_key].last_snapshot_fingerprint
     );
-    assert!(last.index.accepted_snapshot_fingerprint_recorded(&revised));
-    assert!(debt.iter().any(|page| page.uploaded.contains(&revised)));
     for session in [PIPELINE_HELD_SESSION, PIPELINE_SESSIONS[2]] {
         let key = PipelineFixture::key(&baseline, session);
         assert_eq!(
