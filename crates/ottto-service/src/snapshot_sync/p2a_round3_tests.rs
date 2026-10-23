@@ -2415,3 +2415,50 @@ fn p2a_settlement_admission_refusal_keeps_exact_debt_after_ack_and_restart() {
     );
     eprintln!("MONEY_SETTLEMENT_REFUSAL actual_post=true selected_save_certified=false exact_due_dirty_restart=true injected_admission_refusal=true");
 }
+
+#[test]
+fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
+    let scratch = crate::test_scratch::ScratchDir::new("held-transient-restart");
+    let now = current_unix_seconds();
+    let fingerprint = "01".repeat(32);
+    let body = "02".repeat(32);
+    let changed_body = "03".repeat(32);
+    for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
+        let path = scratch.join(format!("progress-{kind:?}.json"));
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut progress = SnapshotUploadProgress::new("held-transient".into(), witness.clone());
+        progress.quarantine_held_body(fingerprint.as_str(), body.as_str(), kind);
+        let record = progress
+            .quarantined_fingerprints
+            .get_mut(fingerprint.as_str())
+            .unwrap();
+        let hold = record.hold.as_mut().unwrap();
+        hold.stage = 2;
+        hold.first_held_unix = now.saturating_sub(31 * 86400);
+        hold.retries_in_day = 6;
+        let expected = hold.clone();
+        let deadline = now + expected.base_seconds(now);
+        record.retry_after_unix_seconds = deadline;
+        for delay in [1800, 21600] {
+            progress.quarantine_transient_body(fingerprint.as_str(), body.as_str(), now + delay);
+            let record = &progress.quarantined_fingerprints[fingerprint.as_str()];
+            assert_eq!(record.hold.as_ref(), Some(&expected));
+            assert_eq!(record.retry_after_unix_seconds, deadline);
+            assert!(!record.hold.as_ref().unwrap().allowance(now));
+        }
+        progress.save(&path).unwrap();
+        let mut restored = SnapshotUploadProgress::load(&path, "held-transient", witness).unwrap();
+        let record = &restored.quarantined_fingerprints[fingerprint.as_str()];
+        assert_eq!(record.hold.as_ref(), Some(&expected));
+        assert_eq!(record.retry_after_unix_seconds, deadline);
+        restored.quarantine_transient_body(fingerprint.as_str(), body.as_str(), deadline + 1);
+        assert_eq!(
+            restored.quarantined_fingerprints[fingerprint.as_str()].retry_after_unix_seconds,
+            deadline + 1
+        );
+        restored.quarantine_transient_body(fingerprint.as_str(), changed_body.as_str(), now + 1800);
+        assert!(restored.quarantined_fingerprints[fingerprint.as_str()]
+            .hold
+            .is_none());
+    }
+}

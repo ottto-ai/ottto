@@ -3886,8 +3886,11 @@ mod p2a_conservation {
         let after = c.build(B, at_limit + 1);
         assert_entity(&c, B, &after, &[], 1, unit(11), true);
         assert_mac_distinct(&[&after], 0);
-        // Transcript retention cannot withdraw telemetry ownership claims.
-        assert_eq!(after.entities[B].counted[0].by, ClaudeCountedBy::Owned);
+        // Transcript retention cannot withdraw telemetry ownership claims:
+        // B remains a removed copy, and A's durable telemetry still owns r1.
+        assert!(after.entities[B].counted.is_empty());
+        assert!(c.ledger.get(&telemetry_key(A)).unwrap().request_hashes()
+            .contains(&claude_request_hash("r1")));
     }
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]

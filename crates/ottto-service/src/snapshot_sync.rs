@@ -1924,6 +1924,34 @@ impl SnapshotUploadProgress {
         record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
     }
 
+    fn quarantine_transient_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        not_before: u64,
+    ) {
+        let previous = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
+            .and_then(|record| {
+                record
+                    .hold
+                    .clone()
+                    .map(|hold| (hold, record.retry_after_unix_seconds))
+            });
+        self.quarantine_retryable_body(fingerprint, body_witness);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("retry inserted");
+        record.retry_after_unix_seconds = record.retry_after_unix_seconds.max(not_before);
+        if let Some((hold, deadline)) = previous {
+            record.hold = Some(hold);
+            record.retry_after_unix_seconds = deadline.max(not_before);
+        }
+    }
+
     fn retain_current_quarantines_with_diagnostics(
         &mut self,
         current: &BTreeSet<String>,
@@ -9641,14 +9669,17 @@ where
                         .get(fp)
                         .map_or(1, |record| record.version_skew_attempts.saturating_add(1))
                         .min(5);
-                    progress.quarantine_retryable_body(fp, &body_witness(&items[*index]));
+                    let delay = (1_800_u64 << (attempts - 1)).min(21_600);
+                    progress.quarantine_transient_body(
+                        fp,
+                        &body_witness(&items[*index]),
+                        current_unix_seconds().saturating_add(delay),
+                    );
                     let record = progress
                         .quarantined_fingerprints
                         .get_mut(fp)
                         .expect("retry inserted");
                     record.version_skew_attempts = attempts;
-                    let delay = (1_800_u64 << (attempts - 1)).min(21_600);
-                    record.retry_after_unix_seconds = current_unix_seconds().saturating_add(delay);
                     retry_after = retry_after.max(delay);
                 }
                 persist(progress).map_err(|_| {
@@ -9794,9 +9825,7 @@ where
                                 == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
                         }) {
                             let fp = fingerprint(&items[*index]);
-                            progress.quarantine_retryable_body(fp, &body_witness(&items[*index]));
-                            progress.quarantined_fingerprints.get_mut(fp)
-                                .expect("route retry inserted").retry_after_unix_seconds = retry_after;
+                            progress.quarantine_transient_body(fp, &body_witness(&items[*index]), retry_after);
                             recorded = true;
                         }
                     }
