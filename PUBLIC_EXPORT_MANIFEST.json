@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 828,
-  "content_sha256": "9beeff7fa518e1ae3e27d03b5aaefc9712e23d6394cb72f456e94555cc28e7b2",
+  "content_sha256": "908448645a80fe988381d9656219c57a0c37d0e4ca910010961efe4196514669",
   "files": [
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel/telemetry_tail.rs",
-      "sha256": "fd3c2f29229be24d58a851f1038ab253714272dfeafd1ea136b02cfe06cc04e5",
-      "size_bytes": 54642
+      "sha256": "7b05d35fe4692bb677815bcd3f531470f3b95fe13383ea52e84b99be8df14d45",
+      "size_bytes": 54943
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/prior_index_lifetime_tests.rs",
-      "sha256": "e896475059812053d5bdc67a810043cb394a9994f407a204870f4b62dd4fa7f2",
-      "size_bytes": 29827
+      "sha256": "26717ccff22fe7884f24718afb1c29725b2ce83a3331ac633843bf8c29283957",
+      "size_bytes": 30052
     },
     {
       "executable": false,
@@ -1777,8 +1777,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "1d942f00cd4629c9ab77eba0bed9aa2543913ecb0f449d6255e18343c96401fb",
-      "size_bytes": 124384
+      "sha256": "c76bfa086d7a41eef4c5d69a4a377f16a7842e42480a45e70bdcdce5b5cee93a",
+      "size_bytes": 124969
     },
     {
       "executable": false,
@@ -1819,15 +1819,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/store.rs",
-      "sha256": "dea2e47c1b899a5f7e78b4d951e2b079e85c54f068c0f80d7f90a0c1b0eb35b9",
-      "size_bytes": 57300
+      "sha256": "044316008c52a17384979d5f675c25fdf0b8a8c959057b2d321690cc93502266",
+      "size_bytes": 57838
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "c6ed995c4434a104aff3bc3b7aebd0d0ae4a02f86ad2a34170f0ae70b8bdb048",
-      "size_bytes": 111803
+      "sha256": "dd0876253b535b47530d1a460ff94e76195830093269745157561e4196621ce3",
+      "size_bytes": 111816
     },
     {
       "executable": false,
@@ -5799,7 +5799,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T15:05:58+00:00",
+  "generated_at": "2026-10-23T15:55:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 829,
   "public_roots": [
@@ -5838,5 +5838,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "9c858eb7324aa0d25c56d65bd4cad939149941fb"
+  "source_commit": "c3b6dcef059d15e98fe12fbaeb4649357acfaff5"
 }
