@@ -423,6 +423,8 @@ struct P2aControl {
     index_path: PathBuf,
     _env: Vec<EnvVarGuard>,
     previous_deadline: Option<Instant>,
+    resource_receipt: bool,
+    accepted_history: usize,
 }
 impl P2aControl {
     fn new(outcome: FinishOutcome) -> Self {
@@ -470,6 +472,8 @@ impl P2aControl {
             cadence: IdentityPipelineCadence::new(),
             index_path,
             _env: env,
+            resource_receipt: false,
+            accepted_history: 0,
             previous_deadline: source_upload_deadlines()
                 .lock()
                 .unwrap()
@@ -486,6 +490,24 @@ impl P2aControl {
         money_resume::forget_for_test(&self.support);
         crate::snapshots::claude_request_money::store::reload_for_test(&self.support).unwrap();
         self.daemon = test_daemon("otm_test");
+    }
+    fn resource_call<T>(&self, phase: &str, call: impl FnOnce() -> T) -> T {
+        if !self.resource_receipt {
+            return call();
+        }
+        let (result, allocation, admitted) =
+            crate::retry_allocation_probe::measure_money_caller_thread(call);
+        eprintln!("MONEY_LIVE_CALLER phase={phase} history={} caller_requested_peak={} caller_usable_peak={} caller_allocations={} shared_admission_sampled_peak={} ceiling={} settlement_scratch_isolated=false not_RSS=true",
+            self.accepted_history, allocation.requested_peak_with_overlap,
+            allocation.usable_peak_with_overlap, allocation.allocations, admitted,
+            crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES);
+        assert!(admitted <= crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES);
+        assert!(
+            allocation.requested_peak_with_overlap
+                <= crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES,
+            "whole caller phase exceeded the 64 MiB resource control: {allocation:?}"
+        );
+        result
     }
     fn cycle(&self) -> (usize, Vec<SnapshotItem>) {
         self.cycle_result().unwrap()
@@ -513,22 +535,24 @@ impl P2aControl {
                 codex_scan_homes: Vec::new(),
                 codex_home_bindings: Vec::new(),
             };
-            let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
-                prepare_sync_source(
-                    &self.client,
-                    &self.device,
-                    "device-secret",
-                    SnapshotSource::ClaudeCode,
-                    "otm_test",
-                    &self.fixture.home,
-                    &self.support,
-                    &self.daemon,
-                    &mut transport,
-                    self.daemon.snapshot_scan_account_witness().unwrap(),
-                    false,
-                )
+            let frame = self.resource_call("prepare_or_resume", || {
+                crate::agent_status_refresh::with_test_collection(collection(), || {
+                    prepare_sync_source(
+                        &self.client,
+                        &self.device,
+                        "device-secret",
+                        SnapshotSource::ClaudeCode,
+                        "otm_test",
+                        &self.fixture.home,
+                        &self.support,
+                        &self.daemon,
+                        &mut transport,
+                        self.daemon.snapshot_scan_account_witness().unwrap(),
+                        false,
+                    )
+                })
             });
-            let frame = match frame {
+            let mut frame = match frame {
                 Ok(Some(frame)) => frame,
                 Ok(None) => return Ok(retained.expect("resumed exact scan completed")),
                 Err(error)
@@ -541,26 +565,46 @@ impl P2aControl {
                 }
                 Err(error) => return Err(error),
             };
+            // Fixture construction stays outside the production allocation window.
+            for n in 0..self.accepted_history {
+                let fp = format!("{n:064x}");
+                frame
+                    .upload_progress
+                    .accepted_fingerprints
+                    .insert(fp.clone());
+                frame
+                    .upload_progress
+                    .accepted_body_witnesses
+                    .insert(fp, "historical-body".into());
+            }
+            if self.accepted_history > 0 {
+                frame
+                    .upload_progress
+                    .save(&frame.upload_progress_path)
+                    .unwrap();
+            }
             let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
             let parsed = scan.scanned_file_count;
             let items = scan.snapshots.clone();
             retained = Some((parsed, items.clone()));
-            let result = crate::agent_status_refresh::with_test_collection(collection(), || {
-                finish_sync_source(
-                    preparation,
-                    index,
-                    scan,
-                    &self.client,
-                    &self.device,
-                    "device-secret",
-                    SnapshotSource::ClaudeCode,
-                    "otm_test",
-                    &self.fixture.home,
-                    &self.support,
-                    &self.daemon,
-                    &mut transport,
-                    &mut retry,
-                )
+            let result = self.resource_call("finish", || {
+                crate::agent_status_refresh::with_test_collection(collection(), || {
+                    finish_sync_source(
+                        preparation,
+                        index,
+                        scan,
+                        &self.client,
+                        &self.device,
+                        "device-secret",
+                        SnapshotSource::ClaudeCode,
+                        "otm_test",
+                        &self.fixture.home,
+                        &self.support,
+                        &self.daemon,
+                        &mut transport,
+                        &mut retry,
+                    )
+                })
             });
             money::store::flush();
             if result.as_ref().err().is_some_and(|error| {
@@ -735,9 +779,9 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
             // This control starts at a settled, matching policy boundary. A
             // mismatching context/revision is an ordinary reparse control.
             let mut persisted = serde_json::to_value(&saved).unwrap();
-            persisted["upload_context_fingerprint"] = serde_json::json!(snapshot_upload_context_fingerprint(
-                SnapshotUploadPolicy::default(), None,
-            ));
+            persisted["upload_context_fingerprint"] = serde_json::json!(
+                snapshot_upload_context_fingerprint(SnapshotUploadPolicy::default(), None,)
+            );
             saved = serde_json::from_value(persisted).unwrap();
             if terminal {
                 saved.insert_unproven_terminal_claude_authority_for_test(
@@ -1847,7 +1891,6 @@ fn p2a_synchronous_audit_mode_never_yields_or_mutates_live_money_custody() {
     money::capture::purge_before(&control.support, Instant::now());
 }
 
-
 // Real-cap controls use the production record limit, actual preparation/finish,
 // POST, durable ACK, selected save and restart. No test cap or timeout stands
 // in for the admission decision.
@@ -1865,7 +1908,8 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let control = P2aControl::new(FinishOutcome::Accept);
+    let mut control = P2aControl::new(FinishOutcome::Accept);
+    control.resource_receipt = true;
     control.cycle();
     let _live = money::LiveForTest::new(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
@@ -2041,7 +2085,6 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
     assert!(!money_resume::pending_for_test(&control.support));
 }
 
-
 #[test]
 #[serial]
 #[serial(source_cadences)]
@@ -2126,7 +2169,10 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
             assert!(money_resume::pending_for_test(&control.support));
             let reserved = money::reserved_for_test();
             money_resume::cancel_owner(&test_daemon("unrelated-owner"));
-            assert!(money_resume::pending_for_test(&control.support), "another daemon cannot cancel this owner");
+            assert!(
+                money_resume::pending_for_test(&control.support),
+                "another daemon cannot cancel this owner"
+            );
             match reason {
                 "account reset" => {
                     control
@@ -2174,5 +2220,48 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
                 .all(|item| item["usage_accounting_contract"] != money::REQUEST_OWNED_CONTRACT),
             "cancelled literal cannot POST"
         );
+    }
+}
+
+// This receipt measures the real caller's whole phases with a small offered
+// page and a large ACK history. It does NOT infer settlement-only scratch
+// from the caller peak; an exact before/after settlement hook is still needed.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_live_page_large_ack_history_resource_receipt() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for history in [0, 20_000] {
+        let mut control = P2aControl::new(FinishOutcome::Accept);
+        control.accepted_history = history;
+        control.resource_receipt = true;
+        let _live = money::LiveForTest::new(&control.support);
+        control.cycle();
+        assert!(!money_resume::pending_for_test(&control.support));
+        let offers = control.offers();
+        let literals = offers
+            .iter()
+            .filter(|item| item["usage_accounting_contract"] == money::REQUEST_OWNED_CONTRACT)
+            .collect::<Vec<_>>();
+        assert!(
+            !literals.is_empty(),
+            "gate ON must exercise literal POST and settlement"
+        );
+        for literal in literals {
+            assert!(control.saved().accepted_snapshot_fingerprint_recorded(
+                literal["snapshot_fingerprint"].as_str().unwrap()
+            ));
+        }
+        assert!(control
+            .saved()
+            .files
+            .values()
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
     }
 }

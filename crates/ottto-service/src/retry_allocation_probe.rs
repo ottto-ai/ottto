@@ -39,6 +39,42 @@ unsafe fn usable(ptr: *const std::ffi::c_void, requested: usize) -> usize {
         requested
     }
 }
+// Test-only sampling at allocator events; this is the SHARED admission
+// counter, not an exact per-phase reservation high-water mark. Reservations
+// with no caller allocation between admission/drop are deliberately unobserved.
+thread_local! {
+    static MONEY_ADMISSION_SAMPLE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+fn sample_money_admission() {
+    let _ = MONEY_ADMISSION_SAMPLE.try_with(|sample| {
+        if let Some(peak) = sample.get() {
+            sample.set(Some(
+                peak.max(crate::snapshots::claude_request_money::reserved_for_test()),
+            ));
+        }
+    });
+}
+
+pub(crate) fn measure_money_caller_thread<T>(f: impl FnOnce() -> T) -> (T, Stats, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_ADMISSION_SAMPLE.with(|sample| sample.set(None));
+        }
+    }
+    MONEY_ADMISSION_SAMPLE.with(|sample| {
+        assert!(sample.get().is_none());
+        sample.set(Some(
+            crate::snapshots::claude_request_money::reserved_for_test(),
+        ));
+    });
+    let reset = Reset;
+    let (value, stats) = measure_caller_thread(f);
+    let peak = MONEY_ADMISSION_SAMPLE.with(|sample| sample.get().unwrap());
+    drop(reset);
+    (value, stats, peak)
+}
+
 struct Probe;
 #[global_allocator]
 static ALLOCATOR: Probe = Probe;
@@ -102,6 +138,7 @@ unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
+            sample_money_admission();
             process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
             record(
                 layout.size() as isize,
@@ -121,6 +158,7 @@ unsafe impl GlobalAlloc for Probe {
         System.dealloc(ptr, layout);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        sample_money_admission();
         let old_usable = usable(ptr.cast(), layout.size());
         let result = process::reallocate(ptr, layout, size);
         if !result.is_null() {
@@ -171,7 +209,10 @@ mod process {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    const SLOTS: usize = 65_536;
+    // The cap receipt can serialize 65,536 ledger records in one caller.
+    // Each record owns several pointers; table overflow must not masquerade
+    // as a resource peak or force reducing the fixture's production cap.
+    const SLOTS: usize = 262_144;
     #[derive(Clone, Copy)]
     struct Entry {
         pointer: usize,

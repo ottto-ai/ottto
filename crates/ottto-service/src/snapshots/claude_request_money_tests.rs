@@ -2778,6 +2778,48 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         .map(|(key, record)| key.len() + 3 + serde_json::to_vec(record).unwrap().len())
         .sum::<usize>();
 
+    // Capacity projection, not a live-admission receipt. The existing M4
+    // fixture is shadow-only and has NONE of these live custody prefixes.
+    // Count its actual physical/logical populations rather than calling its
+    // 17k evidence records proof that a 65k live ledger fits.
+    let transcript_records = index_census.len_for_test();
+    let message_records = census.records_with_prefix("mh:").count();
+    let telemetry_records = census.records_with_prefix(TELEMETRY_KEY_PREFIX).count();
+    let families = index
+        .files
+        .keys()
+        .filter_map(|key| {
+            crate::snapshots::claude_request_money::logical_family_member(&index, key)
+                .map(|(root, _)| root)
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let entities = index
+        .files
+        .keys()
+        .filter_map(|key| {
+            crate::snapshots::claude_request_money::logical_family_member(&index, key)
+        })
+        .collect::<BTreeSet<_>>()
+        .len();
+    let evidence = census.record_count();
+    let evidence_watches = transcript_records + telemetry_records + message_records;
+    // One replacing trace watch/family, ever-indexed root, adoption/entity.
+    let projected_no_debt = evidence + evidence_watches + 2 * families + entities;
+    let projected_with_union = projected_no_debt + index.files.len();
+    for prefix in [
+        "watch:", "adopt:", "ever:", "offer:", "due:", "dirty:", "union:",
+    ] {
+        assert_eq!(
+            census.records_with_prefix(prefix).count(),
+            0,
+            "this is a pre-live fixture, not a successful full-custody admission"
+        );
+    }
+    assert!(projected_no_debt > store::LEDGER_MAX_RECORDS);
+    eprintln!("MONEY_M4_CUSTODY_ESTIMATE evidence={evidence} transcript_records={transcript_records} message_records={message_records} telemetry_records={telemetry_records} evidence_watches={evidence_watches} trace_watches={families} ever_indexed={families} adoption={entities} offers_steady=0 due_dirty_steady=0 projected_no_debt={projected_no_debt} projected_with_union={projected_with_union} cap={} projected_excess={} live_admission_executed=false",
+        store::LEDGER_MAX_RECORDS, projected_no_debt - store::LEDGER_MAX_RECORDS);
+
     // The whole ledger saved, then loaded (a restart).
     let started = Instant::now();
     let mut failed = store::WriterState::default();
