@@ -1804,8 +1804,13 @@ fn build_slice(
     // Page hashes (units and rows), collisions by full id.
     let mut first_id = BTreeMap::<u64, &str>::new();
     let mut collisions = BTreeSet::new();
-    for item in items {
+    let mut checked = 0_usize;
+    for item in &items {
         for request_id in item.claude_usage_occurrences.keys() {
+            checked += 1;
+            if checked.is_multiple_of(1024) && Instant::now() >= deadline {
+                return Err("deadline");
+            }
             let hash = claude_request_hash(request_id);
             match first_id.get(&hash) {
                 Some(first) if *first != request_id.as_str() => {
@@ -1819,7 +1824,12 @@ fn build_slice(
         }
     }
     let mut page_hashes = first_id.keys().copied().collect::<Vec<_>>();
-    page_hashes.extend(page_claims.keys().copied());
+    page_hashes.extend(
+        root_rows
+            .values()
+            .flatten()
+            .flat_map(|rows| rows.iter().map(|row| row.request_hash)),
+    );
     for capture in captures.values() {
         page_hashes.extend(capture.units().iter().filter_map(|unit| match unit.kind {
             capture::CapturedKind::Displaced(hash) => Some(hash),

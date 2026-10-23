@@ -482,6 +482,7 @@ fn money_shadow_capture_never_enters_live_items_or_reservations() {
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             armed.census_complete,
+            &money::coverage::InterimFamilyCoverage::default(),
         );
         money::store::flush();
     };
