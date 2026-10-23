@@ -347,7 +347,9 @@ const _: () = assert!(
 /// by a legacy state, unless a claim recorded a different-user cutoff (that
 /// history stays excluded by the cutoff, as before); an upload ledger with any
 /// record of an earlier upload; a quarantined (`.corrupt.`) sibling of this
-/// index; or the re-emission seen-marker. Read before scanning; none of it
+/// index; any Claude index, ledger or quarantined copy another destination
+/// or a legacy layout left in the support directory (an interrupted
+/// bootstrap before a re-pair); or the re-emission seen-marker. Read before scanning; none of it
 /// lives in the index, so it survives index loss (fail closed, SOURCE
 /// F1a/F1b, StateMissing H1).
 fn claude_prior_history(
@@ -391,6 +393,31 @@ fn claude_prior_history(
                 })
             })
     };
+    let other_destination = || {
+        let prefix = format!("{slug}-scan-index");
+        let own = index_path.parent();
+        // An unreadable directory fails closed; a missing one is empty.
+        let holds_claude_state = |directory: &Path| {
+            Some(directory) != own
+                && match std::fs::read_dir(directory) {
+                    Ok(entries) => entries.flatten().any(|entry| {
+                        entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix))
+                    }),
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                }
+        };
+        let snapshots = support_dir.join("snapshots");
+        holds_claude_state(&snapshots)
+            || match std::fs::read_dir(snapshots.join("destinations")) {
+                Ok(destinations) => destinations
+                    .flatten()
+                    .any(|destination| holds_claude_state(&destination.path())),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+    };
     let seen_marker = || {
         std::fs::symlink_metadata(crate::snapshots::claude_reemission_seen_marker_path(
             support_dir,
@@ -401,6 +428,7 @@ fn claude_prior_history(
         || earlier_bootstrap
         || ledger
         || quarantined_sibling()
+        || other_destination()
         || seen_marker()
 }
 
@@ -6795,12 +6823,19 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    settle_context_curve_replay_state(
-        &mut index,
-        context_curve_enabled,
-        scan_result.census_complete && upload_fully_settled,
-        &replay_generation,
-    );
+    // A curve replay an unreadable backfill state suppressed stays pending
+    // (StateMissing H1), so it runs once the state is readable again.
+    let curve_replay_suppressed = context_curve_enabled
+        && backfill_state.prior_history_unverified
+        && index.context_curve_replay_needed(&replay_generation);
+    if !curve_replay_suppressed {
+        settle_context_curve_replay_state(
+            &mut index,
+            context_curve_enabled,
+            scan_result.census_complete && upload_fully_settled,
+            &replay_generation,
+        );
+    }
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     let side_mark = codex_side_save_mark(daemon, source, &index_path);

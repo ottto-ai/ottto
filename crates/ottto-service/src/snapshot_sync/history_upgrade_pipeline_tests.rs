@@ -968,3 +968,36 @@ fn resumed_pre_gate_index_on_a_new_destination_records_the_cutoff() {
         "the index loaded; nothing was quarantined"
     );
 }
+
+/// SOURCE F1b (AutoReview): a bootstrap interrupted before a re-pair leaves
+/// only its own destination's Claude index or ledger. That is prior history
+/// for the new destination; the new destination's own files are not.
+#[test]
+fn another_destinations_claude_state_is_prior_history() {
+    let fixture = HistoryFixture::new("history-upgrade-other-destination");
+    let backfill = crate::backfill::BackfillState::default();
+    let progress = test_upload_progress();
+    let destinations = fixture.support.join("snapshots/destinations");
+    let own = destinations.join("destination-b");
+    std::fs::create_dir_all(&own).expect("create own destination");
+    let index_path = own.join("claude_code-scan-index-v3.json");
+    std::fs::write(own.join("claude_code-scan-index-v3.lock"), b"").expect("own lock");
+    let prior = || {
+        claude_prior_history(
+            &backfill,
+            "destination-b",
+            &progress,
+            &index_path,
+            &fixture.support,
+        )
+    };
+    assert!(!prior(), "this destination's own files are not evidence");
+    let other = destinations.join("destination-a");
+    std::fs::create_dir_all(&other).expect("create other destination");
+    std::fs::write(
+        other.join("claude_code-scan-index-v3-upload-progress.json"),
+        b"{}",
+    )
+    .expect("other destination ledger");
+    assert!(prior());
+}
