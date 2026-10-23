@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 828,
-  "content_sha256": "ad6e4978367987b80266dbf9f09bed1a6c9e0ea87d077423691e44aa883290d7",
+  "content_sha256": "cbdb857d56164b3566d2d0410f0a408e3bdf56837babcc8d4d1ecc04e7ceea70",
   "files": [
     {
       "executable": false,
@@ -804,8 +804,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/claude_local_otel/telemetry_tail.rs",
-      "sha256": "49d5e335012da7c68bd440a8b0ef1f979a525165fb00cfb368af4196044ddaa7",
-      "size_bytes": 53832
+      "sha256": "fd3c2f29229be24d58a851f1038ab253714272dfeafd1ea136b02cfe06cc04e5",
+      "size_bytes": 54642
     },
     {
       "executable": false,
@@ -1490,8 +1490,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/claude_request_money_pipeline_tests.rs",
-      "sha256": "ceb64bd206b1aa2c40b12651068a1d0fb90e2bd6b1eb173255b39b53cad5498f",
-      "size_bytes": 60329
+      "sha256": "36f9c542d89801c8ebb2341bacae04d353693d1507ddf6be0e98c6b4c1619e10",
+      "size_bytes": 63567
     },
     {
       "executable": false,
@@ -1770,29 +1770,29 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_ledger.rs",
-      "sha256": "6b09d1914aee7ae14b541a0c7a78be28a0bfcdf6645c5fe810a632a59a9a32bc",
-      "size_bytes": 40251
+      "sha256": "faa4228d03c20ddbb4fbe4ad578b17af088f8e33d751f1bddb34cbca580c95b4",
+      "size_bytes": 41452
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "11b5e2160b10d5650d6413e36572578b42c13408bb09eee331312d66ebcf5f25",
-      "size_bytes": 115349
+      "sha256": "cea1f069434cada320ad0a4432b8b811377a0efcfe43c98f52523562cc4abedf",
+      "size_bytes": 120168
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/body.rs",
-      "sha256": "30c87f49a62b9f31f0fdcc4b6a58cc184574b213a03894e22af62f2ff8ec56dc",
-      "size_bytes": 42254
+      "sha256": "1e4bf18f21789ad653296f6aa98201728b79004952017c4128fdd945979ebe52",
+      "size_bytes": 42245
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/capture.rs",
-      "sha256": "d9690e2952edb9121e86782b413dd834b00d673289ab390554f9e6492d3d7888",
-      "size_bytes": 25492
+      "sha256": "3d1db1fdaf19bac9a38a0044759b34c4692847c868d6fee6fb446c81eb9f3dbb",
+      "size_bytes": 26122
     },
     {
       "executable": false,
@@ -1812,22 +1812,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/rows.rs",
-      "sha256": "93a8ce8eebc2332a096cf6c93bf06ce6c1c68d6a456721bbedb6c4d1df39f2ac",
-      "size_bytes": 10236
+      "sha256": "f1adc944a4f23d9eb7868037a7e978bc77fe7a54dadefd828a731fcb095f33e8",
+      "size_bytes": 10218
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/store.rs",
-      "sha256": "48ff11cf2c8dc41c330ecf0b9946a536f55b6b14c651982757ae6177af81e3bc",
-      "size_bytes": 50972
+      "sha256": "dea2e47c1b899a5f7e78b4d951e2b079e85c54f068c0f80d7f90a0c1b0eb35b9",
+      "size_bytes": 57300
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "a957dcfd681d01ed1aa34dbf838df5bde261bffddacc3729912210b218bf78d8",
-      "size_bytes": 110268
+      "sha256": "c6ed995c4434a104aff3bc3b7aebd0d0ae4a02f86ad2a34170f0ae70b8bdb048",
+      "size_bytes": 111803
     },
     {
       "executable": false,
@@ -5799,7 +5799,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T14:35:32+00:00",
+  "generated_at": "2026-10-23T14:58:10+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 829,
   "public_roots": [
@@ -5838,5 +5838,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a49bb4702ff7dc0c67d504bc825b6cd7657e4e0d"
+  "source_commit": "9176d96b69d80e042df7833edada87f66cd3f923"
 }
