@@ -1355,7 +1355,7 @@ fn streamed_64_mib_record_key_refuses_before_key_allocation() {
     assert!(scan_index_containment_lines_for_test()[before..]
         .iter()
         .any(|line| line.contains("lenient_hold_budget_exceeded=1")
-            && line.contains("fallback=prior_history_gated_rebuild_requires_712")));
+            && line.contains("fallback=prior_history_gated_rebuild")));
     eprintln!("lenient_oversize_key_receipt key_bytes={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} normalization_requested={} selected_requested={} selected_usable={}", 64 * 1024 * 1024, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, normalization.requested_peak, selected.requested_peak, selected.usable_peak);
 }
 
@@ -1915,7 +1915,10 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "claude_desktop_identity_census_complete"
             | "claude_desktop_lineage_census_complete"
             | "bounded_sweep_had_unsettled_upload"
-            | "context_curve_capability_enabled" => serde_json::json!(true),
+            | "context_curve_capability_enabled"
+            | "claude_history_gate_loaded"
+            | "claude_history_move_not_full"
+            | "claude_history_move_released" => serde_json::json!(true),
             "generation"
             | "codex_parent_side_generation"
             | "codex_parent_proof_wrap_epoch"
@@ -1925,7 +1928,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "claude_desktop_store_retry_attempt"
             | "claude_desktop_store_retry_not_before_unix_seconds"
             | "bounded_sweep_unsettled_causes"
-            | "context_curve_replay_epoch" => serde_json::json!(1),
+            | "context_curve_replay_epoch"
+            | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
             "upload_context_fingerprint"
             | "codex_parent_proof_cursor"
@@ -2236,6 +2240,86 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
                     raw_slot(&fs::read(&path).unwrap(), field, &held_key),
                     original
                 );
+            }
+        }
+    }
+}
+
+/// K1–K4: every reader shares fail-closed scalar repairs. An intact cutoff
+/// must not hide a damaged move hold after this destination bootstraps.
+#[test]
+fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
+    for bad in [
+        serde_json::json!("damaged"),
+        serde_json::json!(-1),
+        serde_json::json!(1.5),
+        serde_json::json!([]),
+        serde_json::json!({"bad": true}),
+        serde_json::json!(null),
+    ] {
+        for damage_cutoff in [false, true] {
+            for bounded in [false, true] {
+                let scratch = crate::test_scratch::ScratchDir::new("history-gate-cas");
+                let path = scratch.join("index.json");
+                let mut working = fixture();
+                working.claude_history_gate_loaded = true;
+                working.claude_history_cutoff_unix_seconds = Some(1);
+                working.save(&path).unwrap();
+                let mut value = serde_json::to_value(&working).unwrap();
+                value["claude_history_move_not_full"] = bad.clone();
+                value["claude_history_move_released"] = bad.clone();
+                if damage_cutoff {
+                    value["claude_history_cutoff_unix_seconds"] = bad.clone();
+                    value["claude_history_gate_loaded"] = bad.clone();
+                }
+                let bytes = serde_json::to_vec(&value).unwrap();
+                fs::write(&path, &bytes).unwrap();
+                let loaded = ScanIndex::load(&path).unwrap();
+                // Inspect CAS decode results as well as the real save APIs:
+                // a later overwrite must not conceal missing normalization.
+                let current = if bounded {
+                    claude_request_census::decode_bounded_index(&bytes).unwrap()
+                } else {
+                    lenient_decode::read_file(File::open(&path).unwrap(), "cas", "unattributed")
+                        .unwrap()
+                };
+                for mut index in [loaded.clone(), current] {
+                    assert_sibling(&index);
+                    assert!(index.claude_history_move_not_full);
+                    assert!(!index.claude_history_move_released);
+                    if damage_cutoff {
+                        assert_eq!(index.claude_history_cutoff_unix_seconds, None);
+                        assert!(!index.claude_history_gate_loaded);
+                    } else {
+                        assert_eq!(index.claude_history_cutoff_unix_seconds, Some(1));
+                        assert!(index.claude_history_gate_loaded);
+                    }
+                    index.note_claude_history_cutoff(PriorHistory::Here, false, false);
+                    assert!(index.claude_history_gate_loaded);
+                    assert!(index.claude_history_cutoff_unix_seconds.is_some());
+                    assert_eq!(index.claude_no_list_policy, NoListPolicy::HoldMoveNotFull);
+                }
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(corrupt_count(scratch.as_ref()), 0);
+                let mut working = loaded;
+                if bounded {
+                    working.save_with_read_limit(&path, 1024 * 1024).unwrap();
+                } else {
+                    working.save(&path).unwrap();
+                }
+                let mut restarted = ScanIndex::load(&path).unwrap();
+                assert_sibling(&restarted);
+                assert_eq!(restarted.generation, working.generation);
+                restarted.note_claude_history_cutoff(PriorHistory::Here, false, false);
+                assert_eq!(
+                    restarted.claude_no_list_policy,
+                    NoListPolicy::HoldMoveNotFull
+                );
+                restarted.note_claude_history_cutoff(PriorHistory::Here, true, false);
+                assert_eq!(restarted.claude_no_list_policy, NoListPolicy::Pace);
+                assert!(!restarted.claude_history_move_not_full);
+                assert!(restarted.claude_history_move_released);
+                assert_eq!(corrupt_count(scratch.as_ref()), 0);
             }
         }
     }

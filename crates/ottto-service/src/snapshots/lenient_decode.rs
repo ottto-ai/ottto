@@ -285,6 +285,10 @@ impl Serialize for ScanIndex {
             Option::is_none
         );
         field!(held quarantined_snapshot_fingerprints);
+        field!(claude_history_cutoff_unix_seconds, Option::is_none);
+        field!(claude_history_gate_loaded, std::ops::Not::not);
+        field!(claude_history_move_not_full, std::ops::Not::not);
+        field!(claude_history_move_released, std::ops::Not::not);
         map.end()
     }
 }
@@ -358,6 +362,10 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_snapshot_fingerprint_ledger_version",
     "legacy_settlement_reconcile_after_fingerprint",
     "quarantined_snapshot_fingerprints",
+    "claude_history_cutoff_unix_seconds",
+    "claude_history_gate_loaded",
+    "claude_history_move_not_full",
+    "claude_history_move_released",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -764,9 +772,9 @@ fn read_inner<R: BufRead + Seek>(
     let result = decoder.index(false);
     if matches!(result, Err(Error::HoldBudget)) {
         let fallback = if stage == "load" {
-            // Landing dependency: #712 makes this existing whole-index rebuild
-            // classify prior files as history, never freshly discovered usage.
-            "prior_history_gated_rebuild_requires_712"
+            // The load origin feeds the history cutoff before scanning; prior
+            // files are held or paced through the history gate.
+            "prior_history_gated_rebuild"
         } else {
             "cas_refusal_without_rewrite"
         };
@@ -776,6 +784,9 @@ fn read_inner<R: BufRead + Seek>(
     }
     let mut index = result?;
     controls(&index, source)?;
+    // Normalize on every successful read, including both CAS readers. A bad
+    // cutoff clears the loaded marker so prior-history signals re-derive it.
+    index.drop_malformed_claude_history_cutoff();
     index.decode_holds = decoder.holds;
     index.decode_holds.rebuild_scopes();
     let semantic = index.drop_invalid_index_records();
@@ -872,6 +883,25 @@ impl<R: BufRead + Seek> Decoder<R> {
             .map_err(|_| Error::Refused("record type"));
         self.reader.seek(SeekFrom::Start(span.start + span.len))?;
         result
+    }
+    // History scalars repair only type damage, without allocating a Value for
+    // an arbitrarily large malformed record. Seek/I/O errors still propagate.
+    fn history_scalar<T: serde::de::DeserializeOwned>(
+        &mut self,
+        span: Span,
+        malformed: T,
+    ) -> std::result::Result<T, Error> {
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        let result = serde_json::from_reader((&mut self.reader).take(span.len));
+        self.reader.seek(SeekFrom::Start(span.start + span.len))?;
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) if error.is_io() => Err(Error::Io(std::io::Error::new(
+                error.io_error_kind().unwrap_or(std::io::ErrorKind::Other),
+                error,
+            ))),
+            Err(_) => Ok(malformed),
+        }
     }
     fn check_hold_bytes(&self, bytes: u64) -> std::result::Result<(), Error> {
         if self
@@ -1386,6 +1416,22 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "quarantined_snapshot_fingerprints" => {
                             index.quarantined_snapshot_fingerprints = self.quarantines(value)?
+                        }
+                        "claude_history_cutoff_unix_seconds" => {
+                            index.claude_history_cutoff_unix_seconds =
+                                self.history_scalar(value, Some(MALFORMED_CLAUDE_HISTORY_CUTOFF))?;
+                        }
+                        "claude_history_gate_loaded" => {
+                            index.claude_history_gate_loaded = self.history_scalar(value, false)?;
+                        }
+                        "claude_history_move_not_full" => {
+                            // A damaged cross-destination hold cannot release history.
+                            index.claude_history_move_not_full =
+                                self.history_scalar(value, true)?;
+                        }
+                        "claude_history_move_released" => {
+                            index.claude_history_move_released =
+                                self.history_scalar(value, false)?;
                         }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }
