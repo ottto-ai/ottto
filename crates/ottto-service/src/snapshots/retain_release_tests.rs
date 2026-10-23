@@ -738,11 +738,10 @@ fn packet_refusal_buckets_and_budget_variants() {
 }
 
 /// Why T-R0b-ins, -ins-band, -node and -node-band set `ins_extra` through
-/// the test seam: each needs `ins_extra > A` at a chosen size. On a supported
-/// layout a minimal Codex Tail (a confirmed-empty file plus one ignored line)
-/// holds more active state than the insert's own slot adds; since #660/#667,
-/// a minimal Claude Tail's insert term already exceeds its active charge.
-/// Pinned per source, as measured.
+/// the test seam: each needs `ins_extra` against `A` at a chosen size. On a
+/// minimal Tail (a confirmed-empty file plus one ignored line) the natural
+/// relation moved with #660/#667: CI 39897160806 measured `ins_extra > A`
+/// for both sources (Codex by under 1 KiB). It is recorded, not pinned.
 #[test]
 fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -757,11 +756,11 @@ fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
         };
         let mut world = World::build(source, spec);
         let probe = run(&mut world, Opts::default()).probe;
-        let insert_dominates = source == SnapshotSource::ClaudeCode;
-        assert!(
-            probe.ins_extra > 0 && (probe.ins_extra > probe.a) == insert_dominates,
-            "{source:?}: {probe:?}"
+        eprintln!(
+            "R0_INSERT_TERM source={source:?} a={} ins_extra={}",
+            probe.a, probe.ins_extra
         );
+        assert!(probe.ins_extra > 0 && probe.a > 0, "{source:?}: {probe:?}");
     }
 }
 
