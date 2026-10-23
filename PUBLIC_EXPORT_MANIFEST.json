@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 837,
-  "content_sha256": "2b288ab072f66c74b91ea3eeffbcb7afba7528d68fbd0ffb6db06b95bebb57be",
+  "content_sha256": "c2468c7608bbdd9cd8c2b2d6df6b322cbe4309c166f37f86b64a709bd90edcab",
   "files": [
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "74054266a0b57e4fe5d417a153ff4b1b55efb3514c340cfe032465e773724aff",
-      "size_bytes": 3445253
+      "sha256": "537e07dfae76ec1b9ca2913b343b3b61c7c40f75f048de67c8bdc3c2d4623544",
+      "size_bytes": 3445248
     },
     {
       "executable": false,
@@ -1763,8 +1763,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "8f4a11a10c2f4ac1d39d404fcdca1f7b31bda0dd7ce31a61a7e1ba4d522a3bad",
-      "size_bytes": 282509
+      "sha256": "3e4040ed6a6b09ffe132a16047e0de60c56fa8edfa18028b3f8cd9af2cd82ef0",
+      "size_bytes": 284464
     },
     {
       "executable": false,

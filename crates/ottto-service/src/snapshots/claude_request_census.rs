@@ -1284,6 +1284,52 @@ impl ClaudeRequestCensus {
             // census record budget. Worst key JSON is <280 KiB; never a fake
             // zero charge against the record budget.
             debug_assert!(marker.keys.len() <= MAX_RECLAIMED_KEYS);
+            // Reconstruction is best effort before peer admission: a retired
+            // reparse declines its own extra safety before peers may fund only
+            // its main-equivalent core. Never recycle peers into reconstruction.
+            if record.retired.is_some()
+                && (hashes > MAX_CLAUDE_REQUEST_CENSUS_HASHES
+                    || bytes > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES)
+            {
+                let before = entry_serialized_bytes(&key, &record);
+                let original = record.extra.safety_hashes.take();
+                let original_len = original.as_ref().map_or(0, |hashes| hashes.len());
+                let safety = record.extra.safety.get_or_insert_with(Default::default);
+                safety.sc = 1;
+                safety.sr = true;
+                let base = entry_serialized_bytes(&key, &record);
+                let free_bytes = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES.saturating_sub(
+                    bytes
+                        .saturating_sub(before)
+                        .saturating_add(base)
+                        .saturating_add(8),
+                );
+                let keep = original_len
+                    .min(MAX_CLAUDE_REQUEST_CENSUS_HASHES.saturating_sub(self.hash_total))
+                    .min(free_bytes.saturating_mul(3) / 32);
+                record.extra.safety_hashes = original
+                    .as_ref()
+                    .and_then(|hashes| hashes.reclaim(original_len.saturating_sub(keep)))
+                    .map(Box::new);
+                if bytes
+                    .saturating_sub(before)
+                    .saturating_add(entry_serialized_bytes(&key, &record))
+                    > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
+                {
+                    record.extra.safety_hashes = None;
+                    record.extra.safety = None;
+                }
+                let retained = record
+                    .extra
+                    .safety_hashes
+                    .as_ref()
+                    .map_or(0, |hashes| hashes.len());
+                marker.note(&key, original_len.saturating_sub(retained), record.window);
+                hashes = self.hash_total.saturating_add(record.hash_count());
+                bytes = bytes
+                    .saturating_sub(before)
+                    .saturating_add(entry_serialized_bytes(&key, &record));
+            }
             // Byte-pressure order: retired x/sb by retirement age, then
             // active x by window. Only safety data changes; core hashes/facts
             // and main admission bytes are immutable throughout this plan.
@@ -1302,21 +1348,6 @@ impl ClaudeRequestCensus {
                 hashes = hashes.saturating_sub(lost);
                 marker.note(retired_key, lost, record.window);
                 plan.insert(retired_key.clone(), replacement);
-            }
-            // Incoming retired evidence is also retired-first.
-            if bytes > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES && record.retired.is_some() {
-                let before = entry_serialized_bytes(&key, &record);
-                let lost = record
-                    .extra
-                    .safety_hashes
-                    .take()
-                    .map_or(0, |hashes| hashes.len());
-                record.extra.safety = None;
-                bytes = bytes
-                    .saturating_sub(before)
-                    .saturating_add(entry_serialized_bytes(&key, &record));
-                hashes = hashes.saturating_sub(lost);
-                marker.note(&key, lost, record.window);
             }
             let incoming_order = (record.window, key.clone());
             let incoming_active = record.retired.is_none() && record.extra.safety.is_some();
@@ -1364,49 +1395,6 @@ impl ClaudeRequestCensus {
                     .saturating_add(entry_serialized_bytes(&key, &record));
                 marker.note(&key, 0, record.window);
                 marker.metadata_active = marker.metadata_active.saturating_add(1);
-            }
-            if record.retired.is_some()
-                && (hashes > MAX_CLAUDE_REQUEST_CENSUS_HASHES
-                    || bytes > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES)
-            {
-                let before = entry_serialized_bytes(&key, &record);
-                let original = record.extra.safety_hashes.take();
-                let original_len = original.as_ref().map_or(0, |hashes| hashes.len());
-                let safety = record.extra.safety.get_or_insert_with(Default::default);
-                safety.sc = 1;
-                safety.sr = true;
-                let base = entry_serialized_bytes(&key, &record);
-                let free_bytes = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES.saturating_sub(
-                    bytes
-                        .saturating_sub(before)
-                        .saturating_add(base)
-                        .saturating_add(8),
-                );
-                let keep = original_len
-                    .min(MAX_CLAUDE_REQUEST_CENSUS_HASHES.saturating_sub(self.hash_total))
-                    .min(free_bytes.saturating_mul(3) / 32);
-                record.extra.safety_hashes = original
-                    .as_ref()
-                    .and_then(|hashes| hashes.reclaim(original_len.saturating_sub(keep)))
-                    .map(Box::new);
-                if bytes
-                    .saturating_sub(before)
-                    .saturating_add(entry_serialized_bytes(&key, &record))
-                    > MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES
-                {
-                    record.extra.safety_hashes = None;
-                    record.extra.safety = None;
-                }
-                let retained = record
-                    .extra
-                    .safety_hashes
-                    .as_ref()
-                    .map_or(0, |hashes| hashes.len());
-                marker.note(&key, original_len.saturating_sub(retained), record.window);
-                hashes = self.hash_total.saturating_add(record.hash_count());
-                bytes = bytes
-                    .saturating_sub(before)
-                    .saturating_add(entry_serialized_bytes(&key, &record));
             }
             // A retired reparse has already declined its own new safety if
             // necessary. Peer reclaim here can fund only its MONEY core metadata,
@@ -1898,7 +1886,12 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
                 SafetyIncomplete::default()
             }
         });
-    if reader.ambiguous_census || reader.duplicate_census || reader.duplicate_shadow {
+    if reader.ambiguous_census
+        || reader.duplicate_census
+        || reader.duplicate_shadow
+        || index.claude_request_census.decode_lost
+        || !index.claude_request_census.ambiguous.is_empty()
+    {
         index.claude_request_census.safety_incomplete.overflow = true;
     }
     Ok(index)
@@ -2016,7 +2009,12 @@ impl<R: std::io::Read> CensusRead<R> {
                     SafetyIncomplete::default()
                 }
             });
-        if self.ambiguous_census || self.duplicate_census || self.duplicate_shadow {
+        if self.ambiguous_census
+            || self.duplicate_census
+            || self.duplicate_shadow
+            || index.claude_request_census.decode_lost
+            || !index.claude_request_census.ambiguous.is_empty()
+        {
             index.claude_request_census.safety_incomplete.overflow = true;
         }
         Ok(index)
@@ -2137,6 +2135,9 @@ impl<R: std::io::Read> CensusRead<R> {
         }
         if overflow {
             return Ok(b"null".to_vec());
+        }
+        if !phase_b::enabled() {
+            return Ok(bytes);
         }
         // Parsing is isolated from the enclosing index, including numeric
         // conversion and wrong-token errors. Only canonical, finite tokens
@@ -4969,6 +4970,10 @@ pub(crate) fn seed_pipeline_safety_cases_for_test(index: &mut ScanIndex) {
         .keys()
         .cloned()
         .collect::<Vec<_>>();
+    assert!(
+        keys.len() >= 5,
+        "pipeline corpus must cover all five safety cases"
+    );
     for (number, key) in keys.into_iter().enumerate() {
         let Some(mut record) = index.claude_request_census.take_safety(&key) else {
             continue;
@@ -4977,7 +4982,7 @@ pub(crate) fn seed_pipeline_safety_cases_for_test(index: &mut ScanIndex) {
         safety.sc = 1;
         safety.oc = 1;
         safety.ac = true;
-        match number % 4 {
+        match number % 5 {
             0 => record.retire_transcript_preserving_safety(),
             1 => {
                 record.shape = ClaudeRequestCensusShape::Lossy;
@@ -4987,9 +4992,12 @@ pub(crate) fn seed_pipeline_safety_cases_for_test(index: &mut ScanIndex) {
                 record.twin = true;
                 record.extra.safety.as_mut().unwrap().oc = 0;
             }
-            _ => {
+            3 => {
                 record.extra.safety.as_mut().unwrap().sr = true;
             }
+            _ => {
+                record.extra.safety.as_mut().unwrap().sc = 2;
+            } // malformed persisted capability, rejected by real decoder
         }
         assert_eq!(
             index.claude_request_census.insert(key, record),
@@ -5465,6 +5473,44 @@ mod phase_b_tests {
     }
 
     #[test]
+    fn off_decode_preserves_retained_safety_and_refuses_actual_decode_loss() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let mut index = index_with(vec![(A, record('a', vec![1]))]);
+        prepare_safety_checkpoint(&mut index);
+        let raw = serde_json::to_vec(&index).unwrap();
+        let broken = String::from_utf8(raw.clone()).unwrap().replacen(
+            "\"claude_request_census\":{",
+            "\"claude_request_census\":{\"broken\":false,",
+            1,
+        );
+        for enabled in [false, true] {
+            let _mode = phase_b::ShadowMode::set(enabled);
+            for loaded in [
+                decode_index(raw.as_slice()).unwrap(),
+                decode_bounded_index(&raw).unwrap(),
+            ] {
+                assert!(loaded.claude_request_census.safety.is_some());
+                assert!(!loaded.claude_request_census.safety_incomplete.incomplete());
+                assert!(
+                    loaded
+                        .claude_request_census
+                        .safety_get(A)
+                        .unwrap()
+                        .safety
+                        .unwrap()
+                        .ac
+                );
+            }
+            for loaded in [
+                decode_index(broken.as_bytes()).unwrap(),
+                decode_bounded_index(broken.as_bytes()).unwrap(),
+            ] {
+                assert!(loaded.claude_request_census.get(A).is_some());
+                assert!(loaded.claude_request_census.safety_incomplete.incomplete());
+            }
+        }
+    }
+    #[test]
     fn malformed_present_shadow_never_receives_the_legacy_open_default() {
         let _mode = phase_b::ShadowMode::set(true);
         let legacy = index_with(vec![(A, record('a', vec![1]).without_safety_for_test())]);
@@ -5557,7 +5603,6 @@ mod phase_b_tests {
         let mut index = index_with(vec![(A, record('a', vec![1])), (B, record('b', vec![2]))]);
         record_claude_request_census(
             &mut index,
-            &[],
             ClaudeRequestCensusParse {
                 path: Path::new(A),
                 index_key: A,
@@ -5574,6 +5619,7 @@ mod phase_b_tests {
                 opened_birth: None,
                 modified_unix_seconds: 1,
             },
+            &[],
         );
         assert!(
             index
@@ -6275,6 +6321,12 @@ mod phase_b_tests {
                 control.bytes(),
                 "independent main admission bytes retired={retired}"
             );
+            if retired {
+                assert!(
+                    actual.duplicate_safety_hashes_for_test(path).is_empty(),
+                    "peers must not fund retired reconstruction under byte pressure"
+                );
+            }
             assert!(actual.serialized_total <= MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES);
             assert_eq!(actual.serialized_total, actual.recounted_for_test().1);
             assert_eq!(

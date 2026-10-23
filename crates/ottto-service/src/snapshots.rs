@@ -27132,7 +27132,7 @@ fn parse_jsonl_file(
 
 #[derive(Debug)]
 struct ParsedJsonlFile {
-    /// Existing descriptor revalidation: an allowed growing prefix is not acquired EOF.
+    /// Descriptor revalidation: allowed growth belongs to the next bound revision.
     census_source_unchanged: bool,
     snapshots: Vec<SnapshotItem>,
     report: JsonlReadReport,
