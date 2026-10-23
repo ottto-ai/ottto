@@ -1286,6 +1286,9 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
         (t1 + 13 * 3_600, true),
         (t1 + DAY - 1, true),
     ] {
+        // Each traversal finds the conflict's ordinary timer due again, as
+        // every eligible traversal did for ~12-18 h of the cooldown.
+        pipeline.make_conflict_retry_due(&fingerprint);
         let (quiet, parsed, bytes) = pipeline.measured_cycle(now, restart);
         assert_eq!(parsed, 0, "no reason-driven re-read at +{}s", now - t1);
         assert_eq!(bytes, 0, "no transcript bytes at +{}s", now - t1);
