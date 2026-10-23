@@ -4424,7 +4424,16 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
     }
     ledger.metadata_cursor = cursor.unwrap_or_default();
     if obsolete.is_empty() {
-        return MoneyReceipt::Ready;
+        // ACK settlement may have queued a receipt after the prior finish's
+        // last await. Drain it BEFORE adoption reads the custody barrier. A
+        // completed diagnostic memo alone never pauses the next scan.
+        let receipt = if ledger.unacknowledged_custody() {
+            store::checkpoint_receipt(support, &mut ledger)
+        } else {
+            MoneyReceipt::Ready
+        };
+        ledger.metadata_checkpoint = receipt == MoneyReceipt::Pending;
+        return receipt;
     }
     for key in obsolete {
         ledger.remove(&key);
@@ -4760,6 +4769,53 @@ fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
 mod scheduling_reconciliation_tests {
     use super::super::claude_request_census::ClaudeTelemetryTailState;
     use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn preparation_drains_prior_custody_receipt_without_pausing_for_diagnostic_memos() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-adoption-prior-receipt");
+        let _live = LiveForTest::new(&scratch);
+        store::reload_for_test(&scratch).unwrap();
+        store::with_ledger_for_test(&scratch, |ledger| {
+            assert!(store::checkpoint_for_test(&scratch, ledger));
+            assert!(ledger.put_money(
+                "due:sentinel".into(),
+                ClaudeRequestCensusRecord::money_debt([7; 32], 0)
+            ));
+            assert!(!store::checkpoint(&scratch, ledger));
+            // This memo arrives after the custody snapshot. It must remain
+            // dirty without invalidating the real receipt or pausing adoption.
+            ledger.insert(
+                "fam:diagnostic".into(),
+                ClaudeRequestCensusRecord::money_debt([8; 32], 0),
+            );
+        })
+        .unwrap();
+        store::flush();
+        assert!(checkpoint_pending(&scratch));
+        let index = ScanIndex::default();
+        assert_eq!(reclaim_metadata(&scratch, &index), MoneyReceipt::Ready);
+        assert!(!adoption_paused(&scratch, &index));
+        assert!(!checkpoint_pending(&scratch));
+        store::with_ledger_for_test(&scratch, |ledger| {
+            assert!(
+                ledger.dirty_shards() > 0,
+                "diagnostic publication is still pending"
+            );
+            assert_eq!(
+                ledger.get("due:sentinel").unwrap().money_revision(),
+                [7; 32]
+            );
+        })
+        .unwrap();
+        assert_eq!(
+            store::load_for_test(&scratch)
+                .get("due:sentinel")
+                .unwrap()
+                .money_revision(),
+            [7; 32]
+        );
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
