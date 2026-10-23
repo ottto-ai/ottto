@@ -25,9 +25,9 @@ use crate::snapshots::{
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
     SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -46,6 +46,7 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use zeroize::Zeroize;
 
 mod continuation;
+mod reason_reoffer;
 mod rejection_log;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
@@ -82,6 +83,20 @@ const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+// A short, explicitly transient batch failure is resent in place rather than
+// abandoning the page and marking the bounded sweep unsettled: a 429/503 whose
+// Retry-After is at most 5 s (cursor allocation and shared-lock timeouts send
+// 1 s) or a fast 500/502. The wait holds the sync lock, so each source page
+// gets at most two resends and 10 s of waiting, shared by its cache-head
+// bootstrap stages and its main upload. A failure that took 15 s or longer is
+// overload and is never resent; the identity deferral, recognized by its code,
+// keeps its backoff whatever its Retry-After.
+const SNAPSHOT_INPLACE_RETRY_LIMIT: usize = 2;
+const SNAPSHOT_INPLACE_RETRY_MAX_WAIT: Duration = Duration::from_secs(5);
+const SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(10);
+const SNAPSHOT_INPLACE_RETRY_FAST_FAILURE: Duration = Duration::from_secs(15);
+const SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT: Duration = Duration::from_secs(2);
+const SNAPSHOT_INPLACE_RETRY_MIN_WAIT: Duration = Duration::from_millis(250);
 // A pre-ledger checkpoint with ambiguous settlement is re-entered through the
 // existing entity-ACK upload machine. Arm at most one normal 50-entity page per
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
@@ -98,67 +113,101 @@ pub(crate) fn status_test_scan_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Bootstrap only through existing ordinary authority followed by an exact
-/// CAS repeat. Both settlements share the normal atomic ACK progress seam.
+/// Bootstrap a fresh source page's cache heads under its own in-place resend
+/// budget.
+#[cfg(test)]
 fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     ordinary_bootstrap: bool,
+    upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    bootstrap_cache_heads_with_budget(
+        probes,
+        poison_scope,
+        progress,
+        ordinary_bootstrap,
+        &mut InplaceRetryBudget::default(),
+        upload,
+        persist,
+    )
+}
+
+/// Bootstrap only through existing ordinary authority followed by an exact
+/// CAS repeat. Both settlements share the normal atomic ACK progress seam and
+/// the source page's in-place resend budget.
+fn bootstrap_cache_heads_with_budget(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    ordinary_bootstrap: bool,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
         bool,
     ) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     mut persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 ) -> Result<usize> {
-    let mut deferred = 0usize;
-    let stages: &[bool] = if ordinary_bootstrap {
-        &[false, true]
-    } else {
-        &[true]
-    };
-    for &enforce_head_cas in stages {
-        // A prior ordinary body ACK has no head proof. Force the exact probe
-        // even when delivery of these bytes was previously acknowledged.
-        if enforce_head_cas {
-            for probe in probes {
-                progress
-                    .accepted_fingerprints
-                    .remove(&probe.snapshot_fingerprint);
-                progress
-                    .accepted_body_witnesses
-                    .remove(&probe.snapshot_fingerprint);
+    let leased = progress.active_reason_reoffers.clone();
+    let mut shed = false;
+    let result = (|| -> Result<usize> {
+        let mut deferred = 0usize;
+        let stages: &[bool] = if ordinary_bootstrap {
+            &[false, true]
+        } else {
+            &[true]
+        };
+        for &enforce_head_cas in stages {
+            // A prior ordinary body ACK has no head proof. Force the exact probe
+            // even when delivery of these bytes was previously acknowledged.
+            if enforce_head_cas {
+                for probe in probes {
+                    progress
+                        .accepted_fingerprints
+                        .remove(&probe.snapshot_fingerprint);
+                    progress
+                        .accepted_body_witnesses
+                        .remove(&probe.snapshot_fingerprint);
+                }
+            }
+            let mut accepted = 0;
+            let outcome = upload_resumable_batches_with_body_witness_partitioned(
+                probes,
+                poison_scope,
+                progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |item| Some(item.source_session_id.as_str()),
+                |_| false,
+                inplace_retry,
+                |items| upload(items, enforce_head_cas),
+                |progress| persist(progress),
+            )?;
+            match outcome {
+                ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
+                // The partitioned uploader persisted each conflicting probe's exact
+                // body quarantine. Carry that hold into the normal upload rather
+                // than discarding every unrelated file's progress.
+                ResumableUploadResult::Deferred { count } => {
+                    deferred = deferred.saturating_add(count);
+                }
+                outcome => {
+                    shed = matches!(outcome, ResumableUploadResult::Shed { .. });
+                    return Err(anyhow::Error::new(SnapshotAckRejected {
+                        reason: "cache head probe did not settle exact predecessor evidence",
+                    }));
+                }
             }
         }
-        let mut accepted = 0;
-        let outcome = upload_resumable_batches_with_body_witness_partitioned(
-            probes,
-            poison_scope,
-            progress,
-            &mut accepted,
-            |item| item.snapshot_fingerprint.as_str(),
-            snapshot_upload_body_witness,
-            |item| Some(item.source_session_id.as_str()),
-            |_| false,
-            |items| upload(items, enforce_head_cas),
-            |progress| persist(progress),
-        )?;
-        match outcome {
-            ResumableUploadResult::Completed | ResumableUploadResult::Rejected { .. } => {}
-            // The partitioned uploader persisted each conflicting probe's exact
-            // body quarantine. Carry that hold into the normal upload rather
-            // than discarding every unrelated file's progress.
-            ResumableUploadResult::Deferred { count } => {
-                deferred = deferred.saturating_add(count);
-            }
-            _ => {
-                return Err(anyhow::Error::new(SnapshotAckRejected {
-                    reason: "cache head probe did not settle exact predecessor evidence",
-                }));
-            }
-        }
+        Ok(deferred)
+    })();
+    if result.is_err() {
+        progress.finish_reason_reoffers(&leased, shed, poison_scope);
     }
-    Ok(deferred)
+    result
 }
 
 fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
@@ -173,6 +222,9 @@ fn cache_head_probe(item: &SnapshotItem) -> SnapshotItem {
 fn cache_head_probe_held(progress: &SnapshotUploadProgress, probe: &SnapshotItem) -> bool {
     let fingerprint = &probe.snapshot_fingerprint;
     let witness = snapshot_upload_body_witness(probe);
+    if progress.active_reason_reoffers.get(fingerprint) == Some(&witness) {
+        return false;
+    }
     progress
         .permanent_rejections
         .get(fingerprint)
@@ -238,6 +290,36 @@ fn with_bootstrap_deferred(
         },
         other => other,
     }
+}
+
+/// Carry a newer refused-body conflict even when the frozen upload delta is
+/// empty. New conflicts were already counted by bootstrap/main upload; this
+/// adds only older, untransmitted debt from the current source universe.
+fn with_retained_refusal_conflicts(
+    result: ResumableUploadResult,
+    index: &ScanIndex,
+    progress: &SnapshotUploadProgress,
+) -> ResumableUploadResult {
+    let retained = index
+        .current_snapshot_fingerprint_refs()
+        .filter(|fingerprint| {
+            !progress.attempted_reason_reoffers.contains(*fingerprint)
+                && progress
+                    .permanent_rejections
+                    .get(*fingerprint)
+                    .is_some_and(|refusal| {
+                        progress
+                            .quarantined_fingerprints
+                            .get(*fingerprint)
+                            .is_some_and(|record| {
+                                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                    && record.upload_body_witness.as_deref()
+                                        == Some(refusal.body_witness.as_str())
+                            })
+                    })
+        })
+        .collect::<BTreeSet<_>>();
+    with_bootstrap_deferred(result, retained.len())
 }
 
 // Local index projection producer revision; independent of semantic/wire identity.
@@ -310,7 +392,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled();
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -463,7 +545,11 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
@@ -730,7 +816,18 @@ struct PendingCacheHeadFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PermanentSnapshotRejection {
     body_witness: String,
+    /// Old enum vocabulary only: `original_pair_candidate_unproved` is
+    /// written as `other`, so an older daemon keeps reading and suppressing it.
     reason: crate::upload_receipts::RejectedUsageReason,
+    /// Optional daily/one-time re-offer schedule for this exact body. Older
+    /// daemons ignore it; a malformed value disables only this record's retry.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        serialize_with = "reason_reoffer::serialize",
+        deserialize_with = "reason_reoffer::deserialize"
+    )]
+    reoffer: Option<reason_reoffer::RefusalReoffer>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,6 +868,15 @@ struct SnapshotUploadProgress {
     /// clears it; this set only bypasses suppression for the current request.
     #[serde(skip)]
     active_quarantine_retries: BTreeSet<String>,
+    /// Runtime leases for refusals re-offered this cycle: fingerprint -> the
+    /// exact refused body witness. Only that body passes permanent
+    /// suppression, once per logical offer; the refusal stays durable.
+    #[serde(skip)]
+    active_reason_reoffers: BTreeMap<String, String>,
+    #[serde(skip)]
+    attempted_reason_reoffers: BTreeSet<String>,
+    #[serde(skip)]
+    reason_reoffer_counts: reason_reoffer::ReofferCounts,
 }
 
 impl SnapshotUploadProgress {
@@ -792,6 +898,9 @@ impl SnapshotUploadProgress {
             permanent_rejections: BTreeMap::new(),
             active_quarantine_witness: Some(active_quarantine_witness),
             active_quarantine_retries: BTreeSet::new(),
+            active_reason_reoffers: BTreeMap::new(),
+            attempted_reason_reoffers: BTreeSet::new(),
+            reason_reoffer_counts: reason_reoffer::ReofferCounts::default(),
         }
     }
 
@@ -893,6 +1002,7 @@ impl SnapshotUploadProgress {
         };
         progress.active_quarantine_witness = Some(active_quarantine_witness);
         progress.active_quarantine_retries.clear();
+        progress.active_reason_reoffers.clear();
         Ok(progress)
     }
 
@@ -900,13 +1010,43 @@ impl SnapshotUploadProgress {
         &mut self,
         index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
     ) -> bool {
+        self.prepare_quarantine_and_reason_retries(index_quarantine, None)
+    }
+
+    /// Select this cycle's ordinary quarantine retries and due refusal
+    /// re-offers from one shared per-cycle budget, oldest deadline first.
+    /// A selected re-offer reserves its next 24 h deadline here; the caller
+    /// saves that claim before any scan or upload uses the lease.
+    fn prepare_quarantine_and_reason_retries(
+        &mut self,
+        index_quarantine: &BTreeMap<String, SnapshotQuarantineRecord>,
+        reoffer: Option<&reason_reoffer::Scope<'_>>,
+    ) -> bool {
         self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
+        self.attempted_reason_reoffers.clear();
+        self.reason_reoffer_counts = reason_reoffer::ReofferCounts::default();
         // The upload ledger is saved immediately after an exact ACK, before
         // the index can retire its older quarantine. On crash/restart that ACK
         // is the stronger fact and must not be overwritten by restoring the
         // stale index-owned obligation.
         self.quarantined_fingerprints
             .retain(|fingerprint, _| !self.accepted_fingerprints.contains(fingerprint));
+        let newer_retryable_refusals = self
+            .quarantined_fingerprints
+            .iter()
+            .filter(|(fingerprint, record)| {
+                record.disposition == SnapshotQuarantineDisposition::RetryPending
+                    && self
+                        .permanent_rejections
+                        .get(*fingerprint)
+                        .is_some_and(|refusal| {
+                            record.upload_body_witness.as_deref()
+                                == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, _)| fingerprint.clone())
+            .collect::<BTreeSet<_>>();
         for (fingerprint, record) in index_quarantine {
             if !self.accepted_fingerprints.contains(fingerprint) {
                 // The durable index claims a bounded admission re-offer before
@@ -930,6 +1070,12 @@ impl SnapshotUploadProgress {
         // The server-permanent exact-body fact dominates an older index timer.
         // Keep the index-facing disposition truthful as well as suppressing I/O.
         for (fingerprint, record) in &mut self.quarantined_fingerprints {
+            // A conflict recorded alongside the retained refusal is newer:
+            // permanent refusal recording itself always writes terminal. Keep
+            // that retry debt while the old refusal still suppresses early I/O.
+            if newer_retryable_refusals.contains(fingerprint) {
+                continue;
+            }
             if self
                 .permanent_rejections
                 .get(fingerprint)
@@ -947,7 +1093,7 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
-        let retry = self
+        let mut candidates = self
             .quarantined_fingerprints
             .iter()
             .filter(|(fingerprint, record)| {
@@ -968,11 +1114,64 @@ impl SnapshotUploadProgress {
                     fingerprint.clone(),
                 )
             })
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
-            .map(|(_, _, fingerprint)| fingerprint)
             .collect::<BTreeSet<_>>();
+        let mut reoffer_changed = false;
+        let mut due_reoffers = BTreeMap::new();
+        if let Some(scope) = reoffer {
+            reoffer_changed = self.collect_due_reason_reoffers(scope, &mut due_reoffers);
+            // A due re-offer has the same rank as a due ordinary retry under
+            // the active witness: oldest deadline first, fingerprint ties.
+            // A fingerprint owns one shared slot even if a crash left an
+            // ordinary retry for a different body in the progress ledger.
+            candidates.retain(|(_, _, fingerprint)| !due_reoffers.contains_key(fingerprint));
+            candidates.extend(
+                due_reoffers
+                    .iter()
+                    .map(|(fingerprint, (due, _))| (1u8, *due, fingerprint.clone())),
+            );
+        }
+        let reoffer_now = reoffer.map_or(0, |scope| scope.now);
+        let mut retry = BTreeSet::new();
+        for (_, _, fingerprint) in candidates {
+            if retry.len() + self.active_reason_reoffers.len()
+                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+            {
+                break;
+            }
+            if due_reoffers.contains_key(&fingerprint) {
+                let legacy = self
+                    .permanent_rejections
+                    .get(&fingerprint)
+                    .is_some_and(|refusal| {
+                        matches!(
+                            refusal.reoffer,
+                            None | Some(reason_reoffer::RefusalReoffer::LegacyOther { .. })
+                        )
+                    });
+                // The one-time migration gets at most half the shared slots;
+                // keep walking so ordinary retries can use their share.
+                if legacy
+                    && self.reason_reoffer_counts.legacy_selected
+                        >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE / 2
+                {
+                    continue;
+                }
+            }
+            match due_reoffers.remove(&fingerprint) {
+                Some((_, body_witness)) => {
+                    self.reserve_reason_reoffer(&fingerprint, body_witness, reoffer_now);
+                    reoffer_changed = true;
+                }
+                None => {
+                    retry.insert(fingerprint);
+                }
+            }
+        }
+        self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
+        let active = self
+            .active_quarantine_witness
+            .as_ref()
+            .expect("upload progress always has an active quarantine witness");
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
@@ -991,7 +1190,205 @@ impl SnapshotUploadProgress {
             );
         }
         self.active_quarantine_retries = retry;
-        !self.active_quarantine_retries.is_empty()
+        !self.active_quarantine_retries.is_empty() || reoffer_changed
+    }
+
+    /// Due, exactly bound refusal re-offers: fingerprint -> (deadline, body).
+    /// Returns whether a schedule was changed (re-clamped by the clock bound).
+    fn collect_due_reason_reoffers(
+        &mut self,
+        scope: &reason_reoffer::Scope<'_>,
+        due: &mut BTreeMap<String, (u64, String)>,
+    ) -> bool {
+        use reason_reoffer::RefusalReoffer;
+        let index = scope.index;
+        // A missing or quarantined index cannot prove current membership.
+        if index.generation == 0 || self.permanent_rejections.is_empty() {
+            return false;
+        }
+        let current = index
+            .current_snapshot_fingerprint_refs()
+            .collect::<BTreeSet<_>>();
+        let latest = reason_reoffer::latest_valid_deadline(scope.now);
+        let counts = &mut self.reason_reoffer_counts;
+        let mut changed = false;
+        for (fingerprint, refusal) in &mut self.permanent_rejections {
+            // Known reasons are never re-offered; only the old `other`
+            // vocabulary can carry this reason or a legacy record of it.
+            if refusal.reason != crate::upload_receipts::RejectedUsageReason::Other {
+                continue;
+            }
+            let retry_after = match refusal.reoffer {
+                None => 0,
+                Some(RefusalReoffer::Classified) => continue,
+                Some(reoffer) => reoffer.retry_after().unwrap_or_default(),
+            };
+            if retry_after > latest {
+                // A wall-clock rollback must not consume the one-time pass or
+                // permanently disable daily offers. Keep suppression this cycle
+                // and durably restart the conservative 24 h cooldown.
+                refusal.reoffer = refusal.reoffer.map(|reoffer| {
+                    reoffer.with_retry_after(reason_reoffer::next_offer_after(scope.now))
+                });
+                counts.clock_bound_skipped += 1;
+                changed = true;
+                continue;
+            }
+            let bound = index
+                .quarantined_snapshot_fingerprints
+                .get(fingerprint)
+                .is_some_and(|record| {
+                    record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+                        && record.upload_body_witness.as_deref()
+                            == Some(refusal.body_witness.as_str())
+                });
+            if !bound
+                || !current.contains(fingerprint.as_str())
+                || self.accepted_fingerprints.contains(fingerprint)
+                || index.accepted_snapshot_fingerprint_recorded(fingerprint)
+            {
+                counts.ineligible_unbound += 1;
+                continue;
+            }
+            if retry_after > scope.now {
+                continue;
+            }
+            let outside_window = index
+                .snapshot_activity_at
+                .get(fingerprint)
+                .and_then(Option::as_deref)
+                .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+                .is_some_and(|activity| {
+                    activity.unix_timestamp() < scope.window_start_unix_seconds as i64
+                });
+            if outside_window {
+                counts.outside_policy_window += 1;
+                continue;
+            }
+            counts.due += 1;
+            due.insert(
+                fingerprint.clone(),
+                (retry_after, refusal.body_witness.clone()),
+            );
+        }
+        changed
+    }
+
+    /// Reserve the next logical offer before any scan or upload can use it.
+    /// A crash or an unmaterialized lease therefore waits a day.
+    fn reserve_reason_reoffer(&mut self, fingerprint: &str, body_witness: String, now: u64) {
+        use reason_reoffer::RefusalReoffer;
+        let refusal = self
+            .permanent_rejections
+            .get_mut(fingerprint)
+            .expect("selected re-offer has its refusal");
+        let next = reason_reoffer::next_offer_after(now);
+        refusal.reoffer = Some(match refusal.reoffer {
+            None => {
+                self.reason_reoffer_counts.legacy_selected += 1;
+                RefusalReoffer::LegacyOther {
+                    retry_after_unix_seconds: next,
+                }
+            }
+            Some(reoffer) => {
+                if matches!(reoffer, RefusalReoffer::LegacyOther { .. }) {
+                    self.reason_reoffer_counts.legacy_selected += 1;
+                }
+                reoffer.with_retry_after(next)
+            }
+        });
+        self.reason_reoffer_counts.selected += 1;
+        self.active_reason_reoffers
+            .insert(fingerprint.to_string(), body_witness);
+    }
+
+    /// Immediately before the first actual transmission of this cycle, move
+    /// each materialized lease's next deadline to at least now + 24 h.
+    /// Returns whether a deadline moved; the caller persists before POST.
+    fn extend_reason_reoffers_before_upload(
+        &mut self,
+        items: &[SnapshotItem],
+        locally_held: &BTreeSet<String>,
+    ) -> bool {
+        if self.active_reason_reoffers.is_empty() {
+            return false;
+        }
+        let materialized = items
+            .iter()
+            .filter(|item| {
+                self.active_reason_reoffers
+                    .get(&item.snapshot_fingerprint)
+                    .is_some_and(|body| {
+                        *body == snapshot_upload_body_witness(item)
+                            || (item.cache_observations.is_some()
+                                && item.cache_base_head_etag.is_none()
+                                && *body == snapshot_upload_body_witness(&cache_head_probe(item)))
+                    })
+            })
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        self.reason_reoffer_counts.gate_held = self
+            .active_reason_reoffers
+            .keys()
+            .filter(|fingerprint| locally_held.contains(*fingerprint))
+            .count();
+        // Unmaterialized leases are no longer usable this cycle.
+        self.active_reason_reoffers
+            .retain(|fingerprint, _| materialized.contains(fingerprint));
+        self.reason_reoffer_counts.not_materialized = self
+            .reason_reoffer_counts
+            .selected
+            .saturating_sub(materialized.len())
+            .saturating_sub(self.reason_reoffer_counts.gate_held);
+        let next = reason_reoffer::next_offer_after(reason_reoffer::now_unix_seconds());
+        let mut changed = false;
+        for fingerprint in &materialized {
+            if let Some(refusal) = self.permanent_rejections.get_mut(fingerprint) {
+                if let Some(reoffer) = refusal.reoffer {
+                    if reoffer
+                        .retry_after()
+                        .is_some_and(|retry_after| retry_after < next)
+                    {
+                        refusal.reoffer = Some(reoffer.with_retry_after(next));
+                        changed = true;
+                    }
+                }
+            }
+        }
+        changed
+    }
+
+    /// The logical offer ends with the main upload call. Classify each
+    /// attempted lease by its validated durable outcome; a lease still held
+    /// had no validated response and keeps its reserved cooldown.
+    fn finish_reason_reoffers(
+        &mut self,
+        attempted: &BTreeMap<String, String>,
+        shed: bool,
+        source: &str,
+    ) {
+        let counts = &mut self.reason_reoffer_counts;
+        for fingerprint in attempted.keys() {
+            if !self.attempted_reason_reoffers.contains(fingerprint) {
+                counts.gate_held += 1;
+            } else if self.active_reason_reoffers.contains_key(fingerprint) {
+                if shed {
+                    counts.shed += 1;
+                } else {
+                    counts.failed += 1;
+                }
+            }
+            // Validated outcomes were counted when they consumed the exact
+            // lease. Later cache enrichment cannot relabel a probe's ACK, and
+            // an old refusal cannot relabel a fresh retryable conflict.
+        }
+        self.active_reason_reoffers.clear();
+        counts.invalid_extension = counts
+            .invalid_extension
+            .max(reason_reoffer::take_logged_invalid_extensions());
+        if reason_reoffer::should_log(source, counts) {
+            eprintln!("{}", counts.line(source));
+        }
     }
 
     /// Rearm every current entity exactly once for a new historical replay.
@@ -1028,7 +1425,12 @@ impl SnapshotUploadProgress {
             .get(fingerprint)
             .is_some_and(|record| record.body_witness == body_witness)
         {
-            return true;
+            // Only this exact body's own re-offer lease passes suppression.
+            return self
+                .active_reason_reoffers
+                .get(fingerprint)
+                .map(String::as_str)
+                != Some(body_witness);
         }
         if self.active_quarantine_retries.contains(fingerprint) {
             return false;
@@ -1050,12 +1452,22 @@ impl SnapshotUploadProgress {
     }
 
     fn record_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.accepted += 1;
+        }
         self.permanent_rejections.remove(fingerprint);
         self.accepted_fingerprints.insert(fingerprint.to_string());
         self.accepted_body_witnesses
             .insert(fingerprint.to_string(), body_witness.to_string());
         self.quarantined_fingerprints.remove(fingerprint);
         self.active_quarantine_retries.remove(fingerprint);
+        self.active_reason_reoffers.remove(fingerprint);
     }
 
     fn record_cache_state<T: Serialize>(
@@ -1136,18 +1548,48 @@ impl SnapshotUploadProgress {
     }
 
     fn quarantine_permanent_body(&mut self, fingerprint: &str, body_witness: &str, reason: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            if reason == reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED {
+                self.reason_reoffer_counts.refused_same += 1;
+            } else {
+                self.reason_reoffer_counts.refused_other += 1;
+            }
+        }
         self.quarantine_body(fingerprint, body_witness);
         let record = self.quarantined_fingerprints.get_mut(fingerprint).unwrap();
         record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
         record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
         record.retry_after_unix_seconds = 0;
+        let persisted_reason = crate::upload_receipts::RejectedUsageReason::from_wire(reason);
+        // Each same-reason refusal restarts the 24 h clock. Any other `other`
+        // answer is the server's classification of this body: done, never
+        // re-offered. Known reasons keep their old record byte-for-byte.
+        let reoffer = if reason == reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED {
+            Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: reason_reoffer::next_offer_after(
+                    reason_reoffer::now_unix_seconds(),
+                ),
+            })
+        } else if persisted_reason == crate::upload_receipts::RejectedUsageReason::Other {
+            Some(reason_reoffer::RefusalReoffer::Classified)
+        } else {
+            None
+        };
         self.permanent_rejections.insert(
             fingerprint.to_string(),
             PermanentSnapshotRejection {
                 body_witness: body_witness.to_string(),
-                reason: crate::upload_receipts::RejectedUsageReason::from_wire(reason),
+                reason: persisted_reason,
+                reoffer,
             },
         );
+        self.active_reason_reoffers.remove(fingerprint);
     }
 
     /// The server answered `unchanged` with an `unchanged_basis`: it did not
@@ -1156,6 +1598,26 @@ impl SnapshotUploadProgress {
     /// refusal: no usage was rejected. A changed body is a new fingerprint and
     /// is offered again; a historical replay rearms it once.
     fn hold_unstored_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.unchanged_unstored += 1;
+        }
+        // A validated unchanged answer for a re-offered refused body replaces
+        // that refusal's verdict. Retire it, so its reason schedules no more
+        // offers; the hold below keeps the no-body-stored disclosure.
+        if self
+            .permanent_rejections
+            .get(fingerprint)
+            .is_some_and(|refusal| refusal.body_witness == body_witness)
+        {
+            self.permanent_rejections.remove(fingerprint);
+        }
+        self.active_reason_reoffers.remove(fingerprint);
         self.quarantine_body(fingerprint, body_witness);
         let record = self
             .quarantined_fingerprints
@@ -1167,6 +1629,16 @@ impl SnapshotUploadProgress {
     }
 
     fn quarantine_retryable_body(&mut self, fingerprint: &str, body_witness: &str) {
+        if self
+            .active_reason_reoffers
+            .get(fingerprint)
+            .map(String::as_str)
+            == Some(body_witness)
+            && self.attempted_reason_reoffers.contains(fingerprint)
+        {
+            self.reason_reoffer_counts.retryable += 1;
+        }
+        self.active_reason_reoffers.remove(fingerprint);
         self.quarantine_body(fingerprint, body_witness);
         let record = self
             .quarantined_fingerprints
@@ -1511,8 +1983,21 @@ impl SnapshotUploadProgress {
         }
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
-        self.quarantined_fingerprints.clear();
+        // A later conflict on the refused bytes is the stronger settlement
+        // fact, even while the retained refusal gates its next daily offer.
+        // Keep it in the same atomic ledger so an older index-only timer can
+        // still be distinguished from this newer server answer on restart.
+        self.quarantined_fingerprints.retain(|fingerprint, record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && self
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+        });
         self.active_quarantine_retries.clear();
+        self.active_reason_reoffers.clear();
         self.save(path)
     }
 
@@ -1768,6 +2253,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         || Ok(()),
         None,
         Some(NativeSelectedRestore::Logical(fallback)),
+        None,
     )
 }
 
@@ -1826,6 +2312,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         validate_destination,
         read_limit,
         None,
+        None,
     )
 }
 
@@ -1863,6 +2350,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
     fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1889,6 +2377,9 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     // These fields are runtime leases, not persisted settlement evidence.
     durable.active_quarantine_witness = progress.active_quarantine_witness.clone();
     durable.active_quarantine_retries = progress.active_quarantine_retries.clone();
+    durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
+    durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
+    durable.reason_reoffer_counts = progress.reason_reoffer_counts;
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -1941,7 +2432,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
-    committable.mark_bounded_sweep_unsettled();
+    match cause {
+        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
+        None => committable.mark_bounded_sweep_unsettled(),
+    }
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -3390,6 +3884,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
         compaction_events: item.compaction_events.clone(),
+        first_own_request_at: item.first_own_request_at.clone(),
         local_context_points: Vec::new(),
         compaction_total_pre_tokens: item.compaction_total_pre_tokens,
         compaction_total_post_tokens: item.compaction_total_post_tokens,
@@ -4835,11 +5330,21 @@ fn prepare_sync_source(
             }
         }
     }
-    if prepare_upload_progress_for_cycle(
+    // Due exact refusal re-offers are reserved from the loaded, committed
+    // index and saved below before any lease reaches the scan or uploader.
+    let reoffer_now = reason_reoffer::now_unix_seconds();
+    let reoffer_scope = reason_reoffer::Scope {
+        index: &index,
+        now: reoffer_now,
+        window_start_unix_seconds: reoffer_now
+            .saturating_sub(receipt_window_days.saturating_mul(86_400)),
+    };
+    if prepare_upload_progress_for_cycle_with_reoffer(
         &mut upload_progress,
         &index,
         &replay_generation,
         historical_replay_pending,
+        Some(&reoffer_scope),
     ) {
         // Claim the new generation before the potentially long historical
         // scan. This prevents ACKs from the prior revision from suppressing
@@ -4872,8 +5377,12 @@ fn prepare_sync_source(
         index.load_claude_reemission_exclusions(support_dir);
     }
     let committed_index = index.clone();
+    let reoffer_paths =
+        index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
-    let watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
+    let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
+    // Leased unchanged files join the same bounded, revalidated hint queue.
+    watcher_hints.paths.extend(reoffer_paths);
     if watcher_hints.overflowed {
         eprintln!(
             "local snapshot watcher hint queue overflowed for {}; durable traversal will reconcile",
@@ -5528,6 +6037,15 @@ fn finish_sync_source(
         // obligation survives until both cache settlement and index save.
         upload_progress.save(&upload_progress_path)?;
     }
+    // One logical offer per leased refusal: its next deadline is at least
+    // this first transmission + 24 h, and durable before it. A failed save
+    // sends nothing.
+    if upload_progress
+        .extend_reason_reoffers_before_upload(&scan_result.snapshots, locally_held_fingerprints)
+    {
+        upload_progress.save(&upload_progress_path)?;
+    }
+    let attempted_reason_reoffers = upload_progress.active_reason_reoffers.clone();
     // Existing entities cannot authorize their first cache enrichment without
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
@@ -5539,6 +6057,10 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    // One in-place resend budget for the whole source page: both bootstrap
+    // stages and the main upload draw on it, so the page never waits more
+    // than two resends and 10 s under the sync lock.
+    let mut inplace_retry = InplaceRetryBudget::default();
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only
         // the existing typed, content-free cause and the fixed failing role.
@@ -5557,11 +6079,12 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
             ordinary_bootstrap,
+            &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -5589,7 +6112,14 @@ fn finish_sync_source(
         )
         .inspect_err(log_bootstrap_failure("probe"))?;
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
-            .inspect_err(log_bootstrap_failure("apply"))?;
+            .inspect_err(log_bootstrap_failure("apply"))
+            .inspect_err(|_| {
+                upload_progress.finish_reason_reoffers(
+                    &attempted_reason_reoffers,
+                    false,
+                    source.api_slug(),
+                );
+            })?;
         if held > 0 {
             eprintln!(
                 "local snapshot cache-head bootstrap carried {held} held probe(s) for {} as exact quarantined bodies; siblings continue",
@@ -5609,6 +6139,7 @@ fn finish_sync_source(
         snapshot_upload_body_witness,
         |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+        &mut inplace_retry,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -5680,7 +6211,19 @@ fn finish_sync_source(
         }
         Ok(result)
     })
-    .map(|result| with_bootstrap_deferred(result, bootstrap_deferred));
+    .map(|result| {
+        with_retained_refusal_conflicts(
+            with_bootstrap_deferred(result, bootstrap_deferred),
+            &index,
+            &upload_progress,
+        )
+    });
+    // The logical offer ends here; normal bounded HTTP retries happened inside.
+    upload_progress.finish_reason_reoffers(
+        &attempted_reason_reoffers,
+        matches!(upload_result, Ok(ResumableUploadResult::Shed { .. })),
+        source.api_slug(),
+    );
 
     // Exact progress is durable before this seam. The same subsequent index
     // save carries settled file bodies and correction progress; local-state
@@ -5776,6 +6319,7 @@ fn finish_sync_source(
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -5895,6 +6439,7 @@ fn finish_sync_source(
                     comparison_completion
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
+                    Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
                         index = committable;
@@ -6354,15 +6899,37 @@ fn finish_sync_source(
 /// quarantine must not be restored after progress is rearmed. For the same
 /// generation, restore it only after progress has claimed that generation so a
 /// clean follow-up cannot erase a replacement conflict before its retry.
+#[cfg(test)]
 fn prepare_upload_progress_for_cycle(
     upload_progress: &mut SnapshotUploadProgress,
     index: &ScanIndex,
     replay_generation: &str,
     historical_replay_pending: bool,
 ) -> bool {
+    prepare_upload_progress_for_cycle_with_reoffer(
+        upload_progress,
+        index,
+        replay_generation,
+        historical_replay_pending,
+        None,
+    )
+}
+
+/// Production form of the above: outside a historical replay, due refusal
+/// re-offers share the ordinary retry budget. A replay neither re-offers nor
+/// resets a cooldown.
+fn prepare_upload_progress_for_cycle_with_reoffer(
+    upload_progress: &mut SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    historical_replay_pending: bool,
+    reoffer: Option<&reason_reoffer::Scope<'_>>,
+) -> bool {
     if !historical_replay_pending {
-        return upload_progress
-            .prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
+        return upload_progress.prepare_quarantine_and_reason_retries(
+            &index.quarantined_snapshot_fingerprints,
+            reoffer,
+        );
     }
 
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
@@ -7197,7 +7764,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // until a complete family pass reconstructs the exact witness.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -7399,6 +7966,113 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
         .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
 }
 
+/// The wait before resending a failed batch in place, with the HTTP status
+/// that earned it, or `None` when the failure keeps its existing path. The
+/// wait is never earlier than the server's own `Retry-After`.
+fn transient_inplace_retry_wait(error: &anyhow::Error) -> Option<(u16, Duration)> {
+    let (status, base) = if let Some(shed) = error.downcast_ref::<UploadShed>() {
+        // The identity deferral waits on the identity, not on this request:
+        // excluded by its code before any admission, even with a short
+        // Retry-After.
+        if shed.is_original_identity_unavailable() {
+            return None;
+        }
+        // No Retry-After keeps the jittered ladder; a long one is not worth
+        // holding the sync lock for.
+        let retry_after = shed
+            .retry_after
+            .filter(|wait| *wait <= SNAPSHOT_INPLACE_RETRY_MAX_WAIT)?;
+        (shed.status, retry_after)
+    } else {
+        let status = error
+            .downcast_ref::<UploadFailureDiagnostics>()?
+            .transient_batch_status()?;
+        (status, SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT)
+    };
+    let base = base.max(SNAPSHOT_INPLACE_RETRY_MIN_WAIT);
+    let wait = (base + uniform_duration(base.mul_f64(0.2))).min(SNAPSHOT_INPLACE_RETRY_MAX_WAIT);
+    Some((status, wait))
+}
+
+/// In-place resends spent by one source page: every batch of its cache-head
+/// bootstrap stages and of its main upload draws on the same budget.
+#[derive(Default)]
+struct InplaceRetryBudget {
+    resends: usize,
+    waited: Duration,
+}
+
+impl InplaceRetryBudget {
+    fn admit(&self, error: &anyhow::Error, failed_after: Duration) -> Option<(u16, Duration)> {
+        if self.resends >= SNAPSHOT_INPLACE_RETRY_LIMIT
+            || failed_after >= SNAPSHOT_INPLACE_RETRY_FAST_FAILURE
+        {
+            return None;
+        }
+        transient_inplace_retry_wait(error)
+            .filter(|(_, wait)| self.waited + *wait <= SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET)
+    }
+}
+
+fn inplace_retry_failed_after(started: Instant) -> Duration {
+    #[cfg(test)]
+    if let Some(failed_after) = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow().as_ref().and_then(|clock| clock.failed_after))
+    {
+        return failed_after;
+    }
+    started.elapsed()
+}
+
+fn inplace_retry_sleep(wait: Duration) {
+    #[cfg(test)]
+    if INPLACE_RETRY_TEST_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some(clock) => {
+            clock.waits.push(wait);
+            true
+        }
+        None => false,
+    }) {
+        return;
+    }
+    std::thread::sleep(wait);
+}
+
+/// Test-only stand-in for the in-place resend clock: it records every wait
+/// instead of sleeping and may override how long a failed POST took.
+#[cfg(test)]
+struct InplaceRetryTestClock {
+    failed_after: Option<Duration>,
+    waits: Vec<Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPLACE_RETRY_TEST_CLOCK: std::cell::RefCell<Option<InplaceRetryTestClock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with this thread's in-place resend clock replaced. Returns the
+/// result and every wait the uploader asked for, in order.
+#[cfg(test)]
+fn with_inplace_retry_test_clock<R>(
+    failed_after: Option<Duration>,
+    body: impl FnOnce() -> R,
+) -> (R, Vec<Duration>) {
+    INPLACE_RETRY_TEST_CLOCK.with(|clock| {
+        *clock.borrow_mut() = Some(InplaceRetryTestClock {
+            failed_after,
+            waits: Vec::new(),
+        });
+    });
+    let result = body();
+    let waits = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow_mut().take())
+        .map(|clock| clock.waits)
+        .unwrap_or_default();
+    (result, waits)
+}
+
 /// Upload changed snapshots in bounded pages while durably checkpointing every
 /// accepted page. Item-specific validation failures are bisected so one poison
 /// snapshot cannot replay or block its valid siblings; pages that exceed the
@@ -7461,6 +8135,7 @@ where
         body_witness,
         |_| None,
         |_| false,
+        &mut InplaceRetryBudget::default(),
         upload,
         persist,
     )
@@ -7499,6 +8174,19 @@ where
         .iter()
         .map(|index| items[*index].clone())
         .collect::<Vec<_>>();
+    for index in indices {
+        let item = &items[*index];
+        let fp = fingerprint(item);
+        if progress.active_reason_reoffers.get(fp) == Some(&body_witness(item))
+            && progress.attempted_reason_reoffers.insert(fp.to_string())
+        {
+            progress.reason_reoffer_counts.attempted += 1;
+            progress.reason_reoffer_counts.attempted_bytes = progress
+                .reason_reoffer_counts
+                .attempted_bytes
+                .saturating_add(snapshot_packing_json_length(item)?);
+        }
+    }
     let response = upload(batch)?;
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
@@ -7699,6 +8387,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     body_witness: BodyWitness,
     session_id: SessionId,
     batch_class: BatchClass,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -7755,7 +8444,11 @@ where
                     .get(*fingerprint)
                     .is_some_and(|record| {
                         record.upload_body_witness.as_deref() == Some(body.as_str())
-                            && record.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+                            && matches!(
+                                record.disposition,
+                                SnapshotQuarantineDisposition::UnprovenTerminal
+                                    | SnapshotQuarantineDisposition::RetryPending
+                            )
                     })
         })
         .map(|(fingerprint, body)| (fingerprint.clone(), body.clone()))
@@ -7855,7 +8548,8 @@ where
             }
             adaptive_attempts += 1;
         }
-        match attempt_snapshot_page(
+        let attempt_started = Instant::now();
+        let attempt = attempt_snapshot_page(
             items,
             &indices,
             poison_scope,
@@ -7866,7 +8560,11 @@ where
             &session_id,
             &mut upload,
             &mut persist,
-        ) {
+        );
+        let inplace_wait = attempt.as_ref().err().and_then(|error| {
+            inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
+        });
+        match attempt {
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
@@ -7952,6 +8650,27 @@ where
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
+            }
+            Err(_) if inplace_wait.is_some() => {
+                // A short, explicitly transient failure: wait briefly and
+                // resend the same page. Each resend re-runs the whole upload
+                // boundary (lease, authority, fresh relay token), and the
+                // loop-top filter drops anything settled meanwhile. When the
+                // budget runs out the failure takes the arms below unchanged.
+                let (status, wait) = inplace_wait.expect("admitted in-place retry");
+                inplace_retry.resends += 1;
+                inplace_retry.waited += wait;
+                eprintln!(
+                    "local snapshot upload transient status={status} for {poison_scope}; \
+                     retrying the batch in place after {} ms (source page resend {}/{SNAPSHOT_INPLACE_RETRY_LIMIT}; \
+                     {} of {} ms source page in-place wait budget held under the sync lock)",
+                    wait.as_millis(),
+                    inplace_retry.resends,
+                    inplace_retry.waited.as_millis(),
+                    SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET.as_millis(),
+                );
+                inplace_retry_sleep(wait);
+                batches.push_front((indices, adaptive));
             }
             Err(error) if error.downcast_ref::<UploadShed>().is_some() => {
                 let shed = error
@@ -9191,9 +9910,14 @@ mod tests {
         item.cache_base_head_etag = None;
         assert_eq!(item.compaction_events.len(), 1);
         assert!(!item.local_context_points.is_empty());
+        // Codex never carries design E's first own request time; a Claude
+        // value survives the retry copy like the other wire fields.
+        assert_eq!(item.first_own_request_at, None);
+        item.first_own_request_at = Some("2026-10-07T11:00:00Z".into());
 
         let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
 
+        assert_eq!(copy.first_own_request_at, item.first_own_request_at);
         assert_eq!(copy.compaction_events, item.compaction_events);
         assert!(copy.local_context_points.is_empty());
         assert_eq!(
@@ -10890,6 +11614,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |_| Ok(()),
@@ -13821,6 +14546,7 @@ mod tests {
                     Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     }))
                 }
             },
@@ -13848,6 +14574,10 @@ mod tests {
         }
         assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
         reset_for_test();
+    }
+
+    mod inplace_retry_tests {
+        include!("snapshot_sync/inplace_retry_tests.rs");
     }
 
     #[test]
@@ -15049,6 +15779,7 @@ mod tests {
             |item| item.clone(),
             |_| None,
             |item| reconcile_class.contains(item),
+            &mut InplaceRetryBudget::default(),
             |batch| {
                 let is_reconcile = batch
                     .iter()
@@ -17366,6 +18097,161 @@ mod tests {
         );
     }
 
+    /// Diagnostics only: every settlement path that marks the sweep unsettled
+    /// names itself, causes accumulate across pages and survive a reload, and
+    /// a settled outcome names nothing.
+    #[test]
+    fn unsettled_cause_names_each_settlement_and_partial_checkpoint_producer() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
+            held_entity_count: held_fingerprints.len(),
+            retry_pending_family_count: 0,
+            held_fingerprints: held_fingerprints.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            // Restorable non-blocking Rejected holds settle once H1 is composed.
+            progress_blocking: !held_fingerprints.is_empty(),
+        };
+
+        let blocked = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        let restored = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!restored.bounded_sweep_had_unsettled_upload());
+        assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
+
+        let deferred = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            false,
+        );
+        assert!(deferred.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+        let rejected_beside_hold =
+            settle_checkpointed_upload(scanned.clone(), &committed, &progress, &holds(&held), true);
+        assert!(rejected_beside_hold
+            .index
+            .bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            rejected_beside_hold
+                .index
+                .bounded_sweep_unsettled_cause_names(),
+            ["rejected_with_holds"]
+        );
+        let rejected = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            true,
+        );
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        // H1 settles a Rejected page whose holds are restorable and
+        // non-blocking, so it must name no unsettled cause.
+        let restorable = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &LocalHoldSettlement {
+                progress_blocking: false,
+                ..holds(&held)
+            },
+            true,
+        );
+        assert!(!restorable.index.bounded_sweep_had_unsettled_upload());
+        assert!(restorable
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+
+        // The shed and error branches mark through the partial checkpoint.
+        // A cause from an earlier page of the same sweep is kept beside it.
+        for (cause, name) in [
+            (UnsettledUploadCause::Shed, "shed"),
+            (UnsettledUploadCause::UploadError, "upload_error"),
+        ] {
+            let root = test_dir(&format!("unsettled-cause-checkpoint-{name}"));
+            std::fs::create_dir_all(&root).expect("create checkpoint fixture root");
+            let index_path = root.join("scan-index.json");
+            let progress_path = root.join("upload-progress.json");
+            let mut durable = SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 589),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load upload progress");
+            durable.save(&progress_path).expect("save upload progress");
+            let mut working = scanned.clone();
+            working.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+            let checkpoint = checkpoint_partial_snapshot_index_with_comparison(
+                &working,
+                &committed,
+                &durable,
+                &[],
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            )
+            .expect("partial checkpoint");
+            assert!(checkpoint.bounded_sweep_had_unsettled_upload());
+            let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+            assert!(reloaded.bounded_sweep_had_unsettled_upload());
+            assert_eq!(
+                reloaded.bounded_sweep_unsettled_cause_names(),
+                [name, "deferred_conflict"]
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
+    }
+
     /// The backend's error-code set is closed and its forward tolerance covers
     /// unknown fields, never unknown values: `census_residue` against a backend
     /// that does not admit it would reject the ENTIRE receipt. So until the
@@ -19409,8 +20295,14 @@ mod tests {
     pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }
+    mod reason_reoffer_tests {
+        include!("snapshot_sync/reason_reoffer_tests.rs");
+    }
     mod authority_proof_correction_pipeline_tests {
         include!("snapshot_sync/authority_proof_correction_pipeline_tests.rs");
+    }
+    mod load_containment_tests {
+        include!("snapshot_sync/load_containment_tests.rs");
     }
     #[test]
     fn codex_union_native_transport_common_ack_crash_checkpoint_and_restart() {
@@ -20676,6 +21568,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |state| state.save(&path),
@@ -20827,7 +21720,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
@@ -20835,7 +21728,7 @@ crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint,
 #[path = "snapshot_sync/h357_ack_tests.rs"]
 mod h357_ack_tests;
 
-crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason);
+crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reason, reoffer);
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);

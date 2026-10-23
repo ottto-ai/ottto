@@ -328,6 +328,73 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
+/// The fold builds Claude sizes from the retained boundaries and owned
+/// requests, so a Tail pass that sees the next request gives the full read's
+/// sizes. Rebuilt here with every request owned, as for an exclusive root.
+#[test]
+fn sampled_native_claude_compaction_sizes_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let rebuilt = |mut items: Vec<SnapshotItem>| {
+        let mut item = items.remove(0);
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        rebuild_claude_context_posture(&mut item, &owned, None);
+        item
+    };
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "compactMetadata":{"trigger":"manual","preTokens":900000}}));
+    let (retained, _, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+    assert!(retained.is_some());
+    let first = rebuilt(items);
+    assert_eq!(
+        first.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: "2026-10-07T10:30:05Z".to_string(),
+            before: first.first_turn_context_tokens,
+            after: None,
+            trigger: Some("manual".to_string()),
+        }]
+    );
+
+    fixture.append(&usage(source, 40, 1, "claude-opus-4-8"));
+    let (_, mode, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
+    assert_eq!(mode, ReadMode::Tail);
+    let tail = rebuilt(items);
+    let mut full = parse_claude_code_jsonl_file_with_artifacts(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        false,
+    )
+    .unwrap();
+    apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
+    let full = rebuilt(full);
+    assert_eq!(
+        tail.compaction_events[0].before,
+        first.first_turn_context_tokens
+    );
+    assert_eq!(
+        tail.compaction_events[0].after,
+        tail.last_turn_context_tokens
+    );
+    assert!(tail.compaction_events[0].after.is_some());
+    assert_eq!(tail.compaction_events, full.compaction_events);
+    assert_eq!(tail.local_context_points, full.local_context_points);
+}
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
