@@ -587,15 +587,6 @@ impl ShadowReservation {
     pub(crate) fn bytes(&self) -> usize {
         self.0
     }
-
-    /// Transfer already admitted bytes without releasing their charge.
-    pub(super) fn split(&mut self, bytes: usize) -> Option<Self> {
-        if bytes > self.0 {
-            return None;
-        }
-        self.0 -= bytes;
-        Some(Self(bytes))
-    }
 }
 
 impl Drop for ShadowReservation {

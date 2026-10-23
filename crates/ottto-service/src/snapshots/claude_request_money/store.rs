@@ -515,8 +515,6 @@ pub(crate) struct WriteResult {
     meta_unwritten: Option<bool>,
     /// The writer's time on the batch.
     pub(crate) writer_us: u64,
-    // Acknowledgement memos stay funded until the producer takes them.
-    _reservation: Option<ShadowReservation>,
 }
 
 enum Job {
@@ -816,15 +814,8 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         mut jsonl,
         mut memos,
         save,
-        mut reservations,
+        reservations,
     } = job;
-    let ack_bytes = memos
-        .iter()
-        .map(|memo| memo.key.capacity() + 256)
-        .sum::<usize>();
-    let acknowledgement = reservations
-        .first_mut()
-        .and_then(|funds| funds.split(ack_bytes));
     let outcome = super::write_jsonl(&support_dir, &mut jsonl);
     for (memo, family) in memos
         .iter_mut()
@@ -846,7 +837,6 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         failed_shards,
         meta_unwritten,
         writer_us: started.elapsed().as_micros() as u64,
-        _reservation: acknowledgement,
     };
     drop(reservations);
     (support_dir, result)
