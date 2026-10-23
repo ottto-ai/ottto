@@ -189,6 +189,42 @@ fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
 pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
+    /// The backend's error code when it is one the daemon recognizes. Only
+    /// this fixed name survives; the rest of the response body is discarded.
+    pub code: Option<UploadShedCode>,
+}
+
+/// The backend error code of the 503 that defers a batch while an original
+/// session identity cannot be evaluated.
+pub const SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE: &str = "snapshot_original_identity_unavailable";
+
+/// A shed's backend error code, kept only when it is one of these fixed names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadShedCode {
+    /// `snapshot_original_identity_unavailable`: the decision waits for the
+    /// identity, not for the request, so it keeps its own backoff whatever
+    /// `Retry-After` accompanies it and is never resent in place.
+    OriginalIdentityUnavailable,
+}
+
+impl UploadShedCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalIdentityUnavailable => SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE,
+        }
+    }
+
+    fn recognize(code: &str) -> Option<Self> {
+        (code == SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE)
+            .then_some(Self::OriginalIdentityUnavailable)
+    }
+}
+
+impl UploadShed {
+    /// The identity deferral, recognized by its fixed backend code.
+    pub fn is_original_identity_unavailable(&self) -> bool {
+        self.code == Some(UploadShedCode::OriginalIdentityUnavailable)
+    }
 }
 
 impl std::fmt::Display for UploadShed {
@@ -242,13 +278,34 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
     Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
 }
 
-fn shed_from_response(status: u16, response: &ureq::Response) -> UploadShed {
+/// Bytes of a shed body read to recognize its code. The backend's error
+/// envelope is a few hundred bytes; a longer body is not recognized.
+const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
+
+fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+    let retry_after = response
+        .header("Retry-After")
+        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
+    let mut excerpt = Vec::new();
+    let code = response
+        .into_reader()
+        .take(SHED_BODY_EXCERPT_BYTES)
+        .read_to_end(&mut excerpt)
+        .ok()
+        .and_then(|_| shed_code(&excerpt));
     UploadShed {
         status,
-        retry_after: response
-            .header("Retry-After")
-            .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc())),
+        retry_after,
+        code,
     }
+}
+
+/// The recognized top-level `code` of a backend error envelope, which must be
+/// a JSON object. Any other code, a malformed or truncated body, a non-object
+/// body or a non-string code is `None`; no body text outlives this call.
+fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
+    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
+    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
@@ -511,6 +568,14 @@ impl UploadFailureDiagnostics {
     pub(crate) fn is_snapshot_batch_deadline(&self) -> bool {
         self.endpoint == "snapshot_batch"
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
+    }
+
+    /// The status of a snapshot-batch server error that a prompt resend of
+    /// the same idempotent page may clear: 500 or 502 only. Other endpoints,
+    /// other statuses and transport failures never qualify.
+    pub(crate) fn transient_batch_status(&self) -> Option<u16> {
+        self.http_status
+            .filter(|status| self.endpoint == "snapshot_batch" && matches!(status, 500 | 502))
     }
 
     pub fn safe_message(&self) -> String {
@@ -1646,6 +1711,7 @@ impl SnapshotApiClient {
             device_secret,
             source,
             SNAPSHOT_HTTP_READ_TIMEOUT,
+            None,
         )
     }
 
@@ -1657,7 +1723,34 @@ impl SnapshotApiClient {
         timeout: Duration,
     ) -> Result<String> {
         let (agent, request_timeout) = cloud_session_deadline_agent(timeout)?;
-        self.issue_relay_token_with_agent(&agent, device, device_secret, source, request_timeout)
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            None,
+        )
+    }
+
+    /// One optional parent-side token request, with the same DNS, TLS and
+    /// request deadline and response admission bound as the health transport.
+    pub(crate) fn issue_composition_health_relay_token(
+        &self,
+        device: &LocalDeviceBinding,
+        device_secret: &str,
+        source: SnapshotSource,
+        timeout: Duration,
+    ) -> Result<String> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            request_timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )
     }
 
     fn issue_relay_token_with_agent(
@@ -1667,6 +1760,7 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
         timeout: Duration,
+        response_cap: Option<usize>,
     ) -> Result<String> {
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
@@ -1696,10 +1790,13 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?;
-        let response: RelayTokenResponse =
-            require_cloud_session_success(response, "relay token request", "relay_token")?
-                .into_json()
-                .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        let response =
+            require_cloud_session_success(response, "relay token request", "relay_token")?;
+        let response: RelayTokenResponse = match response_cap {
+            Some(cap) => bounded_response_json(response, cap),
+            None => response.into_json().map_err(anyhow::Error::from),
+        }
+        .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
         Ok(response.token)
     }
 
@@ -1943,6 +2040,11 @@ impl SnapshotApiClient {
                             enforce_head_cas,
                             retry.is_some(),
                         );
+                        self.record_composition_start_verdicts(
+                            request,
+                            &response,
+                            enforce_head_cas,
+                        );
                         Ok(response)
                     }
                     Err(_) => {
@@ -1964,12 +2066,13 @@ impl SnapshotApiClient {
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
-                let shed = shed_from_response(code, &response);
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                let shed = shed_from_response(code, response);
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
                     code,
-                    response.header("X-Request-ID"),
+                    server_request_id.as_deref(),
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
@@ -2037,6 +2140,66 @@ impl SnapshotApiClient {
     }
 
     #[allow(clippy::too_many_arguments)]
+    fn record_composition_start_verdicts(
+        &self,
+        request: &SnapshotBatchRequest,
+        response: &SnapshotBatchResponse,
+        enforce_head_cas: bool,
+    ) {
+        let Some(support) = self.receipt_state_dir.as_deref() else {
+            return;
+        };
+        let Some(namespace) = self.receipt_destination_namespace.as_deref() else {
+            return;
+        };
+        let destination = crate::snapshots::start_verdict_store::destination(
+            namespace,
+            &self.api_base_url,
+            &request.machine_id,
+        );
+        if response.disabled
+            || response
+                .validate_entity_ack_with_head_cas(request, enforce_head_cas)
+                .is_err()
+        {
+            return;
+        }
+        // This is the final folded, budget-trimmed wire item. A well-formed
+        // ACK can still reject or conflict individual items: record only the
+        // accepted/unchanged bodies, never those other outcomes.
+        let acknowledged: std::collections::BTreeSet<_> = response
+            .accepted_entities
+            .iter()
+            .chain(&response.unchanged_entities)
+            .map(|r| {
+                (
+                    r.source_session_id.as_str(),
+                    r.snapshot_fingerprint.as_str(),
+                )
+            })
+            .collect();
+        let items = request.snapshots.iter().filter(|item| {
+            response.entity_ack_contract.is_none()
+                || acknowledged.contains(&(
+                    item.source_session_id.as_str(),
+                    item.snapshot_fingerprint.as_str(),
+                ))
+        });
+        match crate::snapshots::start_verdict_store::record(
+            support,
+            &destination,
+            &request.source,
+            items,
+            time::OffsetDateTime::now_utc().unix_timestamp(),
+        ) {
+            Ok(bytes) if bytes > 0 => {
+                eprintln!("ottto-service: composition_start_verdict bytes_appended={bytes}")
+            }
+            Ok(_) => {}
+            Err(_) => eprintln!("ottto-service: composition start verdict persistence failed"),
+        }
+    }
+
     fn record_batch_success(
         &self,
         request: &SnapshotBatchRequest,
@@ -2525,6 +2688,69 @@ impl SnapshotApiClient {
                 Err(anyhow!("backend rejected context composition: HTTP {code}"))
             }
             Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The composition upload from its serialized body, so the bytes the
+    /// run counts are the bytes sent (the same body `send_json` would send).
+    pub fn upload_context_composition_body(&self, relay_token: &str, body: &[u8]) -> Result<Value> {
+        match self
+            .agent
+            .post(&self.api_url("/api/v1/context-composition/snapshot"))
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .set("Content-Type", "application/json")
+            .send_bytes(body)
+        {
+            Ok(response) => response
+                .into_json()
+                .map_err(|error| anyhow!("parse context composition response failed: {error}")),
+            Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
+                Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
+                    status: code,
+                }))
+            }
+            Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
+                Err(anyhow!("backend rejected context composition: HTTP {code}"))
+            }
+            Err(error) => Err(anyhow!("upload context composition failed: {error}")),
+        }
+    }
+
+    /// The daily composition run health: one request, never retried. A
+    /// refusal is counted by the caller and the next day's run sends again.
+    pub fn post_context_composition_run_health(
+        &self,
+        relay_token: &str,
+        body: &Value,
+    ) -> Result<Value> {
+        self.post_context_composition_run_health_with_timeout(
+            relay_token,
+            body,
+            Duration::from_secs(10),
+        )
+    }
+
+    pub(crate) fn post_context_composition_run_health_with_timeout(
+        &self,
+        relay_token: &str,
+        body: &Value,
+        timeout: Duration,
+    ) -> Result<Value> {
+        let (agent, request_timeout) = bounded_snapshot_deadline_agent(Instant::now() + timeout)?;
+        match agent
+            .post(&self.api_url("/api/v1/context-composition/run-health"))
+            .timeout(request_timeout)
+            .set("Accept", "application/json")
+            .set("Authorization", &format!("Bearer {relay_token}"))
+            .send_json(body)
+        {
+            Ok(response) => bounded_response_json(response, 64 * 1024)
+                .map_err(|error| anyhow!("parse composition run health response failed: {error}")),
+            Err(ureq::Error::Status(code, _response)) => Err(anyhow!(
+                "backend refused composition run health: HTTP {code}"
+            )),
+            Err(error) => Err(anyhow!("send composition run health failed: {error}")),
         }
     }
 
@@ -3394,6 +3620,45 @@ mod tests {
     }
 
     #[test]
+    fn shed_code_keeps_only_a_recognized_backend_code() {
+        let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
+        assert_eq!(
+            shed_code(identity),
+            Some(UploadShedCode::OriginalIdentityUnavailable)
+        );
+        assert_eq!(
+            UploadShedCode::OriginalIdentityUnavailable.as_str(),
+            SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
+        );
+        let oversized = format!(
+            r#"{{"detail":"{}","code":"snapshot_original_identity_unavailable"}}"#,
+            "x".repeat(SHED_BODY_EXCERPT_BYTES as usize)
+        );
+        let truncated = &oversized.as_bytes()[..SHED_BODY_EXCERPT_BYTES as usize];
+        let bodies: [&[u8]; 11] = [
+            br#"{"code":"cursor_allocation_timeout"}"#,
+            br#"{"code":"accept_discovery_shared_lock_timeout"}"#,
+            br#"{"detail":"snapshot_original_identity_unavailable"}"#,
+            br#"{"code":"Snapshot_Original_Identity_Unavailable"}"#,
+            br#"{"code":17}"#,
+            br#"{"code":null}"#,
+            br#"["snapshot_original_identity_unavailable"]"#,
+            b"snapshot_original_identity_unavailable",
+            b"<html>503 Service Unavailable</html>",
+            b"",
+            truncated,
+        ];
+        for body in bodies {
+            assert_eq!(
+                shed_code(body),
+                None,
+                "{}",
+                String::from_utf8_lossy(&body[..body.len().min(80)])
+            );
+        }
+    }
+
+    #[test]
     fn retry_after_accepts_delta_seconds_and_http_dates() {
         let now = OffsetDateTime::parse("2026-07-26T10:00:00Z", &Rfc3339).expect("now");
         assert_eq!(
@@ -4025,6 +4290,67 @@ mod tests {
             rejected_entities: Vec::new(),
             conflict_entities: Vec::new(),
         }
+    }
+
+    #[test]
+    fn composition_start_verdict_records_only_final_acknowledged_items() {
+        use crate::snapshots::{start_verdict_store, SnapshotSessionStart, StartVerdict};
+        let support = crate::test_scratch::private_dir("composition-ack-verdict");
+        let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+        item.context_curve = None;
+        item.cache_observations = None;
+        item.session_account_evidence = None;
+        item.session_start = Some(Box::new(SnapshotSessionStart {
+            user_turn_count: Some(1),
+            ..Default::default()
+        }));
+        let request = SnapshotBatchRequest {
+            schema_version: SNAPSHOT_SCHEMA_VERSION,
+            source: "codex".into(),
+            machine_id: "synthetic-machine".into(),
+            collector_version: None,
+            snapshots: vec![item],
+            upload_policy: Default::default(),
+            client_report: crate::client_report::ClientReport::empty(),
+        };
+        let client = SnapshotApiClient::new("https://example.invalid")
+            .with_receipt_state_dir(&support)
+            .with_receipt_destination_namespace("synthetic-namespace".into());
+        let id = &request.snapshots[0].source_session_id;
+        let destination = start_verdict_store::destination(
+            "synthetic-namespace",
+            "https://example.invalid",
+            &request.machine_id,
+        );
+        let get = || {
+            let now = time::OffsetDateTime::now_utc().unix_timestamp();
+            start_verdict_store::load(&support, &destination, now).get("codex", id, now)
+        };
+        let mut conflict = entity_ack(0, vec![]);
+        conflict.conflict_entities.push(entity_ref(
+            id,
+            &request.snapshots[0].snapshot_fingerprint,
+            1,
+        ));
+        conflict.validate_entity_ack(&request).unwrap();
+        client.record_composition_start_verdicts(&request, &conflict, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        let mut disabled = entity_ack(0, vec![]);
+        disabled.disabled = true;
+        client.record_composition_start_verdicts(&request, &disabled, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        // Legacy all-accepted ACK; the final wire body measures this start.
+        let mut accepted = entity_ack(1, vec![]);
+        accepted.entity_ack_contract = None;
+        client.record_composition_start_verdicts(&request, &accepted, false);
+        assert_eq!(get(), StartVerdict::Measured);
+        // A later final-body clear (including a payload-budget clear) must
+        // replace the verdict, not retain the earlier folded start.
+        let mut cleared = request.clone();
+        cleared.snapshots[0].session_start = None;
+        client.record_composition_start_verdicts(&cleared, &accepted, false);
+        assert_eq!(get(), StartVerdict::NotMeasured);
+        std::fs::remove_dir_all(support).unwrap();
     }
 
     #[test]

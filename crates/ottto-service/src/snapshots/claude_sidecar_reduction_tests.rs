@@ -575,6 +575,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
             Arc::new(SharedCache {
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
+                side: Default::default(),
             })
         } else {
             cache.clear();
