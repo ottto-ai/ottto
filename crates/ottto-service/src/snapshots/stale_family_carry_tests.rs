@@ -1732,3 +1732,30 @@ fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
         assert!(index.files[&key].source_file_fingerprint.is_empty());
     }
 }
+
+#[test]
+fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = window_index();
+    let key = carry_key(CARRY_UNWITNESSED, None);
+    let revision = index.files[&key].source_file_fingerprint.clone();
+    let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(first["rearm_window_rearmed_files"], 1);
+    index.files.get_mut(&key).unwrap().source_file_fingerprint = revision;
+    index
+        .claude_usage_family_pending
+        .get_mut(CARRY_UNWITNESSED)
+        .unwrap()
+        .census_window_end = CARRY_RETRY.to_string();
+    carry_red(&mut index, CARRY_RETRY, 1);
+    assert!(!index.bounded_sweep_had_unsettled_upload);
+    let second = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(second["reason"], "terminal_unhealthy_retry");
+    assert_eq!(second["carried_pending_families"], 1);
+    assert_eq!(second["stale_rearm_capped_files"], 1);
+    assert_eq!(second["rearmed_index_files"], 0);
+    assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
+    assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
+}

@@ -4421,13 +4421,12 @@ fn claude_fence_closed_retry_carry(
 
 /// Fix 2 at a traversal start: a start right after a full re-arm terminal
 /// opens a full-rearm window in this context and process; a later start
-/// whose prior traversal needed a clean follow-up returns that window's
-/// census window ends. Another context or a restart drops it (BASE).
+/// whose prior traversal needed a clean follow-up or an unhealthy retry
+/// returns that window's census window ends. Another context or a restart drops it (BASE).
 fn claude_full_rearm_window_at_start(
     index: &mut ScanIndex,
     context_fingerprint: &str,
     collected_at: &str,
-    prior_unsettled_upload: bool,
 ) -> Option<BTreeSet<String>> {
     let progress = &mut index.claude_full_rearm_progress;
     if std::mem::take(&mut progress.full_rearm_window_next) {
@@ -4450,7 +4449,7 @@ fn claude_full_rearm_window_at_start(
         progress.full_rearm_window = None;
         return None;
     }
-    prior_unsettled_upload.then(|| window.window_ends.clone())
+    Some(window.window_ends.clone())
 }
 
 /// Fix 2 cap: full-rearm-window families a start neither carries nor
@@ -33827,25 +33826,23 @@ fn ensure_bounded_traversal(
         // families it cannot carry are re-read whole at most
         // `CLAUDE_STALE_FULL_REARM_WINDOW_REARMS_PER_DEADLINE` times per
         // fence deadline. Every other stale family keeps BASE's re-arm.
-        let full_rearm_window_roots = claude_full_rearm_window_at_start(
-            index,
-            &context_fingerprint,
-            collected_at,
-            prior_unsettled_upload,
-        )
-        .map(|window_ends| {
-            stale_pending_roots
-                .iter()
-                .filter(|root| {
-                    index
-                        .claude_usage_family_pending
-                        .get(*root)
-                        .is_some_and(|pending| window_ends.contains(&pending.census_window_end))
+        let full_rearm_window_roots =
+            claude_full_rearm_window_at_start(index, &context_fingerprint, collected_at)
+                .map(|window_ends| {
+                    stale_pending_roots
+                        .iter()
+                        .filter(|root| {
+                            index
+                                .claude_usage_family_pending
+                                .get(*root)
+                                .is_some_and(|pending| {
+                                    window_ends.contains(&pending.census_window_end)
+                                })
+                        })
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
                 })
-                .cloned()
-                .collect::<BTreeSet<_>>()
-        })
-        .unwrap_or_default();
+                .unwrap_or_default();
         let carry = if full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry(
                 index,
