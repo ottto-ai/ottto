@@ -3301,15 +3301,15 @@ fn unmatched_email_in_a_registered_folder_is_refused_end_to_end_with_usage_conse
         assert!(!text.contains(absent), "{absent}");
     }
 
-    // Genuinely absent or disqualified email, or an unregistered folder: the
-    // earlier org-only meaning stands.
+    // Absent/disqualified email or an unregistered folder does not refuse,
+    // but its transcript-only org is still withdrawn.
     for mut other in [
         parse_session(&slot, &email_session(false, false)),
         parse_session(&slot, &email_session(true, true)),
         parse_session(&dir.join("loose"), &email_session(true, false)),
     ] {
         identity::apply_scan(&mut other, &evidence, BTreeMap::new());
-        assert_eq!(other[0].request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG);
+        assert!(other[0].request_evidence.is_empty());
         assert_eq!(other[0].request_identity_refusals, 0);
     }
     let _ = fs::remove_dir_all(dir);
@@ -3366,8 +3366,8 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         assert_eq!(item.cost, before.cost, "{case}");
         assert_eq!(rows(&item), rows(&before), "{case}");
     };
-    let assert_org_only = |case: &str, (_, item): (SnapshotItem, SnapshotItem)| {
-        assert_eq!(item.request_evidence[0].identity_basis, identity::TRANSCRIPT_ORG, "{case}");
+    let assert_withdrawn = |case: &str, (_, item): (SnapshotItem, SnapshotItem)| {
+        assert!(item.request_evidence.is_empty(), "{case}");
         assert_eq!(item.request_identity_refusals, 0, "{case}");
     };
     // Unit-level reason for the same request.
@@ -3388,7 +3388,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         RequestIdentity::Refused(Refusal::CoverageUnqualified)
     );
     assert_refused("registered slot", scan(&slot, &ledger));
-    assert_org_only("never-registered folder", scan(&loose, &ledger));
+    assert_withdrawn("never-registered folder", scan(&loose, &ledger));
 
     // The slot is removed: its history is cleared, but the SAME request stays
     // refused instead of becoming org-only.
@@ -3400,7 +3400,7 @@ fn removed_slot_keeps_its_refusal_and_lost_registration_never_proves_absence() {
         RequestIdentity::Refused(Refusal::CoverageUnavailable)
     );
     assert_refused("removed slot", scan(&slot, &ledger));
-    assert_org_only("never-registered control after removal", scan(&loose, &ledger));
+    assert_withdrawn("never-registered control after removal", scan(&loose, &ledger));
     // Re-registered: no history, still refused; removed again: still lost.
     ledger.retain(BTreeSet::from([home]), Some(request_at + 900));
     assert_refused("re-registered slot", scan(&slot, &ledger));
@@ -3527,13 +3527,11 @@ fn rows_under_another_root_own_the_request() {
     );
 }
 
-/// A transcript request without its own telemetry is this transcript's alone
-/// only when the pass's duplicate census compared every indexed transcript and
-/// found no other holder. A witnessed duplicate refuses; an unsettled pass
-/// withdraws every marker-derived tag (org-only, and a marker org joined to
-/// login-only telemetry) to missing or login-only. Usage never moves.
+/// A witnessed duplicate still refuses. Every pass withdraws marker-derived
+/// tags to missing or login-only, including a fully compared/open census.
+/// Usage never moves and full telemetry remains authoritative.
 #[test]
-fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
+fn transcript_markers_are_withdrawn_even_when_a_settled_census_shows_unduplicated() {
     use crate::snapshots::ClaudeDuplicateCensusCounts;
     let dir = temp_dir("claude-request-identity-ownership");
     let org = org_hash(ORG_1);
@@ -3593,14 +3591,11 @@ fn transcript_markers_tag_only_requests_a_settled_census_shows_unduplicated() {
     };
     let clean = ScanIndex::default();
 
-    // Settled and unduplicated: today's contract-5 tags, as `apply_scan`.
+    // Settled and unduplicated: marker tags are still withdrawn, as `apply_scan`.
     let tagged = run(&clean, &settled, true);
     assert_eq!(
         bases(&tagged),
-        BTreeSet::from([
-            (identity::TRANSCRIPT_ORG.to_string(), Some(org.clone())),
-            (identity::TELEMETRY_LOGIN.to_string(), Some(org.clone())),
-        ])
+        BTreeSet::from([(identity::TELEMETRY_LOGIN.to_string(), None)])
     );
     assert_eq!(tagged.request_identity_refusals, 0);
     let mut via_default = parse_session(&dir, &lines);
@@ -3690,8 +3685,17 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
         ..Default::default()
     };
     let clean = ScanIndex::default();
+    let mut saved = clean.clone();
+    saved.claude_duplicate_request_owners.insert(
+        format!("{:x}", Sha256::digest(b"req_5")),
+        BTreeSet::from([
+            claude_duplicate_request_owner(ROOT, ROOT),
+            claude_duplicate_request_owner(OTHER_ROOT, OTHER_ROOT),
+        ]),
+    );
     let restarted: ScanIndex =
-        serde_json::from_slice(&serde_json::to_vec(&clean).unwrap()).unwrap();
+        serde_json::from_slice(&serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert_eq!(restarted.claude_duplicate_request_owners, saved.claude_duplicate_request_owners);
     // There is deliberately no D2 switch in this prerequisite. Legacy/OFF
     // and future D2-open inputs reach the same unconditional boundary.
     for (state, index, census, compared) in [
@@ -3844,7 +3848,11 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
 #[test]
 fn capture_on_non_marker_body_matches_main_before_withdrawal() {
     let dir = temp_dir("claude-i1b-non-marker-parity");
-    let lines = vec![owned_response("req_1", "2026-08-02T07:00:01Z", 10, 1)];
+    let lines = vec![
+        json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+            "attachment": {"type": "session_context", "context": {}}}),
+        owned_response("req_1", "2026-08-02T07:00:01Z", 10, 1),
+    ];
     let (api, trace) = reports(
         vec![signed(complete_api_row(ROOT, "req_1", 1, 10, 1, 0))],
         vec![complete_trace_row(ROOT, "req_1", "")],
