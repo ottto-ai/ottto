@@ -14,11 +14,40 @@ type HeldSlots = BTreeMap<String, Arc<HeldRaw>>;
 #[derive(Debug, Clone, Default)]
 pub(super) struct Holds(
     BTreeMap<&'static str, HeldSlots>,
-    BTreeMap<&'static str, BTreeMap<[u8; 32], [u8; 32]>>,
+    RepairProvenance,
     BTreeSet<[u8; 32]>, // held file family roots; fixed-size metadata per hold
     BTreeSet<[u8; 32]>, // known protected owners; no reverse file scan
     bool,               // any held file has unknown ownership
 );
+// Fixed-size multiset commitment to negative records repaired/dropped at the
+// persistence boundary. Neither corpus size nor Clone adds retained allocations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct RepairProvenance {
+    sum: u128,
+    count: u64,
+}
+impl RepairProvenance {
+    fn entry(field: &str, key: &str, raw_hash: [u8; 32]) -> u128 {
+        let mut hash = Sha256::new();
+        hash.update((field.len() as u64).to_le_bytes());
+        hash.update(field.as_bytes());
+        hash.update((key.len() as u64).to_le_bytes());
+        hash.update(key.as_bytes());
+        hash.update(raw_hash);
+        u128::from_le_bytes(hash.finalize()[..16].try_into().expect("digest prefix"))
+    }
+    fn add(&mut self, field: &str, key: &str, raw_hash: [u8; 32]) {
+        self.sum = self.sum.wrapping_add(Self::entry(field, key, raw_hash));
+        self.count = self
+            .count
+            .checked_add(1)
+            .expect("input record count fits u64");
+    }
+    fn remove(&mut self, field: &str, key: &str, raw_hash: [u8; 32]) {
+        self.sum = self.sum.wrapping_sub(Self::entry(field, key, raw_hash));
+        self.count = self.count.checked_sub(1).expect("record was repaired");
+    }
+}
 #[derive(Debug)]
 struct HeldRaw(Box<RawValue>, Option<String>);
 impl HeldRaw {
@@ -53,6 +82,18 @@ impl Holds {
             .flat_map(|slots| slots.values())
             .any(|raw| raw.1.is_none());
     }
+    #[cfg(test)]
+    pub(super) fn provenance_receipt(&self) -> (usize, u64, u128) {
+        (
+            std::mem::size_of::<RepairProvenance>(),
+            self.1.count,
+            self.1.sum,
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn clone_provenance_for_test(&self) -> impl Sized {
+        self.1
+    }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
     }
@@ -76,13 +117,11 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)?;
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.2, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.3, c)
     }
     fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.0, c)?;
-        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.1, c)?;
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.2, c)?;
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.3, c)
     }
@@ -322,10 +361,260 @@ struct Decoder<R> {
 struct Span {
     start: u64,
     len: u64,
+    resource: bool,
 }
 
-// Lexical validation is separate from typed errors, including 1e400. IgnoredAny
-// checks grammar without converting numeric tokens or constructing a DOM.
+// Constant-space gate over ORIGINAL bytes. No nesting tags/parent stack are
+// retained. Serde grammar checks run only after this gate caps their depth;
+// optional resource evidence is drained before it can reach a Serde scanner.
+const MAX_JSON_DEPTH: usize = claude_request_census::MAX_EVIDENCE_DEPTH;
+fn json_ws(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\r' | b'\n')
+}
+fn syntax() -> Error {
+    Error::Syntax(<serde_json::Error as serde::de::Error>::custom(
+        "invalid scan index JSON",
+    ))
+}
+fn peek<R: BufRead>(reader: &mut R) -> std::result::Result<Option<u8>, Error> {
+    Ok(reader.fill_buf()?.first().copied())
+}
+fn whitespace<R: BufRead>(reader: &mut R) -> std::result::Result<Option<u8>, Error> {
+    loop {
+        let bytes = reader.fill_buf()?;
+        let count = bytes.iter().take_while(|&&byte| json_ws(byte)).count();
+        if count == 0 {
+            return Ok(bytes.first().copied());
+        }
+        reader.consume(count);
+    }
+}
+#[derive(Clone, Copy, Default)]
+enum NumberState {
+    #[default]
+    None,
+    Sign,
+    Zero,
+    Integer,
+    Dot,
+    Fraction,
+    Exponent,
+    ExponentSign,
+    ExponentDigits,
+}
+impl NumberState {
+    fn finish(&mut self) -> std::result::Result<(), Error> {
+        if matches!(
+            self,
+            Self::Sign | Self::Dot | Self::Exponent | Self::ExponentSign
+        ) {
+            return Err(syntax());
+        }
+        *self = Self::None;
+        Ok(())
+    }
+    fn byte(&mut self, byte: u8) -> std::result::Result<(), Error> {
+        if json_ws(byte) || matches!(byte, b'{' | b'[' | b'}' | b']' | b',' | b':') {
+            return self.finish();
+        }
+        *self = match (*self, byte) {
+            (Self::None, b'-') => Self::Sign,
+            (Self::None | Self::Sign, b'0') => Self::Zero,
+            (Self::None | Self::Sign, b'1'..=b'9') => Self::Integer,
+            (Self::Integer, b'0'..=b'9') => Self::Integer,
+            (Self::Zero | Self::Integer, b'.') => Self::Dot,
+            (Self::Dot | Self::Fraction, b'0'..=b'9') => Self::Fraction,
+            (Self::Zero | Self::Integer | Self::Fraction, b'e' | b'E') => Self::Exponent,
+            (Self::Exponent, b'+' | b'-') => Self::ExponentSign,
+            (Self::Exponent | Self::ExponentSign | Self::ExponentDigits, b'0'..=b'9') => {
+                Self::ExponentDigits
+            }
+            (Self::None, _) => Self::None, // strings/literals checked after the gate
+            _ => return Err(syntax()),
+        };
+        Ok(())
+    }
+}
+fn lexical_span<R: BufRead + Seek>(
+    reader: &mut R,
+    optional: bool,
+    base_depth: usize,
+) -> std::result::Result<Span, Error> {
+    let first = whitespace(reader)?.ok_or_else(syntax)?;
+    if matches!(first, b',' | b'}' | b']' | b':') {
+        return Err(syntax());
+    }
+    let start = reader.stream_position()?;
+    let compound = matches!(first, b'{' | b'[' | b'"');
+    let mut len = 0u64;
+    let mut depth = 0usize;
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut resource = false;
+    let mut number = NumberState::None;
+    loop {
+        let Some(byte) = peek(reader)? else {
+            if depth != 0 || quoted {
+                return Err(syntax());
+            }
+            break;
+        };
+        if len > 0 && depth == 0 && !quoted && (json_ws(byte) || matches!(byte, b',' | b'}' | b']'))
+        {
+            break;
+        }
+        reader.consume(1);
+        len += 1;
+        resource |= optional && len > claude_request_census::MAX_RAW_BYTES as u64;
+        if quoted {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                quoted = false;
+            }
+        } else {
+            if !resource {
+                number.byte(byte)?;
+            }
+            match byte {
+                b'"' => {
+                    quoted = true;
+                    number = NumberState::None;
+                }
+                b'{' | b'[' => {
+                    depth = depth
+                        .checked_add(1)
+                        .ok_or(Error::Refused("nesting resource cap"))?;
+                    if depth.saturating_add(if optional { 0 } else { base_depth }) > MAX_JSON_DEPTH
+                    {
+                        if !optional {
+                            return Err(Error::Refused("main document nesting resource cap"));
+                        }
+                        resource = true;
+                    }
+                }
+                b'}' | b']' => {
+                    depth = depth.checked_sub(1).ok_or_else(syntax)?;
+                }
+                _ => {}
+            }
+        }
+        if compound && len > 0 && depth == 0 && !quoted {
+            break;
+        }
+    }
+    if !resource {
+        number.finish()?;
+    }
+    Ok(Span {
+        start,
+        len,
+        resource,
+    })
+}
+fn checked_grammar<R: BufRead + Seek>(
+    reader: &mut R,
+    span: Span,
+) -> std::result::Result<(), Error> {
+    // Only admitted depth reaches this library parser. Its scratch is bounded
+    // by MAX_JSON_DEPTH, never the depth of discarded original evidence.
+    // Pinned serde_json 1.0.149 deserialize_ignored_any calls iterative
+    // ignore_value directly; the native 128-level check_recursion is not used.
+    reader.seek(SeekFrom::Start(span.start))?;
+    serde_json::from_reader::<_, serde::de::IgnoredAny>((&mut *reader).take(span.len)).map_err(
+        |error| {
+            if error.is_io() {
+                Error::Refused("input read failed")
+            } else {
+                Error::Syntax(error)
+            }
+        },
+    )?;
+    reader.seek(SeekFrom::Start(span.start + span.len))?;
+    Ok(())
+}
+fn validate_original<R: BufRead + Seek>(reader: &mut R) -> std::result::Result<(), Error> {
+    reader.seek(SeekFrom::Start(0))?;
+    let first = whitespace(reader)?.ok_or_else(syntax)?;
+    let array = first == b'[';
+    if !matches!(first, b'{' | b'[') {
+        let span = lexical_span(reader, false, 0)?;
+        checked_grammar(reader, span)?;
+        if whitespace(reader)?.is_some() {
+            return Err(syntax());
+        }
+        return Err(Error::Refused("index shape"));
+    }
+    reader.consume(1);
+    let close = if array { b']' } else { b'}' };
+    let mut position = 0;
+    if whitespace(reader)? != Some(close) {
+        loop {
+            let name = if array {
+                FIELDS.get(position).copied()
+            } else {
+                if whitespace(reader)? != Some(b'"') {
+                    return Err(syntax());
+                }
+                let key = lexical_span(reader, false, 1)?;
+                checked_grammar(reader, key)?;
+                let name = if key.len <= 512 {
+                    reader.seek(SeekFrom::Start(key.start))?;
+                    let name = serde_json::from_reader::<_, String>((&mut *reader).take(key.len))
+                        .map_err(Error::Syntax)?;
+                    reader.seek(SeekFrom::Start(key.start + key.len))?;
+                    FIELDS.iter().copied().find(|field| *field == name)
+                } else {
+                    None
+                };
+                if whitespace(reader)? != Some(b':') {
+                    return Err(syntax());
+                }
+                reader.consume(1);
+                name
+            };
+            let optional = optional_census(name);
+            let value = lexical_span(reader, optional, 1)?;
+            if optional && !value.resource {
+                checked_grammar(reader, value)?;
+            }
+            position += 1;
+            match whitespace(reader)? {
+                Some(byte) if byte == close => break,
+                Some(b',') => {
+                    reader.consume(1);
+                }
+                _ => return Err(syntax()),
+            }
+        }
+    }
+    reader.consume(1);
+    if whitespace(reader)?.is_some() {
+        return Err(syntax());
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    // CensusRead now drains depth/byte RESOURCE evidence to null. Everything
+    // else was depth-gated above. This checks full JSON grammar without a DOM,
+    // including delimiter kinds/commas and grammar in admitted optional data.
+    claude_request_census::validate_gated_syntax(&mut *reader).map_err(|error| {
+        if error.is_io() {
+            Error::Refused("input read failed")
+        } else {
+            Error::Syntax(error)
+        }
+    })?;
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+fn optional_census(name: Option<&str>) -> bool {
+    matches!(
+        name,
+        Some("claude_request_census" | "claude_request_census_shadow")
+    )
+}
+
 pub(super) fn read<R: BufRead + Seek>(
     mut reader: R,
     stage: &str,
@@ -335,14 +624,7 @@ pub(super) fn read<R: BufRead + Seek>(
     let _side_request_counts = SideRequestCountGuard;
     let input_len = reader.seek(SeekFrom::End(0))?;
     reader.seek(SeekFrom::Start(0))?;
-    serde_json::from_reader::<_, serde::de::IgnoredAny>(&mut reader).map_err(|error| {
-        if error.is_io() {
-            Error::Refused("input read failed")
-        } else {
-            Error::Syntax(error)
-        }
-    })?;
-    reader.seek(SeekFrom::Start(0))?;
+    validate_original(&mut reader)?;
     let mut decoder = Decoder {
         reader,
         input_len,
@@ -447,17 +729,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn span(&mut self) -> std::result::Result<Span, Error> {
-        self.ws()?;
-        let start = self.reader.stream_position()?;
-        let mut stream = serde_json::Deserializer::from_reader(&mut self.reader)
-            .into_iter::<serde::de::IgnoredAny>();
-        stream
-            .next()
-            .ok_or(Error::Refused("missing value"))?
-            .map_err(|_| Error::Refused("changed input"))?;
-        let len = stream.byte_offset() as u64;
-        self.reader.seek(SeekFrom::Start(start + len))?;
-        Ok(Span { start, len })
+        lexical_span(&mut self.reader, false, 0)
+    }
+    fn span_optional(&mut self, optional: bool) -> std::result::Result<Span, Error> {
+        lexical_span(&mut self.reader, optional, 1)
     }
     fn typed<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -552,11 +827,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 Ok(decoded) => {
                     if repaired(&decoded) {
                         let hash = self.hash_span(value)?;
-                        self.holds
-                            .1
-                            .entry(field)
-                            .or_default()
-                            .insert(repair_key(&key), hash);
+                        self.holds.1.add(field, &key, hash);
                     }
                     values.insert(key, decoded);
                 }
@@ -634,11 +905,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         if let Some(held) = self.holds.0.remove(field) {
             for (key, raw) in held {
                 if let Some(value) = repair(&raw.0) {
-                    self.holds
-                        .1
-                        .entry(field)
-                        .or_default()
-                        .insert(repair_key(&key), repair_key(raw.get()));
+                    self.holds.1.add(field, &key, repair_key(raw.get()));
                     values.insert(key, value);
                     self.held_count -= 1;
                     self.held_bytes -= raw.get().len() as u64;
@@ -703,7 +970,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 self.eat(b':')?;
                 name
             };
-            let value = self.span()?;
+            let value = self.span_optional(optional_census(name))?;
             if let Some(name) = name {
                 if matches!(
                     name,
@@ -981,27 +1248,63 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
         Ok(index)
     }
+    fn freeze_unbound_authority_repairs(
+        &mut self,
+        index: &mut ScanIndex,
+    ) -> std::result::Result<(), Error> {
+        if self.counts.authority_repairs == 0 {
+            return Ok(());
+        }
+        let field = "claude_usage_authority_quarantine";
+        let Some(span) = self.family_spans.get(field).copied() else {
+            return Ok(());
+        };
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        self.eat(b'{')?;
+        while self.ws()? != Some(b'}') {
+            let key_span = self.span()?;
+            let key: String = self.typed(key_span)?;
+            self.eat(b':')?;
+            let value = self.span()?;
+            let unbound = index
+                .claude_usage_authority_quarantine
+                .get(&key)
+                .is_some_and(|record| {
+                    !index
+                        .claude_usage_family_witnesses
+                        .get(&key)
+                        .is_some_and(|witness| {
+                            claude_usage_authority_preserves_pending(record, witness)
+                        })
+                });
+            if unbound
+                && self
+                    .typed::<ClaudeUsageAuthorityQuarantineRecord>(value)
+                    .is_err()
+            {
+                let hash = self.hash_span(value)?;
+                self.holds.1.remove(field, &key, hash);
+                self.counts.authority_repairs -= 1;
+                index.claude_usage_authority_quarantine.remove(&key);
+                self.hold(field, key, value)?;
+            }
+            self.reader.seek(SeekFrom::Start(value.start + value.len))?;
+            if self.ws()? == Some(b',') {
+                self.eat(b',')?;
+            } else {
+                break;
+            }
+        }
+        self.eat(b'}')?;
+        Ok(())
+    }
     fn freeze_held_families(&mut self, index: &mut ScanIndex) -> std::result::Result<(), Error> {
         // A held family proof/pending slot also freezes any intact correction
         // and exclusion state for that family. Existing reproof/prune code may
         // not erase its debt just because its typed witness is now absent.
-        let unbound_repairs = index
-            .claude_usage_authority_quarantine
-            .iter()
-            .filter(|(key, record)| {
-                self.holds
-                    .1
-                    .get("claude_usage_authority_quarantine")
-                    .is_some_and(|keys| keys.contains_key(&repair_key(key)))
-                    && !index
-                        .claude_usage_family_witnesses
-                        .get(*key)
-                        .is_some_and(|witness| {
-                            claude_usage_authority_preserves_pending(record, witness)
-                        })
-            })
-            .map(|(key, _)| repair_key(key))
-            .collect::<BTreeSet<_>>();
+        // Admit unbound type repairs as raw holds first, so all sibling maps
+        // share their root fence without a corpus-sized temporary key set.
+        self.freeze_unbound_authority_repairs(index)?;
         let original = std::mem::take(&mut self.holds.0);
         let roots = original
             .iter()
@@ -1017,11 +1320,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                     }),
             )
             .collect::<BTreeSet<_>>();
-        if roots.is_empty() && unbound_repairs.is_empty() {
-            drop(roots);
-            self.holds.0 = original;
-            return Ok(());
-        }
         let fields = std::mem::take(&mut self.family_spans);
         for (field, span) in fields {
             self.reader.seek(SeekFrom::Start(span.start))?;
@@ -1031,18 +1329,25 @@ impl<R: BufRead + Seek> Decoder<R> {
                 let key: String = self.typed(key_span)?;
                 self.eat(b':')?;
                 let value = self.span()?;
-                if (roots.contains(key.as_str()) || unbound_repairs.contains(&repair_key(&key)))
+                let root_held = roots.contains(key.as_str());
+                // Inspect only one original record at a time. No per-repair key
+                // set survives this pass (or exists transiently for the corpus).
+                let repaired = field == "claude_usage_authority_quarantine"
+                    && self.counts.authority_repairs > 0
+                    && root_held
+                    && index.claude_usage_authority_quarantine.contains_key(&key)
+                    && self
+                        .typed::<ClaudeUsageAuthorityQuarantineRecord>(value)
+                        .is_err();
+                if root_held
                     && !original
                         .get(field)
                         .is_some_and(|slots| slots.contains_key(&key))
                     && !self.holds.contains(field, &key)
                 {
-                    if self
-                        .holds
-                        .1
-                        .get_mut(field)
-                        .is_some_and(|keys| keys.remove(&repair_key(&key)).is_some())
-                    {
+                    if repaired {
+                        let hash = self.hash_span(value)?;
+                        self.holds.1.remove(field, &key, hash);
                         self.counts.authority_repairs -= 1;
                     }
                     match field {
@@ -1085,20 +1390,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         index: &ScanIndex,
         span: Option<Span>,
     ) -> std::result::Result<(), Error> {
-        let unbound = index
-            .claude_usage_authority_quarantine
-            .iter()
-            .filter(|(key, record)| {
-                !index
-                    .claude_usage_family_witnesses
-                    .get(*key)
-                    .is_some_and(|witness| {
-                        claude_usage_authority_preserves_pending(record, witness)
-                    })
-            })
-            .map(|(key, _)| repair_key(key))
-            .collect::<BTreeSet<_>>();
-        let Some(span) = span.filter(|_| !unbound.is_empty()) else {
+        let Some(span) = span else {
             return Ok(());
         };
         self.reader.seek(SeekFrom::Start(span.start))?;
@@ -1108,14 +1400,22 @@ impl<R: BufRead + Seek> Decoder<R> {
             let key: String = self.typed(key_span)?;
             self.eat(b':')?;
             let value = self.span()?;
-            let key = repair_key(&key);
-            if unbound.contains(&key) {
+            if index
+                .claude_usage_authority_quarantine
+                .get(&key)
+                .is_some_and(|record| {
+                    !index
+                        .claude_usage_family_witnesses
+                        .get(&key)
+                        .is_some_and(|witness| {
+                            claude_usage_authority_preserves_pending(record, witness)
+                        })
+                })
+            {
                 let hash = self.hash_span(value)?;
                 self.holds
                     .1
-                    .entry("claude_authority_semantic_drop")
-                    .or_default()
-                    .insert(key, hash);
+                    .add("claude_usage_authority_quarantine", &key, hash);
             }
             self.reader.seek(SeekFrom::Start(value.start + value.len))?;
             if self.ws()? == Some(b',') {
@@ -1128,6 +1428,9 @@ impl<R: BufRead + Seek> Decoder<R> {
         Ok(())
     }
     fn census(&mut self, span: Span, field: &str) -> std::result::Result<ScanIndex, Error> {
+        if span.resource {
+            return Ok(ScanIndex::default());
+        }
         self.reader.seek(SeekFrom::Start(span.start))?;
         let prefix = format!("{{\"files\":{{}},\"{field}\":");
         let reader = std::io::Cursor::new(prefix)
@@ -1139,56 +1442,12 @@ impl<R: BufRead + Seek> Decoder<R> {
 
 impl ScanIndex {
     pub(super) fn decode_repairs_match(&self, working: &Self) -> bool {
-        self.decode_holds.1.iter().all(|(field, repairs)| {
-            let observed = |key: &str| {
-                repairs.get(&repair_key(key)).map_or(true, |raw| {
-                    working
-                        .decode_holds
-                        .1
-                        .get(field)
-                        .is_some_and(|prior| prior.get(&repair_key(key)) == Some(raw))
-                })
-            };
-            match *field {
-                "quarantined_snapshot_fingerprints" => self
-                    .quarantined_snapshot_fingerprints
-                    .iter()
-                    .all(|(key, current)| {
-                        observed(key)
-                            || working
-                                .quarantined_snapshot_fingerprints
-                                .get(key)
-                                .is_some_and(|prior| {
-                                    current.witness == prior.witness
-                                        && current.disposition == prior.disposition
-                                        && current.failed_reconstruction_count
-                                            == prior.failed_reconstruction_count
-                                        && current.upload_body_witness == prior.upload_body_witness
-                                        && (current.retry_after_unix_seconds
-                                            == prior.retry_after_unix_seconds
-                                            || (current.retry_after_unix_seconds
-                                                <= sampled_scan::now_seconds()
-                                                && prior.retry_after_unix_seconds
-                                                    <= sampled_scan::now_seconds()))
-                                })
-                    }),
-                "claude_usage_authority_quarantine" => self
-                    .claude_usage_authority_quarantine
-                    .iter()
-                    .all(|(key, current)| {
-                        observed(key)
-                            || working.claude_usage_authority_quarantine.get(key) == Some(current)
-                    }),
-                "claude_authority_semantic_drop" => repairs.iter().all(|(key, raw)| {
-                    working
-                        .decode_holds
-                        .1
-                        .get(field)
-                        .is_some_and(|prior| prior.get(key) == Some(raw))
-                }),
-                _ => false,
-            }
-        })
+        // Working domain transitions leave the load-time commitment intact.
+        // Thus accepting/removing/advancing a repaired record after load does
+        // not mistake our own native edits for new on-disk damage. A canonical
+        // save rewrites ALL repaired/dropped records; an empty current digest
+        // is safe (the old per-record iteration was vacuously true here too).
+        self.decode_holds.1.count == 0 || self.decode_holds.1 == working.decode_holds.1
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
         #[cfg(test)]
@@ -1341,7 +1600,7 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     // Preserve the caller byte bound and the existing census normalization and
     // node/depth admission before constructing native state. Original syntax is
     // checked before the optional census normalizer can replace damaged input.
-    serde_json::from_slice::<serde::de::IgnoredAny>(bytes)?;
+    validate_original(&mut std::io::Cursor::new(bytes))?;
     let (normalized, duplicate_census, duplicate_shadow) =
         claude_request_census::normalized_bounded_bytes(bytes)?;
     bounded_shape(&normalized)?;
@@ -1557,4 +1816,20 @@ thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell:
 #[cfg(test)]
 pub(super) fn scope_visits_for_test(reset: bool) -> usize {
     SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
+}
+
+#[cfg(test)]
+#[test]
+fn repair_commitment_is_order_independent_and_removes_frozen_records() {
+    let mut left = RepairProvenance::default();
+    left.add("quarantined_snapshot_fingerprints", "a", [1; 32]);
+    left.add("claude_usage_authority_quarantine", "b", [2; 32]);
+    let mut right = RepairProvenance::default();
+    right.add("claude_usage_authority_quarantine", "b", [2; 32]);
+    right.add("quarantined_snapshot_fingerprints", "a", [1; 32]);
+    assert_eq!(left, right);
+    right.remove("claude_usage_authority_quarantine", "b", [2; 32]);
+    let mut only_native = RepairProvenance::default();
+    only_native.add("quarantined_snapshot_fingerprints", "a", [1; 32]);
+    assert_eq!(right, only_native);
 }

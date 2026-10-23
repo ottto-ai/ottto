@@ -319,20 +319,26 @@ fn lenient_native_retry_and_terminal_scalar_repairs() {
                 for bounded in [false, true] {
                     fs::write(&path, bytes.as_bytes()).unwrap();
                     let mut saving = working.clone();
-                    if bounded {
-                        let result = saving.save_with_read_limit(&path, 1024 * 1024);
-                        if !loaded.decode_repairs_match(&working) {
-                            assert!(result.is_err());
-                        } else {
-                            result.unwrap();
-                        }
+                    let result = if bounded {
+                        saving.save_with_read_limit(&path, 1024 * 1024)
                     } else {
-                        let result = saving.save(&path);
-                        if !loaded.decode_repairs_match(&working) {
-                            assert!(result.is_err());
-                        } else {
-                            result.unwrap();
-                        }
+                        saving.save(&path)
+                    };
+                    // 300 seconds since the epoch is an ordinary due retry
+                    // deadline, not malformed data. Every other matrix cell
+                    // actually repairs negative state newly seen only at CAS.
+                    if disposition == "retry_pending"
+                        && leaf == "retry_after_unix_seconds"
+                        && bad == "300"
+                    {
+                        result.unwrap();
+                    } else {
+                        assert!(result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("current_index_requires_reload"));
+                        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+                        assert_eq!(saving.generation, working.generation);
                     }
                 }
                 assert_sibling(&loaded);
@@ -873,5 +879,271 @@ fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
         assert!(ScanIndex::load(&path).is_err());
         assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
         assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    }
+}
+
+#[test]
+fn repair_provenance_is_constant_for_many_scalar_repairs_and_authority_drops() {
+    let mut retained_bytes = None;
+    for count in [16, 512] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-fixed-provenance");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        for n in 0..count {
+            seed.quarantined_snapshot_fingerprints.insert(
+                format!("{n:064x}"),
+                snapshot_quarantine_record(SnapshotSource::ClaudeCode),
+            );
+            seed.insert_retry_pending_claude_authority_for_test(&format!("digest-family-{n}"));
+        }
+        seed.save(&path).unwrap();
+        let mut value = serde_json::to_value(&seed).unwrap();
+        for n in 0..count {
+            value["quarantined_snapshot_fingerprints"][format!("{n:064x}")]
+                ["failed_reconstruction_count"] = serde_json::json!(255);
+        }
+        value["claude_usage_family_witnesses"] = serde_json::json!({});
+        let original = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &original).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded.decode_holds.is_empty());
+        assert!(loaded.claude_usage_authority_quarantine.is_empty());
+        let receipt = loaded.decode_holds.provenance_receipt();
+        assert_eq!(receipt.1, (2 * count) as u64);
+        assert_eq!(*retained_bytes.get_or_insert(receipt.0), receipt.0);
+        assert!(receipt.0 <= 32);
+        if crate::heap_layout_bound::layout_supported() {
+            assert_eq!(
+                crate::heap_layout_bound::completed_bound(&loaded.decode_holds, usize::MAX),
+                Some(std::mem::size_of_val(&loaded.decode_holds))
+            );
+        }
+        let (_, clone) = crate::retry_allocation_probe::measure(|| {
+            loaded.decode_holds.clone_provenance_for_test()
+        });
+        assert_eq!(clone.allocations, 0);
+        assert_eq!(clone.requested_peak, 0);
+        assert_eq!(clone.usable_peak, 0);
+        // Large corpus exercises ordinary CAS; selected CAS retains its 8192
+        // node gate, so its independent damage test uses the smaller corpus.
+        for bounded in [false, true]
+            .into_iter()
+            .filter(|bounded| !*bounded || count == 16)
+        {
+            for damage in ["quarantine", "authority"] {
+                let mut saving = loaded.clone();
+                let mut changed_value: Value = serde_json::from_slice(&original).unwrap();
+                if damage == "quarantine" {
+                    changed_value["quarantined_snapshot_fingerprints"][format!("{:064x}", 0)]
+                        ["failed_reconstruction_count"] = serde_json::json!(254);
+                } else {
+                    changed_value["claude_usage_authority_quarantine"]["digest-family-0"]
+                        ["failed_reconstruction_count"] = serde_json::json!(254);
+                }
+                let changed = serde_json::to_vec(&changed_value).unwrap();
+                fs::write(&path, &changed).unwrap();
+                let result = if bounded {
+                    saving.save_with_read_limit(&path, 8 * 1024 * 1024)
+                } else {
+                    saving.save(&path)
+                };
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("current_index_requires_reload"));
+                assert_eq!(fs::read(&path).unwrap(), changed);
+                assert_eq!(saving.generation, loaded.generation);
+                fs::write(&path, &original).unwrap();
+                saving.resume_after_path = Some("unrelated-progress".into());
+                if bounded {
+                    saving.save_with_read_limit(&path, 8 * 1024 * 1024).unwrap();
+                } else {
+                    saving.save(&path).unwrap();
+                }
+                assert_sibling(&ScanIndex::load(&path).unwrap());
+            }
+        }
+        eprintln!("lenient_fixed_provenance_receipt records={} inline_bytes={} clone_requested_peak={} clone_usable_peak={}", 2 * count, receipt.0, clone.requested_peak, clone.usable_peak);
+    }
+}
+
+fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
+    use std::io::Write;
+    let mut file = BufWriter::new(File::create(path).unwrap());
+    file.write_all(&prefix[..prefix.len() - 1]).unwrap();
+    let field = b",\"claude_request_census\":";
+    file.write_all(field).unwrap();
+    for byte in [b'[', b']'] {
+        let block = [byte; 8192];
+        if byte == b']' {
+            file.write_all(b"0").unwrap();
+        }
+        for _ in 0..depth / block.len() {
+            file.write_all(&block).unwrap();
+        }
+        file.write_all(&block[..depth % block.len()]).unwrap();
+    }
+    file.write_all(b"}").unwrap();
+    file.flush().unwrap();
+    prefix.len() + field.len() + 2 * depth + 1
+}
+
+#[test]
+fn streamed_million_deep_census_is_resource_unknown_with_bounded_allocations() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-deep-census");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.save(&path).unwrap();
+    let prefix = fs::read(&path).unwrap();
+    for depth in [128, 200, 256, 257, 1_000, 1_000_000] {
+        let input_len = write_deep_optional(&path, &prefix, depth);
+        // The retained main codec is the baseline for optional unknown/null.
+        let (baseline, main) = crate::retry_allocation_probe::measure(|| {
+            claude_request_census::decode_index(File::open(&path).unwrap()).unwrap()
+        });
+        assert!(baseline.claude_request_census.is_empty());
+        let (loaded, load) =
+            crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
+        assert!(loaded.claude_request_census.is_empty());
+        assert_sibling(&loaded);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        assert!(load.requested_peak <= main.requested_peak + 96 * 1024);
+        assert!(load.usable_peak <= main.usable_peak + 128 * 1024);
+        let mut ordinary = loaded.clone();
+        let (result, cas) = crate::retry_allocation_probe::measure(|| ordinary.save(&path));
+        result.unwrap();
+        assert!(cas.requested_peak <= main.requested_peak + 192 * 1024);
+        assert!(cas.usable_peak <= main.usable_peak + 256 * 1024);
+        write_deep_optional(&path, &prefix, depth);
+        let (input, input_read) = crate::retry_allocation_probe::measure(|| {
+            crate::snapshot_retry::read_state(&path, input_len).unwrap()
+        });
+        assert_eq!(input.len(), input_len);
+        drop(input);
+        let mut bounded = loaded.clone();
+        let (result, selected) = crate::retry_allocation_probe::measure(|| {
+            bounded.save_with_read_limit(&path, input_len)
+        });
+        result.unwrap();
+        assert!(
+            selected.requested_peak <= input_read.requested_peak + main.requested_peak + 192 * 1024
+        );
+        assert!(selected.usable_peak <= input_read.usable_peak + main.usable_peak + 256 * 1024);
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert_sibling(&restarted);
+        assert!(restarted.claude_request_census.is_empty());
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        eprintln!("lenient_deep_census_receipt depth={depth} main_requested={} main_usable={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} input_usable={} selected_requested={} selected_usable={}", main.requested_peak, main.usable_peak, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, input_read.usable_peak, selected.requested_peak, selected.usable_peak);
+    }
+}
+
+#[test]
+fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-depth-resource");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.save(&path).unwrap();
+    let bytes = format!(
+        "{{\"files\":{{}},\"unknown\":{}0{}}}",
+        "[".repeat(1000),
+        "]".repeat(1000)
+    )
+    .into_bytes();
+    fs::write(&path, &bytes).unwrap();
+    assert!(format!("{:#}", ScanIndex::load(&path).unwrap_err()).contains("resource cap"));
+    for bounded in [false, true] {
+        let result = if bounded {
+            seed.save_with_read_limit(&path, bytes.len())
+        } else {
+            seed.save(&path)
+        };
+        assert!(result.is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    }
+    for invalid in [
+        "{\"files\":{},\"unknown\":[}",
+        "{\"files\":{},\"unknown\":[0 1]}",
+        "{\"files\":{},\"claude_request_census\":[0,]}",
+        "{\"files\":{},\"unknown\":01}",
+        "{\"files\":{},\"unknown\":1e}",
+    ] {
+        fs::write(&path, invalid).unwrap();
+        ScanIndex::load(&path).unwrap();
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn populated_valid_wire_matches_the_retained_native_codec() {
+    let mut index = fixture();
+    index.insert_retry_pending_claude_authority_for_test("valid-family");
+    index.legacy_settlement_reconcile_after_fingerprint = Some(format!("{:064x}", 0));
+    index.resume_after_path = Some("/synthetic/7.jsonl".into());
+    let bytes = serde_json::to_vec_pretty(&index).unwrap();
+    let native = claude_request_census::decode_index(std::io::Cursor::new(&bytes)).unwrap();
+    let isolated =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    assert_eq!(serde_json::to_vec_pretty(&native).unwrap(), bytes);
+    assert_eq!(serde_json::to_vec_pretty(&isolated).unwrap(), bytes);
+}
+
+#[test]
+fn unbound_type_repair_freezes_siblings_without_retaining_repair_keys() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-fixed-provenance-hold");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.insert_retry_pending_claude_authority_for_test("family");
+    seed.save(&path).unwrap();
+    let mut value = serde_json::to_value(&seed).unwrap();
+    value["claude_usage_family_witnesses"]["family"]["legacy_owner_roots"] =
+        serde_json::json!(["different-owner"]);
+    value["claude_usage_authority_quarantine"]["family"]["failed_reconstruction_count"] =
+        serde_json::json!(300);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let authority = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
+    let witness = raw_slot(&bytes, "claude_usage_family_witnesses", "family");
+    fs::write(&path, &bytes).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.decode_holds_family("family"));
+    assert!(loaded.claude_usage_authority_quarantine.is_empty());
+    assert_eq!(loaded.decode_holds.provenance_receipt().1, 0);
+    loaded.save(&path).unwrap();
+    let saved = fs::read(&path).unwrap();
+    assert_eq!(
+        raw_slot(&saved, "claude_usage_authority_quarantine", "family"),
+        authority
+    );
+    assert_eq!(
+        raw_slot(&saved, "claude_usage_family_witnesses", "family"),
+        witness
+    );
+}
+
+#[test]
+fn admitted_unknown_main_values_cross_serde_native_recursion_threshold() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-admitted-depth");
+    let path = scratch.as_ref().join("index.json");
+    let mut seed = fixture();
+    seed.save(&path).unwrap();
+    let prefix = fs::read(&path).unwrap();
+    for depth in [128, 200, 255] {
+        let mut bytes = prefix[..prefix.len() - 1].to_vec();
+        bytes.extend_from_slice(b",\"unknown\":");
+        bytes.extend(std::iter::repeat(b'[').take(depth));
+        bytes.push(b'0');
+        bytes.extend(std::iter::repeat(b']').take(depth));
+        bytes.push(b'}');
+        fs::write(&path, &bytes).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_sibling(&loaded);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        // Selected CAS deliberately keeps its stricter preexisting depth-64
+        // shape gate; ordinary load/CAS retain admitted unknown JSON values.
+        assert!(loaded.save_with_read_limit(&path, bytes.len()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        loaded.save(&path).unwrap();
+        assert_sibling(&ScanIndex::load(&path).unwrap());
     }
 }

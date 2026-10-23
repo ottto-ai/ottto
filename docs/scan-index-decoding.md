@@ -35,3 +35,17 @@ The independent money-selection codec must drop/count only a bad file selection,
 leave that file due for census, and retain other selection records. A money
 ledger version or decode failure must return an error without moving or replacing
 the ledger file. This contract does not add money fields or change their owner.
+
+The original-input lexical gate keeps scalar depth, quote/escape and number
+state, with no container stack. Main-document nesting above 256 refuses in
+place. Optional census evidence beyond that depth or its existing raw byte cap
+is drained and becomes unknown/null as a resource outcome. Only admitted input
+reaches bounded grammar checks; syntax damage within admitted data retains the
+quarantine rule. The syntax-only census pass neither buffers nor interprets it.
+
+Negative repair provenance is one fixed-size digest and count, independent of
+the corpus. The digest sums truncated SHA-256 commitments to field, key and
+original record hash. Domain edits after load keep that commitment, so ordinary
+transitions can save against the same damaged disk input. Changed nonempty CAS
+provenance requires reload. Canonical saves remove the repaired input; an empty
+current commitment contains no new damage and permits later partial/final saves.
