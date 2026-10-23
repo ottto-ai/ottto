@@ -18,6 +18,12 @@ terminal owed a clean follow-up that the same debt could never satisfy.
 - The census-withheld branch keeps `census_complete = false` and the
   non-terminal scan, with no v1 for held families, but no longer marks the
   sweep.
+- The scanner terminal keeps its census incomplete while RetryPending debt
+  exists, without owing a clean follow-up. The complete proof fold,
+  quarantine retirement and upload-context adoption therefore stay withheld
+  exactly as the mark withheld them; the first fix run (CI 39871789318) showed
+  that without this gate a held family's quarantine rebound to a newly proven
+  witness and the accepted ledger moved to the new upload context.
 - The C1a latch clear and `identity_contract_rearm` additionally require zero
   authority debt, because the sweep flag no longer carries it.
 
@@ -37,8 +43,9 @@ Pipeline tests cover a bound RetryPending hold that settles on `Completed` and
 `Rejected` pages, the same hold beside a second cause (server deferral and an
 unbound record), unrelated pages settling like no debt, a held family beside a
 witnessed stale family on a red retry (carry only for the unrelated family), a
-held root that is never carried, debt beside an existing mark, the C1a latch
-surviving debt, and a held root that is never an unchanged-proof root.
+held root that is never carried, debt beside an existing mark, and the C1a
+latch surviving debt. Unit tests cover the bound predicate, a held root that is
+never an unchanged-proof root, and debt beside a retryable server conflict.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

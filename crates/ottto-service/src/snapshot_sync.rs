@@ -17324,6 +17324,41 @@ mod tests {
         );
     }
 
+    /// Path-(a) bridge: RetryPending debt elsewhere settles a page without
+    /// local holds as no debt would and keeps only full completion pending; a
+    /// second cause beside the debt (a retryable server conflict) still marks
+    /// the sweep.
+    #[test]
+    fn retry_pending_debt_elsewhere_marks_the_sweep_only_with_a_second_cause() {
+        let committed = claude_index_with(serde_json::json!({}));
+        let debt_only = LocalHoldSettlement {
+            held_entity_count: 0,
+            retry_pending_family_count: 1,
+            held_fingerprints: BTreeSet::new(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: false,
+        };
+        let progress = test_upload_progress();
+        let completed =
+            settle_completed_upload(committed.clone(), &committed, &progress, &debt_only);
+        assert!(!completed.index.bounded_sweep_had_unsettled_upload());
+        assert!(
+            !completed.fully_settled,
+            "the debt keeps completion pending"
+        );
+        let rejected =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(!rejected.fully_settled);
+        let deferred =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
+        assert!(
+            deferred.index.bounded_sweep_had_unsettled_upload(),
+            "a retryable server conflict beside the debt still marks the sweep"
+        );
+        assert!(!deferred.fully_settled);
+    }
+
     /// The backend's error-code set is closed and its forward tolerance covers
     /// unknown fields, never unknown values: `census_residue` against a backend
     /// that does not admit it would reject the ENTIRE receipt. So until the

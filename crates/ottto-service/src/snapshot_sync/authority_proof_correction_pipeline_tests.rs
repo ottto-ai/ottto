@@ -2559,9 +2559,9 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
     fixture.append_family_request(Some(APC_AGENTS[0]), "req_recovered", 4);
     for number in 0..APC_MAX_PAGES {
         let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
-        // Before the path-(a) bridge the RetryPending debt also marked the
-        // sweep, so the ordinary census was incomplete before this fold.
-        // Since the bridge only the outward census is withheld; the native
+        // The ordinary census before this fold is incomplete while the
+        // RetryPending debt exists (before the path-(a) bridge through the
+        // sweep mark, since then through the debt itself); the native
         // terminal folds the reproof either way.
         let target = fixture.native_terminal_seen.get()
             && page.record_before().is_some_and(|record| !record.terminal);

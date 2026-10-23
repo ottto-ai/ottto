@@ -19907,7 +19907,16 @@ impl OwnedSourceScan {
                     && !parent_resolution_restart;
                 let needs_clean_followup =
                     raw_census_complete && index.bounded_sweep_had_unsettled_upload;
-                let census_complete = raw_census_complete && !needs_clean_followup;
+                // Path-(a) bridge: RetryPending authority debt no longer marks
+                // the sweep, but it still withholds census completion (and so
+                // the complete fold and upload-context adoption), as the mark
+                // did. It owes no clean follow-up of its own.
+                let authority_debt_withholds_census = raw_census_complete
+                    && source == SnapshotSource::ClaudeCode
+                    && index.claude_usage_authority_pending_count() > 0;
+                let census_complete = raw_census_complete
+                    && !needs_clean_followup
+                    && !authority_debt_withholds_census;
                 // Slice D1: prune and measure only, before any fold.
                 let claude_request_census_shadow =
                     (source == SnapshotSource::ClaudeCode && census_complete).then(|| {
