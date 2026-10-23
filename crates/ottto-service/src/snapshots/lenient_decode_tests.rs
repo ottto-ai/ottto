@@ -1398,6 +1398,17 @@ fn opaque_file_incidence_preserves_existing_acks_through_both_pruners_and_restar
                 subset.accepted_snapshot_fingerprints.contains(&ack),
                 !exact_empty
             );
+            if !exact_empty {
+                let mut tentative = loaded.clone();
+                tentative
+                    .file_snapshot_fingerprints
+                    .insert(key.into(), BTreeSet::new());
+                assert!(!tentative.decode_has_opaque_file_incidence());
+                let partial =
+                    tentative.committable_subset(&loaded, &BTreeSet::new(), &BTreeMap::new());
+                assert!(partial.decode_has_opaque_file_incidence());
+                assert!(partial.accepted_snapshot_fingerprints.contains(&ack));
+            }
             assert!(!loaded
                 .eligible_snapshot_fingerprint_refs()
                 .any(|fp| fp == ack));

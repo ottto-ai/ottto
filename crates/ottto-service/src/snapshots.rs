@@ -37182,8 +37182,13 @@ impl ScanIndex {
         }
         let mut accepted_snapshot_fingerprints = previous.accepted_snapshot_fingerprints.clone();
         accepted_snapshot_fingerprints.extend(accepted.iter().cloned());
+        // Use the incidence this partial commit will publish, which can still
+        // be UNKNOWN even if working state tentatively learned an exact set.
+        let opaque_incidence = self
+            .decode_held_file_keys()
+            .any(|key| !file_snapshot_fingerprints.contains_key(key));
         accepted_snapshot_fingerprints.retain(|fingerprint| {
-            committable_fingerprints.contains(fingerprint)
+            (opaque_incidence || committable_fingerprints.contains(fingerprint))
                 && !retained_quarantine.contains_key(fingerprint)
         });
         let mut snapshot_activity_at = BTreeMap::new();
