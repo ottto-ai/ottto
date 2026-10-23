@@ -767,10 +767,13 @@ fn run_writer(receiver: Receiver<Job>) {
             Job::Write(job) => {
                 let bytes = job.queued_bytes();
                 let failed = failed.entry(job.support_dir.clone()).or_default();
+                let lost_ack = job.jsonl.fault == super::PageFault::LostAck;
                 let (support_dir, result) = write(*job, failed);
                 QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                if let Ok(mut results) = RESULTS.lock() {
-                    results.entry(support_dir).or_default().push(result);
+                if !lost_ack {
+                    if let Ok(mut results) = RESULTS.lock() {
+                        results.entry(support_dir).or_default().push(result);
+                    }
                 }
             }
             #[cfg(test)]
@@ -827,9 +830,17 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
             memo.basis = None;
         }
     }
+    let save_failed = jsonl.fault == super::PageFault::SaveFailure;
     let jsonl = outcome;
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
-        write_save(&support_dir.join(LEDGER_DIR), &save, failed)
+        if save_failed {
+            (
+                save.shards.iter().map(|(shard, _)| *shard).collect(),
+                Some(save.meta_debt),
+            )
+        } else {
+            write_save(&support_dir.join(LEDGER_DIR), &save, failed)
+        }
     });
     let result = WriteResult {
         jsonl,

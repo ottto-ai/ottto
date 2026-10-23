@@ -1399,3 +1399,36 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(money::reserved_for_test(), 0);
     println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} capture_us={}", armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, counts.capture_us);
 }
+
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    for (at, fault) in [money::PageFault::WriteFailure, money::PageFault::SyncFailure,
+        money::PageFault::SaveFailure, money::PageFault::LostAck].into_iter().enumerate() {
+        let (fixture, index, scan) = money_armed_scan(&format!("money-p1b-fault-{at}"));
+        let page = |now| money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
+        money::set_page_fault_for_test(fault);
+        let first = page(response + 3600);
+        money::set_page_fault_for_test(money::PageFault::None);
+        money::store::flush();
+        let second = page(response + 3601);
+        money::store::flush();
+        if matches!(fault, money::PageFault::WriteFailure | money::PageFault::SyncFailure) {
+            assert!(second.jsonl_failed > 0, "{fault:?}: {second:?}");
+            assert!(second.family_memos_withheld > 0);
+            assert_eq!(second.unchanged, 0);
+            assert!(money_jsonl_rows(&fixture.support).iter().any(|row| row["dropped"] == true));
+        } else if fault == money::PageFault::SaveFailure {
+            assert!(first.ledger_save_bytes > 0);
+            let dirty = money::store::with_ledger_for_test(&fixture.support, |ledger| ledger.dirty_shards());
+            assert!(dirty.unwrap() > 0);
+        } else {
+            assert_eq!(second.unchanged, 0, "a lost acknowledgement cannot suppress output");
+            assert_eq!(second.jsonl_rows, 0);
+        }
+        assert_eq!(money::reserved_for_test(), 0);
+    }
+}

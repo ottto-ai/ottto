@@ -501,6 +501,7 @@ fn publish_off(support_dir: &Path, now: u64) {
         support_dir: support_dir.to_path_buf(),
         jsonl: JsonlBatch {
             now,
+            fault: PageFault::None,
             families: Vec::new(),
             coverage: CoverageRow {
                 row: "page",
@@ -541,6 +542,10 @@ pub(crate) enum PageFault {
     LateAtHandOff,
     /// The batch's admission is refused.
     BatchRefused,
+    WriteFailure,
+    SyncFailure,
+    SaveFailure,
+    LostAck,
 }
 
 #[cfg(test)]
@@ -551,6 +556,17 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_page_fault_for_test(fault: PageFault) {
     PAGE_FAULT.with(|current| current.set(fault));
+}
+
+fn current_fault() -> PageFault {
+    #[cfg(test)]
+    {
+        PAGE_FAULT.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        PageFault::None
+    }
 }
 
 fn faulted(fault: PageFault) -> bool {
@@ -2287,6 +2303,7 @@ fn hand_off_reserved_buffer(
         support_dir: end.support_dir.to_path_buf(),
         jsonl: JsonlBatch {
             now: end.now,
+            fault: current_fault(),
             families,
             coverage,
             buffer_bytes,
@@ -2724,6 +2741,7 @@ fn take_owed_coverage(
 /// One page's rows for today's JSONL file (serialized by the writer).
 pub(crate) struct JsonlBatch {
     now: u64,
+    fault: PageFault,
     families: Vec<FamilyRows>,
     coverage: CoverageRow,
     /// The admitted stream buffer (0: unbuffered).
@@ -2865,6 +2883,11 @@ fn serialized_len<T: Serialize>(value: &T) -> u64 {
 fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
+    if batch.fault == PageFault::WriteFailure {
+        outcome.failed = 1;
+        owe_coverage(support_dir, now, true);
+        return outcome;
+    }
     let dir = support_dir.join("diagnostics");
     let Some(today) = day_stamp(now).filter(|_| std::fs::create_dir_all(&dir).is_ok()) else {
         outcome.failed += 1;
@@ -2967,7 +2990,7 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
             dropped: false,
             ..CoverageRow::owed(now)
         });
-    let written = file.finish() && sealed == seal_written;
+    let written = file.finish() && sealed == seal_written && batch.fault != PageFault::SyncFailure;
     outcome.truncated = rows - kept;
     if written {
         outcome.rows = kept + u64::from(coverage_fits) + u64::from(sealed);
