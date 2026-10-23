@@ -982,7 +982,12 @@ fn money_gate_off_saved_fixture_receipt() {
             &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
             &namespace,
         ));
-        let mut seed = serde_json::to_value(ScanIndex::default()).unwrap();
+        let mut seed = if history == 0 {
+            serde_json::to_value(ScanIndex::default()).unwrap()
+        } else {
+            money_m4_saved_inputs(&base, &support)
+        };
+        let ledger_before = money_saved_ledger_files(&support);
         seed["accepted_snapshot_fingerprints"] = serde_json::json!((0..history)
             .map(|n| format!("{n:064x}"))
             .collect::<Vec<_>>());
@@ -1141,11 +1146,199 @@ fn money_gate_off_saved_fixture_receipt() {
                 );
             }
         }
+        let ledger_after = money_saved_ledger_files(&support);
+        assert_eq!(
+            ledger_before, ledger_after,
+            "OFF must not write the saved money ledger"
+        );
+        let saved_value = serde_json::to_value(&saved).unwrap();
+        let selections = saved_value
+            .get("claude_money_files")
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, |files| files.len());
+        assert_eq!(selections, 0, "OFF must not grow live selection custody");
+        eprintln!("MONEY_GATE_OFF_SAVED history={history} ledger_files={} ledger_bytes={} saved_index_bytes={} selection_records={selections} ledger_rewrites=0 allocation_and_read_io_receipt=false",
+            ledger_before.len(), ledger_before.iter().map(|(_, bytes, _, _)| bytes).sum::<u64>(),
+            std::fs::metadata(&index_path).unwrap().len());
         // Keep the local-only marker comparison separate from the upload
         // identity bytes. The workflow diffs both receipts against main.
         receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,
             "local_claude_org_markers":local_markers,"offers":offers,
-            "saved_fingerprints":ScanIndex::load(&index_path).unwrap().current_snapshot_fingerprints()}));
+            "saved_fingerprints":saved.current_snapshot_fingerprints(),
+            "saved_index_bytes":std::fs::metadata(&index_path).unwrap().len(),
+            "live_selection_records":selections,
+            "money_ledger":ledger_before.iter().map(|(path,bytes,digest,_)|
+                serde_json::json!({"path":path,"bytes":bytes,"sha256":digest})).collect::<Vec<_>>()}));
     }
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
+}
+
+// Kept in this file because CI copies it unchanged into the pinned main tree.
+// The large saved state is generated ONCE and then copied byte for byte for
+// both actual callers. No provider account, host transcript, or live store.
+fn money_m4_saved_inputs(base: &Path, support: &Path) -> serde_json::Value {
+    use crate::snapshots::claude_request_census::{
+        message_key, telemetry_key, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+        ClaudeRequestCensusShape, ClaudeTelemetryTailState,
+    };
+    use crate::snapshots::claude_request_money::{facts, store, ClaudeMoneyTokens};
+    const FILES: usize = 11_500;
+    const SIDECARS: usize = 5_600;
+    let saved = base.join("m4-saved-inputs");
+    let index_path = saved.join("index.json");
+    if !index_path.exists() {
+        std::fs::create_dir_all(&saved).unwrap();
+        let mut index = ScanIndex::default();
+        let mut ledger = store::ClaudeLedger::new_for_test();
+        for n in 0..FILES {
+            let key = format!(
+                "/synthetic/m4/projects/-repo-{}/{n:08x}-0000-4000-8000-000000000000.jsonl",
+                n % 400
+            );
+            let fingerprint = format!("{:064x}", n + 1);
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":1,"modified_unix_seconds":2,
+                    "source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":null
+                }))
+                .unwrap(),
+            );
+            let mut hashes = (n as u64 * 61..(n as u64 + 1) * 61)
+                .map(|id| id.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &fingerprint,
+                7,
+                ClaudeRequestCensusShape::Exact,
+                hashes,
+            );
+            assert_eq!(
+                ledger.insert(
+                    message_key(&key),
+                    ClaudeRequestCensusRecord::message_record(&record, Vec::new())
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+            assert_eq!(
+                index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&key, record),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        let now = 1_792_627_200;
+        for n in 0..SIDECARS {
+            let session = format!("{n:08x}-1111-4111-8111-111111111111");
+            let mut header = facts::ClaudeFactsHeader {
+                session: session.clone(),
+                base_clock: now - 86_400,
+                ..Default::default()
+            };
+            let opus = header.intern("claude-opus-4-6", "", "high").unwrap();
+            let haiku = header.intern("claude-haiku-4-5", "", "").unwrap();
+            let mut pairs = (0..99_u64)
+                .map(|row| {
+                    let id = n as u64 * 1_000 + row;
+                    (
+                        id.wrapping_mul(0xd6e8_feb8_6659_fd93),
+                        facts::ClaudeFact {
+                            tokens: ClaudeMoneyTokens {
+                                input: 3 + id % 7,
+                                output: 200 + id * 13 % 1_800,
+                                cache_read: 40_000 + id * 997 % 110_000,
+                                cache_5m: 1_000 + id * 31 % 4_000,
+                                ..Default::default()
+                            },
+                            cost_micros: Some(20_000 + id * 71 % 80_000),
+                            clock: now - 86_400 + row * 37,
+                            style: if row % 5 == 0 { haiku } else { opus },
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            pairs.sort_unstable_by_key(|(hash, _)| *hash);
+            let blob = facts::encode(&header, pairs.iter().map(|(_, fact)| fact), 0);
+            assert_eq!(
+                ledger.insert(
+                    telemetry_key(&session),
+                    ClaudeRequestCensusRecord::telemetry(
+                        pairs.iter().map(|(hash, _)| *hash).collect(),
+                        blob.into_boxed_slice(),
+                        ClaudeTelemetryTailState {
+                            device: 1,
+                            inode: n as u64 + 1,
+                            offset: 99 * 450,
+                            line_sum: 1,
+                            last_append_unix: now - 3_600,
+                            audited_offset: 99 * 450,
+                            audited_unix: now,
+                            first_event_unix: now - 86_400,
+                            ..Default::default()
+                        },
+                        now - 86_400
+                    )
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        assert_eq!(
+            index.claude_request_census_for_test().hash_total_for_test(),
+            701_500
+        );
+        assert_eq!(ledger.census().record_count(), 17_100);
+        assert_eq!(ledger.census().hash_total_for_test(), 554_400);
+        let mut writer = store::WriterState::default();
+        while let Some((_, _, unwritten)) =
+            store::save_page_for_test(&saved, &mut ledger, &mut writer)
+        {
+            assert_eq!(unwritten, 0);
+        }
+        index.save(&index_path).unwrap();
+    }
+    let source = saved.join("claude-request-ledger");
+    let destination = support.join("claude-request-ledger");
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination).unwrap();
+    }
+    std::fs::create_dir_all(&destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+    }
+    // Verify the saved large index rather than trusting the generation loop.
+    let index = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(index.files.len(), FILES);
+    assert_eq!(index.claude_request_census_for_test().len_for_test(), FILES);
+    assert_eq!(
+        index.claude_request_census_for_test().hash_total_for_test(),
+        701_500
+    );
+    serde_json::to_value(index).unwrap()
+}
+
+// Digest and mtime catch both changed bytes and rewriting identical bytes.
+// This proves absence of ledger writes, not absence of filesystem reads.
+fn money_saved_ledger_files(support: &Path) -> Vec<(String, u64, String, std::time::SystemTime)> {
+    let dir = support.join("claude-request-ledger");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut files = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                metadata.len(),
+                format!("{:x}", Sha256::digest(std::fs::read(entry.path()).unwrap())),
+                metadata.modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
 }
