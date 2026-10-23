@@ -1443,6 +1443,64 @@ fn family_r_measured(item: &SnapshotItem) -> Option<usize> {
         .checked_add(completed_heap_only(&item.usage_buckets)?)
 }
 
+/// What a T1 case adds around its file (fresh-r1 N1, N3).
+#[derive(Default)]
+struct FinishCase<'a> {
+    /// Finish with a launches-prepared attribution context (X_out's K facts
+    /// and U2's path hash), as the scan does, instead of none.
+    attribution: bool,
+    /// Runs on the read accumulator before X_out is taken: rows that exist
+    /// before `finish` (N1). Family R then bounds only part of the item.
+    prepare: Option<&'a dyn Fn(&mut SnapshotAccumulator)>,
+}
+
+/// What one T1 case measured.
+struct FinishReceipt {
+    x_out: usize,
+    decode_peak: usize,
+    born: usize,
+    /// The largest `snapshot_fingerprint` transient of a finished item, one
+    /// item at a time (N1: its semantic JSON has no X_out term of its own).
+    fingerprint_peak: usize,
+}
+
+/// A launch root with one launch event for `SESSION` in `fixture`'s home, as
+/// `retain_release_tests::LaunchHome` builds it, and a context that has
+/// prepared it.
+fn launch_context(fixture: &TempJsonl) -> crate::session_attribution::SessionAttributionContext {
+    use base64::Engine;
+    let home = fixture.dir.join("home");
+    let raw = json!({"schema":"agent_launch.v1",
+        "controller_session_ref":"a9789dcf-1e4a-4a6e-8abd-f30094efb269",
+        "worker_session_ref":SESSION, "relationship_kind":"launched",
+        "workflow_ref":null, "pr_ref":null, "launch_ts":"2026-09-20T10:00:00Z",
+        "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
+    .to_string();
+    let reduced = crate::launch_events::validate_event(&raw).unwrap();
+    let events = home.join(".ottto/launch-events/processed");
+    fs::create_dir_all(&events).unwrap();
+    fs::write(
+        events.join(format!(
+            "{}.json",
+            crate::launch_events::event_digest(&reduced)
+        )),
+        raw,
+    )
+    .unwrap();
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32]);
+    let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::ClaudeCode,
+        &home,
+        true,
+        Some(&key),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap();
+    while !context.prepare_launch_step(&[SESSION.to_owned()]).unwrap() {}
+    assert!(context.launches_prepared(&[SESSION.to_owned()]));
+    context
+}
+
 /// T1, T4, T5, T6 for one file: read it natively, take X_out exactly as the
 /// proof site does (warm U3 identity), then finish inside a born-pointer
 /// allocation audit. Returns the finished items.
@@ -1451,10 +1509,24 @@ fn assert_x_out_covers_finish(
     rows: &[Value],
     title: &ClaudeTitleMetadata,
 ) -> Vec<SnapshotItem> {
+    assert_x_out_covers_finish_with(label, rows, title, FinishCase::default()).0
+}
+
+/// `assert_x_out_covers_finish` with `case`'s additions, and its receipt.
+fn assert_x_out_covers_finish_with(
+    label: &str,
+    rows: &[Value],
+    title: &ClaudeTitleMetadata,
+    case: FinishCase<'_>,
+) -> (Vec<SnapshotItem>, FinishReceipt) {
     let fixture = TempJsonl::new(label);
     fixture.append(rows);
+    let attribution = case.attribution.then(|| launch_context(&fixture));
     let (mut parser, expected) = native_parser(&fixture.path);
     while !parser.step().unwrap() {}
+    if let Some(prepare) = case.prepare {
+        prepare(&mut parser.accumulator);
+    }
     if let Some(workspace) = parser.accumulator.workspace_path.clone() {
         repository_identity_cache()
             .lock()
@@ -1491,7 +1563,7 @@ fn assert_x_out_covers_finish(
                 source_file_fingerprint: "x-out-fixture",
                 opened_object_identity: &expected,
                 title_metadata: Some(title),
-                attribution: false,
+                attribution: attribution.is_some(),
                 repository_identity: identity.as_ref(),
             },
             usize::MAX,
@@ -1506,18 +1578,32 @@ fn assert_x_out_covers_finish(
                 "x-out-fixture".into(),
                 None,
                 Some(title),
-                None,
+                attribution.as_ref(),
                 identity,
             )
             .unwrap()
     });
     let output = crate::heap_layout_bound::completed_bound(&parsed, usize::MAX).unwrap();
     let born = actual.requested_peak_with_overlap;
+    let fingerprint_peak = parsed
+        .snapshots
+        .iter()
+        .map(|item| {
+            crate::retry_allocation_probe::measure_caller_thread(|| {
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, item)
+            })
+            .1
+            .requested_peak_with_overlap
+        })
+        .max()
+        .unwrap_or(0);
     eprintln!(
-        "X_OUT_T1 case={label} responses={responses} items={} x_out={x_out} output={output} decode_peak={peak} born_finish_peak={born} output_slack={} peak_slack={}",
+        "X_OUT_T1 case={label} responses={responses} items={} x_out={x_out} output={output} decode_peak={peak} born_finish_peak={born} output_slack={} peak_slack={} born_ratio={:.4} fingerprint_peak={fingerprint_peak} attribution={}",
         parsed.snapshots.len(),
         x_out - output.min(x_out),
-        (x_out + peak) - born.min(x_out + peak)
+        (x_out + peak) - born.min(x_out + peak),
+        born as f64 / (x_out + peak) as f64,
+        attribution.is_some(),
     );
     // T4: no JSON capacity on a Claude item.
     for item in &parsed.snapshots {
@@ -1547,7 +1633,7 @@ fn assert_x_out_covers_finish(
     // T1: the finished value is within X_out, and what it holds from its
     // responses is within family R.
     eprintln!("X_OUT_T1 case={label} family=composed measured={output} bound={x_out}");
-    if let [item] = parsed.snapshots.as_slice() {
+    if let ([item], None) = (parsed.snapshots.as_slice(), case.prepare) {
         let measured = family_r_measured(item).expect("finished item measured");
         eprintln!("X_OUT_T1 case={label} family=R measured={measured} bound={family_r}");
         assert!(
@@ -1561,7 +1647,15 @@ fn assert_x_out_covers_finish(
         born <= x_out + peak,
         "{label}: born_finish_peak={born} > x_out={x_out} + decode_peak={peak}"
     );
-    parsed.snapshots
+    (
+        parsed.snapshots,
+        FinishReceipt {
+            x_out,
+            decode_peak: peak,
+            born,
+            fingerprint_peak,
+        },
+    )
 }
 
 /// T1 (adversarial sweep, R1a R8 union cases), with T4-T6 per case.
@@ -1738,5 +1832,159 @@ fn x_out_refuses_a_cold_workspace_and_a_subagent() {
         accumulator
             .finish_output_bound(x_out_input(&subagent, &title, Some(&identity)), usize::MAX),
         None
+    );
+}
+
+/// fresh-r1 N3: the composed T1/T6 check with a launches-prepared
+/// attribution context (X_out's K facts, U2's path hash) and title metadata
+/// carrying an account hash and original identity evidence (U1's per-row
+/// hash, evidence strings and sets).
+#[test]
+fn x_out_t1_bounds_a_finish_with_attribution_and_identity_evidence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let account = "a".repeat(64);
+    let mut title = ClaudeTitleMetadata::default();
+    title.titles.insert(
+        SESSION.to_string(),
+        ClaudeTitleCandidate {
+            title: "an attributed desktop title".to_string(),
+            user_set: true,
+        },
+    );
+    title
+        .account_identifier_hashes
+        .insert(SESSION.to_string(), BTreeSet::from([account.clone()]));
+    title.original_identity_evidence.insert(
+        SESSION.to_string(),
+        BTreeSet::from([
+            ClaudeDesktopIdentityEvidence {
+                account_identifier_hash: Some(account.clone()),
+                provider_workspace_hash: Some("w".repeat(64)),
+                source_created_at: Some("2026-09-20T09:59:00.000Z".to_string()),
+                imported: false,
+            },
+            ClaudeDesktopIdentityEvidence {
+                account_identifier_hash: Some("b".repeat(64)),
+                provider_workspace_hash: None,
+                source_created_at: Some("2026-09-21T10:00:00.000Z".to_string()),
+                imported: true,
+            },
+        ]),
+    );
+    let (items, receipt) = assert_x_out_covers_finish_with(
+        "attributed",
+        &with_cwd(realistic_rows(0..3, &[SHELL]), "/work/x-out-attributed"),
+        &title,
+        FinishCase {
+            attribution: true,
+            prepare: None,
+        },
+    );
+    let [item] = items.as_slice() else {
+        panic!("attributed: {} items", items.len());
+    };
+    let launched = item
+        .attribution_facts
+        .iter()
+        .any(|fact| fact.evidence.kind == "launcher_event");
+    let hashed = item
+        .model_usage
+        .iter()
+        .chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        )
+        .filter(|row| row.account_identifier_hash.as_deref() == Some(account.as_str()))
+        .count();
+    eprintln!(
+        "X_OUT_N3 facts={} launcher_fact={launched} account_hashed_rows={hashed} session_account_evidence={} x_out={} decode_peak={} born={}",
+        item.attribution_facts.len(),
+        item.session_account_evidence.is_some(),
+        receipt.x_out,
+        receipt.decode_peak,
+        receipt.born,
+    );
+    assert!(launched, "precondition: the launch context applied");
+    assert!(hashed >= 1, "precondition: rows carry the account hash");
+    assert!(
+        item.session_account_evidence.is_some(),
+        "precondition: the identity evidence applied"
+    );
+}
+
+/// fresh-r1 N1: `finish`'s semantic JSON (`snapshot_fingerprint`) and the
+/// fact-limit buffer have no X_out term of their own; the per-row node
+/// charge covers them (`finish_output_bound`'s doc). A few hundred tiny rows
+/// that exist before `finish` (one model each, so each is its own row; the
+/// rows' smallest per-row charge), with the attribution context on: every
+/// allocation born in `finish` is within X_out plus the decode peak (T6),
+/// and the fingerprint's transient is within five whole
+/// `(RowKey, BucketRowAccumulator)` nodes per usage row. Claude has no file
+/// rows of its own before `finish` (every usage record waits in the
+/// response book), so the rows are added as `add_usage_with_selector` adds
+/// any row.
+#[test]
+fn x_out_t6_covers_tiny_file_rows_with_attribution() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const TINY_ROWS: usize = 300;
+    let prepare = |accumulator: &mut SnapshotAccumulator| {
+        for row in 0..TINY_ROWS {
+            accumulator.add_usage_with_selector(
+                Some(format!("m{row:03}")),
+                UsageTotals {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    request_count: 1,
+                    ..UsageTotals::default()
+                },
+                SelectorCapture::default(),
+                Some(&at(row as u64, 0)),
+                None,
+            );
+        }
+    };
+    let (items, receipt) = assert_x_out_covers_finish_with(
+        "tiny-file-rows",
+        &with_cwd(realistic_rows(0..1, &[SHELL]), "/work/x-out-tiny-file-rows"),
+        &ClaudeTitleMetadata::default(),
+        FinishCase {
+            attribution: true,
+            prepare: Some(&prepare),
+        },
+    );
+    let [item] = items.as_slice() else {
+        panic!("tiny-file-rows: {} items", items.len());
+    };
+    let usage_rows = item.model_usage.len();
+    let bucket_rows: usize = item
+        .usage_buckets
+        .iter()
+        .map(|bucket| bucket.model_usage.len())
+        .sum();
+    let node = crate::heap_layout_bound::tree_node_bytes::<RowKey, BucketRowAccumulator>().unwrap();
+    eprintln!(
+        "X_OUT_N1 tiny_rows={TINY_ROWS} usage_rows={usage_rows} bucket_rows={bucket_rows} facts={} node={node} fingerprint_peak={} fingerprint_per_row={} five_nodes={} born={} x_out={} decode_peak={} born_ratio={:.4}",
+        item.attribution_facts.len(),
+        receipt.fingerprint_peak,
+        receipt.fingerprint_peak / usage_rows.max(1),
+        5 * node,
+        receipt.born,
+        receipt.x_out,
+        receipt.decode_peak,
+        receipt.born as f64 / (receipt.x_out + receipt.decode_peak) as f64,
+    );
+    assert!(
+        usage_rows > TINY_ROWS,
+        "precondition: every tiny row is its own row"
+    );
+    assert!(
+        receipt.fingerprint_peak <= usage_rows * 5 * node,
+        "N1: fingerprint transient {} > {usage_rows} rows x 5 nodes of {node} B",
+        receipt.fingerprint_peak
     );
 }

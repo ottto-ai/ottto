@@ -225,6 +225,8 @@ struct Observed {
     /// Step starts whose active file is a sampled tail (it holds borrowed
     /// retained state) and whose copy budget is zero.
     tail_zero_budget_steps: usize,
+    /// The scan's finished items, before the upload policy.
+    snapshots: Vec<SnapshotItem>,
 }
 impl Observed {
     fn state_missing(&self) -> usize {
@@ -292,6 +294,7 @@ fn observed_scan(
                 scan: result,
                 ..
             } => {
+                let snapshots = result.snapshots.clone();
                 let mut projected = result;
                 apply_upload_policy(
                     source,
@@ -310,6 +313,7 @@ fn observed_scan(
                     modes,
                     full_reasons,
                     tail_zero_budget_steps,
+                    snapshots,
                 };
             }
         }
@@ -1709,6 +1713,12 @@ struct MaRun {
     before: Residents,
     after: Residents,
     tail_key: String,
+    /// The tail's finished items.
+    snapshots: Vec<SnapshotItem>,
+    /// The shared cache's charge besides its retained entries (cursor state
+    /// and side ledger), before and after the tail's scan.
+    cursor_before: usize,
+    cursor_after: usize,
 }
 impl MaRun {
     fn receipt(&self) -> String {
@@ -1745,6 +1755,65 @@ fn m_a_tail(
     x_out: sampled_scan::XOut,
     touch_at_gate: Option<u64>,
 ) -> MaRun {
+    m_a_tail_with(
+        source,
+        fillers_modified,
+        tail_modified,
+        extra,
+        MaOpts {
+            x_out: Some(x_out),
+            touch_at_gate,
+            ..MaOpts::default()
+        },
+    )
+}
+
+/// What an M-a control varies besides its ranks (review r32).
+#[derive(Default)]
+struct MaOpts {
+    /// In place of the measured Claude X_out (`set_x_out`); `None` proves
+    /// with the bound `x_out_for` measures, as production does.
+    x_out: Option<sampled_scan::XOut>,
+    touch_at_gate: Option<u64>,
+    /// Re-admits the tailed file's entry reserving this finalization charge
+    /// (`F_prev` at the next take).
+    finalization_prev: Option<usize>,
+    /// A Codex tail's append carries a usage record too (Claude's always
+    /// does).
+    codex_usage: bool,
+    /// The appended usage record's `cwd`: the tail's workspace, first seen
+    /// in this read (the full read before it has none).
+    workspace: Option<String>,
+    /// Runs after `retain_reduction`, before `finish`.
+    after_retain: Option<Box<dyn FnMut()>>,
+}
+
+/// The shared cache's charge besides its retained entries.
+fn cursor_charge(cache: &Arc<sampled_scan::SharedCache>) -> usize {
+    let retained = crate::heap_layout_bound::bound(
+        &*cache.retained().expect("retained cache lock"),
+        usize::MAX,
+    )
+    .expect("bounded retained cache");
+    optional_resident(cache) - retained
+}
+
+/// `m_a_tail` with `opts`.
+fn m_a_tail_with(
+    source: SnapshotSource,
+    fillers_modified: u64,
+    tail_modified: u64,
+    extra: &[(&str, u64)],
+    opts: MaOpts,
+) -> MaRun {
+    let MaOpts {
+        x_out,
+        touch_at_gate,
+        finalization_prev,
+        codex_usage,
+        workspace,
+        after_retain,
+    } = opts;
     let FullCache {
         cache,
         tailed,
@@ -1764,7 +1833,22 @@ fn m_a_tail(
             "precondition: {key} is admitted"
         );
     }
-    hot_append(source, &tailed, 1, source == SnapshotSource::ClaudeCode);
+    if let Some(charge) = finalization_prev {
+        let mut retained = cache.retained().expect("retained cache lock");
+        let taken = retained.take(&tailed.key()).expect("the tailed entry");
+        assert!(
+            retained.insert_reserving(tailed.key(), taken.retained, 0, charge),
+            "precondition: the tailed entry is re-admitted"
+        );
+    }
+    append_padding(&tailed);
+    if source == SnapshotSource::ClaudeCode || codex_usage {
+        let mut row = usage(source, 141, 1, MODEL);
+        if let Some(workspace) = &workspace {
+            row["cwd"] = json!(workspace);
+        }
+        tailed.append(&row);
+    }
     tailed.set_modified(tail_modified);
     // The scan takes the tailed file's own entry first: never a victim.
     let tail_key = tailed.key();
@@ -1773,7 +1857,10 @@ fn m_a_tail(
         .filter(|(key, _, _)| *key != tail_key)
         .collect();
     sampled_scan::test_hooks::clear();
-    sampled_scan::test_hooks::set_x_out(Some(x_out));
+    sampled_scan::test_hooks::set_x_out(x_out);
+    if let Some(hook) = after_retain {
+        sampled_scan::test_hooks::set(sampled_scan::test_hooks::Point::AfterRetain, hook);
+    }
     if let Some(modified) = touch_at_gate {
         let path = tailed.path.clone();
         sampled_scan::test_hooks::set(
@@ -1791,6 +1878,7 @@ fn m_a_tail(
             },
         );
     }
+    let cursor_before = cursor_charge(&cache);
     let (tail, counts) = observe(|| observed_scan(&tailed, source, index, &cache));
     let run = MaRun {
         modes: tail.modes,
@@ -1800,6 +1888,9 @@ fn m_a_tail(
         before,
         after: residents(&cache),
         tail_key,
+        snapshots: tail.snapshots,
+        cursor_before,
+        cursor_after: cursor_charge(&cache),
     };
     sampled_scan::test_hooks::clear();
     eprintln!("CACHE_POLICY M-a {source:?} {}", run.receipt());
@@ -1875,63 +1966,92 @@ fn cache_policy_m_a_unknown_or_overflowing_x_out_releases_nothing() {
     }
 }
 
-/// M-a T8, the positive provable-fit control: an X_out within the clone's
-/// bound (`K' = C`) proves `|P*| = |P_C|`, so exactly the copy-only prefix
-/// of strictly older fillers leaves and the copy is retained. An entry at
-/// the copy's rank and a newer one stay.
-#[test]
-fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
-    if unexecuted("M_a_T8") {
-        return;
+/// Every copy-refusal count (the corrected M1 (ii) row's sum).
+fn refusals(counts: &Counts) -> u64 {
+    counts.retention_bound_refused
+        + counts.retention_clone_bound_refused
+        + counts.retention_finalization_bound_refused
+        + counts.insert_live_reservation_refused
+        + counts.insert_entry_bound_refused
+        + counts.insert_frozen_charge_refused
+        + counts.insert_no_victim_refused
+}
+
+/// The keys a proven release must evict, derived from the fixture's stored
+/// charges alone (fresh-r2 R2-3): the shortest victim-order prefix of the
+/// entries ranked strictly below the copy's rank whose freed bytes cover
+/// `need'`. `need'` must sit at least `MARGIN` from either end of that
+/// prefix's last entry (a non-boundary target), so the execute room's few
+/// hundred bytes (N5 (a)) cannot move the count.
+fn expected_victims(run: &MaRun) -> Vec<String> {
+    const MARGIN: usize = 256 * 1024;
+    let receipt = run.receipt();
+    let rank = run.probe.rank.expect("the copy's rank");
+    let need = run.probe.need_prime.expect("need' was measured");
+    let mut freed = 0usize;
+    let mut keys = Vec::new();
+    for (key, _, bytes) in run.before.iter().filter(|(_, hint, _)| *hint < rank) {
+        if freed >= need {
+            break;
+        }
+        assert!(
+            freed + MARGIN <= need,
+            "precondition: need' is not at a prefix boundary; {receipt}"
+        );
+        freed += bytes;
+        keys.push(key.clone());
     }
-    let now = unix_now();
-    let tail_modified = now - 600;
-    let run = m_a_tail(
-        SnapshotSource::ClaudeCode,
-        now - OLD_SECONDS,
-        tail_modified,
-        &[
-            ("cache-policy-equal", tail_modified),
-            ("cache-policy-newer", tail_modified + 300),
-        ],
-        sampled_scan::XOut::Bound(0),
-        None,
+    assert!(
+        freed >= need + MARGIN,
+        "precondition: the older entries cover need' with margin; {receipt}"
     );
+    keys
+}
+
+/// T8's release: `|P*| = |P_C|`, and exactly the derived prefix leaves, by
+/// the release only; the copy is retained at its proof's rank, and the
+/// entries at and above that rank stay.
+fn assert_exact_prefix_release(run: &MaRun, label: &str) {
     let receipt = run.receipt();
     let (victims, copy_only) = run.probe.prefixes.expect("the prefixes were measured");
-    assert_eq!(victims, copy_only, "|P*| = |P_C|; {receipt}");
-    assert!(
-        copy_only >= 1,
-        "precondition: the copy needs room; {receipt}"
-    );
-    let evicted = run.counts.copy_refusal_admission_evicted as usize;
-    assert!(
-        (1..=copy_only).contains(&evicted),
-        "at most |P_C| leave, by the release only; {receipt}"
-    );
-    let rank = run.probe.rank.expect("the copy's rank");
-    let left: Vec<_> = run
+    let expected = expected_victims(run);
+    let left: Vec<String> = run
         .before
         .iter()
         .filter(|(key, _, _)| run.resident(key).is_none())
+        .map(|(key, _, _)| key.clone())
         .collect();
-    assert_eq!(left.len(), evicted, "{receipt}");
-    assert!(
-        left.iter().all(|(_, hint, _)| *hint < rank),
-        "only strictly older entries leave; {receipt}"
+    eprintln!(
+        "CACHE_POLICY test=M_a_T8 case={label} x_out={:?} C={:?} peak={:?} need_prime={:?} need_c={:?} prefixes={:?} expected_victims={expected:?} left={left:?}",
+        run.probe.x_out,
+        run.probe.clone,
+        run.probe.peak,
+        run.probe.need_prime,
+        run.probe.need_c,
+        run.probe.prefixes,
     );
-    assert!(
-        left.iter()
-            .zip(&run.before)
-            .all(|((key, _, _), (first, _, _))| key == first),
-        "the victim-order prefix leaves; {receipt}"
+    assert_eq!(victims, copy_only, "{label}: |P*| = |P_C|; {receipt}");
+    assert_eq!(
+        expected.len(),
+        copy_only,
+        "{label}: the derived prefix is P_C; {receipt}"
     );
+    assert_eq!(
+        left, expected,
+        "{label}: exactly that prefix leaves; {receipt}"
+    );
+    assert_eq!(
+        run.counts.copy_refusal_admission_evicted as usize,
+        expected.len(),
+        "{label}: by the release only; {receipt}"
+    );
+    let rank = run.probe.rank.expect("the copy's rank");
     assert!(run.resident("cache-policy-equal").is_some(), "{receipt}");
     assert!(run.resident("cache-policy-newer").is_some(), "{receipt}");
     assert_eq!(
         run.resident(&run.tail_key),
         Some(rank),
-        "the copy is retained at its proof's rank; {receipt}"
+        "{label}: the copy is retained at its proof's rank; {receipt}"
     );
     assert_eq!(
         (
@@ -1940,7 +2060,119 @@ fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
             wipe_clears(&run.counts),
         ),
         (0, 0, 0),
-        "{receipt}"
+        "{label}: {receipt}"
+    );
+}
+
+/// The T8 fixture: two entries at and above the copy's rank beside the
+/// fillers.
+fn m_a_t8(x_out: Option<sampled_scan::XOut>) -> MaRun {
+    let now = unix_now();
+    let tail_modified = now - 600;
+    m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        tail_modified,
+        &[
+            ("cache-policy-equal", tail_modified),
+            ("cache-policy-newer", tail_modified + 300),
+        ],
+        MaOpts {
+            x_out,
+            ..MaOpts::default()
+        },
+    )
+}
+
+/// M-a T8, the positive provable-fit control, at the policy seam: an X_out
+/// within the clone's bound (`Bound(0)`, so `K' = C`) proves
+/// `|P*| = |P_C|`, so exactly the copy-only prefix of strictly older
+/// fillers leaves (its keys derived from the stored charges, R2-3) and the
+/// copy is retained. An entry at the copy's rank and a newer one stay.
+#[test]
+fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
+    if unexecuted("M_a_T8") {
+        return;
+    }
+    let run = m_a_t8(Some(sampled_scan::XOut::Bound(0)));
+    assert_eq!(run.probe.x_out, Some(0), "{}", run.receipt());
+    assert_exact_prefix_release(&run, "bound-0");
+}
+
+/// T8's measured companion (R2-3): the same fixture proving with the X_out
+/// `x_out_for` measures (no `set_x_out`), as production does.
+#[test]
+fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
+    if unexecuted("M_a_T8_measured") {
+        return;
+    }
+    let run = m_a_t8(None);
+    let x_out = run.probe.x_out.expect("a measured X_out");
+    assert!(x_out > 0, "{}", run.receipt());
+    assert_exact_prefix_release(&run, "measured");
+}
+
+/// R2-1's finite X_out: past the clone's bound by enough that `need'`
+/// needs one filler more than `need_C` (about 17.1 MB against 12.2 MB, with
+/// fillers of about 6.9 MB, in CI's receipts).
+const CHURN_X_OUT: usize = 2_500_000;
+
+/// M-a churn negative control (fresh-r2 R2-1) at real scale: a finite,
+/// owned X_out whose `need'` takes more victims than the copy alone needs
+/// (`|P*| > |P_C|`, asserted first) releases nothing. No release is
+/// deferred, nothing leaves, no copy is retained, every resident keeps its
+/// rank, the cache's cursor charge is unchanged (this Claude fixture holds
+/// no suspended Codex proof), and the refusal is counted.
+#[test]
+fn cache_policy_m_a_churn_bound_refuses_a_finite_x_out() {
+    if unexecuted("M_a_churn") {
+        return;
+    }
+    let now = unix_now();
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            x_out: Some(sampled_scan::XOut::Bound(CHURN_X_OUT)),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let probe = run.probe;
+    eprintln!(
+        "CACHE_POLICY test=M_a_churn x_out={CHURN_X_OUT} C={:?} peak={:?} A={} remaining={} need_c={:?} need_prime={:?} prefixes={:?} refusals={} cursor_before={} cursor_after={}",
+        probe.clone,
+        probe.peak,
+        probe.a,
+        probe.remaining,
+        probe.need_c,
+        probe.need_prime,
+        probe.prefixes,
+        refusals(&run.counts),
+        run.cursor_before,
+        run.cursor_after,
+    );
+    let (victims, copy_only) = probe.prefixes.expect("the prefixes were measured");
+    assert!(victims > copy_only, "precondition: |P*| > |P_C|; {receipt}");
+    assert_eq!(probe.x_out, Some(CHURN_X_OUT), "{receipt}");
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "churn");
+    assert!(
+        run.resident(&run.tail_key).is_none(),
+        "no copy is retained; {receipt}"
+    );
+    assert_eq!(run.cursor_after, run.cursor_before, "{receipt}");
+    assert!(
+        refusals(&run.counts) >= 1,
+        "the refusal is counted; {receipt}"
     );
 }
 
@@ -2063,4 +2295,217 @@ fn cache_policy_m_a_codex_keeps_the_legacy_release() {
         run.counts.copy_refusal_admission_evicted >= 1,
         "and runs; {receipt}"
     );
+}
+
+/// A workspace path no other test uses: the repository-identity cache is
+/// process-global.
+fn unique_workspace(tag: &str) -> String {
+    format!(
+        "/cache-policy-u3/{tag}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, AtomicOrdering::Relaxed)
+    )
+}
+
+fn u3_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+    crate::context_footprint::RepositoryIdentity {
+        repository_hash: Some(format!("hash-{tag}")),
+        repository_label: Some(format!("label-{tag}")),
+        repository_label_source: Some("git_remote".to_string()),
+        repository_identity_source: Some("git".to_string()),
+        workspace_kind: Some("git_repo".to_string()),
+    }
+}
+
+/// X_out U3 through the scan (fresh-r2 R2-2, fresh-r1 N2), cold: the tail's
+/// append first names its workspace (`cwd`), whose repository identity is
+/// not in the cache, so `x_out_for` measures no X_out (no `set_x_out`) and
+/// the release proof refuses: zero victims, no copy retained, every filler
+/// at its rank, the refusal counted.
+#[test]
+fn cache_policy_m_a_cold_repository_identity_releases_nothing() {
+    if unexecuted("M_a_U3_cold") {
+        return;
+    }
+    let now = unix_now();
+    let workspace = unique_workspace("cold");
+    assert_eq!(
+        peek_repository_identity(Path::new(&workspace)),
+        None,
+        "precondition: cold"
+    );
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            workspace: Some(workspace),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    eprintln!(
+        "CACHE_POLICY test=M_a_U3_cold refusals={} items={} {receipt}",
+        refusals(&run.counts),
+        run.snapshots.len()
+    );
+    let [item] = run.snapshots.as_slice() else {
+        panic!("precondition: one finished item; {receipt}");
+    };
+    assert!(
+        item.workspace_hash.is_some(),
+        "precondition: the tail read its workspace; {receipt}"
+    );
+    assert!(
+        run.probe.rank.is_some(),
+        "precondition: a release proof reached X_out; {receipt}"
+    );
+    assert_eq!(
+        run.probe.x_out, None,
+        "a cold identity has no X_out; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "cold U3");
+    assert!(
+        run.resident(&run.tail_key).is_none(),
+        "no copy is retained; {receipt}"
+    );
+    assert!(
+        refusals(&run.counts) >= 1,
+        "the refusal is counted; {receipt}"
+    );
+}
+
+/// X_out U3 through the scan, warm: the identity peeked for X_out is the one
+/// the finished item carries. The release runs on the measured X_out; the
+/// cache entry is then replaced between the proof and `finish`
+/// (`Point::AfterRetain`), and the item still carries the peeked identity,
+/// not a re-resolved or re-read one.
+#[test]
+fn cache_policy_m_a_warm_repository_identity_is_the_finished_one() {
+    if unexecuted("M_a_U3_warm") {
+        return;
+    }
+    let now = unix_now();
+    let workspace = unique_workspace("warm");
+    let path = PathBuf::from(&workspace);
+    repository_identity_cache()
+        .lock()
+        .unwrap()
+        .insert(path.clone(), (SystemTime::now(), u3_identity("warm")));
+    let replace = path.clone();
+    let run = m_a_tail_with(
+        SnapshotSource::ClaudeCode,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            workspace: Some(workspace),
+            after_retain: Some(Box::new(move || {
+                repository_identity_cache().lock().unwrap().insert(
+                    replace.clone(),
+                    (SystemTime::now(), u3_identity("replaced")),
+                );
+            })),
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let [item] = run.snapshots.as_slice() else {
+        panic!("precondition: one finished item; {receipt}");
+    };
+    eprintln!(
+        "CACHE_POLICY test=M_a_U3_warm repository_hash={:?} cache_after={:?} {receipt}",
+        item.repository_hash,
+        peek_repository_identity(&path).and_then(|identity| identity.repository_hash),
+    );
+    assert!(
+        run.probe.x_out.is_some(),
+        "a warm identity proves with a measured X_out; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Deferred { .. }]
+        ),
+        "the release is deferred; {receipt}"
+    );
+    assert!(
+        run.counts.copy_refusal_admission_evicted >= 1,
+        "and runs; {receipt}"
+    );
+    assert_eq!(
+        run.resident(&run.tail_key),
+        run.probe.rank,
+        "the copy is retained; {receipt}"
+    );
+    assert_eq!(
+        peek_repository_identity(&path),
+        Some(u3_identity("replaced")),
+        "precondition: the entry was replaced between proof and finish"
+    );
+    assert_eq!(
+        (
+            item.repository_hash.as_deref(),
+            item.repository_label.as_deref()
+        ),
+        (Some("hash-warm"), Some("label-warm")),
+        "the item carries the peeked identity; {receipt}"
+    );
+}
+
+/// M-a T10's refusal arm (fresh-r2 R2-4): a Codex completion whose
+/// `F_prev` exceeds its clone's bound and whose read added usage meets
+/// Q-PR15's guard under release pressure: zero victims and no deferred
+/// release. T10 keeps the positive row (`F_prev < C`).
+#[test]
+fn cache_policy_m_a_codex_finalization_guard_releases_nothing() {
+    if unexecuted("M_a_T10_guard") {
+        return;
+    }
+    const F_PREV: usize = 1_000_000;
+    let now = unix_now();
+    let run = m_a_tail_with(
+        SnapshotSource::Codex,
+        now - OLD_SECONDS,
+        now - 600,
+        &[],
+        MaOpts {
+            x_out: Some(sampled_scan::XOut::Refused),
+            finalization_prev: Some(F_PREV),
+            codex_usage: true,
+            ..MaOpts::default()
+        },
+    );
+    let receipt = run.receipt();
+    let probe = run.probe;
+    assert_eq!(probe.finalization_prev, F_PREV, "precondition: {receipt}");
+    assert!(
+        probe.clone.is_some_and(|clone| clone < F_PREV),
+        "precondition: F_prev > C; {receipt}"
+    );
+    assert!(
+        probe.need.is_some_and(|need| need > 0),
+        "precondition: release pressure; {receipt}"
+    );
+    assert_eq!(probe.x_out, None, "no M-a proof; {receipt}");
+    assert!(
+        probe.finalization_guard,
+        "the guard branch was reached; {receipt}"
+    );
+    assert!(
+        matches!(
+            run.decisions.as_slice(),
+            [sampled_scan::test_hooks::Decision::Granted { .. }]
+        ),
+        "no release is deferred; {receipt}"
+    );
+    assert_no_victims(&run, "codex guard");
 }

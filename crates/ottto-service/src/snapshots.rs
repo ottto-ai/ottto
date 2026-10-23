@@ -14842,6 +14842,26 @@ impl SnapshotAccumulator {
     ///   context curve, cost text, attribution facts.
     /// - U: title metadata (U1), `session_start` (U2) and the peeked
     ///   repository identity, which `finish` must receive (U3), twice.
+    ///
+    /// Transients without a term (fresh-r1 N1; T6 measures them,
+    /// `x_out_t6_covers_tiny_file_rows_with_attribution`):
+    /// - `snapshot_fingerprint`'s semantic JSON <= the per-row node charge.
+    ///   It holds each usage row twice (the item's `model_usage` and its
+    ///   bucket's), each a 23-key map (at most 5 `(String, Value)` nodes of
+    ///   at most 728 B, about 400 B of keys, clones of the row's strings),
+    ///   plus at most twice its serialized text (about 1 KB): about 13 KB
+    ///   plus 4x the row's strings per row. Each row is charged at least 5
+    ///   whole `(RowKey, BucketRowAccumulator)` nodes, each 256 + 12*8 +
+    ///   11*(216 + 320) = 6,248 B on 64-bit, so at least 31 KB, and 5 copies
+    ///   of its strings: a file row by `3*state` and `2*usage_buckets`, a
+    ///   resolved response by R's `ROW_COPIES + 1` nodes.
+    /// - `enforce_fact_limits` has no per-row bound: up to 96 pre-trim facts
+    ///   (at most 96*(576 + |collected_at|) B of text beside the 192 charged
+    ///   slots), then one `to_vec` buffer (at most 2*24*(736 +
+    ///   |collected_at|) B unescaped; control characters escape up to 6x),
+    ///   about 94 KB, of which K charges 2*(8,192 + 576 + |collected_at|).
+    ///   The rest relies on the item's slack (T1's smallest X_out - output
+    ///   is about 400 KB): a disclosed residual.
     fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
         use crate::heap_layout_bound::tree_node_bytes;
         use crate::session_attribution::{

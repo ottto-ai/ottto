@@ -1151,4 +1151,168 @@ mod output_tests {
         assert_eq!(empty.responses, 0);
         assert_eq!(empty.strings, 0);
     }
+
+    /// fresh-r2 R2-5: a response keeps one record's text (model, effort,
+    /// request id, timestamp, slot), so each takes the largest over its
+    /// records, in either order; its selector and tool uses are unions, so
+    /// they sum. Each record is the larger in different terms, so a term
+    /// summed instead of maxed, maxed instead of summed, or dropped changes
+    /// the result.
+    #[test]
+    fn output_merge_takes_text_maxima_and_union_sums() {
+        let first = ResponseOutput {
+            records: 1,
+            model: 0,
+            effort: 4,
+            request_id: 30,
+            timestamp: 24,
+            slot: 7,
+            selector_bytes: 40,
+            selector_entries: 2,
+            tool_bytes: 11,
+            tool_entries: 1,
+        };
+        let late = ResponseOutput {
+            records: 1,
+            model: 17,
+            effort: 9,
+            request_id: 12,
+            timestamp: 29,
+            slot: 3,
+            selector_bytes: 26,
+            selector_entries: 4,
+            tool_bytes: 22,
+            tool_entries: 2,
+        };
+        for (label, a, b) in [("first, late", first, late), ("late, first", late, first)] {
+            let merged = a.merge(b).expect("no overflow");
+            assert_eq!(
+                (
+                    merged.records,
+                    merged.model,
+                    merged.effort,
+                    merged.request_id,
+                    merged.timestamp,
+                    merged.slot,
+                ),
+                (2, 17, 9, 30, 29, 7),
+                "{label}: text terms take the maximum"
+            );
+            assert_eq!(
+                (
+                    merged.selector_bytes,
+                    merged.selector_entries,
+                    merged.tool_bytes,
+                    merged.tool_entries,
+                ),
+                (66, 6, 33, 3),
+                "{label}: union terms sum"
+            );
+        }
+    }
+
+    /// R2-5, the book's side: a response's model is charged on its
+    /// occurrence, on each of its `ROW_COPIES` row copies and as the live
+    /// `latest_model` (`ROW_COPIES + 2` times), and its tool bytes twice
+    /// (counted, then cloned) plus one tool node and slot per tool entry.
+    /// Dropping any one of these charges changes the difference.
+    #[test]
+    fn output_book_charges_the_model_per_row_copy_and_tools_twice() {
+        let bytes = |response: ResponseOutput| {
+            BookOutput::default()
+                .add(response, usize::MAX)
+                .and_then(|book| book.bytes(usize::MAX))
+                .expect("bounded")
+        };
+        let base = ResponseOutput {
+            records: 1,
+            ..ResponseOutput::default()
+        };
+        let modelled = ResponseOutput { model: 17, ..base };
+        assert_eq!(bytes(modelled) - bytes(base), 17 * (ROW_COPIES + 2));
+        let tooled = ResponseOutput {
+            tool_bytes: 22,
+            tool_entries: 1,
+            ..base
+        };
+        let tool = tree_node_bytes::<String, u64>().unwrap() + size_of::<SnapshotToolUsage>();
+        assert_eq!(bytes(tooled) - bytes(base), 2 * 22 + tool);
+    }
+
+    /// R2-5 on real records: a three-record response whose first two records
+    /// carry no model and whose third carries the late model, each record
+    /// with its own selector key and tool use. The output takes the late
+    /// model's and the longest timestamp's capacity once, and the selector
+    /// and tool bytes and entries of all three records.
+    #[test]
+    fn output_of_real_records_takes_the_late_model_and_sums_unions() {
+        let late = "claude-late-model";
+        // Literals, so every capacity is its length.
+        let keys = [
+            (
+                "service_tier",
+                "standard",
+                "toolu_real_0",
+                "2026-10-07T10:00:00Z",
+            ),
+            (
+                "speed_mode",
+                "fast",
+                "toolu_real_1",
+                "2026-10-07T10:00:01.5Z",
+            ),
+            (
+                "region_mode",
+                "us",
+                "toolu_real_2",
+                "2026-10-07T10:00:02.25Z",
+            ),
+        ];
+        let mut selectors = ClaudeSelectorTable::default();
+        let mut records = OwnedVec::new();
+        let (mut selector_bytes, mut tool_bytes) = (0, 0);
+        for (index, (key, value, tool_id, timestamp)) in keys.into_iter().enumerate() {
+            let mut selector = SelectorCapture::default();
+            selector.insert(key, value.to_string(), "usage");
+            selector_bytes += 2 * key.len() + value.len() + "usage".len();
+            tool_bytes += tool_id.len() + "Bash".len();
+            records.push(CompactClaudeResponseRecord::encode(
+                records.first(),
+                index as u16,
+                UsageTotals::default(),
+                (index == 2).then(|| late.to_string()),
+                selectors.intern(selector),
+                None,
+                Some("req_real".to_string()),
+                Some(timestamp.to_string()),
+                None,
+                BTreeMap::from([(tool_id.to_string(), "Bash".to_string())]),
+                RequestSlot::default(),
+            ));
+        }
+        let output = decoded_response_bounds(&records, &selectors, usize::MAX)
+            .and_then(|bounds| bounds.output)
+            .expect("bounded output");
+        assert_eq!(
+            (
+                output.records,
+                output.model,
+                output.effort,
+                output.request_id,
+                output.timestamp,
+            ),
+            (3, late.len(), 0, "req_real".len(), keys[2].3.len()),
+            "text terms: the largest record's"
+        );
+        assert_eq!(
+            (
+                output.selector_bytes,
+                output.selector_entries,
+                output.tool_bytes,
+                output.tool_entries,
+            ),
+            (selector_bytes, 6, tool_bytes, 3),
+            "union terms: every record's"
+        );
+    }
 }
