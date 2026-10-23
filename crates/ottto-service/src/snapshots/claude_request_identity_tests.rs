@@ -3653,8 +3653,11 @@ fn copied_markers_are_withdrawn_on_both_paths_in_every_census_state() {
     let org = org_hash(ORG_1);
     // A copied prefix can contain a perfectly valid marker and request id.
     // The current census may not have observed its other holder yet.
-    let mut lines = email_session(false, false);
-    for n in 2..=5 {
+    // Keep one unchanged selector context so withdrawn marker usage and a
+    // foreign-owner refusal must merge within the same bucket row.
+    let mut lines = vec![json!({"timestamp": "2026-08-02T07:00:00Z", "type": "attachment", "sessionId": ROOT,
+        "attachment": {"type": "credential_org", "organizationUuid": ORG_1}})];
+    for n in 1..=5 {
         lines.push(owned_response(
             &format!("req_{n}"),
             "2026-08-02T07:00:02Z",
