@@ -1462,13 +1462,136 @@ fn money_fixture_heap() -> (usize, usize) {
 fn money_fixture_heap() -> (usize, usize) {
     (0, 0)
 }
+// Diagnostic only: the kernel's own split of this task's memory. The malloc
+// zone totals above omit some zones, so they cannot attribute an RSS delta;
+// these can. Never feeds an assertion.
+#[cfg(target_os = "macos")]
+fn money_fixture_vm() -> serde_json::Value {
+    // task_vm_info through phys_footprint (rev1); every field is 8-byte
+    // aligned, so the C layout matches the header's pack(4) declaration.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+    }
+    // vm_region_extended_info (VM_REGION_EXTENDED_INFO = 13).
+    #[repr(C)]
+    #[derive(Default)]
+    struct RegionInfo {
+        protection: i32,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        pages_reusable: u32,
+    }
+    extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
+        fn mach_vm_region(
+            task: u32,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: i32,
+            info: *mut i32,
+            count: *mut u32,
+            object: *mut u32,
+        ) -> i32;
+    }
+    let mut vm = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    // SAFETY: TASK_VM_INFO (22) fills at most `count` words of `vm`.
+    let status = unsafe {
+        task_info(
+            mach_task_self_,
+            22,
+            (&mut vm as *mut TaskVmInfo).cast(),
+            &mut count,
+        )
+    };
+    let page = u64::try_from(vm.page_size).unwrap_or(0);
+    // Resident/reusable bytes per region kind: the malloc tag (1-12),
+    // stack (30), file-backed ("file") or another tag.
+    let mut regions = BTreeMap::<String, (u64, u64)>::new();
+    let mut address = 0_u64;
+    loop {
+        let mut size = 0_u64;
+        let mut region = RegionInfo::default();
+        let mut region_count = (std::mem::size_of::<RegionInfo>() / 4) as u32;
+        let mut object = 0_u32;
+        // SAFETY: VM_REGION_EXTENDED_INFO fills at most `region_count` words.
+        let found = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut address,
+                &mut size,
+                13,
+                (&mut region as *mut RegionInfo).cast(),
+                &mut region_count,
+                &mut object,
+            )
+        };
+        if found != 0 || size == 0 {
+            break;
+        }
+        let kind = if region.external_pager != 0 {
+            "file".to_string()
+        } else {
+            format!("tag{}", region.user_tag)
+        };
+        let entry = regions.entry(kind).or_default();
+        entry.0 += u64::from(region.pages_resident) * page;
+        entry.1 += u64::from(region.pages_reusable) * page;
+        address = address.saturating_add(size);
+    }
+    regions.retain(|_, (resident, _)| *resident >= 256 * 1024);
+    serde_json::json!({
+        "status": status,
+        "resident": vm.resident_size,
+        "internal": vm.internal,
+        "external": vm.external,
+        "reusable": vm.reusable,
+        "compressed": vm.compressed,
+        "phys_footprint": vm.phys_footprint,
+        "regions_resident_reusable": regions,
+    })
+}
+#[cfg(not(target_os = "macos"))]
+fn money_fixture_vm() -> serde_json::Value {
+    serde_json::Value::Null
+}
 fn money_fixture_phase(phase: &str, phases: &mut Vec<serde_json::Value>) {
     let rss = money_fixture_rss_bytes();
     let (in_use, allocated) = money_fixture_heap();
+    let vm = money_fixture_vm();
     eprintln!(
-        "MONEY_RSS_PHASE phase={phase} rss={rss} heap_in_use={in_use} heap_allocated={allocated}"
+        "MONEY_RSS_PHASE phase={phase} rss={rss} heap_in_use={in_use} heap_allocated={allocated} vm={vm}"
     );
-    phases.push(serde_json::json!({"phase": phase, "rss": rss, "heap_in_use": in_use, "heap_allocated": allocated}));
+    phases.push(serde_json::json!({"phase": phase, "rss": rss, "heap_in_use": in_use, "heap_allocated": allocated, "vm": vm}));
 }
 
 #[test]

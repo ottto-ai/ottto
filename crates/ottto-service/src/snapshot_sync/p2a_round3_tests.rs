@@ -121,13 +121,26 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
         };
         let cycles = if conflict {
             3 // First adopt, then fail a due-only save, then retry unchanged bytes.
-        } else if ledger_fault || ack_save_fault {
+        } else if ledger_fault {
+            // The fault, then recovery: the restart finds the never-written
+            // shard missing (indistinguishable from a lost one), so custody
+            // reloads damaged and refuses admission until its rebuild and a
+            // clean telemetry sweep finish. Bounded; it must then accept.
+            6
+        } else if ack_save_fault {
             2
         } else {
             1
         };
         let _reset = P2aConflictReset;
+        // Only the ledger-fault case stops early, once recovery accepted.
+        let mut recovered = false;
         for cycle in 0..cycles {
+            if recovered {
+                break;
+            }
+            let recovering =
+                ledger_fault && cycle > 0 && money::store::recovering_for_test(&support);
             if conflict && cycle == 1 {
                 let saved = ScanIndex::load(&index_path).unwrap();
                 assert!(saved
@@ -282,11 +295,35 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     .values()
                     .all(|entry| entry.effective_upload_body_witness_revision != 3));
                 std::fs::remove_dir(&blocked).unwrap();
+            } else if ledger_fault
+                && result.as_ref().err().is_some_and(|error| {
+                    error
+                        .to_string()
+                        .contains("request money admission refused")
+                })
+            {
+                assert!(
+                    recovering,
+                    "only custody recovery may refuse admission once the fault is cleared"
+                );
+                assert!(
+                    cycle + 1 < cycles,
+                    "custody recovery must converge to an accepted offer"
+                );
+                assert!(
+                    server.offered.lock().unwrap().is_empty(),
+                    "recovery refusal forbids POST"
+                );
+                assert!(saved
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision != 3));
             } else if matches!(
                 outcome,
                 FinishOutcome::Accept | FinishOutcome::Dominated { .. }
             ) {
                 assert!(result.is_ok(), "{outcome:?}: {result:?}");
+                recovered = ledger_fault;
                 assert!(!saved.files.is_empty());
                 assert!(
                     saved
@@ -1318,7 +1355,7 @@ fn p2a_sidecars_only_real_maturity_restart_and_first_transcript_keep_entity() {
         synthetic["source_session_id"]
     );
     assert_eq!(physical["request_count"], 2);
-    assert_eq!(physical["cost"]["total_cost_usd"], "0.000200");
+    assert_eq!(physical["cost"]["total_cost_usd"], "0.0002");
     assert_eq!(control.saved().files.len(), 1);
 }
 
@@ -1686,9 +1723,22 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
             offers.len() > accepted.len() + 1,
             "unchanged A must really reoffer after message evidence changes"
         );
+        let trail = offers
+            .iter()
+            .map(|item| {
+                format!(
+                    "{}:{}/{}:{}",
+                    item["source_session_id"],
+                    item["request_count"],
+                    item["removed_request_count"],
+                    item["snapshot_fingerprint"]
+                )
+            })
+            .collect::<Vec<_>>();
         assert_eq!(
             a["request_count"], 1,
-            "accepted A loses shared message exactly once"
+            "accepted A loses shared message exactly once (restart={restart}, before B {}, offers {trail:?})",
+            accepted.len()
         );
         assert_eq!(a["removed_request_count"], 1);
         assert_eq!(a["removed_usage"]["input_tokens"], 10);

@@ -1273,6 +1273,10 @@ pub(crate) fn forget_for_test(support_dir: &Path) {
 /// record count.
 #[cfg(test)]
 pub(crate) fn reload_for_test(support_dir: &Path) -> Option<usize> {
+    // A restart waits for the writer to finish the queued saves and the
+    // reload itself; a full ledger takes longer than one page's flush bound
+    // in a debug build.
+    let _flush = flush_timeout_for_test(Duration::from_secs(60));
     forget_for_test(support_dir);
     drop(acquire(support_dir));
     with_ledger_for_test(support_dir, |ledger| ledger.census().record_count())
@@ -1291,6 +1295,13 @@ pub(crate) fn with_ledger_for_test<T>(
     // Run fixture code outside LEDGERS: a failing assertion must not poison
     // the daemon-wide registry and turn later independent controls unavailable.
     Some(read(&mut ledger))
+}
+
+/// Whether the ledger of `support_dir` is in custody recovery (a damaged
+/// load whose rebuild has not completed).
+#[cfg(test)]
+pub(crate) fn recovering_for_test(support_dir: &Path) -> bool {
+    with_ledger_for_test(support_dir, |ledger| ledger.recovering()).expect("the ledger is loaded")
 }
 
 #[cfg(test)]
