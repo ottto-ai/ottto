@@ -30,9 +30,13 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision with a policy row. Raising the active
-/// revision past it fails the release gate test and holds every upgrade.
-pub(super) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
+/// Highest active Claude revision the gate is complete for (SOURCE F2). The
+/// revision-3 row exists but is incomplete until MONEY's revision-3 change
+/// lands (a paused-list literal, a per-revision no-list cutoff, mtime-only
+/// changes), so this stays 2 until then. Above it every owed upgrade and
+/// every listed change is held, no file is stamped, and the Claude revision
+/// constant fails to compile. The release check reads this line.
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
 
 /// At most one owed-without-list alarm an hour.
 const OWED_WITHOUT_LIST_ALARM_INTERVAL: std::time::Duration =
@@ -179,6 +183,8 @@ pub(super) struct PolicyInputs<'a> {
     pub(super) birth_unix_seconds: Option<u64>,
     pub(super) latched: bool,
     pub(super) active_revision: u64,
+    /// The index's history cutoff (rebuilt or prior-install history).
+    pub(super) history_cutoff_unix_seconds: Option<u64>,
 }
 
 /// Apply the list, the birth hold, the family skip, the latch, the budget
@@ -211,6 +217,7 @@ pub(super) fn decide(
             } else if inputs
                 .exclusions
                 .holds_without_list(inputs.birth_unix_seconds)
+                || holds_until_history_cutoff(inputs)
             {
                 Some(HistoryHold::NoListBirth)
             } else if inputs.latched {
@@ -225,6 +232,19 @@ pub(super) fn decide(
     };
     page.note(kind, decision, inputs.exclusions.state());
     decision
+}
+
+/// SOURCE F4a: with no list, rebuilt or prior-install history is held up to
+/// the later of the fixed no-list cutoff and the saved history cutoff, so
+/// history born after 2026-10-21 cannot be paced out without a list. Unknown
+/// birth is history.
+fn holds_until_history_cutoff(inputs: &PolicyInputs<'_>) -> bool {
+    inputs.exclusions.state() == ListState::NotInstalled
+        && inputs.history_cutoff_unix_seconds.is_some_and(|cutoff| {
+            inputs
+                .birth_unix_seconds
+                .map_or(true, |birth| birth <= cutoff)
+        })
 }
 
 /// One page's history budget and its count-only, local diagnostics.
@@ -470,6 +490,7 @@ mod tests {
             birth_unix_seconds: Some(u64::MAX),
             latched: false,
             active_revision: active,
+            history_cutoff_unix_seconds: None,
         }
     }
 
@@ -552,7 +573,63 @@ mod tests {
         assert_eq!(HISTORY_UPGRADE_BYTES_PER_PAGE, 1 << 30);
         assert!(revision_policy(2).unwrap().listed_changed_may_emit);
         assert!(!revision_policy(3).unwrap().listed_changed_may_emit);
-        assert_eq!(revision_policy(MAX_GATED_CLAUDE_REVISION + 1), None);
+        assert_eq!(revision_policy(4), None);
+        // SOURCE F2: the revision-3 row is incomplete, so the gate stops at 2
+        // and an owed revision-3 upgrade is held whatever the list says.
+        assert_eq!(MAX_GATED_CLAUDE_REVISION, 2);
+        let list = installed("");
+        assert_eq!(
+            decide(
+                HistoryKind::Owed,
+                &inputs(&list, false, 3),
+                &mut HistoryPage::default(),
+                "k",
+                1
+            ),
+            HistoryDecision::Held(HistoryHold::UngatedRevision)
+        );
+    }
+
+    #[test]
+    fn no_list_hold_reaches_the_later_history_cutoff() {
+        // SOURCE F4a: history born after the fixed 2026-10-21 cutoff but at
+        // or before the saved history cutoff is still held without a list.
+        let not_installed = ReemissionExclusions::default();
+        let mut cutoff = inputs(&not_installed, false, 2);
+        cutoff.history_cutoff_unix_seconds = Some(u64::MAX - 1);
+        for (birth, held) in [
+            (Some(u64::MAX - 1), true),
+            (None, true),
+            (Some(u64::MAX), false),
+        ] {
+            cutoff.birth_unix_seconds = birth;
+            let decision = decide(
+                HistoryKind::Owed,
+                &cutoff,
+                &mut HistoryPage::default(),
+                "k",
+                1,
+            );
+            assert_eq!(
+                decision == HistoryDecision::Held(HistoryHold::NoListBirth),
+                held,
+                "{birth:?}"
+            );
+        }
+        // An installed list replaces the birth hold.
+        let list = installed("");
+        let mut listed = inputs(&list, false, 2);
+        listed.history_cutoff_unix_seconds = Some(u64::MAX - 1);
+        assert_eq!(
+            decide(
+                HistoryKind::Owed,
+                &listed,
+                &mut HistoryPage::default(),
+                "k",
+                1
+            ),
+            HistoryDecision::Owed
+        );
     }
 
     #[test]

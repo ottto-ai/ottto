@@ -100,6 +100,7 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+pub(crate) use claude_history_upgrade::MAX_GATED_CLAUDE_REVISION;
 use claude_history_upgrade::{HistoryDecision, HistoryEmission, HistoryHold, HistoryPage};
 use claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
@@ -3101,6 +3102,11 @@ pub struct ScanIndex {
     /// entries. A new file born before it (or at an unknown time) is history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claude_history_cutoff_unix_seconds: Option<u64>,
+    /// Claude only: a daemon with the history gate has loaded this index
+    /// (StateMissing M3). Without it, an index a pre-gate daemon built, or
+    /// rebuilt only partly, gets its cutoff on the first gated load.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    claude_history_gate_loaded: bool,
     /// Runtime-only history-gate decisions of this cycle, by source file.
     #[serde(skip)]
     claude_history_emission: HistoryEmission,
@@ -3325,6 +3331,7 @@ impl Default for ScanIndex {
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
             claude_history_cutoff_unix_seconds: None,
+            claude_history_gate_loaded: false,
             claude_history_emission: HistoryEmission::default(),
         }
     }
@@ -9457,6 +9464,12 @@ impl ClaudeIndexPathMemberRef<'_> {
         (self.root.to_owned(), member)
     }
 }
+
+/// The re-emission list's seen-marker: prior-history evidence for the gate.
+pub(crate) fn claude_reemission_seen_marker_path(support_dir: &Path) -> PathBuf {
+    ReemissionExclusions::seen_marker_path(support_dir)
+}
+
 fn claude_index_path_member_ref(path: &Path) -> Option<ClaudeIndexPathMemberRef<'_>> {
     if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
         return None;
@@ -18582,6 +18595,15 @@ enum LoadOrigin {
     Quarantined,
 }
 
+/// What a snapshot-source index load found, outside `snapshots`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ScanIndexLoadOrigin {
+    Loaded,
+    Missing,
+    /// Renamed away as invalid and rebuilt empty.
+    Quarantined,
+}
+
 /// The index file a `MINTED` nonce belongs to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum MintedIdentity {
@@ -24559,8 +24581,18 @@ impl OwnedSourceScan {
                 } else {
                     HistoryDecision::NotOwed
                 };
+                // A held, unchanged member owed only a proof correction is not
+                // re-read every traversal either: its bodies would be vetoed,
+                // and the correction waits for the gate (StateMissing M2).
+                let correction_only = parse_reason
+                    == Some(CandidateParseReason::AuthorityQuarantine)
+                    && index.claude_authority_correction_only(&candidate);
                 match history {
-                    HistoryDecision::Held(_) if adoption_only && !comparison_target => {
+                    HistoryDecision::Held(hold)
+                        if (adoption_only
+                            || (correction_only && hold != HistoryHold::ListedChanged))
+                            && !comparison_target =>
+                    {
                         decision = CandidateDecision::Skip;
                     }
                     HistoryDecision::Held(hold) => {
@@ -35218,34 +35250,49 @@ impl ScanIndex {
         }
     }
 
-    /// Claude only, before scanning: a destination that already completed its
-    /// history bootstrap and now loaded a fresh index, or whose historical
-    /// replay just dropped its entries, records the history cutoff. A new
-    /// file born before it (or at an unknown time) is history (SOURCE P1).
-    /// A later cutoff only moves forward; a fresh install records none.
-    pub(crate) fn note_claude_history_cutoff(&mut self, prior_history: bool, entries_lost: bool) {
-        if !(prior_history && entries_lost) {
-            return;
-        }
+    /// Claude only, before scanning, every cycle. With prior history on this
+    /// Mac, a fresh index or a replay that dropped entries records the history
+    /// cutoff at now; a new file born before it (or at an unknown time) is
+    /// history (SOURCE P1). Proven prior history for this very destination
+    /// also records one on the first gated load of an index with none, so an
+    /// index a pre-gate daemon rebuilt only partly is covered (StateMissing
+    /// M3); an index a gated daemon built, such as a fresh install's after
+    /// its bootstrap, records none. A stored cutoff ahead of the clock is
+    /// pulled back to now, so a forward clock jump is not kept (L1). A fresh
+    /// install records none.
+    pub(crate) fn note_claude_history_cutoff(
+        &mut self,
+        prior_history: bool,
+        prior_history_here: bool,
+        entries_lost: bool,
+    ) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        self.claude_history_cutoff_unix_seconds = Some(
-            self.claude_history_cutoff_unix_seconds
-                .map_or(now, |cutoff| cutoff.max(now)),
-        );
+        if let Some(cutoff) = self.claude_history_cutoff_unix_seconds.as_mut() {
+            *cutoff = (*cutoff).min(now);
+        }
+        let first_gated_load = !std::mem::replace(&mut self.claude_history_gate_loaded, true);
+        if (prior_history && entries_lost)
+            || (prior_history_here
+                && first_gated_load
+                && self.claude_history_cutoff_unix_seconds.is_none())
+        {
+            self.claude_history_cutoff_unix_seconds = Some(now);
+        }
     }
 
     /// The one reason-independent history decision for a Claude candidate,
     /// against its entry before this parse. Every caller (the candidate loop,
     /// MONEY's emitter) uses it; the parse reason stays diagnostic only.
     fn claude_history_upgrade_decision(
-        &self,
+        &mut self,
         candidate: &CandidateFile,
         birth_unix_seconds: Option<u64>,
         page: &mut HistoryPage,
     ) -> HistoryDecision {
+        self.close_claude_reemission_list_over_root_members(candidate);
         let key = local_index_key(&candidate.path);
         let extent = |size_bytes, modified_unix_seconds, modified_unix_nanos| {
             claude_history_upgrade::FileExtent {
@@ -35279,11 +35326,63 @@ impl ScanIndex {
                 birth_unix_seconds,
                 latched: claude_reemission_stop_latched(),
                 active_revision: self.active_effective_upload_body_witness_revision,
+                history_cutoff_unix_seconds: self.claude_history_cutoff_unix_seconds,
             },
             page,
             &key,
             candidate.size_bytes,
         )
+    }
+
+    /// StateMissing M1: a list line may name only a member (`root_stem`). On a
+    /// fresh or replayed index the member is not indexed yet when its root is
+    /// decided, so the load-time closure cannot list the root. Before a root's
+    /// decision, close the list over the members on disk under
+    /// `<root>/subagents/`. The walk is bounded; past the bound the root is
+    /// treated as listed (held, never sent).
+    fn close_claude_reemission_list_over_root_members(&mut self, candidate: &CandidateFile) {
+        const MAX_MEMBER_ENTRIES: usize = 4_096;
+        if self.claude_reemission_exclusions.is_empty()
+            || self.claude_reemission_excluded(candidate)
+        {
+            return;
+        }
+        let Some(member) = claude_index_path_member_ref(&candidate.path) else {
+            return;
+        };
+        if member.subagent_stem.is_some() {
+            return;
+        }
+        let root = member.root.to_owned();
+        let mut pending = vec![candidate.path.with_extension("").join("subagents")];
+        let mut members = Vec::new();
+        let mut visited = 0_usize;
+        while let Some(directory) = pending.pop() {
+            let Ok(entries) = fs::read_dir(&directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                visited += 1;
+                if visited > MAX_MEMBER_ENTRIES {
+                    self.claude_reemission_exclusions.list_root(&root);
+                    return;
+                }
+                let path = entry.path();
+                match entry.file_type() {
+                    Ok(kind) if kind.is_dir() => pending.push(path),
+                    Ok(kind) if kind.is_file() => members.push(path),
+                    _ => {}
+                }
+            }
+        }
+        self.claude_reemission_exclusions.close_over_roots(
+            members
+                .iter()
+                .map(PathBuf::as_path)
+                .filter_map(claude_index_path_member_ref)
+                .filter(|member| member.root == root)
+                .filter_map(|member| Some((member.root, member.subagent_stem?))),
+        );
     }
 
     /// Record a gated candidate before its parse, with the entry's upload
@@ -35470,6 +35569,11 @@ impl ScanIndex {
             return false;
         }
         let monotone = self.active_effective_upload_body_witness_revision_monotone;
+        // SOURCE F2: no Claude file is stamped above the last revision the
+        // history gate is complete for.
+        if monotone && allowed_active > MAX_GATED_CLAUDE_REVISION {
+            return false;
+        }
         let Some(entry) = self.files.get_mut(index_key) else {
             return false;
         };
@@ -36264,7 +36368,23 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<Self> {
-        let index = Self::load_attributed(path, Some(source))?;
+        Ok(Self::load_for_snapshot_source_with_origin(path, source, support_dir)?.0)
+    }
+
+    /// `load_for_snapshot_source` plus what the load found (StateMissing M3):
+    /// a missing or quarantined file is a fresh index whatever it holds.
+    pub(crate) fn load_for_snapshot_source_with_origin(
+        path: &Path,
+        source: SnapshotSource,
+        support_dir: &Path,
+    ) -> Result<(Self, ScanIndexLoadOrigin)> {
+        let (mut index, origin) = Self::load_inner(path, Some(source))?;
+        let load_origin = match &origin {
+            LoadOrigin::Loaded(_) => ScanIndexLoadOrigin::Loaded,
+            LoadOrigin::Missing => ScanIndexLoadOrigin::Missing,
+            LoadOrigin::Quarantined => ScanIndexLoadOrigin::Quarantined,
+        };
+        index.mint_or_reuse_codex_proof_incarnation(path, origin);
         if source == SnapshotSource::ClaudeCode
             && index.generation == 0
             && index.files.is_empty()
@@ -36277,7 +36397,7 @@ impl ScanIndex {
                 std::time::Instant::now(),
             );
         }
-        Ok(index)
+        Ok((index, load_origin))
     }
 
     pub fn load(path: &Path) -> Result<Self> {
@@ -37487,6 +37607,8 @@ impl ScanIndex {
             claude_history_cutoff_unix_seconds: self
                 .claude_history_cutoff_unix_seconds
                 .or(previous.claude_history_cutoff_unix_seconds),
+            claude_history_gate_loaded: self.claude_history_gate_loaded
+                || previous.claude_history_gate_loaded,
             claude_history_emission: self.claude_history_emission.clone(),
         };
         for key in &safe_keys {
@@ -38042,6 +38164,57 @@ impl ScanIndex {
         } else {
             (CandidateDecision::Skip, None)
         }
+    }
+
+    /// StateMissing M2: this member is selected only because its family owes
+    /// a proof correction (no witness change and no due retry).
+    fn claude_authority_correction_only(&self, candidate: &CandidateFile) -> bool {
+        claude_index_path_family_member(&candidate.path).is_some_and(|(root, member)| {
+            self.claude_usage_authority_quarantine
+                .get(&root)
+                .and_then(|record| record.proof_correction.as_ref())
+                .is_some_and(|correction| correction.owed_member_ids.contains(&member))
+                && self
+                    .claude_usage_authority_candidate_requires_family_reparse(candidate)
+                    .is_none()
+        })
+    }
+
+    /// StateMissing M2: whether an owed proof correction still blocks a fully
+    /// settled upload, and how many owed members wait for the history gate
+    /// instead. A member whose indexed file still owes the history upgrade is
+    /// held by the gate: its correction settles once the gate permits it, so
+    /// it is deferred (disclosed), not blocking. A member with no indexed file
+    /// blocks.
+    pub(crate) fn claude_authority_proof_correction_blocking(&self) -> (bool, usize) {
+        let mut owed = BTreeSet::new();
+        for record in self.claude_usage_authority_quarantine.values() {
+            let Some(correction) = record.proof_correction.as_ref() else {
+                continue;
+            };
+            for member in &correction.owed_member_ids {
+                match record.member_source_file_fingerprints.get(member) {
+                    Some(source_file_fingerprint) => {
+                        owed.insert(source_file_fingerprint.as_str());
+                    }
+                    None => return (true, 0),
+                }
+            }
+        }
+        if owed.is_empty() {
+            return (false, 0);
+        }
+        let mut deferred = 0;
+        let mut found = 0;
+        for (key, entry) in &self.files {
+            if owed.contains(entry.source_file_fingerprint.as_str()) {
+                found += 1;
+                if self.effective_upload_body_witness_revision_requires_adoption(key) {
+                    deferred += 1;
+                }
+            }
+        }
+        (found < owed.len() || deferred < found, deferred)
     }
 
     fn claude_usage_authority_candidate_requires_family_reparse(
@@ -76297,7 +76470,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_emission, reason_reoffer_retries);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_emission, reason_reoffer_retries);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);

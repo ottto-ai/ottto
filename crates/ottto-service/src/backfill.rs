@@ -63,6 +63,13 @@ pub struct BackfillState {
     /// re-claims without meaning "resurrect pre-cutoff history").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_cutoff_user_id: Option<String>,
+    /// Set when this state stands in for a present but unreadable state file
+    /// (SOURCE F1a, StateMissing H1). Its history is unknown, so it counts as
+    /// prior history and arms no bootstrap or replay. Any writer that loads,
+    /// changes and saves keeps it, so the signal is never replaced by a plain
+    /// default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prior_history_unverified: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,12 +94,20 @@ pub fn backfill_state_path(state_dir: &Path) -> PathBuf {
     state_dir.join(BACKFILL_STATE_FILENAME)
 }
 
+/// A missing file is a positively empty state. A file that exists but cannot
+/// be opened or decoded fails closed: the default state marked
+/// `prior_history_unverified`.
 pub fn load_backfill_state(state_dir: &Path) -> BackfillState {
     let path = backfill_state_path(state_dir);
-    let Ok(file) = File::open(&path) else {
-        return BackfillState::default();
+    let unverified = || BackfillState {
+        prior_history_unverified: true,
+        ..BackfillState::default()
     };
-    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+    match File::open(&path) {
+        Ok(file) => serde_json::from_reader(BufReader::new(file)).unwrap_or_else(|_| unverified()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BackfillState::default(),
+        Err(_) => unverified(),
+    }
 }
 
 pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()> {
@@ -280,6 +295,11 @@ pub fn pending_backfill_sources_for_destination(
     state: &BackfillState,
     destination_namespace_hash: &str,
 ) -> Vec<SnapshotSource> {
+    // An unreadable state arms no bootstrap or replay (StateMissing H1): its
+    // history is unknown, and a replay would drop the index's entries.
+    if state.prior_history_unverified {
+        return Vec::new();
+    }
     [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
@@ -710,6 +730,40 @@ mod tests {
         let state = BackfillState::default();
         let pending = pending_backfill_sources(&state);
         assert_eq!(pending.len(), 3);
+    }
+
+    /// SOURCE F1a, StateMissing H1: only a missing file is a fresh state. An
+    /// unreadable one arms nothing and keeps its marker through a writer
+    /// that loads, changes and saves.
+    #[test]
+    fn unreadable_state_fails_closed_and_keeps_its_marker() {
+        let dir = temp_dir("unreadable-state");
+        let missing = load_backfill_state(&dir);
+        assert_eq!(missing, BackfillState::default());
+        assert_eq!(
+            pending_backfill_sources_for_destination(&missing, "destination-a").len(),
+            3
+        );
+
+        fs::write(
+            backfill_state_path(&dir),
+            b"{\"completed_destination_namespaces\":",
+        )
+        .expect("write a truncated state");
+        let unreadable = load_backfill_state(&dir);
+        assert!(unreadable.prior_history_unverified);
+        assert!(pending_backfill_sources_for_destination(&unreadable, "destination-a").is_empty());
+
+        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_a")
+            .expect("a claim rewrites the state");
+        let rewritten = load_backfill_state(&dir);
+        assert!(rewritten.prior_history_unverified, "the marker survives");
+        assert_eq!(
+            rewritten.backfill_cutoff_at.as_deref(),
+            Some("2026-07-06T10:00:00Z")
+        );
+        assert!(pending_backfill_sources_for_destination(&rewritten, "destination-a").is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

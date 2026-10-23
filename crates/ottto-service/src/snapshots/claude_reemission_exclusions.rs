@@ -234,6 +234,20 @@ impl ReemissionExclusions {
         }
     }
 
+    /// List a family root whose members could not all be read, within the
+    /// same digest bound as the closure (fail closed: the root is held).
+    pub(crate) fn list_root(&mut self, root: &str) {
+        let root_digest = HexDigest::of(root, None);
+        if self.contains(&root_digest) {
+            return;
+        }
+        if self.digests.len() >= MAX_CLOSED_DIGESTS {
+            self.state = ListState::ClosureOverflow;
+            return;
+        }
+        self.digests.insert(root_digest.as_str().to_owned());
+    }
+
     /// True when the exact full id of the family root or of this member
     /// (`root` alone, or `root_stem`) is listed. After `close_over_roots`,
     /// every member of a family with any listed member matches through its
@@ -425,6 +439,27 @@ mod tests {
         assert!(!parsed.excludes("root-c", None));
         assert!(!parsed.excludes("root-c", Some("agent-1")));
         assert_eq!(parsed.state(), ListState::Installed);
+    }
+
+    /// A family whose members could not all be read is listed by its root,
+    /// once, within the closure bound.
+    #[test]
+    fn list_root_holds_the_family_and_fails_closed_at_the_bound() {
+        let mut parsed =
+            ReemissionExclusions::parse(format!("{}\n", digest("root-b_agent-1")).as_bytes());
+        parsed.list_root("root-b");
+        parsed.list_root("root-b");
+        assert!(parsed.excludes("root-b", None));
+        assert!(parsed.excludes("root-b", Some("agent-9")));
+        assert_eq!(parsed.digests.len(), 2);
+        assert_eq!(parsed.state(), ListState::Installed);
+        let full = (0..MAX_CLOSED_DIGESTS)
+            .map(|slot| format!("{slot:064x}"))
+            .collect::<BTreeSet<_>>();
+        parsed.digests = full;
+        parsed.list_root("root-c");
+        assert_eq!(parsed.state(), ListState::ClosureOverflow);
+        assert!(parsed.pauses_adoption());
     }
 
     /// Repeated members of one listed family add its root once; the closed

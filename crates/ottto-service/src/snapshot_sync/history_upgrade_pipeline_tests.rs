@@ -34,9 +34,12 @@ struct HistoryCycle<'a> {
     revision: u64,
     upload_context: &'a str,
     replay_generation: Option<&'a str>,
-    /// This destination already completed its Claude history bootstrap.
+    /// This destination completed its Claude history bootstrap (persisted to
+    /// the support directory's backfill state before the cycle).
     bootstrapped: bool,
     upload: PipelineUpload,
+    /// Another relay destination (its own index); `None` is the default one.
+    destination: Option<&'a str>,
 }
 
 const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
@@ -45,6 +48,7 @@ const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
     replay_generation: None,
     bootstrapped: false,
     upload: PipelineUpload::Accept,
+    destination: None,
 };
 
 struct HistoryOutcome {
@@ -124,31 +128,66 @@ impl HistoryFixture {
         std::fs::write(&self.index_path, b"{not json").expect("corrupt saved index");
     }
 
+    fn index_path_for(&self, destination: Option<&str>) -> PathBuf {
+        destination.map_or_else(
+            || self.index_path.clone(),
+            |destination| {
+                self.base
+                    .join(format!("claude-scan-index-{destination}.json"))
+            },
+        )
+    }
+
+    fn corrupt_backfill_state(&self) {
+        std::fs::write(
+            crate::backfill::backfill_state_path(&self.support),
+            b"{\"completed_destination_namespaces\":",
+        )
+        .expect("corrupt backfill state");
+    }
+
     fn cycle(&self, collected_at: &str, cycle: HistoryCycle<'_>) -> HistoryOutcome {
-        let mut index = ScanIndex::load_for_snapshot_source(
-            &self.index_path,
+        let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
+        let index_path = self.index_path_for(cycle.destination);
+        let (mut index, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &index_path,
             SnapshotSource::ClaudeCode,
             &self.support,
         )
         .expect("load scan index");
-        let loaded_fresh = index.generation == 0 && index.files.is_empty();
+        let loaded_fresh = origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
+            || (index.generation == 0 && index.files.is_empty());
         index.activate_upload_context(cycle.upload_context.to_string());
-        let replay_dropped = cycle
-            .replay_generation
-            .is_some_and(|generation| index.prepare_historical_replay(generation.to_string()));
-        let mut backfill = crate::backfill::BackfillState::default();
+        let mut backfill = crate::backfill::load_backfill_state(&self.support);
         if cycle.bootstrapped {
             crate::backfill::mark_backfill_complete_for_destination(
                 &mut backfill,
                 SnapshotSource::ClaudeCode,
-                HISTORY_DESTINATION,
+                destination,
             );
+            crate::backfill::save_backfill_state(&self.support, &backfill)
+                .expect("persist backfill state");
         }
+        let mut progress = test_upload_progress();
+        // Read before the replay claims a generation, as in production.
+        let prior_history = claude_prior_history(
+            &backfill,
+            destination,
+            &progress,
+            &index_path,
+            &self.support,
+        );
+        // Production arms no bootstrap replay from an unreadable state.
+        let replay_pending =
+            cycle.replay_generation.is_some() && !backfill.prior_history_unverified;
+        let replay_dropped = replay_pending
+            && cycle
+                .replay_generation
+                .is_some_and(|generation| index.prepare_historical_replay(generation.to_string()));
         note_claude_history_cutoff_for_cycle(
             &mut index,
             SnapshotSource::ClaudeCode,
-            &backfill,
-            HISTORY_DESTINATION,
+            prior_history,
             loaded_fresh || replay_dropped,
         );
         index.activate_effective_upload_body_witness_revision(cycle.revision);
@@ -187,7 +226,6 @@ impl HistoryFixture {
             &disposition,
             &backfill,
         );
-        let mut progress = test_upload_progress();
         exclude_held_effective_body_witness_revision(&mut index, &scan.snapshots, &disposition);
         let proof_corrections =
             index.capture_claude_proof_corrections(&mut scan, &disposition, |snapshot| {
@@ -248,10 +286,10 @@ impl HistoryFixture {
         };
         let mut index = settlement.index;
         settle_index_after_upload(&mut index, &committed_index, &progress);
-        index.save(&self.index_path).expect("save scan index");
+        index.save(&index_path).expect("save scan index");
         HistoryOutcome {
             scan,
-            index: ScanIndex::load(&self.index_path).expect("reload scan index"),
+            index: ScanIndex::load(&index_path).expect("reload scan index"),
             uploaded,
             corrections,
         }
@@ -295,6 +333,7 @@ const HISTORY_REVISION_2: HistoryCycle<'static> = HistoryCycle {
     replay_generation: None,
     bootstrapped: true,
     upload: PipelineUpload::Accept,
+    destination: None,
 };
 
 /// Primary incident shape (addendum 2): a bootstrapped destination's index is
@@ -349,7 +388,10 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
             let kept = &partial.files[key];
             assert_eq!(kept.source_file_fingerprint, entry.source_file_fingerprint);
             assert_eq!(kept.size_bytes, entry.size_bytes);
-            assert_eq!(kept.last_snapshot_fingerprint, entry.last_snapshot_fingerprint);
+            assert_eq!(
+                kept.last_snapshot_fingerprint,
+                entry.last_snapshot_fingerprint
+            );
         }
         for hour in [10, 11] {
             let again = fixture.cycle(&format!("2026-08-02T{hour}:00:00Z"), HISTORY_REVISION_2);
@@ -486,13 +528,14 @@ fn installed_list_paces_rebuilt_history_and_denies_listed_families() {
     }
 }
 
-/// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (no
-/// bootstrap recorded for this destination) ingests new files normally, even
-/// after a quarantine and with old births.
+/// Addendum 2 item 13 and addendum 3 item 19: a genuinely fresh install (a
+/// positively empty support state: no backfill state, no quarantined index,
+/// no upload ledger, no seen-marker) ingests new files normally, even with
+/// old births. A quarantined index is prior history (SOURCE F1a), so this
+/// fixture no longer starts from one.
 #[test]
 fn fresh_install_without_a_prior_bootstrap_ingests_new_files() {
     let fixture = HistoryFixture::new("history-upgrade-fresh");
-    fixture.corrupt_index();
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let fresh = fixture.cycle(
             "2026-08-02T09:00:00Z",
@@ -535,9 +578,11 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     });
 }
 
-/// Addendum 1 items 2 and 5 (P2): under revision 3 the gate holds history the
-/// same way, a listed family's genuine change is denied (it emits under
-/// revision 2), and a stored 3 is never downgraded by revision 2.
+/// Addendum 1 items 2 and 5 (P2), SOURCE F2: revision 3 is above
+/// `MAX_GATED_CLAUDE_REVISION`, so the gate holds every upgrade
+/// (`ungated_revision`) and a listed family's genuine change is denied; no
+/// file is stamped 3. A listed family's genuine change emits under revision
+/// 2, and a stored 3 is never downgraded by revision 2.
 #[test]
 fn revision_three_policy_denies_listed_changes_and_never_downgrades() {
     let fixture = HistoryFixture::new("history-upgrade-revision-three");
@@ -551,14 +596,15 @@ fn revision_three_policy_denies_listed_changes_and_never_downgrades() {
     };
     let denied = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
     assert!(
-        !denied.uploaded.contains(HISTORY_SESSIONS[0]),
-        "revision 3 never emits a listed root, even changed"
+        denied.uploaded.is_empty(),
+        "an ungated revision emits nothing: {:?}",
+        denied.uploaded
     );
-    assert_eq!(
-        denied.uploaded.len(),
-        HISTORY_SESSIONS.len() - 1,
-        "unlisted history upgrades within budget"
-    );
+    assert!(denied
+        .index
+        .files
+        .values()
+        .all(|entry| entry.effective_upload_body_witness_revision <= 2));
 
     let fixture = HistoryFixture::new("history-upgrade-revision-two-listed");
     fixture.baseline();
@@ -667,4 +713,176 @@ fn held_history_never_settles_as_accepted_on_a_deferred_page() {
             2
         );
     });
+}
+
+/// SOURCE F4a: the incident shape with no override of the no-list cutoff.
+/// The fixture's history is born after 2026-10-21, but before the history
+/// cutoff this load records, so it is still held: the hold reaches the later
+/// of the two.
+#[test]
+fn quarantined_index_holds_history_born_after_the_no_list_cutoff() {
+    let fixture = HistoryFixture::new("history-upgrade-quarantine-real-cutoff");
+    fixture.baseline();
+    fixture.corrupt_index();
+    let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    assert_eq!(rebuilt.scan.scanned_file_count, HISTORY_SESSIONS.len());
+    assert!(rebuilt.uploaded.is_empty(), "{:?}", rebuilt.uploaded);
+    assert_eq!(rebuilt.corrections, 0);
+    let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+    assert_eq!(again.scan.scanned_file_count, 0, "no re-read storm");
+    assert!(again.uploaded.is_empty());
+}
+
+/// SOURCE F1a: a quarantined sibling of this index is prior history by
+/// itself, with no backfill state at all.
+#[test]
+fn quarantined_index_sibling_alone_is_prior_history() {
+    let fixture = HistoryFixture::new("history-upgrade-sibling");
+    fixture.baseline();
+    fixture.corrupt_index();
+    let rebuilt = fixture.cycle(
+        "2026-08-02T09:00:00Z",
+        HistoryCycle {
+            bootstrapped: false,
+            ..HISTORY_REVISION_2
+        },
+    );
+    assert!(rebuilt.uploaded.is_empty(), "{:?}", rebuilt.uploaded);
+}
+
+/// SOURCE F1a, StateMissing H1: an unreadable backfill state is prior
+/// history, not a fresh install. With a quarantined index, or with the index
+/// gone and no other evidence, no history is emitted; the state keeps its
+/// marker and arms no bootstrap.
+#[test]
+fn unreadable_backfill_state_emits_no_history_from_a_rebuilt_index() {
+    for (name, quarantine) in [
+        ("history-upgrade-unreadable-quarantined", true),
+        ("history-upgrade-unreadable-missing", false),
+    ] {
+        let fixture = HistoryFixture::new(name);
+        fixture.baseline();
+        fixture.corrupt_backfill_state();
+        if quarantine {
+            fixture.corrupt_index();
+        } else {
+            std::fs::remove_file(&fixture.index_path).expect("lose the index");
+        }
+        for hour in [9, 10] {
+            let outcome = fixture.cycle(
+                &format!("2026-08-02T{hour:02}:00:00Z"),
+                HistoryCycle {
+                    bootstrapped: false,
+                    ..HISTORY_REVISION_2
+                },
+            );
+            assert!(
+                outcome.uploaded.is_empty(),
+                "{name}: {:?}",
+                outcome.uploaded
+            );
+            assert_eq!(outcome.corrections, 0);
+        }
+        let state = crate::backfill::load_backfill_state(&fixture.support);
+        assert!(state.prior_history_unverified);
+        assert!(crate::backfill::pending_backfill_sources_for_destination(
+            &state,
+            HISTORY_DESTINATION
+        )
+        .is_empty());
+    }
+}
+
+/// StateMissing H1: an unreadable backfill state over a populated index arms
+/// no replay (the entries stay, nothing is re-read) and uploads no old
+/// history. The entries' births are old (the no-list cutoff seam).
+#[test]
+fn unreadable_backfill_state_arms_no_replay_over_a_populated_index() {
+    let fixture = HistoryFixture::new("history-upgrade-unreadable-populated");
+    let baseline = fixture.baseline();
+    fixture.corrupt_backfill_state();
+    let outcome = crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        fixture.cycle(
+            "2026-08-02T09:00:00Z",
+            HistoryCycle {
+                replay_generation: Some("history-replay-2"),
+                bootstrapped: false,
+                ..HISTORY_REVISION_2
+            },
+        )
+    });
+    assert!(outcome.uploaded.is_empty(), "{:?}", outcome.uploaded);
+    assert_eq!(outcome.scan.scanned_file_count, 0, "nothing re-read");
+    for (key, entry) in &outcome.index.files {
+        assert_eq!(
+            entry.source_file_fingerprint, baseline.files[key].source_file_fingerprint,
+            "entries kept"
+        );
+        assert_eq!(
+            entry.effective_upload_body_witness_revision, 1,
+            "a replay would have zeroed it"
+        );
+    }
+}
+
+/// SOURCE F1b: a re-pair to a new destination finds history born before the
+/// claim owed and gated, never re-sent ungated: the other destination's
+/// completed bootstrap is prior history.
+#[test]
+fn new_destination_holds_history_born_before_the_claim() {
+    let fixture = HistoryFixture::new("history-upgrade-new-destination");
+    fixture.baseline();
+    // The first destination's bootstrap completes after its first cycle.
+    let settled = fixture.cycle(
+        "2026-08-02T08:30:00Z",
+        HistoryCycle {
+            bootstrapped: true,
+            ..HISTORY_BASELINE
+        },
+    );
+    assert!(settled.uploaded.is_empty());
+    for (hour, bootstrapped) in [(9, false), (10, true)] {
+        let moved = fixture.cycle(
+            &format!("2026-08-02T{hour:02}:00:00Z"),
+            HistoryCycle {
+                destination: Some("history-upgrade-destination-b"),
+                bootstrapped,
+                ..HISTORY_REVISION_2
+            },
+        );
+        assert!(moved.uploaded.is_empty(), "{:?}", moved.uploaded);
+    }
+}
+
+/// SOURCE F1b: a claim that recorded a different-user cutoff keeps that
+/// history excluded by the cutoff, as before, not by the history gate: a
+/// session with activity after the cutoff is still sent whole.
+#[test]
+fn different_user_cutoff_excludes_history_without_the_gate() {
+    let fixture = HistoryFixture::new("history-upgrade-different-user");
+    let mut state = crate::backfill::BackfillState {
+        backfill_cutoff_at: Some("2026-08-02T07:00:15Z".to_string()),
+        backfill_cutoff_user_id: Some("user-b".to_string()),
+        ..Default::default()
+    };
+    crate::backfill::mark_backfill_complete_for_destination(
+        &mut state,
+        SnapshotSource::ClaudeCode,
+        HISTORY_DESTINATION,
+    );
+    crate::backfill::save_backfill_state(&fixture.support, &state).expect("save claim state");
+    fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+    let moved = fixture.cycle(
+        "2026-08-02T09:00:00Z",
+        HistoryCycle {
+            destination: Some("history-upgrade-destination-b"),
+            bootstrapped: false,
+            ..HISTORY_REVISION_2
+        },
+    );
+    assert_eq!(
+        moved.uploaded,
+        BTreeSet::from([HISTORY_SESSIONS[0].to_string()]),
+        "only the session active after the cutoff"
+    );
 }

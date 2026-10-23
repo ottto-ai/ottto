@@ -327,34 +327,110 @@ fn with_retained_refusal_conflicts(
 // written only when its upload settles, so an interrupted pass resumes. Claude
 // Code 2 re-reads its history once so the newer context numbers fill in. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
-pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::ClaudeCode => 2,
         SnapshotSource::Codex | SnapshotSource::Pi => 1,
     }
 }
 
-/// Claude only, before scanning: when every file would come back new (a
-/// fresh index or a replay reset) on a destination that already received its
-/// Claude history bootstrap, record the history cutoff. The backfill state,
-/// not the index, remembers that bootstrap, so the signal survives index
-/// loss; a genuinely fresh install or a new destination has none.
+// SOURCE F2: a Claude revision the history gate is not complete for does not
+// build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
+const _: () = assert!(
+    effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
+);
+
+/// Evidence that this Mac already sent Claude history, read before scanning.
+/// It must survive index loss, so none of it lives in the index.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudePriorHistory {
+    /// This destination completed its Claude history bootstrap, or the state
+    /// that would say so is unreadable (fail closed).
+    here: bool,
+    /// Any evidence at all (fail closed, SOURCE F1a/F1b, StateMissing H1).
+    any: bool,
+}
+
+/// A fresh install is only a positively empty support state. Prior history
+/// is any of: this destination's completed bootstrap; an unreadable backfill
+/// state; a Claude bootstrap completed for another destination or recorded
+/// by a legacy state, unless a claim recorded a different-user cutoff (that
+/// history stays excluded by the cutoff, as before); an upload ledger that
+/// holds a replay generation or a permanent refusal; a quarantined
+/// (`.corrupt.`) sibling of this index; or the re-emission seen-marker.
+fn claude_prior_history(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) -> ClaudePriorHistory {
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    let earlier_bootstrap = backfill_state.backfill_cutoff_at.is_none()
+        && (backfill_state
+            .completed_destination_namespaces
+            .contains_key(slug)
+            || backfill_state.completed_parser_versions.contains_key(slug)
+            || backfill_state.completed_replay_revisions.contains_key(slug)
+            || backfill_state.last_completed_at.is_some());
+    let ledger = upload_progress.historical_replay_generation.is_some()
+        || !upload_progress.permanent_rejections.is_empty();
+    let quarantined_sibling = || {
+        let Some(prefix) = index_path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .map(|stem| format!("{stem}.corrupt."))
+        else {
+            return false;
+        };
+        index_path
+            .parent()
+            .and_then(|parent| std::fs::read_dir(parent).ok())
+            .is_some_and(|entries| {
+                entries.flatten().any(|entry| {
+                    entry
+                        .file_name()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with(&prefix))
+                })
+            })
+    };
+    let seen_marker = || {
+        std::fs::symlink_metadata(crate::snapshots::claude_reemission_seen_marker_path(
+            support_dir,
+        ))
+        .is_ok()
+    };
+    ClaudePriorHistory {
+        here: here || backfill_state.prior_history_unverified,
+        any: here
+            || backfill_state.prior_history_unverified
+            || earlier_bootstrap
+            || ledger
+            || quarantined_sibling()
+            || seen_marker(),
+    }
+}
+
+/// Claude only, before scanning: with prior history, a fresh index (missing
+/// or quarantined) or a replay that dropped entries records the history
+/// cutoff; see `ScanIndex::note_claude_history_cutoff`.
 fn note_claude_history_cutoff_for_cycle(
     index: &mut ScanIndex,
     source: SnapshotSource,
-    backfill_state: &crate::backfill::BackfillState,
-    destination_namespace: &str,
+    prior_history: ClaudePriorHistory,
     entries_lost: bool,
 ) {
     if source != SnapshotSource::ClaudeCode {
         return;
     }
-    let prior_history = backfill_state
-        .completed_destination_namespaces
-        .get(source.api_slug())
-        .map(String::as_str)
-        == Some(destination_namespace);
-    index.note_claude_history_cutoff(prior_history, entries_lost);
+    index.note_claude_history_cutoff(prior_history.any, prior_history.here, entries_lost);
 }
 
 fn exclude_held_effective_body_witness_revision(
@@ -632,7 +708,16 @@ fn settle_upload_corrections_after_selection(
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
-    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+    // Correction members the history gate holds wait for it; they are counted,
+    // not blocking (StateMissing M2).
+    let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
+    if deferred > 0 {
+        eprintln!(
+            "local snapshot proof corrections deferred to the history gate for {}: members={deferred}",
+            scan.source.api_slug()
+        );
+    }
+    transport_fully_settled && !blocking
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -5266,15 +5351,18 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    let (mut index, load_origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
     let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
-    // Absent, quarantined or undecodable: every file would come back new.
-    let claude_index_loaded_fresh = index.generation == 0 && index.files.is_empty();
+    // Absent, quarantined or undecodable: every file would come back new. The
+    // load origin decides it (StateMissing M3); an empty saved index counts too.
+    let claude_index_loaded_fresh = load_origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
+        || (index.generation == 0 && index.files.is_empty());
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -5302,6 +5390,17 @@ fn prepare_sync_source(
     let backfill_pending =
         pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
             .contains(&source);
+    // Read before this cycle's replay claims a generation in the upload
+    // ledger: only a generation an earlier cycle left there is evidence.
+    let prior_claude_history = (source == SnapshotSource::ClaudeCode).then(|| {
+        claude_prior_history(
+            &backfill_state,
+            &upload_destination_namespace,
+            &upload_progress,
+            &index_path,
+            support_dir,
+        )
+    });
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -5391,13 +5490,14 @@ fn prepare_sync_source(
         &daemon.transcript_cache,
         &index_path,
     );
-    note_claude_history_cutoff_for_cycle(
-        &mut index,
-        source,
-        &backfill_state,
-        &upload_destination_namespace,
-        claude_index_loaded_fresh || replay_dropped_entries,
-    );
+    if let Some(prior_history) = prior_claude_history {
+        note_claude_history_cutoff_for_cycle(
+            &mut index,
+            source,
+            prior_history,
+            claude_index_loaded_fresh || replay_dropped_entries,
+        );
+    }
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.

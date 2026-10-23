@@ -2,7 +2,7 @@
 //! selected for a reason other than the revision (a changed upload context),
 //! so only the reason-independent gate can hold it. Fixtures are synthetic.
 
-use super::claude_history_upgrade::{revision_policy, MAX_GATED_CLAUDE_REVISION};
+use super::claude_history_upgrade::revision_policy;
 use super::claude_reemission_exclusions::{with_no_list_cutoff, ListState, ReemissionExclusions};
 use super::*;
 
@@ -355,4 +355,161 @@ fn active_claude_revision_has_a_history_policy_row() {
         crate::snapshot_sync::effective_upload_body_witness_revision(SnapshotSource::ClaudeCode);
     assert!(active <= MAX_GATED_CLAUDE_REVISION, "active {active}");
     assert!(revision_policy(active).is_some());
+}
+
+/// The listed family's subagent member id (`root_stem`).
+fn listed_member(index: &ScanIndex, family: &str) -> String {
+    index
+        .files
+        .keys()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .find(|(root, member)| root == family && member != family)
+        .map(|(_, member)| member)
+        .unwrap()
+}
+
+/// StateMissing M1: on a fresh index a list line naming only a member
+/// (`root_stem`) still protects its root, which is decided before the
+/// member is indexed: no root body is emitted, and the unlisted family
+/// upgrades.
+#[test]
+fn member_only_line_protects_its_root_on_a_fresh_index() {
+    let (home, root, index) = families("history-gate-member-only", 2);
+    let support = support("history-gate-member-only-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&listed_member(&index, &session(1)))),
+    )
+    .unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(true, true, true);
+    fresh.load_claude_reemission_exclusions(&support);
+    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
+    assert_eq!(result.scanned_file_count, 4, "new files parse locally");
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
+    assert!(
+        result
+            .snapshots
+            .iter()
+            .all(|item| !item.source_session_id.starts_with(&session(1))),
+        "{:?}",
+        result
+            .snapshots
+            .iter()
+            .map(|item| &item.source_session_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(result.snapshots.len(), 2, "the unlisted family upgrades");
+    let _ = fs::remove_dir_all(home);
+}
+
+/// StateMissing M2: a listed (held) family member owed only a proof
+/// correction is not re-read every traversal: it is skipped like any held
+/// adoption, and its correction is deferred to the history gate (disclosed)
+/// instead of blocking a fully settled upload.
+#[test]
+fn held_member_owed_a_proof_correction_is_skipped_and_deferred() {
+    let (home, root, mut index) = families("history-gate-correction", 2);
+    let support = support("history-gate-correction-support");
+    let family = session(1);
+    let owed = listed_member(&index, &family);
+    let members = index
+        .files
+        .iter()
+        .filter_map(|(key, entry)| {
+            claude_index_path_family_member(Path::new(key))
+                .filter(|(root, _)| *root == family)
+                .map(|(_, member)| (member, entry.source_file_fingerprint.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(members.len(), 2);
+    let witness = claude_usage_family_witness_fingerprint(
+        index
+            .claude_usage_family_witnesses
+            .entry(family.clone())
+            .or_insert_with(|| ClaudeUsageFamilyWitness {
+                evidence_fingerprint: "e".repeat(64),
+                member_request_id_fingerprints: BTreeMap::new(),
+                member_occurrence_fingerprints: BTreeMap::new(),
+                assigned_request_id_fingerprints: BTreeMap::new(),
+                legacy_excluded_request_id_hashes: BTreeMap::new(),
+                legacy_exclusion_evidence_fingerprint: None,
+                legacy_owner_roots: BTreeSet::new(),
+            }),
+    );
+    index.claude_usage_authority_quarantine.insert(
+        family.clone(),
+        ClaudeUsageAuthorityQuarantineRecord {
+            contract: CLAUDE_USAGE_AUTHORITY_CORRECTION_CONTRACT_VERSION.to_string(),
+            proven_witness_fingerprint: witness.clone(),
+            member_source_file_fingerprints: members,
+            failed_reconstruction_count: MAX_CLAUDE_USAGE_AUTHORITY_FAILURES,
+            disposition: ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+            retry_after_unix_seconds: 0,
+            proof_correction: Some(ClaudeAuthorityProofCorrection {
+                proof_witness_fingerprint: witness,
+                owed_member_ids: BTreeSet::from([owed]),
+            }),
+        },
+    );
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&family)),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let mut scanned = Vec::new();
+    for _ in 0..2 {
+        let mut result = scan(&root, &mut index, "ctx-1", 2);
+        scanned.push(result.scanned_file_count);
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        assert!(result
+            .snapshots
+            .iter()
+            .all(|item| !item.source_session_id.starts_with(&family)));
+    }
+    assert_eq!(
+        scanned,
+        vec![2, 0],
+        "only the unlisted family parses, once; the held member is never re-read"
+    );
+    assert_eq!(
+        index.claude_authority_proof_correction_blocking(),
+        (false, 1),
+        "the held member's correction is deferred, not blocking"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// StateMissing L1: a stored cutoff ahead of the clock is pulled back to
+/// now, and only prior history records one.
+#[test]
+fn history_cutoff_is_bounded_by_the_clock() {
+    let now = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let mut index = ScanIndex::default();
+    index.note_claude_history_cutoff(false, false, true);
+    assert_eq!(
+        index.claude_history_cutoff_unix_seconds, None,
+        "fresh install"
+    );
+    index.note_claude_history_cutoff(true, false, false);
+    assert_eq!(index.claude_history_cutoff_unix_seconds, None);
+    index.claude_history_cutoff_unix_seconds = Some(u64::MAX);
+    index.note_claude_history_cutoff(false, false, false);
+    assert!(index.claude_history_cutoff_unix_seconds.unwrap() <= now());
+    // StateMissing M3: proven prior history records a cutoff on the first
+    // gated load of an index without one, never on an index a gated daemon
+    // already loaded (a fresh install's after its bootstrap).
+    let mut pre_gate = ScanIndex::default();
+    pre_gate.note_claude_history_cutoff(true, true, false);
+    assert!(pre_gate.claude_history_cutoff_unix_seconds.is_some());
+    let mut gated = ScanIndex::default();
+    gated.note_claude_history_cutoff(false, false, false);
+    gated.note_claude_history_cutoff(true, true, false);
+    assert_eq!(gated.claude_history_cutoff_unix_seconds, None);
 }
