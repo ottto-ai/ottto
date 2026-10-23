@@ -2190,3 +2190,313 @@ fn tail_and_full_read_select_the_same_first_request() {
     }
     let _ = fs::remove_dir_all(dir);
 }
+
+/// #677 stop latch (SOURCE Amendments 7 and 10): the first Claude fold that
+/// withholds for a resource limit stops the one-time re-read until the daemon
+/// restarts; a later clean fold does not resume it. The evidence-bound trigger
+/// uses the merged seam; the full remembered-veto table triggers it too.
+#[test]
+fn claude_backfill_stop_latches_until_restart() {
+    let dir = temp_dir("claude-file-birth-backfill-stop");
+    let now = OffsetDateTime::now_utc();
+    let files = five_request_roots(&dir, now, &[ROOT, SECOND]);
+    let paths = [files[0].0.as_path()];
+    let rows = own_rows(&[ROOT], &[]);
+    let is_stop_alarm = |record: &serde_json::Value| {
+        record["stage"]
+            .as_str()
+            .is_some_and(|stage| stage.starts_with("claude_reemission_stop_latched"))
+    };
+    let fold_pass = || {
+        let mut items = vec![files[0].1.clone()];
+        let mut index = indexed(&paths, true);
+        let (disposition, records) = crate::local_resource_diagnostics::capture(|| {
+            fold_with_bound(
+                &mut items,
+                &rows,
+                &mut index,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            )
+        });
+        let alarms = records
+            .into_iter()
+            .filter(is_stop_alarm)
+            .collect::<Vec<_>>();
+        (disposition, alarms)
+    };
+    let (home, transcripts, backfill) =
+        claude_context_backfill_fixture("claude-file-birth-backfill-stop-history", 1);
+    let adoption_page = || {
+        let mut index = backfill.clone();
+        let scan =
+            claude_context_backfill_scan(&transcripts, &mut index, MAX_BACKFILL_FILES_PER_SOURCE);
+        assert!(scan.census_complete, "a stop never holds the census");
+        scan.scanned_file_count
+    };
+
+    let (clean, alarms) = fold_pass();
+    assert!(!clean.context_file_birth.resource_withheld());
+    assert!(alarms.is_empty());
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(adoption_page(), 2, "the root and its subagent adopt");
+
+    // Evidence bound: the seam puts ROOT's five requests over a bound of 4.
+    let (withheld, alarms) =
+        claude_context_file_birth::with_claude_evidence_bound_for_test(4, fold_pass);
+    assert_eq!(
+        withheld.posture_admission(ROOT),
+        Some("withheld_evidence_bound")
+    );
+    assert!(withheld.context_file_birth.resource_withheld());
+    assert!(claude_reemission_stop_latched());
+    assert_eq!(alarms.len(), 1, "one alarm when the latch sets");
+    assert_eq!(alarms[0]["stage"], "claude_reemission_stop_latched");
+    assert_eq!(alarms[0]["source"], "claude_code");
+    let counts = &alarms[0]["counts"];
+    assert_eq!(counts["withheld_evidence_bound_session_count"], 1);
+    assert_eq!(counts["remembered_veto_overflowed"], false);
+    assert_eq!(counts["withheld_folds"], 1);
+    assert_eq!(counts["over_bound_root_count"], 1);
+    let root_ref = format!("{:x}", Sha256::digest(ROOT.as_bytes()))[..16].to_string();
+    assert_eq!(counts["over_bound_root_refs"], json!([root_ref]));
+    assert!(!alarms[0].to_string().contains(ROOT), "no raw id");
+    assert_eq!(adoption_page(), 0, "budget 0 once latched");
+
+    // A clean fold keeps the stop and does not repeat the alarm.
+    let (clean, alarms) = fold_pass();
+    assert!(!clean.context_file_birth.resource_withheld());
+    assert!(alarms.is_empty(), "no repeat within the hour");
+    assert!(claude_reemission_stop_latched());
+    assert_eq!(adoption_page(), 0, "a clean fold does not resume");
+    assert_eq!(claude_reemission_stop_withheld_folds(), 1);
+
+    // A restart is the only reset.
+    restart_claude_reemission_stop_for_test();
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(adoption_page(), 2);
+
+    // A full remembered-veto table latches it too: a capacity-1 table that
+    // already holds another file overflows on the next veto.
+    let item = files[0].1.clone();
+    let mut memory = claude_context_file_birth::ClaudeRememberedTripwire::new(1);
+    memory.remember(&files[1].1);
+    memory.remember(&item);
+    let reports = no_reports();
+    let veto_rows = ClaudeVetoApiRows::new();
+    let tripwire = claude_context_file_birth::ClaudeTelemetryTripwire::build(
+        std::slice::from_ref(&item),
+        1_000,
+        &reports.0,
+        &reports.1,
+        &veto_rows,
+    );
+    let mut counts = ClaudeContextFileBirthCounts::default();
+    let verdict = claude_context_file_birth::admit_claude_file_birth_posture(
+        &mut item.clone(),
+        ROOT,
+        &tripwire,
+        &mut memory,
+        false,
+        &mut counts,
+    );
+    assert_eq!(verdict, ClaudeFileBirthVerdict::Tripwire);
+    assert!(counts.remembered_veto_overflowed);
+    assert_eq!(counts.total.withheld_evidence_bound_session_count, 0);
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        note_claude_reemission_stop(&counts, tripwire.over_bound_roots())
+    });
+    assert_eq!(alarms.len(), 1);
+    assert_eq!(alarms[0]["counts"]["remembered_veto_overflowed"], true);
+    assert_eq!(alarms[0]["counts"]["over_bound_root_count"], 0);
+    assert!(claude_reemission_stop_latched());
+    assert_eq!(adoption_page(), 0, "veto overflow stops adoption");
+    note_claude_reemission_stop(&ClaudeContextFileBirthCounts::default(), &BTreeSet::new());
+    assert_eq!(adoption_page(), 0);
+    let _ = (fs::remove_dir_all(dir), fs::remove_dir_all(home));
+}
+
+/// While latched, the alarm repeats at most once an hour, whatever the folds.
+#[test]
+fn claude_backfill_stop_reminder_is_at_most_hourly() {
+    let withheld = ClaudeContextFileBirthCounts {
+        remembered_veto_overflowed: true,
+        ..Default::default()
+    };
+    let clean = ClaudeContextFileBirthCounts::default();
+    let roots = BTreeSet::new();
+    let start = std::time::Instant::now();
+    let stages = |counts: &ClaudeContextFileBirthCounts, minutes: u64| {
+        let ((), records) = crate::local_resource_diagnostics::capture(|| {
+            note_claude_reemission_stop_at(
+                counts,
+                &roots,
+                start + std::time::Duration::from_secs(minutes * 60),
+            )
+        });
+        records
+            .iter()
+            .map(|record| record["stage"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    assert!(stages(&clean, 0).is_empty(), "a clean fold never latches");
+    assert_eq!(stages(&withheld, 1), ["claude_reemission_stop_latched"]);
+    assert!(stages(&withheld, 2).is_empty());
+    assert!(stages(&clean, 60).is_empty(), "59 minutes since the alarm");
+    assert_eq!(
+        stages(&clean, 61),
+        ["claude_reemission_stop_latched_reminder"]
+    );
+    assert!(stages(&withheld, 90).is_empty());
+    assert_eq!(
+        stages(&clean, 121),
+        ["claude_reemission_stop_latched_reminder"]
+    );
+    assert_eq!(claude_reemission_stop_withheld_folds(), 3);
+    assert!(claude_reemission_stop_latched());
+    restart_claude_reemission_stop_for_test();
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(claude_reemission_stop_withheld_folds(), 0);
+}
+
+/// Exercise the daemon's real load boundary, including quarantine, rather
+/// than directly setting the stop. NewFile reads still run while adoption of
+/// a different destination's existing history is stopped process-wide.
+#[test]
+fn claude_backfill_index_rebuild_load_latches_until_restart() {
+    for kind in ["absent", "corrupt", "empty"] {
+        for missing_list in [false, true] {
+            restart_claude_reemission_stop_for_test();
+            let (home, root, baseline) =
+                claude_context_backfill_fixture("claude-index-rebuild-stop", 1);
+            let support = home.join("support");
+            let list = ReemissionExclusions::path(&support);
+            fs::create_dir_all(list.parent().unwrap()).unwrap();
+            fs::write(&list, "").unwrap();
+            assert_eq!(
+                ReemissionExclusions::load(&support).state(),
+                ListState::Installed
+            );
+            if missing_list {
+                fs::remove_file(&list).unwrap();
+            }
+            let path = home.join("rebuild-index.json");
+            match kind {
+                "corrupt" => fs::write(&path, "{truncated").unwrap(),
+                "empty" => {
+                    fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap()
+                }
+                _ => {}
+            }
+            let (loaded, alarms) = crate::local_resource_diagnostics::capture(|| {
+                ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &support)
+                    .unwrap()
+            });
+            let mut loaded = loaded;
+            assert!(loaded.files.is_empty());
+            assert_eq!(loaded.generation, 0);
+            if kind == "corrupt" {
+                assert!(!path.exists(), "the corrupt file was quarantined");
+                assert!(fs::read_dir(&home).unwrap().flatten().any(|entry| entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("rebuild-index.corrupt.")));
+            }
+            assert!(claude_reemission_stop_latched());
+            assert_eq!(claude_reemission_stop_reason(), "index_rebuild_withheld");
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(alarms[0]["stage"], "claude_reemission_stop_latched");
+            assert_eq!(alarms[0]["counts"]["cause"], "index_rebuild");
+            assert_eq!(alarms[0]["counts"]["withheld_folds"], 0);
+            assert_eq!(alarms[0]["counts"]["over_bound_root_refs"], json!([]));
+            let new_files =
+                claude_context_backfill_scan(&root, &mut loaded, MAX_BACKFILL_FILES_PER_SOURCE);
+            assert_eq!(new_files.scanned_file_count, 2, "NewFile is unchanged");
+            let mut adoption = baseline.clone();
+            assert_eq!(
+                claude_context_backfill_scan(&root, &mut adoption, MAX_BACKFILL_FILES_PER_SOURCE)
+                    .scanned_file_count,
+                0,
+                "adoption in another destination is stopped"
+            );
+            let clean = ClaudeContextFileBirthCounts::default();
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                note_claude_reemission_stop(&clean, &BTreeSet::new());
+                ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &support)
+                    .unwrap();
+            });
+            assert!(
+                alarms.is_empty(),
+                "clean folds and loads do not repeat the alarm"
+            );
+            assert_eq!(claude_reemission_stop_reason(), "index_rebuild_withheld");
+            let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+                note_claude_reemission_stop_at(
+                    &clean,
+                    &BTreeSet::new(),
+                    std::time::Instant::now() + CLAUDE_REEMISSION_STOP_REMINDER_INTERVAL,
+                );
+            });
+            assert_eq!(alarms.len(), 1);
+            assert_eq!(
+                alarms[0]["stage"],
+                "claude_reemission_stop_latched_reminder"
+            );
+            assert_eq!(alarms[0]["counts"]["cause"], "index_rebuild");
+            restart_claude_reemission_stop_for_test();
+            assert_eq!(claude_reemission_stop_reason(), "none");
+            let mut adoption = baseline;
+            assert_eq!(
+                claude_context_backfill_scan(&root, &mut adoption, MAX_BACKFILL_FILES_PER_SOURCE)
+                    .scanned_file_count,
+                2,
+                "restart resets adoption; a still-empty load will latch again"
+            );
+            let _ = fs::remove_dir_all(home);
+        }
+    }
+}
+
+#[test]
+fn claude_backfill_index_load_without_seen_marker_does_not_latch() {
+    let home = temp_dir("claude-index-rebuild-not-active");
+    for corrupt in [false, true] {
+        let path = home.join("scan-index.json");
+        if corrupt {
+            fs::write(&path, "{truncated").unwrap();
+        }
+        ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+        assert_eq!(claude_reemission_stop_reason(), "none");
+    }
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
+    let (home, _, mut baseline) =
+        claude_context_backfill_fixture("claude-index-rebuild-source-guard", 1);
+    let marker = ReemissionExclusions::seen_marker_path(&home);
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(marker, "").unwrap();
+    for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
+        let path = home.join("other-index.json");
+        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+        fs::write(&path, "{truncated").unwrap();
+        ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
+        assert!(!claude_reemission_stop_latched());
+    }
+    // Both conditions matter: a populated generation-0 index and an empty
+    // saved index with a nonzero generation must not be treated as fresh.
+    let path = home.join("existing-index.json");
+    baseline.generation = 0;
+    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    assert!(!claude_reemission_stop_latched());
+    baseline.files.clear();
+    baseline.generation = 1;
+    fs::write(&path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &home).unwrap();
+    assert!(!claude_reemission_stop_latched());
+    let _ = fs::remove_dir_all(home);
+}

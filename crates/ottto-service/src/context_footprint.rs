@@ -707,6 +707,23 @@ pub(crate) fn resolve_repository_identity(
     }
 }
 
+/// The main checkout folder of the repository holding `workspace` (the
+/// parent of its shared `.git` folder), else the workspace's top level for
+/// layouts without one. `None` outside git.
+pub(crate) fn repository_main_checkout(workspace: &Path) -> Option<PathBuf> {
+    let toplevel = git_stdout(workspace, &["rev-parse", "--show-toplevel"])?;
+    let toplevel = absolutize_git_path(workspace, &toplevel);
+    let Some(common_dir) = git_stdout(workspace, &["rev-parse", "--git-common-dir"]) else {
+        return Some(toplevel);
+    };
+    let common_dir = absolutize_git_path(workspace, &common_dir);
+    Some(
+        main_checkout_dir(&common_dir)
+            .map(Path::to_path_buf)
+            .unwrap_or(toplevel),
+    )
+}
+
 fn git_stdout(workspace: &Path, args: &[&str]) -> Option<String> {
     let mut child = Command::new("git")
         .arg("-C")

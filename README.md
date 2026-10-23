@@ -419,7 +419,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   (or an older server that omits it) means the registration may still be
   active until its account disconnects the Mac on the Apps page (Disconnect). An
   account switch sends the same release for the previous device unless the new
-  binding reuses that device id. `local_only=true` is reserved for emergency local
+  binding reuses that device id. When Ottto has already ended this Mac's setup
+  run, an expired connection no longer blocks the release: the daemon presents
+  the same id and secret to `POST /api/v1/telemetry/devices/{device_id}/release`
+  and, once Ottto confirms, finishes the logout like a cloud logout
+  (`cloud_disconnected: false`, `device_released: true`).
+  `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
   Neither mode clears account/device identity while Cloud sessions still needs
   an exact backend DELETE confirmation; revoke it in the Ottto app, wait for
