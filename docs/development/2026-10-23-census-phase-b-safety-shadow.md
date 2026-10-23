@@ -94,3 +94,9 @@ separately and checks complete checkpoint bytes as well as the independent
 census field. A boxed retirement-buffer descriptor keeps OFF record slots small;
 the descriptor and chunk storage are allocated only when safety is retained and
 are included in physical accounting. Inline growth is explicitly reported.
+
+OFF with already persisted incomplete safety still reports the cheap marker
+counters and N10/age alarms, without a join or digests. A legacy missing marker
+with no retained safety does not trigger this exception. The OFF existing-state
+control verifies full-budget main admission, incremental reclaim, persistence,
+alarm and healthy prune; clean OFF state still emits no new shadow line.

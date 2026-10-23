@@ -3080,8 +3080,22 @@ pub(crate) fn prepare_claude_request_census_terminal(
     if !phase_b::enabled() {
         *view = None;
         let census = &index.claude_request_census;
+        let existing_safety = !census.retired_order.is_empty()
+            || !census.safety_incomplete.keys.is_empty()
+            || index
+                .claude_request_census_shadow
+                .safety_incomplete
+                .is_some();
+        let incomplete = existing_safety && census.safety_incomplete.incomplete();
         return ClaudeRequestCensusShadowCounts {
-            safety_incomplete: census.safety_incomplete.incomplete(),
+            safety_incomplete: incomplete,
+            safety_incomplete_alarm: incomplete
+                && (census.safety_incomplete.since == 0
+                    || window.saturating_sub(census.safety_incomplete.since) > 7 * 86400),
+            d2_hash_budget_alarm: existing_safety
+                && (incomplete
+                    || census.hash_total.saturating_mul(100)
+                        >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * 80),
             safety_incomplete_since: census.safety_incomplete.since,
             safety_incomplete_overflow: census.safety_incomplete.overflow,
             safety_reclaimed: census.safety_incomplete.reclaimed,
@@ -5887,5 +5901,74 @@ mod phase_b_tests {
         );
         assert_eq!(qualified.shadow_healthy_terminals_memory_refused, 0);
         eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families);
+    }
+    #[test]
+    fn off_with_preexisting_safety_keeps_reclaim_marker_and_alarm() {
+        let mut retained = record('a', (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect());
+        retained.retire_transcript_preserving_safety();
+        let mut index = index_with(vec![(A, retained)]);
+        let mut main = main_reference::MainAdmission::from_census(&index.claude_request_census);
+        let _mode = phase_b::ShadowMode::set(false);
+        let incoming = record('b', vec![u64::MAX]).without_safety_for_test();
+        assert_eq!(
+            main.insert_for_test(B, incoming.clone()),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
+            index.claude_request_census.insert_for_test(B, incoming),
+            ClaudeRequestCensusInsert::Stored
+        );
+        assert_eq!(
+            main_reference::MainAdmission::from_census(&index.claude_request_census).bytes(),
+            main.bytes()
+        );
+        assert_eq!(
+            index
+                .claude_request_census
+                .get(A)
+                .unwrap()
+                .duplicate_safety_iter()
+                .len(),
+            MAX_CLAUDE_REQUEST_CENSUS_HASHES - 1
+        );
+        let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = "b".repeat(64);
+        index.files.insert(B.to_owned(), entry);
+        let mut view = None;
+        let counts = prepare_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            WINDOW,
+            &mut view,
+        );
+        assert!(view.is_none());
+        assert_eq!(counts.shadow_join_builds, 0);
+        assert!(counts.safety_incomplete);
+        assert!(counts.safety_incomplete_alarm);
+        assert!(counts.d2_hash_budget_alarm);
+        prepare_safety_checkpoint(&mut index);
+        assert!(index
+            .claude_request_census_shadow
+            .safety_incomplete
+            .as_ref()
+            .unwrap()
+            .incomplete());
+        index.files.remove(A);
+        let counts = prepare_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            WINDOW,
+            &mut view,
+        );
+        assert!(!counts.safety_incomplete);
+        prepare_safety_checkpoint(&mut index);
+        assert!(!index
+            .claude_request_census_shadow
+            .safety_incomplete
+            .as_ref()
+            .unwrap()
+            .incomplete());
     }
 }

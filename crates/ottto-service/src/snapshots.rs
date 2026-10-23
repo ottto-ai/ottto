@@ -25017,7 +25017,9 @@ impl OwnedSourceScan {
                             &mut claude_request_census_view,
                         )
                     })
-                    .filter(|_| claude_request_census::d2_shadow_enabled());
+                    .filter(|counts| {
+                        claude_request_census::d2_shadow_enabled() || counts.safety_incomplete
+                    });
                 let reconciliation_pending = traversal_discovery_done
                     && traversal_healthy
                     && clean_frozen_generation
