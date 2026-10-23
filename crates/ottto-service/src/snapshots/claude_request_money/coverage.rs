@@ -32,11 +32,15 @@ pub(crate) enum CensusReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Covered/Missing belong to the future strong-view adapter.
 pub(crate) enum FamilyCensus {
     Covered,
     Unknown(CensusReason),
     /// Census keys with no usable record (`more` past the listed ones).
-    Missing { keys: Vec<String>, more: u32 },
+    Missing {
+        keys: Vec<String>,
+        more: u32,
+    },
 }
 
 impl FamilyCensus {

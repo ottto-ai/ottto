@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// The shadow's shared per-page work budget: physical bytes read, metadata
 /// calls (stat/open) and a deadline. Every reader of the shadow (tail, audit,
@@ -72,11 +72,11 @@ pub(crate) struct ClaudeLedgerWork {
 }
 
 impl ClaudeLedgerWork {
-    pub(crate) fn new(max_bytes: u64, max_stats: u64, max_elapsed: Duration) -> Self {
+    pub(crate) fn new(max_bytes: u64, max_stats: u64, deadline: Instant) -> Self {
         Self {
             bytes_left: max_bytes,
             stats_left: max_stats,
-            deadline: Instant::now() + max_elapsed,
+            deadline,
             stopped: false,
         }
     }
@@ -628,7 +628,8 @@ fn read_again_matches(
     }
     let range = end - start;
     // Its own allowance: the pass is bounded by the read it checks.
-    let mut again_work = ClaudeLedgerWork::new(range + 1, 0, Duration::from_millis(250));
+    let mut again_work =
+        ClaudeLedgerWork::new((range + 1).min(work.bytes_left()), 0, work.deadline);
     let mut counting = CountingRead::new((&mut *file).take(range - skip));
     let again = {
         let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);

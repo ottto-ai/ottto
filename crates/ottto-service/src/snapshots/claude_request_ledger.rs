@@ -205,9 +205,13 @@ pub(crate) fn scan_holders<'a>(
             ..
         } = &mut holders;
         if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, deadline, |hash| {
-                hold(transcript, overflow, &mut *charge, hash, key)
-            })
+            || !intersect(
+                record.request_hashes(),
+                page_hashes,
+                compared,
+                deadline,
+                |hash| hold(transcript, overflow, &mut *charge, hash, key),
+            )
         {
             return None;
         }
@@ -220,9 +224,13 @@ pub(crate) fn scan_holders<'a>(
             ..
         } = &mut holders;
         if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, deadline, |hash| {
-                hold(telemetry, overflow, &mut *charge, hash, key)
-            })
+            || !intersect(
+                record.request_hashes(),
+                page_hashes,
+                compared,
+                deadline,
+                |hash| hold(telemetry, overflow, &mut *charge, hash, key),
+            )
         {
             return None;
         }

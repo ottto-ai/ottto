@@ -614,6 +614,7 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
                 removed_requests: 3,
                 removed_tokens: 900,
                 snapshot: 5,
+                published: None,
             },
         ),
     );
@@ -875,7 +876,7 @@ fn money_api_line(session: &str, request: &str, observed_at: &str) -> String {
 }
 
 fn money_work(bytes: u64) -> ClaudeLedgerWork {
-    ClaudeLedgerWork::new(bytes, 1024, Duration::from_secs(30))
+    ClaudeLedgerWork::new(bytes, 1024, Instant::now() + Duration::from_secs(30))
 }
 
 struct MoneyTail {
@@ -2082,6 +2083,7 @@ impl MoneyLedger {
             trace: traces,
             telemetry_complete_through: 2_000_000_000,
             deadline,
+            holder_view: super::claude_request_money::coverage::ClaudeHolderView { request: true, message: true },
             unbuilt_older: std::cell::Cell::new(0),
         };
         ctx.classify_request(hash, 1_000, own_key, own_root)
@@ -2311,6 +2313,7 @@ fn money_message_only_copies_pick_one_owner() {
         trace: &empty_traces,
         telemetry_complete_through: 2_000_000_000,
         deadline,
+        holder_view: super::claude_request_money::coverage::ClaudeHolderView { request: true, message: true },
         unbuilt_older: std::cell::Cell::new(0),
     };
     let verdicts = keys.map(|key| ctx.classify_message(message, key));

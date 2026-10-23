@@ -47,6 +47,36 @@ static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 /// Time spent in capture work since the last page took it (microseconds).
 static CAPTURE_MICROS: AtomicU64 = AtomicU64::new(0);
 
+/// Cumulative work allowance, independent of resident refunds. Reset once,
+/// before the page's native finalizers. Time counts capture work, not parsing.
+#[derive(Default)]
+struct Work {
+    input: usize,
+    comparisons: usize,
+    micros: u64,
+}
+const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
+const PAGE_COMPARISONS: usize = 1_048_576;
+const PAGE_CAPTURE_US: u64 = 250_000;
+static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
+
+pub(crate) fn begin_page(scope: &Path) {
+    if let Ok(mut work) = WORK.lock() {
+        work.insert(scope.to_path_buf(), Work::default());
+    }
+}
+
+fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
+    WORK.lock().is_ok_and(|mut pages| {
+        let work = pages.entry(scope.to_path_buf()).or_default();
+        work.input = work.input.saturating_add(bytes);
+        work.comparisons = work.comparisons.saturating_add(comparisons);
+        work.input <= PAGE_INPUT_BYTES
+            && work.comparisons <= PAGE_COMPARISONS
+            && work.micros < PAGE_CAPTURE_US
+    })
+}
+
 /// Bytes held against the capture ceiling, released on drop.
 #[derive(Debug, Default)]
 struct Funds {
@@ -168,6 +198,10 @@ impl ClaudeResponseCapture {
         if self.refused {
             return;
         }
+        if !spend_work(&self.scope, 0, 1) {
+            self.refuse();
+            return;
+        }
         let mut finished = false;
         let started = Instant::now();
         super::guarded(|| {
@@ -178,7 +212,12 @@ impl ClaudeResponseCapture {
             run(self);
             finished = true;
         });
-        CAPTURE_MICROS.fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+        let elapsed = started.elapsed().as_micros() as u64;
+        CAPTURE_MICROS.fetch_add(elapsed, Ordering::Relaxed);
+        if let Ok(mut work) = WORK.lock() {
+            let work = work.entry(self.scope.clone()).or_default();
+            work.micros = work.micros.saturating_add(elapsed);
+        }
         if !finished {
             self.refuse();
         }
@@ -197,10 +236,7 @@ impl ClaudeResponseCapture {
     }
 
     /// Record the message-id hash of every message-keyed response.
-    pub(crate) fn note_messages<'k>(
-        &mut self,
-        keys: impl Iterator<Item = (u64, &'k str)> + Clone,
-    ) {
+    pub(crate) fn note_messages<'k>(&mut self, keys: impl Iterator<Item = (u64, &'k str)> + Clone) {
         self.contained(|capture| capture.record_messages(keys));
     }
 
@@ -216,7 +252,8 @@ impl ClaudeResponseCapture {
         for (_, message_id) in keys.clone() {
             count += 1;
             bytes = bytes.saturating_add(message_id.len());
-            if count > MAX_MESSAGE_IDS
+            if !spend_work(&self.scope, message_id.len(), 1)
+                || count > MAX_MESSAGE_IDS
                 || message_id.len() > MAX_MESSAGE_ID_BYTES
                 || bytes > MAX_MESSAGE_HASH_INPUT_BYTES
             {
@@ -228,6 +265,16 @@ impl ClaudeResponseCapture {
             .funds
             .spend(count.saturating_mul(std::mem::size_of::<(u64, u64)>()))
         {
+            self.refuse();
+            return;
+        }
+        // Prepay comparisons for ordering detection, binary lookups, and
+        // worst-case sort work before hashing or sorting.
+        if !spend_work(
+            &self.scope,
+            0,
+            count.saturating_mul(2 + count.max(1).ilog2() as usize),
+        ) {
             self.refuse();
             return;
         }
@@ -273,6 +320,26 @@ impl ClaudeResponseCapture {
         billing: &[(&'static str, Option<&str>)],
     ) {
         if self.refused {
+            return;
+        }
+        // Bound each input and precharge every possible selector comparison
+        // before looking at interned rows (resident admission is separate).
+        let mut input = bucket_start.len().saturating_add(model.len());
+        for (key, value) in context {
+            input = input.saturating_add(key.len()).saturating_add(value.len());
+            if !spend_work(&self.scope, key.len().saturating_add(value.len()), 1) {
+                self.refuse();
+                return;
+            }
+        }
+        for (key, value) in billing {
+            input = input.saturating_add(key.len() + value.map_or(0, str::len));
+        }
+        let comparisons = input
+            .saturating_mul(self.rows.len().max(1))
+            .saturating_mul(1 + context.len().max(1).ilog2() as usize);
+        if input > 16 * 1024 || !spend_work(&self.scope, input, comparisons) {
+            self.refuse();
             return;
         }
         let present = || {
@@ -426,6 +493,9 @@ impl ClaudeResponseCapture {
     }
 
     fn keep(mut self, index_key: String, fingerprint: String) {
+        if self.refused {
+            return;
+        }
         if !self.refused
             && !self.funds.spend(
                 index_key.len()
@@ -435,6 +505,9 @@ impl ClaudeResponseCapture {
             )
         {
             self.refuse();
+        }
+        if self.refused {
+            return;
         }
         let Ok(mut store) = STORE.lock() else {
             return;
@@ -514,4 +587,52 @@ pub(crate) fn capture_reserved() -> usize {
 /// Capture work time since the last call (microseconds).
 pub(crate) fn take_capture_us() -> u64 {
     CAPTURE_MICROS.swap(0, Ordering::Relaxed)
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+
+    #[test]
+    fn cumulative_work_does_not_refund_when_a_capture_drops() {
+        let scope = PathBuf::from("cumulative-capture-budget-fixture");
+        begin_page(&scope);
+        let mut accepted = 0;
+        for _ in 0..4096 {
+            let mut capture = ClaudeResponseCapture {
+                scope: scope.clone(),
+                ..Default::default()
+            };
+            let id = "m".repeat(256);
+            capture.note_messages((0..64).map(|sequence| (sequence, id.as_str())));
+            accepted += usize::from(!capture.refused);
+            // Deliberately drop resident funds: work must stay spent.
+        }
+        assert!(accepted > 0 && accepted <= PAGE_INPUT_BYTES / (64 * 256));
+        let work = WORK.lock().unwrap();
+        assert!(work[&scope].input >= PAGE_INPUT_BYTES);
+        println!("MONEY_P1B_CAPTURE admitted_files={accepted} attempted_files=4096 input_cap={PAGE_INPUT_BYTES} comparisons_cap={PAGE_COMPARISONS} time_cap_us={PAGE_CAPTURE_US}");
+    }
+
+    #[test]
+    fn giant_ids_and_selectors_are_refused_before_comparison_or_hashing() {
+        let scope = PathBuf::from("capture-input-fixture");
+        begin_page(&scope);
+        let mut capture = ClaudeResponseCapture {
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        let id = "x".repeat(257);
+        capture.note_messages(std::iter::once((0, id.as_str())));
+        assert!(capture.refused);
+        assert!(capture.messages.is_empty());
+        let mut capture = ClaudeResponseCapture {
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        let selector = BTreeMap::from([("plan".to_owned(), "x".repeat(PAGE_INPUT_BYTES + 1))]);
+        capture.place(0, "hour", "model", &selector, &[]);
+        assert!(capture.refused);
+        assert!(capture.rows.is_empty());
+    }
 }
