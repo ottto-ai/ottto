@@ -1961,9 +1961,6 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
         fixture.seed_terminal_authority(PIPELINE_HELD_SESSION);
         fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
         fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
-        if retry_pending {
-            fixture.inject_retry_pending_family();
-        }
         let upload = PipelineUpload::EntityAckRejected {
             session: PIPELINE_SESSIONS[1],
             reason: reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
@@ -1974,8 +1971,19 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
             ..PIPELINE_HOLD_CYCLE
         };
         let settled_before = terminal_hold_settlement_count();
-        let first =
-            fixture.page_with_reoffers("2026-08-02T09:00:00Z", &cycle, upload, |_| {}, true);
+        let first = fixture.page_with_reoffers(
+            "2026-08-02T09:00:00Z",
+            &cycle,
+            upload,
+            |index| {
+                if retry_pending {
+                    // The same held family has RetryPending debt at the
+                    // upload boundary, rather than an unrelated pending root.
+                    index.insert_retry_pending_claude_authority_for_test(PIPELINE_HELD_SESSION);
+                }
+            },
+            true,
+        );
         assert!(matches!(
             first.result,
             ResumableUploadResult::Rejected { .. }
