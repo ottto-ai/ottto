@@ -1369,7 +1369,8 @@ pub(super) fn tail_completion_budget(
     };
     // 5. Feasibility under the retained lock, without mutating: the
     // lower-ranked entries can make the copies fit `R - need`
-    // (`older_release_fits`, the test `release_older_to_fit` repeats).
+    // (`older_release_fits`; the post-gate `release_older_to_fit` repeats
+    // it under the same lock it releases under).
     let Ok(retained) = context.cache.retained() else {
         return (granted, step);
     };

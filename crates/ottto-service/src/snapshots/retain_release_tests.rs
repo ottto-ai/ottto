@@ -1053,3 +1053,112 @@ fn r0_unknown_resident_evicts_nothing() {
         assert_eq!(victims(&world.cache), run.before, "{source:?}");
     }
 }
+
+/// X_out coverage witness (hunk map §3; c22 ACK): every field of the finished
+/// `ParsedJsonlFile` and its `SnapshotItem` is named here with its X_out
+/// family, so a new field fails compile until it is classified. Families:
+/// I inline, R per Claude response, D derived from the accumulator at
+/// `into_items`, M moved unchanged, K capped constant, U not owned at the
+/// proof site (X_out refuses). Compile-only: the closures never run.
+#[test]
+fn x_out_coverage_witness_names_every_finished_field() {
+    let _parsed = |file: ParsedJsonlFile| {
+        let ParsedJsonlFile {
+            snapshots: _,                               // I (Vec slot) + per-item fields below
+            report: _,                                  // M
+            recognized_usage_drop_count: _,             // I
+            ownership_incomplete_file_count: _,         // I
+            zero_snapshot_usage_evidence: _,            // I
+            dropped_usage_record_count: _,              // I
+            claude_compaction_unlinked_parent_count: _, // I
+            terminal_line_loss_count: _,                // I
+            state_only_blocked_session_ids: _,          // M (Codex only; empty on Claude)
+            codex_parent_session_ref: _,                // M (Codex only)
+            codex_parent_ledger_identity_used: _,       // M (Codex only)
+            codex_parent_resolution_pending: _,         // I
+            codex_parent_ownership_ledger: _,           // M (Codex only)
+            codex_parent_unresolvable: _,               // I
+            codex_parent_ledger_unusable: _,            // I
+            codex_parent_ledger_consulted: _,           // I
+            codex_parent_prefix_decided: _,             // I
+            codex_parent_proof_used: _,                 // M (Codex only)
+            codex_parent_proof_refusal: _,              // M (Codex only)
+        } = file;
+    };
+    let _item = |item: SnapshotItem| {
+        let SnapshotItem {
+            session_account_evidence: _,                    // U (title metadata)
+            source_session_id: _,                           // D
+            snapshot_fingerprint: _,                        // K (empty)
+            status: _,                                      // K ("final")
+            input_tokens: _,                                // I
+            output_tokens: _,                               // I
+            cache_read_tokens: _,                           // I
+            cache_creation_5m_tokens: _,                    // I
+            cache_creation_1h_tokens: _,                    // I
+            reasoning_output_tokens: _,                     // I
+            unattributed_total_tokens: _,                   // I
+            request_count: _,                               // I
+            usage_accounting_contract: _,                   // K (literal)
+            claude_usage_request_ids: _,                    // R
+            claude_usage_occurrences: _,                    // R
+            cache_observations: _,                          // K (None on Claude)
+            cache_observations_state: _,                    // K (None at into_items)
+            cache_base_head_etag: _,                        // K (None at into_items)
+            cache_requests: _,                              // R
+            cache_requests_complete: _,                     // I
+            avg_duration_ms: _,                             // I
+            avg_time_to_first_token_ms: _,                  // I
+            max_duration_ms: _,                             // I
+            max_time_to_first_token_ms: _,                  // I
+            peak_context_fill_tokens: _,                    // I
+            first_turn_context_tokens: _,                   // I
+            last_turn_context_tokens: _,                    // I
+            compaction_count: _,                            // I
+            compaction_timestamps: _,                       // D
+            compaction_events: _,                           // K (empty on Claude)
+            local_context_points: _,                        // K (empty on Claude)
+            compaction_total_pre_tokens: _,                 // I
+            compaction_total_post_tokens: _,                // I
+            compaction_total_cumulative_dropped_tokens: _,  // I
+            compaction_total_duration_ms: _,                // I
+            context_curve: _,                               // K (unavailable_context_curve)
+            claude_context_curve_boundaries: _,             // M
+            claude_context_curve_identity_complete: _,      // I
+            claude_context_curve_request_index_complete: _, // I
+            claude_context_curve_owned_start_proven: _,     // I
+            claude_file_birth: _,                           // M
+            activity_summary: _,                            // D
+            tool_usage: _,                                  // D (from R's tool names)
+            tool_usage_truncated: _,                        // I
+            session_start: _,                               // U
+            model_usage: _,                                 // D (rows from R)
+            usage_buckets: _,                               // D (rows from R)
+            cost: _,                                        // I
+            session_display_name: _,                        // D / U (title metadata)
+            session_display_name_source: _,                 // D / U (title metadata)
+            source_started_at: _,                           // D
+            source_ended_at: _,                             // D
+            source_last_activity_at: _,                     // D
+            collected_at: _,                                // K (RFC 3339)
+            workspace_hash: _,                              // D
+            workspace_display_label: _,                     // K (None)
+            workspace_label_source: _,                      // K (None)
+            repository_hash: _,                             // U (repository identity)
+            repository_label: _,                            // U
+            repository_label_source: _,                     // U
+            repository_identity_source: _,                  // U
+            workspace_kind: _,                              // U
+            source_file_fingerprint: _,                     // K
+            session_artifacts: _,                           // D
+            provenance: _,                                  // K
+            origin: _,                                      // D
+            originator: _,                                  // D
+            attribution_facts: _,                           // K (enforce_fact_limits caps)
+            request_evidence: _,                            // U (ownership fold)
+            request_identity_refusals: _,                   // I
+            claude_org_markers: _,                          // M
+            claude_account_withheld_reason: _,              // I (&'static str)
+        } = item;
+    };
+}
