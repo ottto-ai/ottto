@@ -4109,6 +4109,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_context_curve_request_index_complete: false,
         claude_context_curve_owned_start_proven: false,
         claude_file_birth: item.claude_file_birth,
+        claude_file_birth_verdict: item.claude_file_birth_verdict(),
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
