@@ -1760,3 +1760,150 @@ fn fix2_unhealthy_retry_also_honors_the_same_deadline_cap() {
     assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
     assert_eq!(index.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
 }
+
+/// Persist a real active Fix 2 carry, both with and without its capped
+/// fallback. Losing scheduling state or retained provenance must restore
+/// BASE before the matching mid-walk checkpoint can select any candidate.
+#[test]
+fn fix2_persisted_carry_with_lost_progress_or_origin_restarts_as_base() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let dir = temp_dir("fix2-carry-lost-provenance");
+    let path = dir.join("scan-index.json");
+    for capped in [false, true] {
+        let mut active = window_index();
+        let unwitnessed = carry_key(CARRY_UNWITNESSED, None);
+        let revision = active.files[&unwitnessed].source_file_fingerprint.clone();
+        let first = carry_start(&mut active, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first["carried_pending_families"], 1);
+        if capped {
+            active
+                .files
+                .get_mut(&unwitnessed)
+                .unwrap()
+                .source_file_fingerprint = revision;
+            active
+                .claude_usage_family_pending
+                .get_mut(CARRY_UNWITNESSED)
+                .unwrap()
+                .census_window_end = CARRY_RETRY.to_string();
+            window_needs_clean_followup(&mut active);
+            let row = carry_start(&mut active, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+            assert_eq!(row["stale_rearm_capped_files"], 1);
+            assert!(active
+                .claude_stale_family_carry
+                .capped_roots
+                .contains(CARRY_UNWITNESSED));
+        }
+        assert!(active.claude_stale_family_carry.roots.contains(CARRY_ROOT));
+        let retained = active.claude_stale_family_carry.roots.clone();
+        for key in carry_family_keys() {
+            assert!(!active.files[&key].source_file_fingerprint.is_empty());
+        }
+        // A still-active checkpoint has already passed a member and has a
+        // pending candidate. A resume would retain its old census window.
+        let traversal = active.traversal.as_mut().unwrap();
+        traversal
+            .observed_index_keys
+            .insert(carry_key(CARRY_ROOT, None));
+        traversal.pending_candidates.push_back(ScanTraversalPath {
+            scan_root: PathBuf::from(CARRY_SCAN_ROOT),
+            path: PathBuf::from(carry_key(CARRY_OTHER, None)),
+            census_member: true,
+            watcher_hint: false,
+        });
+        let saved = serde_json::to_value(&active).unwrap();
+        fs::write(&path, serde_json::to_vec(&saved).unwrap()).unwrap();
+        let mut valid = ScanIndex::load(&path).unwrap();
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut valid,
+            "2026-08-02T07:40:00Z",
+            BACKFILL_WINDOW_DAYS,
+        );
+        assert_eq!(valid.claude_stale_family_carry.roots, retained);
+        assert_eq!(
+            valid.traversal.as_ref().unwrap().census_window_end,
+            active.traversal.as_ref().unwrap().census_window_end
+        );
+        for key in carry_family_keys() {
+            assert_eq!(
+                valid.files[&key].source_file_fingerprint,
+                active.files[&key].source_file_fingerprint
+            );
+        }
+        for cause in [
+            "missing-progress",
+            "malformed-progress",
+            "empty-progress",
+            "missing-origin",
+            "malformed-origin",
+            "other-process",
+            "other-context",
+        ] {
+            let mut value = saved.clone();
+            match cause {
+                "missing-progress" => {
+                    value
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("claude_full_rearm_progress");
+                }
+                "malformed-progress" => value["claude_full_rearm_progress"] = serde_json::json!(42),
+                "empty-progress" => value["claude_full_rearm_progress"] = serde_json::json!({}),
+                // Simulate an older decoder dropping unknown origin fields.
+                "missing-origin" => {
+                    value["claude_stale_family_carry"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("origin");
+                }
+                "malformed-origin" => {
+                    value["claude_stale_family_carry"]["origin"] =
+                        serde_json::json!({"process": "bad"})
+                }
+                "other-process" => {
+                    value["claude_stale_family_carry"]["origin"]["process"] =
+                        serde_json::json!(claude_full_rearm_process().wrapping_add(2))
+                }
+                "other-context" => {
+                    value["claude_stale_family_carry"]["origin"]["context_fingerprint"] =
+                        serde_json::json!("another-context")
+                }
+                _ => unreachable!(),
+            }
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let mut loaded =
+                ScanIndex::load(&path).expect("malformed cost state never quarantines the index");
+            assert!(path.exists());
+            assert_eq!(loaded.files.len(), active.files.len());
+            assert_eq!(loaded.claude_stale_family_carry.roots, retained);
+            let row = carry_start(&mut loaded, "2026-08-02T07:40:00Z", BACKFILL_WINDOW_DAYS);
+            assert_eq!(row["carried_pending_families"], 0, "{capped}/{cause}");
+            assert!(
+                loaded.claude_stale_family_carry.is_empty(),
+                "{capped}/{cause}"
+            );
+            let traversal = loaded.traversal.as_ref().unwrap();
+            assert_eq!(
+                traversal.census_window_end, "2026-08-02T07:40:00Z",
+                "{capped}/{cause}"
+            );
+            assert!(traversal.observed_index_keys.is_empty(), "{capped}/{cause}");
+            assert!(traversal.pending_candidates.is_empty(), "{capped}/{cause}");
+            for (key, entry) in &loaded.files {
+                if claude_index_path_member_ref(Path::new(key))
+                    .is_some_and(|member| retained.contains(member.root))
+                {
+                    assert!(
+                        entry.source_file_fingerprint.is_empty(),
+                        "{capped}/{cause}: {key}"
+                    );
+                }
+            }
+        }
+    }
+    let _ = fs::remove_dir_all(dir);
+}

@@ -733,3 +733,207 @@ fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
         BTreeSet::from(["2026-08-02T07:20:00Z".to_string()])
     );
 }
+
+/// An observation before the deadline cannot pay for the required full re-arm.
+#[test]
+fn non_due_changes_remain_owed_until_one_real_full_rearm() {
+    for cause in ["member", "set", "basis", "missing", "malformed", "reverted"] {
+        let mut rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.establish(&mut index, &rearm.items);
+        let mut items = rearm.items.clone();
+        match cause {
+            "member" | "reverted" => {
+                let key = rearm.sources.keys().next().unwrap().clone();
+                index
+                    .files
+                    .get_mut(&key)
+                    .unwrap()
+                    .source_file_fingerprint
+                    .push_str("-changed");
+                if cause == "member" {
+                    rearm.sources.get_mut(&key).unwrap().push_str("-changed");
+                }
+            }
+            "set" => {
+                rearm.add_other_family(&mut index);
+                items.push(rearm.other_family(true));
+            }
+            "basis" => {
+                index
+                    .claude_full_rearm_progress
+                    .structural_record
+                    .as_mut()
+                    .unwrap()
+                    .basis = "previous-basis".to_string()
+            }
+            "missing" | "malformed" => {
+                let mut saved = serde_json::to_value(&index).unwrap();
+                if cause == "missing" {
+                    saved
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("claude_full_rearm_progress");
+                } else {
+                    saved["claude_full_rearm_progress"] =
+                        serde_json::json!({"structural_record": 7});
+                }
+                index = serde_json::from_value(saved).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = index.claude_full_rearm_progress.structural_record.clone();
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(CENSUS_CLOCK + 100);
+        let early = rearm.fold(
+            &mut index,
+            &items,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        let early = rearm.reread(&mut index, &early);
+        assert!(!early.counts.full_rearm, "{cause}: {early:?}");
+        assert!(!early.suppression.full_rearm_suppressed, "{cause}");
+        assert_eq!(early.rearmed_files, 0, "{cause}");
+        assert_eq!(
+            index.claude_full_rearm_progress.structural_record, before,
+            "{cause}"
+        );
+        assert!(
+            index.claude_full_rearm_progress.structural_rearm_owed,
+            "{cause}"
+        );
+        // The obligation survives persistence, including a change that reverts.
+        index = serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        if cause == "reverted" {
+            for (key, revision) in &rearm.sources {
+                index.files.get_mut(key).unwrap().source_file_fingerprint = revision.clone();
+            }
+        }
+        let due = rearm.terminal(&mut index, &items);
+        assert!(due.counts.full_rearm, "{cause}: {due:?}");
+        assert_eq!(due.rearmed_files, rearm.sources.len(), "{cause}");
+        assert!(!due.suppression.full_rearm_suppressed, "{cause}");
+        assert!(
+            !index.claude_full_rearm_progress.structural_rearm_owed,
+            "{cause}"
+        );
+        let next = rearm.terminal(&mut index, &items);
+        assert!(!next.counts.full_rearm, "{cause}: {next:?}");
+        assert!(next.suppression.full_rearm_suppressed, "{cause}");
+        assert_eq!(next.rearmed_files, 0, "{cause}");
+    }
+}
+
+/// Every disallowed cause is exercised through the real terminal fold with
+/// an otherwise unchanged, established structural baseline.
+#[test]
+fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
+    for cause in [
+        "account",
+        "owned-start",
+        "api",
+        "trace",
+        "bad-clock",
+        "identity-refused",
+        "coverage",
+    ] {
+        let mut rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.establish(&mut index, &rearm.items);
+        let mut items = rearm.items.clone();
+        let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+        let mut trace = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+        let mut window = WINDOW;
+        match cause {
+            "account" => {
+                let key = rearm.sources.keys().next().unwrap().clone();
+                index
+                    .claude_account_deferred_holds
+                    .insert(key, "held-revision".to_string());
+            }
+            "owned-start" => {
+                index.claude_owned_start_census.insert(
+                    items[0].source_session_id.clone(),
+                    ClaudeOwnedStartCensusWitness {
+                        marker_source_file_fingerprint: "marker-revision".to_string(),
+                        verified_source_file_fingerprint: None,
+                        emitted_source_file_fingerprint: None,
+                    },
+                );
+            }
+            "api" => api.health.missing_files = 1,
+            "trace" => trace.missing_files = 1,
+            "bad-clock" => window = "bad-clock",
+            "identity-refused" => items[0].request_identity_refusals = 1,
+            "coverage" => rearm.add_other_family(&mut index),
+            _ => unreachable!(),
+        }
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let disposition = apply_claude_reported_usage_with_index_and_limits(
+            &mut items,
+            &api,
+            &trace,
+            &mut index,
+            true,
+            window,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+            None,
+        );
+        let run = rearm.reread(&mut index, &disposition);
+        assert!(
+            run.counts.fence_before && run.counts.fence_after,
+            "{cause}: {run:?}"
+        );
+        assert!(run.counts.full_rearm, "{cause}: {run:?}");
+        assert!(!run.suppression.full_rearm_suppressed, "{cause}");
+        assert_eq!(run.rearmed_files, rearm.sources.len(), "{cause}");
+    }
+}
+
+#[test]
+fn unhealthy_earlier_page_keeps_a_healthy_terminal_rearm_enabled() {
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut api = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
+    api.health.unreadable_lines = 1;
+    apply_claude_reported_usage_with_index_and_limits(
+        &mut [],
+        &api,
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+        &mut index,
+        false,
+        WINDOW,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        MAX_CLAUDE_DUPLICATE_REQUEST_OWNERS,
+        None,
+    );
+    let run = rearm.terminal(&mut index, &rearm.items);
+    assert!(run.counts.full_rearm);
+    assert!(!run.suppression.full_rearm_suppressed);
+    assert_eq!(run.rearmed_files, 2);
+}
+
+#[test]
+fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    rearm.establish(&mut index, &rearm.items);
+    let mut items = rearm.items.clone();
+    let (key, occurrence) = items[0].claude_usage_occurrences.pop_first().unwrap();
+    items[0]
+        .claude_usage_occurrences
+        .insert(format!("unknown-{key}"), occurrence);
+    assert!(!claude_member_invalidity_is_structural(&items[0]));
+    rearm.fold(
+        &mut index,
+        &rearm.items,
+        false,
+        MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+    );
+    let run = rearm.terminal(&mut index, &items);
+    assert!(run.counts.full_rearm);
+    assert!(!run.suppression.full_rearm_suppressed);
+    assert_eq!(run.rearmed_files, 2);
+}

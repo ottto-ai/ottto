@@ -37,16 +37,22 @@ deadline) only when all of these hold:
 - no current-window family is invalid for another cause, and no stale pending
   keeps the census invalid;
 - the contract-5 latch is clear and the recorded contract is the current one;
-- a record exists under the current basis, every recorded family's member
-  digest is unchanged, every current structural family is in the record, and
+- a record established by a real full re-arm exists under the current basis,
+  every recorded family's member digest is unchanged, every current
+  structural family is in the record, and
   a fully observed window's set equals the record;
+- no indexed account hold or owned-start dependency, API/trace health gap,
+  invalid census clock, identity refusal or unexplained coverage omission;
 - no first-proof hold (see below).
 
 Any change (a member revision, a new family, a basis change, a latch flip, an
 unrecorded contract, a lost or malformed record) re-arms exactly once as
-before, and that window records the new set. An incremental window that reads
-nothing is closed only by coverage; the same unchanged families keep it
-closed, so it is skipped too. The skip never touches `identity_contract_rearm`
+before, and that re-arm window records the new set. A non-due observation
+can mark a durable re-arm obligation but cannot replace the last re-armed
+baseline; the obligation survives persistence and a return to the old bytes.
+An incremental window that reads nothing skips only when every unobserved
+member belongs to those same unchanged structural families. The skip never
+touches `identity_contract_rearm`
 or `fence_recovery_rearm`, never clears the latch, and leaves the posture veto
 and M1 per-file re-emission unchanged.
 
@@ -96,7 +102,11 @@ stale re-arm; a changed revision fails the cap. Capped families share C1b's
 funded cancellation/replay buffer, so M1 selection of a changed member cancels
 the cap and queues passed siblings. The window origin is recorded at the
 terminal; restart before its first start or during a carried window restores
-BASE before selection.
+BASE before selection. The retained carry stores its own process/context
+origin, including whether it depends on the full-rearm window. Missing or
+malformed provenance (including an older decoder's rewrite), a lost window
+record, or another process/context clears the retained member revisions and
+restarts the traversal before refund or candidate selection.
 
 The traversal start row reports `rearm_window_families`,
 `rearm_window_carried_families`, `rearm_window_rearmed_families`,
