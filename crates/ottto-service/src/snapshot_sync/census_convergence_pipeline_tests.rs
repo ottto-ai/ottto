@@ -2913,3 +2913,140 @@ fn due_reoffer_rejected_page_preserves_terminal_and_retry_pending_holds() {
         assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
     }
 }
+
+/// Re-review r5 (path-(a) bridge composed with #706): a due reason re-offer on
+/// a Rejected page beside a RetryPending family that is bound, with no
+/// correction, to the exact held revision. The held body is gate-held and
+/// never sent; the page takes the restorable settlement exactly as without
+/// the lease (the old entry and body stay, the page counter moves once), and
+/// the authority debt names no unsettled cause. The family keeps its record,
+/// binding, failure count, deadline and pending, and the ordinary census,
+/// backfill and replay stay withheld. #706's unbound arm above is the
+/// second-cause control.
+#[test]
+#[serial(source_manifests)]
+fn due_reoffer_rejected_page_settles_a_bound_retry_pending_hold_without_a_cause() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = PipelineFixture::new("reoffer-bound-retry-pending");
+    let baseline = fixture.baseline();
+    let committed_revision = fixture.seed_retry_pending_authority(PIPELINE_HELD_SESSION);
+    fixture.seed_retry_pending_family_pending(PIPELINE_HELD_SESSION);
+    fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
+    fixture.append(PIPELINE_SESSIONS[1], "req_1_2");
+    let held_key = PipelineFixture::key(&baseline, PIPELINE_HELD_SESSION);
+    let upload = PipelineUpload::EntityAckRejected {
+        session: PIPELINE_SESSIONS[1],
+        reason: reason_reoffer::ORIGINAL_PAIR_CANDIDATE_UNPROVED,
+    };
+    let cycle = PipelineCycle {
+        first_page_upload: upload,
+        ..BRIDGE_CYCLE
+    };
+    let settled_before = terminal_hold_settlement_count();
+    let mut bound_record = None;
+    let first = fixture.page_with_reoffers(
+        "2026-08-02T09:00:00Z",
+        &cycle,
+        upload,
+        |index| {
+            // Positive precondition at the upload boundary: the held family's
+            // RetryPending record has no correction and is bound to its
+            // retained witness and to this exact held revision.
+            let record = index
+                .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+                .expect("the held family is quarantined");
+            assert!(!record.terminal && record.bound_to_retained_witness);
+            assert!(record.correction.is_none());
+            assert!(record.family_pending_retained);
+            let held_revision = &record.member_source_file_fingerprints[PIPELINE_HELD_SESSION];
+            assert_ne!(held_revision, &committed_revision);
+            assert_eq!(
+                held_revision,
+                &index.files[&held_key].source_file_fingerprint
+            );
+            assert_eq!(index.claude_usage_authority_pending_count(), 1);
+            bound_record = Some(record);
+        },
+        true,
+    );
+    let bound_record = bound_record.expect("the precondition ran");
+    assert!(matches!(
+        first.result,
+        ResumableUploadResult::Rejected { .. }
+    ));
+    assert_eq!(first.held.len(), 1);
+    assert!(
+        !first.progress_blocking,
+        "the bound RetryPending hold is non-progressing"
+    );
+    let held_body = first.held.iter().next().expect("held body").clone();
+    assert!(
+        first.held.is_disjoint(&first.uploaded),
+        "a leased held body was never transmitted"
+    );
+    assert!(!first.progress.accepted_fingerprints.contains(&held_body));
+    assert!(!first
+        .index
+        .accepted_snapshot_fingerprint_recorded(&held_body));
+    assert_eq!(first.progress.reason_reoffer_counts.selected, 2);
+    assert_eq!(first.progress.reason_reoffer_counts.attempted, 1);
+    assert_eq!(first.progress.reason_reoffer_counts.refused_same, 1);
+    assert_eq!(first.progress.reason_reoffer_counts.gate_held, 1);
+    assert_eq!(
+        terminal_hold_settlement_count(),
+        settled_before + 1,
+        "the restorable settlement counts the page once"
+    );
+    assert!(!first.index.bounded_sweep_had_unsettled_upload());
+    assert!(first.index.bounded_sweep_unsettled_cause_names().is_empty());
+    assert!(!first.fully_settled, "the debt keeps completion pending");
+    // The held key keeps its committed entry and body.
+    assert_eq!(
+        first.index.files[&held_key].last_snapshot_fingerprint,
+        baseline.files[&held_key].last_snapshot_fingerprint
+    );
+    assert_eq!(
+        first.index.files[&held_key].source_file_fingerprint,
+        committed_revision
+    );
+    assert_eq!(
+        first.index.file_snapshot_fingerprints[&held_key],
+        baseline.file_snapshot_fingerprints[&held_key]
+    );
+    // The authority debt is retained exactly.
+    let kept = first
+        .index
+        .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+        .expect("the family stays quarantined");
+    assert_eq!(
+        kept, bound_record,
+        "same record, binding, count and deadline"
+    );
+    assert!(first
+        .index
+        .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+
+    let last = fixture.page("2026-08-02T09:01:00Z", &cycle, PipelineUpload::Accept);
+    assert_eq!(last.scan.census_window_end, first.scan.census_window_end);
+    assert!(
+        !last.scan.census_complete,
+        "the ordinary census stays withheld"
+    );
+    assert!(!last.backfill_succeeded);
+    assert!(!last.fully_settled);
+    assert!(last
+        .index
+        .context_curve_replay_needed(cycle.replay_generation));
+    assert!(!last.index.bounded_sweep_had_unsettled_upload());
+    assert!(last.index.bounded_sweep_unsettled_cause_names().is_empty());
+    assert!(!last.uploaded.contains(&held_body));
+    assert_eq!(last.index.claude_usage_authority_pending_count(), 1);
+    let still = last
+        .index
+        .claude_authority_record_for_test(PIPELINE_HELD_SESSION)
+        .expect("still quarantined");
+    assert_eq!(still, bound_record);
+    assert!(last
+        .index
+        .claude_usage_family_pending_retained_for_test(PIPELINE_HELD_SESSION));
+}
