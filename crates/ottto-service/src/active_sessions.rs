@@ -67,6 +67,7 @@ pub fn reconcile_active_sessions(
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
     upload_policy: SnapshotUploadPolicy,
+    scan_started_at: Option<&str>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
     let policy = serde_json::to_string(&upload_policy)?;
@@ -75,6 +76,7 @@ pub fn reconcile_active_sessions(
         source,
         snapshots,
         agent_status,
+        scan_started_at,
         reconciled_at,
         Some(&policy),
         crate::agent_status::claude_session_registrations,
@@ -93,17 +95,20 @@ pub fn clear_active_sessions(
         source,
         &[],
         None,
+        None,
         reconciled_at,
         None,
         crate::agent_status::claude_session_registrations,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_with_registrations(
     support_dir: &Path,
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
+    scan_started_at: Option<&str>,
     reconciled_at: &str,
     carry_policy: Option<&str>,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
@@ -112,7 +117,13 @@ fn reconcile_with_registrations(
     let mut cache = read_cache(&path);
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let activity_cutoff = now - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
+    // A slow scan may observe live work long before it reconciles. Its start
+    // bounds what activity it could have observed; the ceiling still uses now.
+    let activity_clock = scan_started_at
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .unwrap_or(now)
+        .min(now);
+    let activity_cutoff = activity_clock - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
@@ -300,6 +311,7 @@ fn reconcile_with_registrations(
         .registration_evidence
         .retain(|session_id, _| listed.contains(session_id.as_str()));
     let reconciliation = ActiveSessionReconciliation {
+        scan_started_at: scan_started_at.map(str::to_string),
         reconciled_at: reconciled_at.to_string(),
         changed_session_count,
         sessions,
@@ -1173,6 +1185,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("reconciliation");
@@ -1227,6 +1240,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &snapshots,
+            None,
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
@@ -1286,6 +1300,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             registrations,
@@ -1321,6 +1336,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
+            None,
             "2026-07-19T10:10:00Z",
             Some("policy"),
             || panic!("no registration acquisition without new activity"),
@@ -1344,6 +1360,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[],
+            None,
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
@@ -1371,6 +1388,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[older, newer],
+            None,
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
@@ -1407,6 +1425,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 std::slice::from_ref(&snapshot),
                 None,
+                None,
                 "2026-07-19T10:05:00Z",
                 Some("policy"),
                 registrations,
@@ -1430,6 +1449,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             registrations,
@@ -1451,6 +1471,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             BTreeMap::new,
@@ -1464,6 +1485,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[],
+            None,
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
@@ -1486,6 +1508,55 @@ mod tests {
 
     fn temp_dir(name: &str) -> PathBuf {
         crate::test_scratch::private_dir(&format!("ottto-active-sessions-{name}"))
+    }
+
+    #[test]
+    fn long_scan_keeps_activity_seen_after_scan_start_and_advances_watermark() {
+        let dir = temp_dir("long-scan");
+        let snapshot = test_snapshot("live", "2026-07-19T10:06:00Z");
+        let result = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[
+                snapshot,
+                test_snapshot("old", "2026-07-19T09:44:00Z"),
+                test_snapshot("future", "2026-07-19T10:46:00Z"),
+            ],
+            None,
+            test_policy(),
+            Some("2026-07-19T10:00:00Z"),
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        assert_eq!(result.changed_session_count, 1);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_session_id, "live");
+        let cache = read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode));
+        assert_eq!(cache.watermarks["live"], "2026-07-19T10:06:00Z");
+        assert_eq!(cache.reconciliation, Some(result.clone()));
+        assert_eq!(
+            result.scan_started_at.as_deref(),
+            Some("2026-07-19T10:00:00Z")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_start_after_reconciliation_uses_reconciliation_cutoff() {
+        let dir = temp_dir("scan-clock-rollback");
+        let result = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[test_snapshot("live", "2026-07-19T10:35:00Z")],
+            None,
+            test_policy(),
+            Some("2026-07-19T11:00:00Z"),
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_session_id, "live");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1515,6 +1586,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1550,6 +1622,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:06:00Z",
         )
         .expect("quiet reconciliation");
@@ -1561,6 +1634,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:10:00Z",
         )
         .expect("unchanged reconciliation");
@@ -1579,6 +1653,7 @@ mod tests {
             std::slice::from_ref(&busy),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1591,6 +1666,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:15:00Z",
         )
         .expect("quiet reconciliation");
@@ -1605,6 +1681,7 @@ mod tests {
             &[busy.clone(), other],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:17:00Z",
         )
         .expect("mixed reconciliation");
@@ -1623,6 +1700,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:20:00Z",
         )
         .expect("later reconciliation");
@@ -1646,6 +1724,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1664,6 +1743,7 @@ mod tests {
             &[stripped],
             None,
             policy,
+            None,
             "2026-07-19T10:08:00Z",
         )
         .expect("rebuilt reconciliation");
@@ -1684,6 +1764,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1697,6 +1778,7 @@ mod tests {
             &[],
             None,
             policy,
+            None,
             "2026-07-19T10:08:00Z",
         )
         .expect("policy-change reconciliation");
@@ -1718,6 +1800,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             Some(&status),
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1732,6 +1815,7 @@ mod tests {
             &[],
             Some(&status),
             test_policy(),
+            None,
             "2026-07-19T10:06:00Z",
         )
         .expect("agreeing reconciliation");
@@ -1752,6 +1836,7 @@ mod tests {
             &[],
             Some(&conflicting),
             test_policy(),
+            None,
             "2026-07-19T10:07:00Z",
         )
         .expect("conflicting reconciliation");
@@ -1802,6 +1887,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1815,6 +1901,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:07:00Z",
         )
         .expect("next reconciliation");
