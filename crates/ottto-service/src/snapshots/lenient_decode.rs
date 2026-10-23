@@ -64,6 +64,16 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
 }
 impl Holds {
     fn rebuild_scopes(&mut self) {
+        if self.0.is_empty() {
+            // Removing the final repaired slot can leave an allocated empty
+            // BTree root. Published empty Holds must own no container storage;
+            // otherwise a repair-only corpus would retain that parser scratch.
+            self.0 = BTreeMap::new();
+            self.2 = BTreeSet::new();
+            self.3 = BTreeSet::new();
+            self.4 = false;
+            return;
+        }
         let files = self.0.get("files");
         self.2 = files
             .into_iter()
@@ -116,11 +126,20 @@ impl crate::heap_layout_bound::HeapLayoutBound for Holds {
     // Both maps and the shared raw payloads are immutable without &mut self.
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // Only Default/Clone or rebuild_scopes-published values escape the
+        // decoder. Their empty containers have been replaced with fresh ones;
+        // unlike arbitrary empty BTrees they cannot retain allocated roots.
+        if self.0.is_empty() && self.2.is_empty() && self.3.is_empty() {
+            return Some(());
+        }
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.2, c)?;
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.3, c)
     }
     fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        if self.0.is_empty() && self.2.is_empty() && self.3.is_empty() {
+            return Some(());
+        }
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.0, c)?;
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.2, c)?;
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.3, c)

@@ -924,6 +924,11 @@ fn repair_provenance_is_constant_for_many_scalar_repairs_and_authority_drops() {
         assert_eq!(clone.allocations, 0);
         assert_eq!(clone.requested_peak, 0);
         assert_eq!(clone.usable_peak, 0);
+        let (_, holds_clone) =
+            crate::retry_allocation_probe::measure(|| loaded.decode_holds.clone());
+        assert_eq!(holds_clone.allocations, 0);
+        assert_eq!(holds_clone.requested_peak, 0);
+        assert_eq!(holds_clone.usable_peak, 0);
         // Large corpus exercises ordinary CAS; selected CAS retains its 8192
         // node gate, so its independent damage test uses the smaller corpus.
         for bounded in [false, true]
@@ -965,6 +970,36 @@ fn repair_provenance_is_constant_for_many_scalar_repairs_and_authority_drops() {
         }
         eprintln!("lenient_fixed_provenance_receipt records={} inline_bytes={} clone_requested_peak={} clone_usable_peak={}", 2 * count, receipt.0, clone.requested_peak, clone.usable_peak);
     }
+}
+
+#[test]
+fn repair_only_published_holds_drop_without_heap_retirement() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-empty-hold-storage");
+    let path = scratch.as_ref().join("index.json");
+    let key = "b".repeat(64);
+    let mut seed = fixture();
+    seed.quarantined_snapshot_fingerprints.insert(
+        key.clone(),
+        snapshot_quarantine_record(SnapshotSource::ClaudeCode),
+    );
+    seed.save(&path).unwrap();
+    let mut value = serde_json::to_value(&seed).unwrap();
+    // Unlike a serde-valid scalar repair, this first allocates a raw hold map,
+    // then removes its last slot during repair_held. Normalization must retire
+    // its empty BTree root before the value escapes the decoder.
+    value["quarantined_snapshot_fingerprints"][&key]["failed_reconstruction_count"] =
+        serde_json::json!(300);
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.decode_holds.is_empty());
+    assert_eq!(loaded.decode_holds.provenance_receipt().1, 1);
+    assert_sibling(&loaded);
+    // The thread probe intentionally refuses negative live bytes. A leaked
+    // pre-scope empty root would therefore fail this measurement itself.
+    let (_, retired) = crate::retry_allocation_probe::measure(|| drop(loaded.decode_holds));
+    assert_eq!(retired.deallocations, 0);
+    assert_eq!(retired.requested_live, 0);
+    assert_eq!(retired.usable_live, 0);
 }
 
 fn write_deep_optional(path: &Path, prefix: &[u8], depth: usize) -> usize {
