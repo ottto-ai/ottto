@@ -1470,6 +1470,7 @@ fn shadow_page_with_coverage(
             )
         };
         let state = coverage_view.family(root);
+        let digest_state = state.clone();
         let mut basis = None;
         let mut rows;
         let mut owned_reservation = None;
@@ -1554,7 +1555,7 @@ fn shadow_page_with_coverage(
                 rows = failure_rows(
                     root,
                     "deadline",
-                    coverage_view.family(root),
+                    digest_state,
                     now,
                     snapshot,
                     ledger,
@@ -2245,13 +2246,12 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
     row.snapshot = 0;
     row.observed_unix = 0;
     let mut hash = HashWriter(Sha256::new(), deadline);
-    let result = (|| {
-        serde_json::to_writer(&mut hash, &*row)?;
+    let result = serde_json::to_writer(&mut hash, &*row).and_then(|()| {
         for (key, (old, new)) in &rows.grains {
             serde_json::to_writer(&mut hash, &grain_row(row, key, old, new))?;
         }
-        Ok::<(), serde_json::Error>(())
-    })();
+        Ok(())
+    });
     (
         row.snapshot,
         row.observed_unix,
