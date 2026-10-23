@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 828,
-  "content_sha256": "4c4feed5caf4cabec73d540480c00d56f70b2d6a64e3edbdd198e532df69f533",
+  "content_sha256": "48ffc9d422cd7c135c4404ef28c33efe52b8ef1c749d76775a25147d0293d98f",
   "files": [
     {
       "executable": false,
@@ -1476,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/census_convergence_pipeline_tests.rs",
-      "sha256": "1b2714eddd31db38b09ee46ed336e6519d62cfa3952c30ea056303065afc0e1b",
-      "size_bytes": 138558
+      "sha256": "fae24229fada7d0c6001c7be85eed34f8b8e74146118823bd7d0c516192752e2",
+      "size_bytes": 150130
     },
     {
       "executable": false,
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/reason_reoffer_pipeline_tests.rs",
-      "sha256": "b75507b90d337ac91d2fc3863e306d97595451ba754cc1921a680b85333e21c9",
-      "size_bytes": 45678
+      "sha256": "580422425e38091f6bdb2418c315019cd02a50a0f3b9b3c36ffba642c3371d06",
+      "size_bytes": 49339
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "8706184cdb86718b54029d95f8d14020677f3eb76a23565c3adfadfba1f9508f",
-      "size_bytes": 3416088
+      "sha256": "fbec666e8304fa355495702b70dec6d61ab13f53c56397d7f3abc210785ac0f3",
+      "size_bytes": 3430647
     },
     {
       "executable": false,
@@ -1672,8 +1672,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "14c02507df1c8054729acb0e662ade74afb7e17cbdcbe07693959cdd3bf5b86d",
-      "size_bytes": 68657
+      "sha256": "a8ebbba9baf2390a57201d22c73bf874cb37ac1fe336a48cb4b83012e8803ab5",
+      "size_bytes": 82389
     },
     {
       "executable": false,
@@ -2134,8 +2134,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/traversal_transition.rs",
-      "sha256": "d196ac00cdc7b927d5b4bef34654a11373499d4dc5406c412ccbd371d27e736a",
-      "size_bytes": 36723
+      "sha256": "eb904f164c4611e0fdfaca13156feca5dd0415804e2b1b984128059f37fb2b82",
+      "size_bytes": 40321
     },
     {
       "executable": false,
@@ -4010,8 +4010,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-patha-authority-hold-bridge.md",
-      "sha256": "97b43cb8cc1a26ab6139a411b5df6d3d2643680c1df488ba24cc65274613e102",
-      "size_bytes": 9676
+      "sha256": "54bd852966bd46ae464f7a474269738afe976b6fe3582168a3c78bef5bd98a3f",
+      "size_bytes": 11717
     },
     {
       "executable": false,
@@ -5799,7 +5799,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T14:19:40+00:00",
+  "generated_at": "2026-10-23T16:01:41+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 829,
   "public_roots": [
@@ -5838,5 +5838,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "7772867b3af6ecff867ff2aadc5250ab78ba9997"
+  "source_commit": "f775a19d14f42051ab9b194da9d2f201e26b2dd1"
 }
