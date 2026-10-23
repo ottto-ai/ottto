@@ -36156,6 +36156,15 @@ impl ScanIndex {
                 Ok((index, LoadOrigin::Loaded(opened)))
             }
             Err(error) if error.quarantines() => {
+                if matches!(error, lenient_decode::Error::HoldBudget)
+                    && scan_index_rebuilt_recently(path, SystemTime::now())?
+                {
+                    emit_scan_index_containment_line(format!(
+                        "local snapshot scan index load: source={} lenient_hold_budget_exceeded=1 refusal_kind=rebuild_loop source_paused=1 index_kept=1; recent quarantine rebuild alarm, reviewed repair required, never delete the index",
+                        scan_index_source_label(source)
+                    ));
+                    return Err(error.into());
+                }
                 quarantine_invalid_scan_index(path, "decode", None)
                     .map(|index| (index, LoadOrigin::Quarantined))
             }

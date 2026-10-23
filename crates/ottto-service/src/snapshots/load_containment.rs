@@ -143,6 +143,43 @@ fn normalize_snapshot_quarantine_record(record: &mut SnapshotQuarantineRecord, n
     }
 }
 
+// Existing backup names encode the rename time, unlike mtime (which rename
+// preserves). Inspect only this checkpoint's siblings; retain no new state.
+const SCAN_INDEX_REBUILD_COOLDOWN_NANOS: u128 = 7 * 24 * 60 * 60 * 1_000_000_000;
+fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
+    let now = now.duration_since(UNIX_EPOCH)?.as_nanos();
+    let stem = path
+        .file_stem()
+        .context("scan index has no file stem")?
+        .to_string_lossy();
+    let prefix = format!("{stem}.corrupt.");
+    for entry in fs::read_dir(path.parent().unwrap_or_else(|| Path::new(".")))? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        let Some(tail) = name
+            .strip_prefix(&prefix)
+            .and_then(|s| s.strip_suffix(".json"))
+        else {
+            continue;
+        };
+        let Some((pid, stamp)) = tail.split_once('.') else {
+            continue;
+        };
+        if pid.parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(stamp) = stamp.parse::<u128>() else {
+            continue;
+        };
+        // A future timestamp is conservative under clock rollback.
+        if now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn quarantine_invalid_scan_index(
     path: &Path,
     cause: &str,

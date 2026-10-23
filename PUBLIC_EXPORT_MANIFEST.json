@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 832,
-  "content_sha256": "df3c8488adf3ae5b92b8455972fbc514aa78431ba0239ca28504c5b1512354bf",
+  "content_sha256": "bc9259d675c78954673a43788ded55760e2e342437f019d16ca1a0e728ad8f82",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "ca41d7eeb676ece4c76db8890946930dce6db03a37212673960bd2b8d4cd9bb0",
-      "size_bytes": 918636
+      "sha256": "19745293b89bd50125bef939b0be18fdf4e9d841183a9910226a9f6ec248cc82",
+      "size_bytes": 919192
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "313e59a94cfa0691e7e204f8f838165f61f461c1608d1eaf18d5a3ccc57f0ae7",
-      "size_bytes": 3374901
+      "sha256": "addbc53913b9f455de9a0efd66fbe16e4e3423143fc88db3efe949dbccc89894",
+      "size_bytes": 3375510
     },
     {
       "executable": false,
@@ -2008,22 +2008,22 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/lenient_decode.rs",
-      "sha256": "78e418cdb5eefa5ba62fb23c6d3202f63f2e55ca80c7a60eca92fa7eed676bec",
-      "size_bytes": 81980
+      "sha256": "b4e7481e267d0c5167435fa133f0233f83fbcc290619f126d48b234eb6ba33cb",
+      "size_bytes": 83922
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/lenient_decode_tests.rs",
-      "sha256": "7214b756fa25589321834e7762aed31fa88bd97086b6ac7f11b070d3c5132e0d",
-      "size_bytes": 69202
+      "sha256": "b39bccc5f4b538548bf321d94313429bcfa058524bc40295470e456eb4cb9b49",
+      "size_bytes": 94625
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/load_containment.rs",
-      "sha256": "e01a639bd63c663e13c3dbe9a3170f03f8f629c8bfba189d1044049d1f295775",
-      "size_bytes": 10759
+      "sha256": "c8a163f054522ff1ea3a612ee022d64e7ca1f8b93b350e163eeee275da4ff5da",
+      "size_bytes": 12123
     },
     {
       "executable": false,
@@ -2372,8 +2372,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/scan-index-decoding.md",
-      "sha256": "4d7614f8b1c9707eceb9aee4a9c788fe18bed49fd7a20bb2520809997dfd7f4a",
-      "size_bytes": 4386
+      "sha256": "12907d2b029871176ccd9e44331091e4626facb609b1279d41928d3395bca5cb",
+      "size_bytes": 5671
     },
     {
       "executable": false,

@@ -390,7 +390,7 @@ fn lenient_budget_overflow_uses_existing_load_and_cas_outcomes() {
     let mut working = fixture();
     working.save(&path).unwrap();
     let mut value = serde_json::to_value(&working).unwrap();
-    value["files"]["huge-held"] = serde_json::json!({"unknown": "x".repeat(32_000)});
+    value["files"]["huge-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
     let bytes = serde_json::to_vec(&value).unwrap();
     fs::write(&path, &bytes).unwrap();
     assert!(working.save(&path).is_err());
@@ -907,7 +907,7 @@ fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
     ] {
         let bytes = format!(
             "{{\"files\":{{\"bad\":{{\"unknown\":\"{}\"}}}},\"{field}\":{control}}}",
-            "x".repeat(32_000)
+            "x".repeat(2 * 1024 * 1024)
         );
         fs::write(&path, bytes.as_bytes()).unwrap();
         assert!(ScanIndex::load(&path).is_err());
@@ -1366,9 +1366,17 @@ fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
         seed.save(&path).unwrap();
         let mut value = serde_json::to_value(&seed).unwrap();
         for n in 0..records {
-            value["files"][format!("{n}{}", "k".repeat(4096))] = Value::Bool(false);
+            value["files"][format!(
+                "{n}{}",
+                "k".repeat(if records == 3 {
+                    400 * 1024
+                } else {
+                    2 * 1024 * 1024
+                })
+            )] = Value::Bool(false);
         }
-        value["unknown_padding"] = Value::String("p".repeat(48 * 1024));
+        value["unknown_padding"] =
+            Value::String("p".repeat(if records == 3 { 0 } else { 20 * 1024 * 1024 }));
         let bytes = serde_json::to_vec(&value).unwrap();
         fs::write(&path, &bytes).unwrap();
         if records == 3 {
@@ -1383,7 +1391,7 @@ fn held_key_bytes_and_overhead_obey_running_and_restart_budgets() {
             // The original padding funded this key; canonical output does not.
             for bounded in [false, true] {
                 let error = if bounded {
-                    loaded.save_with_read_limit(&path, 1024 * 1024)
+                    loaded.save_with_read_limit(&path, 32 * 1024 * 1024)
                 } else {
                     loaded.save(&path)
                 }
@@ -1561,5 +1569,545 @@ fn held_owner_range_survives_clone_original_drop_and_restart() {
             original_slot
         );
         assert_sibling(&restarted);
+    }
+}
+
+// SI R1: valid native empty/optional cells are explicit controls, not damage.
+#[test]
+fn si_strict_refusal_matrix_preserves_bytes_generation_and_sibling_binding() {
+    let fields = [
+        "session_account_bindings",
+        "claude_account_deferred_holds",
+        "claude_request_identity_contract",
+        "claude_request_identity_contract_changed",
+        "claude_stale_family_carry",
+        "claude_owned_start_census",
+        "claude_duplicate_request_owners",
+        "codex_parent_ownership_refs",
+        "codex_parent_ownership_ledgers",
+        "bounded_sweep_had_unsettled_upload",
+    ];
+    for field in fields {
+        for bad in [
+            Value::Null,
+            serde_json::json!(17),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!("x"),
+            if field == "claude_stale_family_carry" {
+                serde_json::json!({"roots":[17]})
+            } else {
+                serde_json::json!({"bad":17})
+            },
+        ] {
+            let mut seed = fixture();
+            seed.generation = 37;
+            seed.session_account_bindings.insert(
+                "sibling-session".into(),
+                SessionAccountBinding {
+                    account_identifier_hash: "a".repeat(64),
+                    workspace_identifier_hash: Some("b".repeat(64)),
+                },
+            );
+            let mut value = serde_json::to_value(&seed).unwrap();
+            value[field] = bad.clone();
+            // serde permits empty maps/sets/struct sequences, strings for the
+            // optional token, and null for Option. Pin those lawful cells too.
+            let valid = match field {
+                "claude_request_identity_contract" => bad.is_null() || bad.is_string(),
+                "claude_request_identity_contract_changed"
+                | "bounded_sweep_had_unsettled_upload" => false,
+                "codex_parent_ownership_refs" => bad == serde_json::json!([]),
+                "claude_stale_family_carry" => {
+                    bad == serde_json::json!({}) || bad == serde_json::json!([])
+                }
+                _ => bad == serde_json::json!({}),
+            };
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<ScanIndex>(&bytes).is_ok(),
+                valid,
+                "{field}: {bad}"
+            );
+            for bounded in [false, true] {
+                let scratch = crate::test_scratch::ScratchDir::new("si-strict-refusal");
+                let path = scratch.as_ref().join("index.json");
+                fs::write(&path, &bytes).unwrap();
+                let before = scan_index_containment_lines_for_test().len();
+                let loaded = ScanIndex::load(&path);
+                let mut working = seed.clone();
+                let saved = if bounded {
+                    working.save_with_read_limit(&path, 1024 * 1024)
+                } else {
+                    working.save(&path)
+                };
+                if valid {
+                    assert!(loaded.is_ok(), "{field}: {bad}");
+                    saved.unwrap();
+                    continue;
+                }
+                assert!(loaded.is_err(), "{field}: {bad}");
+                assert!(saved.is_err(), "{field}: {bad}");
+                assert_eq!(working.generation, 37);
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(corrupt_count(scratch.as_ref()), 0);
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&bytes).unwrap()["generation"],
+                    37
+                );
+                let lines = scan_index_containment_lines_for_test();
+                assert_eq!(
+                    lines[before..]
+                        .iter()
+                        .filter(|s| s.contains("refusal_kind=strict_decode"))
+                        .count(),
+                    2
+                );
+                assert!(lines[before..]
+                    .iter()
+                    .all(|s| !s.contains("sibling-session") && !s.contains("bad")));
+            }
+        }
+    }
+    // Actual contained damage elsewhere permits commit without touching this
+    // independent binding's canonical slot, through both CAS readers.
+    for bounded in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("si-binding-control");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        seed.session_account_bindings.insert(
+            "sibling-session".into(),
+            SessionAccountBinding {
+                account_identifier_hash: "a".repeat(64),
+                workspace_identifier_hash: Some("b".repeat(64)),
+            },
+        );
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["files"]["/synthetic/0.jsonl"] = serde_json::json!(false);
+        let bytes = serde_json::to_vec_pretty(&value).unwrap();
+        let binding = raw_slot(&bytes, "session_account_bindings", "sibling-session");
+        fs::write(&path, &bytes).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            raw_slot(
+                &serde_json::to_vec_pretty(&loaded).unwrap(),
+                "session_account_bindings",
+                "sibling-session"
+            ),
+            binding
+        );
+        if bounded {
+            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        } else {
+            loaded.save(&path).unwrap();
+        }
+        assert_eq!(
+            raw_slot(
+                &fs::read(&path).unwrap(),
+                "session_account_bindings",
+                "sibling-session"
+            ),
+            binding
+        );
+    }
+}
+
+#[test]
+fn si_unknown_contract_latches_through_observation_save_and_restart() {
+    for bounded in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("si-unknown-contract");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        seed.claude_request_identity_contract = Some("FUTURE_UNKNOWN".into());
+        seed.claude_request_identity_contract_changed = false;
+        seed.save(&path).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.claude_request_identity_contract.as_deref(),
+            Some("FUTURE_UNKNOWN")
+        );
+        assert!(!loaded.claude_request_identity_contract_changed);
+        loaded.observe_claude_request_identity_contract(true);
+        assert!(loaded.claude_request_identity_contract_changed);
+        if bounded {
+            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        } else {
+            loaded.save(&path).unwrap();
+        }
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert!(restarted.claude_request_identity_contract_changed);
+        assert_eq!(
+            restarted.claude_request_identity_contract,
+            loaded.claude_request_identity_contract
+        );
+        let generation = loaded.generation;
+        let mut bad = serde_json::to_value(&loaded).unwrap();
+        bad["claude_request_identity_contract"] = serde_json::json!(17);
+        let bytes = serde_json::to_vec(&bad).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(ScanIndex::load(&path).is_err());
+        assert!(if bounded {
+            loaded.save_with_read_limit(&path, 1024 * 1024)
+        } else {
+            loaded.save(&path)
+        }
+        .is_err());
+        assert_eq!(loaded.generation, generation);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    }
+}
+
+#[test]
+fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
+    // Small damage below the floor is contained, not a whole-source rebuild.
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-floor");
+    let path = scratch.as_ref().join("index.json");
+    let mut value = serde_json::to_value(fixture()).unwrap();
+    value["files"]["floor-held"] = serde_json::json!({"unknown": "x".repeat(128 * 1024)});
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.decode_holds_file("floor-held"));
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    loaded.save(&path).unwrap();
+    assert_eq!(
+        raw_slot(&fs::read(&path).unwrap(), "files", "floor-held"),
+        raw_slot(&bytes, "files", "floor-held")
+    );
+    assert!(ScanIndex::load(&path)
+        .unwrap()
+        .decode_holds_file("floor-held"));
+
+    for previous_syntax in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-budget-loop");
+        let path = scratch.as_ref().join("index.json");
+        let mut value = serde_json::to_value(fixture()).unwrap();
+        value["files"]["excess-held"] = serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(
+            &path,
+            if previous_syntax {
+                b"{".as_slice()
+            } else {
+                bytes.as_slice()
+            },
+        )
+        .unwrap();
+        assert!(ScanIndex::load(&path).unwrap().files.is_empty());
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
+        fs::write(&path, &bytes).unwrap();
+        let before = scan_index_containment_lines_for_test().len();
+        assert!(format!("{:#}", ScanIndex::load(&path).unwrap_err())
+            .contains("lenient_hold_budget_exceeded"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
+        assert!(scan_index_containment_lines_for_test()[before..]
+            .iter()
+            .any(|s| s.contains("refusal_kind=rebuild_loop")
+                && s.contains("lenient_hold_budget_exceeded=1")
+                && s.contains("alarm")));
+        let now = SystemTime::now();
+        assert!(scan_index_rebuilt_recently(&path, now).unwrap());
+        assert!(!scan_index_rebuilt_recently(
+            &path,
+            now + std::time::Duration::from_secs(8 * 24 * 60 * 60)
+        )
+        .unwrap());
+        assert!(!scan_index_rebuilt_recently(&scratch.as_ref().join("another.json"), now).unwrap());
+    }
+}
+
+#[test]
+fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
+    let mut seed = fixture();
+    seed.insert_retry_pending_claude_authority_for_test("valid-family");
+    seed.codex_parent_prefix_proofs.insert(
+        "child".into(),
+        CodexParentProofState::Owed(CodexParentProofOwed::new(
+            "parent".into(),
+            1,
+            CAUSE_NO_EVIDENCE,
+            OwedOrigin::Lineage,
+        )),
+    );
+    let mut value = serde_json::to_value(&seed).unwrap();
+    // Explicit, non-default fixture for EVERY registry member. New fields must
+    // add native evidence here as well as serializer/registry/dispatch entries.
+    for &field in lenient_decode::FIELDS {
+        let replacement = match field {
+            "schema_version"
+            | "files"
+            | "snapshot_activity_at"
+            | "accepted_snapshot_fingerprints"
+            | "file_snapshot_fingerprints"
+            | "quarantined_snapshot_fingerprints"
+            | "claude_usage_family_witnesses"
+            | "claude_usage_authority_quarantine"
+            | "codex_parent_prefix_proofs"
+            | "accepted_snapshot_fingerprint_ledger_version" => continue,
+            "session_account_bindings" => {
+                serde_json::json!({"session":{"account_identifier_hash":"account","workspace_identifier_hash":"workspace"}})
+            }
+            "terminal_jsonl_dispositions" => {
+                serde_json::json!({"file":{"source_file_fingerprint":"fp","parser_generation":"generation","loss":{"over_line_cap_count":1}}})
+            }
+            "known_configured_scan_roots"
+            | "legacy_unresolved_root_file_witnesses"
+            | "codex_state_only_blocked_session_ids"
+            | "codex_state_only_blocked_unattributed"
+            | "codex_state_only_blocked_legacy"
+            | "codex_parent_ownership_refs"
+            | "confirmed_empty_files" => serde_json::json!(["member"]),
+            "codex_state_only_snapshot_fingerprints" | "claude_account_deferred_holds" => {
+                serde_json::json!({"session":"value"})
+            }
+            "codex_state_only_blocked_by_file" => serde_json::json!({"file":["session"]}),
+            "codex_parent_ownership_ledgers" => {
+                serde_json::json!({"parent":{"signatures":["signature"],"scan_complete":true}})
+            }
+            "codex_parent_side_requests" => {
+                serde_json::json!({"parent":{"dev_ino":[1,2],"needed_extent":1,"state":{"kind":"live"},"state_extent":1,"state_ctime":[1,0],"attempt_extent":1,"attempt_ctime":[1,0],"attempts":1,"not_before_unix_seconds":1}})
+            }
+            "codex_parent_side" => serde_json::json!({"parent":{
+                "verdict":{"kind":"settled"},"generation":1,"referenced_epoch":1,
+                "parsed":{"dev":1,"ino":2,"extent":1,"modified":[1,0],"changed":[1,0]},
+                "seal":{"stamp":{"length":1,"device":1,"inode":2,"modified":[1,0],"changed":[1,0]},
+                    "scope":codex_parent_side_scope().0,"sample_len":1,"head_sha256":"a".repeat(64),"boundary_sha256":"b".repeat(64),"verified_unix_seconds":1,"sealed_unix_seconds":1}}}),
+            "claude_desktop_title_files" => {
+                serde_json::json!({"sidecar":{"cli_session_id":"session","title":"title","user_set":true}})
+            }
+            "claude_account_family_witnesses" => {
+                serde_json::json!({"account-family":{"account_identifier_hash":"account","evidence_request_count":1,"members":{"member":1}}})
+            }
+            "claude_account_family_pending" => {
+                serde_json::json!({"account-family":{"census_window_end":"2026-10-22T00:00:00Z","account_identifier_hash":"account","evidence_request_count":1,"members":{"member":1},"invalid":false}})
+            }
+            "claude_usage_family_pending" => {
+                serde_json::json!({"pending-family":{"census_window_end":"2026-10-22T00:00:00Z","member_request_id_hashes":{"member":["hash"]},"invalid":false}})
+            }
+            "claude_request_census" => {
+                serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact"}})
+            }
+            "claude_request_census_shadow" => serde_json::json!({"o":true}),
+            "claude_duplicate_request_owners" => {
+                serde_json::json!({"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]})
+            }
+            "claude_owned_start_census" => {
+                serde_json::json!({"member":{"marker_source_file_fingerprint":"fp"}})
+            }
+            "claude_desktop_census_witness" => {
+                serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
+            }
+            "claude_stale_family_carry" => serde_json::json!({"roots":["carried-family"]}),
+            "traversal" => {
+                serde_json::json!({"context_fingerprint":"context","census_window_end":"2026-10-22T00:00:00Z","scan_roots":["/synthetic"],"pending_directories":[],"pending_candidates":[],"observed_index_keys":["file"],"reconciliation_upper_bound":"file","reconciliation_after":null,"reconciliation_started":true,"counts":{}})
+            }
+            "scan_residue_witness" => {
+                serde_json::json!({"census_window_end":"2026-10-22T00:00:00Z","index_keys":["file"]})
+            }
+            "codex_state_only_blocked_attributed"
+            | "claude_duplicate_request_witness_overflowed"
+            | "claude_request_identity_contract_changed"
+            | "claude_desktop_store_sweep_had_errors"
+            | "claude_desktop_identity_census_complete"
+            | "claude_desktop_lineage_census_complete"
+            | "bounded_sweep_had_unsettled_upload"
+            | "context_curve_capability_enabled" => serde_json::json!(true),
+            "generation"
+            | "codex_parent_side_generation"
+            | "codex_parent_proof_wrap_epoch"
+            | "codex_parent_proof_seq"
+            | "claude_duplicate_fence_rearm_attempt"
+            | "claude_duplicate_fence_next_full_rearm_unix_seconds"
+            | "claude_desktop_store_retry_attempt"
+            | "claude_desktop_store_retry_not_before_unix_seconds"
+            | "bounded_sweep_unsettled_causes"
+            | "context_curve_replay_epoch" => serde_json::json!(1),
+            "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
+            "upload_context_fingerprint"
+            | "codex_parent_proof_cursor"
+            | "codex_parent_side_cursor"
+            | "codex_proof_index_incarnation"
+            | "claude_request_identity_contract"
+            | "claude_desktop_store_cursor"
+            | "claude_desktop_store_upper_bound"
+            | "resume_after_path"
+            | "resume_upper_bound_path"
+            | "resume_census_window_end"
+            | "historical_replay_generation"
+            | "completed_context_curve_replay_generation" => serde_json::json!("non-default"),
+            _ => panic!("add a non-default native fixture for persisted field {field}"),
+        };
+        value[field] = replacement;
+    }
+    let index: ScanIndex = serde_json::from_value(value).unwrap();
+    let bytes = serde_json::to_vec_pretty(&index).unwrap();
+    let encoded: BTreeMap<String, &serde_json::value::RawValue> =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(
+        encoded.keys().map(String::as_str).collect::<BTreeSet<_>>(),
+        lenient_decode::FIELDS.iter().copied().collect()
+    );
+    let decoded =
+        lenient_decode::read(std::io::Cursor::new(&bytes), "load", "unattributed").unwrap();
+    assert!(decoded.decode_holds.is_empty());
+    assert_eq!(serde_json::to_vec_pretty(&decoded).unwrap(), bytes);
+}
+
+#[test]
+#[serial_test::serial(source_manifests)]
+fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
+    for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
+        for family_slot in [false, true] {
+            if source == SnapshotSource::Codex && family_slot {
+                continue;
+            }
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-real-rescan");
+            let path = scratch.as_ref().join("index.json");
+            let root = scratch.as_ref().join("projects");
+            let session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+            fs::create_dir_all(&root).unwrap();
+            let mut transcript_paths = Vec::new();
+            if source == SnapshotSource::ClaudeCode {
+                let file = root.join(format!("{session}.jsonl"));
+                fs::write(&file, format!("{{\"timestamp\":\"2026-10-21T10:01:00Z\",\"sessionId\":\"{session}\",\"message\":{{\"id\":\"message\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n")).unwrap();
+                transcript_paths.push(file);
+            } else {
+                for (name, response, input, total) in
+                    [("a", "response-a", 100, 100), ("b", "response-b", 200, 300)]
+                {
+                    let file = root.join(format!("{name}.jsonl"));
+                    let rows = codex_file_join::tests::member(session, response, input, total);
+                    fs::write(
+                        &file,
+                        rows.iter()
+                            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                            .collect::<String>(),
+                    )
+                    .unwrap();
+                    transcript_paths.push(file);
+                }
+            }
+            let mut index = ScanIndex::default();
+            let first = scan_source_roots(
+                source,
+                std::slice::from_ref(&root),
+                &mut index,
+                "2026-10-22T00:00:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            assert!(
+                !first.snapshots.is_empty(),
+                "healthy scan must exercise emission: {source:?}"
+            );
+            assert_eq!(first.scanned_file_count, transcript_paths.len());
+            assert_eq!(index.files.len(), transcript_paths.len());
+            let accepted = first
+                .snapshots
+                .iter()
+                .map(|s| s.snapshot_fingerprint.clone())
+                .collect();
+            index.record_accepted_snapshot_fingerprints(&accepted);
+            index.save(&path).unwrap();
+            let key = local_index_key(&transcript_paths[0]);
+            let (field, held_key) = if family_slot {
+                ("claude_usage_family_witnesses", session.to_owned())
+            } else {
+                ("files", key.clone())
+            };
+            let mut value = serde_json::to_value(&index).unwrap();
+            if value.get(field).is_none() {
+                value[field] = serde_json::json!({});
+            }
+            value[field][&held_key] = serde_json::json!({"members": [false], "opaque": "future"});
+            let bytes = serde_json::to_vec_pretty(&value).unwrap();
+            let original = raw_slot(&bytes, field, &held_key);
+            fs::write(&path, &bytes).unwrap();
+            let mut loaded = ScanIndex::load(&path).unwrap();
+            assert!(loaded.decode_holds_file(&key));
+            // Pins the NewFile decision independently of the scan's earlier
+            // candidate guard, including when the held native entry is absent.
+            let candidate = CandidateFile {
+                scan_root: root.clone(),
+                path: transcript_paths[0].clone(),
+                size_bytes: fs::metadata(&transcript_paths[0]).unwrap().len(),
+                modified_unix_seconds: 0,
+                modified_unix_nanos: 0,
+                source_file_fingerprint: "different-revision".into(),
+                legacy_source_file_fingerprint: String::new(),
+                legacy_config_reconciliation_required: false,
+                opened_object_identity: String::new(),
+            };
+            assert_eq!(
+                loaded.candidate_decision_with_reason(&candidate),
+                (CandidateDecision::Skip, None)
+            );
+            let rescanned = scan_source_roots(
+                source,
+                std::slice::from_ref(&root),
+                &mut loaded,
+                "2026-10-22T00:01:00Z",
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap();
+            assert!(
+                rescanned.snapshots.is_empty(),
+                "held file/group emitted: {source:?} family={family_slot}"
+            );
+            assert_eq!(
+                rescanned.scanned_file_count, 0,
+                "no parse, including NewFile, may begin"
+            );
+            assert_eq!(rescanned.scanned_session_count, 0);
+            assert!(!rescanned.census_complete);
+            assert!(
+                !crate::snapshot_sync::decode_hold_manifest_published_for_test(
+                    &mut loaded,
+                    &path,
+                    source,
+                    rescanned.census_complete
+                )
+                .unwrap()
+            );
+            assert_eq!(
+                raw_slot(&fs::read(&path).unwrap(), field, &held_key),
+                original
+            );
+            let mut restarted = ScanIndex::load(&path).unwrap();
+            assert!(restarted.decode_holds.same_as(&loaded.decode_holds));
+            assert_eq!(
+                raw_slot(
+                    &serde_json::to_vec_pretty(&restarted).unwrap(),
+                    field,
+                    &held_key
+                ),
+                original
+            );
+            if family_slot {
+                // A held-family file remains typed; exercise missing-file
+                // reconciliation as well, so its exact incidence survives.
+                let incidence = restarted.file_snapshot_fingerprints[&key].clone();
+                fs::remove_file(&transcript_paths[0]).unwrap();
+                let missing = scan_source_roots(
+                    source,
+                    std::slice::from_ref(&root),
+                    &mut restarted,
+                    "2026-10-22T00:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                )
+                .unwrap();
+                assert!(missing.snapshots.is_empty());
+                assert!(!missing.census_complete);
+                assert!(restarted.files.contains_key(&key));
+                assert_eq!(restarted.file_snapshot_fingerprints[&key], incidence);
+                restarted.save(&path).unwrap();
+                assert_eq!(
+                    raw_slot(&fs::read(&path).unwrap(), field, &held_key),
+                    original
+                );
+            }
+        }
     }
 }

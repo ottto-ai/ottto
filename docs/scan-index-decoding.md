@@ -18,16 +18,26 @@ also fences state-only publication, since its lost owner cannot safely be named.
 
 Hold admission checks lexically delimited keys before String allocation and
 charges their original wire bytes, values and per-slot bookkeeping before
-retention: at most 8 MiB, one eighth of the input, and 4,096 slots per read.
+retention: `min(8 MiB, max(input_bytes / 8, 1 MiB))` and 4,096 slots per read.
 Intact file owners use inline ranges into the shared raw slot, without a second
 payload allocation. Repairs release the complete charge; output restart admission
 uses that same charge. Oversized
 keys take the counted budget path without allocating a large key buffer.
 Excess damage uses the existing load quarantine or CAS error. The load diagnostic
 names the prior-history gated rebuild, which requires #712 to land first; the
-existing whole-index alarm and lenient_hold_budget_exceeded counter remain. Syntax/truncation still quarantines on load.
+existing whole-index alarm and lenient_hold_budget_exceeded counter remain.
+If this same checkpoint has a `.corrupt` sibling timestamped within seven days,
+the next over-budget load refuses in place instead of rebuilding again. The
+existing backup name supplies the rename timestamp (mtime survives rename);
+no new durable state is added. Future timestamps also block a rebuild, covering
+clock rollback. All same-checkpoint corruption backups conservatively count,
+including syntax and identity-collision quarantines. Syntax/truncation still quarantines on load.
 Malformed schema, generation, ledger or monotone controls refuse with the source
-file unchanged. Ambiguous duplicate fields also refuse. Bounded selected CAS
+file unchanged. Ambiguous duplicate fields also refuse. Each refused decode
+emits one content-free fixed-category containment line; the future-ledger path
+keeps its existing once-per-source alarm. Recovery requires a compatible decoder
+or reviewed repair that preserves custody. Do not delete the index: that is a
+Missing origin, and forfeits its acceptance and history evidence. Bounded selected CAS
 keeps its existing byte cap and 8,192-node/depth-64 admission. A save also checks
 that its output will admit the same holds after restart; if dropping optional
 input would violate that fraction, it refuses with the original file unchanged.
@@ -63,3 +73,12 @@ original record hash. Domain edits after load keep that commitment, so ordinary
 transitions can save against the same damaged disk input. Changed nonempty CAS
 provenance requires reload. Canonical saves remove the repaired input; an empty
 current commitment contains no new damage and permits later partial/final saves.
+
+The manual serializer, FIELDS registry and dispatch must change together.
+An all-persisted-fields, non-default fixture asserts exact registry coverage and
+an unchanged round trip through the shared decoder. An unhandled dispatch field
+refuses in place rather than panicking.
+
+The ClaudeScope shadow reader still treats held native files as absent. Before
+money-ledger decisions become live, its walk must include held file keys as lost
+debt. This is a prerequisite for enabling the independent money implementation.

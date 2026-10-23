@@ -2213,6 +2213,27 @@ fn save_index_and_publish_manifest(
     Ok(())
 }
 
+// Exercise the real durable-save/publication boundary from decoder rescans.
+#[cfg(test)]
+pub(crate) fn decode_hold_manifest_published_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    source: SnapshotSource,
+    complete: bool,
+) -> Result<bool> {
+    let namespace = "lenient-decode-rescan";
+    save_index_and_publish_manifest(
+        index,
+        path,
+        namespace,
+        source,
+        complete,
+        "2026-01-01T00:00:00Z",
+        "2026-10-22T00:00:00Z",
+    )?;
+    Ok(cached_source_manifest(namespace, source).is_some())
+}
+
 // Test-only empty-ACK/shed boundary; invokes the real locked partial save.
 #[cfg(test)]
 pub(crate) fn comparison_partial_checkpoint_for_test(

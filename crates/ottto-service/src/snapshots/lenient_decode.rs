@@ -5,9 +5,13 @@ use serde_json::value::RawValue;
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-// Source-owner admission: at most 1/8 of input, with these absolute ceilings.
+// Source-owner admission: input/8 with a 1 MiB floor and 8 MiB ceiling.
 // No parser-copy/census credit is consumed. Check before allocating raw bytes.
 const HOLD_BYTES_MAX: u64 = 8 * 1024 * 1024;
+const HOLD_BYTES_MIN: u64 = 1024 * 1024;
+fn hold_bytes_limit(input_len: u64) -> u64 {
+    (input_len / 8).clamp(HOLD_BYTES_MIN, HOLD_BYTES_MAX)
+}
 const HOLD_COUNT_MAX: usize = 4096;
 // Inline bookkeeping retained for each slot: key/map entries, shared payload
 // and Arc counters, and both fixed-size scope keys. Tree-node slack remains
@@ -697,7 +701,40 @@ fn optional_census(name: Option<&str>) -> bool {
     )
 }
 
+fn note_refusal(error: &Error, stage: &str, source: &str) {
+    let kind = match error {
+        // The future-ledger path already has its once-per-source alarm. Keep
+        // that existing counter/alarm contract rather than adding repeats.
+        Error::Refused("accepted-ledger version") => return,
+        Error::Refused("schema_version") => "control",
+        Error::Refused("duplicate index field" | "duplicate record key") => "duplicate",
+        Error::Refused("main document nesting resource cap" | "nesting resource cap") => "resource",
+        Error::Refused("unhandled index field") => "unhandled_field",
+        Error::Refused(
+            "input changed during decode" | "changed input" | "changed repair input",
+        ) => "changed_input",
+        Error::Refused(_) => "strict_decode",
+        Error::Io(_) => "io",
+        Error::Syntax(_) | Error::HoldBudget => return,
+    };
+    emit_scan_index_containment_line(format!(
+        "local snapshot scan index {stage}: source={source} refusal_kind={kind} source_paused=1 index_kept=1; recover with compatible decoding or reviewed repair, never delete the index"
+    ));
+}
+
 pub(super) fn read<R: BufRead + Seek>(
+    reader: R,
+    stage: &str,
+    source: &'static str,
+) -> std::result::Result<ScanIndex, Error> {
+    let result = read_inner(reader, stage, source);
+    if let Err(error) = &result {
+        note_refusal(error, stage, source);
+    }
+    result
+}
+
+fn read_inner<R: BufRead + Seek>(
     mut reader: R,
     stage: &str,
     source: &'static str,
@@ -772,7 +809,9 @@ pub(super) fn read_file(
     let result = read(&mut reader, stage, source);
     let after = sampled_scan::codex_cursor::OpenStamp::capture(reader.get_ref())?;
     if before != after {
-        return Err(Error::Refused("input changed during decode"));
+        let error = Error::Refused("input changed during decode");
+        note_refusal(&error, stage, source);
+        return Err(error);
     }
     result
 }
@@ -838,7 +877,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         if self
             .held_bytes
             .checked_add(bytes)
-            .map_or(true, |total| total > HOLD_BYTES_MAX.min(self.input_len / 8))
+            .map_or(true, |total| total > hold_bytes_limit(self.input_len))
         {
             return Err(Error::HoldBudget);
         }
@@ -1348,7 +1387,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "quarantined_snapshot_fingerprints" => {
                             index.quarantined_snapshot_fingerprints = self.quarantines(value)?
                         }
-                        _ => unreachable!(),
+                        _ => return Err(Error::Refused("unhandled index field")),
                     }
                 }
             }
@@ -1492,7 +1531,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
                         }
-                        _ => unreachable!(),
+                        _ => return Err(Error::Refused("unhandled index field")),
                     }
                     self.hold(field, key, key_span, value)?;
                 }
@@ -1737,10 +1776,18 @@ pub(super) fn read_bounded(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     // Preserve the caller byte bound and the existing census normalization and
     // node/depth admission before constructing native state. Original syntax is
     // checked before the optional census normalizer can replace damaged input.
-    validate_original(&mut std::io::Cursor::new(bytes))?;
+    validate_original(&mut std::io::Cursor::new(bytes)).inspect_err(|error| {
+        note_refusal(error, "cas", "unattributed");
+    })?;
     let (normalized, duplicate_census, duplicate_shadow) =
         claude_request_census::normalized_bounded_bytes(bytes)?;
-    bounded_shape(&normalized)?;
+    bounded_shape(&normalized).inspect_err(|_| {
+        note_refusal(
+            &Error::Refused("nesting resource cap"),
+            "cas",
+            "unattributed",
+        );
+    })?;
     let mut index = read(std::io::Cursor::new(normalized), "cas", "unattributed")?;
     if duplicate_census {
         index.claude_request_census = ClaudeRequestCensus::default();
@@ -1942,7 +1989,7 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
         .sum::<u64>();
     let mut output = Count(0);
     serde_json::to_writer_pretty(&mut output, index)?;
-    if held > HOLD_BYTES_MAX.min(output.0 / 8) {
+    if held > hold_bytes_limit(output.0) {
         emit_scan_index_containment_line(
             "local snapshot scan index save: source=unattributed lenient_hold_budget_exceeded=1"
                 .into(),
