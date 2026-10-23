@@ -1442,114 +1442,38 @@ fn shadow_page_with_coverage(
     let mut written = 0;
     let mut incomplete = 0;
     for root in order {
+        // Check time before any content walk; remaining roots still flow
+        // through the pre-admitted failure publication and memo bookkeeping.
+        let expired = preflight_check(deadline).is_err();
         let items = &by_root[root];
         let mut family_captures = BTreeMap::new();
-        for item in items {
+        for item in items.iter().take(if expired { 0 } else { items.len() }) {
+            if Instant::now() >= deadline {
+                break;
+            }
             let key = (root.to_owned(), item.source_session_id.clone());
             if let Some(capture) = captures.remove(&key) {
                 family_captures.insert(key, capture);
             }
         }
-        let units = items
-            .iter()
-            .map(|item| item.claude_usage_occurrences.len())
-            .sum::<usize>()
-            .saturating_add(
-                family_captures
-                    .values()
-                    .map(|capture| capture.units().len())
-                    .sum::<usize>(),
-            );
-        let bucket_rows = items
-            .iter()
-            .flat_map(|item| &item.usage_buckets)
-            .map(|bucket| bucket.model_usage.len())
-            .sum::<usize>();
-        let live_rows = api_report.evidence.get(root).map_or_else(
-            || {
-                ledger
-                    .get(&telemetry_key(root))
-                    .map_or(0, |record| record.request_hashes().len())
-            },
-            Vec::len,
-        );
-        let trace_rows = trace_report.evidence.get(root).map_or(0, Vec::len);
-        let string_bytes = items
-            .iter()
-            .map(|item| {
-                item.claude_usage_occurrences
-                    .iter()
-                    .map(|(key, occurrence)| {
-                        key.len()
-                            + occurrence.model.as_ref().map_or(0, String::len)
-                            + occurrence.timestamp.as_ref().map_or(0, String::len)
-                    })
-                    .sum::<usize>()
-                    + item
-                        .usage_buckets
-                        .iter()
-                        .map(|bucket| {
-                            bucket
-                                .model_usage
-                                .iter()
-                                .map(|row| {
-                                    bucket.bucket_start.len()
-                                        + row.model.len()
-                                        + [
-                                            &row.auth_mode,
-                                            &row.billing_channel,
-                                            &row.billing_provider,
-                                            &row.gateway_provider,
-                                            &row.model_provider,
-                                            &row.subscription_product,
-                                        ]
-                                        .iter()
-                                        .map(|field| field.as_ref().map_or(0, String::len))
-                                        .sum::<usize>()
-                                        + row
-                                            .selector_context
-                                            .iter()
-                                            .map(|(key, value)| key.len() + value.len())
-                                            .sum::<usize>()
-                                })
-                                .sum::<usize>()
-                        })
-                        .sum::<usize>()
-            })
-            .sum::<usize>();
-        let evidence_bytes = api_report
-            .evidence
-            .get(root)
-            .map_or(0, |rows| {
-                rows.iter()
-                    .map(|row| {
-                        row.request_id.len() + row.model.len() + row.speed.len() + row.effort.len()
-                    })
-                    .sum::<usize>()
-            })
-            .saturating_add(trace_report.evidence.get(root).map_or(0, |rows| {
-                rows.iter()
-                    .map(|row| row.request_id.len() + row.agent_id.len())
-                    .sum::<usize>()
-            }));
-        let scratch = string_bytes
-            .saturating_add(evidence_bytes)
-            .saturating_mul(16)
-            .saturating_add(units.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES))
-            .saturating_add(row_charge(live_rows))
-            .saturating_add(bucket_rows.saturating_mul(LIVE_ROW_BYTES))
-            .saturating_add(trace_rows.saturating_mul(TRACE_ROW_BYTES));
+        let scratch = if expired {
+            Err("deadline")
+        } else {
+            family_preflight(
+                root,
+                items,
+                &family_captures,
+                ledger,
+                api_report,
+                trace_report,
+                deadline,
+            )
+        };
         let state = coverage_view.family(root);
         let mut basis = None;
         let mut rows;
         let mut owned_reservation = None;
-        let slice = if Instant::now() >= deadline {
-            Err("deadline")
-        } else if scratch > SHADOW_MEMORY_CEILING_BYTES {
-            Err("oversize")
-        } else {
-            ShadowReservation::admit(scratch).ok_or("memory")
-        };
+        let slice = scratch.and_then(|scratch| ShadowReservation::admit(scratch).ok_or("memory"));
         match slice {
             Ok(reservation) => {
                 let mut budget = ShadowBudget::new(reservation);
@@ -1613,9 +1537,11 @@ fn shadow_page_with_coverage(
                 rows = failure_rows(root, reason, state, now, snapshot, ledger, &mut counts);
             }
         }
-        if !rows.row.old_available {
+        if !rows.row.old_available && !rows.row.p1_reasons.contains(&"deadline") {
             if let Some(members) = indexed_members.get(root) {
-                rows.row.revision = hex_revision(&union_revision(members));
+                if let Some(revision) = union_revision_by(members, deadline) {
+                    rows.row.revision = hex_revision(&revision);
+                }
                 rows.row.members_total = members.len().max(items.len());
                 rows.row.absent_old_unknown = members.len().saturating_sub(items.len()) as u64;
             }
@@ -1698,6 +1624,138 @@ fn shadow_page_with_coverage(
     );
     emit(&end, Some(ledger), index, &mut counts);
     counts
+}
+
+/// Preflight charges borrowed input without copying it. Every nested walk
+/// checks the same absolute deadline before touching the next item. Once
+/// oversized, no remaining content is visited.
+#[allow(clippy::too_many_arguments)]
+fn family_preflight(
+    root: &str,
+    items: &[&SnapshotItem],
+    captures: &BTreeMap<(String, String), ClaudeResponseCapture>,
+    ledger: &ClaudeLedger,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    deadline: Instant,
+) -> Result<usize, &'static str> {
+    let mut bytes = 0_usize;
+    let mut charge = |more: usize| {
+        preflight_check(deadline)?;
+        bytes = bytes.saturating_add(more);
+        if bytes > SHADOW_MEMORY_CEILING_BYTES {
+            Err("oversize")
+        } else {
+            Ok(())
+        }
+    };
+    charge(0)?;
+    for item in items {
+        charge(
+            item.claude_usage_occurrences
+                .len()
+                .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES),
+        )?;
+        for (key, occurrence) in &item.claude_usage_occurrences {
+            charge(
+                key.len()
+                    .saturating_add(occurrence.model.as_ref().map_or(0, String::len))
+                    .saturating_add(occurrence.timestamp.as_ref().map_or(0, String::len))
+                    .saturating_mul(16),
+            )?;
+        }
+        for bucket in &item.usage_buckets {
+            charge(bucket.model_usage.len().saturating_mul(LIVE_ROW_BYTES))?;
+            for row in &bucket.model_usage {
+                let fields = [
+                    &row.auth_mode,
+                    &row.billing_channel,
+                    &row.billing_provider,
+                    &row.gateway_provider,
+                    &row.model_provider,
+                    &row.subscription_product,
+                ];
+                charge(
+                    bucket
+                        .bucket_start
+                        .len()
+                        .saturating_add(row.model.len())
+                        .saturating_add(
+                            fields
+                                .iter()
+                                .map(|field| field.as_ref().map_or(0, String::len))
+                                .sum::<usize>(),
+                        )
+                        .saturating_mul(16),
+                )?;
+                for (key, value) in &row.selector_context {
+                    charge(key.len().saturating_add(value.len()).saturating_mul(16))?;
+                }
+            }
+        }
+    }
+    for capture in captures.values() {
+        charge(
+            capture
+                .units()
+                .len()
+                .saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES),
+        )?;
+    }
+    if let Some(rows) = api.evidence.get(root) {
+        charge(row_charge(rows.len()))?;
+        for row in rows {
+            charge(
+                (row.request_id.len() + row.model.len() + row.speed.len() + row.effort.len())
+                    .saturating_mul(16),
+            )?;
+        }
+    } else {
+        charge(row_charge(
+            ledger
+                .get(&telemetry_key(root))
+                .map_or(0, |record| record.request_hashes().len()),
+        ))?;
+    }
+    if let Some(rows) = trace.evidence.get(root) {
+        charge(rows.len().saturating_mul(TRACE_ROW_BYTES))?;
+        for row in rows {
+            charge(
+                row.request_id
+                    .len()
+                    .saturating_add(row.agent_id.len())
+                    .saturating_mul(16),
+            )?;
+        }
+    }
+    Ok(bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    static PREFLIGHT_CHECKS: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn preflight_checks_for_test(checks: Option<usize>) {
+    PREFLIGHT_CHECKS.with(|current| current.set(checks));
+}
+fn preflight_check(deadline: Instant) -> Result<(), &'static str> {
+    #[cfg(test)]
+    if PREFLIGHT_CHECKS.with(|checks| match checks.get() {
+        Some(0) => true,
+        Some(left) => {
+            checks.set(Some(left - 1));
+            false
+        }
+        None => false,
+    }) {
+        return Err("deadline");
+    }
+    if Instant::now() >= deadline {
+        Err("deadline")
+    } else {
+        Ok(())
+    }
 }
 
 /// One family's scratch is admitted independently; the page scope is borrowed.
@@ -1808,7 +1866,7 @@ fn build_slice(
     for item in &items {
         for request_id in item.claude_usage_occurrences.keys() {
             checked += 1;
-            if checked.is_multiple_of(1024) && Instant::now() >= deadline {
+            if checked % 1024 == 0 && Instant::now() >= deadline {
                 return Err("deadline");
             }
             let hash = claude_request_hash(request_id);
@@ -1955,7 +2013,7 @@ fn build_slice(
         if retired_roots.contains(root) {
             counts.possible_retired_copies += body.units.requests;
         }
-        let union = union_revision(members);
+        let union = union_revision_by(members, deadline).ok_or("deadline")?;
         Ok((body, union, absent_old, absent_old_unknown))
     }
 }
@@ -2545,14 +2603,17 @@ fn grain_row<'a>(
 
 /// The union revision a removal delta is bound to: the family's indexed
 /// member set.
-fn union_revision(members: &BTreeSet<String>) -> [u8; 32] {
+fn union_revision_by(members: &BTreeSet<String>, deadline: Instant) -> Option<[u8; 32]> {
     let mut digest = Sha256::new();
     digest.update(b"claude_request_money_union:v1\0");
     for member in members {
+        if Instant::now() >= deadline {
+            return None;
+        }
         digest.update((member.len() as u64).to_be_bytes());
         digest.update(member.as_bytes());
     }
-    digest.finalize().into()
+    Some(digest.finalize().into())
 }
 
 /// Drop family memos no page rebuilt within the retention window.
@@ -3117,7 +3178,7 @@ mod bounded_tests {
 
     #[test]
     fn semantic_digest_ignores_publication_and_delta_but_includes_failure_reasons() {
-        let ledger = ClaudeLedger::empty(false);
+        let ledger = ClaudeLedger::new_for_test();
         let mut counts = ClaudeRequestMoneyShadowCounts::default();
         let mut rows = failure_rows(
             "root",
@@ -3184,5 +3245,122 @@ mod seal_tests {
         assert_eq!(std::fs::read(scratch.join(RUN_MARKER)).unwrap(), before);
         std::fs::remove_dir(staged).unwrap();
         assert!(note_unclean_run(&scratch, now + 86_400));
+    }
+}
+
+#[cfg(test)]
+mod round3_tests {
+    use super::*;
+    #[test]
+    fn expired_and_mid_preflight_abort_before_walking_remaining_content() {
+        let ledger = ClaudeLedger::new_for_test();
+        let api = ClaudeLocalOtelLoadReport::default();
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let captures = (0..100)
+            .map(|at| {
+                (
+                    ("root".into(), at.to_string()),
+                    ClaudeResponseCapture::default(),
+                )
+            })
+            .collect();
+        PREFLIGHT_CHECKS.with(|checks| checks.set(Some(100)));
+        assert_eq!(
+            family_preflight(
+                "root",
+                &[],
+                &captures,
+                &ledger,
+                &api,
+                &trace,
+                Instant::now()
+            ),
+            Err("deadline")
+        );
+        assert_eq!(PREFLIGHT_CHECKS.with(std::cell::Cell::get), Some(99));
+        PREFLIGHT_CHECKS.with(|checks| checks.set(Some(5)));
+        assert_eq!(
+            family_preflight(
+                "root",
+                &[],
+                &captures,
+                &ledger,
+                &api,
+                &trace,
+                Instant::now() + Duration::from_secs(30)
+            ),
+            Err("deadline")
+        );
+        assert_eq!(PREFLIGHT_CHECKS.with(std::cell::Cell::get), Some(0));
+        PREFLIGHT_CHECKS.with(|checks| checks.set(None));
+    }
+
+    #[test]
+    fn complete_test_seam_preserves_previous_complete_removal_basis_across_failure() {
+        use coverage::{CoveredForTest, FamilyCoverage};
+        let mut ledger = ClaudeLedger::new_for_test();
+        let mut counts = ClaudeRequestMoneyShadowCounts::default();
+        let body = || ClaudeRequestBody {
+            certificate_ok: true,
+            rows_complete: true,
+            members_built: 1,
+            members_total: 1,
+            removed: ClaudeMoneyTotals {
+                requests: 2,
+                tokens: 20,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let (first, basis) = family_rows(
+            "root",
+            body(),
+            [1; 32],
+            Default::default(),
+            0,
+            CoveredForTest.family("root"),
+            10,
+            100,
+            &ledger,
+            &mut counts,
+        );
+        assert!(first.row.coverage_complete);
+        assert_eq!(
+            first.row.removed_change_unavailable,
+            Some("no_previous_body")
+        );
+        let (revision, memo) = basis.unwrap();
+        ledger.insert(
+            family_key("root"),
+            ClaudeRequestCensusRecord::family_record(revision, 10, memo),
+        );
+        let failed = failure_rows(
+            "root",
+            "deadline",
+            FamilyCensus::Covered,
+            11,
+            101,
+            &ledger,
+            &mut counts,
+        );
+        assert!(!failed.row.coverage_complete);
+        assert!(failed.row.removed_change.is_none());
+        let (next, _) = family_rows(
+            "root",
+            body(),
+            [1; 32],
+            Default::default(),
+            0,
+            CoveredForTest.family("root"),
+            12,
+            102,
+            &ledger,
+            &mut counts,
+        );
+        assert!(next.row.coverage_complete);
+        assert_eq!(next.row.removed_change_basis_snapshot, Some(100));
+        assert_eq!(next.row.removed_change_basis, Some("previous_shadow"));
+        let change = next.row.removed_change.unwrap();
+        assert_eq!((change.requests, change.tokens), (0, 0));
     }
 }

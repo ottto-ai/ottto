@@ -54,6 +54,7 @@ struct Work {
     input: usize,
     comparisons: usize,
     micros: u64,
+    exhausted: bool,
 }
 const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const PAGE_COMPARISONS: usize = 1_048_576;
@@ -69,11 +70,19 @@ pub(crate) fn begin_page(scope: &Path) {
 fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
     WORK.lock().is_ok_and(|mut pages| {
         let work = pages.entry(scope.to_path_buf()).or_default();
-        work.input = work.input.saturating_add(bytes);
-        work.comparisons = work.comparisons.saturating_add(comparisons);
-        work.input <= PAGE_INPUT_BYTES
-            && work.comparisons <= PAGE_COMPARISONS
-            && work.micros < PAGE_CAPTURE_US
+        let input = work.input.saturating_add(bytes);
+        let comparisons = work.comparisons.saturating_add(comparisons);
+        if work.exhausted
+            || input > PAGE_INPUT_BYTES
+            || comparisons > PAGE_COMPARISONS
+            || work.micros >= PAGE_CAPTURE_US
+        {
+            work.exhausted = true;
+            return false;
+        }
+        work.input = input;
+        work.comparisons = comparisons;
+        true
     })
 }
 
@@ -606,6 +615,14 @@ pub(crate) fn take_capture_us() -> u64 {
     CAPTURE_MICROS.swap(0, Ordering::Relaxed)
 }
 
+/// Accepted cumulative work, including work whose resident capture was dropped.
+#[cfg(test)]
+pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {
+    let pages = WORK.lock().unwrap();
+    let work = pages.get(scope).expect("page capture budget installed");
+    (work.input, work.comparisons, work.micros)
+}
+
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
@@ -628,7 +645,9 @@ mod bounded_tests {
         }
         assert!(accepted > 0 && accepted <= PAGE_INPUT_BYTES / (64 * 256));
         let work = WORK.lock().unwrap();
-        assert!(work[&scope].input >= PAGE_INPUT_BYTES);
+        assert!(work[&scope].exhausted);
+        assert!(work[&scope].input <= PAGE_INPUT_BYTES);
+        assert!(work[&scope].comparisons <= PAGE_COMPARISONS);
         println!("MONEY_P1B_CAPTURE admitted_files={accepted} attempted_files=4096 input_cap={PAGE_INPUT_BYTES} comparisons_cap={PAGE_COMPARISONS} time_cap_us={PAGE_CAPTURE_US}");
     }
 

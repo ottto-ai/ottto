@@ -849,17 +849,10 @@ fn money_shadow_removed_change_is_bound_to_the_previous_body() {
         .filter(|row| row["family"] == copy_family.as_str())
         .collect::<Vec<_>>();
     assert!(!rows.is_empty());
-    let first = rows[0];
-    if first["coverage_complete"] == true {
-        assert!(first["removed_change"].is_null(), "{first}");
-        assert_eq!(first["removed_change_unavailable"], "no_previous_body");
-    }
-    for row in rows.iter().skip(1) {
-        if row["coverage_complete"] == true && !row["removed_change"].is_null() {
-            assert_eq!(row["removed_change_basis"], "previous_shadow", "{row}");
-            assert_eq!(row["removed_change"]["requests"], 0, "{row}");
-            assert_eq!(row["removed_change"]["tokens"], 0, "{row}");
-        }
+    for row in &rows {
+        assert_eq!(row["coverage_complete"], false, "interim seam: {row}");
+        assert!(row["removed_change"].is_null(), "{row}");
+        assert_eq!(row["removed_change_unavailable"], "body_incomplete");
     }
     assert!(money_count(&on.lines, "removed_change_available")
         + money_count(&on.lines, "removed_change_unavailable")
@@ -1337,7 +1330,7 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
     let (fixture, index, mut scan) = money_armed_scan("money-p1b-70k");
     let large = &mut scan.snapshots[0];
-    let root = crate::snapshots::claude_snapshot_family_root_ref(large).to_owned();
+    let root = large.source_session_id.as_str().to_owned();
     let occurrence = large.claude_usage_occurrences.values().next().unwrap().clone();
     large.claude_usage_occurrences = (0..70_000).map(|at| (format!("req-large-{at}"), occurrence.clone())).collect();
     let page = |items: &[crate::snapshots::SnapshotItem], now| {
@@ -1358,6 +1351,9 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     let page_row = rows.iter().find(|row| row["row"] == "page").unwrap();
     assert_eq!(page_row["page_families"].as_u64().unwrap(), page_row["written"].as_u64().unwrap() + page_row["failed"].as_u64().unwrap() + page_row["unchanged"].as_u64().unwrap());
     assert!(first.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
+    // Cooperative deadline: allow 100 ms for bounded failure publication.
+    assert!(first.elapsed_us <= 2_100_000, "{first:?}");
+    assert!(first.capture_us <= 300_000, "{first:?}");
     // Simulate a crash between slices: durable intent survives lost memory.
     money::store::restart_for_test(&fixture.support);
     money::forget_owed_coverage_for_test(&fixture.support);
@@ -1401,7 +1397,12 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let rows = money_jsonl_rows(&fixture.support);
     assert!(rows.iter().any(|row| row["row"] == "page"));
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} capture_us={}", armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, counts.capture_us);
+    let (input, comparisons, capture_us) = money::capture::work_for_test(&fixture.support);
+    assert!(counts.elapsed_us <= 2_100_000, "{counts:?}");
+    assert!(capture_us <= 300_000, "capture callback overshoot: {capture_us}");
+    assert!(input <= 8 * 1024 * 1024, "{input}");
+    assert!(comparisons <= 1_048_576, "{comparisons}");
+    println!("MONEY_P1B_FULL reads={} peak_transient={} wall_us={} capture_us={} capture_input={} capture_comparisons={}", armed.snapshots.len(), counts.admitted_peak_bytes, counts.elapsed_us, capture_us, input, comparisons);
 }
 
 #[test]
@@ -1435,4 +1436,47 @@ fn money_p1b_write_sync_save_and_ack_faults_never_create_false_progress() {
         }
         assert_eq!(money::reserved_for_test(), 0);
     }
+}
+
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_64k_capture_input_refusal_preserves_live_output() {
+    let fixture = PipelineFixture::new("money-long-capture-refusal");
+    const SESSION: &str = "10000000-1234-4567-890a-123456789abc";
+    let model = format!("claude-haiku-4-5-{}", "x".repeat(64 * 1024));
+    std::fs::write(fixture.root.join(format!("{SESSION}.jsonl")), pipeline_transcript_line(SESSION, "req-long", 7).replace("claude-haiku-4-5", &model)).unwrap();
+    let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index, "2026-08-02T08:00:00Z", 183, 16, true).unwrap();
+    let mut baseline_index = ScanIndex::default();
+    let baseline = scan(&mut baseline_index);
+    money::enable_shadow_for_test(&fixture.support);
+    let mut armed_index = ScanIndex::default();
+    let armed = scan(&mut armed_index);
+    assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
+    assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
+    money::shadow_page_at(&fixture.support, &armed.snapshots, &armed_index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), armed.census_complete,
+        census_pipeline_window("2026-08-02T08:00:00Z"));
+    money::store::flush();
+    assert!(money_jsonl_rows(&fixture.support).iter().any(|row| row["family"] == money::hashed_id_for_test(SESSION) && row["p1_reasons"].as_array().is_some_and(|reasons| reasons.iter().any(|reason| reason == "unbuilt"))));
+}
+
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_mid_preflight_uses_pre_admitted_failure_rows() {
+    let (fixture, index, scan) = money_armed_scan("money-preflight-expiry");
+    money::preflight_checks_for_test(Some(5));
+    let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete,
+        census_pipeline_window("2026-08-02T08:00:00Z"));
+    money::preflight_checks_for_test(None);
+    money::store::flush();
+    let rows = money_jsonl_rows(&fixture.support);
+    let families = rows.iter().filter(|row| row["row"] == "family").collect::<Vec<_>>();
+    assert_eq!(families.len() as u64, counts.families);
+    assert!(!families.is_empty());
+    assert!(families.iter().all(|row| row["p1_reasons"] == serde_json::json!(["deadline"])));
+    assert_eq!(money::reserved_for_test(), 0);
 }

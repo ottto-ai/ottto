@@ -89,6 +89,8 @@ pub(crate) const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
 pub(crate) const SAVE_DAILY_BYTES: usize = 64 * 1024 * 1024;
 /// The day's attempted save bytes, beside the shards.
 const SAVE_BUDGET_FILE: &str = "save-budget.json";
+/// Physical attempted shard writes, charged on the writer's UTC clock.
+const WRITE_BUDGET_FILE: &str = "write-budget.json";
 /// The load waits this long, in steps, for each shard's admission; then it
 /// gives up (nothing is lost: the next page asks for the load again).
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
@@ -562,10 +564,12 @@ static CREDITS: Mutex<BTreeMap<PathBuf, Credit>> = Mutex::new(BTreeMap::new());
 fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
     let dir = support_dir.join(LEDGER_DIR);
     let (saved_day, saved_bytes) = load_budget(&dir);
+    let (write_day, _) = load_counter(&dir, WRITE_BUDGET_FILE);
+    let max_day = saved_day.max(write_day);
     let used = if day > saved_day { 0 } else { saved_bytes };
     let amount = SAVE_BYTES_PER_PAGE.min(SAVE_DAILY_BYTES.saturating_sub(used as usize));
     let total = used.saturating_add(amount as u64);
-    let granted = day >= saved_day
+    let granted = day >= max_day
         && amount > 0
         && std::fs::create_dir_all(&dir).is_ok()
         && write_atomic(
@@ -573,7 +577,7 @@ fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
             format!("{{\"day\":{day},\"bytes\":{total}}}").as_bytes(),
         );
     Credit {
-        day: saved_day.max(day),
+        day: max_day.max(day),
         reserved: if granted {
             total
         } else {
@@ -817,8 +821,8 @@ fn run_writer(receiver: Receiver<Job>) {
             Err(TryRecvError::Disconnected) => break,
         };
         match job {
-            Job::Reserve(dir, day) => {
-                let credit = reserve_credit(&dir, day);
+            Job::Reserve(dir, _observed_day) => {
+                let credit = reserve_credit(&dir, super::utc_day(writer_unix()));
                 if let Ok(mut credits) = CREDITS.lock() {
                     credits.insert(dir, credit);
                 }
@@ -970,7 +974,7 @@ fn write_save(
     let mut meta_unwritten = None;
     let mut blocked = std::fs::create_dir_all(dir).is_err();
     if let Some(meta) = &save.meta_first {
-        if blocked || !write_atomic(&shard_path(dir, META), meta) {
+        if blocked || !write_shard(dir, META, meta) {
             blocked = true;
             meta_unwritten = Some(save.meta_debt);
             state.debt_unwritten |= save.meta_debt;
@@ -981,7 +985,7 @@ fn write_save(
     // An earlier batch's debt is not on disk yet: nothing goes before it.
     blocked |= state.debt_unwritten;
     for (shard, bytes) in &save.shards {
-        if !blocked && write_atomic(&shard_path(dir, *shard), bytes) {
+        if !blocked && write_shard(dir, *shard, bytes) {
             state.failed.remove(shard);
         } else {
             state.failed.insert(*shard);
@@ -989,12 +993,51 @@ fn write_save(
         }
     }
     if let Some(meta) = &save.meta_last {
-        if blocked || !state.failed.is_empty() || !write_atomic(&shard_path(dir, META), meta) {
+        if blocked || !state.failed.is_empty() || !write_shard(dir, META, meta) {
             // A zero meta that failed before keeps its debt flag.
             meta_unwritten.get_or_insert(false);
         }
     }
     (unwritten, meta_unwritten)
+}
+
+/// A write-day counter is separate from ticket reservations. Every physical
+/// attempt (including both metas and failed retries) is charged before IO.
+/// A delayed save uses the day of each shard's actual attempt. A clock behind
+/// either persisted high-water day blocks writes and cannot create new credit.
+fn write_shard(dir: &Path, shard: usize, bytes: &[u8]) -> bool {
+    let day = super::utc_day(writer_unix());
+    let (ticket_day, _) = load_budget(dir);
+    let (write_day, written) = load_counter(dir, WRITE_BUDGET_FILE);
+    if day < ticket_day.max(write_day) {
+        return false;
+    }
+    let used = if day > write_day { 0 } else { written };
+    let Some(total) = used
+        .checked_add(bytes.len() as u64)
+        .filter(|total| *total <= SAVE_DAILY_BYTES as u64)
+    else {
+        return false;
+    };
+    if !write_atomic(
+        &dir.join(WRITE_BUDGET_FILE),
+        format!("{{\"day\":{day},\"bytes\":{total}}}").as_bytes(),
+    ) {
+        return false;
+    }
+    write_atomic(&shard_path(dir, shard), bytes)
+}
+
+fn writer_unix() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = WRITE_CLOCK.with(|clock| clock.borrow_mut().pop_front()) {
+        return now;
+    }
+    super::now_unix()
+}
+#[cfg(test)]
+thread_local! {
+    static WRITE_CLOCK: std::cell::RefCell<std::collections::VecDeque<u64>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// Loads given up because their admission never came (process memory).
@@ -1096,15 +1139,28 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
 
 /// The day's attempted save bytes a save persisted (none: (0, 0)).
 fn load_budget(dir: &Path) -> (u64, u64) {
+    load_counter(dir, SAVE_BUDGET_FILE)
+}
+
+/// Missing counters on an established store fail closed for the current day,
+/// preserving valid sibling ledger data. Only an actually fresh store starts
+/// at zero. A malformed counter never participates in ledger/index decoding.
+fn load_counter(dir: &Path, name: &str) -> (u64, u64) {
     #[derive(serde::Deserialize)]
     struct Budget {
         day: u64,
         bytes: u64,
     }
-    let path = dir.join(SAVE_BUDGET_FILE);
+    let path = dir.join(name);
     let exhausted = (super::utc_day(super::now_unix()), SAVE_DAILY_BYTES as u64);
     match std::fs::metadata(&path) {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (0, 0),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if (0..SHARDS).any(|shard| shard_path(dir, shard).exists()) {
+                exhausted
+            } else {
+                (0, 0)
+            }
+        }
         Ok(meta) if meta.len() <= 256 => std::fs::read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Budget>(&bytes).ok())
@@ -1386,5 +1442,89 @@ mod bounded_save_tests {
         );
         println!("MONEY_P1B_IO reserved_bytes={charged} save_cap={SAVE_BYTES_PER_PAGE} daily_cap={SAVE_DAILY_BYTES} restart_refund=0");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn physical_writer_charges_midnight_delays_and_blocks_clock_rollback() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-write-day");
+        let dir = scratch.join(LEDGER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let today = super::super::utc_day(super::super::now_unix());
+        let set = |name: &str, day, bytes| {
+            assert!(write_atomic(
+                &dir.join(name),
+                format!("{{\"day\":{day},\"bytes\":{bytes}}}").as_bytes()
+            ))
+        };
+        set(SAVE_BUDGET_FILE, today - 1, SAVE_DAILY_BYTES);
+        set(WRITE_BUDGET_FILE, today - 1, SAVE_DAILY_BYTES - 2);
+        let save = ClaudeLedgerSave {
+            shards: vec![(0, b"{}".to_vec()), (1, b"{}".to_vec())],
+            ..Default::default()
+        };
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400 - 1, today * 86_400].into());
+        let mut state = WriterState::default();
+        let (failed, _) = write_save(&dir, &save, &mut state);
+        assert!(failed.is_empty());
+        assert_eq!(load_counter(&dir, WRITE_BUDGET_FILE), (today, 2));
+        // This queued prior-day save cannot spend today's physically used cap.
+        set(WRITE_BUDGET_FILE, today, SAVE_DAILY_BYTES - 2);
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400, today * 86_400].into());
+        let (failed, _) = write_save(&dir, &save, &mut WriterState::default());
+        assert_eq!(failed, vec![1]);
+        assert_eq!(
+            load_counter(&dir, WRITE_BUDGET_FILE),
+            (today, SAVE_DAILY_BYTES as u64)
+        );
+        // Drop all writer memory: both counters still prevent rollback credit.
+        assert_eq!(reserve_credit(&scratch, today - 1).bytes, 0);
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [today * 86_400 - 1].into());
+        assert!(!write_shard(&dir, 2, b"{}"));
+        assert!(!shard_path(&dir, 2).exists());
+        assert_eq!(
+            load_counter(&dir, WRITE_BUDGET_FILE),
+            (today, SAVE_DAILY_BYTES as u64)
+        );
+        assert!(WRITE_CLOCK.with(|clock| clock.borrow().is_empty()));
+        println!("MONEY_P1B_PHYSICAL daily_cap={SAVE_DAILY_BYTES} midnight_day_bytes=2 exhausted_bytes={} rollback_grant=0", load_counter(&dir, WRITE_BUDGET_FILE).1);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn broken_or_missing_accounting_preserves_loaded_siblings_and_grants_nothing() {
+        for missing in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-quota-load");
+            let mut ledger = ClaudeLedger::new_for_test();
+            let key = "fam:valid-sibling";
+            let record = ClaudeRequestCensusRecord::family_record(
+                [1; 32],
+                super::super::now_unix(),
+                Default::default(),
+            );
+            ledger.insert(key.to_owned(), record.clone());
+            assert_eq!(
+                save_page_for_test(&scratch, &mut ledger, &mut WriterState::default())
+                    .unwrap()
+                    .2,
+                0
+            );
+            let path = scratch.join(LEDGER_DIR).join(SAVE_BUDGET_FILE);
+            if missing {
+                std::fs::remove_file(path).unwrap();
+            } else {
+                std::fs::write(path, b"broken").unwrap();
+            }
+            let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
+            assert_eq!(loaded.get(key), Some(&record));
+            assert!(!loaded.load_damaged);
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
+            // Exercise the actual async writer request, not just the parser.
+            assert!(submit(Job::Reserve(scratch.to_path_buf(), loaded.save_day)).is_ok());
+            flush();
+            take_results(&scratch, &mut loaded);
+            assert_eq!(loaded.save_credit, 0);
+            assert_eq!(loaded.get(key), Some(&record));
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
+        }
     }
 }
