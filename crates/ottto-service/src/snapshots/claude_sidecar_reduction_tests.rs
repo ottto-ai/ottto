@@ -303,10 +303,17 @@ fn assert_oracle(fixture: &Fixture, cached: &Run, prior: ScanIndex) {
         serde_json::to_value(&cached.index.claude_usage_family_witnesses).unwrap(),
         serde_json::to_value(&full.index.claude_usage_family_witnesses).unwrap()
     );
-    assert_eq!(
-        serde_json::to_value(&cached.index.claude_usage_authority_quarantine).unwrap(),
-        serde_json::to_value(&full.index.claude_usage_authority_quarantine).unwrap()
-    );
+    let quarantine = |index: &ScanIndex| {
+        let mut records = index.claude_usage_authority_quarantine.clone();
+        for record in records.values_mut() {
+            assert!(claude_usage_authority_deadline_is_bounded(record));
+            // Independent scans can create retry deadlines on opposite sides
+            // of a wall-clock second. Compare every other field exactly.
+            record.retry_after_unix_seconds = 0;
+        }
+        serde_json::to_value(records).unwrap()
+    };
+    assert_eq!(quarantine(&cached.index), quarantine(&full.index));
 }
 fn settle(mut run: Run) -> ScanIndex {
     finalize_scan_after_policy_with_body_witness(
@@ -568,6 +575,7 @@ fn restart_and_copy_budget_refusal_keep_full_fallback() {
             Arc::new(SharedCache {
                 inner: Mutex::new(TranscriptCache::with_byte_limit(0)),
                 cursor: Default::default(),
+                side: Default::default(),
             })
         } else {
             cache.clear();

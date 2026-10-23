@@ -1563,8 +1563,6 @@ pub(crate) enum StartVerdict {
 /// client version only). Measured when the item carries any start value the
 /// server stores besides the client version and the config fingerprint; the
 /// server calls the same start "measured". Reads only the item: no file IO.
-// The composition reader is the first caller; it is wired separately.
-#[allow(dead_code)]
 pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
     let Some(start) = item.session_start.as_deref() else {
         return StartVerdict::NotMeasured;

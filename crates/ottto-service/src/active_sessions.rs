@@ -15,14 +15,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ottto_protocol::{
-    ActiveSession, ActiveSessionReconciliation, AgentLoginState, AgentStatusConfidence,
-    AgentStatusPlanObservation, AgentStatusSnapshot,
+    ActiveSession, ActiveSessionCompaction, ActiveSessionContextPoint, ActiveSessionReconciliation,
+    AgentLoginState, AgentStatusConfidence, AgentStatusPlanObservation, AgentStatusSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{
-    bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
+    bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
+    SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
     SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
@@ -387,6 +388,10 @@ fn active_session_from_snapshot(
         peak_context_fill_tokens: snapshot.peak_context_fill_tokens,
         compaction_count: snapshot.compaction_count,
         compaction_timestamps,
+        compaction_events: active_session_compactions(&snapshot.compaction_events),
+        first_turn_context_tokens: snapshot.first_turn_context_tokens,
+        last_turn_context_tokens: snapshot.last_turn_context_tokens,
+        context_points: active_session_context_points(&snapshot.local_context_points),
         input_tokens: Some(snapshot.input_tokens),
         cache_read_tokens: Some(snapshot.cache_read_tokens),
         cache_creation_5m_tokens: Some(snapshot.cache_creation_5m_tokens),
@@ -415,6 +420,32 @@ fn active_session_from_snapshot(
         latest_model,
         latest_reasoning_effort,
     }
+}
+
+/// The uploaded compaction list, bounded the same way as the timestamps the
+/// row carries, with the app's key names.
+fn active_session_compactions(events: &[SnapshotCompactionEvent]) -> Vec<ActiveSessionCompaction> {
+    bounded_compaction_events(events.to_vec())
+        .into_iter()
+        .map(|event| ActiveSessionCompaction {
+            at: event.at,
+            before_tokens: event.before,
+            after_tokens: event.after,
+            trigger: event.trigger,
+        })
+        .collect()
+}
+
+fn active_session_context_points(points: &[LocalContextPoint]) -> Vec<ActiveSessionContextPoint> {
+    points
+        .iter()
+        .map(|point| {
+            (
+                i64::from(point.at_unix_seconds),
+                u64::from(point.prompt_tokens),
+            )
+        })
+        .collect()
 }
 
 /// The model + effort tier this session was most recently seen running.
@@ -961,7 +992,8 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
     };
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create active session cache dir {}", parent.display()))?;
-    let payload = serde_json::to_vec_pretty(cache).context("serialize active session cache")?;
+    // Compact: the status path reads this whole file on every poll.
+    let payload = serde_json::to_vec(cache).context("serialize active session cache")?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = File::create(&temp_path)
         .with_context(|| format!("create active session cache temp {}", temp_path.display()))?;
@@ -1459,7 +1491,24 @@ mod tests {
     #[test]
     fn requires_advanced_recent_activity_and_preserves_compaction_times() {
         let dir = temp_dir("advanced");
-        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        let mut snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        snapshot.last_turn_context_tokens = Some(59_000);
+        snapshot.compaction_events = vec![crate::snapshots::SnapshotCompactionEvent {
+            at: "2026-07-19T09:59:00Z".to_string(),
+            before: Some(100),
+            after: Some(59_000),
+            trigger: None,
+        }];
+        snapshot.local_context_points = vec![
+            LocalContextPoint {
+                at_unix_seconds: 1_784_454_600, // 2026-07-19T09:50:00Z
+                prompt_tokens: 90,
+            },
+            LocalContextPoint {
+                at_unix_seconds: 1_784_455_440, // 2026-07-19T10:04:00Z
+                prompt_tokens: 59_000,
+            },
+        ];
         let first = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
@@ -1474,6 +1523,37 @@ mod tests {
             first.sessions[0].compaction_timestamps,
             vec!["2026-07-19T09:59:00Z"]
         );
+        let session = &first.sessions[0];
+        assert_eq!(
+            session.compaction_events,
+            [ActiveSessionCompaction {
+                at: "2026-07-19T09:59:00Z".to_string(),
+                before_tokens: Some(100),
+                after_tokens: Some(59_000),
+                trigger: None,
+            }]
+        );
+        assert_eq!(session.first_turn_context_tokens, Some(90));
+        assert_eq!(session.last_turn_context_tokens, Some(59_000));
+        assert_eq!(
+            session.context_points,
+            [(1_784_454_600, 90), (1_784_455_440, 59_000),]
+        );
+        // The list file is compact JSON, and a quiet scan carries the row
+        // with its points and sizes unchanged.
+        let written = std::fs::read(active_session_cache_path(&dir, SnapshotSource::Codex))
+            .expect("read list file");
+        assert!(!written.contains(&b'\n'));
+        let quiet = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            test_policy(),
+            "2026-07-19T10:06:00Z",
+        )
+        .expect("quiet reconciliation");
+        assert_eq!(quiet.sessions, first.sessions);
 
         let unchanged = reconcile_active_sessions(
             &dir,
@@ -2756,6 +2836,9 @@ mod tests {
             first_turn_context_tokens: Some(90),
             compaction_count: Some(1),
             compaction_timestamps: vec!["2026-07-19T09:59:00Z".to_string()],
+            compaction_events: Vec::new(),
+            first_own_request_at: None,
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,

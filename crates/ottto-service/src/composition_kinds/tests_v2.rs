@@ -1718,6 +1718,52 @@ fn repository_hash_matches_the_workspace_identity_without_git() {
     let fake = scratch.join("fake");
     std::fs::create_dir_all(fake.join(".git")).unwrap();
     assert_eq!(repository_hash(&fake), None);
+    // Nor one with `HEAD` alone: git also needs `objects` and `refs`.
+    std::fs::write(fake.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    assert_eq!(repository_hash(&fake), None);
+    std::fs::create_dir_all(fake.join(".git/objects")).unwrap();
+    std::fs::create_dir_all(fake.join(".git/refs")).unwrap();
+    assert!(repository_hash(&fake).is_some());
+    // A pointer without the space after `gitdir:` is not one git reads.
+    let pointer = scratch.join("pointer");
+    std::fs::create_dir_all(&pointer).unwrap();
+    let main_git = main.join(".git");
+    std::fs::write(
+        pointer.join(".git"),
+        format!("gitdir:{}\n", main_git.display()),
+    )
+    .unwrap();
+    assert_eq!(repository_hash(&pointer), None);
+    std::fs::write(
+        pointer.join(".git"),
+        format!("gitdir: {}\n", main_git.display()),
+    )
+    .unwrap();
+    assert_eq!(repository_hash(&pointer), repository_hash(&main));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_fifo_in_place_of_a_git_pointer_never_blocks() {
+    let scratch = crate::test_scratch::ScratchDir::new("composition-git-fifo");
+    let root = scratch.join("checkout");
+    std::fs::create_dir_all(&root).unwrap();
+    let fifo = root.join(".git");
+    let status = std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap();
+    assert!(status.success());
+    // Opening a FIFO for reading blocks until a writer comes; the check
+    // for a regular file returns first.
+    let (done, wait) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = done.send(repository_hash(&root));
+    });
+    let hash = wait
+        .recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the lookup returned");
+    assert_eq!(hash, None);
 }
 
 #[test]

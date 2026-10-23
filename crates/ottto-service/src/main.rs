@@ -24,6 +24,8 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(hide = true)]
+    ContextCompositionWorker,
+    #[command(hide = true)]
     ClaudeAuthSupervisor {
         #[arg(long)]
         operation_id: String,
@@ -183,6 +185,9 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     match cli.command.unwrap_or(Command::Status { json: true }) {
+        Command::ContextCompositionWorker => {
+            ottto_service::context_composition::run_context_composition_worker()?;
+        }
         Command::ClaudeAuthSupervisor {
             operation_id,
             config_dir,

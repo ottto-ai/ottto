@@ -25,9 +25,9 @@ use crate::snapshots::{
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
     SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -82,6 +82,20 @@ const SNAPSHOT_BATCH_MAX_BYTES: usize = 2 * 1024 * 1024;
 const SNAPSHOT_ADAPTIVE_SPLIT_LIMIT: usize = 6;
 const SNAPSHOT_ADAPTIVE_ATTEMPT_LIMIT: usize = SNAPSHOT_BATCH_LIMIT + 4;
 const SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE: usize = SNAPSHOT_BATCH_LIMIT;
+// A short, explicitly transient batch failure is resent in place rather than
+// abandoning the page and marking the bounded sweep unsettled: a 429/503 whose
+// Retry-After is at most 5 s (cursor allocation and shared-lock timeouts send
+// 1 s) or a fast 500/502. The wait holds the sync lock, so each source page
+// gets at most two resends and 10 s of waiting, shared by its cache-head
+// bootstrap stages and its main upload. A failure that took 15 s or longer is
+// overload and is never resent; the identity deferral, recognized by its code,
+// keeps its backoff whatever its Retry-After.
+const SNAPSHOT_INPLACE_RETRY_LIMIT: usize = 2;
+const SNAPSHOT_INPLACE_RETRY_MAX_WAIT: Duration = Duration::from_secs(5);
+const SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET: Duration = Duration::from_secs(10);
+const SNAPSHOT_INPLACE_RETRY_FAST_FAILURE: Duration = Duration::from_secs(15);
+const SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT: Duration = Duration::from_secs(2);
+const SNAPSHOT_INPLACE_RETRY_MIN_WAIT: Duration = Duration::from_millis(250);
 // A pre-ledger checkpoint with ambiguous settlement is re-entered through the
 // existing entity-ACK upload machine. Arm at most one normal 50-entity page per
 // five-minute source cycle; the scan-index cursor and quarantine map resume the
@@ -98,13 +112,37 @@ pub(crate) fn status_test_scan_lock() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// Bootstrap only through existing ordinary authority followed by an exact
-/// CAS repeat. Both settlements share the normal atomic ACK progress seam.
+/// Bootstrap a fresh source page's cache heads under its own in-place resend
+/// budget.
+#[cfg(test)]
 fn bootstrap_cache_heads(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     ordinary_bootstrap: bool,
+    upload: impl FnMut(Vec<SnapshotItem>, bool) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    persist: impl FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+) -> Result<usize> {
+    bootstrap_cache_heads_with_budget(
+        probes,
+        poison_scope,
+        progress,
+        ordinary_bootstrap,
+        &mut InplaceRetryBudget::default(),
+        upload,
+        persist,
+    )
+}
+
+/// Bootstrap only through existing ordinary authority followed by an exact
+/// CAS repeat. Both settlements share the normal atomic ACK progress seam and
+/// the source page's in-place resend budget.
+fn bootstrap_cache_heads_with_budget(
+    probes: &[SnapshotItem],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    ordinary_bootstrap: bool,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
         bool,
@@ -140,6 +178,7 @@ fn bootstrap_cache_heads(
             snapshot_upload_body_witness,
             |item| Some(item.source_session_id.as_str()),
             |_| false,
+            inplace_retry,
             |items| upload(items, enforce_head_cas),
             |progress| persist(progress),
         )?;
@@ -310,7 +349,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled();
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -417,10 +456,18 @@ fn settle_completed_upload(
     }
 }
 
+/// Process-local, content-free count of `Rejected` pages whose local holds
+/// were all terminal-bound and settled through the `Completed` restore path.
+static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 /// Settle a `Deferred` or `Rejected` upload. Retryable or locally unproven
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
-/// still discloses the rejected usage.
+/// still discloses the rejected usage. Its holds settle exactly as on a
+/// `Completed` page: when every hold is non-progressing (no RetryPending
+/// family anywhere) and restorable, held keys keep their committed revision
+/// and the traversal may settle; backfill and replay stay pending.
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -428,7 +475,23 @@ fn settle_checkpointed_upload(
     holds: &LocalHoldSettlement,
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
-    let mut index = if holds.any() {
+    let terminal_bound_holds = resolved_permanent_rejections
+        && holds.any()
+        && !holds.progress_blocking
+        && index.locally_held_keys_restorable(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        );
+    let mut index = if terminal_bound_holds {
+        CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        index.into_locally_held_keys_reverted(
+            committed_index,
+            &holds.held_fingerprints,
+            &holds.account_deferred_fingerprints,
+        )
+    } else if holds.any() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -437,11 +500,15 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && !holds.any();
+    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
-    let fully_settled = upload_settled_without_account_holds(&index, settled);
+    let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
         index,
         fully_settled,
@@ -1744,6 +1811,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         || Ok(()),
         None,
         Some(NativeSelectedRestore::Logical(fallback)),
+        None,
     )
 }
 
@@ -1802,6 +1870,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         validate_destination,
         read_limit,
         None,
+        None,
     )
 }
 
@@ -1839,6 +1908,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
     fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1917,7 +1987,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
-    committable.mark_bounded_sweep_unsettled();
+    match cause {
+        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
+        None => committable.mark_bounded_sweep_unsettled(),
+    }
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -3365,6 +3438,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         last_turn_context_tokens: item.last_turn_context_tokens,
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
+        compaction_events: item.compaction_events.clone(),
+        first_own_request_at: item.first_own_request_at.clone(),
+        local_context_points: Vec::new(),
         compaction_total_pre_tokens: item.compaction_total_pre_tokens,
         compaction_total_post_tokens: item.compaction_total_post_tokens,
         compaction_total_cumulative_dropped_tokens: item.compaction_total_cumulative_dropped_tokens,
@@ -4722,7 +4798,13 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load(&index_path)?;
+    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
+    // and eager hydrate run against the index exactly as loaded, namespaced
+    // by this index file. They touch only side requests and side records.
+    let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
+        crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
+    });
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -4819,9 +4901,16 @@ fn prepare_sync_source(
         .intersection(&legacy_reconciliation_pending)
         .cloned()
         .collect::<BTreeSet<_>>();
-    if historical_replay_pending {
-        index.prepare_historical_replay(replay_generation.clone());
-    }
+    // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
+    // scan is built.
+    crate::snapshots::prepare_historical_replay_with_side(
+        &mut index,
+        historical_replay_pending,
+        replay_generation.clone(),
+        source,
+        &daemon.transcript_cache,
+        &index_path,
+    );
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
@@ -4893,7 +4982,8 @@ fn prepare_sync_source(
             "{:x}",
             Sha256::digest(sampled_scope.as_bytes())
         )),
-    );
+    )
+    .with_codex_side_pass(codex_side_pass);
     if crate::snapshots::claude_native_comparison::enabled() {
         scan.enable_native_comparison();
     }
@@ -4983,6 +5073,36 @@ fn capture_codex_recovery_evidence(
         }
     }
     scan_result.finish_codex_capture_boundary(index);
+}
+
+/// U1a-2a D5′ (C15), Codex only: read immediately before the call that
+/// assembles and writes the selected save; no side writer runs in between.
+fn codex_side_save_mark(
+    daemon: &LocalDaemon,
+    source: SnapshotSource,
+    index_path: &Path,
+) -> Option<crate::snapshots::CodexSideSaveMark> {
+    (source == SnapshotSource::Codex)
+        .then(|| crate::snapshots::codex_side_save_mark(&daemon.transcript_cache, index_path))
+}
+
+/// U1a-2a (C15): this pass's side-ledger entries up to `mark` are now on
+/// disk (a full save, or a partial checkpoint that carries every side
+/// field). `Ok` arms only.
+fn note_codex_side_saved(
+    daemon: &LocalDaemon,
+    index_path: &Path,
+    full: bool,
+    mark: Option<crate::snapshots::CodexSideSaveMark>,
+) {
+    if let Some(mark) = mark {
+        crate::snapshots::note_codex_side_pass_saved(
+            &daemon.transcript_cache,
+            index_path,
+            full,
+            mark,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5469,6 +5589,10 @@ fn finish_sync_source(
         .map(cache_head_probe)
         .collect::<Vec<_>>();
     let mut bootstrap_deferred = 0usize;
+    // One in-place resend budget for the whole source page: both bootstrap
+    // stages and the main upload draw on it, so the page never waits more
+    // than two resends and 10 s under the sync lock.
+    let mut inplace_retry = InplaceRetryBudget::default();
     if !probes.is_empty() {
         // These failures precede the main upload's diagnostic. Preserve only
         // the existing typed, content-free cause and the fixed failing role.
@@ -5487,11 +5611,12 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads(
+        bootstrap_deferred = bootstrap_cache_heads_with_budget(
             &probes,
             source.api_slug(),
             &mut upload_progress,
             ordinary_bootstrap,
+            &mut inplace_retry,
             |snapshots, enforce_head_cas| {
                 let request = SnapshotBatchRequest {
                     schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -5539,6 +5664,7 @@ fn finish_sync_source(
         snapshot_upload_body_witness,
         |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+        &mut inplace_retry,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
             // history and retroactive backfill before the first upload. Relay
@@ -5676,8 +5802,11 @@ fn finish_sync_source(
             deferred_entity_count = Some(count);
             eprintln!(
                 "local snapshot upload checkpointed accepted siblings but left {count} \
-                 unsettled entity(ies) pending for {}; a clean follow-up scan is required",
-                source.api_slug()
+                 unsettled entity(ies) pending for {}; a clean follow-up scan is required \
+                 ({} page(s) settled with terminal-bound holds)",
+                source.api_slug(),
+                CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS
+                    .load(std::sync::atomic::Ordering::Relaxed)
             );
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
@@ -5685,6 +5814,7 @@ fn finish_sync_source(
             let retry_after = note_shed_and_backoff(source, retry_after);
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
+            let side_mark = codex_side_save_mark(daemon, source, &index_path);
             let committable = match checkpoint_partial_snapshot_index_with_comparison(
                 &index,
                 &committed_index,
@@ -5702,8 +5832,12 @@ fn finish_sync_source(
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             ) {
-                Ok(committable) => committable,
+                Ok(committable) => {
+                    note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    committable
+                }
                 Err(error) => {
                     checkpoint_succeeded = false;
                     eprintln!(
@@ -5800,6 +5934,7 @@ fn finish_sync_source(
             // delta can prune those ACKs. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
+                let side_mark = codex_side_save_mark(daemon, source, &index_path);
                 match checkpoint_partial_snapshot_index_with_comparison(
                     &index,
                     &committed_index,
@@ -5817,8 +5952,12 @@ fn finish_sync_source(
                     comparison_completion
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
+                    Some(UnsettledUploadCause::UploadError),
                 ) {
-                    Ok(committable) => index = committable,
+                    Ok(committable) => {
+                        index = committable;
+                        note_codex_side_saved(daemon, &index_path, false, side_mark);
+                    }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
                         source.api_slug(),
@@ -6035,6 +6174,7 @@ fn finish_sync_source(
     );
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
+    let side_mark = codex_side_save_mark(daemon, source, &index_path);
     save_index_and_publish_manifest(
         &mut index,
         &index_path,
@@ -6044,6 +6184,7 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    note_codex_side_saved(daemon, &index_path, true, side_mark);
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()
@@ -7114,7 +7255,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // until a complete family pass reconstructs the exact witness.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -7316,6 +7457,113 @@ fn is_snapshot_batch_deadline_failure(error: &anyhow::Error) -> bool {
         .is_some_and(UploadFailureDiagnostics::is_snapshot_batch_deadline)
 }
 
+/// The wait before resending a failed batch in place, with the HTTP status
+/// that earned it, or `None` when the failure keeps its existing path. The
+/// wait is never earlier than the server's own `Retry-After`.
+fn transient_inplace_retry_wait(error: &anyhow::Error) -> Option<(u16, Duration)> {
+    let (status, base) = if let Some(shed) = error.downcast_ref::<UploadShed>() {
+        // The identity deferral waits on the identity, not on this request:
+        // excluded by its code before any admission, even with a short
+        // Retry-After.
+        if shed.is_original_identity_unavailable() {
+            return None;
+        }
+        // No Retry-After keeps the jittered ladder; a long one is not worth
+        // holding the sync lock for.
+        let retry_after = shed
+            .retry_after
+            .filter(|wait| *wait <= SNAPSHOT_INPLACE_RETRY_MAX_WAIT)?;
+        (shed.status, retry_after)
+    } else {
+        let status = error
+            .downcast_ref::<UploadFailureDiagnostics>()?
+            .transient_batch_status()?;
+        (status, SNAPSHOT_INPLACE_RETRY_SERVER_ERROR_WAIT)
+    };
+    let base = base.max(SNAPSHOT_INPLACE_RETRY_MIN_WAIT);
+    let wait = (base + uniform_duration(base.mul_f64(0.2))).min(SNAPSHOT_INPLACE_RETRY_MAX_WAIT);
+    Some((status, wait))
+}
+
+/// In-place resends spent by one source page: every batch of its cache-head
+/// bootstrap stages and of its main upload draws on the same budget.
+#[derive(Default)]
+struct InplaceRetryBudget {
+    resends: usize,
+    waited: Duration,
+}
+
+impl InplaceRetryBudget {
+    fn admit(&self, error: &anyhow::Error, failed_after: Duration) -> Option<(u16, Duration)> {
+        if self.resends >= SNAPSHOT_INPLACE_RETRY_LIMIT
+            || failed_after >= SNAPSHOT_INPLACE_RETRY_FAST_FAILURE
+        {
+            return None;
+        }
+        transient_inplace_retry_wait(error)
+            .filter(|(_, wait)| self.waited + *wait <= SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET)
+    }
+}
+
+fn inplace_retry_failed_after(started: Instant) -> Duration {
+    #[cfg(test)]
+    if let Some(failed_after) = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow().as_ref().and_then(|clock| clock.failed_after))
+    {
+        return failed_after;
+    }
+    started.elapsed()
+}
+
+fn inplace_retry_sleep(wait: Duration) {
+    #[cfg(test)]
+    if INPLACE_RETRY_TEST_CLOCK.with(|clock| match clock.borrow_mut().as_mut() {
+        Some(clock) => {
+            clock.waits.push(wait);
+            true
+        }
+        None => false,
+    }) {
+        return;
+    }
+    std::thread::sleep(wait);
+}
+
+/// Test-only stand-in for the in-place resend clock: it records every wait
+/// instead of sleeping and may override how long a failed POST took.
+#[cfg(test)]
+struct InplaceRetryTestClock {
+    failed_after: Option<Duration>,
+    waits: Vec<Duration>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static INPLACE_RETRY_TEST_CLOCK: std::cell::RefCell<Option<InplaceRetryTestClock>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `body` with this thread's in-place resend clock replaced. Returns the
+/// result and every wait the uploader asked for, in order.
+#[cfg(test)]
+fn with_inplace_retry_test_clock<R>(
+    failed_after: Option<Duration>,
+    body: impl FnOnce() -> R,
+) -> (R, Vec<Duration>) {
+    INPLACE_RETRY_TEST_CLOCK.with(|clock| {
+        *clock.borrow_mut() = Some(InplaceRetryTestClock {
+            failed_after,
+            waits: Vec::new(),
+        });
+    });
+    let result = body();
+    let waits = INPLACE_RETRY_TEST_CLOCK
+        .with(|clock| clock.borrow_mut().take())
+        .map(|clock| clock.waits)
+        .unwrap_or_default();
+    (result, waits)
+}
+
 /// Upload changed snapshots in bounded pages while durably checkpointing every
 /// accepted page. Item-specific validation failures are bisected so one poison
 /// snapshot cannot replay or block its valid siblings; pages that exceed the
@@ -7378,6 +7626,7 @@ where
         body_witness,
         |_| None,
         |_| false,
+        &mut InplaceRetryBudget::default(),
         upload,
         persist,
     )
@@ -7616,6 +7865,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     body_witness: BodyWitness,
     session_id: SessionId,
     batch_class: BatchClass,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -7772,7 +8022,8 @@ where
             }
             adaptive_attempts += 1;
         }
-        match attempt_snapshot_page(
+        let attempt_started = Instant::now();
+        let attempt = attempt_snapshot_page(
             items,
             &indices,
             poison_scope,
@@ -7783,7 +8034,11 @@ where
             &session_id,
             &mut upload,
             &mut persist,
-        ) {
+        );
+        let inplace_wait = attempt.as_ref().err().and_then(|error| {
+            inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
+        });
+        match attempt {
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
@@ -7869,6 +8124,27 @@ where
                 if deferred_validation_error.is_none() {
                     deferred_validation_error = Some(error);
                 }
+            }
+            Err(_) if inplace_wait.is_some() => {
+                // A short, explicitly transient failure: wait briefly and
+                // resend the same page. Each resend re-runs the whole upload
+                // boundary (lease, authority, fresh relay token), and the
+                // loop-top filter drops anything settled meanwhile. When the
+                // budget runs out the failure takes the arms below unchanged.
+                let (status, wait) = inplace_wait.expect("admitted in-place retry");
+                inplace_retry.resends += 1;
+                inplace_retry.waited += wait;
+                eprintln!(
+                    "local snapshot upload transient status={status} for {poison_scope}; \
+                     retrying the batch in place after {} ms (source page resend {}/{SNAPSHOT_INPLACE_RETRY_LIMIT}; \
+                     {} of {} ms source page in-place wait budget held under the sync lock)",
+                    wait.as_millis(),
+                    inplace_retry.resends,
+                    inplace_retry.waited.as_millis(),
+                    SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET.as_millis(),
+                );
+                inplace_retry_sleep(wait);
+                batches.push_front((indices, adaptive));
             }
             Err(error) if error.downcast_ref::<UploadShed>().is_some() => {
                 let shed = error
@@ -8815,7 +9091,7 @@ fn snapshot_destination_scoped_index_path(
         .join(file_name)
 }
 
-fn snapshot_upload_destination_namespace(
+pub(crate) fn snapshot_upload_destination_namespace(
     device: &LocalDeviceBinding,
     device_secret: &str,
 ) -> String {
@@ -9079,6 +9355,50 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 mod tests {
     use super::*;
     use crate::snapshots::finalize_scan_after_policy;
+    #[test]
+    fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
+        let root = crate::test_scratch::ScratchDir::new("retry-compaction-events");
+        let path = root.join("rollout-retry-compaction.jsonl");
+        let token = |at: &str, total: u64, last: u64| {
+            serde_json::json!({"type":"event_msg", "timestamp":at,
+            "payload":{"type":"token_count", "info":{"model":"gpt-5.6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":total/10},
+            "last_token_usage":{"input_tokens":last,"cached_input_tokens":last/2,"output_tokens":last/10}}}})
+        };
+        let lines = [
+            serde_json::json!({"type":"session_meta","payload":{"id":"retry-compaction"}}),
+            token("2026-10-07T11:00:00Z", 240_000, 240_000),
+            serde_json::json!({"timestamp":"2026-10-07T11:10:00Z","type":"compacted","payload":{"replacement_history":[]}}),
+            token("2026-10-07T11:20:00Z", 299_000, 59_000),
+        ];
+        let body = lines
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .collect::<String>();
+        std::fs::write(&path, body).unwrap();
+        let mut item =
+            crate::snapshots::parse_codex_jsonl_file(&path, "2026-10-07T12:00:00Z", "fp".into())
+                .unwrap()
+                .remove(0);
+        item.cache_observations = None;
+        item.cache_base_head_etag = None;
+        assert_eq!(item.compaction_events.len(), 1);
+        assert!(!item.local_context_points.is_empty());
+        // Codex never carries design E's first own request time; a Claude
+        // value survives the retry copy like the other wire fields.
+        assert_eq!(item.first_own_request_at, None);
+        item.first_own_request_at = Some("2026-10-07T11:00:00Z".into());
+
+        let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
+
+        assert_eq!(copy.first_own_request_at, item.first_own_request_at);
+        assert_eq!(copy.compaction_events, item.compaction_events);
+        assert!(copy.local_context_points.is_empty());
+        assert_eq!(
+            serde_json::to_value(&copy).unwrap()["compaction_events"],
+            serde_json::to_value(&item).unwrap()["compaction_events"]
+        );
+    }
     #[test]
     fn native_comparison_decision_records_bounded_base_fold_without_completion() {
         use crate::snapshots::claude_native_comparison::{lifecycle, Completion};
@@ -10768,6 +11088,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |_| Ok(()),
@@ -13699,6 +14020,7 @@ mod tests {
                     Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     }))
                 }
             },
@@ -13726,6 +14048,10 @@ mod tests {
         }
         assert_eq!(observe().quantity(ClientReportReason::RatelimitBackoff), 1);
         reset_for_test();
+    }
+
+    mod inplace_retry_tests {
+        include!("snapshot_sync/inplace_retry_tests.rs");
     }
 
     #[test]
@@ -14927,6 +15253,7 @@ mod tests {
             |item| item.clone(),
             |_| None,
             |item| reconcile_class.contains(item),
+            &mut InplaceRetryBudget::default(),
             |batch| {
                 let is_reconcile = batch
                     .iter()
@@ -17242,6 +17569,161 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
+    }
+
+    /// Diagnostics only: every settlement path that marks the sweep unsettled
+    /// names itself, causes accumulate across pages and survive a reload, and
+    /// a settled outcome names nothing.
+    #[test]
+    fn unsettled_cause_names_each_settlement_and_partial_checkpoint_producer() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
+            held_entity_count: held_fingerprints.len(),
+            retry_pending_family_count: 0,
+            held_fingerprints: held_fingerprints.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            // Restorable non-blocking Rejected holds settle once H1 is composed.
+            progress_blocking: !held_fingerprints.is_empty(),
+        };
+
+        let blocked = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        let restored = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!restored.bounded_sweep_had_unsettled_upload());
+        assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
+
+        let deferred = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            false,
+        );
+        assert!(deferred.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+        let rejected_beside_hold =
+            settle_checkpointed_upload(scanned.clone(), &committed, &progress, &holds(&held), true);
+        assert!(rejected_beside_hold
+            .index
+            .bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            rejected_beside_hold
+                .index
+                .bounded_sweep_unsettled_cause_names(),
+            ["rejected_with_holds"]
+        );
+        let rejected = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            true,
+        );
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        // H1 settles a Rejected page whose holds are restorable and
+        // non-blocking, so it must name no unsettled cause.
+        let restorable = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &LocalHoldSettlement {
+                progress_blocking: false,
+                ..holds(&held)
+            },
+            true,
+        );
+        assert!(!restorable.index.bounded_sweep_had_unsettled_upload());
+        assert!(restorable
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+
+        // The shed and error branches mark through the partial checkpoint.
+        // A cause from an earlier page of the same sweep is kept beside it.
+        for (cause, name) in [
+            (UnsettledUploadCause::Shed, "shed"),
+            (UnsettledUploadCause::UploadError, "upload_error"),
+        ] {
+            let root = test_dir(&format!("unsettled-cause-checkpoint-{name}"));
+            std::fs::create_dir_all(&root).expect("create checkpoint fixture root");
+            let index_path = root.join("scan-index.json");
+            let progress_path = root.join("upload-progress.json");
+            let mut durable = SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 589),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load upload progress");
+            durable.save(&progress_path).expect("save upload progress");
+            let mut working = scanned.clone();
+            working.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+            let checkpoint = checkpoint_partial_snapshot_index_with_comparison(
+                &working,
+                &committed,
+                &durable,
+                &[],
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            )
+            .expect("partial checkpoint");
+            assert!(checkpoint.bounded_sweep_had_unsettled_upload());
+            let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+            assert!(reloaded.bounded_sweep_had_unsettled_upload());
+            assert_eq!(
+                reloaded.bounded_sweep_unsettled_cause_names(),
+                [name, "deferred_conflict"]
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
@@ -20554,6 +21036,7 @@ mod tests {
                 Err(anyhow::Error::new(UploadShed {
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
+                    code: None,
                 }))
             },
             |state| state.save(&path),
