@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 824,
-  "content_sha256": "dbd2df0fb056adba9fb85143ec25b27b93e8e78cbfad84387b1949b9dae8cdda",
+  "content_sha256": "7e81c67e5ae6c6583b348ffa2135d8de9f4b97c0380edaf560bf24f2962ee823",
   "files": [
     {
       "executable": false,
@@ -1665,8 +1665,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "4a654147f09925b97d2abb9deb71637e751d7213d1cca0ee52fcc067206d31cb",
-      "size_bytes": 68289
+      "sha256": "c0c179f0b3d9f93d93559d0e25f13a1d2fec3e716774e271bd3c857f7a251fe3",
+      "size_bytes": 68481
     },
     {
       "executable": false,
@@ -5771,7 +5771,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T10:15:11+00:00",
+  "generated_at": "2026-10-23T12:17:55+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 825,
   "public_roots": [
@@ -5810,5 +5810,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "398441e853e5c7e3c44968e273edb0573c2f68c7"
+  "source_commit": "3b5c5e26c0525fd2aec5acb3e033fbdd2cef5181"
 }
