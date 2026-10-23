@@ -193,6 +193,11 @@ impl ScanIndex {
                 rearmed += 1;
             }
         }
+        // A pure CAS reread discards this normalized graph. Only the load or
+        // working save applies a rearm, so do not count that same action twice.
+        if stage == "cas" {
+            return;
+        }
         CLAUDE_AUTHORITY_DROPS.fetch_add(unbound.len(), std::sync::atomic::Ordering::Relaxed);
         CLAUDE_AUTHORITY_DROP_REARMED_FILES
             .fetch_add(rearmed, std::sync::atomic::Ordering::Relaxed);

@@ -14,7 +14,10 @@ type HeldSlots = BTreeMap<String, Arc<HeldRaw>>;
 #[derive(Debug, Clone, Default)]
 pub(super) struct Holds(
     BTreeMap<&'static str, HeldSlots>,
-    BTreeMap<&'static str, BTreeSet<String>>,
+    BTreeMap<&'static str, BTreeMap<[u8; 32], [u8; 32]>>,
+    BTreeSet<[u8; 32]>, // held file family roots; fixed-size metadata per hold
+    BTreeSet<[u8; 32]>, // known protected owners; no reverse file scan
+    bool,               // any held file has unknown ownership
 );
 #[derive(Debug)]
 struct HeldRaw(Box<RawValue>, Option<String>);
@@ -31,6 +34,25 @@ impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     }
 }
 impl Holds {
+    fn rebuild_scopes(&mut self) {
+        let files = self.0.get("files");
+        self.2 = files
+            .into_iter()
+            .flat_map(|slots| slots.keys())
+            .filter_map(|key| {
+                claude_index_path_member_ref(Path::new(key)).map(|member| repair_key(member.root))
+            })
+            .collect();
+        self.3 = files
+            .into_iter()
+            .flat_map(|slots| slots.values())
+            .filter_map(|raw| raw.1.as_deref().map(repair_key))
+            .collect();
+        self.4 = files
+            .into_iter()
+            .flat_map(|slots| slots.values())
+            .any(|raw| raw.1.is_none());
+    }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
     }
@@ -50,13 +72,19 @@ impl Holds {
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Holds {
+    // Both maps and the shared raw payloads are immutable without &mut self.
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.0, c)?;
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.2, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.3, c)
     }
     fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.0, c)?;
-        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.1, c)
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.1, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.2, c)?;
+        crate::heap_layout_bound::HeapLayoutBound::completed_heap_bound(&self.3, c)
     }
 }
 
@@ -324,7 +352,14 @@ pub(super) fn read<R: BufRead + Seek>(
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
     };
-    let result = decoder.index();
+    // Controls are checked before any record can exhaust hold admission.
+    // Otherwise a future ledger placed after damaged records could be renamed
+    // as corruption before this build learns it cannot interpret the file.
+    let headers = decoder.index(true)?;
+    controls(&headers, source)?;
+    drop(headers);
+    decoder.reader.seek(SeekFrom::Start(0))?;
+    let result = decoder.index(false);
     if matches!(result, Err(Error::HoldBudget)) {
         emit_scan_index_containment_line(format!(
             "local snapshot scan index {stage}: source={source} lenient_hold_budget_exceeded=1"
@@ -333,6 +368,7 @@ pub(super) fn read<R: BufRead + Seek>(
     let mut index = result?;
     controls(&index, source)?;
     index.decode_holds = decoder.holds;
+    index.decode_holds.rebuild_scopes();
     let semantic = index.drop_invalid_index_records();
     decoder.counts.drops.activity += semantic.activity;
     decoder.counts.drops.accepted += semantic.accepted;
@@ -457,12 +493,15 @@ impl<R: BufRead + Seek> Decoder<R> {
         key: String,
         span: Span,
     ) -> std::result::Result<(), Error> {
+        if (field == "quarantined_snapshot_fingerprints" && !is_snapshot_fingerprint(&key))
+            || key.is_empty()
+        {
+            return Err(Error::Refused("unaddressable held identity"));
+        }
         let raw = self.raw(span)?;
         self.held_bytes += span.len;
         self.held_count += 1;
-        let owner = (field == "files")
-            .then(|| held_file_owner(&raw, &key))
-            .flatten();
+        let owner = (field == "files").then(|| held_file_owner(&raw)).flatten();
         self.holds
             .0
             .entry(field)
@@ -481,6 +520,15 @@ impl<R: BufRead + Seek> Decoder<R> {
         field: &'static str,
         span: Span,
         debt: bool,
+    ) -> std::result::Result<BTreeMap<String, T>, Error> {
+        self.records_checked(field, span, debt, |_| false)
+    }
+    fn records_checked<T: serde::de::DeserializeOwned>(
+        &mut self,
+        field: &'static str,
+        span: Span,
+        debt: bool,
+        repaired: impl Fn(&T) -> bool,
     ) -> std::result::Result<BTreeMap<String, T>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         if self.ws()? != Some(b'{') {
@@ -502,6 +550,14 @@ impl<R: BufRead + Seek> Decoder<R> {
             }
             match self.typed(value) {
                 Ok(decoded) => {
+                    if repaired(&decoded) {
+                        let hash = self.hash_span(value)?;
+                        self.holds
+                            .1
+                            .entry(field)
+                            .or_default()
+                            .insert(repair_key(&key), hash);
+                    }
                     values.insert(key, decoded);
                 }
                 Err(_) if debt => self.hold(field, key, value)?,
@@ -544,21 +600,17 @@ impl<R: BufRead + Seek> Decoder<R> {
         &mut self,
         span: Span,
     ) -> std::result::Result<BTreeMap<String, SnapshotQuarantineRecord>, Error> {
-        let mut values = self.records("quarantined_snapshot_fingerprints", span, true)?;
+        let mut values = self.records_checked(
+            "quarantined_snapshot_fingerprints",
+            span,
+            true,
+            |record: &SnapshotQuarantineRecord| !snapshot_quarantine_deadline_is_bounded(record),
+        )?;
         self.repair_held(
             "quarantined_snapshot_fingerprints",
             &mut values,
             repaired_quarantine,
         )?;
-        for (key, record) in &values {
-            if !snapshot_quarantine_deadline_is_bounded(record) {
-                self.holds
-                    .1
-                    .entry("quarantined_snapshot_fingerprints")
-                    .or_default()
-                    .insert(key.clone());
-            }
-        }
         Ok(values)
     }
     fn authorities(
@@ -579,12 +631,15 @@ impl<R: BufRead + Seek> Decoder<R> {
         values: &mut BTreeMap<String, T>,
         repair: impl Fn(&RawValue) -> Option<T>,
     ) -> std::result::Result<(), Error> {
-        let repairs = &mut self.holds.1;
-        if let Some(held) = self.holds.0.get_mut(field) {
-            held.retain(|key, raw| {
+        if let Some(held) = self.holds.0.remove(field) {
+            for (key, raw) in held {
                 if let Some(value) = repair(&raw.0) {
-                    values.insert(key.clone(), value);
-                    repairs.entry(field).or_default().insert(key.clone());
+                    self.holds
+                        .1
+                        .entry(field)
+                        .or_default()
+                        .insert(repair_key(&key), repair_key(raw.get()));
+                    values.insert(key, value);
                     self.held_count -= 1;
                     self.held_bytes -= raw.get().len() as u64;
                     self.counts.held -= 1;
@@ -594,18 +649,30 @@ impl<R: BufRead + Seek> Decoder<R> {
                         self.counts.families -= 1;
                         self.counts.authority_repairs += 1;
                     }
-                    false
                 } else {
-                    true
+                    self.holds.0.entry(field).or_default().insert(key, raw);
                 }
-            });
-            if held.is_empty() {
-                self.holds.0.remove(field);
             }
         }
         Ok(())
     }
-    fn index(&mut self) -> std::result::Result<ScanIndex, Error> {
+    fn hash_span(&mut self, span: Span) -> std::result::Result<[u8; 32], Error> {
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        let mut remaining = span.len;
+        let mut hash = Sha256::new();
+        while remaining > 0 {
+            let bytes = self.reader.fill_buf()?;
+            let count = bytes.len().min(remaining as usize);
+            if count == 0 {
+                return Err(Error::Refused("changed repair input"));
+            }
+            hash.update(&bytes[..count]);
+            self.reader.consume(count);
+            remaining -= count as u64;
+        }
+        Ok(hash.finalize().into())
+    }
+    fn index(&mut self, headers_only: bool) -> std::result::Result<ScanIndex, Error> {
         let mut index = ScanIndex {
             accepted_snapshot_fingerprint_ledger_version: 0,
             ..ScanIndex::default()
@@ -659,6 +726,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                     }
                 } else {
                     match name {
+                        _ if headers_only
+                            && !matches!(
+                                name,
+                                "schema_version"
+                                    | "generation"
+                                    | "accepted_snapshot_fingerprint_ledger_version"
+                                    | "codex_parent_side_generation"
+                                    | "codex_parent_proof_wrap_epoch"
+                                    | "codex_parent_proof_seq"
+                                    | "codex_proof_index_incarnation"
+                            ) => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "upload_context_fingerprint" => {
@@ -893,21 +971,55 @@ impl<R: BufRead + Seek> Decoder<R> {
             return Err(Error::Refused("missing files"));
         }
 
-        self.freeze_held_families(&mut index)?;
+        if !headers_only {
+            let authority_span = self
+                .family_spans
+                .get("claude_usage_authority_quarantine")
+                .copied();
+            self.freeze_held_families(&mut index)?;
+            self.note_authority_drops(&index, authority_span)?;
+        }
         Ok(index)
     }
     fn freeze_held_families(&mut self, index: &mut ScanIndex) -> std::result::Result<(), Error> {
         // A held family proof/pending slot also freezes any intact correction
         // and exclusion state for that family. Existing reproof/prune code may
         // not erase its debt just because its typed witness is now absent.
-        let roots = self
-            .holds
-            .0
+        let unbound_repairs = index
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(key, record)| {
+                self.holds
+                    .1
+                    .get("claude_usage_authority_quarantine")
+                    .is_some_and(|keys| keys.contains_key(&repair_key(key)))
+                    && !index
+                        .claude_usage_family_witnesses
+                        .get(*key)
+                        .is_some_and(|witness| {
+                            claude_usage_authority_preserves_pending(record, witness)
+                        })
+            })
+            .map(|(key, _)| repair_key(key))
+            .collect::<BTreeSet<_>>();
+        let original = std::mem::take(&mut self.holds.0);
+        let roots = original
             .iter()
             .filter(|(field, _)| field.starts_with("claude_"))
-            .flat_map(|(_, slots)| slots.keys().cloned())
+            .flat_map(|(_, slots)| slots.keys().map(String::as_str))
+            .chain(
+                original
+                    .get("files")
+                    .into_iter()
+                    .flat_map(|slots| slots.keys())
+                    .filter_map(|key| {
+                        claude_index_path_member_ref(Path::new(key)).map(|member| member.root)
+                    }),
+            )
             .collect::<BTreeSet<_>>();
-        if roots.is_empty() {
+        if roots.is_empty() && unbound_repairs.is_empty() {
+            drop(roots);
+            self.holds.0 = original;
             return Ok(());
         }
         let fields = std::mem::take(&mut self.family_spans);
@@ -919,13 +1031,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                 let key: String = self.typed(key_span)?;
                 self.eat(b':')?;
                 let value = self.span()?;
-                if roots.contains(&key) && !self.holds.contains(field, &key) {
-                    self.hold(field, key.clone(), value)?;
+                if (roots.contains(key.as_str()) || unbound_repairs.contains(&repair_key(&key)))
+                    && !original
+                        .get(field)
+                        .is_some_and(|slots| slots.contains_key(&key))
+                    && !self.holds.contains(field, &key)
+                {
                     if self
                         .holds
                         .1
                         .get_mut(field)
-                        .is_some_and(|keys| keys.remove(&key))
+                        .is_some_and(|keys| keys.remove(&repair_key(&key)).is_some())
                     {
                         self.counts.authority_repairs -= 1;
                     }
@@ -947,6 +1063,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         _ => unreachable!(),
                     }
+                    self.hold(field, key, value)?;
                 }
                 self.reader.seek(SeekFrom::Start(value.start + value.len))?;
                 if self.ws()? == Some(b',') {
@@ -957,6 +1074,57 @@ impl<R: BufRead + Seek> Decoder<R> {
             }
             self.eat(b'}')?;
         }
+        drop(roots);
+        for (field, slots) in original {
+            self.holds.0.entry(field).or_default().extend(slots);
+        }
+        Ok(())
+    }
+    fn note_authority_drops(
+        &mut self,
+        index: &ScanIndex,
+        span: Option<Span>,
+    ) -> std::result::Result<(), Error> {
+        let unbound = index
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(key, record)| {
+                !index
+                    .claude_usage_family_witnesses
+                    .get(*key)
+                    .is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
+            })
+            .map(|(key, _)| repair_key(key))
+            .collect::<BTreeSet<_>>();
+        let Some(span) = span.filter(|_| !unbound.is_empty()) else {
+            return Ok(());
+        };
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        self.eat(b'{')?;
+        while self.ws()? != Some(b'}') {
+            let key_span = self.span()?;
+            let key: String = self.typed(key_span)?;
+            self.eat(b':')?;
+            let value = self.span()?;
+            let key = repair_key(&key);
+            if unbound.contains(&key) {
+                let hash = self.hash_span(value)?;
+                self.holds
+                    .1
+                    .entry("claude_authority_semantic_drop")
+                    .or_default()
+                    .insert(key, hash);
+            }
+            self.reader.seek(SeekFrom::Start(value.start + value.len))?;
+            if self.ws()? == Some(b',') {
+                self.eat(b',')?;
+            } else {
+                break;
+            }
+        }
+        self.eat(b'}')?;
         Ok(())
     }
     fn census(&mut self, span: Span, field: &str) -> std::result::Result<ScanIndex, Error> {
@@ -971,50 +1139,74 @@ impl<R: BufRead + Seek> Decoder<R> {
 
 impl ScanIndex {
     pub(super) fn decode_repairs_match(&self, working: &Self) -> bool {
-        self.decode_holds.1.iter().all(|(field, keys)| {
-            keys.iter().all(|key| match *field {
-                "quarantined_snapshot_fingerprints" => {
-                    match (
-                        self.quarantined_snapshot_fingerprints.get(key),
-                        working.quarantined_snapshot_fingerprints.get(key),
-                    ) {
-                        (Some(current), Some(prior)) => {
-                            current.witness == prior.witness
-                                && current.disposition == prior.disposition
-                                && current.failed_reconstruction_count
-                                    == prior.failed_reconstruction_count
-                                && current.upload_body_witness == prior.upload_body_witness
-                                && (current.retry_after_unix_seconds
-                                    == prior.retry_after_unix_seconds
-                                    || (current.retry_after_unix_seconds
-                                        <= sampled_scan::now_seconds()
-                                        && prior.retry_after_unix_seconds
-                                            <= sampled_scan::now_seconds()))
-                        }
-                        (None, None) => true,
-                        _ => false,
-                    }
-                }
-                "claude_usage_authority_quarantine" => {
-                    self.claude_usage_authority_quarantine.get(key)
-                        == working.claude_usage_authority_quarantine.get(key)
-                }
+        self.decode_holds.1.iter().all(|(field, repairs)| {
+            let observed = |key: &str| {
+                repairs.get(&repair_key(key)).map_or(true, |raw| {
+                    working
+                        .decode_holds
+                        .1
+                        .get(field)
+                        .is_some_and(|prior| prior.get(&repair_key(key)) == Some(raw))
+                })
+            };
+            match *field {
+                "quarantined_snapshot_fingerprints" => self
+                    .quarantined_snapshot_fingerprints
+                    .iter()
+                    .all(|(key, current)| {
+                        observed(key)
+                            || working
+                                .quarantined_snapshot_fingerprints
+                                .get(key)
+                                .is_some_and(|prior| {
+                                    current.witness == prior.witness
+                                        && current.disposition == prior.disposition
+                                        && current.failed_reconstruction_count
+                                            == prior.failed_reconstruction_count
+                                        && current.upload_body_witness == prior.upload_body_witness
+                                        && (current.retry_after_unix_seconds
+                                            == prior.retry_after_unix_seconds
+                                            || (current.retry_after_unix_seconds
+                                                <= sampled_scan::now_seconds()
+                                                && prior.retry_after_unix_seconds
+                                                    <= sampled_scan::now_seconds()))
+                                })
+                    }),
+                "claude_usage_authority_quarantine" => self
+                    .claude_usage_authority_quarantine
+                    .iter()
+                    .all(|(key, current)| {
+                        observed(key)
+                            || working.claude_usage_authority_quarantine.get(key) == Some(current)
+                    }),
+                "claude_authority_semantic_drop" => repairs.iter().all(|(key, raw)| {
+                    working
+                        .decode_holds
+                        .1
+                        .get(field)
+                        .is_some_and(|prior| prior.get(key) == Some(raw))
+                }),
                 _ => false,
-            })
+            }
         })
     }
     pub(super) fn decode_holds_family(&self, root: &str) -> bool {
-        [
-            "claude_usage_authority_quarantine",
-            "claude_account_family_witnesses",
-            "claude_account_family_pending",
-            "claude_usage_family_witnesses",
-            "claude_usage_family_pending",
-        ]
-        .iter()
-        .any(|field| self.decode_holds.contains(field, root))
+        #[cfg(test)]
+        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
+        self.decode_holds.2.contains(&repair_key(root))
+            || [
+                "claude_usage_authority_quarantine",
+                "claude_account_family_witnesses",
+                "claude_account_family_pending",
+                "claude_usage_family_witnesses",
+                "claude_usage_family_pending",
+            ]
+            .iter()
+            .any(|field| self.decode_holds.contains(field, root))
     }
-    pub(super) fn decode_holds_file(&self, key: &str) -> bool {
+    pub(crate) fn decode_holds_file(&self, key: &str) -> bool {
+        #[cfg(test)]
+        SCOPE_VISITS.with(|count| count.set(count.get() + 1));
         self.decode_holds.contains("files", key)
             || claude_index_path_member_ref(Path::new(key))
                 .is_some_and(|member| self.decode_holds_family(member.root))
@@ -1027,38 +1219,35 @@ impl ScanIndex {
             .flat_map(|slots| slots.keys())
             .map(String::as_str)
     }
+    // Exact entity holds and file/family holds have separate keyed queries.
+    // Consumers with a file key must retain that context rather than reverse
+    // scanning every incidence set for each fingerprint.
     pub(crate) fn decode_holds_entity(&self, fingerprint: &str) -> bool {
-        if self.decode_holds.is_empty() {
-            return false;
-        }
-        if self
-            .decode_holds
-            .contains("quarantined_snapshot_fingerprints", fingerprint)
-        {
-            return true;
-        }
-        let family_hold = self
-            .decode_holds
-            .0
-            .keys()
-            .any(|field| field.starts_with("claude_"));
-        if !family_hold && !self.decode_holds.0.contains_key("files") {
-            return false;
-        }
         self.decode_holds
             .contains("quarantined_snapshot_fingerprints", fingerprint)
-            || self
-                .codex_state_only_snapshot_fingerprints
-                .iter()
-                .any(|(id, body)| body == fingerprint && self.decode_holds_codex_owner(id))
-            || self
-                .file_snapshot_fingerprints
-                .iter()
-                .any(|(key, members)| members.contains(fingerprint) && self.decode_holds_file(key))
-            || self.files.iter().any(|(key, entry)| {
-                entry.last_snapshot_fingerprint.as_deref() == Some(fingerprint)
-                    && self.decode_holds_file(key)
+    }
+    pub(crate) fn eligible_snapshot_fingerprint_refs(&self) -> impl Iterator<Item = &str> {
+        let exact = self
+            .file_snapshot_fingerprints
+            .iter()
+            .filter(|(key, _)| !self.decode_holds_file(key))
+            .flat_map(|(_, values)| values.iter().map(String::as_str));
+        let legacy = self
+            .files
+            .iter()
+            .filter(|(key, _)| {
+                !self.file_snapshot_fingerprints.contains_key(*key) && !self.decode_holds_file(key)
             })
+            .filter_map(|(_, entry)| entry.last_snapshot_fingerprint.as_deref());
+        let state = self
+            .codex_state_only_snapshot_fingerprints
+            .iter()
+            .filter(|(id, _)| !self.decode_holds_codex_owner(id))
+            .map(|(_, fingerprint)| fingerprint.as_str());
+        exact.chain(legacy).chain(state)
+    }
+    pub(super) fn decode_holds_indexed_entity(&self, key: &str, fingerprint: &str) -> bool {
+        self.decode_holds_file(key) || self.decode_holds_entity(fingerprint)
     }
     pub(super) fn decode_held_codex_owners(&self) -> impl Iterator<Item = Option<&str>> {
         self.decode_holds
@@ -1068,10 +1257,49 @@ impl ScanIndex {
             .flat_map(|slots| slots.values())
             .map(|raw| raw.1.as_deref())
     }
-    fn decode_holds_codex_owner(&self, id: &str) -> bool {
-        let owner = codex_protected_owner(id);
-        self.decode_held_codex_owners()
-            .any(|held| held.map_or(true, |held| held == owner))
+    pub(super) fn decode_holds_codex_owner(&self, id: &str) -> bool {
+        self.decode_holds.4
+            || self
+                .decode_holds
+                .3
+                .contains(&repair_key(&codex_protected_owner(id)))
+    }
+    pub(super) fn preserve_decode_held_files(
+        &mut self,
+        source: SnapshotSource,
+        snapshots: &[SnapshotItem],
+        pending: &mut [PendingIndexFinalization],
+    ) {
+        if self.decode_holds.is_empty() {
+            return;
+        }
+        for file in pending {
+            if !snapshots.iter().any(|item| {
+                item.source_file_fingerprint.as_deref()
+                    == Some(file.source_file_fingerprint.as_str())
+                    && self.decode_holds_snapshot(source, item)
+            }) {
+                continue;
+            }
+            file.parse_complete = false;
+            self.confirmed_empty_files.remove(&file.index_key);
+            if let Some(entry) = self.files.get_mut(&file.index_key) {
+                entry.last_snapshot_fingerprint = file.previous_snapshot_fingerprint.clone();
+                entry.last_upload_body_witness = file.previous_upload_body_witness.clone();
+            }
+            for item in snapshots {
+                if item.source_file_fingerprint.as_deref()
+                    == Some(file.source_file_fingerprint.as_str())
+                    && self.decode_holds_snapshot(source, item)
+                {
+                    self.file_snapshot_fingerprints
+                        .entry(file.index_key.clone())
+                        .or_default()
+                        .insert(item.snapshot_fingerprint.clone());
+                }
+            }
+            self.mark_bounded_sweep_unsettled();
+        }
     }
     pub(super) fn decode_holds_snapshot(
         &self,
@@ -1083,6 +1311,14 @@ impl ScanIndex {
         }
         if source == SnapshotSource::ClaudeCode
             && self.decode_holds_family(claude_snapshot_family_root_ref(item))
+        {
+            return true;
+        }
+        if source == SnapshotSource::Codex
+            && self
+                .decode_holds
+                .3
+                .contains(&repair_key(&codex_protected_owner(&item.source_session_id)))
         {
             return true;
         }
@@ -1258,7 +1494,7 @@ fn repaired_authority(raw: &RawValue) -> Option<ClaudeUsageAuthorityQuarantineRe
     claude_authority_record_contract_is_valid(&record).then_some(record)
 }
 
-fn held_file_owner(raw: &RawValue, key: &str) -> Option<String> {
+fn held_file_owner(raw: &RawValue) -> Option<String> {
     #[derive(Deserialize)]
     struct Owner<'a> {
         #[serde(default, borrow)]
@@ -1268,6 +1504,57 @@ fn held_file_owner(raw: &RawValue, key: &str) -> Option<String> {
     if let Some(owner) = owner.codex_protected_owner {
         return valid_codex_protected_owner(owner).then(|| owner.to_owned());
     }
-    let names = codex_session_id_candidates_from_path(Path::new(key));
-    (names.len() == 1).then(|| codex_protected_owner(&names[0]))
+    // Filename hints are not ownership proof for captured/joined history.
+    // Without an intact owner disclosure, keep the state-only domain unknown.
+    None
+}
+
+// Dropped optional/unknown input can make the next wire document much smaller.
+// Refuse before writing if that would turn an admitted hold into excess damage
+// on restart. This streams to a counter, never another encoded byte buffer.
+pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
+    if index.decode_holds.is_empty() {
+        return Ok(());
+    }
+    struct Count(u64);
+    impl std::io::Write for Count {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| std::io::Error::other("scan index output length"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let held = index
+        .decode_holds
+        .0
+        .values()
+        .flat_map(|slots| slots.values())
+        .map(|raw| raw.get().len() as u64)
+        .sum::<u64>();
+    let mut output = Count(0);
+    serde_json::to_writer_pretty(&mut output, index)?;
+    if held > HOLD_BYTES_MAX.min(output.0 / 8) {
+        emit_scan_index_containment_line(
+            "local snapshot scan index save: source=unattributed lenient_hold_budget_exceeded=1"
+                .into(),
+        );
+        return Err(Error::HoldBudget.into());
+    }
+    Ok(())
+}
+
+fn repair_key(value: &str) -> [u8; 32] {
+    Sha256::digest(value.as_bytes()).into()
+}
+
+#[cfg(test)]
+thread_local! { static SCOPE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+pub(super) fn scope_visits_for_test(reset: bool) -> usize {
+    SCOPE_VISITS.with(|count| if reset { count.replace(0) } else { count.get() })
 }

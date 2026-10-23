@@ -1207,7 +1207,7 @@ impl SnapshotUploadProgress {
             return false;
         }
         let current = index
-            .current_snapshot_fingerprint_refs()
+            .eligible_snapshot_fingerprint_refs()
             .collect::<BTreeSet<_>>();
         let latest = reason_reoffer::latest_valid_deadline(scope.now);
         let counts = &mut self.reason_reoffer_counts;
@@ -1932,6 +1932,9 @@ impl SnapshotUploadProgress {
             let Some((index_key, entry)) = current_files.get(file) else {
                 return !census_complete;
             };
+            if index.decode_holds_file(index_key) {
+                return true;
+            }
             // Neither held absence nor a changed aggregate alone certifies
             // enrichment. Rebinding comes from the current admitted raw item.
             if entry.source_file_fingerprint != pending.source_file_fingerprint

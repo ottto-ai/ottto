@@ -173,7 +173,13 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
             assert_eq!(working.generation, generation);
             assert_eq!(fs::read(&path).unwrap(), bytes);
             assert_eq!(corrupt_count(scratch.as_ref()), 0);
+            let lines_before = scan_index_containment_lines_for_test().len();
             let mut loaded = ScanIndex::load(&path).unwrap();
+            let lines = scan_index_containment_lines_for_test();
+            assert_eq!(lines.len() - lines_before, 1);
+            assert!(lines[lines_before].contains("decode_held=1"));
+            assert!(!lines[lines_before].contains("PRIVATE_FUTURE_DISPOSITION"));
+            assert!(!lines[lines_before].contains("synthetic"));
             assert!(!loaded.decode_holds.is_empty());
             assert_sibling(&loaded);
             assert_eq!(loaded.generation, generation);
@@ -185,7 +191,7 @@ fn lenient_opaque_holds_refuse_new_cas_then_round_trip_original_slot() {
                 assert!(!loaded.quarantine_requires_retry_body(&key, "different-body"));
             } else if field == "files" {
                 assert!(loaded.decode_holds_file(&key));
-                assert!(loaded.decode_holds_entity(&format!("{:064x}", 0)));
+                assert!(loaded.decode_holds_indexed_entity(&key, &format!("{:064x}", 0)));
                 loaded.remove_file_entry(&key);
                 assert!(loaded.file_snapshot_fingerprints.contains_key(&key));
             } else {
@@ -573,4 +579,299 @@ fn lenient_load_and_selected_cas_allocation_receipt() {
     assert!(working.decode_holds.same_as(&committed.decode_holds));
     assert!(subset.decode_holds.same_as(&loaded.decode_holds));
     eprintln!("lenient_decode_allocation_receipt load_requested_peak={} load_usable_peak={} selected_cas_with_three_graphs_requested_peak={} selected_cas_with_three_graphs_usable_peak={}", load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak);
+}
+
+#[test]
+fn lenient_save_refuses_to_write_holds_that_would_exceed_restart_admission() {
+    for bounded in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-output-admission");
+        let path = scratch.as_ref().join("index.json");
+        let mut index = fixture();
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"]["opaque-large"] = serde_json::json!({"unknown": "x".repeat(8192)});
+        value["unknown_padding"] = serde_json::json!("p".repeat(128 * 1024));
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(!loaded.decode_holds.is_empty());
+        let generation = loaded.generation;
+        let result = if bounded {
+            loaded.save_with_read_limit(&path, 1024 * 1024)
+        } else {
+            loaded.save(&path)
+        };
+        assert!(result.is_err());
+        assert_eq!(loaded.generation, generation);
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        assert!(!ScanIndex::load(&path).unwrap().decode_holds.is_empty());
+    }
+}
+
+#[test]
+fn lenient_unkeyed_or_unaddressable_debt_refuses_without_rebuild() {
+    for field in [
+        "files",
+        "accepted_snapshot_fingerprints",
+        "quarantined_snapshot_fingerprints",
+        "claude_usage_family_pending",
+    ] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-unkeyed");
+        let path = scratch.as_ref().join("index.json");
+        let mut index = fixture();
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value[field] = Value::Bool(false);
+        let bytes = serde_json::to_vec(&value).unwrap();
+        fs::write(&path, &bytes).unwrap();
+        assert!(ScanIndex::load(&path).is_err());
+        assert!(index.save(&path).is_err());
+        assert!(index.save_with_read_limit(&path, 1024 * 1024).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-unaddressable");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["quarantined_snapshot_fingerprints"]["damaged-identity"] =
+        serde_json::json!({"disposition":"unknown"});
+    let bytes = serde_json::to_vec(&value).unwrap();
+    fs::write(&path, &bytes).unwrap();
+    assert!(ScanIndex::load(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert_eq!(corrupt_count(scratch.as_ref()), 0);
+}
+
+#[test]
+fn lenient_opaque_claude_file_also_freezes_family_correction() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-file-family");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    index.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+    index.files.insert(
+        "/synthetic/family.jsonl".into(),
+        tests::manifest_index_entry(Some(&"a".repeat(64))),
+    );
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["files"]["/synthetic/family.jsonl"]["size_bytes"] = serde_json::json!([]);
+    let bytes = serde_json::to_vec(&value).unwrap();
+    let original = raw_slot(&bytes, "claude_usage_authority_quarantine", "family");
+    fs::write(&path, bytes).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.decode_holds_family("family"));
+    loaded.save(&path).unwrap();
+    assert_eq!(
+        raw_slot(
+            &fs::read(&path).unwrap(),
+            "claude_usage_authority_quarantine",
+            "family"
+        ),
+        original
+    );
+    assert_sibling(&loaded);
+}
+
+#[test]
+fn repaired_records_can_advance_after_load_but_new_cas_damage_still_requires_reload() {
+    for bounded in [false, true] {
+        for changed_again in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-repair-provenance");
+            let path = scratch.as_ref().join("index.json");
+            let fingerprint = "e".repeat(64);
+            let mut index = fixture();
+            index.file_snapshot_fingerprints.insert(
+                "/synthetic/0.jsonl".into(),
+                BTreeSet::from([fingerprint.clone()]),
+            );
+            index
+                .snapshot_activity_at
+                .insert(fingerprint.clone(), Some("2026-10-22T00:00:00Z".into()));
+            index.save(&path).unwrap();
+            let mut value = serde_json::to_value(&index).unwrap();
+            value["quarantined_snapshot_fingerprints"][&fingerprint]
+                ["failed_reconstruction_count"] = serde_json::json!(300);
+            fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+            let mut loaded = ScanIndex::load(&path).unwrap();
+            loaded.retain_quarantined_fingerprints(&BTreeMap::new());
+            loaded.record_accepted_snapshot_fingerprints(&BTreeSet::from([fingerprint.clone()]));
+            assert!(!loaded
+                .quarantined_snapshot_fingerprints
+                .contains_key(&fingerprint));
+            if changed_again {
+                value["quarantined_snapshot_fingerprints"][&fingerprint]
+                    ["failed_reconstruction_count"] = serde_json::json!(400);
+            }
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let generation = loaded.generation;
+            let result = if bounded {
+                loaded.save_with_read_limit(&path, 1024 * 1024)
+            } else {
+                loaded.save(&path)
+            };
+            if changed_again {
+                assert!(result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("current_index_requires_reload"));
+                assert_eq!(fs::read(&path).unwrap(), bytes);
+                assert_eq!(loaded.generation, generation);
+            } else {
+                result.unwrap();
+                let reloaded = ScanIndex::load(&path).unwrap();
+                assert!(reloaded.accepted_snapshot_fingerprint_recorded(&fingerprint));
+                assert!(!reloaded
+                    .quarantined_snapshot_fingerprints
+                    .contains_key(&fingerprint));
+            }
+        }
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-authority-advance");
+        let path = scratch.as_ref().join("index.json");
+        let mut index = fixture();
+        index.insert_retry_pending_claude_authority_for_test("family");
+        index.save(&path).unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["claude_usage_authority_quarantine"]["family"]["failed_reconstruction_count"] =
+            serde_json::json!(300);
+        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        loaded.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
+        if bounded {
+            loaded.save_with_read_limit(&path, 1024 * 1024).unwrap();
+        } else {
+            loaded.save(&path).unwrap();
+        }
+        assert_eq!(
+            ScanIndex::load(&path)
+                .unwrap()
+                .claude_usage_authority_quarantine["family"]
+                .disposition,
+            ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal
+        );
+    }
+}
+
+#[test]
+fn held_entity_finalization_keeps_file_membership_and_never_confirms_empty() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-pending-membership");
+    let path = scratch.as_ref().join("index.json");
+    let mut snapshot = tests::sample_session_artifact_item();
+    snapshot.source_file_fingerprint = Some("source".into());
+    let fingerprint = snapshot_fingerprint(SnapshotSource::Pi, &snapshot);
+    let key = "/synthetic/0.jsonl".to_string();
+    let mut index = fixture();
+    index.files.get_mut(&key).unwrap().last_snapshot_fingerprint = Some("previous-group".into());
+    index
+        .file_snapshot_fingerprints
+        .insert(key.clone(), BTreeSet::from([fingerprint.clone()]));
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["quarantined_snapshot_fingerprints"][&fingerprint] =
+        serde_json::json!({"disposition": "unknown"});
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    let mut empty_index = ScanIndex::default();
+    let mut scan = scan_source_roots_with_test_limit(
+        SnapshotSource::Pi,
+        &[scratch.as_ref().to_path_buf()],
+        &mut empty_index,
+        "2026-10-22T00:00:00Z",
+        BACKFILL_WINDOW_DAYS,
+        4,
+        false,
+    )
+    .unwrap();
+    scan.snapshots = vec![snapshot];
+    scan.pending_finalization.push(PendingIndexFinalization {
+        sampled_audit_verified: false,
+        codex_pending_recovery: false,
+        index_key: key.clone(),
+        source_file_fingerprint: "source".into(),
+        previous_snapshot_fingerprint: Some("previous-group".into()),
+        previous_upload_body_witness: None,
+        parse_complete: true,
+        diagnostic_reason: FileReason::Complete,
+        parsed_snapshot_count: 1,
+        effective_upload_body_witness_revision: 0,
+    });
+    finalize_scan_after_policy(SnapshotSource::Pi, &mut scan, &mut loaded);
+    assert!(scan.snapshots.is_empty());
+    assert!(!scan.census_complete);
+    assert!(!scan.pending_finalization[0].parse_complete);
+    assert!(!loaded.confirmed_empty_files.contains(&key));
+    assert_eq!(
+        loaded.file_snapshot_fingerprints[&key],
+        BTreeSet::from([fingerprint.clone()])
+    );
+    assert_eq!(
+        loaded.files[&key].last_snapshot_fingerprint.as_deref(),
+        Some("previous-group")
+    );
+    loaded.save(&path).unwrap();
+    let restarted = ScanIndex::load(&path).unwrap();
+    assert!(restarted.file_snapshot_fingerprints[&key].contains(&fingerprint));
+    assert!(!restarted.confirmed_empty_files.contains(&key));
+}
+
+#[test]
+fn held_scope_manifest_visits_are_linear_in_file_count() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-keyed-scope");
+    let path = scratch.as_ref().join("index.json");
+    let mut index = fixture();
+    for n in 16..1024 {
+        let key = format!("/synthetic/{n}.jsonl");
+        let fingerprint = format!("{n:064x}");
+        index
+            .files
+            .insert(key.clone(), tests::manifest_index_entry(Some(&fingerprint)));
+        index
+            .file_snapshot_fingerprints
+            .insert(key, BTreeSet::from([fingerprint.clone()]));
+        index
+            .snapshot_activity_at
+            .insert(fingerprint, Some("2026-10-22T00:00:00Z".into()));
+    }
+    index.save(&path).unwrap();
+    let mut value = serde_json::to_value(&index).unwrap();
+    // Many held files catch reverse scans hidden behind one outer lookup.
+    for n in 0..128 {
+        value["files"][format!("/synthetic/{n}.jsonl")] = serde_json::json!({"unknown": 1});
+    }
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(loaded.decode_held_file_keys().count(), 128);
+    lenient_decode::scope_visits_for_test(true);
+    let manifest = loaded
+        .manifest_for_window(
+            SnapshotSource::Pi,
+            "2026-10-01T00:00:00Z",
+            "2026-11-01T00:00:00Z",
+        )
+        .unwrap();
+    assert_eq!(manifest.entity_count, 1024 - 128);
+    assert!(lenient_decode::scope_visits_for_test(false) <= 3 * 1024);
+}
+
+#[test]
+fn controls_refuse_before_excess_damage_can_quarantine_the_index() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-control-priority");
+    let path = scratch.as_ref().join("index.json");
+    for (field, control) in [
+        ("accepted_snapshot_fingerprint_ledger_version", "256"),
+        ("generation", "\"unknown\""),
+        ("codex_parent_proof_seq", "1e400"),
+    ] {
+        let bytes = format!(
+            "{{\"files\":{{\"bad\":{{\"unknown\":\"{}\"}}}},\"{field}\":{control}}}",
+            "x".repeat(32_000)
+        );
+        fs::write(&path, bytes.as_bytes()).unwrap();
+        assert!(ScanIndex::load(&path).is_err());
+        assert_eq!(fs::read(&path).unwrap(), bytes.as_bytes());
+        assert_eq!(corrupt_count(scratch.as_ref()), 0);
+    }
 }

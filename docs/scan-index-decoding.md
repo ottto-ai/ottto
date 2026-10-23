@@ -17,7 +17,9 @@ one eighth of the input, and 4,096 slots per read. Excess damage uses the existi
 load quarantine or CAS error. Syntax/truncation still quarantines on load.
 Malformed schema, generation, ledger or monotone controls refuse with the source
 file unchanged. Ambiguous duplicate fields also refuse. Bounded selected CAS
-keeps its existing byte cap and 8,192-node/depth-64 admission.
+keeps its existing byte cap and 8,192-node/depth-64 admission. A save also checks
+that its output will admit the same holds after restart; if dropping optional
+input would violate that fraction, it refuses with the original file unchanged.
 
 Both CAS readers use the same record policies as load. New opaque debt or an
 incompatible negative-state repair found only at CAS requires reload before a

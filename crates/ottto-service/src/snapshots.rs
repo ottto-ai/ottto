@@ -3967,7 +3967,7 @@ fn claude_index_file_body_accepted(
             .is_some_and(|fingerprints| {
                 !fingerprints.is_empty()
                     && fingerprints.iter().all(|fingerprint| {
-                        !index.decode_holds_entity(fingerprint)
+                        !index.decode_holds_indexed_entity(index_key, fingerprint)
                             && index.accepted_snapshot_fingerprints.contains(fingerprint)
                             && !index
                                 .quarantined_snapshot_fingerprints
@@ -5746,6 +5746,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
         );
     }
 
+    index.preserve_decode_held_files(source, &result.snapshots, &mut result.pending_finalization);
     result
         .snapshots
         .retain(|snapshot| !index.decode_holds_snapshot(source, snapshot));
@@ -24279,6 +24280,7 @@ impl OwnedSourceScan {
                         snapshot.context_curve = None;
                     }
                 }
+                index.preserve_decode_held_files(source, &snapshots, &mut pending_finalization);
                 snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
                 let census_complete = census_complete && index.decode_holds.is_empty();
                 if !index.decode_holds.is_empty() {
@@ -35717,15 +35719,16 @@ impl ScanIndex {
             self.legacy_settlement_reconcile_after_fingerprint = None;
             return (BTreeSet::new(), true);
         }
-        let unarmed = pending
-            .iter()
+        let unarmed = self
+            .eligible_snapshot_fingerprint_refs()
             .filter(|fingerprint| {
-                !self.decode_holds_entity(fingerprint)
+                pending.contains(*fingerprint)
+                    && !self.decode_holds_entity(fingerprint)
                     && !self
                         .quarantined_snapshot_fingerprints
                         .contains_key(*fingerprint)
             })
-            .cloned()
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>();
         if unarmed.is_empty() || limit == 0 {
             return (BTreeSet::new(), false);
@@ -35929,7 +35932,10 @@ impl ScanIndex {
     /// increase. Legacy records have no rejection reason: re-offer current
     /// refusals, preserving accepted marks and absent/superseded disclosures.
     pub(crate) fn prepare_snapshot_admission_reoffer(&mut self, limit: usize) -> bool {
-        let current = self.current_snapshot_fingerprints();
+        let current = self
+            .eligible_snapshot_fingerprint_refs()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let selected = self
             .quarantined_snapshot_fingerprints
             .iter()
@@ -36145,6 +36151,8 @@ impl ScanIndex {
                 .with_context(|| format!("create scan index directory {}", parent.display()))?;
         }
         let _lock = CheckpointLock::acquire(path)?;
+        #[cfg(test)]
+        pause_scan_index_cas_if_requested_for_test();
         if path.exists() {
             let current: Self = match read_limit {
                 Some(cap) => claude_request_census::decode_bounded_index(
@@ -36182,6 +36190,10 @@ impl ScanIndex {
             .generation
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("local snapshot scan index generation overflow"))?;
+        if let Err(error) = lenient_decode::check_held_output(self) {
+            self.generation = previous_generation;
+            return Err(error);
+        }
         // Never truncate the live index in place. The flock serializes new
         // daemons; the v2-only path isolates this state from older daemons.
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -36273,7 +36285,10 @@ impl ScanIndex {
                 "snapshot manifest window must be non-empty and increasing"
             ));
         }
-        let all_fingerprints = self.current_snapshot_fingerprints();
+        let all_fingerprints = self
+            .eligible_snapshot_fingerprint_refs()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>();
         let fingerprints = all_fingerprints
             .iter()
             .map(String::as_str)
@@ -37027,6 +37042,9 @@ impl ScanIndex {
                 && (accepted.contains(fingerprint) || quarantined.contains_key(fingerprint))
         };
         let safe = |key: &String, fingerprint: Option<&str>| {
+            if self.decode_holds_file(key) {
+                return false;
+            }
             if self.confirmed_empty_files.contains(key) {
                 // A newly discovered empty file has no remote entity to lose.
                 // A file that PREVIOUSLY produced an entity is different: a
@@ -76449,3 +76467,24 @@ crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; would_open, w
 mod composition_compactions;
 pub(crate) use composition_compactions::CompositionCompactions;
 pub(crate) mod start_verdict_store;
+
+#[cfg(test)]
+type ScanIndexCasPauseForTest = (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>);
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_CAS_PAUSE: std::cell::RefCell<Option<ScanIndexCasPauseForTest>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+pub(crate) fn pause_next_scan_index_cas_for_test(
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+) {
+    SCAN_INDEX_CAS_PAUSE.with(|pause| *pause.borrow_mut() = Some((entered, resume)));
+}
+#[cfg(test)]
+fn pause_scan_index_cas_if_requested_for_test() {
+    if let Some((entered, resume)) = SCAN_INDEX_CAS_PAUSE.with(|pause| pause.borrow_mut().take()) {
+        entered.send(()).expect("CAS observer");
+        resume.recv().expect("CAS release");
+    }
+}
