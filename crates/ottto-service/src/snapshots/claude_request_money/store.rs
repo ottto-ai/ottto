@@ -1498,6 +1498,84 @@ mod bounded_save_tests {
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
+    fn deferred_deadline_row_gets_full_digest_and_no_basis_before_ack() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-deferred-deadline");
+        let now = super::super::now_unix();
+        let snapshot = 123;
+        let root = "unreached-root";
+        let state = super::super::FamilyCensus::Unknown(
+            super::super::coverage::CensusReason::StrongViewUnavailable,
+        );
+        let memo = PendingMemo {
+            key: super::super::family_key(root),
+            basis: None,
+            observed_unix: 0,
+            published: super::super::ClaudeFamilyPublication {
+                utc_day: super::super::utc_day(now),
+                digest: 0,
+                epoch: 1,
+                attempted: now,
+            },
+            row: true,
+            deferred: Some((root.to_owned(), state.clone())),
+        };
+        let reservation = ShadowReservation::admit(super::super::FAMILY_BYTES).unwrap();
+        let job = WriteJob {
+            support_dir: scratch.to_path_buf(),
+            jsonl: JsonlBatch {
+                now,
+                fault: super::super::PageFault::None,
+                families: Vec::with_capacity(1),
+                coverage: super::super::CoverageRow {
+                    snapshot,
+                    page_families: 1,
+                    families: 1,
+                    failed: 1,
+                    ..super::super::CoverageRow::owed(now)
+                },
+                buffer_bytes: 0,
+            },
+            memos: vec![memo],
+            save: None,
+            reservations: vec![reservation],
+        };
+        let (_, result) = write(job, &mut WriterState::default());
+        assert!(result.jsonl.published);
+        assert_eq!(result.jsonl.rows, 2);
+        let memo = &result.memos[0];
+        assert!(memo.deferred.is_none());
+        assert!(memo.basis.is_none());
+        assert_eq!(memo.observed_unix, 0, "unreached turn remains first");
+        let mut expected = super::super::failure_rows(
+            root,
+            "deadline",
+            state,
+            now,
+            snapshot,
+            &ClaudeLedger::empty(false),
+            &mut Default::default(),
+        );
+        assert_eq!(
+            memo.published.digest,
+            super::super::semantic_digest(&mut expected)
+        );
+        let bytes = std::fs::read_to_string(scratch.join("diagnostics").join(format!(
+            "claude-request-money-shadow-{}.jsonl",
+            super::super::day_stamp(now).unwrap()
+        )))
+        .unwrap();
+        let rows = bytes
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0]["p1_reasons"], serde_json::json!(["deadline"]));
+        assert_eq!(rows[0]["old_available"], false);
+        assert_eq!(rows[0]["coverage_complete"], false);
+        assert_eq!(rows[0]["grains"], 0);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
     fn queued_or_dropped_save_reservation_survives_restart_and_corruption_seals_day() {
         let dir = std::env::temp_dir().join(format!(
             "ottto-budget-reserve-{}",
