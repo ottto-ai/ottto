@@ -37,7 +37,13 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   removed in place; absence earns no acceptance, and a present held family
   stays held. The check is one pass over that membership evidence into a set
   of borrowed roots, at most one per RetryPending record, priced against the
-  parked overlap budget first; a refused price retires nothing.
+  parked overlap budget first. When that price is refused (an unsupported
+  heap layout, which also disables native comparison, or an over-budget
+  count), an allocation-free fallback applies the same rule to at most 16
+  RetryPending roots per raw-complete census, using fixed-size stack arrays,
+  and resumes from a runtime-only cursor (never persisted; a restart begins
+  at the first root). Every root is checked within ceil(P / 16) raw-complete
+  censuses of one process, so retirement never depends on the priced path.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -77,8 +83,11 @@ Ordinary-fallback absence tests (native comparison absent) retire a wholly
 removed RetryPending family and its pending on a single-page traversal and
 after a parent-present removal. Controls keep the family, its pending and the
 withheld census when it is still present, when only a subagent transcript is
-left, when its only member is observed but unindexed residue after a replay
-reset, and when the retirement scratch is refused.
+left, and when its only member is observed but unindexed residue after a replay
+reset. With the retirement scratch refused for the whole test, an absent
+family still retires on its first raw-complete census and a present one stays
+held; a unit test walks 40 roots through the fallback cursor in 16-root
+windows.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

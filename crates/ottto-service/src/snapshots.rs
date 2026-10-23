@@ -7757,6 +7757,50 @@ fn claude_absent_family_scratch_admitted(retry_pending_roots: usize) -> bool {
     crate::heap_layout_bound::tree_nodes::<&str, ()>(retry_pending_roots, &mut cost).is_some()
 }
 
+/// Most RetryPending roots one raw-complete Claude census checks on the
+/// allocation-free absent-family fallback, used whenever the fast path's
+/// scratch is not admitted (an unsupported heap layout, which also disables
+/// native comparison, or a price over the parked budget). Retirement is a
+/// liveness repair, so it cannot depend on that optional fast path alone.
+/// With P RetryPending roots, every root is checked within ceil(P / 16)
+/// raw-complete censuses of one process.
+const MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS: usize = 16;
+
+/// Runtime-only resume position of the fallback: the ordinal, in root order
+/// among RetryPending records, at which the next raw-complete census starts
+/// checking. Never persisted or serialized, and no index field: a restart
+/// starts again at the first root, and progress resumes from there. An
+/// ordinal rather than a root key keeps the cursor free of any owned copy.
+#[cfg(not(test))]
+static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+fn claude_absent_family_fallback_cursor() -> usize {
+    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+fn claude_absent_family_fallback_cursor() -> usize {
+    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn set_claude_absent_family_fallback_cursor(cursor: usize) {
+    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR.store(cursor, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+fn set_claude_absent_family_fallback_cursor(cursor: usize) {
+    CLAUDE_ABSENT_FAMILY_FALLBACK_CURSOR_FOR_TEST.with(|cell| cell.set(cursor));
+}
+
 /// Proven families of one complete closed-fence terminal whose earlier-page
 /// members need no replay, as `root -> true`. Every member of such a family
 /// was parsed in this census window under the same witness this terminal
@@ -35461,15 +35505,23 @@ impl ScanIndex {
     /// Cost: one pass over the existing membership evidence, probing the
     /// quarantine by borrowed root, into a scratch set of borrowed roots that
     /// holds at most one entry per RetryPending record and is priced before
-    /// use. A refused price retires nothing, which keeps every family held.
+    /// use. A refused price takes the bounded allocation-free fallback below
+    /// instead, so retirement never depends on the priced fast path.
     fn retire_absent_retry_pending_claude_families(
         &mut self,
         observed_index_keys: &BTreeSet<String>,
         residue_index_keys: &BTreeSet<String>,
     ) -> usize {
         let retry_pending = self.claude_usage_authority_pending_count();
-        if retry_pending == 0 || !claude_absent_family_scratch_admitted(retry_pending) {
+        if retry_pending == 0 {
             return 0;
+        }
+        if !claude_absent_family_scratch_admitted(retry_pending) {
+            return self.retire_absent_retry_pending_claude_families_bounded(
+                retry_pending,
+                observed_index_keys,
+                residue_index_keys,
+            );
         }
         let quarantine = &self.claude_usage_authority_quarantine;
         let mut present = BTreeSet::<&str>::new();
@@ -35504,6 +35556,93 @@ impl ScanIndex {
                 }
                 !absent
             });
+        retired
+    }
+
+    /// The allocation-free fallback of
+    /// `retire_absent_retry_pending_claude_families`: the same membership rule
+    /// (indexed, observed or residue), the same raw-complete caller and the
+    /// same mutation (only an absent root's record and pending entry, removed
+    /// in place), over a bounded window of at most
+    /// `MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS` RetryPending roots that
+    /// starts at the runtime cursor and wraps around.
+    ///
+    /// No heap allocation: the window's borrowed roots and their presence
+    /// flags live in fixed-size stack arrays. CPU per census is one pass over
+    /// the quarantine to fill the window, one pass over the F + O + R
+    /// membership keys (one borrowed path parse each, compared with at most K
+    /// window roots, so O(K x (F + O + R)) comparisons), and one retain pass.
+    /// A sorted range lookup cannot replace the key pass: index keys are full
+    /// paths ordered by directory, and the family root is a file stem or the
+    /// directory above `subagents`, never a key prefix.
+    fn retire_absent_retry_pending_claude_families_bounded(
+        &mut self,
+        retry_pending: usize,
+        observed_index_keys: &BTreeSet<String>,
+        residue_index_keys: &BTreeSet<String>,
+    ) -> usize {
+        let start = claude_absent_family_fallback_cursor() % retry_pending;
+        let checks = retry_pending.min(MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS);
+        let next = (start + checks) % retry_pending;
+        // Window position of a RetryPending ordinal, if this census checks it.
+        let window_position = |ordinal: usize| {
+            let position = (ordinal + retry_pending - start) % retry_pending;
+            (position < checks).then_some(position)
+        };
+        let mut roots = [""; MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS];
+        for (ordinal, root_session_id) in self
+            .claude_usage_authority_quarantine
+            .iter()
+            .filter(|(_, record)| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+            })
+            .map(|(root_session_id, _)| root_session_id.as_str())
+            .enumerate()
+        {
+            if let Some(position) = window_position(ordinal) {
+                roots[position] = root_session_id;
+            }
+        }
+        let mut present = [false; MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS];
+        for index_key in self
+            .files
+            .keys()
+            .chain(observed_index_keys)
+            .chain(residue_index_keys)
+        {
+            if present[..checks].iter().all(|found| *found) {
+                break;
+            }
+            let Some(member) = claude_index_path_member_ref(Path::new(index_key)) else {
+                continue;
+            };
+            for (found, root_session_id) in present[..checks].iter_mut().zip(&roots[..checks]) {
+                *found |= *root_session_id == member.root;
+            }
+        }
+        let family_pending = &mut self.claude_usage_family_pending;
+        let mut ordinal = 0;
+        let mut retired = 0;
+        let mut resume = 0;
+        self.claude_usage_authority_quarantine
+            .retain(|root_session_id, record| {
+                if record.disposition != ClaudeUsageAuthorityQuarantineDisposition::RetryPending {
+                    return true;
+                }
+                let this = ordinal;
+                ordinal += 1;
+                let absent = window_position(this).is_some_and(|position| !present[position]);
+                if absent {
+                    family_pending.remove(root_session_id);
+                    retired += 1;
+                } else if this < next {
+                    resume += 1;
+                }
+                !absent
+            });
+        // The next census starts at the first root this one did not check,
+        // in the order left after these retirements.
+        set_claude_absent_family_fallback_cursor(resume);
         retired
     }
 

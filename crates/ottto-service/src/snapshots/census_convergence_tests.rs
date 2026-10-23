@@ -1384,3 +1384,60 @@ fn p12_experimental_base_exit_duplicate_fence_full_coverage_oracle() {
     assert_eq!(scope.counts().rearm_suppressed, 0);
     writeln!(std::io::stderr().lock(), "p12_oracle: name=claude_duplicate_fence_reopens_only_after_full_coverage mode=experimental_base_exit_no_reuse status=PASS original_assertions_unchanged=true eligible_reuse_proved=false").unwrap();
 }
+
+// Re-review r3 (path-(a) bridge): with the absent-family scratch refused for
+// the whole test, more RetryPending roots than one fallback window all get
+// checked through the runtime cursor. Absent roots retire with their pending
+// entries, at most one window per raw-complete census; roots whose member is
+// observed (root transcript or subagent) or residue stay held.
+#[test]
+fn bounded_absence_fallback_checks_every_retry_pending_root_through_its_cursor() {
+    let _refuse = RefuseClaudeAbsentFamilyScratchForTest::new();
+    let window = MAX_CLAUDE_ABSENT_FAMILY_FALLBACK_ROOTS;
+    assert_eq!(window, 16);
+    let roots = (0..40).map(|n| format!("root-{n:02}")).collect::<Vec<_>>();
+    let mut index = ScanIndex::default();
+    for root in &roots {
+        index.insert_retry_pending_claude_authority_for_test(root);
+        index.insert_claude_usage_family_pending_for_test(root, OLDER_WINDOW);
+    }
+    // An unrelated terminal record is neither counted nor touched.
+    index.insert_claude_authority_for_test(
+        "terminal-root",
+        &hex64('9'),
+        ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal,
+    );
+    assert_eq!(index.claude_usage_authority_pending_count(), roots.len());
+    let observed = BTreeSet::from([
+        "/synthetic/projects/p/root-05.jsonl".to_string(),
+        "/synthetic/projects/p/root-38/subagents/agent-a1.jsonl".to_string(),
+    ]);
+    let residue = BTreeSet::from(["/synthetic/projects/q/root-20.jsonl".to_string()]);
+    let present = ["root-05", "root-20", "root-38"];
+    // Windows: roots 00-15 (05 present), then 16-31 after the kept 05 (20
+    // present), then the ten left, wrapping (38 present).
+    let mut retired_per_census = Vec::new();
+    for _ in 0..4 {
+        retired_per_census
+            .push(index.retire_absent_retry_pending_claude_families(&observed, &residue));
+    }
+    assert_eq!(retired_per_census, vec![15, 15, 7, 0]);
+    assert!(retired_per_census.iter().all(|retired| *retired <= window));
+    assert_eq!(index.claude_usage_authority_pending_count(), present.len());
+    for root in &roots {
+        let held = present.contains(&root.as_str());
+        assert_eq!(
+            index.claude_authority_record_for_test(root).is_some(),
+            held,
+            "{root}"
+        );
+        assert_eq!(
+            index.claude_usage_family_pending_retained_for_test(root),
+            held,
+            "{root}"
+        );
+    }
+    assert!(index
+        .claude_authority_record_for_test("terminal-root")
+        .is_some_and(|record| record.terminal));
+}

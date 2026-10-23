@@ -2619,13 +2619,16 @@ fn retry_pending_family_with_only_a_subagent_left_stays_held() {
     );
 }
 
-/// Re-review r2-F1b: the retirement scratch is priced before use, and a
-/// refused price fails closed. The absent family stays held and the census
-/// withheld until a census whose scratch is admitted retires it.
+/// Re-review r3: a scratch refusal that never clears (the unsupported-layout
+/// path, where native comparison is also off) still retires an absent
+/// family. The bounded allocation-free fallback checks it on the first
+/// raw-complete census (one RetryPending root is within one window), so the
+/// debt retires and the census completes on the first walk.
 #[test]
 #[serial(source_manifests)]
-fn refused_absence_scratch_keeps_an_absent_family_held() {
+fn persistently_refused_absence_scratch_still_retires_an_absent_family() {
     let _source_manifests = SourceManifestTestGuard::new();
+    let _refuse = crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new();
     let mut fixture = PipelineFixture::new("patha-absent-retry-pending-refused-scratch");
     let baseline = fixture.baseline();
     let session = PIPELINE_SESSIONS[2];
@@ -2634,15 +2637,34 @@ fn refused_absence_scratch_keeps_an_absent_family_held() {
     std::fs::remove_file(fixture.root.join(format!("{session}.jsonl")))
         .expect("remove the held family's only member");
     fixture.page_files = 8;
-    let refused = {
-        let _refuse = crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new();
-        fixture.walk(9, &ABSENCE_CYCLE)
-    };
-    assert_present_family_held(
-        refused.last().expect("terminal page"),
-        session,
-        "refused scratch",
+    let traversals = walk_until_census_complete(&fixture, 9, 3);
+    assert_eq!(
+        traversals.len(),
+        1,
+        "the fallback retires the debt on the first raw-complete census"
     );
-    let traversals = walk_until_census_complete(&fixture, 10, 3);
-    assert_absent_family_retired(&traversals, &baseline, session, "admitted scratch");
+    assert_eq!(traversals[0].len(), 1, "a single-page traversal");
+    assert_absent_family_retired(&traversals, &baseline, session, "refused scratch");
+}
+
+/// Re-review r3 control: under the same persistent refusal, a present family
+/// stays held across raw-complete censuses; the fallback finds its member.
+#[test]
+#[serial(source_manifests)]
+fn persistently_refused_absence_scratch_keeps_a_present_family_held() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let _refuse = crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new();
+    let mut fixture = PipelineFixture::new("patha-present-retry-pending-refused-scratch");
+    let baseline = fixture.baseline();
+    let session = PIPELINE_SESSIONS[2];
+    fixture.seed_retry_pending_authority(session);
+    fixture.seed_retry_pending_family_pending(session);
+    fixture.page_files = 8;
+    let key = PipelineFixture::key(&baseline, session);
+    for hour in [9, 10] {
+        let pages = fixture.walk(hour, &ABSENCE_CYCLE);
+        let last = pages.last().expect("terminal page");
+        assert!(last.index.files.contains_key(&key), "walk {hour}");
+        assert_present_family_held(last, session, &format!("refused scratch, walk {hour}"));
+    }
 }
