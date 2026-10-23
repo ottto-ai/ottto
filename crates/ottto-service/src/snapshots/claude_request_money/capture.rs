@@ -419,6 +419,9 @@ impl ClaudeResponseCapture {
     }
 
     fn record_displaced(&mut self, request_hash: u64, prior: &ClaudeTranscriptUsageOccurrence) {
+        if !self.charge_unit_input(prior.timestamp.as_deref(), prior.model.as_deref()) {
+            return;
+        }
         self.push_unit(CapturedUnit {
             kind: CapturedKind::Displaced(request_hash),
             sequence: prior.sequence,
@@ -448,6 +451,9 @@ impl ClaudeResponseCapture {
         timestamp: Option<&str>,
         model: Option<&str>,
     ) {
+        if !self.charge_unit_input(timestamp, model) {
+            return;
+        }
         let kind = match self.message(sequence) {
             Some(hash) => CapturedKind::Message(hash),
             None => CapturedKind::Idless,
@@ -464,6 +470,17 @@ impl ClaudeResponseCapture {
 
     pub(crate) fn units(&self) -> &[CapturedUnit] {
         &self.units
+    }
+
+    fn charge_unit_input(&mut self, timestamp: Option<&str>, model: Option<&str>) -> bool {
+        let bytes = timestamp
+            .map_or(0, str::len)
+            .saturating_add(model.map_or(0, str::len));
+        if bytes > 16 * 1024 || !spend_work(&self.scope, bytes, 1) {
+            self.refuse();
+            return false;
+        }
+        true
     }
 
     /// Sorted unique message-only hashes (the ledger's `mh:` record).
@@ -594,6 +611,7 @@ mod bounded_tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
     fn cumulative_work_does_not_refund_when_a_capture_drops() {
         let scope = PathBuf::from("cumulative-capture-budget-fixture");
         begin_page(&scope);
@@ -615,6 +633,7 @@ mod bounded_tests {
     }
 
     #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
     fn giant_ids_and_selectors_are_refused_before_comparison_or_hashing() {
         let scope = PathBuf::from("capture-input-fixture");
         begin_page(&scope);
@@ -634,5 +653,45 @@ mod bounded_tests {
         capture.place(0, "hour", "model", &selector, &[]);
         assert!(capture.refused);
         assert!(capture.rows.is_empty());
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn saturated_capture_with_occupied_outbox_stays_in_separate_limits() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-occupied-outbox");
+        let paused = super::super::store::pause_for_test();
+        let now = super::super::now_unix();
+        for _ in 0..4 {
+            let reservation = super::super::ShadowReservation::admit(8 * 1024 * 1024).unwrap();
+            let job = super::super::store::WriteJob {
+                support_dir: scratch.to_path_buf(),
+                jsonl: super::super::JsonlBatch {
+                    now,
+                    fault: super::super::PageFault::None,
+                    families: Vec::new(),
+                    coverage: super::super::CoverageRow::owed(now),
+                    buffer_bytes: 0,
+                },
+                memos: Vec::new(),
+                save: None,
+                reservations: vec![reservation],
+            };
+            assert!(super::super::store::submit_unledgered(job).is_ok());
+        }
+        let mut occupied = Funds::default();
+        assert!(occupied.spend(CAPTURE_CEILING_BYTES));
+        let scope = scratch.to_path_buf();
+        begin_page(&scope);
+        let mut capture = ClaudeResponseCapture {
+            scope,
+            ..Default::default()
+        };
+        capture.note_messages(std::iter::once((0, "message")));
+        assert!(capture.is_refused());
+        assert_eq!(capture_reserved(), CAPTURE_CEILING_BYTES);
+        assert_eq!(super::super::reserved_for_test(), 32 * 1024 * 1024);
+        println!("MONEY_P1B_OUTBOX queued_transient=33554432 capture_resident={} capture_cap={} transient_cap=67108864", capture_reserved(), CAPTURE_CEILING_BYTES);
+        drop((capture, occupied, paused));
+        super::super::store::flush();
+        assert_eq!(super::super::reserved_for_test(), 0);
     }
 }

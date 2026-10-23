@@ -2614,20 +2614,10 @@ fn note_unclean_run(support_dir: &Path, observed: u64) -> bool {
         for day in (first.max(observed.saturating_sub(6 * 86_400)) / 86_400)
             ..=(last.min(observed) / 86_400)
         {
-            owe_coverage(support_dir, day * 86_400, true);
-            persisted &= owed_path(
-                &support_dir.join("diagnostics"),
-                &day_stamp(day * 86_400).unwrap_or_default(),
-            )
-            .is_file();
+            persisted &= owe_coverage(support_dir, day * 86_400, true);
         }
     } else if path.exists() {
-        owe_coverage(support_dir, observed, true);
-        persisted = owed_path(
-            &support_dir.join("diagnostics"),
-            &day_stamp(observed).unwrap_or_default(),
-        )
-        .is_file();
+        persisted = owe_coverage(support_dir, observed, true);
     }
     persisted
 }
@@ -2669,15 +2659,25 @@ fn owed_path(dir: &Path, day: &str) -> PathBuf {
 /// writes a false coverage row there. `durable` (the writer thread only)
 /// also writes the day's marker, a few bytes, once per owing day (a later
 /// debt of the same day keeps it).
-fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
+fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) -> bool {
     let Some(day) = day_stamp(observed_unix) else {
-        return;
+        return false;
     };
     let dir = support_dir.join("diagnostics");
     let marker = owed_path(&dir, &day);
-    if durable && !marker.exists() && std::fs::create_dir_all(&dir).is_ok() {
-        let _ = store::write_atomic(&marker, observed_unix.to_string().as_bytes());
-    }
+    let persisted = if durable && std::fs::create_dir_all(&dir).is_ok() {
+        // Existence cannot prove durability after a failed directory sync.
+        // Retry the atomic write and propagate its actual sync result.
+        let earliest = std::fs::metadata(&marker)
+            .ok()
+            .filter(|meta| meta.len() <= 32)
+            .and_then(|_| std::fs::read_to_string(&marker).ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .map_or(observed_unix, |old| old.min(observed_unix));
+        store::write_atomic(&marker, earliest.to_string().as_bytes())
+    } else {
+        false
+    };
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
         let slot = owed
             .entry(support_dir.to_path_buf())
@@ -2689,6 +2689,7 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
     if !durable {
         store::wake_writer();
     }
+    persisted
 }
 
 /// A false row of `day` is on disk: its debt is settled.
@@ -2807,6 +2808,9 @@ fn ends_with_seal(path: &Path) -> bool {
         .find(|line| !line.is_empty())
         .and_then(|line| serde_json::from_slice::<Seal>(line).ok())
         .is_some_and(|row| row.row == "page" && row.truncated)
+        && file.sync_all().is_ok()
+        && std::fs::File::open(path.parent().unwrap_or(Path::new(".")))
+            .is_ok_and(|dir| dir.sync_all().is_ok())
 }
 
 /// Rows appended to one day's file, each serialized straight into the
@@ -2957,7 +2961,10 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
     if file.sealed || file.size > room {
-        // A terminal PARTIAL row already seals this day. Never append past it.
+        // A synced terminal row already discharges any false-row debt.
+        if file.sealed {
+            settle_owed(&dir, &today);
+        }
         outcome.truncated = rows;
         return outcome;
     }
@@ -3010,6 +3017,9 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
         let sealed = file.push_false(&seal) && file.finish();
         outcome.truncated = rows;
         outcome.sealed = u64::from(sealed);
+        if sealed {
+            settle_owed(&dir, &today);
+        }
         if !sealed {
             outcome.failed += 1;
             owe_coverage(support_dir, now, true);
@@ -3156,5 +3166,23 @@ mod seal_tests {
         assert!(!reopened.push(&CoverageRow::owed(1_786_000_001)));
         assert!(reopened.finish());
         assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn recovery_keeps_previous_intent_when_an_existing_debt_cannot_be_synced() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-recovery-debt-sync");
+        let now = 1_786_000_000;
+        assert!(open_run_marker(&scratch, (now, now)));
+        assert!(owe_coverage(&scratch, now, true));
+        let marker = owed_path(&scratch.join("diagnostics"), &day_stamp(now).unwrap());
+        // An earlier failed directory sync may leave a visible marker. Force
+        // its retry to fail: mere existence must not allow intent replacement.
+        let staged = marker.with_extension("json.tmp");
+        std::fs::create_dir(&staged).unwrap();
+        let before = std::fs::read(scratch.join(RUN_MARKER)).unwrap();
+        assert!(!note_unclean_run(&scratch, now + 86_400));
+        assert_eq!(std::fs::read(scratch.join(RUN_MARKER)).unwrap(), before);
+        std::fs::remove_dir(staged).unwrap();
+        assert!(note_unclean_run(&scratch, now + 86_400));
     }
 }

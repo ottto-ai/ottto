@@ -534,6 +534,8 @@ enum Job {
     Write(Box<WriteJob>),
     #[cfg(test)]
     Flush(SyncSender<()>),
+    #[cfg(test)]
+    Pause(SyncSender<()>, Receiver<()>),
     /// A restart of the writer's state of a directory (a new process).
     #[cfg(test)]
     Restart(PathBuf),
@@ -848,6 +850,11 @@ fn run_writer(receiver: Receiver<Job>) {
                 }
             }
             #[cfg(test)]
+            Job::Pause(ready, resume) => {
+                let _ = ready.send(());
+                let _ = resume.recv();
+            }
+            #[cfg(test)]
             Job::Flush(done) => {
                 super::persist_coverage_debt();
                 let _ = done.send(());
@@ -1122,6 +1129,29 @@ pub(crate) fn flush() {
     if sent {
         let _ = wait.recv();
     }
+}
+
+/// Block the writer so a fixture can fill its bounded outbox deterministically.
+#[cfg(test)]
+pub(crate) struct PausedWriter(SyncSender<()>);
+#[cfg(test)]
+impl Drop for PausedWriter {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+#[cfg(test)]
+pub(crate) fn pause_for_test() -> PausedWriter {
+    let (ready, entered) = sync_channel(0);
+    let (resume, wait) = sync_channel(0);
+    writer()
+        .expect("writer")
+        .lock()
+        .unwrap()
+        .send(Job::Pause(ready, wait))
+        .unwrap_or_else(|_| panic!("pause writer"));
+    entered.recv().unwrap();
+    PausedWriter(resume)
 }
 
 /// Forget the in-memory ledger of `support_dir` (a restart): the next page
