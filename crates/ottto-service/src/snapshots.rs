@@ -14859,6 +14859,22 @@ impl SnapshotAccumulator {
     ///   dropped field names, their sort and `join`, one `to_vec` buffer
     ///   escaped 6x) is charged by `fact_limit_scratch_bound` in K, at its
     ///   caps; no residual relies on the item's slack (c22, r33).
+    /// - `SessionStartState::finish`'s stable sort of the arrived files: no
+    ///   allocation below 21 files, else at most `max(len, 48)` slots of
+    ///   `(String, usize, OpeningFileState)`, at most 3x the `files` map's
+    ///   own entry storage from 21 entries on. That map is accumulator
+    ///   state, so D/M's `3*(accumulator - book)` covers it; U2 charges the
+    ///   collected vector and the candidates.
+    /// - `claude_buffered_request_hashes` (itemless Claude files only, built
+    ///   just before `finish` and live across it): one `u64` per book record
+    ///   with a request id, grown by doubling, so at most 24 B per record;
+    ///   at most 4,096 records per response and 65,536 per file
+    ///   (`MAX_CLAUDE_RECORDS_PER_RESPONSE`, `_PER_FILE`), so at most
+    ///   1,572,864 B. R charges every resolved response at least 6
+    ///   `(RowKey, BucketRowAccumulator)` nodes (37,488 B), which covers the
+    ///   vector while each response holds at most 1,562 records. A response
+    ///   with more records, or one past the record limit (R charges it
+    ///   nothing), is not dominated by a named term (#665 r34, open).
     fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
         use crate::heap_layout_bound::tree_node_bytes;
         use crate::session_attribution::{
@@ -15901,7 +15917,9 @@ struct FinishOutputInput<'a> {
 
 /// A fact's `field`, `kind` and `strength` are literals at their call sites
 /// (every `push_fact`/`push_labeled_fact` caller in `session_attribution.rs`
-/// passes one; the longest is 22 bytes).
+/// passes one; the longest is 22 bytes). The contract is stated at
+/// `push_labeled_fact`: `'static` literals of at most 64 bytes; raise this
+/// first for a longer or dynamic one.
 const FACT_LITERAL_BYTES: usize = 64;
 /// Keys and punctuation of one serialized fact, at most 161 bytes: ten keys
 /// (100 bytes) with their quotes and colons (30), the quotes of nine strings

@@ -1984,6 +1984,11 @@ fn refusals(counts: &Counts) -> u64 {
 /// prefix's last entry (a non-boundary target), so the execute room's few
 /// hundred bytes (N5 (a)) cannot move the count.
 fn expected_victims(run: &MaRun) -> Vec<String> {
+    // At 99f72169 the measured companion's need' (13,428,400) sits 370,784 B
+    // below the two-filler prefix's 13,799,184: 108,640 B of need' beyond
+    // this margin, so about 54 KB of X_out headroom (need' grows by twice
+    // X_out). K/U growth past that trips this precondition loudly; then
+    // recalibrate the filler sizes, not the margin.
     const MARGIN: usize = 256 * 1024;
     let receipt = run.receipt();
     let rank = run.probe.rank.expect("the copy's rank");
@@ -2100,7 +2105,8 @@ fn cache_policy_m_a_provable_fit_releases_exactly_the_copy_only_prefix() {
 }
 
 /// T8's measured companion (R2-3): the same fixture proving with the X_out
-/// `x_out_for` measures (no `set_x_out`), as production does.
+/// `x_out_for` measures (no `set_x_out`), as production does. Its X_out
+/// headroom against `expected_victims`' `MARGIN` is about 54 KB (see there).
 #[test]
 fn cache_policy_m_a_measured_x_out_releases_exactly_the_copy_only_prefix() {
     if unexecuted("M_a_T8_measured") {

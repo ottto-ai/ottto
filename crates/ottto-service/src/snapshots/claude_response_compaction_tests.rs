@@ -1915,9 +1915,10 @@ fn x_out_t1_bounds_a_finish_with_attribution_and_identity_evidence() {
     );
 }
 
-/// fresh-r1 N1: `finish`'s semantic JSON (`snapshot_fingerprint`) and the
-/// fact-limit buffer have no X_out term of their own; the per-row node
-/// charge covers them (`finish_output_bound`'s doc). A few hundred tiny rows
+/// fresh-r1 N1: `finish`'s semantic JSON (`snapshot_fingerprint`) has no
+/// X_out term of its own; the per-row node charge covers it
+/// (`finish_output_bound`'s doc). The fact-limit scratch is charged by
+/// `fact_limit_scratch_bound` (r33). A few hundred tiny rows
 /// that exist before `finish` (one model each, so each is its own row; the
 /// rows' smallest per-row charge), with the attribution context on: every
 /// allocation born in `finish` is within X_out plus the decode peak (T6),
