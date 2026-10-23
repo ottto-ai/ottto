@@ -2989,76 +2989,105 @@ fn absent_retry_pending_family_is_kept_on_an_index_loaded_fresh_in_this_process(
     assert_absent_family_retired(&traversals, &baseline, session, "after a restart");
 }
 
-/// SOURCE Round 11 tombstone: a retired family's member that reappears (a
-/// restored file) is never ingested as a new file. Each traversal holds it
-/// before any read and counts a tombstone hit; it is never parsed, offered,
-/// uploaded, accepted or indexed, and the census still completes.
+/// SOURCE/COST/SI Round 12 tombstone, never-proving case: a retired family's
+/// member that returns (a restored file) is never read as a new file and
+/// never skipped forever. It re-enters the family's authority path against
+/// the witness the tombstone retained: each changed revision is read, held
+/// (nothing offered, uploaded or accepted) and counted as one more
+/// RetryPending failure, until the bounded terminal at the existing failure
+/// cap. The tombstone, the witness and the terminal record stay; every
+/// sighting counts as a tombstone hit.
 #[test]
 #[serial(source_manifests)]
-fn retired_family_member_that_reappears_is_held_by_its_tombstone() {
+fn returning_member_that_never_reproves_is_held_until_its_bounded_terminal() {
     let _source_manifests = SourceManifestTestGuard::new();
-    let mut fixture = PipelineFixture::new("patha-tombstone-reappearance");
+    let mut fixture = PipelineFixture::new("patha-tombstone-never-reproves");
     let session = PIPELINE_SESSIONS[2];
     let baseline = fixture.absent_retry_pending_family(session);
+    let witness = ScanIndex::load(&fixture.index_path)
+        .expect("load scan index")
+        .claude_usage_family_witness_digest_for_test(session)
+        .expect("the seeded family keeps its witness");
     let traversals = walk_until_census_complete(&fixture, 9, 3);
-    assert_absent_family_retired(&traversals, &baseline, session, "before reappearance");
+    assert_absent_family_retired(&traversals, &baseline, session, "before the return");
     let retired = traversals
         .last()
         .and_then(|pages| pages.last())
         .expect("terminal page");
     assert!(retired.index.claude_family_tombstoned_for_test(session));
-    let removed_key = PipelineFixture::key(&baseline, session);
+    assert_eq!(
+        retired
+            .index
+            .claude_usage_family_witness_digest_for_test(session),
+        Some(witness.clone()),
+        "a tombstoned family keeps its witness through the complete census"
+    );
     let member = fixture.root.join(format!("{session}.jsonl"));
-    // The restored file: its original body plus a later response.
-    std::fs::write(
-        &member,
-        pipeline_transcript_line(session, "req_2_1", 0)
-            + &pipeline_transcript_line(session, "req_2_restored", 30),
-    )
-    .expect("restore the retired family's member");
-    for hour in [12, 13] {
-        let hits_before = crate::snapshots::claude_absence_counters_for_test().tombstone_hits;
-        let pages = fixture.walk(hour, &ABSENCE_CYCLE);
-        let shape = format!("reappeared, walk {hour}");
+    std::fs::write(&member, pipeline_transcript_line(session, "req_2_1", 0))
+        .expect("restore the retired family's member");
+    let max = crate::snapshots::MAX_CLAUDE_USAGE_AUTHORITY_FAILURES_FOR_TEST;
+    let hits_before = crate::snapshots::claude_absence_counters_for_test().tombstone_hits;
+    let mut failures = Vec::new();
+    for step in 0..u32::from(max) {
+        if step > 0 {
+            // A changed revision is due at once; an unchanged one waits for
+            // its retry deadline like any held member.
+            fixture.append(session, &format!("req_2_return_{step}"));
+        }
+        let pages = fixture.walk(12 + step, &ABSENCE_CYCLE);
+        let shape = format!("return {step}");
         for page in &pages {
-            assert!(
-                page.scan
-                    .snapshots
-                    .iter()
-                    .all(|snapshot| snapshot.source_session_id != session),
-                "{shape}: the tombstoned member is never parsed or offered"
-            );
-            assert!(
-                page.uploaded
-                    .is_disjoint(&baseline.file_snapshot_fingerprints[&removed_key]),
-                "{shape}: zero uploads for the tombstoned family"
-            );
-            assert!(
-                page.progress
-                    .accepted_fingerprints
-                    .is_disjoint(&baseline.file_snapshot_fingerprints[&removed_key]),
-                "{shape}: never accepted"
-            );
+            for item in page
+                .scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == session)
+            {
+                assert!(
+                    !page.uploaded.contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is uploaded before a proof"
+                );
+                assert!(
+                    !page
+                        .progress
+                        .accepted_fingerprints
+                        .contains(&item.snapshot_fingerprint),
+                    "{shape}: nothing is accepted before a proof"
+                );
+            }
         }
         let last = pages.last().expect("terminal page");
-        assert!(
-            !last.index.files.contains_key(&removed_key),
-            "{shape}: never indexed as a new file"
-        );
-        assert!(last
+        let record = last
             .index
             .claude_authority_record_for_test(session)
-            .is_none());
+            .unwrap_or_else(|| panic!("{shape}: the returning member re-forms its record"));
+        assert!(record.bound_to_retained_witness, "{shape}");
+        assert_eq!(record.proven_witness_fingerprint, witness, "{shape}");
+        assert!(
+            record.member_source_file_fingerprints.contains_key(session),
+            "{shape}: the record binds the returning revision"
+        );
         assert!(
             last.index.claude_family_tombstoned_for_test(session),
             "{shape}"
         );
-        assert!(last.scan.census_complete, "{shape}: the census completes");
-        assert!(
-            crate::snapshots::claude_absence_counters_for_test().tombstone_hits > hits_before,
-            "{shape}: the hold is counted"
+        failures.push(record.failed_reconstruction_count);
+        assert_eq!(
+            record.terminal,
+            record.failed_reconstruction_count == max,
+            "{shape}"
         );
     }
+    assert_eq!(
+        failures,
+        (1..=max).collect::<Vec<_>>(),
+        "one bounded failure per changed revision, then the terminal"
+    );
+    assert!(
+        crate::snapshots::claude_absence_counters_for_test().tombstone_hits
+            >= hits_before + u64::from(max),
+        "every return is counted"
+    );
     assert!(member.is_file());
 }
 

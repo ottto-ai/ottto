@@ -62,12 +62,23 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   with its retirement unix seconds, at most 1024 entries, the oldest evicted
   first. The field decodes leniently: a malformed entry drops alone and any
   other container decodes as empty, each counted, so damage never quarantines
-  the index. A reappearing member of a tombstoned family (a restored file, a
-  re-mounted directory) is held before any open or read on every traversal:
-  never parsed, offered, uploaded, accepted or indexed.
-- Local content-free counters (`absent_families_retired`, `tombstone_hits`,
-  `retirements_refused`, `tombstone_decode_drops`) are logged once per Claude
-  census terminal once any is nonzero.
+  the index. A tombstoned family keeps its proven witness through complete
+  censuses (Round 12, SOURCE/COST/SI). A returning member (a restored file, a
+  re-mounted directory) is never read as a new file and never skipped
+  forever: it re-enters the family's authority path. The ordinary parser
+  rebuilds it from the current sidecar rows; if that reconstructs the
+  retained witness the bodies are offered as usual, otherwise the demotion
+  hold keeps them back and a RetryPending record re-forms against that
+  witness, re-read only when its revision changes or its retry is due, and
+  going terminal (disclosed) at the existing failure cap. While tombstoned,
+  the whole-family disappearance rule does not resolve that record, because a
+  held returning member is unindexed. The tombstone clears once a member is
+  indexed again with no authority record left. A lost or malformed tombstone
+  falls back to a fresh read of that root.
+- Local content-free process counters appear on each Claude traversal's
+  `retiring` transition row: `absent_retry_pending_retired`,
+  `absent_family_tombstone_hits`, `retirements_refused` and
+  `tombstone_decode_drops`.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -120,11 +131,13 @@ and a third checks the cursor map evicts only its least recently used entry.
 Round 11 adds one pipeline test per guard: an absent family is kept while the
 re-emission stop is latched and on an index loaded fresh in this process (each
 retires after a simulated restart), and a unit test keeps it after each kind
-of traversal problem. A pipeline test restores a retired family's member and
-shows it is never offered, uploaded, accepted or indexed while each traversal
-counts a tombstone hit and the census completes. Unit tests cover the lenient
-tombstone decode (malformed entries and wrong containers, with the rest of the
-index kept), the 1024 cap, and the fresh-load memo.
+of traversal problem. Round 12 adds two returning-family tests: a member that
+never re-proves is held with nothing uploaded through one bounded failure per
+changed revision until the terminal; and a proven family that returns under
+unhealthy evidence is held, then re-proves from the repaired sidecar rows, is
+re-offered and accepted, and its tombstone clears. Unit tests cover the
+lenient tombstone decode (malformed entries and wrong containers, with the
+rest of the index kept), the 1024 cap, and the fresh-load memo.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

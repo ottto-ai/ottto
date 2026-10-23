@@ -1,7 +1,7 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
-    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ClaudeAbsenceCounters, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
@@ -113,6 +113,7 @@ pub(super) fn retiring(
     traversal: &ScanTraversalCheckpoint,
     raw_complete: bool,
     unsettled_causes: u16,
+    absence: Option<ClaudeAbsenceCounters>,
     gates: CensusGates,
 ) {
     #[derive(Serialize)]
@@ -127,6 +128,16 @@ pub(super) fn retiring(
         unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
+        /// Claude only: path-(a) absence retirement process totals (SOURCE
+        /// Rounds 11-12, COST names).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_retry_pending_retired: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_hits: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retirements_refused: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tombstone_decode_drops: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -151,6 +162,10 @@ pub(super) fn retiring(
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
+            absent_retry_pending_retired: absence.map(|counts| counts.absent_families_retired),
+            absent_family_tombstone_hits: absence.map(|counts| counts.tombstone_hits),
+            retirements_refused: absence.map(|counts| counts.retirements_refused),
+            tombstone_decode_drops: absence.map(|counts| counts.tombstone_decode_drops),
         },
     );
 }
@@ -845,6 +860,13 @@ mod tests {
                     index.traversal.as_ref().unwrap(),
                     true,
                     u16::MAX,
+                    (source == SnapshotSource::ClaudeCode).then_some(ClaudeAbsenceCounters {
+                        absent_families_retired: u64::MAX,
+                        tombstone_hits: u64::MAX,
+                        retirements_refused: u64::MAX,
+                        tombstone_decode_drops: u64::MAX,
+                        tombstones_cleared: u64::MAX,
+                    }),
                     CensusGates {
                         clean_followup: true,
                         ..Default::default()
