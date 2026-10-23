@@ -21,8 +21,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub(super) const ORIGINAL_PAIR_CANDIDATE_UNPROVED: &str = "original_pair_candidate_unproved";
 /// One logical offer per record per day.
 pub(super) const REOFFER_INTERVAL_SECONDS: u64 = 86_400;
-/// SI clock tolerance: a deadline past now + 24 h + 600 s disables that
-/// record's retry and keeps suppression.
+/// SI clock tolerance: a deadline past now + 24 h + 600 s is skipped and
+/// re-clamped to now + 24 h, keeping suppression until the next due cycle.
 pub(super) const REOFFER_CLOCK_TOLERANCE_SECONDS: u64 = 600;
 
 const EXTENSION_VERSION: u64 = 1;
@@ -554,6 +554,10 @@ pub(super) struct ReofferCounts {
     pub(super) selected: usize,
     pub(super) legacy_selected: usize,
     pub(super) attempted: usize,
+    pub(super) attempted_bytes: usize,
+    pub(super) gate_held: usize,
+    pub(super) ineligible_unbound: usize,
+    pub(super) clock_bound_skipped: usize,
     pub(super) accepted: usize,
     pub(super) unchanged_unstored: usize,
     pub(super) refused_same: usize,
@@ -568,25 +572,21 @@ pub(super) struct ReofferCounts {
 }
 
 impl ReofferCounts {
-    /// One line per cycle with selected work or a changed decode/backlog state.
-    pub(super) fn worth_logging(&self) -> bool {
-        self.selected > 0
-            || self.deferred_budget > 0
-            || self.outside_policy_window > 0
-            || self.invalid_extension > 0
-    }
-
     pub(super) fn line(&self, source: &str) -> String {
         format!(
             "snapshot reason_reoffer source={source} reason={ORIGINAL_PAIR_CANDIDATE_UNPROVED} \
-             due={} selected={} legacy_selected={} attempted={} accepted={} \
+             due={} selected={} legacy_selected={} attempted={} attempted_bytes={} gate_held={} ineligible_unbound={} clock_bound_skipped={} accepted={} \
              unchanged_unstored={} refused_same={} refused_other={} retryable={} shed={} \
              failed={} not_materialized={} deferred_budget={} outside_policy_window={} \
-             invalid_extension={}",
+             invalid_extension_process={}",
             self.due,
             self.selected,
             self.legacy_selected,
             self.attempted,
+            self.attempted_bytes,
+            self.gate_held,
+            self.ineligible_unbound,
+            self.clock_bound_skipped,
             self.accepted,
             self.unchanged_unstored,
             self.refused_same,
@@ -600,4 +600,23 @@ impl ReofferCounts {
             self.invalid_extension,
         )
     }
+}
+
+/// Emit work every cycle, but an unchanged, quiet backlog only once. The
+/// decoder counter is process-wide and explicitly labelled that way above.
+pub(super) fn should_log(source: &str, counts: &ReofferCounts) -> bool {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, OnceLock};
+    static PREVIOUS: OnceLock<Mutex<BTreeMap<String, ReofferCounts>>> = OnceLock::new();
+    let mut previous = PREVIOUS.get_or_init(Default::default).lock().unwrap();
+    should_log_change(previous.insert(source.to_string(), *counts), counts)
+}
+
+pub(super) fn should_log_change(previous: Option<ReofferCounts>, counts: &ReofferCounts) -> bool {
+    counts.selected > 0
+        || counts.attempted > 0
+        || counts.clock_bound_skipped > 0
+        || counts.invalid_extension > 0
+        || (previous.is_some_and(|old| old != *counts)
+            || previous.is_none() && *counts != ReofferCounts::default())
 }

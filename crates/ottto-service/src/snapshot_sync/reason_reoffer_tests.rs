@@ -394,8 +394,8 @@ fn only_exactly_bound_current_due_refusals_are_reoffered() {
     assert_eq!(progress.reason_reoffer_counts.outside_policy_window, 1);
     assert_eq!(
         progress.permanent_rejections[&fp(9)].reoffer,
-        Some(RefusalReoffer::Classified),
-        "a deadline past now + 24 h + 600 s disables that record's retry"
+        original_pair(NOW + DAY),
+        "a deadline past the clock bound is re-clamped, never classified"
     );
     assert_eq!(
         progress.permanent_rejections[&fp(10)].reoffer,
@@ -499,6 +499,9 @@ fn unanswered_reoffer_keeps_refusal_and_counts_failure() {
     let (mut progress, index) = refused(&[(1, original_pair(0)), (2, original_pair(0))]);
     assert!(select(&mut progress, &index, NOW));
     let attempted = progress.active_reason_reoffers.clone();
+    progress
+        .attempted_reason_reoffers
+        .extend(attempted.keys().cloned());
     progress.record_body(&fp(2), &body(2));
     progress.finish_reason_reoffers(&attempted, false, SnapshotSource::Codex);
     let counts = progress.reason_reoffer_counts;
@@ -510,4 +513,115 @@ fn unanswered_reoffer_keeps_refusal_and_counts_failure() {
         original_pair(NOW + DAY)
     );
     assert!(!progress.permanent_rejections.contains_key(&fp(2)));
+}
+
+/// F2: injected wall-clock rollback keeps both kinds eligible after a full
+/// cooldown; a save/reload must not turn either into the permanent done marker.
+#[test]
+fn clock_rollback_reclamps_and_skips_without_consuming_classification() {
+    use reason_reoffer::RefusalReoffer;
+    let fast_clock = NOW + 3_600;
+    let (mut progress, index) = refused(&[
+        (1, original_pair(fast_clock + DAY)),
+        (
+            2,
+            Some(RefusalReoffer::LegacyOther {
+                retry_after_unix_seconds: fast_clock + DAY,
+            }),
+        ),
+    ]);
+    assert!(select(&mut progress, &index, NOW));
+    assert_eq!(progress.reason_reoffer_counts.clock_bound_skipped, 2);
+    assert!(progress.active_reason_reoffers.is_empty());
+    assert_eq!(
+        progress.permanent_rejections[&fp(1)].reoffer,
+        original_pair(NOW + DAY)
+    );
+    assert_eq!(
+        progress.permanent_rejections[&fp(2)].reoffer,
+        Some(RefusalReoffer::LegacyOther {
+            retry_after_unix_seconds: NOW + DAY
+        })
+    );
+    let mut reloaded: SnapshotUploadProgress =
+        serde_json::from_slice(&serde_json::to_vec(&progress).unwrap()).unwrap();
+    reloaded.active_quarantine_witness = progress.active_quarantine_witness.clone();
+    assert!(!select(&mut reloaded, &index, NOW + DAY - 1));
+    assert!(reloaded.contains_body(&fp(1), &body(1)));
+    assert!(reloaded.contains_body(&fp(2), &body(2)));
+    assert!(select(&mut reloaded, &index, NOW + DAY));
+    assert_eq!(reloaded.active_reason_reoffers.len(), 2);
+}
+
+/// F8/F9: migration cannot starve ordinary retries or claim two slots for a
+/// fingerprint whose ordinary retry and refusal disagree after a crash.
+#[test]
+fn legacy_pass_uses_at_most_half_the_shared_slots_and_deduplicates() {
+    let entities = (0..60).map(|value| (value, None)).collect::<Vec<_>>();
+    let (mut progress, mut index) = refused(&entities);
+    for value in 200..230 {
+        let mut record = terminal_record(&body(value));
+        record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        record.retry_after_unix_seconds = 1;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fp(value), record);
+    }
+    // The index's A binding is authoritative for the re-offer; progress still
+    // contains a newer B retry. It must not spend an additional ordinary slot.
+    let mut stale = terminal_record(&body(999));
+    stale.disposition = SnapshotQuarantineDisposition::RetryPending;
+    stale.retry_after_unix_seconds = 0;
+    progress.quarantined_fingerprints.insert(fp(0), stale);
+    assert!(select(&mut progress, &index, NOW));
+    assert_eq!(progress.reason_reoffer_counts.legacy_selected, 25);
+    assert_eq!(progress.active_reason_reoffers.len(), 25);
+    assert_eq!(progress.active_quarantine_retries.len(), 25);
+    assert!(progress.active_reason_reoffers.contains_key(&fp(0)));
+    assert!(!progress.active_quarantine_retries.contains(&fp(0)));
+    assert_eq!(progress.reason_reoffer_counts.deferred_budget, 35);
+}
+
+#[test]
+fn summaries_report_changed_backlogs_and_logical_offer_bytes() {
+    use reason_reoffer::{should_log_change, ReofferCounts};
+    let empty = ReofferCounts::default();
+    assert!(!should_log_change(None, &empty));
+    let backlog = ReofferCounts {
+        outside_policy_window: 2,
+        ..empty
+    };
+    assert!(should_log_change(Some(empty), &backlog));
+    assert!(!should_log_change(Some(backlog), &backlog));
+    assert!(should_log_change(Some(backlog), &empty));
+    let work = ReofferCounts {
+        selected: 1,
+        attempted: 1,
+        attempted_bytes: 123,
+        ..empty
+    };
+    assert!(should_log_change(Some(work), &work));
+    assert!(work
+        .line("codex")
+        .contains("attempted=1 attempted_bytes=123"));
+}
+
+#[test]
+fn unsent_leases_are_held_and_conflicts_are_retryable_not_refused() {
+    let (mut progress, index) = refused(&[(1, original_pair(0)), (2, original_pair(0))]);
+    assert!(select(&mut progress, &index, NOW));
+    let leased = progress.active_reason_reoffers.clone();
+    progress.attempted_reason_reoffers.insert(fp(2));
+    progress.quarantine_retryable_body(&fp(2), &body(2));
+    progress.finish_reason_reoffers(&leased, false, SnapshotSource::Codex);
+    let counts = progress.reason_reoffer_counts;
+    assert_eq!(
+        (
+            counts.gate_held,
+            counts.retryable,
+            counts.failed,
+            counts.refused_same
+        ),
+        (1, 1, 0, 0)
+    );
 }

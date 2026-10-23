@@ -53,6 +53,7 @@ struct ReofferServer {
     answer: Arc<Mutex<Answer>>,
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+    cache_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn entity_ack(item: &serde_json::Value) -> serde_json::Value {
@@ -101,6 +102,8 @@ impl ReofferServer {
         let bodies = offered.clone();
         let terminal = Arc::new(Mutex::new(Vec::new()));
         let statuses = terminal.clone();
+        let cache_enabled = Arc::new(AtomicBool::new(false));
+        let cache = cache_enabled.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -127,6 +130,11 @@ impl ReofferServer {
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
                         "recommended_scan_after":"2099-01-01T00:00:00Z"});
+                    if cache.load(Ordering::Relaxed) {
+                        hint["session_cache_observations_contract"] =
+                            "session_cache_observations:v1".into();
+                        hint["snapshot_head_cas_required"] = false.into();
+                    }
                     if capture {
                         hint["session_request_identity_contract"] =
                             "own_request_identity_rows:v1".into();
@@ -202,6 +210,7 @@ impl ReofferServer {
             answer,
             offered,
             terminal,
+            cache_enabled,
         }
     }
 
@@ -230,6 +239,8 @@ impl Drop for ReofferServer {
 
 struct CycleResult {
     result: Result<()>,
+    leased_offers: usize,
+    cache_enriched_items: usize,
     index: ScanIndex,
     progress: SnapshotUploadProgress,
     /// The saved upload ledger as JSON, to read the exact disk form.
@@ -335,6 +346,12 @@ impl ReofferPipeline {
         .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
         assert!(scan.census_complete, "synthetic census is complete");
+        let cache_enriched_items = scan
+            .snapshots
+            .iter()
+            .filter(|item| item.cache_observations.is_some())
+            .count();
+        let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
         let index_path = preparation.index_path.clone();
         let progress_path = preparation.upload_progress_path.clone();
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
@@ -360,6 +377,8 @@ impl ReofferPipeline {
             .unwrap_or(serde_json::Value::Null);
         CycleResult {
             result,
+            leased_offers,
+            cache_enriched_items,
             index: ScanIndex::load(&index_path).unwrap(),
             progress: SnapshotUploadProgress::load(
                 &progress_path,
@@ -919,6 +938,10 @@ fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
 
     let t1 = t0 + DAY + 60;
     let day1 = pipeline.cycle(t1);
+    assert_eq!(
+        day1.leased_offers, 1,
+        "the daily lease selected the refused record; disabling re-offers must fail this test"
+    );
     assert!(day1.result.is_ok(), "{:?}", day1.result);
     let offered = pipeline.server.offered();
     assert_eq!(offered.len(), 2, "one offer for the session on the due day");
@@ -979,4 +1002,158 @@ fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
     assert!(later
         .index
         .accepted_snapshot_fingerprint_recorded(&accepted_fingerprint));
+}
+
+/// F1: cache capability on, no accepted head and CAS optional. The recorded
+/// refusal belongs to the stripped probe, not the cache-enriched scan item.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
+    if !supported("cache_head_probe_refusal_reoffers_its_own_exact_body") {
+        return;
+    }
+    let t0 = current_unix_seconds();
+    let mut pipeline =
+        ReofferPipeline::new("reoffer-cache-probe", Answer::Refuse(ORIGINAL_PAIR), t0);
+    pipeline
+        .server
+        .cache_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    assert!(
+        first.cache_enriched_items > 0,
+        "fixture must rebuild cache-enriched bodies"
+    );
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 1);
+    let refused = offered[0].clone();
+    let fingerprint = fingerprint_of(&refused);
+    assert!(refused.get("cache_observations").is_none());
+    assert!(first.progress.accepted_cache_heads.is_empty());
+    let quiet = pipeline.cycle(t0 + DAY - 1);
+    assert!(quiet.result.is_ok(), "{:?}", quiet.result);
+    assert_eq!(pipeline.server.offered().len(), 1);
+    let due = pipeline.cycle(t0 + DAY + 60);
+    assert!(due.result.is_ok(), "{:?}", due.result);
+    assert_eq!(due.leased_offers, 1);
+    assert!(due.cache_enriched_items > 0);
+    let offered = pipeline.server.offered();
+    assert_eq!(offered.len(), 2, "the rebuilt probe must reach SOURCE");
+    assert_eq!(fingerprint_of(&offered[1]), fingerprint);
+    assert!(offered[1].get("cache_observations").is_none());
+    assert_eq!(
+        due.progress.permanent_rejections[&fingerprint].body_witness,
+        first.progress.permanent_rejections[&fingerprint].body_witness
+    );
+    assert_eq!(
+        reoffer_json(&due, &fingerprint)["retry_after_unix_seconds"],
+        t0 + DAY + 60 + DAY
+    );
+}
+
+/// #692: two physical POSTs remain one logical leased offer, including bytes.
+/// Advancing the injected clock after 503 proves the saved claim is not bumped
+/// by the resend; the legacy done marker appears only with the final answer.
+#[test]
+#[serial(client_report)]
+fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
+    let start = 2_000_000_000;
+    let clock = ClockGuard::start(start);
+    let fingerprint = "b".repeat(64);
+    let body = "c".repeat(64);
+    let mut progress = test_upload_progress();
+    progress.quarantine_permanent_body(&fingerprint, &body, "future_unknown_reason");
+    progress
+        .permanent_rejections
+        .get_mut(&fingerprint)
+        .unwrap()
+        .reoffer = None;
+    progress.reserve_reason_reoffer(&fingerprint, body.clone(), start);
+    let leased = progress.active_reason_reoffers.clone();
+    // The exact pre-send durable claim is observable by each fake POST.
+    let saved = std::cell::RefCell::new(serde_json::to_value(&progress).unwrap());
+    let mut posts = 0;
+    let mut accepted = 0;
+    let mut budget = InplaceRetryBudget::default();
+    let (result, waits) = with_inplace_retry_test_clock(Some(Duration::ZERO), || {
+        upload_resumable_batches_with_body_witness_partitioned(
+            std::slice::from_ref(&fingerprint),
+            &unique_poison_scope(),
+            &mut progress,
+            &mut accepted,
+            String::as_str,
+            |_| body.clone(),
+            |_| Some("synthetic-session"),
+            |_| false,
+            &mut budget,
+            |items| {
+                assert_eq!(items, vec![fingerprint.clone()]);
+                let disk = saved.borrow();
+                let state = &disk["permanent_rejections"][&fingerprint]["reoffer"];
+                assert_eq!(state["reason"], "legacy_other_reclassification");
+                assert_eq!(state["retry_after_unix_seconds"], start + DAY);
+                posts += 1;
+                if posts == 1 {
+                    clock.set(start + 600);
+                    return Err(anyhow::Error::new(UploadShed {
+                        status: 503,
+                        retry_after: Some(Duration::from_secs(1)),
+                        code: None,
+                    }));
+                }
+                let mut response = accepted_batch(0);
+                response.entity_ack_contract =
+                    Some(crate::snapshots::SNAPSHOT_ENTITY_ACK_CONTRACT.into());
+                response
+                    .rejected_entities
+                    .push(crate::snapshot_client::SnapshotEntityRejection {
+                        source_session_id: "synthetic-session".into(),
+                        snapshot_fingerprint: fingerprint.clone(),
+                        reason: "future_unknown_reason".into(),
+                        detail: "synthetic final answer".into(),
+                        permanent: true,
+                        occurrence_count: 1,
+                    });
+                Ok(response)
+            },
+            |checkpoint| {
+                *saved.borrow_mut() = serde_json::to_value(checkpoint).unwrap();
+                Ok(())
+            },
+        )
+    });
+    assert!(matches!(
+        result.unwrap(),
+        ResumableUploadResult::Rejected { .. }
+    ));
+    assert_eq!(posts, 2);
+    assert_eq!(budget.resends, 1);
+    assert_eq!(waits.len(), 1);
+    assert!(budget.waited <= SNAPSHOT_INPLACE_RETRY_WAIT_BUDGET);
+    assert_eq!(
+        saved.borrow()["permanent_rejections"][&fingerprint]["reoffer"]["reason"],
+        "classified"
+    );
+    progress.finish_reason_reoffers(&leased, false, SnapshotSource::ClaudeCode);
+    let counts = progress.reason_reoffer_counts;
+    assert_eq!(
+        (
+            counts.selected,
+            counts.attempted,
+            counts.refused_other,
+            counts.failed
+        ),
+        (1, 1, 1, 0)
+    );
+    assert_eq!(
+        counts.attempted_bytes,
+        snapshot_packing_json_length(&fingerprint).unwrap()
+    );
+    assert!(
+        progress.contains_body(&fingerprint, &body),
+        "lease consumed only by final answer"
+    );
 }
