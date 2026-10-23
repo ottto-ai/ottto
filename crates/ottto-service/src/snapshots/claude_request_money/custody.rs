@@ -320,15 +320,15 @@ impl Delivery {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct FileCustody {
     path: Option<String>,
-    logical: Option<(String, String)>,
-    birth: Option<Birth>,
     rebuild_owed: bool,
-    indexed: bool,
     current_m: Option<Box<Slot>>,
     live: Option<Box<FileLive>>,
 }
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct FileLive {
+    logical: Option<(String, String)>,
+    birth: Option<Birth>,
+    indexed: bool,
     seen_r: Option<Box<Slot>>,
     seen_m: Option<Box<Slot>>,
     trace: Option<Box<Slot>>,
@@ -353,7 +353,10 @@ impl std::ops::DerefMut for FileCustody {
 }
 impl FileLive {
     fn is_empty(&self) -> bool {
-        self.seen_r.is_none()
+        self.logical.is_none()
+            && self.birth.is_none()
+            && !self.indexed
+            && self.seen_r.is_none()
             && self.seen_m.is_none()
             && self.trace.is_none()
             && self.union.is_none()
@@ -761,6 +764,13 @@ impl Custody {
     }
     pub(crate) fn serialized_headroom(&self) -> usize {
         (MAX_BYTES - 1024 * 1024).saturating_sub(self.bytes)
+    }
+    pub(super) fn has_adoption_controls(&self) -> bool {
+        // Control is fixed-small; never scan the full ledger under its registry lock.
+        self.control
+            .slots
+            .iter()
+            .any(|slot| slot.key.starts_with("adopt:entity:"))
     }
     pub(super) fn recovery(&self) -> bool {
         self.control.recovery
@@ -1996,12 +2006,12 @@ impl Custody {
                     }
                     let file = FileCustody {
                         path: wire.path,
-                        logical: wire.logical,
-                        birth: wire.birth,
                         rebuild_owed: wire.rebuild_owed?,
-                        indexed: wire.indexed?,
                         current_m,
                         live: Some(Box::new(FileLive {
+                            logical: wire.logical,
+                            birth: wire.birth,
+                            indexed: wire.indexed?,
                             seen_r: decode(wire.seen_r, None)?,
                             seen_m,
                             trace: decode(wire.trace, None)?,

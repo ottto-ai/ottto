@@ -4247,10 +4247,22 @@ pub(crate) fn note_adoption_outcomes_receipt(
 }
 
 pub(crate) fn adoption_paused(support_dir: &Path, index: &ScanIndex) -> bool {
+    if index.active_upload_context_fingerprint.is_none()
+        && index.upload_context_fingerprint.is_none()
+        && store::unresolved_adoption_context(support_dir)
+    {
+        return true;
+    }
     store::adoption_paused(support_dir, &adoption_prefix(index), page_now(support_dir))
 }
 
 pub(crate) fn adoption_probe_due(support_dir: &Path, index: &ScanIndex) -> bool {
+    if index.active_upload_context_fingerprint.is_none()
+        && index.upload_context_fingerprint.is_none()
+        && store::unresolved_adoption_context(support_dir)
+    {
+        return false;
+    }
     store::adoption_probe_due(support_dir, &adoption_prefix(index), page_now(support_dir))
 }
 
@@ -4958,6 +4970,35 @@ fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
 mod scheduling_reconciliation_tests {
     use super::super::claude_request_census::ClaudeTelemetryTailState;
     use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn unactivated_index_keeps_adoption_closed_until_context_is_bound() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-unactivated-context");
+        let _live = LiveForTest::new(&scratch);
+        store::reload_for_test(&scratch).unwrap();
+        let mut active = ScanIndex::default();
+        active.activate_upload_context("context-a".into());
+        let prefix = adoption_prefix(&active);
+        store::with_ledger_for_test(&scratch, |ledger| {
+            assert!(ledger.put_money(
+                format!("{prefix}rates"),
+                ClaudeRequestCensusRecord::money_debt([0x80; 32], page_now(&scratch))
+            ));
+            assert!(store::checkpoint_for_test(&scratch, ledger));
+        })
+        .unwrap();
+        store::reload_for_test(&scratch).unwrap();
+        let inactive = ScanIndex::default();
+        assert!(adoption_paused(&scratch, &inactive));
+        assert!(!adoption_probe_due(&scratch, &inactive));
+        assert!(adoption_paused(&scratch, &active));
+        active.activate_upload_context("context-b".into());
+        assert!(
+            !adoption_paused(&scratch, &active),
+            "explicit current context keeps its independent authority"
+        );
+    }
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]

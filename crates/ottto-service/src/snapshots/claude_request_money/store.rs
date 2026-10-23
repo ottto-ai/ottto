@@ -1690,6 +1690,22 @@ pub(super) fn checkpoint_pending(support_dir: &Path) -> bool {
     }
 }
 
+pub(super) fn unresolved_adoption_context(support_dir: &Path) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return true;
+    };
+    match ledgers.get(support_dir) {
+        Some(Slot::Ready(ledger)) => {
+            ledger.load_damaged
+                || ledger.recovering()
+                || ledger.unacknowledged_custody()
+                || ledger.barrier_needed
+                || ledger.census().has_adoption_controls()
+        }
+        _ => true,
+    }
+}
+
 pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> bool {
     let pause = |state: u64| {
         static ALARMED: AtomicU64 = AtomicU64::new(0);

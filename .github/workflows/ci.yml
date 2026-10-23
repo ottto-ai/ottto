@@ -163,7 +163,7 @@ jobs:
           import pathlib, sys
           path = pathlib.Path(sys.argv[1]) / "crates/ottto-service/src/retry_allocation_probe.rs"
           source = path.read_text()
-          old = "const SLOTS: usize = 262_144;"
+          old = "const SLOTS: usize = 65_536;"
           assert source.count(old) == 1
           path.write_text(source.replace(old, "const SLOTS: usize = 1_048_576;"))
           PY
