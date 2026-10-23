@@ -46,8 +46,10 @@ const MAX_LINES: usize = 1_024;
 /// root is one 64-byte string; the walk itself allocates nothing.
 const MAX_CLOSED_DIGESTS: usize = 2 * MAX_LINES;
 /// 2026-10-21T00:00:00Z. Before the list was ever installed, entities first
-/// indexed before this instant are not re-emitted by adoption.
-const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
+/// indexed before this instant are not re-emitted by adoption. This is the
+/// revision 2 row's cutoff; each revision carries its own in the history
+/// policy table (F4b).
+pub(super) const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
 
 /// Where the list stands this cycle. `as_str` is the plain local status reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -181,6 +183,13 @@ impl ReemissionExclusions {
         }
     }
 
+    /// Test seam: the same list in another state.
+    #[cfg(test)]
+    pub(crate) fn with_state_for_test(mut self, state: ListState) -> Self {
+        self.state = state;
+        self
+    }
+
     pub(crate) fn state(&self) -> ListState {
         self.state
     }
@@ -203,10 +212,22 @@ impl ReemissionExclusions {
     }
 
     /// Before the list was ever installed, an entity first indexed before
-    /// the cutoff, or at an unknown time, is held.
+    /// revision 2's cutoff, or at an unknown time, is held. Production reads
+    /// the active revision's own cutoff (`holds_without_list_before`).
+    #[cfg(test)]
     pub(crate) fn holds_without_list(&self, first_indexed_unix_seconds: Option<u64>) -> bool {
+        self.holds_without_list_before(first_indexed_unix_seconds, NO_LIST_HOLD_BEFORE_UNIX_SECONDS)
+    }
+
+    /// The same hold against one revision's cutoff (F4b).
+    pub(crate) fn holds_without_list_before(
+        &self,
+        first_indexed_unix_seconds: Option<u64>,
+        revision_cutoff_unix_seconds: u64,
+    ) -> bool {
+        let cutoff = no_list_cutoff(revision_cutoff_unix_seconds);
         self.state == ListState::NotInstalled
-            && !matches!(first_indexed_unix_seconds, Some(seconds) if seconds >= no_list_cutoff())
+            && !matches!(first_indexed_unix_seconds, Some(seconds) if seconds >= cutoff)
     }
 
     pub(crate) fn is_empty(&self) -> bool {
@@ -321,32 +342,33 @@ fn write_seen_marker(path: &Path) -> std::io::Result<()> {
 }
 
 #[cfg(not(test))]
-fn no_list_cutoff() -> u64 {
-    NO_LIST_HOLD_BEFORE_UNIX_SECONDS
+fn no_list_cutoff(revision_cutoff: u64) -> u64 {
+    revision_cutoff
 }
 
 #[cfg(test)]
 thread_local! {
-    static NO_LIST_CUTOFF: std::cell::Cell<u64> =
-        const { std::cell::Cell::new(NO_LIST_HOLD_BEFORE_UNIX_SECONDS) };
+    static NO_LIST_CUTOFF: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
 }
 
 #[cfg(test)]
-fn no_list_cutoff() -> u64 {
-    NO_LIST_CUTOFF.with(std::cell::Cell::get)
+fn no_list_cutoff(revision_cutoff: u64) -> u64 {
+    NO_LIST_CUTOFF
+        .with(std::cell::Cell::get)
+        .unwrap_or(revision_cutoff)
 }
 
-/// Test seam: moves the "first indexed before" cutoff so fixtures born now
-/// can stand for old or new entities.
+/// Test seam: moves the "first indexed before" cutoff of every revision so
+/// fixtures born now can stand for old or new entities.
 #[cfg(test)]
 pub(crate) fn with_no_list_cutoff<T>(cutoff: u64, f: impl FnOnce() -> T) -> T {
-    struct Reset(u64);
+    struct Reset(Option<u64>);
     impl Drop for Reset {
         fn drop(&mut self) {
             NO_LIST_CUTOFF.with(|value| value.set(self.0));
         }
     }
-    let _reset = Reset(NO_LIST_CUTOFF.with(|value| value.replace(cutoff)));
+    let _reset = Reset(NO_LIST_CUTOFF.with(|value| value.replace(Some(cutoff))));
     f()
 }
 

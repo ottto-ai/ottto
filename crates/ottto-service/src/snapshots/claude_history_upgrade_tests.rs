@@ -2,7 +2,10 @@
 //! selected for a reason other than the revision (a changed upload context),
 //! so only the reason-independent gate can hold it. Fixtures are synthetic.
 
-use super::claude_history_upgrade::revision_policy;
+use super::claude_history_upgrade::{
+    local_count, revision_policy, with_max_gated_claude_revision, LocalCount,
+    REQUEST_OWNED_USAGE_CONTRACT,
+};
 use super::claude_reemission_exclusions::{with_no_list_cutoff, ListState, ReemissionExclusions};
 use super::*;
 
@@ -799,4 +802,270 @@ fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
         NoListPolicy::Pace,
         "explicit full still releases"
     );
+}
+
+/// Owner B ruling 2: activating a revision with no history-policy row keeps
+/// the previous active revision, raises one local alarm and counts it; with
+/// a row it activates. The static release check above stays the second line.
+#[test]
+fn activation_without_a_policy_row_keeps_the_previous_revision_and_alarms() {
+    let mut index = ScanIndex::default();
+    index.activate_effective_upload_body_witness_revision(2);
+    let refused = local_count(LocalCount::ActivationRefused);
+    let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+        with_max_gated_claude_revision(2, || {
+            index.activate_effective_upload_body_witness_revision(3);
+        });
+    });
+    assert_eq!(index.active_effective_upload_body_witness_revision, 2);
+    assert_eq!(alarms.len(), 1, "{alarms:?}");
+    assert_eq!(
+        alarms[0]["stage"],
+        "claude_history_revision_activation_refused"
+    );
+    assert_eq!(alarms[0]["counts"]["refused_revision"], 3);
+    assert_eq!(alarms[0]["counts"]["kept_revision"], 2);
+    assert_eq!(local_count(LocalCount::ActivationRefused), refused + 1);
+
+    let ((), none) = crate::local_resource_diagnostics::capture(|| {
+        index.activate_effective_upload_body_witness_revision(3);
+    });
+    assert_eq!(index.active_effective_upload_body_witness_revision, 3);
+    assert!(none.is_empty());
+    assert_eq!(local_count(LocalCount::ActivationRefused), refused + 1);
+    let _ = crate::local_resource_diagnostics::capture(|| {
+        index.activate_effective_upload_body_witness_revision(MAX_GATED_CLAUDE_REVISION + 1);
+    });
+    assert_eq!(index.active_effective_upload_body_witness_revision, 3);
+}
+
+/// Owner B ruling 3: the named re-owe only lowers, only below the active
+/// revision, counts `history_reowed`, and leaves the file owed and gated: a
+/// listed re-owed file is held, an unlisted one upgrades again.
+#[test]
+fn re_owe_lowers_a_stamp_and_the_file_is_owed_and_gated_again() {
+    let (home, root, mut index) = families("history-gate-reowe", 2);
+    let empty = support("history-gate-reowe-empty");
+    fs::write(ReemissionExclusions::path(&empty), "").unwrap();
+    index.load_claude_reemission_exclusions(&empty);
+    let previous = index.clone();
+    let mut upgraded = scan(&root, &mut index, "ctx-1", 3);
+    let mut index = settle(&home, &previous, &mut upgraded, &mut index);
+    assert_eq!(revisions(&index), vec![3; 4]);
+
+    index.activate_effective_upload_body_witness_revision(3);
+    let reowed = local_count(LocalCount::Reowed);
+    let root_key = |slot: usize| {
+        index
+            .files
+            .keys()
+            .find(|key| key.ends_with(&format!("{}.jsonl", session(slot))))
+            .unwrap()
+            .clone()
+    };
+    let (listed, unlisted) = (root_key(1), root_key(0));
+    assert!(!index.re_owe_effective_upload_body_witness_revision(&listed, 3));
+    assert!(!index.re_owe_effective_upload_body_witness_revision(&listed, 4));
+    assert!(index.re_owe_effective_upload_body_witness_revision(&listed, 2));
+    assert!(index.re_owe_effective_upload_body_witness_revision(&unlisted, 2));
+    assert!(!index.re_owe_effective_upload_body_witness_revision("missing", 1));
+    assert_eq!(local_count(LocalCount::Reowed), reowed + 2);
+    assert_eq!(
+        index.files[&listed].effective_upload_body_witness_revision,
+        2
+    );
+
+    let support = support("history-gate-reowe-listed");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&session(1))),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let previous = index.clone();
+    let mut result = scan(&root, &mut index, "ctx-1", 3);
+    let listed_file = previous.files[&listed].source_file_fingerprint.clone();
+    let settled = settle(&home, &previous, &mut result, &mut index);
+    assert!(
+        result
+            .snapshots
+            .iter()
+            .any(|item| item.source_session_id == session(0)),
+        "the unlisted re-owed root upgrades again"
+    );
+    assert!(result
+        .snapshots
+        .iter()
+        .all(|item| item.source_file_fingerprint.as_deref() != Some(listed_file.as_str())));
+    assert_eq!(
+        settled.files[&listed].effective_upload_body_witness_revision,
+        2
+    );
+    assert_eq!(
+        settled.files[&unlisted].effective_upload_body_witness_revision,
+        3
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+fn append_root_response(root: &Path, slot: usize) {
+    let session = session(slot);
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .open(root.join(format!("{session}.jsonl")))
+        .unwrap();
+    writeln!(
+        file,
+        "{}",
+        json!({
+            "timestamp": "2026-08-23T18:30:00Z",
+            "type": "assistant",
+            "sessionId": session,
+            "requestId": format!("request-{slot}-root-2"),
+            "message": {
+                "id": format!("message-{slot}-root-2"),
+                "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }
+        })
+    )
+    .unwrap();
+}
+
+/// Stand-in for MONEY's emitter (#699), which builds request-owned items
+/// after the emission seam: one literal copy of every item. It ignores
+/// #699's own protected-root skip, so only the gate removes it.
+fn mint_request_owned_copies(snapshots: &mut Vec<SnapshotItem>) {
+    let copies = snapshots
+        .iter()
+        .map(|item| {
+            let mut copy = item.clone();
+            copy.usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
+            copy
+        })
+        .collect::<Vec<_>>();
+    snapshots.extend(copies);
+}
+
+/// SOURCE Amendment 14 at the fold: under revision 3 a listed root's genuine
+/// change emits its ordinary body, loses only its request-owned items, does
+/// not stamp 3, counts `listed_literal`, and is owed and held next cycle.
+/// Its unchanged member stays held history.
+#[test]
+fn listed_genuine_change_under_revision_three_loses_only_its_literal() {
+    let (home, root, mut index) = families("history-gate-literal", 2);
+    let support = support("history-gate-literal-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&session(1))),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    append_root_response(&root, 1);
+    let denied = local_count(LocalCount::ListedLiteralDenied);
+    let previous = index.clone();
+    let mut result = scan(&root, &mut index, "ctx-1", 3);
+    assert_eq!(local_count(LocalCount::ListedLiteralDenied), denied + 1);
+    mint_request_owned_copies(&mut result.snapshots);
+    let mut resend = result.snapshots.clone();
+    index.retain_claude_history_emission_permitted(&mut resend);
+    let settled = settle(&home, &previous, &mut result, &mut index);
+    for emitted in [&resend, &result.snapshots] {
+        let listed = emitted
+            .iter()
+            .filter(|item| item.source_session_id == session(1))
+            .collect::<Vec<_>>();
+        assert_eq!(listed.len(), 1, "the listed root's ordinary body only");
+        assert_ne!(
+            listed[0].usage_accounting_contract.as_deref(),
+            Some(REQUEST_OWNED_USAGE_CONTRACT)
+        );
+        assert!(emitted
+            .iter()
+            .any(|item| item.source_session_id == session(0)
+                && item.usage_accounting_contract.as_deref()
+                    == Some(REQUEST_OWNED_USAGE_CONTRACT)));
+    }
+    for (key, entry) in &settled.files {
+        let listed = claude_index_path_family_member(Path::new(key))
+            .is_some_and(|(family, _)| family == session(1));
+        assert_eq!(
+            entry.effective_upload_body_witness_revision,
+            if listed { 1 } else { 3 },
+            "{key}"
+        );
+    }
+
+    let mut index = settled;
+    index.load_claude_reemission_exclusions(&support);
+    let previous = index.clone();
+    let listed_files = previous
+        .files
+        .iter()
+        .filter(|(key, _)| {
+            claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(family, _)| family == session(1))
+        })
+        .map(|(_, entry)| entry.source_file_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let mut next = scan(&root, &mut index, "ctx-1", 3);
+    let settled = settle(&home, &previous, &mut next, &mut index);
+    // The fold harness never settles the upload context, so the settled
+    // family re-syncs; the listed family is owed and held.
+    assert!(
+        next.snapshots.iter().all(|item| item
+            .source_file_fingerprint
+            .as_ref()
+            .is_some_and(|file| !listed_files.contains(file))),
+        "owed and held, never settled at 3"
+    );
+    assert!(settled
+        .files
+        .iter()
+        .filter(|(key, _)| claude_index_path_family_member(Path::new(key))
+            .is_some_and(|(family, _)| family == session(1)))
+        .all(|(_, entry)| entry.effective_upload_body_witness_revision == 1));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// F5: a same-size file whose mtime alone moved is not a genuine change. A
+/// listed root touched this way is held history under revision 3: nothing
+/// emits and its tuple and stamp stay.
+#[test]
+fn a_touched_listed_file_is_held_history_not_a_genuine_change() {
+    let (home, root, mut index) = families("history-gate-touched", 1);
+    let support = support("history-gate-touched-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&session(0))),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let path = root.join(format!("{}.jsonl", session(0)));
+    let size = fs::metadata(&path).unwrap().len();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(120))
+        .unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().len(), size);
+    let previous = index.clone();
+    let denied = local_count(LocalCount::ListedLiteralDenied);
+    let mut result = scan(&root, &mut index, "ctx-1", 3);
+    let settled = settle(&home, &previous, &mut result, &mut index);
+    assert!(result.snapshots.is_empty(), "held, not ordinary sync");
+    assert_eq!(local_count(LocalCount::ListedLiteralDenied), denied);
+    assert_eq!(revisions(&settled), vec![1; 2]);
+    let suffix = format!("{}.jsonl", session(0));
+    let key = settled
+        .files
+        .keys()
+        .find(|key| key.ends_with(&suffix))
+        .unwrap();
+    assert_eq!(
+        settled.files[key].last_snapshot_fingerprint,
+        previous.files[key].last_snapshot_fingerprint
+    );
+    let _ = fs::remove_dir_all(home);
 }

@@ -319,6 +319,16 @@ pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
         },
     );
 }
+/// Local alarm, once per refusal: a body-witness revision with no history
+/// policy row was not activated, and the previous active revision was kept.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_history_revision_activation_refused(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_revision_activation_refused",
+        "claude_code",
+        counts,
+    );
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.

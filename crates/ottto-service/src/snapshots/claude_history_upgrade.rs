@@ -26,6 +26,16 @@
 //! the upgrade is skipped as before.
 //!
 //! The parse reason is a diagnostic only; no decision here reads it.
+//!
+//! Under a revision whose policy row denies the request-owned literal
+//! (revision 3, SOURCE Amendment 14), a listed family, or any family while
+//! the list is paused, still emits its ordinary body on a genuine change, as
+//! today. Only items carrying `claude_request_owned_usage:v1` are removed,
+//! and the file never stamps that revision, so it stays owed and gated.
+//!
+//! The only writers of a file's stored revision are
+//! `stamp_effective_upload_body_witness_revision` (raise) and
+//! `re_owe_effective_upload_body_witness_revision` (lower).
 
 use super::claude_reemission_exclusions::{ListState, ReemissionExclusions};
 use std::collections::{BTreeMap, BTreeSet};
@@ -35,40 +45,97 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is complete for (SOURCE F2). The
-/// revision-3 row exists but is incomplete until MONEY's revision-3 change
-/// lands (a paused-list literal, a per-revision no-list cutoff, mtime-only
-/// changes), so this stays 2 until then. Above it every owed upgrade and
-/// every listed change is held, no file is stamped, and the Claude revision
-/// constant fails to compile. The release check reads this line.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
+/// Highest active Claude revision the gate is complete for (SOURCE F2).
+/// The revision-3 row is complete (literal-only denial for listed roots and
+/// paused lists, its own no-list cutoff, mtime-only changes held), so this
+/// is 3. Above it every owed upgrade and every listed change is held, no
+/// file is stamped, activation is refused at runtime
+/// (`activate_effective_upload_body_witness_revision`), and the Claude
+/// revision constant fails to compile. The release check reads this line.
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
+/// The request-owned usage literal of MONEY P2 (#699's
+/// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
+pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
 
 /// At most one owed-without-list alarm an hour.
 const OWED_WITHOUT_LIST_ALARM_INTERVAL: std::time::Duration =
     std::time::Duration::from_secs(60 * 60);
 
-/// What one active revision allows for a listed (protected) family.
+/// What a listed family (or, while the list is paused, any family) may emit
+/// when it is parsed as ordinary sync under one revision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RevisionPolicy {
-    /// A listed family whose transcript genuinely changed may emit its
-    /// ordinary sync under this revision. Revision 2 adds only context
-    /// numbers; revision 3 adds request-owned money, which listed roots must
-    /// never emit, even on a genuine change.
-    pub(super) listed_changed_may_emit: bool,
+pub(super) enum ListedEmission {
+    /// Its whole body, as today.
+    Ordinary,
+    /// Its ordinary body; every item carrying the request-owned literal is
+    /// removed, and the file never stamps this revision.
+    WithoutRequestOwnedLiteral,
 }
 
-/// The per-revision policy table. An unknown revision has no row: every owed
-/// upgrade and every listed change is held.
+/// What one active revision allows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct RevisionPolicy {
+    /// A listed family's (or, while the list is paused, any family's)
+    /// ordinary sync, a genuine change included. Revision 2 adds only
+    /// context numbers; revision 3 adds request-owned money, which listed
+    /// roots must never emit (F3, Amendment 14).
+    pub(super) listed_emission: ListedEmission,
+    /// Before the list was ever installed, history born before this second,
+    /// or at an unknown time, is held under this revision (F4b).
+    pub(super) no_list_birth_cutoff_unix_seconds: u64,
+}
+
+/// The per-revision policy table. An unknown revision, or one above
+/// `MAX_GATED_CLAUDE_REVISION`, has no row: it cannot be activated, and
+/// every owed upgrade and every listed change is held.
 pub(super) fn revision_policy(revision: u64) -> Option<RevisionPolicy> {
+    if revision > max_gated_claude_revision() {
+        return None;
+    }
     match revision {
         0..=2 => Some(RevisionPolicy {
-            listed_changed_may_emit: true,
+            listed_emission: ListedEmission::Ordinary,
+            no_list_birth_cutoff_unix_seconds:
+                super::claude_reemission_exclusions::NO_LIST_HOLD_BEFORE_UNIX_SECONDS,
         }),
+        // Until owner B dates revision 3's no-list cutoff, no history born
+        // at any time is upgraded to it without an installed list.
         3 => Some(RevisionPolicy {
-            listed_changed_may_emit: false,
+            listed_emission: ListedEmission::WithoutRequestOwnedLiteral,
+            no_list_birth_cutoff_unix_seconds: u64::MAX,
         }),
         _ => None,
     }
+}
+
+#[cfg(not(test))]
+fn max_gated_claude_revision() -> u64 {
+    MAX_GATED_CLAUDE_REVISION
+}
+
+#[cfg(test)]
+thread_local! {
+    static MAX_GATED_FOR_TEST: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(MAX_GATED_CLAUDE_REVISION) };
+}
+
+#[cfg(test)]
+fn max_gated_claude_revision() -> u64 {
+    MAX_GATED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+/// Test seam: run `f` as if the policy table ended at `max` (a revision
+/// above it has no row).
+#[cfg(test)]
+pub(crate) fn with_max_gated_claude_revision<T>(max: u64, f: impl FnOnce() -> T) -> T {
+    struct Reset(u64);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MAX_GATED_FOR_TEST.with(|value| value.set(self.0));
+        }
+    }
+    let _reset = Reset(MAX_GATED_FOR_TEST.with(|value| value.replace(max)));
+    f()
 }
 
 /// How one candidate stands before its parse.
@@ -146,6 +213,8 @@ pub(super) struct FileExtent {
 /// Classify a candidate against its entry before this parse.
 /// `stored_below_active` is the index's own revision comparison for the
 /// entry (true for a zero or missing stamp while a revision is active).
+/// Only a size change is a genuine change: a same-size file whose mtime
+/// alone moved (a touch, a copy, a restore) is unchanged history (F5).
 pub(super) fn classify(
     entry: Option<FileExtent>,
     candidate: FileExtent,
@@ -163,13 +232,7 @@ pub(super) fn classify(
             HistoryKind::Fresh
         };
     };
-    let changed = entry.size_bytes != candidate.size_bytes
-        || entry.modified_unix_seconds != candidate.modified_unix_seconds
-        || entry
-            .modified_unix_nanos
-            .zip(candidate.modified_unix_nanos)
-            .is_some_and(|(stored, current)| stored != current);
-    if changed {
+    if entry.size_bytes != candidate.size_bytes {
         HistoryKind::Changed
     } else if stored_below_active {
         HistoryKind::Owed
@@ -199,8 +262,6 @@ pub(crate) enum HistoryHold {
     Latched,
     /// This page's history budget is spent.
     Budget,
-    /// The revision policy denies a listed family's genuine change.
-    ListedChanged,
 }
 
 impl HistoryHold {
@@ -213,7 +274,6 @@ impl HistoryHold {
             Self::MoveNotFull => "move_not_full",
             Self::Latched => "latched",
             Self::Budget => "budget",
-            Self::ListedChanged => "listed_changed",
         }
     }
 }
@@ -235,7 +295,15 @@ pub(crate) enum HistoryDecision {
     Owed,
     /// Owed (or a listed change) and held: no body of this file is emitted.
     Held(HistoryHold),
+    /// Ordinary sync of a listed family (or of any family while the list is
+    /// paused) under a revision that denies the request-owned literal: the
+    /// ordinary body emits, literal items are removed, and the file does not
+    /// stamp the active revision.
+    LiteralDenied,
 }
+
+/// The `history_emission_denied` reason of a literal-only denial.
+pub(super) const LISTED_LITERAL_REASON: &str = "listed_literal";
 
 /// Inputs the policy reads besides the classification.
 pub(super) struct PolicyInputs<'a> {
@@ -259,17 +327,18 @@ pub(super) fn decide(
     index_key: &str,
     size_bytes: u64,
 ) -> HistoryDecision {
-    let policy = revision_policy(inputs.active_revision)
-        .filter(|_| inputs.active_revision <= MAX_GATED_CLAUDE_REVISION);
+    let policy = revision_policy(inputs.active_revision);
+    // Under a paused list no family can be shown unlisted (F3).
+    let maybe_listed = inputs.listed || inputs.exclusions.pauses_adoption();
     let decision = match kind {
-        HistoryKind::Settled | HistoryKind::Fresh => HistoryDecision::NotOwed,
-        HistoryKind::Changed => {
-            if inputs.listed && !policy.is_some_and(|policy| policy.listed_changed_may_emit) {
-                HistoryDecision::Held(HistoryHold::ListedChanged)
-            } else {
-                HistoryDecision::NotOwed
-            }
-        }
+        HistoryKind::Settled | HistoryKind::Fresh | HistoryKind::Changed => match policy {
+            None if inputs.listed => HistoryDecision::Held(HistoryHold::UngatedRevision),
+            Some(RevisionPolicy {
+                listed_emission: ListedEmission::WithoutRequestOwnedLiteral,
+                ..
+            }) if maybe_listed => HistoryDecision::LiteralDenied,
+            _ => HistoryDecision::NotOwed,
+        },
         HistoryKind::Owed => {
             let hold = if policy.is_none() {
                 Some(HistoryHold::UngatedRevision)
@@ -277,7 +346,7 @@ pub(super) fn decide(
                 Some(HistoryHold::ListPaused)
             } else if inputs.listed {
                 Some(HistoryHold::Listed)
-            } else if let Some(hold) = no_list_hold(inputs) {
+            } else if let Some(hold) = no_list_hold(inputs, policy) {
                 Some(hold)
             } else if inputs.latched {
                 Some(HistoryHold::Latched)
@@ -294,18 +363,20 @@ pub(super) fn decide(
 }
 
 /// SOURCE F4a, narrowed by Amendment 16: where no list is intended and the
-/// policy holds, owed history is held up to the later of the fixed no-list
-/// cutoff and the saved history cutoff. Unknown birth is history. Under
-/// `Pace` nothing is held here; the budget paces it.
-fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
+/// policy holds, owed history is held up to the later of the active
+/// revision's own no-list cutoff (F4b) and the saved history cutoff. Unknown
+/// birth is history. Under `Pace` nothing is held here; the budget paces it.
+fn no_list_hold(inputs: &PolicyInputs<'_>, policy: Option<RevisionPolicy>) -> Option<HistoryHold> {
     let hold = match inputs.no_list_policy {
         NoListPolicy::Pace => return None,
         NoListPolicy::HoldUnverified => HistoryHold::NoListBirth,
         NoListPolicy::HoldMoveNotFull => HistoryHold::MoveNotFull,
     };
+    let revision_cutoff =
+        policy.map_or(u64::MAX, |policy| policy.no_list_birth_cutoff_unix_seconds);
     (inputs
         .exclusions
-        .holds_without_list(inputs.birth_unix_seconds)
+        .holds_without_list_before(inputs.birth_unix_seconds, revision_cutoff)
         || holds_until_history_cutoff(inputs))
     .then_some(hold)
 }
@@ -332,9 +403,12 @@ pub(crate) struct HistoryPage {
     pub(super) permitted: u64,
     /// Held candidates by (reason, list state).
     pub(super) denied: BTreeMap<(&'static str, &'static str), u64>,
+    /// Family roots with a literal-only denial on this page. Local only:
+    /// the census prints their count, never a root.
+    pub(super) listed_literal_roots: BTreeSet<String>,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots);
 
 impl HistoryPage {
     /// Reserve this page's budget for one file. A file reserved earlier on
@@ -378,16 +452,38 @@ impl HistoryPage {
         match decision {
             HistoryDecision::Owed => self.permitted = self.permitted.saturating_add(1),
             HistoryDecision::Held(hold) => self.note_denied(hold, list),
+            HistoryDecision::LiteralDenied => {
+                self.note_reason(LISTED_LITERAL_REASON, list);
+                note_listed_literal_denied();
+            }
             HistoryDecision::NotOwed => {}
         }
     }
 
     pub(super) fn note_denied(&mut self, hold: HistoryHold, list: ListState) {
-        let count = self
-            .denied
-            .entry((hold.as_str(), list.as_str()))
-            .or_default();
+        self.note_reason(hold.as_str(), list);
+    }
+
+    fn note_reason(&mut self, reason: &'static str, list: ListState) {
+        let count = self.denied.entry((reason, list.as_str())).or_default();
         *count = count.saturating_add(1);
+    }
+
+    /// Record the family root of a literal-only denial (once per root).
+    pub(super) fn note_listed_literal_root(&mut self, root: &str) {
+        if !self.listed_literal_roots.contains(root) {
+            self.listed_literal_roots.insert(root.to_owned());
+        }
+    }
+
+    /// Denials counted under one `history_emission_denied` reason.
+    #[cfg(test)]
+    pub(super) fn denied_for_reason(&self, reason: &str) -> u64 {
+        self.denied
+            .iter()
+            .filter(|((denied, _), _)| *denied == reason)
+            .map(|(_, count)| *count)
+            .sum()
     }
 
     pub(super) fn denied_for(&self, holds: &[HistoryHold]) -> u64 {
@@ -417,15 +513,16 @@ impl HistoryPage {
 
 /// The upload-owned part of an index entry, kept for a held file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Its stored revision needs no copy: the parse carries it and the stamp
+/// refuses a held file.
 pub(super) struct HeldUploadTuple {
     pub(super) last_snapshot_fingerprint: Option<String>,
     pub(super) last_upload_body_witness: Option<String>,
-    pub(super) revision: u64,
     pub(super) file_snapshot_fingerprints: Option<BTreeSet<String>>,
     pub(super) confirmed_empty: bool,
 }
 
-crate::heap_layout_bound::fields!(HeldUploadTuple; last_snapshot_fingerprint, last_upload_body_witness, revision, file_snapshot_fingerprints, confirmed_empty);
+crate::heap_layout_bound::fields!(HeldUploadTuple; last_snapshot_fingerprint, last_upload_body_witness, file_snapshot_fingerprints, confirmed_empty);
 
 /// One gated Claude history file of this cycle, keyed by its source file
 /// fingerprint.
@@ -434,6 +531,9 @@ pub(super) struct GatedHistory {
     pub(super) index_key: String,
     /// `None` while permitted; a hold once denied.
     pub(super) held: Option<HistoryHold>,
+    /// Ordinary sync whose request-owned literal is denied
+    /// (`HistoryDecision::LiteralDenied`); never an upgrade.
+    pub(super) literal_denied: bool,
     /// The entry's upload tuple before this parse; `None` for a new file.
     pub(super) previous: Option<HeldUploadTuple>,
     /// A held new file's local entity fingerprints. They name the file's
@@ -441,7 +541,7 @@ pub(super) struct GatedHistory {
     pub(super) local: BTreeSet<String>,
 }
 
-crate::heap_layout_bound::fields!(GatedHistory; index_key, held, previous, local);
+crate::heap_layout_bound::fields!(GatedHistory; index_key, held, literal_denied, previous, local);
 
 /// Runtime-only gate state of one cycle.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -458,12 +558,35 @@ impl HistoryEmission {
             .and_then(|gated| gated.held)
     }
 
+    /// True when this source file emits only its ordinary body this cycle.
+    pub(super) fn literal_denied(&self, source_file_fingerprint: &str) -> bool {
+        self.files
+            .get(source_file_fingerprint)
+            .is_some_and(|gated| gated.held.is_none() && gated.literal_denied)
+    }
+
+    /// Whether this item may reach an upload path this cycle: no item of a
+    /// held file, and no request-owned literal of a literal-denied file.
+    pub(super) fn permits(&self, item: &super::SnapshotItem) -> bool {
+        let Some(gated) = item
+            .source_file_fingerprint
+            .as_deref()
+            .and_then(|fingerprint| self.files.get(fingerprint))
+        else {
+            return true;
+        };
+        gated.held.is_none()
+            && !(gated.literal_denied
+                && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT))
+    }
+
     /// Recheck the stop latch at the emission seam: a fold can latch after a
-    /// candidate was permitted.
+    /// candidate was permitted. A literal-denied file is ordinary sync, not
+    /// an upgrade, and is not held.
     pub(super) fn hold_permitted_for_latch(&mut self) -> usize {
         let mut held = 0;
         for gated in self.files.values_mut() {
-            if gated.held.is_none() {
+            if gated.held.is_none() && !gated.literal_denied {
                 gated.held = Some(HistoryHold::Latched);
                 held += 1;
             }
@@ -542,6 +665,105 @@ pub(super) fn alarm_if_owed_without_list_at(
     );
 }
 
+/// Process-wide local counts, read by the census line. Counts only.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LocalCount {
+    /// Files whose request-owned literal was denied (`listed_literal`).
+    ListedLiteralDenied = 0,
+    /// Stored revisions lowered through the named re-owe.
+    Reowed = 1,
+    /// Revision activations refused for a missing policy row.
+    ActivationRefused = 2,
+}
+
+#[cfg(not(test))]
+static LOCAL_COUNTS: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+    std::sync::atomic::AtomicU64::new(0),
+];
+
+#[cfg(not(test))]
+fn add_local_count(count: LocalCount) {
+    LOCAL_COUNTS[count as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The process-wide count so far.
+#[cfg(not(test))]
+pub(crate) fn local_count(count: LocalCount) -> u64 {
+    LOCAL_COUNTS[count as usize].load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+thread_local! {
+    static LOCAL_COUNTS: [std::cell::Cell<u64>; 3] = const {
+        [std::cell::Cell::new(0), std::cell::Cell::new(0), std::cell::Cell::new(0)]
+    };
+}
+
+#[cfg(test)]
+fn add_local_count(count: LocalCount) {
+    LOCAL_COUNTS.with(|counts| {
+        let cell = &counts[count as usize];
+        cell.set(cell.get().saturating_add(1));
+    });
+}
+
+/// The count so far on this test thread.
+#[cfg(test)]
+pub(crate) fn local_count(count: LocalCount) -> u64 {
+    LOCAL_COUNTS.with(|counts| counts[count as usize].get())
+}
+
+fn note_listed_literal_denied() {
+    add_local_count(LocalCount::ListedLiteralDenied);
+}
+
+/// The one rule for lowering a stored body-witness revision (owner B):
+/// only downward, and only to a value below `active` (before any
+/// activation, below the highest revision with a policy row), so the file
+/// is owed again and goes back through the history gate. Counts
+/// `history_reowed`. Returns false and writes nothing otherwise.
+pub(super) fn re_owe(stored: &mut u64, to: u64, active: u64) -> bool {
+    let ceiling = if active == 0 {
+        max_gated_claude_revision()
+    } else {
+        active
+    };
+    if to >= *stored || to >= ceiling {
+        return false;
+    }
+    *stored = to;
+    add_local_count(LocalCount::Reowed);
+    true
+}
+
+#[derive(serde::Serialize)]
+struct ActivationRefusedAlarm {
+    refused_revision: u64,
+    kept_revision: u64,
+    max_gated_revision: u64,
+    history_activation_refused: u64,
+}
+
+/// True when `revision` may be activated. Otherwise counts the refusal and
+/// raises one local alarm for it; the caller keeps its active revision.
+pub(super) fn admit_activation(revision: u64, kept_revision: u64) -> bool {
+    if revision_policy(revision).is_some() {
+        return true;
+    }
+    add_local_count(LocalCount::ActivationRefused);
+    crate::local_resource_diagnostics::claude_history_revision_activation_refused(
+        &ActivationRefusedAlarm {
+            refused_revision: revision,
+            kept_revision,
+            max_gated_revision: max_gated_claude_revision(),
+            history_activation_refused: local_count(LocalCount::ActivationRefused),
+        },
+    );
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -589,12 +811,12 @@ mod tests {
             classify(Some(EXTENT), grown, true, None, None),
             HistoryKind::Changed
         );
-        let touched = FileExtent {
-            modified_unix_nanos: Some(100_000_000_001),
+        let shrunk = FileExtent {
+            size_bytes: 9,
             ..EXTENT
         };
         assert_eq!(
-            classify(Some(EXTENT), touched, true, None, None),
+            classify(Some(EXTENT), shrunk, true, None, None),
             HistoryKind::Changed
         );
         let legacy = FileExtent {
@@ -605,6 +827,49 @@ mod tests {
             classify(Some(legacy), EXTENT, true, None, None),
             HistoryKind::Owed,
             "a legacy entry without nanos is unchanged when seconds agree"
+        );
+    }
+
+    /// F5: a same-size file whose mtime alone moved (seconds or nanos) is
+    /// not a genuine change; it is unchanged history, so it is gated.
+    #[test]
+    fn a_same_size_mtime_only_change_is_not_a_genuine_change() {
+        for touched in [
+            FileExtent {
+                modified_unix_nanos: Some(100_000_000_001),
+                ..EXTENT
+            },
+            FileExtent {
+                modified_unix_seconds: 101,
+                modified_unix_nanos: Some(101_000_000_000),
+                ..EXTENT
+            },
+        ] {
+            assert_eq!(
+                classify(Some(EXTENT), touched, true, None, None),
+                HistoryKind::Owed
+            );
+            assert_eq!(
+                classify(Some(EXTENT), touched, false, None, None),
+                HistoryKind::Settled
+            );
+        }
+        let list = installed("");
+        let mut page = HistoryPage::default();
+        let touched = classify(
+            Some(EXTENT),
+            FileExtent {
+                modified_unix_seconds: 101,
+                ..EXTENT
+            },
+            true,
+            None,
+            None,
+        );
+        assert_eq!(
+            decide(touched, &inputs(&list, true, 3), &mut page, "k", 1),
+            HistoryDecision::Held(HistoryHold::Listed),
+            "a touched listed file is held history, not a listed change"
         );
     }
 
@@ -645,23 +910,38 @@ mod tests {
     fn policy_table_and_budget_constants() {
         assert_eq!(HISTORY_UPGRADE_FILES_PER_PAGE, 2_000);
         assert_eq!(HISTORY_UPGRADE_BYTES_PER_PAGE, 1 << 30);
-        assert!(revision_policy(2).unwrap().listed_changed_may_emit);
-        assert!(!revision_policy(3).unwrap().listed_changed_may_emit);
-        assert_eq!(revision_policy(4), None);
-        // SOURCE F2: the revision-3 row is incomplete, so the gate stops at 2
-        // and an owed revision-3 upgrade is held whatever the list says.
-        assert_eq!(MAX_GATED_CLAUDE_REVISION, 2);
-        let list = installed("");
+        let revision_2 = revision_policy(2).unwrap();
+        assert_eq!(revision_2.listed_emission, ListedEmission::Ordinary);
         assert_eq!(
-            decide(
-                HistoryKind::Owed,
-                &inputs(&list, false, 3),
-                &mut HistoryPage::default(),
-                "k",
-                1
-            ),
-            HistoryDecision::Held(HistoryHold::UngatedRevision)
+            revision_2.no_list_birth_cutoff_unix_seconds, 1_792_540_800,
+            "revision 2 keeps 2026-10-21"
         );
+        let revision_3 = revision_policy(3).unwrap();
+        assert_eq!(
+            revision_3.listed_emission,
+            ListedEmission::WithoutRequestOwnedLiteral
+        );
+        assert_ne!(
+            revision_3.no_list_birth_cutoff_unix_seconds,
+            revision_2.no_list_birth_cutoff_unix_seconds,
+            "each revision carries its own no-list cutoff (F4b)"
+        );
+        assert_eq!(revision_policy(MAX_GATED_CLAUDE_REVISION + 1), None);
+        with_max_gated_claude_revision(2, || assert_eq!(revision_policy(3), None));
+        // SOURCE F2: without a complete row a revision is ungated: an owed
+        // upgrade to it is held whatever the list says.
+        with_max_gated_claude_revision(2, || {
+            assert_eq!(
+                decide(
+                    HistoryKind::Owed,
+                    &inputs(&installed(""), false, 3),
+                    &mut HistoryPage::default(),
+                    "k",
+                    1
+                ),
+                HistoryDecision::Held(HistoryHold::UngatedRevision)
+            );
+        });
     }
 
     #[test]
@@ -769,8 +1049,28 @@ mod tests {
         }
     }
 
+    /// F4b: where the no-list policy holds, the birth hold reads the active
+    /// revision's own cutoff.
     #[test]
-    fn listed_change_emits_under_revision_two_and_is_denied_under_three() {
+    fn the_no_list_birth_hold_is_per_revision() {
+        let not_installed = ReemissionExclusions::default();
+        let born_after_revision_2_cutoff = Some(1_792_540_800 + 60);
+        let mut page = HistoryPage::default();
+        for (revision, held) in [(2, false), (3, true)] {
+            let mut owed = inputs(&not_installed, false, revision);
+            owed.no_list_policy = NoListPolicy::HoldUnverified;
+            owed.birth_unix_seconds = born_after_revision_2_cutoff;
+            let decision = decide(HistoryKind::Owed, &owed, &mut page, "k", 1);
+            assert_eq!(
+                decision == HistoryDecision::Held(HistoryHold::NoListBirth),
+                held,
+                "revision {revision}: {decision:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn listed_change_emits_under_revision_two_and_only_its_literal_is_denied_under_three() {
         let list = installed("");
         let mut page = HistoryPage::default();
         assert_eq!(
@@ -791,8 +1091,22 @@ mod tests {
                 "k",
                 1
             ),
-            HistoryDecision::Held(HistoryHold::ListedChanged)
+            HistoryDecision::LiteralDenied,
+            "the ordinary body emits; only the request-owned literal is denied"
         );
+        assert_eq!(
+            decide(
+                HistoryKind::Fresh,
+                &inputs(&list, true, 3),
+                &mut page,
+                "k",
+                1
+            ),
+            HistoryDecision::LiteralDenied,
+            "a listed root's new file never carries the literal either"
+        );
+        assert_eq!(page.denied_for_reason(LISTED_LITERAL_REASON), 2);
+        assert!(page.denied_summary().contains("listed_literal:installed=2"));
         assert_eq!(
             decide(
                 HistoryKind::Changed,
@@ -814,6 +1128,121 @@ mod tests {
             ),
             HistoryDecision::Held(HistoryHold::UngatedRevision)
         );
+        assert_eq!(
+            decide(
+                HistoryKind::Changed,
+                &inputs(&list, true, MAX_GATED_CLAUDE_REVISION + 1),
+                &mut page,
+                "k",
+                1
+            ),
+            HistoryDecision::Held(HistoryHold::UngatedRevision)
+        );
+    }
+
+    /// F3: while the list is paused no family can be shown unlisted, so
+    /// under revision 3 every ordinary sync loses only its literal; owed
+    /// history stays held. Revision 2 is unchanged.
+    #[test]
+    fn a_paused_list_denies_only_the_literal_under_revision_three() {
+        for paused in [
+            installed("not-a-digest\n"),
+            ReemissionExclusions::default().with_state_for_test(ListState::MissingAfterInstall),
+            ReemissionExclusions::default().with_state_for_test(ListState::ClosureOverflow),
+        ] {
+            assert!(paused.pauses_adoption());
+            let mut page = HistoryPage::default();
+            for kind in [HistoryKind::Changed, HistoryKind::Fresh] {
+                assert_eq!(
+                    decide(kind, &inputs(&paused, false, 3), &mut page, "k", 1),
+                    HistoryDecision::LiteralDenied
+                );
+                assert_eq!(
+                    decide(kind, &inputs(&paused, false, 2), &mut page, "k", 1),
+                    HistoryDecision::NotOwed
+                );
+            }
+            assert_eq!(
+                decide(
+                    HistoryKind::Owed,
+                    &inputs(&paused, false, 3),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::Held(HistoryHold::ListPaused)
+            );
+        }
+    }
+
+    #[test]
+    fn literal_denial_removes_only_request_owned_items() {
+        let mut emission = HistoryEmission::default();
+        emission.files.insert(
+            "denied".into(),
+            GatedHistory {
+                literal_denied: true,
+                ..GatedHistory::default()
+            },
+        );
+        emission.files.insert(
+            "held".into(),
+            GatedHistory {
+                held: Some(HistoryHold::Listed),
+                ..GatedHistory::default()
+            },
+        );
+        let item = |file: &str, literal: bool| {
+            let mut item = crate::snapshots::tests::sample_session_artifact_item();
+            item.source_file_fingerprint = Some(file.into());
+            item.usage_accounting_contract = literal.then(|| REQUEST_OWNED_USAGE_CONTRACT.into());
+            item
+        };
+        assert!(emission.permits(&item("denied", false)));
+        assert!(!emission.permits(&item("denied", true)));
+        assert!(!emission.permits(&item("held", false)));
+        assert!(emission.permits(&item("other", true)));
+        let mut ordinary = item("denied", false);
+        ordinary.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
+        assert!(
+            emission.permits(&ordinary),
+            "session_exclusive v1 on the ordinary body keeps today's rules"
+        );
+        assert!(emission.literal_denied("denied"));
+        assert_eq!(
+            emission.hold_permitted_for_latch(),
+            0,
+            "never latched as an upgrade"
+        );
+        assert!(emission.literal_denied("denied"));
+    }
+
+    #[test]
+    fn re_owe_only_lowers_below_the_active_revision_and_counts() {
+        let before = local_count(LocalCount::Reowed);
+        let mut stored = 3;
+        assert!(!re_owe(&mut stored, 3, 3), "not a lowering");
+        assert!(!re_owe(&mut stored, 4, 3), "never raises");
+        let mut low = 1;
+        assert!(!re_owe(&mut low, 2, 3), "never raises");
+        let mut at_active = 3;
+        assert!(
+            !re_owe(&mut at_active, 2, 2),
+            "must end below the active revision"
+        );
+        assert_eq!(at_active, 3);
+        assert!(re_owe(&mut stored, 2, 3));
+        assert_eq!(stored, 2);
+        let mut decoded = 3;
+        assert!(
+            re_owe(&mut decoded, 2, 0),
+            "before activation the bound is the highest revision with a row"
+        );
+        with_max_gated_claude_revision(2, || {
+            let mut decoded = 3;
+            assert!(!re_owe(&mut decoded, 2, 0));
+        });
+        assert_eq!(local_count(LocalCount::Reowed), before + 2);
     }
 
     #[test]
