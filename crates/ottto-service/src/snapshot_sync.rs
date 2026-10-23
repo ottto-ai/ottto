@@ -5927,15 +5927,15 @@ fn finish_sync_source(
         &current_codex_bindings,
         cached_codex_login_changed,
     );
-    // Judge recency on the clock at reconciliation, not the scan start: a long
-    // scan reads transcripts that were still being written after it began, and
-    // anchoring to the start rejected that live activity as "future".
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
     )
     .is_err()
