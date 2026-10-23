@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 817,
-  "content_sha256": "dff1821d34cecfb541a5fbb6f2b41ee729c548680a2c113815d58ff190c9e11e",
+  "content_sha256": "bea5352a2fe6935c66ca1a755ceb3a8c47f7f5a09b50dc518e037fb4a9f4ce8b",
   "files": [
     {
       "executable": false,
@@ -1994,8 +1994,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/retain_release_tests.rs",
-      "sha256": "62f1ecf5f993a085fdd47c22a683c45d74ce33de2b89940024fd8e5f13a4dda7",
-      "size_bytes": 48608
+      "sha256": "d8f9c97f30160974ff5b3ee458ef37216dbb58ac46f65bf6aba32fab6f9bb8ef",
+      "size_bytes": 49203
     },
     {
       "executable": false,
@@ -2015,8 +2015,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan.rs",
-      "sha256": "39e417eccd1da69ea0cce959db32797d0bec823c67df74cc7e25af3654df6f56",
-      "size_bytes": 79407
+      "sha256": "704101518bd09979fe7fb59e79a9a2dae85d79b4d0ace5ceeac52a70bf7d128e",
+      "size_bytes": 80426
     },
     {
       "executable": false,

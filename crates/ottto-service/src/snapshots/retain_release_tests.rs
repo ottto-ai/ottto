@@ -104,28 +104,28 @@ fn append_ignored(fixture: &ScanFixture, _: SnapshotSource) {
     fixture.file.append(&json!({"type":"ignored"}));
 }
 
-/// T-R0c (Claude): 100 assistant records of 50 browser `tool_use` blocks
-/// each, every block with its own id, so the active walk passes its 4,096
-/// visits. Usage rows alone do not: the parser's walk is constant in its
+/// T-R0c (Claude): one usage-bearing assistant record with 2,500 browser
+/// `tool_use` blocks, every block with its own id. Since #667 the response
+/// book keeps a per-record summary (`owned_heap`), so many small records no
+/// longer reach the walk's 4,096 visits; one record whose `tool_uses` (two
+/// strings per call) pass them leaves its summary, and so the active,
+/// unmeasured. Usage rows alone do not: the parser's walk is constant in its
 /// row count (pinned by
-/// `sampled_native_large_history_has_constant_step_charge_and_conservative_clones`;
-/// CI measured 4,000 rows, then 1,500 usage hours, both under it). Each
-/// capability call's id is kept in an uncapped set walked per entry.
+/// `sampled_native_large_history_has_constant_step_charge_and_conservative_clones`).
 fn append_many(fixture: &ScanFixture, source: SnapshotSource) {
     assert_eq!(source, SnapshotSource::ClaudeCode);
-    for record in 0..100_usize {
-        let blocks = (0..50_usize)
-            .map(|block| {
-                json!({"type":"tool_use", "id":format!("toolu_r0_{record:03}_{block:02}"),
-                    "name":"mcp__claude-in-chrome__navigate", "input":{}})
-            })
-            .collect::<Vec<_>>();
-        fixture.file.append(
-            &json!({"type":"assistant", "sessionId":"native-tail-fixture",
-            "timestamp":"2026-10-07T11:00:00Z", "message":{"id":format!("response-r0-{record}"),
-            "role":"assistant", "model":"fixture-model-tail", "content":blocks}}),
-        );
-    }
+    let blocks = (0..2_500_usize)
+        .map(|block| {
+            json!({"type":"tool_use", "id":format!("toolu_r0_{block:04}"),
+                "name":"mcp__claude-in-chrome__navigate", "input":{}})
+        })
+        .collect::<Vec<_>>();
+    fixture.file.append(
+        &json!({"type":"assistant", "sessionId":"native-tail-fixture",
+        "requestId":"req_r0_many", "timestamp":"2026-10-07T11:00:00Z",
+        "message":{"id":"response-r0-many", "role":"assistant", "model":"fixture-model-tail",
+            "usage":{"input_tokens":1,"output_tokens":1}, "content":blocks}}),
+    );
 }
 
 const OLDER: usize = 3;
@@ -468,10 +468,16 @@ fn r0_tail_with_room_is_granted_and_releases_nothing() {
             (probe.remaining - probe.a.max(probe.ins_extra)) / 2,
             "{source:?}"
         );
+        // #667: a granted copy is admitted against main's peak-reserved
+        // budget, `b_ins` less the decode peak (none for Codex).
+        let peak = probe.granted_peak.expect("granted peak");
+        if source == SnapshotSource::Codex {
+            assert_eq!(peak, 0);
+        }
         assert_eq!(
             run.decisions,
             vec![Decision::Granted {
-                budget: probe.b_ins,
+                budget: probe.b_ins - peak,
                 resident_measured: true,
                 active_measured: true,
             }],
@@ -732,11 +738,13 @@ fn packet_refusal_buckets_and_budget_variants() {
 }
 
 /// Why T-R0b-ins, -ins-band, -node and -node-band set `ins_extra` through
-/// the test seam: each needs `ins_extra > A`, and on a supported layout even
-/// a minimal Tail (a confirmed-empty file plus one ignored line) holds more
-/// active state than the insert's own slot adds.
+/// the test seam: each needs `ins_extra > A` at a chosen size. On a supported
+/// layout a minimal Codex Tail (a confirmed-empty file plus one ignored line)
+/// holds more active state than the insert's own slot adds; since #660/#667,
+/// a minimal Claude Tail's insert term already exceeds its active charge.
+/// Pinned per source, as measured.
 #[test]
-fn r0_insert_term_is_below_the_active_charge_on_supported_layouts() {
+fn r0_insert_term_against_the_active_charge_on_supported_layouts() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
@@ -749,8 +757,9 @@ fn r0_insert_term_is_below_the_active_charge_on_supported_layouts() {
         };
         let mut world = World::build(source, spec);
         let probe = run(&mut world, Opts::default()).probe;
+        let insert_dominates = source == SnapshotSource::ClaudeCode;
         assert!(
-            probe.ins_extra > 0 && probe.a > probe.ins_extra,
+            probe.ins_extra > 0 && (probe.ins_extra > probe.a) == insert_dominates,
             "{source:?}: {probe:?}"
         );
     }

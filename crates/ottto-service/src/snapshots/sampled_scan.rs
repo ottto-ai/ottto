@@ -1449,14 +1449,17 @@ pub(super) fn prove_release(
     sampling: Option<&Context>,
     x_out: XOut,
     finish_copy_budget: impl Fn(usize) -> Option<usize>,
-    decode_peak: impl FnOnce(usize) -> Option<usize>,
+    decode_peak: impl Fn(usize) -> Option<usize>,
 ) -> RetainBudget {
     let raw = granted.raw();
+    // The peak #667 reserved from main's `copy_budget` (`granted`).
+    #[cfg(test)]
+    test_hooks::probe(|probe| probe.granted_peak = decode_peak(usize::MAX));
     let Some((proof, context)) = proof.zip(sampling) else {
         return granted;
     };
     match x_out {
-        XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget),
+        XOut::Legacy => legacy_release(granted, proof, context, finish_copy_budget, decode_peak),
         XOut::Refused => granted,
         XOut::Bound(x_out) => {
             proven_release(proof, context, x_out, raw, finish_copy_budget, decode_peak)
@@ -1465,19 +1468,29 @@ pub(super) fn prove_release(
     }
 }
 
-/// The pre-M-a decision, unchanged: `K = max(C, F_prev)` with the Q-PR15
-/// guard, at the completion walk's `remaining`, then `reserve_peak`.
+/// The pre-M-a decision: `K = max(C, F_prev)` with the Q-PR15 guard, at the
+/// completion walk's `remaining`. #667 funds the decode peak inside the copy
+/// share (c22 integ2 ACK, the rule M-a uses): the share is `K + peak`, so
+/// `budget_after = finish_copy_budget(K + peak)` still admits the copy.
 fn legacy_release(
     granted: RetainBudget,
     proof: ReleaseProof,
     context: &Context,
     finish_copy_budget: impl Fn(usize) -> Option<usize>,
+    decode_peak: impl FnOnce(usize) -> Option<usize>,
 ) -> RetainBudget {
     let raw = granted.raw();
     let k = proof.clone.max(proof.finalization_prev);
-    // Overflow-safe; `None` or 0 means `b_ins >= K` (or an unreachable
-    // overflow, admitted only against `b_ins` anyway).
-    let Some(need) = k
+    let Some(share) = decode_peak(proof.remaining).and_then(|peak| {
+        #[cfg(test)]
+        test_hooks::probe(|probe| probe.peak = Some(peak));
+        k.checked_add(peak)
+    }) else {
+        return granted;
+    };
+    // Overflow-safe; `None` or 0 means `b_ins >= K + peak` (or an
+    // unreachable overflow, admitted only against `b_ins` anyway).
+    let Some(need) = share
         .checked_mul(2)
         .and_then(|twice| twice.checked_add(proof.floor))
         .and_then(|total| total.checked_sub(proof.remaining))
@@ -1497,7 +1510,7 @@ fn legacy_release(
     // `R - need = STATE_BYTES - cursor - pinned`, with the context's own
     // charge (the side ledger once) in `pinned` (`DeferredRelease::pinned`).
     let Some(pinned) = context_overhead(context)
-        .and_then(|overhead| overhead.checked_add(k.checked_mul(2)?))
+        .and_then(|overhead| overhead.checked_add(share.checked_mul(2)?))
         .and_then(|pinned| pinned.checked_add(proof.floor))
     else {
         return granted;
@@ -1520,7 +1533,7 @@ fn legacy_release(
     drop(retained);
     // #667: the release keeps running only where the decode peak fits
     // `budget_after` too; a release never precedes an unfunded peak.
-    let Some(budget_after) = finish_copy_budget(k) else {
+    let Some(budget_after) = finish_copy_budget(share) else {
         return granted;
     };
     RetainBudget::Deferred {
@@ -1556,6 +1569,8 @@ fn proven_release(
     let remaining = STATE_BYTES.checked_sub(resident)?;
     let k = proof.clone.max(x_out);
     let peak = decode_peak(remaining)?;
+    #[cfg(test)]
+    test_hooks::probe(|probe| probe.peak = Some(peak));
     let share = k.checked_add(peak)?;
     let need = share
         .checked_mul(2)?
@@ -1643,6 +1658,11 @@ pub(super) mod test_hooks {
         pub(in crate::snapshots) need_prime: Option<usize>,
         pub(in crate::snapshots) need_c: Option<usize>,
         pub(in crate::snapshots) prefixes: Option<(usize, usize)>,
+        /// #667's decode peak: `peak` sized into a release's share,
+        /// `granted_peak` reserved from main's `copy_budget` (Claude-tail
+        /// retention sites only: set in `prove_release`).
+        pub(in crate::snapshots) peak: Option<usize>,
+        pub(in crate::snapshots) granted_peak: Option<usize>,
     }
 
     /// A retention budget as a retention call received it.
