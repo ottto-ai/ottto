@@ -37,10 +37,11 @@
 //! the census budget caps: `LEDGER_RESIDENT_BOUND_BYTES`.
 
 use super::super::claude_request_census::{
-    decode_ledger_shard, ClaudeLedgerSweep, ClaudeRequestCensus, ClaudeRequestCensusInsert,
-    ClaudeRequestCensusRecord, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
-    MIN_ENTRY_SERIALIZED_BYTES, RECORD_RESIDENT_OVERHEAD_BYTES, SWEEP_KEY_PREFIX,
+    decode_ledger_shard, ClaudeLedgerSweep, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+    MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES, MIN_ENTRY_SERIALIZED_BYTES,
+    RECORD_RESIDENT_OVERHEAD_BYTES, SWEEP_KEY_PREFIX,
 };
+use super::custody::{Custody, CONTROL};
 use super::{ClaudeFamilyMemo, JsonlBatch, JsonlOutcome, ShadowReservation};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -51,7 +52,8 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-pub(crate) const LEDGER_DIR: &str = "claude-request-ledger";
+pub(crate) const LEDGER_DIR: &str = "claude-request-custody-v2";
+const LEGACY_LEDGER_DIR: &str = "claude-request-ledger";
 const DATA_SHARDS: usize = 256;
 /// The meta shard's slot (the `sweep:` records).
 const META: usize = DATA_SHARDS;
@@ -88,7 +90,7 @@ fn load_charge(len: usize) -> usize {
 }
 
 fn shard_of(key: &str) -> usize {
-    if key.starts_with(SWEEP_KEY_PREFIX) {
+    if key == CONTROL || key.starts_with(SWEEP_KEY_PREFIX) {
         META
     } else {
         usize::from(Sha256::digest(key.as_bytes())[0])
@@ -105,7 +107,7 @@ fn shard_path(dir: &Path, shard: usize) -> PathBuf {
 
 /// The ledger of one support directory.
 pub(crate) struct ClaudeLedger {
-    census: ClaudeRequestCensus,
+    census: Custody,
     /// Serialized bytes each shard holds (its entries), kept exact.
     shard_bytes: Vec<usize>,
     /// Shards changed since their last write was handed to the writer.
@@ -132,17 +134,13 @@ pub(crate) struct ClaudeLedger {
 }
 
 fn custody_key(key: &str) -> bool {
-    [
-        "due:", "dirty:", "offer:", "hold:", "watch:", "unbuilt:", "adopt:", "union:", "ever:",
-    ]
-    .iter()
-    .any(|prefix| key.starts_with(prefix))
+    !key.starts_with("fam:")
 }
 
 impl ClaudeLedger {
     fn empty(dirty: bool) -> Self {
-        Self {
-            census: ClaudeRequestCensus::default(),
+        let mut ledger = Self {
+            census: Custody::default(),
             shard_bytes: vec![0; SHARDS],
             dirty: vec![dirty; SHARDS],
             meta_debt: false,
@@ -158,11 +156,63 @@ impl ClaudeLedger {
             live_refused: false,
             metadata_cursor: String::new(),
             metadata_checkpoint: false,
+        };
+        for (key, value) in ledger.census.entries() {
+            ledger.shard_bytes[shard_of(key)] =
+                super::custody::serialized_len(key) + super::custody::serialized_len(&value) + 2;
         }
+        ledger
     }
 
-    pub(crate) fn census(&self) -> &ClaudeRequestCensus {
+    pub(crate) fn census(&self) -> &Custody {
         &self.census
+    }
+
+    pub(super) fn epoch(&self) -> u64 {
+        self.custody_epoch
+    }
+    pub(super) fn recovering(&self) -> bool {
+        self.census.recovery()
+    }
+    pub(super) fn synthetic_closed(&self) -> bool {
+        self.census.synthetic_closed()
+    }
+
+    pub(super) fn note_rebuilt(&mut self, path: &str) {
+        let before = self.census.serialized_total();
+        if self.census.rebuilt(path) {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+            self.account(
+                shard_of(&format!("file:{:x}", Sha256::digest(path.as_bytes()))),
+                before,
+            );
+        }
+    }
+    pub(super) fn finish_rebuild(&mut self, index: &super::super::ScanIndex, complete: bool) {
+        if complete && self.census.recovery() && self.census.rebuild_complete(index) {
+            let before = self.census.serialized_total();
+            self.census.finish_recovery();
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+            self.account(META, before);
+        }
+    }
+    pub(super) fn bind_file(
+        &mut self,
+        path: &str,
+        root: String,
+        member: String,
+        birth: Option<u64>,
+    ) -> bool {
+        let carrier = format!("file:{:x}", Sha256::digest(path.as_bytes()));
+        let before = self.census.serialized_total();
+        if !self.census.bind_file(path, root, member, birth) {
+            return false;
+        }
+        if self.census.serialized_total() != before {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+            self.account(shard_of(&carrier), before);
+        }
+        true
     }
 
     pub(crate) fn get(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
@@ -181,13 +231,13 @@ impl ClaudeLedger {
         key: String,
         record: ClaudeRequestCensusRecord,
     ) -> ClaudeRequestCensusInsert {
-        if self.census.record_count() >= LEDGER_MAX_RECORDS && self.census.get(&key).is_none() {
-            return ClaudeRequestCensusInsert::Refused;
-        }
         if custody_key(&key) && self.get(&key) != Some(&record) {
             self.custody_epoch = self.custody_epoch.wrapping_add(1);
         }
-        let shard = shard_of(&key);
+        let Some(carrier) = self.census.carrier_key(&key) else {
+            return ClaudeRequestCensusInsert::Refused;
+        };
+        let shard = shard_of(&carrier);
         let before = self.census.serialized_total();
         let outcome = self.census.insert(key, record);
         self.account(shard, before);
@@ -201,7 +251,10 @@ impl ClaudeLedger {
         if custody_key(key) {
             self.custody_epoch = self.custody_epoch.wrapping_add(1);
         }
-        let shard = shard_of(key);
+        let Some(carrier) = self.census.carrier_key(key) else {
+            return;
+        };
+        let shard = shard_of(&carrier);
         let before = self.census.serialized_total();
         self.census.remove(key);
         self.account(shard, before);
@@ -209,9 +262,13 @@ impl ClaudeLedger {
 
     /// Remove and return `key`'s record (its buffers move to the caller).
     pub(crate) fn take(&mut self, key: &str) -> Option<ClaudeRequestCensusRecord> {
-        let shard = shard_of(key);
+        let carrier = self.census.carrier_key(key)?;
+        let shard = shard_of(&carrier);
         let before = self.census.serialized_total();
         let record = self.census.take(key)?;
+        if custody_key(key) {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+        }
         self.account(shard, before);
         Some(record)
     }
@@ -284,37 +341,32 @@ impl ClaudeLedger {
             }
         }
         if !buffers.is_empty() {
-            for (key, record) in self.census.records() {
+            for (key, record) in self.census.entries() {
                 if Instant::now() >= deadline {
                     return None;
                 }
-                if key.starts_with(SWEEP_KEY_PREFIX) {
+                if key == CONTROL {
                     continue;
                 }
                 if let Some(buffer) = buffers.get_mut(&shard_of(key)) {
-                    push_entry(buffer, key, record);
+                    push_entry(buffer, key, &record);
                 }
             }
         }
         let mut zero = zero_first.then(|| open(self.shard_bytes[META]));
         let mut current = meta_last.then(|| open(self.shard_bytes[META]));
-        for (key, record) in self.census.records_with_prefix(SWEEP_KEY_PREFIX) {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            if let Some(buffer) = current.as_mut() {
-                push_entry(buffer, key, record);
-            }
-            if let Some(buffer) = zero.as_mut() {
-                match record.sweep() {
-                    Some((cursor, start, sweep)) => push_entry(
-                        buffer,
-                        key,
-                        &ClaudeRequestCensusRecord::sweep_record(*cursor, start, zeroed(sweep)),
-                    ),
-                    None => push_entry(buffer, key, record),
-                }
-            }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        if let Some(buffer) = current.as_mut() {
+            let (_, control) = self
+                .census
+                .entries()
+                .find(|(key, _)| key.as_str() == CONTROL)?;
+            push_entry(buffer, CONTROL, &control);
+        }
+        if let Some(buffer) = zero.as_mut() {
+            push_entry(buffer, CONTROL, &self.census.zero_control());
         }
         let close = |mut buffer: Vec<u8>| {
             buffer.push(b'}');
@@ -359,7 +411,7 @@ impl ClaudeLedger {
     }
 }
 
-fn push_entry(buffer: &mut Vec<u8>, key: &str, record: &ClaudeRequestCensusRecord) {
+fn push_entry(buffer: &mut Vec<u8>, key: &str, record: &impl serde::Serialize) {
     if buffer.len() > 1 {
         buffer.push(b',');
     }
@@ -372,7 +424,7 @@ fn push_entry(buffer: &mut Vec<u8>, key: &str, record: &ClaudeRequestCensusRecor
 
 /// A sweep state as the zero meta saves it: no certificate, and a sweep
 /// that held one carries debt (a restart from it certifies nothing).
-fn zeroed(sweep: ClaudeLedgerSweep) -> ClaudeLedgerSweep {
+pub(super) fn zeroed(sweep: ClaudeLedgerSweep) -> ClaudeLedgerSweep {
     ClaudeLedgerSweep {
         complete_through: 0,
         debt: sweep.debt.max(u64::from(sweep.complete_through > 0)),
@@ -608,7 +660,9 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
                 ClaudeLedgerAcquire::Unavailable
             }
         }
-        None if !money_io!(Metadata, support_dir.join(LEDGER_DIR).exists()) => {
+        None if !money_io!(Metadata, support_dir.join(LEDGER_DIR).exists())
+            && !money_io!(Metadata, support_dir.join(LEGACY_LEDGER_DIR).exists()) =>
+        {
             ledgers.insert(support_dir.to_path_buf(), Slot::Busy(false));
             ClaudeLedgerAcquire::Ready(ClaudeLedgerGuard {
                 support_dir: support_dir.to_path_buf(),
@@ -914,6 +968,40 @@ fn load(support_dir: &Path) -> Option<ClaudeLedger> {
 fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     let dir = support_dir.join(LEDGER_DIR);
     let mut ledger = ClaudeLedger::empty(false);
+    if !dir.exists() && support_dir.join(LEGACY_LEDGER_DIR).exists() {
+        let old = support_dir.join(LEGACY_LEDGER_DIR);
+        let mut history_unknown = false;
+        for shard in 0..SHARDS {
+            let path = shard_path(&old, shard);
+            let Ok(metadata) = std::fs::metadata(&path) else {
+                history_unknown = true;
+                continue;
+            };
+            if metadata.len() as usize > SAVE_BYTES_PER_PAGE {
+                history_unknown = true;
+                continue;
+            }
+            let _funds = admit_waiting(load_charge(metadata.len() as usize))?;
+            let Some(records) = std::fs::read(&path)
+                .ok()
+                .and_then(|bytes| decode_ledger_shard(&bytes))
+            else {
+                history_unknown = true;
+                continue;
+            };
+            for (key, record) in records.records() {
+                if ledger.insert(key.clone(), record.clone()) != ClaudeRequestCensusInsert::Stored {
+                    history_unknown = true;
+                }
+            }
+        }
+        ledger.census.mark_recovery(history_unknown);
+        ledger.load_damaged = true;
+        ledger.dirty.fill(true);
+        ledger.barrier_needed = true;
+        return Some(ledger);
+    }
+
     let mut missing = Vec::new();
     let mut present = 0_usize;
     for shard in 0..SHARDS {
@@ -953,16 +1041,20 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
             }
         };
         present += 1;
-        let decoded = decode_ledger_shard(&bytes)
-            .filter(|census| census.records().all(|(key, _)| shard_of(key) == shard));
+        let decoded =
+            serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(&bytes)
+                .ok();
         let Some(decoded) = decoded else {
             ledger.load_damaged = true;
             ledger.dirty[shard] = true;
             continue;
         };
         let before = ledger.census.serialized_total();
-        if !ledger.census.absorb(decoded, max_records) {
-            ledger.load_damaged = true;
+        for (key, value) in decoded {
+            if shard_of(&key) != shard || !ledger.census.absorb_entry(key, value.get(), max_records)
+            {
+                ledger.load_damaged = true;
+            }
         }
         ledger.account(shard, before);
         ledger.dirty[shard] = false;
@@ -972,6 +1064,11 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     }
     for shard in missing {
         ledger.dirty[shard] = true;
+    }
+    if ledger.load_damaged {
+        ledger.census.mark_recovery(true);
+        ledger.dirty[META] = true;
+        ledger.barrier_needed = true;
     }
     Some(ledger)
 }
@@ -1041,11 +1138,12 @@ pub(crate) fn with_ledger_for_test<T>(
     read: impl FnOnce(&mut ClaudeLedger) -> T,
 ) -> Option<T> {
     flush();
-    let mut ledgers = LEDGERS.lock().ok()?;
-    match ledgers.get_mut(support_dir)? {
-        Slot::Ready(ledger) => Some(read(ledger)),
-        _ => None,
-    }
+    let ClaudeLedgerAcquire::Ready(mut ledger) = acquire(support_dir) else {
+        return None;
+    };
+    // Run fixture code outside LEDGERS: a failing assertion must not poison
+    // the daemon-wide registry and turn later independent controls unavailable.
+    Some(read(&mut ledger))
 }
 
 #[cfg(test)]
@@ -1089,7 +1187,10 @@ pub(crate) fn try_load_for_test(support_dir: &Path) -> Option<ClaudeLedger> {
 
 #[cfg(test)]
 pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
-    shard_path(&support_dir.join(LEDGER_DIR), shard_of(key))
+    let carrier = Custody::default()
+        .carrier_key(key)
+        .unwrap_or_else(|| key.into());
+    shard_path(&support_dir.join(LEDGER_DIR), shard_of(&carrier))
 }
 
 #[cfg(test)]
@@ -1134,6 +1235,17 @@ pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedger
 
 /// Stable, content-free identity of a physical member's local scheduling debt.
 pub(in crate::snapshots) fn money_key(prefix: &str, index_key: &str) -> String {
+    if let Some(root) = index_key.strip_prefix("synthetic:") {
+        return format!("{prefix}otel:{root}");
+    }
+    if prefix == "watch:r:" && index_key.starts_with("otel:") {
+        return format!("{prefix}{index_key}");
+    }
+    let index_key = if prefix == "watch:m:" {
+        index_key.strip_prefix("mh:").unwrap_or(index_key)
+    } else {
+        index_key
+    };
     format!("{prefix}{:x}", Sha256::digest(index_key.as_bytes()))
 }
 
@@ -1313,7 +1425,11 @@ pub(super) fn checkpoint_receipt_until(
 #[cfg(test)]
 pub(crate) fn checkpoint_for_test(support_dir: &Path, ledger: &mut ClaudeLedger) -> bool {
     for _ in 0..8 {
-        let durable = checkpoint(support_dir, ledger);
+        let durable = checkpoint_receipt_until(
+            support_dir,
+            ledger,
+            Instant::now() + Duration::from_secs(60),
+        ) == MoneyReceipt::Ready;
         if durable && ledger.dirty_shards() == 0 {
             return true;
         }
@@ -1432,7 +1548,11 @@ pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> boo
     let Some(Slot::Ready(ledger)) = ledgers.get(support_dir) else {
         return pause(1);
     };
-    if ledger.load_damaged || ledger.unacknowledged_custody() || ledger.barrier_needed {
+    if ledger.load_damaged
+        || ledger.recovering()
+        || ledger.unacknowledged_custody()
+        || ledger.barrier_needed
+    {
         return pause(1);
     }
     if ledger
@@ -1470,6 +1590,7 @@ pub(super) fn adoption_probe_due(support_dir: &Path, prefix: &str, now: u64) -> 
         return false;
     };
     !ledger.load_damaged
+        && !ledger.recovering()
         && !ledger.unacknowledged_custody()
         && !ledger.barrier_needed
         && !ledger

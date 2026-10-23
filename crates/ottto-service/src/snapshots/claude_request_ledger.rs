@@ -179,7 +179,7 @@ fn hold<'a>(
 /// by `charge` first. None when the deadline passed or memory was refused.
 pub(crate) fn scan_holders<'a>(
     index: &'a ClaudeRequestCensus,
-    ledger: &'a ClaudeRequestCensus,
+    ledger: &'a super::claude_request_money::custody::Custody,
     page_hashes: &[u64],
     page_message_hashes: &[u64],
     deadline: Instant,
@@ -252,7 +252,7 @@ pub(crate) fn scan_holders<'a>(
 /// record: its `mh:` record is of the same revision.
 pub(crate) fn message_known(
     index: &ClaudeRequestCensus,
-    ledger: &ClaudeRequestCensus,
+    ledger: &super::claude_request_money::custody::Custody,
     key: &str,
 ) -> bool {
     index
@@ -355,7 +355,11 @@ impl ClaudeScopeDebt {
 #[derive(Debug, Clone, Copy, Default)]
 struct FileDebt(ClaudeScopeDebt);
 
-fn file_debt(index: &ScanIndex, ledger: &ClaudeRequestCensus, key: &str) -> FileDebt {
+fn file_debt(
+    index: &ScanIndex,
+    ledger: &super::claude_request_money::custody::Custody,
+    key: &str,
+) -> FileDebt {
     let mut debt = ClaudeScopeDebt::default();
     let Some(entry) = index.files.get(key) else {
         // A census record of an unindexed member (residue) is never a
@@ -437,7 +441,7 @@ impl ClaudeLedgerScope {
     /// the deadline passed.
     pub(crate) fn build(
         index: &ScanIndex,
-        ledger: &ClaudeRequestCensus,
+        ledger: &super::claude_request_money::custody::Custody,
         page_groups: &BTreeSet<&str>,
         page_roots: &BTreeSet<&str>,
         deadline: Instant,
@@ -571,7 +575,7 @@ impl ClaudeLedgerScope {
 pub(crate) struct ClaudeClassifyContext<'a, 'b> {
     pub(crate) index: &'a ScanIndex,
     /// The money ledger's records (telemetry, message-only).
-    pub(crate) ledger: &'a ClaudeRequestCensus,
+    pub(crate) ledger: &'a super::claude_request_money::custody::Custody,
     pub(crate) holders: &'b ClaudeRequestHolders<'a>,
     pub(crate) scope: &'b ClaudeLedgerScope,
     /// Page roots' own telemetry claims (rows read this page), by hash:
@@ -892,7 +896,7 @@ fn holders_with<'k>(holders: &[&'k str], own_key: &'k str) -> Vec<&'k str> {
 /// entry's fingerprint, and births all known or all unknown.
 fn birth_policy<'k>(
     index: &ScanIndex,
-    ledger: &ClaudeRequestCensus,
+    ledger: &super::claude_request_money::custody::Custody,
     holders: &[&'k str],
 ) -> Result<&'k str, ClaudeUndecidedBy> {
     let mut ranked = Vec::with_capacity(holders.len());

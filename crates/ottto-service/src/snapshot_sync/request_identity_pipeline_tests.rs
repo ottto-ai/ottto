@@ -1287,14 +1287,20 @@ fn money_m4_saved_inputs(base: &Path, support: &Path) -> serde_json::Value {
             index.claude_request_census_for_test().hash_total_for_test(),
             701_500
         );
-        assert_eq!(ledger.census().record_count(), 17_100);
+        assert_eq!(ledger.census().records().count(), 17_100);
         assert_eq!(ledger.census().hash_total_for_test(), 554_400);
-        let mut writer = store::WriterState::default();
-        while let Some((_, _, unwritten)) =
-            store::save_page_for_test(&saved, &mut ledger, &mut writer)
-        {
-            assert_eq!(unwritten, 0);
+        // Pin the shared OFF input to the legacy format, independently of the
+        // candidate's live custody codec. Both separately built callers read
+        // these exact bytes; the OFF caller never migrates this directory.
+        let dir = saved.join("claude-request-ledger");
+        std::fs::create_dir_all(&dir).unwrap();
+        for shard in 0..256 {
+            let records = ledger.census().records().filter(|(key,_)| {
+                usize::from(Sha256::digest(key.as_bytes())[0]) == shard
+            }).collect::<BTreeMap<_,_>>();
+            std::fs::write(dir.join(format!("shard-{shard:02x}.json")), serde_json::to_vec(&records).unwrap()).unwrap();
         }
+        std::fs::write(dir.join("meta.json"),b"{}").unwrap();
         index.save(&index_path).unwrap();
     }
     let source = saved.join("claude-request-ledger");

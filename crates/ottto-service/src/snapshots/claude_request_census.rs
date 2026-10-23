@@ -448,6 +448,13 @@ impl ClaudeRequestCensusRecord {
         }
     }
 
+    pub(crate) fn custody_watch(revision: [u8; 32], hashes: Vec<u64>) -> Self {
+        Self {
+            request_hashes: shared_hashes(hashes),
+            ..Self::bookkeeping(revision, 0)
+        }
+    }
+
     /// A `sweep:` record: cursor bytes, the sweep's start and its state.
     pub(crate) fn sweep_record(
         cursor: [u8; 32],
@@ -727,6 +734,7 @@ impl ClaudeRequestCensus {
             .filter(|(_, record)| !record.is_birth_stub())
     }
 
+    #[cfg(test)]
     pub(crate) fn records_after(
         &self,
         cursor: &str,
@@ -742,6 +750,7 @@ impl ClaudeRequestCensus {
     }
 
     /// Records held (birth stubs included).
+    #[cfg(test)]
     pub(crate) fn record_count(&self) -> usize {
         self.records.len()
     }
@@ -752,17 +761,20 @@ impl ClaudeRequestCensus {
 
     /// Serialized bytes a full record may still take before the tombstone
     /// reserve (what the ledger admits its growth against).
+    #[cfg(test)]
     pub(crate) fn serialized_headroom(&self) -> usize {
         (MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES)
             .saturating_sub(self.serialized_total)
     }
 
     /// Hashes a record may still add.
+    #[cfg(test)]
     pub(crate) fn hash_headroom(&self) -> usize {
         MAX_CLAUDE_REQUEST_CENSUS_HASHES.saturating_sub(self.hash_total)
     }
 
     /// The records whose keys start with `prefix`, in key order.
+    #[cfg(test)]
     pub(crate) fn records_with_prefix<'a>(
         &'a self,
         prefix: &'a str,
@@ -780,6 +792,7 @@ impl ClaudeRequestCensus {
     /// groups, keys and its map slots (a B-tree slot share at two-thirds
     /// node occupancy). One copy: the ledger is never cloned. None when
     /// `deadline` passes during the walk (checked before every record).
+    #[cfg(test)]
     pub(crate) fn resident_bytes(&self, deadline: std::time::Instant) -> Option<usize> {
         let node =
             (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3
@@ -807,6 +820,7 @@ impl ClaudeRequestCensus {
     /// Move every record of `other` in (a ledger shard), each against the
     /// budgets like a decoded record and against `max_records` in total (a
     /// new key past it is dropped). True when every record was kept.
+    #[cfg(test)]
     pub(crate) fn absorb(&mut self, other: Self, max_records: usize) -> bool {
         let mut kept = true;
         for (key, record) in other.records {
@@ -904,6 +918,7 @@ impl ClaudeRequestCensus {
 
     /// Remove `key`'s record and return it, uncharged (its hashes move to
     /// the caller; nothing is copied).
+    #[cfg(test)]
     pub(crate) fn take(&mut self, key: &str) -> Option<ClaudeRequestCensusRecord> {
         let old = self.records.remove(key)?;
         self.charge(key, &old, false);
@@ -1578,6 +1593,22 @@ pub(crate) fn decode_ledger_shard(bytes: &[u8]) -> Option<ClaudeRequestCensus> {
         .ok()?;
     isolated.end().ok()?;
     (dropped == 0).then_some(census)
+}
+
+/// Bounded evidence decoder shared by the versioned custody store. Scalar
+/// custody fields use their own codec and never enter the index decoder.
+pub(crate) fn decode_custody_evidence(bytes: &[u8]) -> Option<ClaudeRequestCensusRecord> {
+    if bytes.len() > MAX_RAW_BYTES {
+        return None;
+    }
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let record = RecordSeed {
+        remaining: MAX_CLAUDE_REQUEST_CENSUS_HASHES,
+    }
+    .deserialize(&mut decoder)
+    .ok()??;
+    decoder.end().ok()?;
+    Some(record)
 }
 
 /// Tolerant like the census: anything unexpected reads as the default.

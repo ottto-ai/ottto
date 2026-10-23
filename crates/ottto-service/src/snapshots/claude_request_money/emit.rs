@@ -31,6 +31,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     let mut requests = 0_u64;
     let mut cost = None::<u64>;
     let mut buckets = BTreeMap::<String, Vec<SnapshotModelUsage>>::new();
+    let mut row_costs = BTreeMap::new();
     for ((key, origin), grain) in &entity.grains {
         let mut selector_context = key.2.clone();
         let mut selector_sources = BTreeMap::new();
@@ -82,6 +83,23 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
             cache_read_cost_usd: None,
             cache_creation_cost_usd: None,
         };
+        let row_key = super::super::row_key_from_model_usage(&row);
+        let cost = grain.cost();
+        match row_costs.entry(row_key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(cost);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let next = match (*entry.get(), cost) {
+                    (Some(a), Some(b)) => match a.checked_add(b) {
+                        Some(sum) => Some(sum),
+                        None => return false,
+                    },
+                    _ => None,
+                };
+                entry.insert(next);
+            }
+        }
         buckets.entry(key.0.clone()).or_default().push(row);
     }
     let r = removed(entity.removed);
@@ -150,6 +168,16 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         })
         .collect();
     super::super::rebuild_snapshot_model_usage(item);
+    // The ordinary token-only rebuild deliberately drops monetary fields.
+    // Literal top rows must retain the exact per-row sum of own costs so
+    // contract 5 can reproduce both bucket and top-level rows.
+    for row in &mut item.model_usage {
+        row.cost_usd = row_costs
+            .get(&super::super::row_key_from_model_usage(row))
+            .copied()
+            .flatten()
+            .map(dollars);
+    }
     item.cost = cost.map(|micros| SnapshotCost {
         total_cost_usd: Some(dollars(micros)),
         input_cost_usd: None,

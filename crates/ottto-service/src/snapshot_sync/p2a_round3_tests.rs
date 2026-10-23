@@ -1938,7 +1938,8 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     let _live = money::LiveForTest::new(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
-        for n in 0..money::store::LEDGER_MAX_RECORDS {
+        let vacant=money::store::LEDGER_MAX_RECORDS-ledger.census().record_count();
+        for n in 0..vacant {
             assert_eq!(
                 ledger.insert(
                     format!("dirty:{n:064x}"),
@@ -2039,7 +2040,8 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
             ),
             ClaudeRequestCensusInsert::Stored
         );
-        for n in 1..money::store::LEDGER_MAX_RECORDS {
+        let vacant=money::store::LEDGER_MAX_RECORDS-ledger.census().record_count();
+        for n in 1..=vacant {
             assert_eq!(
                 ledger.insert(
                     format!(

@@ -132,7 +132,7 @@ pub(crate) fn stage_selection_fingerprints(
     for (key, record) in index
         .claude_request_census
         .records()
-        .chain(ledger.census().records())
+        .chain(ledger.census().semantic_records())
     {
         if key.starts_with("offer:")
             || key.starts_with("hold:")
@@ -155,6 +155,13 @@ pub(crate) fn stage_selection_fingerprints(
         digest.update((key.len() as u64).to_be_bytes());
         digest.update(key.as_bytes());
         digest.update(revision);
+    }
+    digest.update(b"ever-indexed\0");
+    for root in ledger.census().history() {
+        if Instant::now() >= deadline {
+            return false;
+        }
+        digest.update(root);
     }
     let consumed = format!("{:x}", digest.finalize());
     let selected = union_items_by_source(index, items)

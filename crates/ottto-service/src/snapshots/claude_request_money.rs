@@ -62,6 +62,7 @@ pub(crate) use selection::{
     record_logical_member, selected_money_files, stage_selection_fingerprints,
     synthetic_fingerprints, union_items_by_source, union_reparse, MoneyFileSelection,
 };
+pub(crate) mod custody;
 pub(crate) mod facts;
 pub(crate) mod rows;
 pub(crate) mod store;
@@ -1578,6 +1579,7 @@ async fn build_page_at(
     let dropped = end.tail.certificate_dropped;
     end.tail = tail;
     end.tail.certificate_dropped += dropped;
+    ledger.finish_rebuild(index, census_complete && telemetry_certified(ledger));
     if live {
         let mut updates = MoneyWatchUpdates::new();
         let complete = schedule_evidence(ledger, index, now, deadline, &mut budget, &mut updates);
@@ -2633,6 +2635,18 @@ fn note_message_record(
         return;
     };
     let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());
+    if let Some((root, member)) = logical_family_member(index, key) {
+        if !ledger.bind_file(
+            key,
+            root,
+            member,
+            record.birth().map(|birth| birth.unix_seconds),
+        ) {
+            counts.message_records_refused += 1;
+            return;
+        }
+    }
+    ledger.note_rebuilt(key);
     let message = message_key(key);
     if ledger.get(&message) == Some(&next) {
         return;
@@ -3498,6 +3512,9 @@ pub(crate) fn prepare_money_offers_receipt(
         &mut ledger,
         &mut ClaudeRequestMoneyShadowCounts::default(),
     );
+    if ledger.recovering() {
+        return MoneyReceipt::Refused;
+    }
     let deadline = Instant::now() + Duration::from_millis(100);
     let cutoff = page_now(support_dir).saturating_sub(35 * 86400);
     let stale_count = ledger
@@ -3867,7 +3884,7 @@ pub(crate) fn reconcile_saved_money_offers(
         &mut ledger,
         &mut ClaudeRequestMoneyShadowCounts::default(),
     );
-    let before = ledger.census().record_count();
+    let before = ledger.epoch();
     reconcile_money_offers(
         &mut ledger,
         saved,
@@ -3875,7 +3892,7 @@ pub(crate) fn reconcile_saved_money_offers(
         snapshots,
         Instant::now() + Duration::from_millis(100),
     );
-    if ledger.census().record_count() != before {
+    if ledger.epoch() != before {
         let _ = store::checkpoint(support, &mut ledger);
     }
 }
@@ -4334,7 +4351,6 @@ fn schedule_trace(
 ) -> bool {
     for (root, trace) in traces {
         let root_hash = format!("{:x}", Sha256::digest(root.as_bytes()));
-        let watch = format!("watch:trace:v2:{root_hash}");
         let legacy = format!("watch:trace:{root_hash}:");
         let mut digest = Sha256::new();
         for (request, owner) in trace {
@@ -4345,44 +4361,59 @@ fn schedule_trace(
             super::update_length_prefixed(&mut digest, owner.as_bytes());
         }
         let revision = digest.finalize().into();
-        if ledger
-            .get(&watch)
-            .is_some_and(|old| old.money_revision() == revision)
-            && ledger
-                .census()
-                .records_with_prefix(&legacy)
-                .next()
-                .is_none()
-        {
-            continue;
-        }
+        let mut watches = Vec::new();
         for key in index.files.keys() {
             if Instant::now() >= deadline {
                 return false;
             }
-            if logical_family_member(index, key).is_some_and(|(family, _)| family == *root)
-                && !stage_money_dirty(ledger, key, revision, now)
-            {
+            if logical_family_member(index, key).is_some_and(|(family, _)| family == *root) {
+                if !budget.charge(key.len() + 256) {
+                    return false;
+                }
+                watches.push((key.as_str(), store::money_key("watch:trace:file:", key)));
+            }
+        }
+        if watches.is_empty() {
+            watches.push(("", format!("watch:trace:otel:{root_hash}")));
+        }
+        let old_root = format!("watch:trace:v2:{root_hash}");
+        let changed = ledger.get(&old_root).is_some()
+            || ledger
+                .census()
+                .records_with_prefix(&legacy)
+                .next()
+                .is_some()
+            || watches.iter().any(|(_, watch)| {
+                ledger
+                    .get(watch)
+                    .is_none_or(|old| old.money_revision() != revision)
+            });
+        if !changed {
+            continue;
+        }
+        // All family dependents are dirty before any carrier advances seen.
+        for (key, _) in &watches {
+            if !key.is_empty() && !stage_money_dirty(ledger, key, revision, now) {
                 return false;
             }
         }
-        // Clone only after charging; deletions precede insertion so a ledger
-        // at the actual record cap can replace legacy records without growth.
         for (key, _) in ledger.census().records_with_prefix(&legacy) {
-            if Instant::now() >= deadline {
-                return false;
-            }
             if !stage_money_watch(updates, key.clone(), None, budget) {
                 return false;
             }
         }
-        if !stage_money_watch(
-            updates,
-            watch,
-            Some(ClaudeRequestCensusRecord::money_debt(revision, 0)),
-            budget,
-        ) {
+        if ledger.get(&old_root).is_some() && !stage_money_watch(updates, old_root, None, budget) {
             return false;
+        }
+        for (_, watch) in watches {
+            if !stage_money_watch(
+                updates,
+                watch,
+                Some(ClaudeRequestCensusRecord::money_debt(revision, 0)),
+                budget,
+            ) {
+                return false;
+            }
         }
     }
     true
@@ -4433,6 +4464,21 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
             ));
         }
     }
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return MoneyReceipt::Refused;
+        }
+        if let Some((root, member)) = logical_family_member(index, key) {
+            let birth = index
+                .claude_request_census
+                .get(key)
+                .and_then(ClaudeRequestCensusRecord::birth)
+                .map(|birth| birth.unix_seconds);
+            if !ledger.bind_file(key, root, member, birth) {
+                return MoneyReceipt::Refused;
+            }
+        }
+    }
     let prefix = adoption_prefix(index);
     let mut obsolete = Vec::new();
     let mut cursor = None;
@@ -4445,21 +4491,24 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
             break;
         }
         cursor = Some(key.clone());
-        let stale_trace = key.strip_prefix("watch:trace:").is_some_and(|suffix| {
-            let root = suffix
-                .strip_prefix("v2:")
-                .unwrap_or(suffix)
-                .split(':')
-                .next()
-                .unwrap_or("");
-            !roots.contains(root)
+        let stale_trace = key
+            .strip_prefix("watch:trace:")
+            .filter(|suffix| !suffix.starts_with("file:") && !suffix.starts_with("otel:"))
+            .is_some_and(|suffix| {
+                let root = suffix
+                    .strip_prefix("v2:")
+                    .unwrap_or(suffix)
+                    .split(':')
+                    .next()
+                    .unwrap_or("");
+                !roots.contains(root)
                 // Legacy per-request metadata is redundant when the new
                 // aggregate watch is absent: that absence unconditionally
                 // invalidates EVERY family member before any live offer. A
                 // crash during reclamation retains the same absence barrier.
                 || !suffix.starts_with("v2:")
                     && ledger.get(&format!("watch:trace:v2:{root}")).is_none()
-        });
+            });
         let stale_adoption = key.starts_with("adopt:entity:")
             && key != &format!("{prefix}rates")
             && key != &format!("{prefix}route")
@@ -4678,7 +4727,8 @@ pub(crate) fn append_synthetic_sessions(
             }
         }
     }
-    if !store::checkpoint(support, &mut ledger) || ledger.load_damaged {
+    if !store::checkpoint(support, &mut ledger) || ledger.load_damaged || ledger.synthetic_closed()
+    {
         return None;
     }
     let mut roots = Vec::new();

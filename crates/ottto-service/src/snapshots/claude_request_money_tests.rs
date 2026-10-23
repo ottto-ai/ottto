@@ -2053,7 +2053,7 @@ fn money_facts_round_trip_compactly() {
 /// root B, every record current at its entry and its message-only ids known.
 struct MoneyLedger {
     index: ScanIndex,
-    ledger: ClaudeRequestCensus,
+    ledger: super::claude_request_money::custody::Custody,
     /// Session ids by telemetry key, as a page names its roots'.
     sessions: BTreeMap<String, String>,
     a: String,
@@ -2073,7 +2073,7 @@ fn money_hashes(ids: &[&str]) -> Vec<u64> {
 impl MoneyLedger {
     fn new(a: &[&str], ax: &[&str], b: &[&str]) -> Self {
         let mut index = ScanIndex::default();
-        let mut ledger = ClaudeRequestCensus::default();
+        let mut ledger = super::claude_request_money::custody::Custody::default();
         let keys = [
             ("/m/projects/-repo/A.jsonl", 'a', a),
             ("/m/projects/-repo/A/subagents/agent-x.jsonl", 'b', ax),
@@ -2338,7 +2338,7 @@ fn money_scope_debt_blocks_negative_membership_claims() {
 fn money_message_only_copies_pick_one_owner() {
     let message = crate::snapshots::claude_request_money::claude_message_hash("msg_shared");
     let mut index = ScanIndex::default();
-    let mut ledger = ClaudeRequestCensus::default();
+    let mut ledger = super::claude_request_money::custody::Custody::default();
     let keys = ["/m/projects/-repo/P.jsonl", "/m/projects/-repo/Q.jsonl"];
     for (key, seed) in keys.iter().zip(['1', '2']) {
         let mut entry = manifest_index_entry(Some("body"));
