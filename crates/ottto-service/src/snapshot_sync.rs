@@ -5735,9 +5735,10 @@ fn finish_sync_source(
         };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
-                crate::snapshots::claude_api_cache_creation_rejection_count()
+                crate::snapshots::claude_api_cache_creation_rejection_count(),
+                stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
@@ -7036,6 +7037,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// Fix 1's skipped full re-arms; absent from the line while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
+    pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -7752,6 +7756,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {

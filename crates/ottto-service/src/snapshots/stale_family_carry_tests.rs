@@ -1340,3 +1340,395 @@ fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
     );
     assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
 }
+
+// Fix 2: after a full re-arm terminal, the traversal that re-read every
+// family (started at CARRY_FAILED) finished needing a clean follow-up. Its
+// follow-up carries the unchanged witnessed family under the C1b family
+// checks instead of re-reading it whole again, and re-reads the families it
+// cannot carry at most once per fence deadline.
+
+/// The fence deadline the full-rearm window's stale re-arms count against.
+const WINDOW_DEADLINE: u64 = 1_785_700_000;
+
+fn window_needs_clean_followup(index: &mut ScanIndex) {
+    index.traversal = None;
+    index.bounded_sweep_had_unsettled_upload = true;
+}
+
+/// A closed fence whose last complete terminal was a full re-arm: the
+/// traversal it opened read both families and finished needing a clean
+/// follow-up.
+fn window_index() -> ScanIndex {
+    let mut index = ScanIndex {
+        claude_request_identity_contract: Some(
+            crate::snapshots::claude_request_identity::COLLECTOR.to_string(),
+        ),
+        claude_duplicate_request_witness_overflowed: true,
+        claude_duplicate_fence_next_full_rearm_unix_seconds: Some(WINDOW_DEADLINE),
+        ..ScanIndex::default()
+    };
+    index.claude_full_rearm_progress.full_rearm_window_next = true;
+    index.claude_full_rearm_progress.full_rearm_window = Some(ClaudeFullRearmWindow {
+        context_fingerprint: scan_traversal_context_fingerprint(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &index,
+            BACKFILL_WINDOW_DAYS,
+        ),
+        process: claude_full_rearm_process(),
+        window_ends: BTreeSet::new(),
+        member_digests: BTreeMap::new(),
+    });
+    carry_file(&mut index, CARRY_OTHER, None);
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        CARRY_FAILED,
+        BACKFILL_WINDOW_DAYS,
+    );
+    carry_family(&mut index, CARRY_ROOT, &[None, Some(CARRY_AGENT)], true);
+    carry_family(&mut index, CARRY_UNWITNESSED, &[None], false);
+    window_needs_clean_followup(&mut index);
+    index
+}
+
+fn window_indexed_ids(index: &ScanIndex) -> BTreeSet<String> {
+    index
+        .files
+        .keys()
+        .filter_map(|key| claude_index_path_family_member(Path::new(key)))
+        .flat_map(|(root, member)| [root, member])
+        .collect()
+}
+
+/// Carried and capped pending is compacted to member keys: it credits
+/// nothing and keeps the next complete census invalid.
+fn assert_compacted_and_invalid(index: &ScanIndex, root: &str) {
+    let pending = &index.claude_usage_family_pending[root];
+    assert!(pending.member_occurrences.is_empty(), "{root}");
+    assert!(!pending.member_request_id_hashes.is_empty(), "{root}");
+    assert!(pending
+        .member_request_id_hashes
+        .values()
+        .all(BTreeSet::is_empty));
+    assert!(claude_stale_pending_keeps_census_invalid(
+        index,
+        root,
+        pending,
+        true,
+        &window_indexed_ids(index)
+    ));
+}
+
+/// Positive: the first clean follow-up carries the witnessed family and
+/// re-reads the unwitnessed one, where BASE re-reads both; the second
+/// follow-up within the same fence deadline re-reads neither. A new deadline
+/// allows one more stale re-arm.
+#[test]
+fn fix2_clean_followup_carries_window_families_and_caps_stale_rearms() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fix = window_index();
+    let window = fix
+        .claude_full_rearm_progress
+        .full_rearm_window
+        .clone()
+        .expect("the start after a full re-arm opens a window");
+    assert_eq!(
+        window.window_ends,
+        BTreeSet::from([CARRY_FAILED.to_string()])
+    );
+    assert!(!fix.claude_full_rearm_progress.full_rearm_window_next);
+    let before = fix.clone();
+    let mut base = window_index();
+    let row = carry_start(&mut fix, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    let base_row = {
+        let _base = KeepStaleClaudeFamilyRearmForTest::new();
+        carry_start(&mut base, CARRY_RETRY, BACKFILL_WINDOW_DAYS)
+    };
+    for arm_row in [&row, &base_row] {
+        assert_eq!(arm_row["prior_unsettled_upload"], true);
+        assert_eq!(arm_row["stale_pending_families"], 2);
+    }
+    // Preconditions on BASE: the clean follow-up re-arms both families.
+    assert_eq!(base_row["rearmed_index_files"], 3);
+    assert_eq!(base_row["carried_pending_families"], 0);
+    // FLIPS: the witnessed family is carried.
+    assert_eq!(row["rearm_window_families"], 2);
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["carried_index_files"], 2);
+    assert_eq!(row["rearm_window_carried_families"], 1);
+    assert_eq!(row["rearmed_index_files"], 1);
+    assert_eq!(row["rearm_window_rearmed_files"], 1);
+    assert!(row.get("stale_rearm_capped_families").is_none());
+    for key in carry_family_keys() {
+        assert_eq!(
+            fix.files[&key].source_file_fingerprint,
+            before.files[&key].source_file_fingerprint
+        );
+    }
+    let unwitnessed = carry_key(CARRY_UNWITNESSED, None);
+    assert!(fix.files[&unwitnessed].source_file_fingerprint.is_empty());
+    assert_compacted_and_invalid(&fix, CARRY_ROOT);
+    assert_eq!(
+        fix.claude_usage_family_witnesses,
+        before.claude_usage_family_witnesses
+    );
+    let progress = &fix.claude_full_rearm_progress;
+    assert_eq!(progress.stale_rearm_fence_deadline, Some(WINDOW_DEADLINE));
+    assert_eq!(progress.stale_rearms_at_deadline, 1);
+    assert_eq!(
+        progress.full_rearm_window.as_ref().unwrap().window_ends,
+        BTreeSet::from([CARRY_FAILED.to_string(), CARRY_RETRY.to_string()])
+    );
+
+    // The follow-up re-read the unwitnessed family and again needed a clean
+    // follow-up. Its one stale re-arm for this deadline already ran.
+    fix.files
+        .get_mut(&unwitnessed)
+        .unwrap()
+        .source_file_fingerprint = before.files[&unwitnessed].source_file_fingerprint.clone();
+    fix.claude_usage_family_pending
+        .get_mut(CARRY_UNWITNESSED)
+        .unwrap()
+        .census_window_end = CARRY_RETRY.to_string();
+    window_needs_clean_followup(&mut fix);
+    let second = fix.clone();
+    let row = carry_start(&mut fix, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearm_window_families"], 2);
+    assert_eq!(row["carried_pending_families"], 1);
+    assert_eq!(row["rearmed_index_files"], 0, "no second stale re-arm");
+    assert_eq!(row["stale_rearm_capped_families"], 1);
+    assert_eq!(row["stale_rearm_capped_files"], 1);
+    assert_eq!(
+        fix.files[&unwitnessed].source_file_fingerprint,
+        before.files[&unwitnessed].source_file_fingerprint
+    );
+    for root in [CARRY_ROOT, CARRY_UNWITNESSED] {
+        assert_compacted_and_invalid(&fix, root);
+    }
+    assert_eq!(fix.claude_full_rearm_progress.stale_rearms_at_deadline, 1);
+    let serialized = row.to_string();
+    for forbidden in [CARRY_ROOT, CARRY_UNWITNESSED, "rev-", "body-", "/carry/"] {
+        assert!(!serialized.contains(forbidden), "{forbidden}");
+    }
+
+    // A new fence deadline allows one more stale re-arm.
+    let mut next = second.clone();
+    next.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(WINDOW_DEADLINE + 86_400);
+    let row = carry_start(&mut next, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearmed_index_files"], 1);
+    assert!(row.get("stale_rearm_capped_families").is_none());
+    assert!(next.files[&unwitnessed].source_file_fingerprint.is_empty());
+
+    // The cap never holds a family whose member is not accepted, nor any
+    // family while the contract-5 latch is set.
+    let mut unaccepted = second.clone();
+    unaccepted
+        .accepted_snapshot_fingerprints
+        .remove(&format!("body-{}", carry_member(CARRY_UNWITNESSED, None)));
+    let row = carry_start(&mut unaccepted, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearmed_index_files"], 1);
+    assert!(row.get("stale_rearm_capped_families").is_none());
+    let mut latched = second;
+    latched.claude_request_identity_contract_changed = true;
+    let row = carry_start(&mut latched, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearmed_index_files"], 3, "BASE: nothing carried");
+    assert!(row.get("stale_rearm_capped_families").is_none());
+}
+
+/// Another upload context, a daemon restart (another process), or no window
+/// at all takes BASE's whole re-arm at the clean follow-up.
+#[test]
+fn fix2_window_from_another_context_or_process_is_base() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mutations: [(&str, fn(&mut ScanIndex)); 3] = [
+        ("context", |index| {
+            index
+                .claude_full_rearm_progress
+                .full_rearm_window
+                .as_mut()
+                .unwrap()
+                .context_fingerprint = "another-context".to_string();
+        }),
+        ("process", |index| {
+            let window = index
+                .claude_full_rearm_progress
+                .full_rearm_window
+                .as_mut()
+                .unwrap();
+            window.process = window.process.wrapping_add(2);
+        }),
+        ("no_window", |index| {
+            index.claude_full_rearm_progress.full_rearm_window = None;
+        }),
+    ];
+    for (case, mutate) in mutations {
+        let mut index = window_index();
+        mutate(&mut index);
+        let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["rearmed_index_files"], 3, "{case}");
+        assert_eq!(row["carried_pending_families"], 0, "{case}");
+        assert!(row.get("rearm_window_families").is_none(), "{case}");
+        assert!(
+            index.claude_full_rearm_progress.full_rearm_window.is_none(),
+            "{case}: the window is dropped"
+        );
+    }
+}
+
+/// Reuse C1b's boundary controls at the clean-follow-up entry. Only the two
+/// entry conditions intentionally changed by Fix 2 are omitted.
+#[test]
+fn fix2_clean_followup_preserves_c1b_family_refusals() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for control in carry_controls() {
+        if matches!(
+            control.name,
+            "no_retained_traversal" | "prior_unsettled_upload"
+        ) {
+            continue;
+        }
+        let mut fix = window_index();
+        (control.mutate)(&mut fix);
+        let mut base = fix.clone();
+        let row = carry_start(&mut fix, CARRY_RETRY, control.days);
+        let _base_row = {
+            let _base = KeepStaleClaudeFamilyRearmForTest::new();
+            carry_start(&mut base, CARRY_RETRY, control.days)
+        };
+        assert_eq!(row["carried_pending_families"], 0, "{}", control.name);
+        for (key, entry) in &fix.files {
+            assert_eq!(
+                entry.source_file_fingerprint, base.files[key].source_file_fingerprint,
+                "{}: {key}",
+                control.name
+            );
+        }
+    }
+}
+
+#[test]
+fn fix2_restart_before_the_first_window_start_is_base() {
+    let mut index = window_index();
+    index.claude_full_rearm_progress.full_rearm_window_next = true;
+    index
+        .claude_full_rearm_progress
+        .full_rearm_window
+        .as_mut()
+        .unwrap()
+        .process = claude_full_rearm_process().wrapping_add(2);
+    let row = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearmed_index_files"], 3);
+    assert_eq!(row["carried_pending_families"], 0);
+    assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
+}
+
+#[test]
+fn fix2_capped_family_member_change_cancels_and_requeues_passed_member() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let agent = "agent-b7c2696e421181e1a";
+    let mut index = window_index();
+    carry_family(&mut index, CARRY_UNWITNESSED, &[None, Some(agent)], false);
+    let before = index.files.clone();
+    let first = carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(first["rearm_window_rearmed_files"], 2);
+    for (key, entry) in &mut index.files {
+        entry.source_file_fingerprint = before[key].source_file_fingerprint.clone();
+    }
+    index
+        .claude_usage_family_pending
+        .get_mut(CARRY_UNWITNESSED)
+        .unwrap()
+        .census_window_end = CARRY_RETRY.to_string();
+    window_needs_clean_followup(&mut index);
+    let ready = index.clone();
+    let second = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(second["stale_rearm_capped_files"], 2);
+    assert_compacted_and_invalid(&index, CARRY_UNWITNESSED);
+    let child = carry_key(CARRY_UNWITNESSED, Some(agent));
+    let root = carry_key(CARRY_UNWITNESSED, None);
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.scan_roots = vec![PathBuf::from(CARRY_SCAN_ROOT)];
+    traversal.observed_index_keys.insert(child.clone());
+    carry_fill_queue(&mut index);
+    cancel_claude_family_carry_for_member_parse(
+        &mut index,
+        CARRY_SECOND_RETRY,
+        Path::new(&root),
+        &[],
+        &VecDeque::new(),
+    );
+    assert!(!index
+        .claude_stale_family_carry
+        .roots
+        .contains(CARRY_UNWITNESSED));
+    assert!(index.files[&child].source_file_fingerprint.is_empty());
+    assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
+    assert_eq!(
+        index.claude_stale_family_carry.replay[0].path,
+        PathBuf::from(child)
+    );
+
+    // A changed committed revision fails the cap before the scan too.
+    let mut changed = ready.clone();
+    changed
+        .files
+        .get_mut(&root)
+        .unwrap()
+        .source_file_fingerprint
+        .push_str("-changed");
+    let row = carry_start(&mut changed, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["rearm_window_rearmed_files"], 2);
+    assert!(row.get("stale_rearm_capped_files").is_none());
+
+    // Authority correction debt and account holds remain outside the cap.
+    for account_hold in [false, true] {
+        let mut held = ready.clone();
+        if account_hold {
+            held.claude_account_deferred_holds
+                .insert(root.clone(), "rev".to_string());
+        } else {
+            carry_unbound_quarantine(&mut held, true);
+            let record = held
+                .claude_usage_authority_quarantine
+                .remove(CARRY_ROOT)
+                .unwrap();
+            held.claude_usage_authority_quarantine
+                .insert(CARRY_UNWITNESSED.to_string(), record);
+        }
+        let row = carry_start(&mut held, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(row["rearm_window_rearmed_files"], 2);
+        assert!(row.get("stale_rearm_capped_files").is_none());
+    }
+}
+
+#[test]
+fn fix2_restart_during_a_carried_window_restores_base_before_resuming() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut index = window_index();
+    carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert!(index.claude_stale_family_carry.roots.contains(CARRY_ROOT));
+    index
+        .claude_full_rearm_progress
+        .full_rearm_window
+        .as_mut()
+        .unwrap()
+        .process = claude_full_rearm_process().wrapping_add(2);
+    let row = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 0);
+    assert!(index.claude_full_rearm_progress.full_rearm_window.is_none());
+    for key in carry_family_keys() {
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+    }
+}
