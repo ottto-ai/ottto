@@ -6887,16 +6887,14 @@ fn forget_installation_state_locked() -> Result<(), LocalApiError> {
         .map_err(|_| LocalApiError::StatePoisoned)?;
     let support_dir = default_support_dir();
     crate::upload_receipts::clear(&support_dir).map_err(|_| LocalApiError::StatePoisoned)?;
-    for path in [
-        support_dir.join("snapshots"),
-        support_dir.join("snapshot_backfill_state.json"),
-    ] {
-        if path.is_dir() {
-            fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
-        } else if path.exists() {
-            fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
-        }
+    let path = support_dir.join("snapshots");
+    if path.is_dir() {
+        fs::remove_dir_all(&path).map_err(|_| LocalApiError::StatePoisoned)?;
+    } else if path.exists() {
+        fs::remove_file(&path).map_err(|_| LocalApiError::StatePoisoned)?;
     }
+    crate::backfill::remove_backfill_state(&support_dir)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     Ok(())
 }
 

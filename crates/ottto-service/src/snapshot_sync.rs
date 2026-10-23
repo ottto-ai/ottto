@@ -1,9 +1,11 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
+#[cfg(test)]
+use crate::backfill::save_backfill_state;
 use crate::backfill::{
     apply_backfill_cutoff, current_historical_replay, load_backfill_state,
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
-    save_backfill_state,
+    update_backfill_state,
 };
 use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
 use crate::detected_uses::{
@@ -7026,17 +7028,16 @@ fn finish_sync_source(
     }
 
     if backfill_succeeded {
-        // Reload before mutating: a claim completion can persist an
-        // account-switch backfill cutoff while this (potentially minutes-long)
-        // sync is running, and saving the stale pre-scan copy would clobber it.
-        let mut backfill_state = load_backfill_state(support_dir);
-        mark_backfill_complete_for_destination(
-            &mut backfill_state,
-            source,
-            &upload_destination_namespace,
-        );
-        backfill_state.last_completed_at = Some(scan_started_at.clone());
-        if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
+        // Keep completion's reload, mutation and save atomic with claims,
+        // list intent and deliberate installation reset.
+        if let Err(error) = update_backfill_state(support_dir, |backfill_state| {
+            mark_backfill_complete_for_destination(
+                backfill_state,
+                source,
+                &upload_destination_namespace,
+            );
+            backfill_state.last_completed_at = Some(scan_started_at.clone());
+        }) {
             eprintln!(
                 "local snapshot backfill state save failed for {}: {}",
                 source.api_slug(),
