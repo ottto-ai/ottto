@@ -3429,6 +3429,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
         compaction_events: item.compaction_events.clone(),
+        first_own_request_at: item.first_own_request_at.clone(),
         local_context_points: Vec::new(),
         compaction_total_pre_tokens: item.compaction_total_pre_tokens,
         compaction_total_post_tokens: item.compaction_total_post_tokens,
@@ -9371,9 +9372,14 @@ mod tests {
         item.cache_base_head_etag = None;
         assert_eq!(item.compaction_events.len(), 1);
         assert!(!item.local_context_points.is_empty());
+        // Codex never carries design E's first own request time; a Claude
+        // value survives the retry copy like the other wire fields.
+        assert_eq!(item.first_own_request_at, None);
+        item.first_own_request_at = Some("2026-10-07T11:00:00Z".into());
 
         let copy = retry_ordinary_owned(&item).expect("ordinary item copies");
 
+        assert_eq!(copy.first_own_request_at, item.first_own_request_at);
         assert_eq!(copy.compaction_events, item.compaction_events);
         assert!(copy.local_context_points.is_empty());
         assert_eq!(
