@@ -19,6 +19,7 @@ fn census_pipeline_window(census_window_end: &str) -> u64 {
 #[test]
 #[serial(source_manifests)]
 fn census_records_keep_the_held_revision_and_cover_it_in_window() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("claude-census-records-held");
     let baseline = fixture.baseline();

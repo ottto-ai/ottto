@@ -3636,8 +3636,8 @@ impl ClaudeRequestCensusJoin {
         // even without a MONEY index entry. Only this terminal's observation
         // covers such a key; no indexed fingerprint exists to excuse it.
         for key in census
-            .records
-            .keys()
+            .records()
+            .map(|(key, _)| key)
             .chain(observed_index_keys.iter())
             .chain(residue_index_keys.iter())
         {

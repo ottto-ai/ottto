@@ -555,6 +555,7 @@ fn money_facts(session: &str, count: usize) -> Box<[u8]> {
 /// insert is the exact serialized size.
 #[test]
 fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let mut census = ClaudeRequestCensus::default();
     let birth = ClaudeRequestBirth {
         unix_seconds: 1_700_000_000,
@@ -874,6 +875,7 @@ fn money_serialized_budget_keeps_a_tombstone_reserve() {
 /// full census under the serialized budget).
 #[test]
 fn money_census_round_trips_at_the_hash_cap() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let mut census = ClaudeRequestCensus::default();
     assert_eq!(
         census.insert_for_test(
