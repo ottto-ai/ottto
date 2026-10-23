@@ -57,17 +57,22 @@ impl RepairProvenance {
     }
 }
 #[derive(Debug)]
-struct HeldRaw(Box<RawValue>, Option<String>, u64); // admitted key/value/bookkeeping charge
+struct HeldRaw(Box<RawValue>, Option<std::ops::Range<usize>>, u64); // admitted key/value/bookkeeping charge
 impl HeldRaw {
     fn get(&self) -> &str {
         self.0.get()
+    }
+    fn owner(&self) -> Option<&str> {
+        self.1
+            .as_ref()
+            .and_then(|span| self.get().get(span.clone()))
     }
 }
 impl crate::heap_layout_bound::HeapLayoutBound for HeldRaw {
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
-        c.add(self.get().len())?;
-        crate::heap_layout_bound::HeapLayoutBound::heap_bound(&self.1, c)
+        // The optional owner is an inline range into this immutable raw slot.
+        c.add(self.get().len())
     }
 }
 impl Holds {
@@ -93,12 +98,12 @@ impl Holds {
         self.3 = files
             .into_iter()
             .flat_map(|slots| slots.values())
-            .filter_map(|raw| raw.1.as_deref().map(repair_key))
+            .filter_map(|raw| raw.owner().map(repair_key))
             .collect();
         self.4 = files
             .into_iter()
             .flat_map(|slots| slots.values())
-            .any(|raw| raw.1.is_none());
+            .any(|raw| raw.owner().is_none());
     }
     #[cfg(test)]
     pub(super) fn provenance_receipt(&self) -> (usize, u64, u128) {
@@ -849,11 +854,10 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
         self.typed(span)
     }
-    fn hold_charge(field: &str, key: Span, value: Span) -> std::result::Result<u64, Error> {
+    fn hold_charge(key: Span, value: Span) -> std::result::Result<u64, Error> {
         key.len
             .checked_add(value.len)
             .and_then(|bytes| bytes.checked_add(HOLD_RECORD_OVERHEAD))
-            .and_then(|bytes| bytes.checked_add(if field == "files" { value.len } else { 0 }))
             .ok_or(Error::HoldBudget)
     }
     fn raw(&mut self, span: Span, charge: u64) -> std::result::Result<Box<RawValue>, Error> {
@@ -861,7 +865,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         if self.held_count >= HOLD_COUNT_MAX {
             return Err(Error::HoldBudget);
         }
-        // Key, value, optional owner copy and bookkeeping have all been checked
+        // Key, value and inline bookkeeping have all been checked
         // before retaining either raw bytes or the already bounded record key.
         self.reader.seek(SeekFrom::Start(span.start))?;
         let mut bytes = String::with_capacity(span.len as usize);
@@ -883,9 +887,9 @@ impl<R: BufRead + Seek> Decoder<R> {
             return Err(Error::Refused("unaddressable held identity"));
         }
         // Retain the lexical key charge, including escapes, so canonical output
-        // can never require a larger restart admission. A file may also retain
-        // an owner copied out of its raw slot; its size is <= that raw span.
-        let charge = Self::hold_charge(field, key_span, span)?;
+        // can never require a larger restart admission. An intact file owner
+        // is an inline range into the raw slot, never a second payload copy.
+        let charge = Self::hold_charge(key_span, span)?;
         let raw = self.raw(span, charge)?;
         self.held_bytes += charge;
         self.held_count += 1;
@@ -936,7 +940,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             // admission. Its full charge is checked before allocating the key.
             let decoded = self.typed(value);
             if debt && decoded.is_err() {
-                self.check_hold_bytes(Self::hold_charge(field, key_span, value)?)?;
+                self.check_hold_bytes(Self::hold_charge(key_span, value)?)?;
                 if self.held_count >= HOLD_COUNT_MAX {
                     return Err(Error::HoldBudget);
                 }
@@ -1645,7 +1649,7 @@ impl ScanIndex {
             .get("files")
             .into_iter()
             .flat_map(|slots| slots.values())
-            .map(|raw| raw.1.as_deref())
+            .map(|raw| raw.owner())
     }
     pub(super) fn decode_holds_codex_owner(&self, id: &str) -> bool {
         self.decode_holds.4
@@ -1886,7 +1890,7 @@ fn repaired_authority(raw: &RawValue) -> Option<ClaudeUsageAuthorityQuarantineRe
     claude_authority_record_contract_is_valid(&record).then_some(record)
 }
 
-fn held_file_owner(raw: &RawValue) -> Option<String> {
+fn held_file_owner(raw: &RawValue) -> Option<std::ops::Range<usize>> {
     #[derive(Deserialize)]
     struct Owner<'a> {
         #[serde(default, borrow)]
@@ -1894,7 +1898,15 @@ fn held_file_owner(raw: &RawValue) -> Option<String> {
     }
     let owner: Owner<'_> = serde_json::from_str(raw.get()).ok()?;
     if let Some(owner) = owner.codex_protected_owner {
-        return valid_codex_protected_owner(owner).then(|| owner.to_owned());
+        if !valid_codex_protected_owner(owner) {
+            return None;
+        }
+        // Serde's borrowed &str is within the immutable raw allocation. Store
+        // only its checked byte range; Arc clones keep the backing slot alive.
+        let start = (owner.as_ptr() as usize).checked_sub(raw.get().as_ptr() as usize)?;
+        let end = start.checked_add(owner.len())?;
+        raw.get().get(start..end).filter(|value| *value == owner)?;
+        return Some(start..end);
     }
     // Filename hints are not ownership proof for captured/joined history.
     // Without an intact owner disclosure, keep the state-only domain unknown.

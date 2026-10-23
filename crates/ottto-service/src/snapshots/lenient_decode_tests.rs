@@ -22,6 +22,21 @@ fn fixture() -> ScanIndex {
     );
     index
 }
+// Keys and fixed custody metadata now spend the same input-funded allowance
+// as values. Fund hold-heavy fixtures with unrelated COMMITTED native state,
+// which survives partial save and restart, rather than disposable padding.
+fn fund_hold_metadata(index: &mut ScanIndex, count: usize) {
+    let members = index
+        .file_snapshot_fingerprints
+        .get_mut("/synthetic/15.jsonl")
+        .unwrap();
+    for n in 0..count {
+        let fingerprint = format!("{:064x}", 0x10000 + n);
+        members.insert(fingerprint.clone());
+        index.accepted_snapshot_fingerprints.insert(fingerprint);
+    }
+}
+
 fn raw_slot(bytes: &[u8], field: &str, key: &str) -> String {
     let root: BTreeMap<String, &serde_json::value::RawValue> =
         serde_json::from_slice(bytes).unwrap();
@@ -566,6 +581,7 @@ fn lenient_load_and_selected_cas_allocation_receipt() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-allocations");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
+    fund_hold_metadata(&mut index, 1024);
     index.save(&path).unwrap();
     let mut value = serde_json::to_value(&index).unwrap();
     for n in 0..64 {
@@ -575,6 +591,9 @@ fn lenient_load_and_selected_cas_allocation_receipt() {
     fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
     let (loaded, load) = crate::retry_allocation_probe::measure(|| ScanIndex::load(&path).unwrap());
     assert!(!loaded.decode_holds.is_empty());
+    for n in 0..64 {
+        assert!(loaded.decode_holds_entity(&format!("{n:064x}")));
+    }
     let ((working, committed, subset), cas) = crate::retry_allocation_probe::measure(|| {
         let working = ScanIndex::load(&path).unwrap();
         let committed = working.clone();
@@ -584,6 +603,13 @@ fn lenient_load_and_selected_cas_allocation_receipt() {
     });
     assert!(working.decode_holds.same_as(&committed.decode_holds));
     assert!(subset.decode_holds.same_as(&loaded.decode_holds));
+    assert_eq!(
+        subset.file_snapshot_fingerprints["/synthetic/15.jsonl"].len(),
+        1025
+    );
+    assert!(subset
+        .accepted_snapshot_fingerprints
+        .contains(&format!("{:064x}", 0x10000 + 1023)));
     eprintln!("lenient_decode_allocation_receipt load_requested_peak={} load_usable_peak={} selected_cas_with_three_graphs_requested_peak={} selected_cas_with_three_graphs_usable_peak={}", load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak);
 }
 
@@ -656,6 +682,7 @@ fn lenient_opaque_claude_file_also_freezes_family_correction() {
     let scratch = crate::test_scratch::ScratchDir::new("lenient-file-family");
     let path = scratch.as_ref().join("index.json");
     let mut index = fixture();
+    fund_hold_metadata(&mut index, 128);
     index.insert_unproven_terminal_claude_authority_for_test("family", &"1".repeat(64));
     index.files.insert(
         "/synthetic/family.jsonl".into(),
@@ -679,6 +706,13 @@ fn lenient_opaque_claude_file_also_freezes_family_correction() {
         original
     );
     assert_sibling(&loaded);
+    assert_eq!(
+        loaded.file_snapshot_fingerprints["/synthetic/15.jsonl"].len(),
+        129
+    );
+    assert!(loaded
+        .accepted_snapshot_fingerprints
+        .contains(&format!("{:064x}", 0x10000 + 127)));
 }
 
 #[test]
@@ -1480,5 +1514,52 @@ fn opaque_file_incidence_blocks_both_legacy_seals_and_ack_reopening() {
                 SNAPSHOT_ACCEPTED_LEDGER_VERSION
             );
         }
+    }
+}
+
+#[test]
+fn held_owner_range_survives_clone_original_drop_and_restart() {
+    for valid in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-shared-owner-range");
+        let path = scratch.as_ref().join("index.json");
+        let mut seed = fixture();
+        seed.save(&path).unwrap();
+        let owner = if valid {
+            codex_protected_owner("held-owner")
+        } else {
+            "invalid".into()
+        };
+        let key = "/synthetic/0.jsonl";
+        let mut value = serde_json::to_value(&seed).unwrap();
+        value["files"][key] =
+            serde_json::json!({"size_bytes": [], "codex_protected_owner": &owner});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let original_slot = raw_slot(&bytes, "files", key);
+        fs::write(&path, &bytes).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        let mut cloned = loaded.clone();
+        drop(loaded);
+        assert_eq!(
+            cloned.decode_held_codex_owners().collect::<Vec<_>>(),
+            vec![valid.then_some(owner.as_str())]
+        );
+        assert!(cloned.decode_holds_codex_owner("held-owner"));
+        assert_eq!(cloned.decode_holds_codex_owner("unrelated-owner"), !valid);
+        cloned.save(&path).unwrap();
+        let restarted = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            restarted.decode_held_codex_owners().collect::<Vec<_>>(),
+            vec![valid.then_some(owner.as_str())]
+        );
+        assert!(restarted.decode_holds_codex_owner("held-owner"));
+        assert_eq!(
+            restarted.decode_holds_codex_owner("unrelated-owner"),
+            !valid
+        );
+        assert_eq!(
+            raw_slot(&fs::read(&path).unwrap(), "files", key),
+            original_slot
+        );
+        assert_sibling(&restarted);
     }
 }

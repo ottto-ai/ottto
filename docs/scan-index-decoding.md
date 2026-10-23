@@ -10,7 +10,7 @@ Holds grant no acceptance, proof, retry or mismatch bypass. Candidate, group,
 publication, manifest and removal gates preserve their scope. This first slice
 keeps holds until a compatible implementation understands the original slot;
 it introduces no automatic release. A held file without exact incidence keeps
-its prior membership UNKNOWN. Both acceptance pruners retain existing ACKs while
+its prior membership UNKNOWN. Acceptance pruning, including partial commits, retains existing ACKs while
 that uncertainty exists, and legacy reconciliation neither reopens ACKs nor seals
 until incidence is known. This creates no acceptance or manifest membership;
 an explicit exact empty set remains known empty. An opaque Codex file with unknown ownership
@@ -19,8 +19,9 @@ also fences state-only publication, since its lost owner cannot safely be named.
 Hold admission checks lexically delimited keys before String allocation and
 charges their original wire bytes, values and per-slot bookkeeping before
 retention: at most 8 MiB, one eighth of the input, and 4,096 slots per read.
-File holds also reserve an owner copy up to the raw value length. Repairs release
-the complete charge; output restart admission uses that same charge. Oversized
+Intact file owners use inline ranges into the shared raw slot, without a second
+payload allocation. Repairs release the complete charge; output restart admission
+uses that same charge. Oversized
 keys take the counted budget path without allocating a large key buffer.
 Excess damage uses the existing load quarantine or CAS error. The load diagnostic
 names the prior-history gated rebuild, which requires #712 to land first; the

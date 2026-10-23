@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 830,
-  "content_sha256": "edd92641fa320c485bbb2d1c584cf7713bf11c79edd53e1243cdd808ee771527",
+  "content_sha256": "08d2ce1aefc50e59c2099dc939f185a3957e83869ed88d09d84a673bc2063318",
   "files": [
     {
       "executable": false,
@@ -2008,15 +2008,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/lenient_decode.rs",
-      "sha256": "d18ad42e5420af248fa7e7ac30a5178f497c5070d9f3baaf8eda3ab46d4eab58",
-      "size_bytes": 81540
+      "sha256": "78e418cdb5eefa5ba62fb23c6d3202f63f2e55ca80c7a60eca92fa7eed676bec",
+      "size_bytes": 81980
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/lenient_decode_tests.rs",
-      "sha256": "1ebf625b385fcb66c691d6ca46dd1cc2f60c277da656b1ae06f952780f29dfe6",
-      "size_bytes": 66129
+      "sha256": "7214b756fa25589321834e7762aed31fa88bd97086b6ac7f11b070d3c5132e0d",
+      "size_bytes": 69202
     },
     {
       "executable": false,
@@ -2372,8 +2372,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/scan-index-decoding.md",
-      "sha256": "6330be4517a6e45d44ca2f53aa6d7611e2f00d662d96dc03e2b53b49f755073b",
-      "size_bytes": 4328
+      "sha256": "4d7614f8b1c9707eceb9aee4a9c788fe18bed49fd7a20bb2520809997dfd7f4a",
+      "size_bytes": 4386
     },
     {
       "executable": false,
