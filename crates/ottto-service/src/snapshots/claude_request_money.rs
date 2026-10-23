@@ -1294,12 +1294,13 @@ fn shadow_page_with_coverage(
                 + 1024
                 + tail_fixed_memory(&ClaudeTelemetryTailBudget::default()),
         );
-    counts.admission_bytes = admission as u64;
+    counts.admission_bytes = admission.saturating_add(root_funds.bytes()) as u64;
     let Some(base) = ShadowReservation::admit(admission) else {
         counts.refused_budget = 1;
         purge_captures(&scope_key, &mut counts);
         return refuse(&end, None, index, snapshots.len(), counts);
     };
+    counts.admitted_peak_bytes = SHADOW_RESERVED.load(Ordering::Acquire) as u64;
     let mut guard = match store::acquire(support_dir) {
         ClaudeLedgerAcquire::Ready(guard) => guard,
         acquired => {
@@ -1483,6 +1484,17 @@ fn shadow_page_with_coverage(
                                 .map(|row| {
                                     bucket.bucket_start.len()
                                         + row.model.len()
+                                        + [
+                                            &row.auth_mode,
+                                            &row.billing_channel,
+                                            &row.billing_provider,
+                                            &row.gateway_provider,
+                                            &row.model_provider,
+                                            &row.subscription_product,
+                                        ]
+                                        .iter()
+                                        .map(|field| field.as_ref().map_or(0, String::len))
+                                        .sum::<usize>()
                                         + row
                                             .selector_context
                                             .iter()
@@ -1494,7 +1506,23 @@ fn shadow_page_with_coverage(
                         .sum::<usize>()
             })
             .sum::<usize>();
+        let evidence_bytes = api_report
+            .evidence
+            .get(root)
+            .map_or(0, |rows| {
+                rows.iter()
+                    .map(|row| {
+                        row.request_id.len() + row.model.len() + row.speed.len() + row.effort.len()
+                    })
+                    .sum::<usize>()
+            })
+            .saturating_add(trace_report.evidence.get(root).map_or(0, |rows| {
+                rows.iter()
+                    .map(|row| row.request_id.len() + row.agent_id.len())
+                    .sum::<usize>()
+            }));
         let scratch = string_bytes
+            .saturating_add(evidence_bytes)
             .saturating_mul(16)
             .saturating_add(units.saturating_mul(UNIT_BYTES + GRAIN_BYTES + PAGE_HASH_BYTES))
             .saturating_add(row_charge(live_rows))
@@ -2247,6 +2275,9 @@ fn hand_off_reserved_buffer(
             None if Instant::now() >= end.deadline => counts.ledger_save_late = 1,
             None => counts.ledger_save_refused = u64::from(ledger.dirty_shards() > 0),
         }
+        counts.admitted_peak_bytes = counts
+            .admitted_peak_bytes
+            .max(SHADOW_RESERVED.load(Ordering::Acquire) as u64);
         counts.ledger_save_oversized = ledger.oversized_shards;
         counts.save_bytes_today = ledger.save_bytes_today;
     }
@@ -2748,13 +2779,15 @@ impl DayFile {
             .ok()
             .map(|file| std::io::BufWriter::with_capacity(buffer_bytes, file));
         let written = match writer.as_mut() {
-            Some(writer) => !open_row || writer.write_all(b"\n").is_ok(),
+            Some(writer) => {
+                !open_row || size < JSONL_DAY_CAP_BYTES && writer.write_all(b"\n").is_ok()
+            }
             None => false,
         };
         Self {
             writer,
             written,
-            size: size + u64::from(open_row),
+            size: size + u64::from(open_row && size < JSONL_DAY_CAP_BYTES),
             room,
             sealed: false,
         }

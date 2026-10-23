@@ -216,9 +216,8 @@ pub(crate) struct ClaudeFamilyPublication {
     pub(crate) digest: u64,
     /// The publishing process's epoch.
     pub(crate) epoch: u64,
-    /// When a page last attempted the family (unix seconds; a family the
-    /// page deadline never reached keeps its older time): pages take the
-    /// least recently attempted families first.
+    /// The page clock of the last synced publication, including a failure:
+    /// pages take the least recently published families first.
     pub(crate) attempted: u64,
 }
 
