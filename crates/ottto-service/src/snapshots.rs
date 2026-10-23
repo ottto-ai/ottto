@@ -36017,6 +36017,7 @@ impl ScanIndex {
     /// exact-body cooldown defers.
     fn quarantine_retry_selects_file(&self, fingerprint: &str) -> bool {
         self.quarantine_requires_retry(fingerprint)
+            && !self.reason_reoffer_cooldown_defers(fingerprint)
     }
 
     /// Count each cooldown entity of a skipped file whose ordinary retry was
