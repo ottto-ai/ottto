@@ -1358,26 +1358,25 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
     // Back to what a killed first cycle leaves: the ledger's own claim of a
     // replay generation, saved before the scan, but no server answer, no
     // index and no completed bootstrap.
-    let mut claim = first.progress_json.clone();
-    let object = claim.as_object_mut().expect("ledger object");
-    object.insert("generation".into(), 1.into());
-    object.insert(
-        "historical_replay_generation".into(),
-        "claude_code:killed-first-cycle".into(),
-    );
-    for attested in [
-        "accepted_fingerprints",
-        "accepted_body_witnesses",
-        "accepted_cache_states",
-        "accepted_cache_heads",
-        "pending_cache_heads",
-        "quarantined_fingerprints",
-        "permanent_rejections",
-    ] {
-        object.remove(attested);
-    }
-    std::fs::write(&first.progress_path, serde_json::to_vec(&claim).unwrap())
+    // A settled bootstrap leaves no ledger file, so write the claim itself.
+    let mut claim = SnapshotUploadProgress::load(
+        &first.progress_path,
+        &snapshot_upload_destination_namespace(&pipeline.device, "device-secret"),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .expect("load the ledger");
+    claim.historical_replay_generation = Some("claude_code:killed-first-cycle".into());
+    claim.accepted_fingerprints.clear();
+    claim.accepted_body_witnesses.clear();
+    claim.accepted_cache_states.clear();
+    claim.accepted_cache_heads.clear();
+    claim.pending_cache_heads.clear();
+    claim.quarantined_fingerprints.clear();
+    claim.permanent_rejections.clear();
+    claim
+        .save(&first.progress_path)
         .expect("write the claim-only ledger");
+    assert!(!claim.records_server_attested_upload());
     std::fs::remove_file(claude_index_path(&pipeline.support)).expect("lose the index");
     let _ = std::fs::remove_file(crate::backfill::backfill_state_path(&pipeline.support));
 

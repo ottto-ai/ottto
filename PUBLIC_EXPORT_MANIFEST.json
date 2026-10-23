@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 830,
-  "content_sha256": "3d0494a49347b26416b21235b802532bb46978951c7f3de8f357285487dd4075",
+  "content_sha256": "59e9df53409fa271267abf11a77e963955e5d37673666fc64020b231c5baaf80",
   "files": [
     {
       "executable": false,
@@ -1588,8 +1588,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/reason_reoffer_pipeline_tests.rs",
-      "sha256": "eca7a95781fede28b72cee17fca4d3912ae6814b2c45575a9847909a4d6b0a16",
-      "size_bytes": 55453
+      "sha256": "87b8fa3957073b53419941b84dd1ae0930f6477e1a8d517a5345b9ce24248a89",
+      "size_bytes": 55608
     },
     {
       "executable": false,
@@ -1707,8 +1707,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_history_upgrade_tests.rs",
-      "sha256": "d38fdfa1ca528665c83cc944f80291671b17ea248092a99c30dfbf71ace88714",
-      "size_bytes": 32639
+      "sha256": "79a3e40b8d321c7ef95f9ba4252b714889cb44744031968547d3aeccf6f76f13",
+      "size_bytes": 32574
     },
     {
       "executable": false,

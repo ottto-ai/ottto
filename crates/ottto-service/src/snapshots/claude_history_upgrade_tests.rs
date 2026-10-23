@@ -706,9 +706,8 @@ fn no_list_policy_follows_the_prior_history_evidence() {
         !lifted.claude_history_move_not_full,
         "a partial commit keeps it lifted"
     );
-    let lifted_path = scratch.join("lifted.json");
-    lifted.save(&lifted_path).unwrap();
-    let mut again = ScanIndex::load(&lifted_path).unwrap();
+    lifted.save(&path).unwrap();
+    let mut again = ScanIndex::load(&path).unwrap();
     again.note_claude_history_cutoff(PriorHistory::Here, false, false);
     assert_eq!(again.claude_no_list_policy, NoListPolicy::Pace);
 
