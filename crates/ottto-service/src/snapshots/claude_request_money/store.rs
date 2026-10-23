@@ -126,7 +126,7 @@ pub(crate) struct ClaudeLedger {
     barrier_needed: bool,
     custody_epoch: u64,
     durable_custody_epoch: u64,
-    live_refused_at: Option<(usize, usize)>,
+    live_refused: bool,
     pub(super) metadata_cursor: String,
     pub(super) metadata_checkpoint: bool,
 }
@@ -155,7 +155,7 @@ impl ClaudeLedger {
             barrier_needed: dirty,
             custody_epoch: 0,
             durable_custody_epoch: 0,
-            live_refused_at: None,
+            live_refused: false,
             metadata_cursor: String::new(),
             metadata_checkpoint: false,
         }
@@ -1146,9 +1146,7 @@ impl ClaudeLedger {
     }
 
     fn live_refused(&self) -> bool {
-        self.live_refused_at.is_some_and(|(records, bytes)| {
-            self.census.record_count() >= records && self.census.serialized_total() >= bytes
-        })
+        self.live_refused
     }
 
     pub(super) fn put_money(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
@@ -1187,7 +1185,7 @@ pub(crate) fn allow_live(support: &Path) {
             // The saved ledger remains on disk; next admission loads it anew.
             ledgers.remove(support);
         } else if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
-            ledger.live_refused_at = None;
+            ledger.live_refused = false;
         }
     }
 }
@@ -1195,10 +1193,9 @@ pub(crate) fn allow_live(support: &Path) {
 pub(crate) fn refuse_live(support: &Path) {
     if let Ok(mut ledgers) = LEDGERS.lock() {
         if let Some(Slot::Ready(ledger)) = ledgers.get_mut(support) {
-            ledger.live_refused_at = Some((
-                ledger.census.record_count(),
-                ledger.census.serialized_total(),
-            ));
+            // Reclamation or unrelated record shrinkage cannot skip the
+            // ordinary-collection turn promised after terminal refusal.
+            ledger.live_refused = true;
         }
     }
 }

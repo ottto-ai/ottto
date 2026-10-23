@@ -1995,6 +1995,10 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
     .unwrap();
     money::store::refuse_live(&control.support);
     let before = control.offers().len();
+    // A refusal always earns an ordinary collection first. Reclaimed slots
+    // then admit the following live attempt without dropping old custody.
+    control.cycle();
+    assert!(!money_resume::pending_for_test(&control.support));
     control
         .cycle_changing(|attempt| {
             assert!(
