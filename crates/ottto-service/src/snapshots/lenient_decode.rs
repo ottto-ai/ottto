@@ -771,10 +771,10 @@ fn read_inner<R: BufRead + Seek>(
     decoder.reader.seek(SeekFrom::Start(0))?;
     let result = decoder.index(false);
     if matches!(result, Err(Error::HoldBudget)) {
+        // A load has not decided whether a rebuild is permitted yet. The
+        // quarantine boundary emits that token after its shared loop guard.
         let fallback = if stage == "load" {
-            // The load origin feeds the history cutoff before scanning; prior
-            // files are held or paced through the history gate.
-            "prior_history_gated_rebuild"
+            "pending_rebuild_guard"
         } else {
             "cas_refusal_without_rewrite"
         };

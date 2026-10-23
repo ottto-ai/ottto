@@ -1355,7 +1355,7 @@ fn streamed_64_mib_record_key_refuses_before_key_allocation() {
     assert!(scan_index_containment_lines_for_test()[before..]
         .iter()
         .any(|line| line.contains("lenient_hold_budget_exceeded=1")
-            && line.contains("fallback=prior_history_gated_rebuild")));
+            && line.contains("fallback=gated_rebuild history_policy=prior_history_gated_rebuild")));
     eprintln!("lenient_oversize_key_receipt key_bytes={} load_requested={} load_usable={} cas_requested={} cas_usable={} input_requested={} normalization_requested={} selected_requested={} selected_usable={}", 64 * 1024 * 1024, load.requested_peak, load.usable_peak, cas.requested_peak, cas.usable_peak, input_read.requested_peak, normalization.requested_peak, selected.requested_peak, selected.usable_peak);
 }
 
@@ -2322,5 +2322,132 @@ fn history_gate_damage_is_local_through_load_and_both_cas_readers() {
                 assert_eq!(corrupt_count(scratch.as_ref()), 0);
             }
         }
+    }
+}
+
+// Every current failure shares one budget, regardless of the previous cause.
+fn whole_index_damage(kind: &str) -> Vec<u8> {
+    match kind {
+        "syntax" => b"{".to_vec(),
+        "budget" => {
+            let mut value = serde_json::to_value(fixture()).unwrap();
+            value["files"]["excess-held"] =
+                serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+            serde_json::to_vec(&value).unwrap()
+        }
+        "collision" => {
+            let mut index = fixture();
+            let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+            index
+                .codex_state_only_snapshot_fingerprints
+                .insert(key.to_string(), "lower".to_string());
+            index
+                .codex_state_only_snapshot_fingerprints
+                .insert(key.to_ascii_uppercase(), "upper".to_string());
+            serde_json::to_vec(&index).unwrap()
+        }
+        _ => panic!("unknown synthetic damage"),
+    }
+}
+
+#[test]
+fn every_whole_index_rebuild_cause_shares_the_seven_day_guard() {
+    for previous in ["budget", "syntax", "collision"] {
+        for current in ["budget", "syntax", "collision"] {
+            let scratch = crate::test_scratch::ScratchDir::new("lenient-all-rebuild-causes");
+            let path = scratch.join("index.json");
+            let previous_bytes = whole_index_damage(previous);
+            fs::write(&path, &previous_bytes).unwrap();
+            let before = scan_index_containment_lines_for_test().len();
+            let (index, origin) =
+                ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode)).unwrap();
+            assert!(index.files.is_empty());
+            assert!(matches!(origin, LoadOrigin::Quarantined));
+            assert!(!path.exists());
+            assert_eq!(corrupt_count(scratch.as_ref()), 1);
+            let backup = fs::read_dir(scratch.as_ref())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains(".corrupt.")
+                })
+                .unwrap();
+            assert_eq!(fs::read(&backup).unwrap(), previous_bytes);
+            let lines = scan_index_containment_lines_for_test();
+            let success = lines[before..]
+                .iter()
+                .filter(|line| line.contains("fallback=gated_rebuild"))
+                .collect::<Vec<_>>();
+            assert_eq!(success.len(), 1);
+            assert!(success[0].contains("history_policy=prior_history_gated_rebuild"));
+
+            let bytes = whole_index_damage(current);
+            fs::write(&path, &bytes).unwrap();
+            let before = scan_index_containment_lines_for_test().len();
+            let error = ScanIndex::load_inner(&path, Some(SnapshotSource::ClaudeCode)).unwrap_err();
+            assert!(
+                error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+                "{previous} -> {current}: {error:#}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(fs::read(&backup).unwrap(), previous_bytes);
+            assert_eq!(corrupt_count(scratch.as_ref()), 1);
+            let lines = scan_index_containment_lines_for_test();
+            assert!(!lines[before..]
+                .iter()
+                .any(|line| line.contains("fallback=gated_rebuild")));
+            assert!(lines[before..]
+                .iter()
+                .any(|line| line.contains("refusal_kind=rebuild_loop")
+                    && line.contains("source=claude_code")
+                    && line.contains("source_paused=1")
+                    && line.contains("index_kept=1")
+                    && line.contains("alarm")));
+        }
+    }
+}
+
+#[test]
+fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
+    let now = SystemTime::now();
+    let now_nanos = now.duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    for current in ["budget", "syntax", "collision"] {
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-load-cooldown-time");
+        let path = scratch.join("index.json");
+        let bytes = whole_index_damage(current);
+        fs::write(&path, &bytes).unwrap();
+        // A future rename stamp remains a hold during clock rollback.
+        let stamp = now_nanos + 24 * 60 * 60 * 1_000_000_000;
+        let backup = scratch.join(format!("index.corrupt.123.{stamp}.json"));
+        fs::write(&backup, b"prior witness").unwrap();
+        let error = ScanIndex::load_inner_at(&path, None, now).unwrap_err();
+        assert!(error.downcast_ref::<ScanIndexRebuildLoop>().is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
+        // The exact 7-day boundary is still protected.
+        let boundary = UNIX_EPOCH
+            + std::time::Duration::from_nanos(
+                u64::try_from(stamp + SCAN_INDEX_REBUILD_COOLDOWN_NANOS).unwrap(),
+            );
+        assert!(ScanIndex::load_inner_at(&path, None, boundary)
+            .unwrap_err()
+            .downcast_ref::<ScanIndexRebuildLoop>()
+            .is_some());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        let before = scan_index_containment_lines_for_test().len();
+        let (index, origin) =
+            ScanIndex::load_inner_at(&path, None, boundary + std::time::Duration::from_nanos(1))
+                .unwrap();
+        assert!(index.files.is_empty());
+        assert!(matches!(origin, LoadOrigin::Quarantined));
+        assert!(!path.exists());
+        assert_eq!(corrupt_count(scratch.as_ref()), 2);
+        assert_eq!(fs::read(&backup).unwrap(), b"prior witness");
+        assert!(scan_index_containment_lines_for_test()[before..]
+            .iter()
+            .any(|line| line.contains("fallback=gated_rebuild")));
     }
 }

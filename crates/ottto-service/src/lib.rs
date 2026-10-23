@@ -2665,6 +2665,24 @@ fn local_health_source_for_status(
     source: &SourceHealth,
     projection_revision: u64,
 ) -> LocalHealthSourceV1 {
+    let snapshot_source = match source.source {
+        SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
+        SourceKind::Codex => snapshots::SnapshotSource::Codex,
+        SourceKind::Pi => snapshots::SnapshotSource::Pi,
+    };
+    if snapshots::scan_index_rebuild_paused(snapshot_source) {
+        return LocalHealthSourceV1 {
+            source_id: format!("src_{}", source_slug(&source.source)),
+            app: source.source.clone(),
+            state: LocalHealthSourceState::RepairRequired,
+            authority: LocalHealthAuthority::Runtime,
+            authority_at: current_rfc3339_timestamp(),
+            projection_revision: projection_revision.saturating_sub(1),
+            blocking_reason: Some(snapshots::SCAN_INDEX_REBUILD_LOOP_CODE.to_string()),
+            next_action: Some("review_scan_index_repair".to_string()),
+            clear_condition: Some("successful compatible scan-index load after reviewed repair or cooldown; preserve the index and quarantine witnesses, never delete the index".to_string()),
+        };
+    }
     let has_verify_attention =
         source.last_verified_at.is_some() && has_verification_failure_problem(source);
     let authority = if source.last_verified_at.is_some() {
@@ -5386,6 +5404,108 @@ mod tests {
         assert_eq!(status.sources.len(), 1);
         assert_eq!(status.sources[0].source, SourceKind::Codex);
         assert_eq!(status.sources[0].state, SourceState::Healthy);
+    }
+
+    #[test]
+    fn rebuild_loop_pause_is_a_server_visible_canonical_source_blocker() {
+        use snapshots::{ScanIndex, SnapshotSource};
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut sibling = codex_health();
+        sibling.source = SourceKind::Pi;
+        sibling.descriptor = source_descriptor(&SourceKind::Pi);
+        daemon
+            .update_sources(TOKEN, vec![codex_health(), sibling])
+            .unwrap();
+        let scratch = crate::test_scratch::ScratchDir::new("rebuild-loop-source-health");
+        let path = scratch.as_ref().join("index.json");
+        std::fs::write(&path, b"{").unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Quarantined);
+        let original = b"{ ";
+        std::fs::write(&path, original).unwrap();
+        let error = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let status = daemon.status(TOKEN).unwrap();
+        let health = status.canonical_health.unwrap();
+        let source = health
+            .sources
+            .iter()
+            .find(|s| s.app == SourceKind::Codex)
+            .unwrap();
+        assert_eq!(source.state, LocalHealthSourceState::RepairRequired);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("scan_index_rebuild_loop")
+        );
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert!(source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .contains("never delete the index"));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Pi)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.severity == LocalHealthSeverity::Blocking));
+        assert_ne!(health.overall.state, LocalHealthOverallState::Healthy);
+        // This is the same typed payload upload_local_health_projection posts.
+        let wire = serde_json::to_value(&health).unwrap();
+        assert!(wire["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["blocking_reason"] == "scan_index_rebuild_loop"));
+        assert!(wire["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["code"] == "scan_index_rebuild_loop"));
+
+        // Reviewed repair restores a compatible index; the next actual load
+        // clears only this source's runtime pause without a daemon restart.
+        std::fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Loaded);
+        let health = daemon.status(TOKEN).unwrap().canonical_health.unwrap();
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Codex)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
     }
 
     #[test]

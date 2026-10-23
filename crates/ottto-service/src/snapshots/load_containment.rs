@@ -146,6 +146,58 @@ fn normalize_snapshot_quarantine_record(record: &mut SnapshotQuarantineRecord, n
 // Existing backup names encode the rename time, unlike mtime (which rename
 // preserves). Inspect only this checkpoint's siblings; retain no new state.
 const SCAN_INDEX_REBUILD_COOLDOWN_NANOS: u128 = 7 * 24 * 60 * 60 * 1_000_000_000;
+/// Distinct source-health reason; canonical health accepts open string codes.
+pub(crate) const SCAN_INDEX_REBUILD_LOOP_CODE: &str = "scan_index_rebuild_loop";
+
+#[derive(Debug)]
+struct ScanIndexRebuildLoop;
+impl std::fmt::Display for ScanIndexRebuildLoop {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(SCAN_INDEX_REBUILD_LOOP_CODE)
+    }
+}
+impl std::error::Error for ScanIndexRebuildLoop {}
+
+// One bit per supported source, no paths or index contents retained. Tests
+// mirror the process state per thread, like the existing containment alarms.
+#[cfg(not(test))]
+static SCAN_INDEX_REBUILD_PAUSED: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_REBUILD_PAUSED: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
+}
+fn scan_index_source_bit(source: SnapshotSource) -> u8 {
+    match source {
+        SnapshotSource::ClaudeCode => 1,
+        SnapshotSource::Codex => 2,
+        SnapshotSource::Pi => 4,
+    }
+}
+fn note_scan_index_rebuild_paused(source: SnapshotSource, paused: bool) {
+    let bit = scan_index_source_bit(source);
+    #[cfg(not(test))]
+    if paused {
+        SCAN_INDEX_REBUILD_PAUSED.fetch_or(bit, std::sync::atomic::Ordering::Relaxed);
+    } else {
+        SCAN_INDEX_REBUILD_PAUSED.fetch_and(!bit, std::sync::atomic::Ordering::Relaxed);
+    }
+    #[cfg(test)]
+    SCAN_INDEX_REBUILD_PAUSED.with(|state| {
+        state.set(if paused {
+            state.get() | bit
+        } else {
+            state.get() & !bit
+        });
+    });
+}
+pub(crate) fn scan_index_rebuild_paused(source: SnapshotSource) -> bool {
+    #[cfg(not(test))]
+    let state = SCAN_INDEX_REBUILD_PAUSED.load(std::sync::atomic::Ordering::Relaxed);
+    #[cfg(test)]
+    let state = SCAN_INDEX_REBUILD_PAUSED.with(std::cell::Cell::get);
+    state & scan_index_source_bit(source) != 0
+}
+
 fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
     let now = now.duration_since(UNIX_EPOCH)?.as_nanos();
     let stem = path
@@ -188,7 +240,18 @@ fn quarantine_invalid_scan_index(
     path: &Path,
     cause: &str,
     discarded_file_entries: Option<usize>,
+    source: Option<SnapshotSource>,
+    now: SystemTime,
 ) -> Result<ScanIndex> {
+    // Every whole-index fallback shares this decision while the caller holds
+    // the checkpoint lock: budget, syntax and canonical identity collision.
+    if scan_index_rebuilt_recently(path, now)? {
+        emit_scan_index_containment_line(format!(
+            "local snapshot scan index load: source={} lenient_hold_budget_exceeded={} refusal_kind=rebuild_loop source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; recent quarantine rebuild alarm, reviewed repair required, never delete the index",
+            scan_index_source_label(source), usize::from(cause == "hold_budget")
+        ));
+        return Err(ScanIndexRebuildLoop.into());
+    }
     // The index is only a local incremental-scan optimization. A crash or
     // structural damage must not permanently block collection, but never
     // overwrite the unreadable witness in place.
@@ -203,6 +266,11 @@ fn quarantine_invalid_scan_index(
          discarded_file_entries={}; whole_index_quarantines_this_process={quarantines})",
         discarded_file_entries.map_or_else(|| "unknown".to_string(), |count| count.to_string())
     );
+    // Disclose the chosen fallback only after the guard and durable rename.
+    emit_scan_index_containment_line(format!(
+        "local snapshot scan index load: source={} lenient_hold_budget_exceeded={} cause={cause} fallback=gated_rebuild history_policy=prior_history_gated_rebuild",
+        scan_index_source_label(source), usize::from(cause == "hold_budget")
+    ));
     Ok(ScanIndex::default())
 }
 

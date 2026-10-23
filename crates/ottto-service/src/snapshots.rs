@@ -36634,7 +36634,18 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<(Self, ScanIndexLoadOrigin)> {
-        let (mut index, origin) = Self::load_inner(path, Some(source))?;
+        let (mut index, origin) = match Self::load_inner(path, Some(source)) {
+            Ok(loaded) => {
+                note_scan_index_rebuild_paused(source, false);
+                loaded
+            }
+            Err(error) => {
+                if error.downcast_ref::<ScanIndexRebuildLoop>().is_some() {
+                    note_scan_index_rebuild_paused(source, true);
+                }
+                return Err(error);
+            }
+        };
         let load_origin = match &origin {
             LoadOrigin::Loaded(_) => ScanIndexLoadOrigin::Loaded,
             LoadOrigin::Missing => ScanIndexLoadOrigin::Missing,
@@ -36670,6 +36681,14 @@ impl ScanIndex {
     /// `load` before the U1a-2a proof incarnation (row 35): each accepted
     /// return says what it found.
     fn load_inner(path: &Path, source: Option<SnapshotSource>) -> Result<(Self, LoadOrigin)> {
+        Self::load_inner_at(path, source, SystemTime::now())
+    }
+
+    fn load_inner_at(
+        path: &Path,
+        source: Option<SnapshotSource>,
+        now: SystemTime,
+    ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
             return Ok((Self::default(), LoadOrigin::Missing));
         }
@@ -36705,6 +36724,8 @@ impl ScanIndex {
                         path,
                         "codex_identity_collision",
                         Some(discarded),
+                        source,
+                        now,
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
                 }
@@ -36713,17 +36734,14 @@ impl ScanIndex {
                 Ok((index, LoadOrigin::Loaded(opened)))
             }
             Err(error) if error.quarantines() => {
-                if matches!(error, lenient_decode::Error::HoldBudget)
-                    && scan_index_rebuilt_recently(path, SystemTime::now())?
-                {
-                    emit_scan_index_containment_line(format!(
-                        "local snapshot scan index load: source={} lenient_hold_budget_exceeded=1 refusal_kind=rebuild_loop source_paused=1 index_kept=1; recent quarantine rebuild alarm, reviewed repair required, never delete the index",
-                        scan_index_source_label(source)
-                    ));
-                    return Err(error.into());
-                }
-                quarantine_invalid_scan_index(path, "decode", None)
+                let cause = if matches!(error, lenient_decode::Error::HoldBudget) {
+                    "hold_budget"
+                } else {
+                    "decode"
+                };
+                quarantine_invalid_scan_index(path, cause, None, source, now)
                     .map(|index| (index, LoadOrigin::Quarantined))
+                    .map_err(|refusal| refusal.context(error))
             }
             Err(error) => {
                 Err(error).with_context(|| format!("parse scan index {}", path.display()))
