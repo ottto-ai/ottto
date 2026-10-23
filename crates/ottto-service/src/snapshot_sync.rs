@@ -5440,8 +5440,11 @@ fn prepare_sync_source(
             upload_destination_namespace
         )
     };
-    let curve_replay_pending =
-        context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
+    // An unreadable backfill state arms no replay of either kind, and no
+    // replay-wide scan window (StateMissing H1).
+    let curve_replay_pending = context_curve_enabled
+        && index.context_curve_replay_needed(&replay_generation)
+        && !backfill_state.prior_history_unverified;
     let historical_replay_pending = backfill_pending || curve_replay_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)

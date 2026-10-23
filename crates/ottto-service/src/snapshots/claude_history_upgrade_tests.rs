@@ -403,6 +403,34 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// M1 (AutoReview): a member directory the closure cannot read may hold a
+/// listed member, so its root is held, not sent.
+#[cfg(unix)]
+#[test]
+fn unreadable_member_directory_holds_its_root() {
+    use std::os::unix::fs::PermissionsExt;
+    let (home, root, index) = families("history-gate-member-unreadable", 2);
+    let support = support("history-gate-member-unreadable-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&listed_member(&index, &session(1)))),
+    )
+    .unwrap();
+    let subagents = root.join(session(1)).join("subagents");
+    fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(true, true, true);
+    fresh.load_claude_reemission_exclusions(&support);
+    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
+    fs::set_permissions(&subagents, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(result
+        .snapshots
+        .iter()
+        .all(|item| !item.source_session_id.starts_with(&session(1))));
+    let _ = fs::remove_dir_all(home);
+}
+
 /// StateMissing M2: a listed (held) family member owed only a proof
 /// correction is not re-read every traversal: it is skipped like any held
 /// adoption, and its correction is deferred to the history gate (disclosed)

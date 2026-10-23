@@ -35339,8 +35339,9 @@ impl ScanIndex {
     /// fresh or replayed index the member is not indexed yet when its root is
     /// decided, so the load-time closure cannot list the root. Before a root's
     /// decision, close the list over the members on disk under
-    /// `<root>/subagents/`. The walk is bounded; past the bound the root is
-    /// treated as listed (held, never sent).
+    /// `<root>/subagents/`. The walk is bounded; past the bound, or on a
+    /// directory or entry it cannot read, the root is treated as listed
+    /// (held, never sent).
     fn close_claude_reemission_list_over_root_members(&mut self, candidate: &CandidateFile) {
         const MAX_MEMBER_ENTRIES: usize = 4_096;
         if self.claude_reemission_exclusions.is_empty()
@@ -35359,20 +35360,30 @@ impl ScanIndex {
         let mut members = Vec::new();
         let mut visited = 0_usize;
         while let Some(directory) = pending.pop() {
-            let Ok(entries) = fs::read_dir(&directory) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                visited += 1;
-                if visited > MAX_MEMBER_ENTRIES {
+            let entries = match fs::read_dir(&directory) {
+                Ok(entries) => entries,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => {
                     self.claude_reemission_exclusions.list_root(&root);
                     return;
                 }
-                let path = entry.path();
-                match entry.file_type() {
-                    Ok(kind) if kind.is_dir() => pending.push(path),
-                    Ok(kind) if kind.is_file() => members.push(path),
-                    _ => {}
+            };
+            for entry in entries {
+                visited += 1;
+                let readable = entry
+                    .ok()
+                    .and_then(|entry| Some((entry.path(), entry.file_type().ok()?)))
+                    .filter(|_| visited <= MAX_MEMBER_ENTRIES);
+                // Past the bound, or an entry that cannot be read (it may be
+                // a listed member): hold the root.
+                let Some((path, kind)) = readable else {
+                    self.claude_reemission_exclusions.list_root(&root);
+                    return;
+                };
+                if kind.is_dir() {
+                    pending.push(path);
+                } else if kind.is_file() {
+                    members.push(path);
                 }
             }
         }
