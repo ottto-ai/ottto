@@ -382,7 +382,7 @@ fn member_only_line_protects_its_root_on_a_fresh_index() {
     )
     .unwrap();
     let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(true, true, true);
+    fresh.note_claude_history_cutoff(true, true);
     fresh.load_claude_reemission_exclusions(&support);
     let mut result = scan(&root, &mut fresh, "ctx-1", 2);
     assert_eq!(result.scanned_file_count, 4, "new files parse locally");
@@ -419,7 +419,7 @@ fn unreadable_member_directory_holds_its_root() {
     let subagents = root.join(session(1)).join("subagents");
     fs::set_permissions(&subagents, fs::Permissions::from_mode(0o000)).unwrap();
     let mut fresh = ScanIndex::default();
-    fresh.note_claude_history_cutoff(true, true, true);
+    fresh.note_claude_history_cutoff(true, true);
     fresh.load_claude_reemission_exclusions(&support);
     let mut result = scan(&root, &mut fresh, "ctx-1", 2);
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
@@ -520,24 +520,24 @@ fn history_cutoff_is_bounded_by_the_clock() {
             .as_secs()
     };
     let mut index = ScanIndex::default();
-    index.note_claude_history_cutoff(false, false, true);
+    index.note_claude_history_cutoff(false, true);
     assert_eq!(
         index.claude_history_cutoff_unix_seconds, None,
         "fresh install"
     );
-    index.note_claude_history_cutoff(true, false, false);
+    index.note_claude_history_cutoff(true, false);
     assert_eq!(index.claude_history_cutoff_unix_seconds, None);
     index.claude_history_cutoff_unix_seconds = Some(u64::MAX);
-    index.note_claude_history_cutoff(false, false, false);
+    index.note_claude_history_cutoff(false, false);
     assert!(index.claude_history_cutoff_unix_seconds.unwrap() <= now());
-    // StateMissing M3: proven prior history records a cutoff on the first
-    // gated load of an index without one, never on an index a gated daemon
-    // already loaded (a fresh install's after its bootstrap).
+    // StateMissing M3: prior history records a cutoff on the first gated
+    // load of an index without one, never on an index a gated daemon already
+    // loaded (a fresh install's after its bootstrap).
     let mut pre_gate = ScanIndex::default();
-    pre_gate.note_claude_history_cutoff(true, true, false);
+    pre_gate.note_claude_history_cutoff(true, false);
     assert!(pre_gate.claude_history_cutoff_unix_seconds.is_some());
     let mut gated = ScanIndex::default();
-    gated.note_claude_history_cutoff(false, false, false);
-    gated.note_claude_history_cutoff(true, true, false);
+    gated.note_claude_history_cutoff(false, false);
+    gated.note_claude_history_cutoff(true, false);
     assert_eq!(gated.claude_history_cutoff_unix_seconds, None);
 }

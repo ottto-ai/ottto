@@ -341,35 +341,22 @@ const _: () = assert!(
         <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
 );
 
-/// Evidence that this Mac already sent Claude history, read before scanning.
-/// It must survive index loss, so none of it lives in the index.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct ClaudePriorHistory {
-    /// Evidence that history was already sent from this Mac whatever this
-    /// index holds: a completed Claude bootstrap for any destination (no
-    /// different-user cutoff), an unreadable backfill state, a quarantined
-    /// sibling of this index or the seen-marker. On the first gated load of
-    /// an index with no cutoff it records one (StateMissing M3, re-pairs).
-    bootstrapped: bool,
-    /// Any evidence at all, the upload ledger included (fail closed, SOURCE
-    /// F1a/F1b, StateMissing H1). It records a cutoff when entries are lost.
-    any: bool,
-}
-
 /// A fresh install is only a positively empty support state. Prior history
 /// is any of: this destination's completed bootstrap; an unreadable backfill
 /// state; a Claude bootstrap completed for another destination or recorded
 /// by a legacy state, unless a claim recorded a different-user cutoff (that
 /// history stays excluded by the cutoff, as before); an upload ledger with any
 /// record of an earlier upload; a quarantined (`.corrupt.`) sibling of this
-/// index; or the re-emission seen-marker.
+/// index; or the re-emission seen-marker. Read before scanning; none of it
+/// lives in the index, so it survives index loss (fail closed, SOURCE
+/// F1a/F1b, StateMissing H1).
 fn claude_prior_history(
     backfill_state: &crate::backfill::BackfillState,
     destination_namespace: &str,
     upload_progress: &SnapshotUploadProgress,
     index_path: &Path,
     support_dir: &Path,
-) -> ClaudePriorHistory {
+) -> bool {
     let slug = SnapshotSource::ClaudeCode.api_slug();
     let here = backfill_state
         .completed_destination_namespaces
@@ -410,30 +397,27 @@ fn claude_prior_history(
         ))
         .is_ok()
     };
-    let bootstrapped = here
-        || backfill_state.prior_history_unverified
+    here || backfill_state.prior_history_unverified
         || earlier_bootstrap
+        || ledger
         || quarantined_sibling()
-        || seen_marker();
-    ClaudePriorHistory {
-        bootstrapped,
-        any: bootstrapped || ledger,
-    }
+        || seen_marker()
 }
 
 /// Claude only, before scanning: with prior history, a fresh index (missing
-/// or quarantined) or a replay that dropped entries records the history
-/// cutoff; see `ScanIndex::note_claude_history_cutoff`.
+/// or quarantined), a replay that dropped entries or the first gated load of
+/// an index without one records the history cutoff; see
+/// `ScanIndex::note_claude_history_cutoff`.
 fn note_claude_history_cutoff_for_cycle(
     index: &mut ScanIndex,
     source: SnapshotSource,
-    prior_history: ClaudePriorHistory,
+    prior_history: bool,
     entries_lost: bool,
 ) {
     if source != SnapshotSource::ClaudeCode {
         return;
     }
-    index.note_claude_history_cutoff(prior_history.any, prior_history.bootstrapped, entries_lost);
+    index.note_claude_history_cutoff(prior_history, entries_lost);
 }
 
 fn exclude_held_effective_body_witness_revision(

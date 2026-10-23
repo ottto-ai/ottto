@@ -35251,22 +35251,16 @@ impl ScanIndex {
     }
 
     /// Claude only, before scanning, every cycle. With prior history on this
-    /// Mac, a fresh index or a replay that dropped entries records the history
-    /// cutoff at now; a new file born before it (or at an unknown time) is
-    /// history (SOURCE P1). A completed bootstrap (any destination) or other
-    /// index-independent evidence also records one on the first gated load of
-    /// an index with none, so an index a pre-gate daemon rebuilt or replayed
-    /// only partly is covered, re-pairs included (StateMissing M3, SOURCE
-    /// F1b); an index a gated daemon built, such as a fresh install's after
-    /// its bootstrap, records none. A stored cutoff ahead of the clock is
-    /// pulled back to now, so a forward clock jump is not kept (L1). A fresh
-    /// install records none.
-    pub(crate) fn note_claude_history_cutoff(
-        &mut self,
-        prior_history: bool,
-        prior_bootstrap: bool,
-        entries_lost: bool,
-    ) {
+    /// Mac (SOURCE F1a), a fresh index, a replay that dropped entries or the
+    /// first gated load of an index with no cutoff records the history cutoff
+    /// at now; a new file born before it (or at an unknown time) is history
+    /// (SOURCE P1). The first-load rule covers an index a pre-gate daemon
+    /// built, rebuilt or replayed only partly, re-pairs included (StateMissing
+    /// M3, SOURCE F1b); an index a gated daemon built, such as a fresh
+    /// install's after its bootstrap, records none. A stored cutoff ahead of
+    /// the clock is pulled back to now, so a forward clock jump is not kept
+    /// (L1). A fresh install records none.
+    pub(crate) fn note_claude_history_cutoff(&mut self, prior_history: bool, entries_lost: bool) {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
@@ -35275,10 +35269,9 @@ impl ScanIndex {
             *cutoff = (*cutoff).min(now);
         }
         let first_gated_load = !std::mem::replace(&mut self.claude_history_gate_loaded, true);
-        if (prior_history && entries_lost)
-            || (prior_bootstrap
-                && first_gated_load
-                && self.claude_history_cutoff_unix_seconds.is_none())
+        if prior_history
+            && (entries_lost
+                || (first_gated_load && self.claude_history_cutoff_unix_seconds.is_none()))
         {
             self.claude_history_cutoff_unix_seconds = Some(now);
         }

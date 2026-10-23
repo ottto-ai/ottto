@@ -889,8 +889,7 @@ fn different_user_cutoff_excludes_history_without_the_gate() {
 
 /// SOURCE F1a (AutoReview): any record of an earlier upload in this
 /// destination's ledger is prior history, not only a replay generation or a
-/// refusal. It is weak evidence: it records a cutoff only when entries are
-/// lost.
+/// refusal.
 #[test]
 fn any_upload_ledger_record_is_prior_history() {
     let fixture = HistoryFixture::new("history-upgrade-ledger");
@@ -905,15 +904,9 @@ fn any_upload_ledger_record_is_prior_history() {
             &fixture.support,
         )
     };
-    assert_eq!(prior(&progress), ClaudePriorHistory::default());
+    assert!(!prior(&progress), "a positively empty support state");
     progress.accepted_fingerprints.insert("f".repeat(64));
-    assert_eq!(
-        prior(&progress),
-        ClaudePriorHistory {
-            bootstrapped: false,
-            any: true,
-        }
-    );
+    assert!(prior(&progress));
 }
 
 /// SOURCE F1b, StateMissing M3 (AutoReview): a re-pair resuming a partial
