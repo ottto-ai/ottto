@@ -17227,6 +17227,21 @@ mod tests {
     ) -> SyncCounts {
         let root = test_dir(fixture_name);
         std::fs::create_dir_all(&root).expect("create empty Claude scan root");
+        // A RetryPending family is present on disk: a raw-complete census
+        // retires a wholly absent one (path-(a) bridge), so its debt would
+        // no longer withhold anything.
+        for (family_index, (disposition, _)) in dispositions.iter().enumerate() {
+            if *disposition == "retry_pending" {
+                let session = format!("root-{family_index}");
+                std::fs::write(
+                    root.join(format!("{session}.jsonl")),
+                    format!(
+                        "{{\"timestamp\":\"2026-06-01T09:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"req_{session}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+                    ),
+                )
+                .expect("write the held family's present member");
+            }
+        }
         let mut index = claude_usage_authority_index(dispositions);
         let mut scan = crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
