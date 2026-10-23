@@ -685,3 +685,51 @@ fn contract_rearm_remains_independent_of_the_full_rearm_deadline() {
         "the unsettled latch survives"
     );
 }
+
+/// The production scanner retires a clean traversal before the fold. Its
+/// origin must survive so the re-arm can bind the next window, even then.
+#[test]
+fn full_rearm_window_keeps_the_origin_after_scanner_checkpoint_retirement() {
+    let rearm = Rearm::new();
+    let mut index = rearm.index();
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        WINDOW,
+        BACKFILL_WINDOW_DAYS,
+    );
+    let origin = index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .context_fingerprint
+        .clone();
+    index.traversal = None;
+    let closed = rearm.terminal(&mut index, &rearm.items);
+    assert!(closed.counts.full_rearm);
+    let window = index
+        .claude_full_rearm_progress
+        .full_rearm_window
+        .as_ref()
+        .unwrap();
+    assert_eq!(window.context_fingerprint, origin);
+    assert_eq!(window.process, claude_full_rearm_process());
+    assert!(index.claude_full_rearm_progress.full_rearm_window_next);
+    ensure_bounded_traversal(
+        SnapshotSource::ClaudeCode,
+        &[],
+        &mut index,
+        "2026-08-02T07:20:00Z",
+        BACKFILL_WINDOW_DAYS,
+    );
+    assert_eq!(
+        index
+            .claude_full_rearm_progress
+            .full_rearm_window
+            .as_ref()
+            .unwrap()
+            .window_ends,
+        BTreeSet::from(["2026-08-02T07:20:00Z".to_string()])
+    );
+}

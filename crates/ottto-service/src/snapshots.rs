@@ -1996,6 +1996,10 @@ struct ClaudeFullRearmProgress {
     /// The structural set a complete-observation terminal recorded.
     #[serde(skip_serializing_if = "Option::is_none")]
     structural_record: Option<ClaudeStructuralInvalidRecord>,
+    /// The scanner retires its checkpoint before the terminal fold, so keep
+    /// that traversal's origin available until the fold schedules a window.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    traversal_origin: Option<ClaudeFullRearmWindow>,
     /// Fix 2: a terminal performed a full re-arm behind a closed fence, so
     /// the next traversal start opens a full-rearm window.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -7723,19 +7727,23 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .saturating_add(1)
                 .min(CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT);
         }
-        let next_window = full_rearm
-            .then(|| {
-                index
-                    .traversal
-                    .as_ref()
-                    .map(|traversal| ClaudeFullRearmWindow {
-                        context_fingerprint: traversal.context_fingerprint.clone(),
-                        process: claude_full_rearm_process(),
-                        window_ends: BTreeSet::new(),
-                        member_digests: BTreeMap::new(),
-                    })
-            })
-            .flatten();
+        let next_window = if full_rearm && index.claude_duplicate_request_witness_overflowed {
+            index
+                .claude_full_rearm_progress
+                .traversal_origin
+                .as_ref()
+                .filter(|origin| {
+                    origin.process == claude_full_rearm_process()
+                        && origin.window_ends.contains(census_window_end)
+                })
+                .cloned()
+                .map(|mut origin| {
+                    origin.window_ends.clear();
+                    origin
+                })
+        } else {
+            None
+        };
         let progress = &mut index.claude_full_rearm_progress;
         if !index.claude_duplicate_request_witness_overflowed {
             // An open fence needs no suppression or window memory.
@@ -33942,6 +33950,14 @@ fn ensure_bounded_traversal(
             capped_roots,
             replay,
         };
+    }
+    if source == SnapshotSource::ClaudeCode {
+        index.claude_full_rearm_progress.traversal_origin = Some(ClaudeFullRearmWindow {
+            context_fingerprint: context_fingerprint.clone(),
+            process: claude_full_rearm_process(),
+            window_ends: BTreeSet::from([collected_at.to_string()]),
+            member_digests: BTreeMap::new(),
+        });
     }
     transition.emit(source);
 
@@ -76785,7 +76801,7 @@ crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, 
 crate::heap_layout_bound::fields!(ScanTraversalCounts; discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count);
 crate::heap_layout_bound::fields!(ScanTraversalPath; scan_root, path, census_member, watcher_hint);
 crate::heap_layout_bound::fields!(ClaudeStaleFamilyCarry; roots, capped_roots, replay);
-crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; observed_window, structural_roots, other_invalidation_observed, structural_record, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
+crate::heap_layout_bound::fields!(ClaudeFullRearmProgress; observed_window, structural_roots, other_invalidation_observed, structural_record, traversal_origin, full_rearm_window_next, full_rearm_window, stale_rearm_fence_deadline, stale_rearms_at_deadline, first_proof_hold_since_full_rearm);
 crate::heap_layout_bound::fields!(ClaudeStructuralInvalidRecord; basis, families, suppressed_since_unix_seconds, skipped_full_rearms);
 crate::heap_layout_bound::fields!(ClaudeFullRearmWindow; context_fingerprint, process, window_ends, member_digests);
 crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_session_ids, codex_inventory_hold);
