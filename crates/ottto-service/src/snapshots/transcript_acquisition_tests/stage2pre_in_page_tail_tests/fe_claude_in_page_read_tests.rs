@@ -1467,7 +1467,6 @@ fn fe_claude_old_unknown_and_malformed_provenance_exclude() {
         "semantic_sync:v2+sampled_unverified:v99:9999999999:c",
         "semantic_sync:v2+sampled_unverified:v2:9999999999:unknown",
         "semantic_sync:v2+sampled_unverified:v2:bad:c",
-        "unknown-provenance",
     ] {
         let (fixture, mut index, result) = quiescent();
         let key = local_index_key(&fixture.file.0);
@@ -1638,8 +1637,8 @@ fn fe_g1_ordinary_unverified_rerecord_never_mints_prefix_provenance() {
         let key = local_index_key(&fixture.file.0);
         index.files.get_mut(&key).unwrap().scan_identity_version = reset.map(Into::into);
         assert!(
-            index.files[&key].has_prefix_provenance(),
-            "{id}: the read side fails closed until re-recorded"
+            !index.files[&key].has_prefix_provenance(),
+            "{id}: SOURCE Option 1: a non-stem identity is not a prefix"
         );
         fixture
             .file
@@ -1731,4 +1730,36 @@ fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
         assert!(record.unverified_or_twin(), "{shape:?}");
         assert_eq!(record.can_bind_recomposed_body(), binds, "{shape:?}");
     }
+}
+
+/// SOURCE Option 1 condition: historical replay keeps every stem entry and
+/// re-sets its deadline with the prefix flag preserved, so a replay reset
+/// cannot turn an FE prefix into `None` or a clean identity. Before the next
+/// re-record, the replayed prefix still mints no positive verdict.
+#[test]
+fn fe_prefix_entry_survives_replay_reset_without_positive_verdict() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut grown = grown_full();
+    let key = grown.base.key.clone();
+    let before = grown.index.files[&key].unverified_deadline();
+    assert!(grown.index.files[&key].has_prefix_provenance());
+    grown
+        .index
+        .prepare_historical_replay("fe-prefix-replay".into());
+    let entry = grown
+        .index
+        .files
+        .get(&key)
+        .expect("replay retains a stem entry");
+    assert!(entry.has_unverified_source());
+    assert!(entry.has_prefix_provenance());
+    assert!(entry
+        .scan_identity_version
+        .as_deref()
+        .unwrap()
+        .ends_with(":p"));
+    assert_eq!(entry.unverified_deadline(), before);
+    assert!(!mints_v1(&mut grown.index, &grown.result, 0..9));
 }

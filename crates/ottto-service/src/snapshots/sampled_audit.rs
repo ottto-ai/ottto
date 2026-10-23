@@ -48,14 +48,15 @@ impl ScanIndexEntry {
             .as_deref()
             .is_some_and(|version| version.starts_with(UNVERIFIED_STEM))
     }
-    /// Only the known full identity or a decoded v2 c tag authorizes complete
-    /// provenance. Missing/old/unknown/malformed provenance fails closed.
+    /// FE writes every prefix tag under the sampled stem, and replay keeps stem
+    /// entries, so only a stem can carry a prefix. A stem fails closed unless
+    /// it decodes as a v2 c tag; None and legacy identities are not prefixes.
     pub(super) fn has_prefix_provenance(&self) -> bool {
-        match self.scan_identity_version.as_deref() {
-            Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION) => false,
-            Some(version) => !matches!(decode_marker(version), Some((_, false))),
-            None => true,
-        }
+        self.has_unverified_source()
+            && self
+                .scan_identity_version
+                .as_deref()
+                .is_some_and(|version| !matches!(decode_marker(version), Some((_, false))))
     }
     pub(super) fn unverified_deadline(&self) -> Option<u64> {
         if !self.has_unverified_source() {
@@ -533,8 +534,9 @@ mod provenance_tests {
         }
     }
     /// c22 G1: `record` carries only an existing sampled stem. A replay-reset
-    /// or legacy entry re-recorded without verification or obligation becomes
-    /// the clean identity; the same completion's FE mark still tags `p`.
+    /// or legacy entry (never a prefix, SOURCE Option 1) re-recorded without
+    /// verification or obligation becomes the clean identity; the same
+    /// completion's FE mark still tags `p`.
     #[test]
     fn ordinary_record_never_mints_prefix_but_fe_mark_after_record_does() {
         let candidate = CandidateFile {
@@ -553,8 +555,8 @@ mod provenance_tests {
             let mut entry = index().files.remove("file").unwrap();
             entry.scan_identity_version = reset.map(Into::into);
             assert!(
-                entry.has_prefix_provenance(),
-                "{reset:?}: read side fails closed"
+                !entry.has_prefix_provenance(),
+                "{reset:?}: SOURCE Option 1: a non-stem identity is not a prefix"
             );
             let mut ordinary = ScanIndex::default();
             ordinary.files.insert(key.clone(), entry);
