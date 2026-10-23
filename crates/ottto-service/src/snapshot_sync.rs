@@ -25,9 +25,9 @@ use crate::snapshots::{
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
     SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
     SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, CONTEXT_CURVE_CONTRACT_VERSION, MAX_BACKFILL_FILES_PER_SOURCE,
-    MAX_SNAPSHOT_RECONSTRUCTION_FAILURES, SNAPSHOT_QUARANTINE_RETRY_SECONDS,
-    SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
+    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+    SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
 use crate::LocalDaemon;
 use crate::LocalHealthUploadFailureKind;
@@ -349,7 +349,7 @@ fn commit_completed_with_local_holds(
     server_quarantine.retain(|fingerprint, _| !locally_held_fingerprints.contains(fingerprint));
     let mut index =
         index.committable_subset(committed_index, &accepted_fingerprints, &server_quarantine);
-    index.mark_bounded_sweep_unsettled();
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::CompletedBlockingHolds);
     index
 }
 
@@ -502,7 +502,11 @@ fn settle_checkpointed_upload(
     };
     let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
     if !settled {
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
+            UnsettledUploadCause::RejectedWithHolds
+        } else {
+            UnsettledUploadCause::DeferredConflict
+        });
     }
     let fully_settled = upload_settled_without_account_holds(&index, settled && !holds.any());
     UploadIndexSettlement {
@@ -1807,6 +1811,7 @@ pub(crate) fn comparison_partial_fallback_for_test(
         || Ok(()),
         None,
         Some(NativeSelectedRestore::Logical(fallback)),
+        None,
     )
 }
 
@@ -1865,6 +1870,7 @@ fn checkpoint_partial_snapshot_index_with_read_limit(
         validate_destination,
         read_limit,
         None,
+        None,
     )
 }
 
@@ -1902,6 +1908,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     validate_destination: impl FnOnce() -> Result<()>,
     read_limit: Option<usize>,
     fallback: Option<NativeSelectedRestore<'_>>,
+    cause: Option<UnsettledUploadCause>,
 ) -> Result<ScanIndex> {
     let _lock = SnapshotProgressLock::acquire(progress_path)?;
     let mut durable: SnapshotUploadProgress = match match read_limit {
@@ -1980,7 +1987,10 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     if let Some(fallback) = fallback {
         fallback.restore(&mut committable, committed_index)?;
     }
-    committable.mark_bounded_sweep_unsettled();
+    match cause {
+        Some(cause) => committable.mark_bounded_sweep_unsettled_by(cause),
+        None => committable.mark_bounded_sweep_unsettled(),
+    }
     validate_destination()?;
     if let Some(cap) = read_limit {
         committable.save_with_read_limit(index_path, cap)?;
@@ -5822,6 +5832,7 @@ fn finish_sync_source(
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             ) {
                 Ok(committable) => {
                     note_codex_side_saved(daemon, &index_path, false, side_mark);
@@ -5941,6 +5952,7 @@ fn finish_sync_source(
                     comparison_completion
                         .as_mut()
                         .map(NativeSelectedRestore::Paid),
+                    Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
                         index = committable;
@@ -7243,7 +7255,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         // until a complete family pass reconstructs the exact witness.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled();
+        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -17557,6 +17569,161 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
+    }
+
+    /// Diagnostics only: every settlement path that marks the sweep unsettled
+    /// names itself, causes accumulate across pages and survive a reload, and
+    /// a settled outcome names nothing.
+    #[test]
+    fn unsettled_cause_names_each_settlement_and_partial_checkpoint_producer() {
+        let entry = |source: &str, fingerprint: &str| {
+            serde_json::json!({
+                "size_bytes": 1,
+                "modified_unix_seconds": 2,
+                "source_file_fingerprint": source,
+                "last_snapshot_fingerprint": fingerprint,
+                "scan_identity_version": "semantic_sync:v2",
+            })
+        };
+        let committed = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-old-source", "held-old")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-old"]},
+        }));
+        let scanned = claude_index_with(serde_json::json!({
+            "files": {"/opaque/held.jsonl": entry("held-new-source", "held-new")},
+            "file_snapshot_fingerprints": {"/opaque/held.jsonl": ["held-new"]},
+        }));
+        let held = BTreeSet::from(["held-new".to_string()]);
+        let progress = test_upload_progress();
+        let holds = |held_fingerprints: &BTreeSet<String>| LocalHoldSettlement {
+            held_entity_count: held_fingerprints.len(),
+            retry_pending_family_count: 0,
+            held_fingerprints: held_fingerprints.clone(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            // Restorable non-blocking Rejected holds settle once H1 is composed.
+            progress_blocking: !held_fingerprints.is_empty(),
+        };
+
+        let blocked = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            true,
+        );
+        assert!(blocked.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            blocked.bounded_sweep_unsettled_cause_names(),
+            ["completed_blocking_holds"]
+        );
+        let restored = commit_completed_with_local_holds(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &held,
+            &BTreeSet::new(),
+            false,
+        );
+        assert!(!restored.bounded_sweep_had_unsettled_upload());
+        assert!(restored.bounded_sweep_unsettled_cause_names().is_empty());
+
+        let deferred = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            false,
+        );
+        assert!(deferred.index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"]
+        );
+        let rejected_beside_hold =
+            settle_checkpointed_upload(scanned.clone(), &committed, &progress, &holds(&held), true);
+        assert!(rejected_beside_hold
+            .index
+            .bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            rejected_beside_hold
+                .index
+                .bounded_sweep_unsettled_cause_names(),
+            ["rejected_with_holds"]
+        );
+        let rejected = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &holds(&BTreeSet::new()),
+            true,
+        );
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        // H1 settles a Rejected page whose holds are restorable and
+        // non-blocking, so it must name no unsettled cause.
+        let restorable = settle_checkpointed_upload(
+            scanned.clone(),
+            &committed,
+            &progress,
+            &LocalHoldSettlement {
+                progress_blocking: false,
+                ..holds(&held)
+            },
+            true,
+        );
+        assert!(!restorable.index.bounded_sweep_had_unsettled_upload());
+        assert!(restorable
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+
+        // The shed and error branches mark through the partial checkpoint.
+        // A cause from an earlier page of the same sweep is kept beside it.
+        for (cause, name) in [
+            (UnsettledUploadCause::Shed, "shed"),
+            (UnsettledUploadCause::UploadError, "upload_error"),
+        ] {
+            let root = test_dir(&format!("unsettled-cause-checkpoint-{name}"));
+            std::fs::create_dir_all(&root).expect("create checkpoint fixture root");
+            let index_path = root.join("scan-index.json");
+            let progress_path = root.join("upload-progress.json");
+            let mut durable = SnapshotUploadProgress::load(
+                &progress_path,
+                &format!("{:064x}", 589),
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .expect("load upload progress");
+            durable.save(&progress_path).expect("save upload progress");
+            let mut working = scanned.clone();
+            working.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+            let checkpoint = checkpoint_partial_snapshot_index_with_comparison(
+                &working,
+                &committed,
+                &durable,
+                &[],
+                None,
+                &BTreeSet::new(),
+                &index_path,
+                &progress_path,
+                || Ok(()),
+                None,
+                None,
+                Some(cause),
+            )
+            .expect("partial checkpoint");
+            assert!(checkpoint.bounded_sweep_had_unsettled_upload());
+            let reloaded = ScanIndex::load(&index_path).expect("reload scan index");
+            assert!(reloaded.bounded_sweep_had_unsettled_upload());
+            assert_eq!(
+                reloaded.bounded_sweep_unsettled_cause_names(),
+                [name, "deferred_conflict"]
+            );
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     /// The backend's error-code set is closed and its forward tolerance covers
