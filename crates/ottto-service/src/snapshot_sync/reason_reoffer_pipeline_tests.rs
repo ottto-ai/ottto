@@ -754,8 +754,8 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     );
     assert!(quiet.index.bounded_sweep_had_unsettled_upload());
     assert_eq!(
-        pipeline.server.last_terminal()["last_census_complete"],
-        false
+        pipeline.server.last_terminal()["last_error_code"],
+        "server_error"
     );
     assert_eq!(
         reoffer_json(&quiet, &fingerprint)["retry_after_unix_seconds"],

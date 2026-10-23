@@ -687,6 +687,21 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     assert!(select(&mut progress, &index, NOW));
     progress.quarantine_retryable_body(&fp(1), &body(1));
     let retry = progress.quarantined_fingerprints[&fp(1)].clone();
+    let root = test_dir("reoffer-newer-conflict-retirement");
+    let path = root.join("progress.json");
+    progress.save(&path).unwrap();
+    progress.finish_cycle(&path).unwrap();
+    let mut progress = SnapshotUploadProgress::load(
+        &path,
+        &"a".repeat(64),
+        snapshot_quarantine_witness(SnapshotSource::Codex),
+    )
+    .unwrap();
+    assert_eq!(
+        progress.quarantined_fingerprints[&fp(1)],
+        retry,
+        "the newer conflict survives retirement and restart before selection"
+    );
     assert!(!select(&mut progress, &index, NOW + 300));
     assert_eq!(progress.quarantined_fingerprints[&fp(1)], retry);
     assert!(progress.contains_body(&fp(1), &body(1)));
@@ -709,6 +724,7 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         original_pair(NOW + DAY)
     );
 
+    std::fs::remove_dir_all(root).unwrap();
     let (mut old_progress, mut old_index) = refused(&[(2, original_pair(NOW + DAY))]);
     let old_timer = old_index
         .quarantined_snapshot_fingerprints

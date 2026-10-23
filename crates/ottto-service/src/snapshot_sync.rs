@@ -1949,7 +1949,19 @@ impl SnapshotUploadProgress {
         }
         self.accepted_fingerprints.clear();
         self.accepted_body_witnesses.clear();
-        self.quarantined_fingerprints.clear();
+        // A later conflict on the refused bytes is the stronger settlement
+        // fact, even while the retained refusal gates its next daily offer.
+        // Keep it in the same atomic ledger so an older index-only timer can
+        // still be distinguished from this newer server answer on restart.
+        self.quarantined_fingerprints.retain(|fingerprint, record| {
+            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                && self
+                    .permanent_rejections
+                    .get(fingerprint)
+                    .is_some_and(|refusal| {
+                        record.upload_body_witness.as_deref() == Some(refusal.body_witness.as_str())
+                    })
+        });
         self.active_quarantine_retries.clear();
         self.active_reason_reoffers.clear();
         self.save(path)
