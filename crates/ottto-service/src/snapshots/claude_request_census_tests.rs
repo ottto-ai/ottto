@@ -1639,6 +1639,8 @@ fn census_shadow_counts_encoding_is_bounded() {
         shadow_peak_measured: false,
         shadow_workspace_peak_measured: false,
         safety_resource_refused_keys: usize::MAX,
+        confirmed_empty_keys: usize::MAX,
+        missing_confirmed_empty_records: usize::MAX,
         strong_comparison_complete: false,
         safety_incomplete: false,
         safety_incomplete_overflow: false,
@@ -1789,7 +1791,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 5363;
+const CENSUS_SHADOW_WORST_BYTES: usize = 5462;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.

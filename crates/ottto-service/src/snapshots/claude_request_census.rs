@@ -3324,6 +3324,23 @@ impl ClaudeRequestCensusJoin {
                 continue;
             };
             if index.confirmed_empty_files.contains(key) {
+                join.counts.confirmed_empty_keys += 1;
+                let record = census.get(key).filter(|record| record.current_derivation());
+                let coverage =
+                    Self::coverage(index, key, entry, record, window, residue_index_keys);
+                let covered = matches!(
+                    coverage,
+                    ClaudeRequestCensusCoverage::Fingerprint | ClaudeRequestCensusCoverage::Window
+                );
+                join.counts.missing_confirmed_empty_records += usize::from(!covered);
+                if record
+                    .filter(|_| covered)
+                    .is_some_and(|record| record.shape.unknown() || record.twin)
+                {
+                    join.unknown_roots.insert(path_owner.0.clone());
+                }
+                join.coverage.insert(key.clone(), coverage);
+                *path_owners.entry(path_owner).or_default() += 1;
                 continue;
             }
             join.counts.family_keys += 1;
@@ -3385,12 +3402,16 @@ impl ClaudeRequestCensusJoin {
             let alias = record.twin
                 || claude_index_path_family_member(Path::new(key))
                     .is_some_and(|owner| path_owners.get(&owner).is_some_and(|keys| *keys > 1));
-            let inert = !matches!(
-                join.coverage.get(key),
-                Some(
-                    ClaudeRequestCensusCoverage::Fingerprint | ClaudeRequestCensusCoverage::Window
+            let inert = !record.safety_complete()
+                || record.safety.as_ref().is_some_and(|safety| !safety.ac)
+                || !matches!(
+                    join.coverage.get(key),
+                    Some(
+                        ClaudeRequestCensusCoverage::Fingerprint
+                            | ClaudeRequestCensusCoverage::Window
+                    )
                 )
-            ) || record.shape.unknown()
+                || record.shape.unknown()
                 || record.unverified;
             let reason = u8::from(record.window != window)
                 | (u8::from(inert) << 1)
@@ -3431,7 +3452,9 @@ impl ClaudeRequestCensusJoin {
             }
         }
         for (key, coverage) in &join.coverage {
-            if matches!(coverage, ClaudeRequestCensusCoverage::Migrate) {
+            if matches!(coverage, ClaudeRequestCensusCoverage::Migrate)
+                || (index.confirmed_empty_files.contains(key) && census.get(key).is_none())
+            {
                 migration.insert(key);
             }
         }
@@ -3699,6 +3722,7 @@ impl ClaudeRequestCensusJoin {
         let counts = &self.counts;
         census_complete
             && !counts.safety_incomplete
+            && counts.missing_confirmed_empty_records == 0
             && counts.safety_resource_refused_keys == 0
             && counts.shape_lossy_unread == 0
             && counts.retired_safety_missing == 0
@@ -5133,5 +5157,29 @@ mod phase_b_tests {
                 scope(control, path, fingerprint, root)
             );
         }
+    }
+    #[test]
+    fn confirmed_empty_file_is_never_a_recordless_safety_excusal() {
+        let mut index = index_with(vec![(A, record('a', vec![9])), (B, record('b', vec![9]))]);
+        index.confirmed_empty_files.insert(A.to_owned());
+        index.claude_request_census.remove(A);
+        let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
+        assert!(!join.disjointness_complete(true));
+        assert_eq!(join.counts.missing_confirmed_empty_records, 1);
+        assert_eq!(
+            join.member_status(&index, B, true),
+            ClaudeCensusMemberStatus::Unobserved
+        );
+        // A real all-read zero-usage response still carries its visible IDs.
+        let mut restored = record('a', vec![9]);
+        restored.shape = ClaudeRequestCensusShape::IdentityIncomplete;
+        index.claude_request_census.insert_for_test(A, restored);
+        let join = ClaudeRequestCensusJoin::new(&index, 7, &BTreeSet::new());
+        assert!(join.disjointness_complete(true));
+        assert_eq!(
+            join.member_status(&index, B, true),
+            ClaudeCensusMemberStatus::SharesHash
+        );
+        assert_eq!(join.counts.missing_confirmed_empty_records, 0);
     }
 }
