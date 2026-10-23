@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 829,
-  "content_sha256": "80156de97e2810d8c3c4ab08405952f5256a45c434e4719ba2ef4d42b33f1b35",
+  "content_sha256": "1a022b632317e40bce72876f59aa006cbd27d43f6ffc9ba1f12543da86510893",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "431eac54e6fdbd3d7410e8468e842517855ad96202c0cf706a84ef8646f8eef6",
-      "size_bytes": 916705
+      "sha256": "f298b966c398abd213d48bdeaab58178632e7fc9620891f34398ab4ef567e032",
+      "size_bytes": 917068
     },
     {
       "executable": false,
@@ -1623,8 +1623,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "62d4513d01b8865f5ee72eae5c30db37f3eef40e5e342a01ecfc76ab27b43fdb",
-      "size_bytes": 3410457
+      "sha256": "9a7954b04d30b24add9e9d3acdf6a44d566e351cd16976806e3e7bda10e73127",
+      "size_bytes": 3411135
     },
     {
       "executable": false,
@@ -1987,8 +1987,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/full_rearm_progress_tests.rs",
-      "sha256": "e44fccb33d31065fef73d58ede25bd14dbe1081c1655b246403d97e5a73dc6eb",
-      "size_bytes": 35982
+      "sha256": "c79614f5a9800e7be37c35bae2564bc73456371ed7f573f00a5a8c9f7609b2ae",
+      "size_bytes": 38951
     },
     {
       "executable": false,
@@ -4024,8 +4024,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-23-claude-full-rearm-no-progress.md",
-      "sha256": "0d2f0adfca6627b45449ad2b0b11a871c81d1e28021b2d82ff44b9142f0b0a56",
-      "size_bytes": 8814
+      "sha256": "fd479d04d733051c74a41eecf62aad1181c8c05ea3c3dfa38b7a9525892049cf",
+      "size_bytes": 9032
     },
     {
       "executable": false,
@@ -5806,7 +5806,7 @@
       "size_bytes": 1484
     }
   ],
-  "generated_at": "2026-10-23T16:20:14+00:00",
+  "generated_at": "2026-10-23T16:29:07+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 830,
   "public_roots": [
@@ -5845,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "e67f539cabfd9a9bf8b442e03a5268e7fdbc3a4f"
+  "source_commit": "91d4d1f5622de7d54b7e94c1cf22a0a8bea85c79"
 }

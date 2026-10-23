@@ -45,6 +45,10 @@ deadline) only when all of these hold:
   invalid census clock, identity refusal or unexplained coverage omission;
 - no first-proof hold (see below).
 
+Sidecar health failures retain their veto before the pipeline filters the
+failed rows out of its aggregate reports. Occurrence clocks are checked
+before the later request-identity classification can produce BadClock.
+
 Any change (a member revision, a new family, a basis change, a latch flip, an
 unrecorded contract, a lost or malformed record) re-arms exactly once as
 before, and that re-arm window records the new set. A non-due observation

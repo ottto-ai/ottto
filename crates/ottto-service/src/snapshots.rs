@@ -5359,6 +5359,7 @@ impl ClaudeFullRearmProgress {
                 // Unknown identity failures remain non-structural even when
                 // another member of the same root is structurally invalid.
                 item.request_identity_refusals > 0
+                    || item.claude_usage_occurrences.values().any(|occurrence| !occurrence.event_clock_complete)
                     || item.claude_account_withheld_reason.is_some()
                     || (!claude_member_invalidity_is_structural(item)
                         && claude_snapshot_request_id_hashes(item).is_none())
@@ -6882,6 +6883,7 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
     duplicate_census.fence_before = index.claude_duplicate_request_witness_overflowed;
     let reports_healthy = api_report.health.is_complete() && trace_report.is_complete();
     let other_evidence_cause = !reports_healthy
+        || identity.is_some_and(|evidence| !evidence.unhealthy_roots.is_empty())
         || rfc3339_unix_seconds(census_window_end).is_none()
         || (census_complete
             && index.files.keys().any(|key| {
@@ -36093,6 +36095,18 @@ impl ScanIndex {
             (true, 0) => UnsettledUploadCause::Unattributed.bit(),
             (true, causes) => causes,
         }
+    }
+
+    /// The pipeline filters failed sidecars out of otherwise healthy reports.
+    /// Preserve that cause for the whole window before the terminal fold.
+    pub(crate) fn note_claude_full_rearm_evidence_gap(&mut self, census_window_end: &str) {
+        self.claude_full_rearm_progress.observe_page(
+            &[],
+            &self.claude_usage_family_pending,
+            census_window_end,
+            &ClaudeDuplicateCensusCounts::default(),
+            true,
+        );
     }
 
     /// Record the contract-5 contract a prepared Claude cycle builds bodies

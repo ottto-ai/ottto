@@ -834,6 +834,8 @@ fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
         "api",
         "trace",
         "bad-clock",
+        "census-clock",
+        "filtered-health",
         "identity-refused",
         "coverage",
     ] {
@@ -863,7 +865,16 @@ fn non_own_byte_causes_veto_structural_suppression_at_the_terminal() {
             }
             "api" => api.health.missing_files = 1,
             "trace" => trace.missing_files = 1,
-            "bad-clock" => window = "bad-clock",
+            "bad-clock" => {
+                items[0]
+                    .claude_usage_occurrences
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .event_clock_complete = false
+            }
+            "census-clock" => window = "bad-clock",
+            "filtered-health" => index.note_claude_full_rearm_evidence_gap(window),
             "identity-refused" => items[0].request_identity_refusals = 1,
             "coverage" => rearm.add_other_family(&mut index),
             _ => unreachable!(),
@@ -936,4 +947,68 @@ fn occurrence_key_mismatch_in_an_already_invalid_family_still_vetoes() {
     assert!(run.counts.full_rearm);
     assert!(!run.suppression.full_rearm_suppressed);
     assert_eq!(run.rearmed_files, 2);
+}
+
+/// Production removes unpaired/unhealthy sidecars from the aggregate reports.
+/// Those reports must not erase the suppression veto, even without a permit.
+#[test]
+fn pipeline_filtered_sidecar_failures_keep_the_due_rearm_enabled() {
+    let rearm = Rearm::new();
+    let mut baseline = rearm.index();
+    rearm.establish(&mut baseline, &rearm.items);
+    for cause in ["absent", "unpaired", "malformed-pair"] {
+        let support = temp_dir("full-rearm-filtered-sidecars");
+        if cause != "absent" {
+            let digest = format!("{:x}", Sha256::digest(rearm.parent.as_bytes()));
+            let mut kinds = vec!["claude-code-effort"];
+            if cause == "malformed-pair" {
+                kinds.push("claude-code-trace-ownership");
+            }
+            for kind in kinds {
+                let path = support
+                    .join("local-otel")
+                    .join(kind)
+                    .join(format!("{digest}.jsonl"));
+                fs::create_dir_all(path.parent().unwrap()).unwrap();
+                fs::write(path, "not json\n").unwrap();
+            }
+        }
+        // Obtain a real empty scan envelope, independently of the index whose
+        // baseline is under test, then supply this window's parsed fixture.
+        let mut scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut ScanIndex::default(),
+            WINDOW,
+            7,
+            100,
+            false,
+        )
+        .unwrap();
+        scan.snapshots = rearm.items.clone();
+        scan.census_complete = true;
+        let mut index = baseline.clone();
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        let (disposition, _, _) = crate::snapshot_sync::apply_claude_local_evidence_to_scan(
+            &support, &mut scan, &mut index,
+        );
+        let run = rearm.reread(&mut index, &disposition);
+        assert!(
+            run.counts.fence_before && run.counts.fence_after,
+            "{cause}: {run:?}"
+        );
+        if cause == "absent" {
+            assert!(
+                run.suppression.full_rearm_suppressed,
+                "healthy control: {run:?}"
+            );
+            assert!(!run.counts.full_rearm);
+            assert_eq!(run.rearmed_files, 0);
+        } else {
+            assert!(run.counts.full_rearm, "{cause}: {run:?}");
+            assert!(!run.suppression.full_rearm_suppressed, "{cause}");
+            assert_eq!(run.rearmed_files, 2, "{cause}");
+        }
+        let _ = fs::remove_dir_all(support);
+    }
 }
