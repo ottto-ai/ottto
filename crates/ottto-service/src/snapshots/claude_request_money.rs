@@ -98,7 +98,8 @@ const WORK_MAX_STATS: u64 = 1024;
 /// Includes closing failure rows and handoff; the writer runs separately.
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
 /// Leave bounded closing work inside the total, rather than after expiry.
-const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(150);
+const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
+const TELEMETRY_MAX_ELAPSED: Duration = Duration::from_millis(20);
 /// A growing structure's admission step.
 const GROWTH_STEP_BYTES: usize = 256 * 1024;
 
@@ -1324,6 +1325,7 @@ fn shadow_page_with_coverage(
         .saturating_add(page_claim_rows.saturating_mul(PAGE_HASH_BYTES))
         .saturating_add(
             JSONL_WRITE_BUFFER_BYTES
+                + FAMILY_BYTES // one cached canonical failure template
                 + 1024
                 + tail_fixed_memory(&ClaudeTelemetryTailBudget::default()),
         );
@@ -1351,7 +1353,11 @@ fn shadow_page_with_coverage(
         drop_certificate(ledger);
     }
     // Telemetry runs first and shares the caller's absolute time bound.
-    let mut work = ClaudeLedgerWork::new(WORK_MAX_BYTES, WORK_MAX_STATS, deadline);
+    let mut work = ClaudeLedgerWork::new(
+        WORK_MAX_BYTES,
+        WORK_MAX_STATS,
+        deadline.min(started + TELEMETRY_MAX_ELAPSED),
+    );
     let unloaded = roots
         .iter()
         .copied()
@@ -1464,6 +1470,7 @@ fn shadow_page_with_coverage(
     let mut failed = 0;
     let mut written = 0;
     let mut incomplete = 0;
+    let mut failure_digest = DeadlineDigest::default();
     for root in order {
         if Instant::now() >= absolute_deadline {
             // If exceptional closing work itself exhausts the total, use
@@ -1582,7 +1589,11 @@ fn shadow_page_with_coverage(
         let digest = if rows.row.p1_reasons.contains(&"deadline") {
             // Already a bounded failure row: never repeat body construction
             // or tallying after expiry.
-            semantic_digest(&mut rows)
+            if !rows.row.old_available {
+                failure_digest.digest(&mut rows)
+            } else {
+                semantic_digest(&mut rows)
+            }
         } else if let Some(digest) = semantic_digest_by(&mut rows, Some(deadline)) {
             digest
         } else {
@@ -2325,6 +2336,21 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
             Ok(())
         }
     }
+    let mut hash = HashWriter {
+        hash: Sha256::new(),
+        deadline,
+        buffer: [0; 4096],
+        used: 0,
+    };
+    write_semantic(rows, &mut hash).ok()?;
+    hash.flush().ok()?;
+    Some(u64::from_be_bytes(
+        hash.hash.finalize()[..8].try_into().expect("digest"),
+    ))
+}
+
+/// The single canonical encoder used by streaming bodies and cached failures.
+fn write_semantic(rows: &mut FamilyRows, writer: &mut impl Write) -> serde_json::Result<()> {
     let row = &mut rows.row;
     let saved = (
         row.snapshot,
@@ -2336,15 +2362,9 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
     );
     row.snapshot = 0;
     row.observed_unix = 0;
-    let mut hash = HashWriter {
-        hash: Sha256::new(),
-        deadline,
-        buffer: [0; 4096],
-        used: 0,
-    };
-    let result = serde_json::to_writer(&mut hash, &*row).and_then(|()| {
+    let result = serde_json::to_writer(&mut *writer, &*row).and_then(|()| {
         for (key, (old, new)) in &rows.grains {
-            serde_json::to_writer(&mut hash, &grain_row(row, key, old, new))?;
+            serde_json::to_writer(&mut *writer, &grain_row(row, key, old, new))?;
         }
         Ok(())
     });
@@ -2356,11 +2376,71 @@ fn semantic_digest_by(rows: &mut FamilyRows, deadline: Option<Instant>) -> Optio
         row.removed_change_basis_snapshot,
         row.removed_change_unavailable,
     ) = saved;
-    result.ok()?;
-    hash.flush().ok()?;
-    Some(u64::from_be_bytes(
-        hash.hash.finalize()[..8].try_into().expect("digest"),
-    ))
+    result
+}
+
+/// Only `failure_rows(..., "deadline", ...)` uses this cache. Such rows
+/// differ solely in family identity and the census wire fields. Serialize
+/// one exact canonical template per census shape, then reuse its SHA prefix
+/// and suffix bytes. This preserves the digest and unchanged suppression
+/// without repeating hundreds of serde calls per deferred family.
+#[derive(Default)]
+struct DeadlineDigest {
+    template: Option<DeadlineTemplate>,
+}
+struct DeadlineTemplate {
+    census: &'static str,
+    reason: Option<coverage::CensusReason>,
+    statuses: BTreeMap<&'static str, u64>,
+    prefix: Sha256,
+    bytes: Vec<u8>,
+    suffix: usize,
+}
+impl DeadlineDigest {
+    fn digest(&mut self, rows: &mut FamilyRows) -> u64 {
+        if rows.row.family.len() != 16 {
+            return semantic_digest(rows);
+        }
+        let matches = self.template.as_ref().is_some_and(|template| {
+            template.census == rows.row.census
+                && template.reason == rows.row.census_reason
+                && template.statuses == rows.row.key_statuses
+        });
+        if !matches {
+            // Fixed admitted buffer: future schema growth cannot allocate
+            // beyond the template allowance before falling back.
+            self.template = None;
+            let mut bytes = vec![0; FAMILY_BYTES];
+            let mut writer = std::io::Cursor::new(bytes.as_mut_slice());
+            if write_semantic(rows, &mut writer).is_err() {
+                return semantic_digest(rows);
+            }
+            let len = writer.position() as usize;
+            bytes.truncate(len);
+            let needle = b"\"family\":\"";
+            let start = bytes
+                .windows(needle.len())
+                .position(|part| part == needle)
+                .expect("canonical family field")
+                + needle.len();
+            let suffix = start + rows.row.family.len();
+            let mut prefix = Sha256::new();
+            prefix.update(&bytes[..start]);
+            self.template = Some(DeadlineTemplate {
+                census: rows.row.census,
+                reason: rows.row.census_reason,
+                statuses: rows.row.key_statuses.clone(),
+                prefix,
+                bytes,
+                suffix,
+            });
+        }
+        let template = self.template.as_ref().expect("canonical deadline template");
+        let mut hash = template.prefix.clone();
+        hash.update(rows.row.family.as_bytes());
+        hash.update(&template.bytes[template.suffix..]);
+        u64::from_be_bytes(hash.finalize()[..8].try_into().expect("digest"))
+    }
 }
 
 #[cfg(test)]
@@ -3577,6 +3657,49 @@ mod round3_tests {
 #[cfg(test)]
 mod digest_deadline_tests {
     use super::*;
+    #[test]
+    fn cached_deadline_digest_matches_canonical_bytes_across_families_and_census_shapes() {
+        use coverage::CensusReason;
+        let ledger = ClaudeLedger::new_for_test();
+        let mut counts = ClaudeRequestMoneyShadowCounts::default();
+        let mut cached = DeadlineDigest::default();
+        for state in [
+            FamilyCensus::Covered,
+            FamilyCensus::Unknown(CensusReason::FenceInvalid),
+            FamilyCensus::Unknown(CensusReason::CensusIncomplete),
+            FamilyCensus::Unknown(CensusReason::AuthorityRetry),
+            FamilyCensus::Unknown(CensusReason::StrongViewUnavailable),
+            FamilyCensus::Missing {
+                keys: vec!["private-key".to_owned()],
+                more: 0,
+            },
+            FamilyCensus::Missing {
+                keys: vec![],
+                more: 5,
+            },
+        ] {
+            for (at, root) in ["first-root", "second-root", "first-root"]
+                .iter()
+                .enumerate()
+            {
+                let mut rows = failure_rows(
+                    root,
+                    "deadline",
+                    state.clone(),
+                    at as u64 + 10,
+                    at as u64 + 100,
+                    &ledger,
+                    &mut counts,
+                );
+                let expected = semantic_digest(&mut rows);
+                assert_eq!(cached.digest(&mut rows), expected, "{state:?}: {root}");
+                assert_eq!(
+                    (rows.row.observed_unix, rows.row.snapshot),
+                    (at as u64 + 10, at as u64 + 100)
+                );
+            }
+        }
+    }
     #[test]
     fn money_p1b_digest_stops_inside_serialization_and_restores_observation_fields() {
         let ledger = ClaudeLedger::new_for_test();
