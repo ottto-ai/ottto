@@ -153,7 +153,7 @@ pub(crate) struct ClaudeRequestCensusRecord {
     request_hashes: Option<Arc<[u64]>>,
     /// Transcript-only safety extension; MONEY never reads these fields.
     safety: Option<Box<TranscriptSafety>>,
-    safety_hashes: Option<SafetyHashes>,
+    safety_hashes: Option<Box<SafetyHashes>>,
     /// First-seen birth of the physical object at this key, set once and
     /// bound to its (device, inode).
     birth: Option<ClaudeRequestBirth>,
@@ -351,11 +351,9 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusRecord {
             ledger,
         } = self;
         c.add(shared_hashes_bytes(request_hashes))?;
-        c.add(
-            safety_hashes
-                .as_ref()
-                .map_or(0, SafetyHashes::resident_bytes),
-        )?;
+        c.add(safety_hashes.as_ref().map_or(0, |hashes| {
+            std::mem::size_of::<SafetyHashes>() + hashes.resident_bytes()
+        }))?;
         if let Some(safety) = safety {
             crate::heap_layout_bound::HeapLayoutBound::heap_bound(safety, c)?;
         }
@@ -390,7 +388,7 @@ impl ClaudeRequestCensusRecord {
         if self.retired.is_some() {
             self.safety_hashes
                 .as_ref()
-                .map_or_else(|| HashIter::slice(&[]), SafetyHashes::iter)
+                .map_or_else(|| HashIter::slice(&[]), |hashes| hashes.iter())
         } else {
             HashIter::slice(self.request_hashes())
         }
@@ -414,7 +412,7 @@ impl ClaudeRequestCensusRecord {
                 return;
             }
             self.retired = Some(self.request_hashes().len() as u64);
-            self.safety_hashes = SafetyHashes::from_slice(self.request_hashes());
+            self.safety_hashes = SafetyHashes::from_slice(self.request_hashes()).map(Box::new);
             self.request_hashes = None;
             let safety = self.safety.get_or_insert_with(Default::default);
             safety.sc = 1;
@@ -969,12 +967,9 @@ impl ClaudeRequestCensus {
                         .saturating_add(node)
                         .saturating_add(key.capacity())
                         .saturating_add(shared_hashes_bytes(&record.request_hashes))
-                        .saturating_add(
-                            record
-                                .safety_hashes
-                                .as_ref()
-                                .map_or(0, SafetyHashes::resident_bytes),
-                        )
+                        .saturating_add(record.safety_hashes.as_ref().map_or(0, |hashes| {
+                            std::mem::size_of::<SafetyHashes>() + hashes.resident_bytes()
+                        }))
                         .saturating_add(
                             record
                                 .safety
@@ -1076,7 +1071,7 @@ impl ClaudeRequestCensus {
     ) -> ClaudeRequestCensusInsert {
         let mut lost_previous = 0;
         if let Some(old) = self.records.remove(&key) {
-            lost_previous = old.safety_hashes.as_ref().map_or(0, SafetyHashes::len);
+            lost_previous = old.safety_hashes.as_ref().map_or(0, |hashes| hashes.len());
             self.charge(&key, &old, false);
         }
         let limit = MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES;
@@ -1173,7 +1168,8 @@ impl ClaudeRequestCensus {
                     .min(free_bytes.saturating_mul(3) / 32);
                 record.safety_hashes = original
                     .as_ref()
-                    .and_then(|hashes| hashes.reclaim(original_len.saturating_sub(keep)));
+                    .and_then(|hashes| hashes.reclaim(original_len.saturating_sub(keep)))
+                    .map(Box::new);
                 if bytes
                     .saturating_sub(before)
                     .saturating_add(entry_serialized_bytes(&key, &record))
@@ -1221,7 +1217,7 @@ impl ClaudeRequestCensus {
                 let byte_need = old_hashes.len().saturating_sub(retain_by_bytes);
                 let reclaimed = old_hashes.len().min(hash_need.max(byte_need).max(1));
                 let mut replacement = old.clone();
-                replacement.safety_hashes = old_hashes.reclaim(reclaimed);
+                replacement.safety_hashes = old_hashes.reclaim(reclaimed).map(Box::new);
                 replacement.mark_safety_refused();
                 marker.note(retired_key, reclaimed, record.window);
                 hashes = hashes.saturating_sub(reclaimed);
@@ -1254,10 +1250,19 @@ impl ClaudeRequestCensus {
             }
             self.safety_incomplete = marker;
         }
-        if lost_previous > record.safety_hashes.as_ref().map_or(0, SafetyHashes::len) {
+        if lost_previous
+            > record
+                .safety_hashes
+                .as_ref()
+                .map_or(0, |hashes| hashes.len())
+        {
             self.safety_incomplete.note(
                 &key,
-                lost_previous - record.safety_hashes.as_ref().map_or(0, SafetyHashes::len),
+                lost_previous
+                    - record
+                        .safety_hashes
+                        .as_ref()
+                        .map_or(0, |hashes| hashes.len()),
                 record.window,
             );
         }
@@ -2441,7 +2446,7 @@ impl<'de> Visitor<'de> for RecordVisitor {
                     unverified,
                     request_hashes: shared_hashes(request_hashes),
                     safety,
-                    safety_hashes: SafetyHashes::from_slice(&safety_hashes),
+                    safety_hashes: SafetyHashes::from_slice(&safety_hashes).map(Box::new),
                     birth: birth.map(|values| ClaudeRequestBirth {
                         unix_seconds: values[0],
                         device: values[1],
@@ -5547,6 +5552,23 @@ mod phase_b_tests {
         );
     }
 
+    fn thread_cpu_micros() -> Option<u64> {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            let mut spec = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            // SAFETY: clock_gettime writes the struct it is given.
+            if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut spec) } != 0 {
+                return None;
+            }
+            Some(spec.tv_sec as u64 * 1_000_000 + spec.tv_nsec as u64 / 1_000)
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        None
+    }
+
     #[test]
     fn off_mode_m4_scale_receipt_and_frozen_main_money_maintenance() {
         let _mode = phase_b::ShadowMode::set(false);
@@ -5587,9 +5609,12 @@ mod phase_b_tests {
             .len();
         let mut baseline = main_reference::MainAdmission::from_census(&index.claude_request_census);
         let started = std::time::Instant::now();
+        let cpu_started = thread_cpu_micros().expect("native CI thread CPU clock");
         baseline.terminal(&index, &BTreeSet::new(), window);
-        let main_cpu = started.elapsed().as_micros();
+        let main_cpu = thread_cpu_micros().unwrap().saturating_sub(cpu_started);
+        let main_wall = started.elapsed().as_micros();
         let started = std::time::Instant::now();
+        let cpu_started = thread_cpu_micros().unwrap();
         let mut view = None;
         let counts = prepare_claude_request_census_terminal(
             &mut index,
@@ -5598,7 +5623,8 @@ mod phase_b_tests {
             WINDOW,
             &mut view,
         );
-        let off_cpu = started.elapsed().as_micros();
+        let off_cpu = thread_cpu_micros().unwrap().saturating_sub(cpu_started);
+        let off_wall = started.elapsed().as_micros();
         prepare_safety_checkpoint(&mut index);
         assert!(view.is_none());
         assert_eq!(counts.shadow_join_builds, 0);
@@ -5618,10 +5644,39 @@ mod phase_b_tests {
             index.claude_request_census.active_hash_total,
             baseline.hash_total()
         );
+        let mut expected_index = index.clone();
+        expected_index.claude_request_census = baseline.into_census();
+        let checkpoint_actual = serde_json::to_vec_pretty(&index).unwrap();
+        let checkpoint_expected = serde_json::to_vec_pretty(&expected_index).unwrap();
+        assert_eq!(
+            checkpoint_actual, checkpoint_expected,
+            "OFF whole checkpoint matches main MONEY-maintenance basis"
+        );
+        let checkpoint_delta = checkpoint_actual.len() as i128 - checkpoint_expected.len() as i128;
+        let retained_bytes = index
+            .claude_request_census
+            .records
+            .values()
+            .map(|record| {
+                record.safety_hashes.as_ref().map_or(0, |hashes| {
+                    std::mem::size_of::<SafetyHashes>() + hashes.resident_bytes()
+                })
+            })
+            .sum::<usize>();
+        let metadata_bytes = index
+            .claude_request_census
+            .records
+            .values()
+            .filter_map(|record| record.safety.as_ref())
+            .map(|safety| crate::heap_layout_bound::completed_bound(safety, usize::MAX).unwrap())
+            .sum::<usize>();
+        assert_eq!(retained_bytes, 0);
+        assert_eq!(metadata_bytes, 0);
+        assert_eq!(checkpoint_delta, 0);
         let inline_delta = std::mem::size_of::<ClaudeRequestCensusRecord>()
             .saturating_sub(std::mem::size_of::<main_reference::MainRecordLayout>())
             * FILES;
-        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes=0 metadata_bytes=0 serialization_delta_per_save=0 phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} cpu_baseline=independent_main_money_maintenance excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128);
+        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=independent_main_money_maintenance excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, checkpoint_actual.len());
     }
 
     #[test]

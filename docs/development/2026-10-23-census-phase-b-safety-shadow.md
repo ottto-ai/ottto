@@ -88,3 +88,9 @@ the original shadow heap and checkpoint delta beyond main; it asserts the same
 128/64 MiB limits. The test-only allocator pointer inventory accommodates the
 full overlap, with a control above its former65,536-pointer capacity. This does
 not change any runtime cap or production measurement availability.
+
+The OFF receipt uses the native calling-thread CPU clock, reports wall time
+separately and checks complete checkpoint bytes as well as the independent
+census field. A boxed retirement-buffer descriptor keeps OFF record slots small;
+the descriptor and chunk storage are allocated only when safety is retained and
+are included in physical accounting. Inline growth is explicitly reported.
