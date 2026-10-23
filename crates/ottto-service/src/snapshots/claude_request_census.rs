@@ -1062,14 +1062,16 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    let mut index = crate::snapshot_retry::decode_state(&normalized)?;
-    reader.invalidate_duplicates(&mut index);
-    Ok(index)
+    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+}
+
+pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+    super::lenient_decode::read_bounded(bytes)
 }
 
 /// Derive positional slots from Serde's own field metadata rather than pinning
@@ -1102,6 +1104,11 @@ fn sequence_fields() -> (usize, usize) {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
         let fields = fields.expect("derived ScanIndex field metadata");
+        assert_eq!(
+            fields,
+            super::lenient_decode::FIELDS,
+            "ScanIndex field registry drift"
+        );
         let slot = |name| {
             fields
                 .iter()

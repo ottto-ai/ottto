@@ -7,10 +7,9 @@
 // accepted siblings of THAT file. That behavior exists on main and is made
 // local here; this change does not fix it or add semantic-fingerprint
 // suppression. Save normalizes the working index before its CAS re-read.
-// Whole-index quarantine remains for non-I/O decode errors, including serde
-// type errors in a single field/record, and the Codex canonical-key collision.
-// Per-record lenient decoding is a separate follow-up. A decodable accepted-
-// ledger version above the supported one is refused like a schema mismatch.
+// The shared lenient boundary now isolates record type errors. Syntax damage,
+// excess held damage, and the Codex canonical-key collision still quarantine.
+// Unsupported controls refuse without renaming the original witness.
 
 /// Content-free counts of the records one load or save dropped or normalized.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -210,6 +209,14 @@ impl ScanIndex {
 /// One content-free line per load or save that repaired anything: the
 /// source kind and a separate count per conversion kind; never per entry.
 fn note_scan_index_record_drops(stage: &str, source: &str, drops: ScanIndexLoadDrops) {
+    note_scan_index_record_drops_and_decode(stage, source, drops, [0; 4]);
+}
+fn note_scan_index_record_drops_and_decode(
+    stage: &str,
+    source: &str,
+    drops: ScanIndexLoadDrops,
+    decode: [usize; 4],
+) {
     #[cfg(test)]
     SCAN_INDEX_LOAD_DROPS_FOR_TEST.with(|cell| {
         let total = cell.get();
@@ -220,16 +227,17 @@ fn note_scan_index_record_drops(stage: &str, source: &str, drops: ScanIndexLoadD
             quarantine: total.quarantine + drops.quarantine,
         });
     });
-    if drops.records() == 0 {
+    let records = drops.records() + decode[0] + decode[3];
+    if records == 0 {
         return;
     }
     let process_total = SCAN_INDEX_RECORD_DROPS
-        .fetch_add(drops.records(), std::sync::atomic::Ordering::Relaxed)
-        .saturating_add(drops.records());
+        .fetch_add(records, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(records);
     emit_scan_index_containment_line(format!(
         "local snapshot scan index {stage} dropped or normalized invalid record(s); index kept: \
          source={source} activity_dropped={} accepted_dropped={} cursor_normalized={} \
-         quarantine_normalized={} record_repairs_this_process={process_total}",
-        drops.activity, drops.accepted, drops.cursor, drops.quarantine
+         quarantine_normalized={} record_repairs_this_process={process_total} decode_held={} file_records_held={} family_records_held={} authority_normalized={}",
+        drops.activity, drops.accepted, drops.cursor, drops.quarantine, decode[0], decode[1], decode[2], decode[3]
     ));
 }

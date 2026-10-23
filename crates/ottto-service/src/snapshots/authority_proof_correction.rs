@@ -169,9 +169,10 @@ impl ScanIndex {
             .claude_usage_authority_quarantine
             .iter()
             .filter(|(root, record)| {
-                !witnesses.get(*root).is_some_and(|witness| {
-                    claude_usage_authority_preserves_pending(record, witness)
-                })
+                !self.decode_holds_family(root)
+                    && !witnesses.get(*root).is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
