@@ -3240,6 +3240,7 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     let mut fixture = PipelineFixture::new("patha-h729-restored-stale-member");
     let baseline = fixture.absent_retry_pending_family(session);
     let removed_key = PipelineFixture::key(&baseline, session);
+    let committed_bytes = std::fs::read(&fixture.index_path).expect("read committed index");
     let committed = ScanIndex::load(&fixture.index_path).expect("load scan index");
     assert!(committed.files.contains_key(&removed_key));
     let witness = committed
@@ -3248,10 +3249,13 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
     let traversals = walk_until_census_complete(&fixture, 9, 3);
     assert_absent_family_retired(&traversals, &baseline, session, shape);
 
-    // The retiring page's upload is shed: the partial checkpoint selects
-    // against the committed index, restoring the removed member's entry
-    // while it keeps the retirement, its tombstone and the witness.
+    // The retiring pages' uploads are shed: their ordinary saves never land,
+    // and the partial checkpoint selects against the committed index
+    // instead, restoring the removed member's entry while it keeps the
+    // retirement, its tombstone and the witness.
     let retired = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    std::fs::write(&fixture.index_path, &committed_bytes)
+        .expect("only the committed index is on disk");
     let mut checkpoint = retired.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
     checkpoint.mark_bounded_sweep_unsettled();
     assert!(
