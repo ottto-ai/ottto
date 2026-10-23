@@ -5,9 +5,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE_SCRIPT="$ROOT/scripts/public_repo_export_bundle.sh"
 CONTRACT_SCRIPT="$ROOT/scripts/public_repo_contract_check.sh"
 PRIVATE_ROOT="$(cd "$ROOT/../.." && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$ROOT/scripts/public_repo_temp_cleanup.sh"
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+script_completed=0
+cleanup_tmp_dir() {
+  local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "test_public_repo_contract_check: exited before completion" >&2
+    status=1
+  fi
+  public_repo_remove_temp_dir "test_public_repo_contract_check" "$tmp_dir" || true
+  exit "$status"
+}
+trap cleanup_tmp_dir EXIT
 
 output_dir="$tmp_dir/public-ottto"
 "$BUNDLE_SCRIPT" --output-dir "$output_dir" --force >/tmp/public-contract-bundle.out
@@ -1977,6 +1990,18 @@ cp -R "$output_dir" "$public_git"
 git -C "$public_git" init -q
 git -C "$public_git" config user.email "public-contract@example.invalid"
 git -C "$public_git" config user.name "Public Contract"
+# Disposable fixture: keep commit-triggered background gc/maintenance from
+# writing into .git while the EXIT trap removes it.
+git -C "$public_git" config gc.auto 0
+git -C "$public_git" config gc.autoDetach false
+git -C "$public_git" config maintenance.auto false
+git -C "$public_git" config core.fsmonitor false
+for key_value in "gc.auto=0" "gc.autoDetach=false" "maintenance.auto=false" "core.fsmonitor=false"; do
+  if [[ "$(git -C "$public_git" config --local --get "${key_value%%=*}")" != "${key_value#*=}" ]]; then
+    echo "Expected fixture repo to set ${key_value} locally" >&2
+    exit 1
+  fi
+done
 git -C "$public_git" add .
 git -C "$public_git" commit -qm "public runtime"
 public_commit="$(git -C "$public_git" rev-parse HEAD)"
@@ -2062,3 +2087,4 @@ grep -q "private backend registry loader must read root connectors/registry.gene
 grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
 
 echo "public_repo_contract_check tests passed"
+script_completed=1

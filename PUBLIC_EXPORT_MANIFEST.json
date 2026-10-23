@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 827,
-  "content_sha256": "4cdf9c55ef24da51eeb3b34158fc86f5ac249e92aee8affb66d6a3ef3d3f4ec5",
+  "candidate_file_count": 829,
+  "content_sha256": "04f1b2b081534dbbf716a5c0fea89cbd19b86f19f12a979933ada3e3c75d34df",
   "files": [
     {
       "executable": false,
@@ -5585,8 +5585,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "a415b26b78cbd06f6541977255a4bf2ecdffa7b4c0c16c57258edc63273e3c58",
-      "size_bytes": 7593
+      "sha256": "a75dc375c5ec2dc958b1cd9c7ba2425cd04675c01642a7ef0dc4febc6db98871",
+      "size_bytes": 8132
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": "scripts/public_repo_temp_cleanup.sh",
+      "sha256": "3ab3f0b2b5feb17baba64e825cb1fce8f525d98cb1481bf658aa870a1cb5102c",
+      "size_bytes": 1924
     },
     {
       "executable": false,
@@ -5739,8 +5746,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/test_public_repo_contract_check.sh",
-      "sha256": "32027e183845a28710457c70e3a4a9b7d27a281acbf238b69382997781bf1b79",
-      "size_bytes": 99153
+      "sha256": "04262798b32f6d7503b7fb027da6bb5ad84aa468d07d541ec1fd9f883da50651",
+      "size_bytes": 100259
     },
     {
       "executable": true,
@@ -5790,11 +5797,18 @@
       "path": "scripts/test_public_repo_surface_ci.sh",
       "sha256": "f67eaeee2bfcd1edd458e36754cf24fdf799d0f1c76d5450acddd45436d97921",
       "size_bytes": 1484
+    },
+    {
+      "executable": true,
+      "mode": "0755",
+      "path": "scripts/test_public_repo_temp_cleanup.sh",
+      "sha256": "55fa91fd491a927c138c82aba7626174b41bb9cc4f69a4d639a5719d82886624",
+      "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-23T15:22:46+00:00",
+  "generated_at": "2026-10-23T16:41:23+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 828,
+  "output_file_count": 830,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5831,5 +5845,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c2eea35a9a55886eb59c4d121c0bf2f0cbe846d0"
+  "source_commit": "a457dcd74a5c69a694744a1b8d4b90b4da1ddb60"
 }
