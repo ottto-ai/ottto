@@ -1440,7 +1440,9 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let progressed = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
     assert!(progressed > 0, "following page must reach deferred families");
-    let built = next_families.iter().filter(|row| row["category"] != "unbuilt").count();
+    let built = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
+        row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0) &&
+        !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
     assert!(built > 0, "the next Full page must build money bodies, not merely change failure reason: {following:?}");
     assert!(following.families_unbuilt < following.families, "{following:?}");
     let (skip, skip_elapsed) = run(&reread, &following_index, now + 2);
