@@ -1434,7 +1434,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     // Sol R3-5: rewritten in place AND appended mid-read (it grew, so the
     // length alone looks like an append): the second pass sees the bytes
     // read changed, nothing commits and the read is debt.
-    let committed = ledger.get(&key).cloned();
+    let committed = ledger.get(&key).map(|record|record.to_owned_record());
     let more = money_api_line(session, "req_more", t);
     race_reads_for_test(Some(Box::new(move |path: &Path| {
         let text = std::fs::read_to_string(path).unwrap();
@@ -1461,7 +1461,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert_eq!(counts.files_reread_proven, 0, "{counts:?}");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key).cloned(), committed, "nothing committed");
+    assert_eq!(ledger.get(&key).map(|record|record.to_owned_record()), committed, "nothing committed");
 }
 
 /// Sol N2: the tail admits a record's growth against the ledger's budgets
@@ -2757,6 +2757,8 @@ fn money_m4_sized_ledger_and_page_are_measured() {
             debt: 0,
         },
     );
+    let (_, live_native) = crate::retry_allocation_probe::measure_caller_thread(||
+        super::claude_request_money::custody_tests::admit_m4(&mut ledger, &index, now));
     let build_ms = started.elapsed().as_millis();
     let index_census = index.claude_request_census_for_test();
     let index_bytes = index_census.exact_serialized_len_for_test();
@@ -2775,65 +2777,44 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     assert_eq!(census.serialized_total_for_test(), ledger_bytes - 1);
     let telemetry_serialized = census
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
-        .map(|(key, record)| key.len() + 3 + serde_json::to_vec(record).unwrap().len())
+        .map(|(key, record)| key.len() + 3 + serde_json::to_vec(&record).unwrap().len())
         .sum::<usize>();
 
-    // Capacity projection, not a live-admission receipt. The existing M4
-    // fixture is shadow-only and has NONE of these live custody prefixes.
-    // Count its actual physical/logical populations rather than calling its
-    // 17k evidence records proof that a 65k live ledger fits.
+    // Admit every live field into its physical carrier. Packed history and
+    // every optional scheduling field consume bytes, never hidden records.
     let transcript_records = index_census.len_for_test();
-    let message_records = census.records_with_prefix("mh:").count();
     let telemetry_records = census.records_with_prefix(TELEMETRY_KEY_PREFIX).count();
-    let families = index
-        .files
-        .keys()
-        .filter_map(|key| {
-            crate::snapshots::claude_request_money::logical_family_member(&index, key)
-                .map(|(root, _)| root)
-        })
-        .collect::<BTreeSet<_>>()
-        .len();
-    let entities = index
-        .files
-        .keys()
-        .filter_map(|key| {
-            crate::snapshots::claude_request_money::logical_family_member(&index, key)
-        })
-        .collect::<BTreeSet<_>>()
-        .len();
-    let evidence = census.record_count();
-    let evidence_watches = transcript_records + telemetry_records + message_records;
-    // One replacing trace watch/family, ever-indexed root, adoption/entity.
-    let projected_no_debt = evidence + evidence_watches + 2 * families + entities;
-    let projected_with_union = projected_no_debt + index.files.len();
-    for prefix in [
-        "watch:", "adopt:", "ever:", "offer:", "due:", "dirty:", "union:",
-    ] {
-        assert_eq!(
-            census.records_with_prefix(prefix).count(),
-            0,
-            "this is a pre-live fixture, not a successful full-custody admission"
-        );
-    }
-    assert!(projected_no_debt > store::LEDGER_MAX_RECORDS);
-    eprintln!("MONEY_M4_CUSTODY_ESTIMATE evidence={evidence} transcript_records={transcript_records} message_records={message_records} telemetry_records={telemetry_records} evidence_watches={evidence_watches} trace_watches={families} ever_indexed={families} adoption={entities} offers_steady=0 due_dirty_steady=0 projected_no_debt={projected_no_debt} projected_with_union={projected_with_union} cap={} projected_excess={} live_admission_executed=false",
-        store::LEDGER_MAX_RECORDS, projected_no_debt - store::LEDGER_MAX_RECORDS);
+    let actual_admitted = census.record_count();
+    assert_eq!(actual_admitted, index.files.len() + telemetry_records + 2);
+    assert!(actual_admitted * 100 < store::LEDGER_MAX_RECORDS * 35);
+    assert_eq!(census.records_with_prefix("watch:r:").count(), transcript_records + telemetry_records);
+    assert_eq!(census.records_with_prefix("watch:m:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("union:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("adopt:member:v1:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("offer:").count(),16);
+    assert_eq!(census.records_with_prefix("due:").count(),16);
+    assert_eq!(census.records_with_prefix("dirty:").count(),16);
+    assert_eq!(census.totals_for_test(),census.recounted_for_test());
+    eprintln!("MONEY_M4_CUSTODY_ESTIMATE actual_admitted={actual_admitted} physical={} telemetry={telemetry_records} detached=0 globals=2 cap={} live_admission_executed=true percent={:.3} serialized_bytes={ledger_bytes} resident_bytes={ledger_resident}",index.files.len(),store::LEDGER_MAX_RECORDS,actual_admitted as f64 *100.0 / store::LEDGER_MAX_RECORDS as f64);
 
-    // The whole ledger saved, then loaded (a restart).
-    let started = Instant::now();
-    let mut failed = store::WriterState::default();
-    let mut save_pages = 0;
-    while let Some((_, _, unwritten)) =
-        store::save_page_for_test(&support, &mut ledger, &mut failed)
-    {
-        assert_eq!(unwritten, 0);
-        save_pages += 1;
-    }
-    let save_ms = started.elapsed().as_millis();
-    let started = Instant::now();
-    let loaded = store::load_for_test(&support);
-    let load_ms = started.elapsed().as_millis();
+    // The whole ledger saved, then loaded (a restart). Native measurements
+    // are incremental caller allocations, not process RSS or writer-thread I/O.
+    let ((save_pages, dirty_shard_writes, save_ms),save_native) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let started=Instant::now();
+        let mut failed=store::WriterState::default();
+        let mut pages=0;
+        let mut writes=0;
+        while let Some((shards,_,unwritten))=store::save_page_for_test(&support,&mut ledger,&mut failed) {
+            assert_eq!(unwritten,0);
+            pages+=1;
+            writes+=shards;
+        }
+        (pages,writes,started.elapsed().as_millis())
+    });
+    let started=Instant::now();
+    let (loaded,load_native) = crate::retry_allocation_probe::measure_caller_thread(||store::load_for_test(&support));
+    let load_ms=started.elapsed().as_millis();
+    eprintln!("MONEY_M4_CUSTODY_RESOURCES live_requested_peak={} live_native_usable_peak={} save_requested_peak={} save_native_usable_peak={} load_requested_peak={} load_native_usable_peak={} dirty_shard_writes={dirty_shard_writes} save_pages={save_pages} save_ms={save_ms} load_ms={load_ms}",live_native.requested_peak,live_native.usable_peak,save_native.requested_peak,save_native.usable_peak,load_native.requested_peak,load_native.usable_peak);
     assert!(!loaded.load_damaged);
     assert_eq!(loaded.census(), ledger.census());
     drop(loaded);

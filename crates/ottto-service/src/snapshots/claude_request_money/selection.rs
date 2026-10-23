@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 pub(crate) struct MoneyFileSelection {
     pub(crate) revision: String,
     pub(crate) root: String,
-    member: String,
+    pub(super) member: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     consumed: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -132,6 +132,7 @@ pub(crate) fn stage_selection_fingerprints(
     for (key, record) in index
         .claude_request_census
         .records()
+        .map(|(key, record)| (key, super::custody::RecordRef::from(record)))
         .chain(ledger.census().semantic_records())
     {
         if key.starts_with("offer:")
@@ -230,7 +231,7 @@ pub(crate) fn union_items_by_source<'a>(
     sources
 }
 
-fn logical_digest(root: &str, member: &str) -> [u8; 32] {
+pub(super) fn logical_digest(root: &str, member: &str) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"claude_union_discovery:v1\0");
     digest.update((root.len() as u64).to_be_bytes());

@@ -126,6 +126,7 @@ pub(crate) struct ClaudeLedger {
     pub(crate) synthetic_cursor: String,
     pending_checkpoint: Option<PendingCheckpoint>,
     barrier_needed: bool,
+    promotion_pending: bool,
     custody_epoch: u64,
     durable_custody_epoch: u64,
     live_refused: bool,
@@ -151,6 +152,7 @@ impl ClaudeLedger {
             synthetic_cursor: String::new(),
             pending_checkpoint: None,
             barrier_needed: dirty,
+            promotion_pending: false,
             custody_epoch: 0,
             durable_custody_epoch: 0,
             live_refused: false,
@@ -162,6 +164,14 @@ impl ClaudeLedger {
                 super::custody::serialized_len(key) + super::custody::serialized_len(&value) + 2;
         }
         ledger
+    }
+
+    fn recount_shards(&mut self) {
+        self.shard_bytes.fill(0);
+        for (key, value) in self.census.entries() {
+            self.shard_bytes[shard_of(key)] +=
+                super::custody::serialized_len(key) + super::custody::serialized_len(&value) + 2;
+        }
     }
 
     pub(crate) fn census(&self) -> &Custody {
@@ -201,21 +211,75 @@ impl ClaudeLedger {
         path: &str,
         root: String,
         member: String,
-        birth: Option<u64>,
+        birth: Option<super::super::claude_request_census::ClaudeRequestBirth>,
     ) -> bool {
+        let changed = !self.census.binding_matches(path, &root, &member, birth);
         let carrier = format!("file:{:x}", Sha256::digest(path.as_bytes()));
         let before = self.census.serialized_total();
         if !self.census.bind_file(path, root, member, birth) {
             return false;
         }
-        if self.census.serialized_total() != before {
+        if changed {
             self.custody_epoch = self.custody_epoch.wrapping_add(1);
             self.account(shard_of(&carrier), before);
         }
         true
     }
 
-    pub(crate) fn get(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
+    pub(super) fn put_entity(
+        &mut self,
+        owner: &str,
+        key: String,
+        record: ClaudeRequestCensusRecord,
+        entity: super::custody::EntityBinding,
+    ) -> bool {
+        if self.census.entity_matches(owner, &key, &record, &entity) {
+            return true;
+        }
+        let carrier = if let Some(root) = owner.strip_prefix("synthetic:") {
+            format!("telemetry:{root}")
+        } else {
+            format!("file:{:x}", Sha256::digest(owner.as_bytes()))
+        };
+        let before = self.census.serialized_total();
+        if self.census.insert_entity(owner, key, record, entity)
+            != ClaudeRequestCensusInsert::Stored
+        {
+            return false;
+        }
+        self.custody_epoch = self.custody_epoch.wrapping_add(1);
+        self.account(shard_of(&carrier), before);
+        true
+    }
+    pub(super) fn promote(&mut self, index: &super::super::ScanIndex, deadline: Instant) -> bool {
+        let retire = self.pending_checkpoint.is_none()
+            && self.custody_epoch == self.durable_custody_epoch
+            && !self.promotion_pending;
+        let Some(changes) = self.census.promote(index, retire, deadline) else {
+            return false;
+        };
+        for change in changes {
+            let shard = shard_of(&change.carrier);
+            self.shard_bytes[shard] = self.shard_bytes[shard]
+                .saturating_sub(change.before)
+                .saturating_add(change.after);
+            self.dirty[shard] = true;
+            if change.custody {
+                self.custody_epoch = self.custody_epoch.wrapping_add(1);
+            }
+            self.promotion_pending = true;
+            self.barrier_needed = true;
+        }
+        true
+    }
+    pub(super) fn has_pending_checkpoint(&self) -> bool {
+        self.pending_checkpoint.is_some()
+    }
+    pub(super) fn promotions_pending(&self) -> bool {
+        self.promotion_pending
+    }
+
+    pub(crate) fn get(&self, key: &str) -> Option<super::custody::RecordRef<'_>> {
         self.census.get(key)
     }
 
@@ -231,21 +295,25 @@ impl ClaudeLedger {
         key: String,
         record: ClaudeRequestCensusRecord,
     ) -> ClaudeRequestCensusInsert {
-        if custody_key(&key) && self.get(&key) != Some(&record) {
-            self.custody_epoch = self.custody_epoch.wrapping_add(1);
-        }
+        let changed = custody_key(&key) && !self.get(&key).is_some_and(|old| old.matches(&record));
         let Some(carrier) = self.census.carrier_key(&key) else {
             return ClaudeRequestCensusInsert::Refused;
         };
         let shard = shard_of(&carrier);
         let before = self.census.serialized_total();
         let outcome = self.census.insert(key, record);
+        if outcome == ClaudeRequestCensusInsert::Stored && changed {
+            self.custody_epoch = self.custody_epoch.wrapping_add(1);
+        }
         self.account(shard, before);
         outcome
     }
 
     pub(crate) fn remove(&mut self, key: &str) {
-        if self.census.get(key).is_none() {
+        if key.starts_with("ever:")
+            || key.starts_with("hold:body:")
+            || self.census.get(key).is_none()
+        {
             return;
         }
         if custody_key(key) {
@@ -968,42 +1036,24 @@ fn load(support_dir: &Path) -> Option<ClaudeLedger> {
 fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
     let dir = support_dir.join(LEDGER_DIR);
     let mut ledger = ClaudeLedger::empty(false);
-    if !dir.exists() && support_dir.join(LEGACY_LEDGER_DIR).exists() {
-        let old = support_dir.join(LEGACY_LEDGER_DIR);
-        let mut history_unknown = false;
-        for shard in 0..SHARDS {
-            let path = shard_path(&old, shard);
-            let Ok(metadata) = std::fs::metadata(&path) else {
-                history_unknown = true;
-                continue;
-            };
-            if metadata.len() as usize > SAVE_BYTES_PER_PAGE {
-                history_unknown = true;
-                continue;
-            }
-            let _funds = admit_waiting(load_charge(metadata.len() as usize))?;
-            let Some(records) = std::fs::read(&path)
-                .ok()
-                .and_then(|bytes| decode_ledger_shard(&bytes))
-            else {
-                history_unknown = true;
-                continue;
-            };
-            for (key, record) in records.records() {
-                if ledger.insert(key.clone(), record.clone()) != ClaudeRequestCensusInsert::Stored {
-                    history_unknown = true;
-                }
-            }
-        }
-        ledger.census.mark_recovery(history_unknown);
+    if !money_io!(Metadata, dir.exists())
+        && money_io!(Metadata, support_dir.join(LEGACY_LEDGER_DIR).exists())
+    {
+        let history_unknown = recover_legacy(support_dir, &mut ledger)?;
+        ledger
+            .census
+            .mark_recovery(history_unknown || ledger.census.orphan_holds());
         ledger.load_damaged = true;
         ledger.dirty.fill(true);
         ledger.barrier_needed = true;
+        ledger.recount_shards();
         return Some(ledger);
     }
 
     let mut missing = Vec::new();
     let mut present = 0_usize;
+    let mut control_seen = false;
+    let mut history_seen = false;
     for shard in 0..SHARDS {
         let limit = SAVE_BYTES_PER_PAGE as u64;
         let opened =
@@ -1041,36 +1091,124 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
             }
         };
         present += 1;
-        let decoded =
-            serde_json::from_slice::<BTreeMap<String, Box<serde_json::value::RawValue>>>(&bytes)
-                .ok();
+        let decoded = super::custody::decode_shard(&bytes);
         let Some(decoded) = decoded else {
             ledger.load_damaged = true;
             ledger.dirty[shard] = true;
             continue;
         };
         let before = ledger.census.serialized_total();
+        let mut damaged = false;
         for (key, value) in decoded {
+            let is_control = key == CONTROL;
+            let is_history = key == super::custody::EVER;
             if shard_of(&key) != shard || !ledger.census.absorb_entry(key, value.get(), max_records)
             {
                 ledger.load_damaged = true;
+                damaged = true;
+            } else {
+                control_seen |= is_control;
+                history_seen |= is_history;
             }
         }
         ledger.account(shard, before);
-        ledger.dirty[shard] = false;
+        ledger.dirty[shard] = damaged;
     }
-    if present > 0 && !missing.is_empty() {
+    if present > 0 && !missing.is_empty()
+        || present > 0 && (!control_seen || !history_seen)
+        || present == 0 && dir.exists()
+    {
         ledger.load_damaged = true;
     }
     for shard in missing {
         ledger.dirty[shard] = true;
     }
-    if ledger.load_damaged {
-        ledger.census.mark_recovery(true);
-        ledger.dirty[META] = true;
+    if (ledger.load_damaged || ledger.census.recovery())
+        && money_io!(Metadata, support_dir.join(LEGACY_LEDGER_DIR).exists())
+    {
+        let history_unknown = recover_legacy(support_dir, &mut ledger)?;
+        ledger
+            .census
+            .mark_recovery(history_unknown || ledger.census.orphan_holds());
+        ledger.dirty.fill(true);
         ledger.barrier_needed = true;
     }
+    if ledger.load_damaged {
+        ledger
+            .census
+            .mark_recovery(!history_seen && !support_dir.join(LEGACY_LEDGER_DIR).exists());
+        ledger.dirty.fill(true);
+        ledger.barrier_needed = true;
+    }
+    ledger.recount_shards();
     Some(ledger)
+}
+
+/// Import recovery input without changing its directory. Existing new-format
+/// fields win; an earlier unbuilt clock/release and current-context route hold
+/// cannot disappear merely because a migration was interrupted.
+fn recover_legacy(support_dir: &Path, ledger: &mut ClaudeLedger) -> Option<bool> {
+    let old = support_dir.join(LEGACY_LEDGER_DIR);
+    let mut unknown = false;
+    for shard in 0..SHARDS {
+        let path = shard_path(&old, shard);
+        let Ok(metadata) = money_io!(Metadata, std::fs::metadata(&path)) else {
+            unknown = true;
+            continue;
+        };
+        if metadata.len() as usize > SAVE_BYTES_PER_PAGE {
+            unknown = true;
+            continue;
+        }
+        let _funds = admit_waiting(load_charge(metadata.len() as usize))?;
+        let Some(records) = money_io!(ReadFile, std::fs::read(&path))
+            .ok()
+            .and_then(|bytes| decode_ledger_shard(&bytes))
+        else {
+            unknown = true;
+            continue;
+        };
+        for (key, record) in records.records() {
+            if key.starts_with("unbuilt:") {
+                if let Some(current) = ledger.get(key) {
+                    let released = (record.window() | current.window()) & super::UNBUILT_RELEASED;
+                    let first = (record.window() & !super::UNBUILT_RELEASED)
+                        .min(current.window() & !super::UNBUILT_RELEASED);
+                    // Preserve the live revision/cycle while merging the irreversible
+                    // release bit and earliest first-held clock from recovery input.
+                    let merged = ClaudeRequestCensusRecord::money_debt(
+                        current.money_revision(),
+                        first | released,
+                    );
+                    if ledger.insert(key.clone(), merged) != ClaudeRequestCensusInsert::Stored {
+                        unknown = true;
+                    }
+                    continue;
+                }
+            }
+            let replace = match ledger.get(key) {
+                None => true,
+                Some(current) if key.starts_with("unbuilt:") => {
+                    (record.window() & !super::UNBUILT_RELEASED)
+                        < (current.window() & !super::UNBUILT_RELEASED)
+                        || record.window() & super::UNBUILT_RELEASED != 0
+                            && current.window() & super::UNBUILT_RELEASED == 0
+                }
+                Some(current) if key.starts_with("adopt:entity:") && key.ends_with(":route") => {
+                    record.window() > current.window()
+                }
+                _ => false,
+            };
+            if replace
+                && ledger.insert(key.clone(), record.clone()) != ClaudeRequestCensusInsert::Stored
+            {
+                unknown = true;
+            }
+        }
+    }
+    let _funds = admit_waiting(ledger.census.record_count().saturating_mul(128))?;
+    ledger.census.coalesce_recovered_holds();
+    Some(unknown)
 }
 
 /// Wait until the writer has done everything handed to it so far.
@@ -1269,7 +1407,7 @@ impl ClaudeLedger {
     }
 
     pub(super) fn put_money(&mut self, key: String, record: ClaudeRequestCensusRecord) -> bool {
-        if self.get(&key) == Some(&record) {
+        if self.get(&key).is_some_and(|old| old.matches(&record)) {
             return true;
         }
         // The general census codec may replace an over-budget value with a
@@ -1362,6 +1500,7 @@ pub(super) fn checkpoint_receipt_until(
                 ledger.barrier_needed = !durable;
                 if durable {
                     ledger.durable_custody_epoch = epoch;
+                    ledger.promotion_pending = false;
                 } else if !failed.is_empty() || meta.is_some() {
                     return MoneyReceipt::Refused;
                 }
@@ -1381,7 +1520,10 @@ pub(super) fn checkpoint_receipt_until(
         ledger,
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
     );
-    if !ledger.barrier_needed && ledger.custody_epoch == ledger.durable_custody_epoch {
+    if !ledger.barrier_needed
+        && ledger.custody_epoch == ledger.durable_custody_epoch
+        && !(ledger.promotion_pending && ledger.dirty_shards() > 0)
+    {
         return MoneyReceipt::Ready;
     }
     // Admit the boxed command and its directory before allocating either.
@@ -1492,7 +1634,8 @@ pub(super) fn hold_revision_bound(support_dir: &Path, revision: &str) -> bool {
     ledger
         .get(&format!("hold:body:{revision}"))
         .is_some_and(|record| {
-            super::super::claude_request_census::fingerprint_matches(record, revision)
+            super::super::claude_request_census::decode_fingerprint(revision)
+                == Some(record.money_revision())
         })
 }
 

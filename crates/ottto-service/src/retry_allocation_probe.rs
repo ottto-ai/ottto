@@ -285,6 +285,23 @@ pub(crate) fn measure_money_io<T>(f: impl FnOnce() -> T) -> (T, MoneyIoReceipt) 
     (value, receipt)
 }
 
+thread_local! {static MONEY_SETTLEMENT_REFUSE:Cell<bool>=const{Cell::new(false)};}
+pub(crate) fn money_settlement_refused_for_test() -> bool {
+    MONEY_SETTLEMENT_REFUSE.with(Cell::get)
+}
+pub(crate) fn refuse_money_settlement_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_SETTLEMENT_REFUSE.with(|cell| cell.set(self.0));
+        }
+    }
+    let reset = Reset(MONEY_SETTLEMENT_REFUSE.with(|cell| cell.replace(true)));
+    let value = f();
+    drop(reset);
+    value
+}
+
 struct Probe;
 #[global_allocator]
 static ALLOCATOR: Probe = Probe;

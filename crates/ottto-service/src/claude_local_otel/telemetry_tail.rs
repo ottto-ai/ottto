@@ -371,7 +371,7 @@ fn lose_claims(ledger: &mut ClaudeLedger, counts: &mut ClaudeTelemetryTailCounts
 /// A sweep record's (cursor stem, sweep start, state). The cursor is the
 /// record's fingerprint bytes as hex (all zero: the start).
 fn sweep_state(ledger: &ClaudeLedger, key: &str) -> (String, u64, ClaudeLedgerSweep) {
-    match ledger.get(key).and_then(ClaudeRequestCensusRecord::sweep) {
+    match ledger.get(key).and_then(|record| record.sweep()) {
         Some((cursor, start, sweep)) => {
             let stem = if cursor.iter().all(|byte| *byte == 0) {
                 String::new()
@@ -402,14 +402,14 @@ pub(crate) fn save_sweep(
     }
     debug_assert!(key.starts_with(SWEEP_KEY_PREFIX));
     let record = ClaudeRequestCensusRecord::sweep_record(bytes, start, sweep);
-    let before = ledger.get(key).and_then(ClaudeRequestCensusRecord::sweep);
+    let before = ledger.get(key).and_then(|record| record.sweep());
     if before.is_some_and(|(_, _, before)| before.complete_through > 0)
         && sweep.complete_through == 0
     {
         // A certificate went to zero: that zero reaches the disk first.
         ledger.note_meta_debt();
     }
-    if ledger.get(key) != Some(&record) {
+    if !ledger.get(key).is_some_and(|old| old.matches(&record)) {
         let _ = ledger.insert(key.to_owned(), record);
     }
 }
@@ -1113,7 +1113,7 @@ fn read_file(
     let previous = ledger.take(&key);
     let first_seen = previous
         .as_ref()
-        .and_then(ClaudeRequestCensusRecord::birth)
+        .and_then(|record| record.birth())
         .filter(|birth| birth.device == device && birth.inode == inode)
         .map_or(now_unix, |birth| birth.unix_seconds);
     let kept = resume.and(previous.as_ref());
@@ -1126,7 +1126,7 @@ fn read_file(
         ),
         None => Some((collected, 0)),
     };
-    let retired = kept.and_then(ClaudeRequestCensusRecord::retired);
+    let retired = kept.and_then(|record| record.retired());
     let lost_claims = previous
         .as_ref()
         .is_some_and(|previous| !previous.request_hashes().is_empty())

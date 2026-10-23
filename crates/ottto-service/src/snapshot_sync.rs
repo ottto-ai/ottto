@@ -6890,13 +6890,63 @@ async fn finish_sync_source_resume(
             item.usage_accounting_contract.as_deref()
                 == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
         });
-        let required = offered
-            .clone()
-            .map(|item| 512_usize.saturating_add(item.snapshot_fingerprint.len().saturating_mul(2)))
-            .sum();
+        let required = (|| -> Option<usize> {
+            let mut maps = 0_usize;
+            let mut witness = 0_usize;
+            let node = crate::heap_layout_bound::tree_node_bytes::<String, ()>()?
+                .checked_add(crate::heap_layout_bound::tree_node_bytes::<String, String>()?)?;
+            // One full node per entry plus a root overcounts the supported
+            // B-tree layout and covers the first small page's root nodes.
+            for item in offered.clone() {
+                maps = maps
+                    .checked_add(node)?
+                    .checked_add(item.snapshot_fingerprint.len().checked_mul(2)?)?
+                    .checked_add(64)?;
+                witness = witness
+                    .max(crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)?);
+            }
+            let mut sources = 0_usize;
+            let mut source_bytes = 0_usize;
+            for item in &scan_result.snapshots {
+                if let Some(source) = &item.source_file_fingerprint {
+                    sources = sources.checked_add(1)?;
+                    source_bytes = source_bytes.checked_add(source.len())?;
+                }
+            }
+            for (key, state) in &index.claude_money_files {
+                if index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| entry.source_file_fingerprint == state.revision)
+                    && scan_result.snapshots.iter().any(|item| {
+                        crate::snapshots::claude_request_money::family_root(item) == state.root
+                            && item.source_session_id == state.member
+                    })
+                {
+                    sources = sources.checked_add(1)?;
+                    source_bytes = source_bytes.checked_add(state.revision.len())?;
+                }
+            }
+            let stamp_nodes = scan_result
+                .snapshots
+                .len()
+                .checked_add(sources.checked_mul(2)?)?
+                .checked_add(3)?;
+            let stamp = crate::heap_layout_bound::tree_node_bytes::<String, String>()?
+                .checked_mul(stamp_nodes)?
+                .checked_add(source_bytes)?;
+            maps.checked_add(node)?
+                .checked_add(stamp)?
+                .checked_add(witness)
+        })()
+        .ok_or_else(money_resume::admission_refused)?;
         #[cfg(test)]
         let offered_count = offered.count();
         let build_settlement = || {
+            #[cfg(test)]
+            if crate::retry_allocation_probe::money_settlement_refused_for_test() {
+                return Err(money_resume::admission_refused());
+            }
             let Some(settlement_funds) =
                 crate::snapshots::claude_request_money::ShadowReservation::admit(required)
             else {

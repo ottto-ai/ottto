@@ -223,9 +223,10 @@ pub(crate) fn scan_holders<'a>(
                 return None;
             }
             let file_key = &key[MESSAGE_KEY_PREFIX.len()..];
-            if !index
-                .get(file_key)
-                .is_some_and(|file| file.same_fingerprint(record))
+            if record.over_budget()
+                || !index
+                    .get(file_key)
+                    .is_some_and(|file| file.money_revision() == record.money_revision())
             {
                 continue;
             }
@@ -258,7 +259,9 @@ pub(crate) fn message_known(
     index
         .get(key)
         .zip(ledger.get(&message_key(key)))
-        .is_some_and(|(file, messages)| file.same_fingerprint(messages))
+        .is_some_and(|(file, messages)| {
+            !messages.over_budget() && file.money_revision() == messages.money_revision()
+        })
 }
 
 impl<'a> ClaudeRequestHolders<'a> {
@@ -651,7 +654,7 @@ impl ClaudeClassifyContext<'_, '_> {
         let stored = self
             .ledger
             .get(key)
-            .and_then(ClaudeRequestCensusRecord::tail)
+            .and_then(|record| record.tail())
             .map(|tail| tail.first_event_unix)
             .filter(|time| *time > 0);
         let page = self.first_event.get(key).copied().filter(|time| *time > 0);
@@ -679,7 +682,7 @@ impl ClaudeClassifyContext<'_, '_> {
             .index
             .claude_request_census
             .get(winner)
-            .and_then(ClaudeRequestCensusRecord::birth)
+            .and_then(|record| record.birth())
             .map(|birth| birth.unix_seconds);
         if self.scope.unbuilt_older(own_key, birth) {
             self.unbuilt_older.set(self.unbuilt_older.get() + 1);

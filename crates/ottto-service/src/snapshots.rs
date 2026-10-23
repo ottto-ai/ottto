@@ -10958,6 +10958,43 @@ pub(crate) fn snapshot_upload_body_witness(item: &SnapshotItem) -> String {
     format!("{:x}", Sha256::digest(canonical))
 }
 
+/// Conservative requested-allocation credit for one additive witness. Count
+/// borrowed fields without constructing serde_json::Value. The multiplier
+/// covers Value tree nodes, map/array growth, canonical output, UTF-16 sort
+/// keys and JSON-pointer scratch, including old/new realloc overlap. Witnesses
+/// are built sequentially, so settlement needs the maximum of these credits.
+pub(crate) fn snapshot_upload_body_witness_scratch_bound(item: &SnapshotItem) -> Option<usize> {
+    fn bytes(value: &impl Serialize) -> Option<usize> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self
+                    .0
+                    .checked_add(bytes.len())
+                    .ok_or_else(|| std::io::Error::other("witness length overflow"))?;
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut count = Count(0);
+        serde_json::to_writer(&mut count, value).ok()?;
+        Some(count.0)
+    }
+    let mut size = 1024_usize;
+    size = size.checked_add(bytes(&item.session_account_evidence)?)?;
+    size = size.checked_add(bytes(&item.context_curve)?)?;
+    size = size.checked_add(bytes(&item.tool_usage)?)?;
+    if item.cache_observations.is_some() {
+        size = size.checked_add(match &item.cache_observations_state {
+            Some(state) => bytes(state)?,
+            None => bytes(&item.cache_observations)?,
+        })?;
+    }
+    size.checked_mul(256)
+}
+
 /// The policy-neutral component hashes, in canonical order.
 pub(crate) fn policy_neutral_component_hashes(
     component_hashes: &BTreeMap<&'static str, String>,

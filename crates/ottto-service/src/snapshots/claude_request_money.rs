@@ -63,6 +63,8 @@ pub(crate) use selection::{
     synthetic_fingerprints, union_items_by_source, union_reparse, MoneyFileSelection,
 };
 pub(crate) mod custody;
+#[cfg(test)]
+pub(super) mod custody_tests;
 pub(crate) mod facts;
 pub(crate) mod rows;
 pub(crate) mod store;
@@ -1509,7 +1511,7 @@ async fn build_page_at(
             &item.source_session_id,
         )
         .and_then(|key| index.claude_request_census.get(&key))
-        .and_then(ClaudeRequestCensusRecord::birth)
+        .and_then(|record| record.birth())
         .map(|birth| birth.unix_seconds);
         output.births.insert(item.source_session_id.clone(), birth);
     }
@@ -2018,7 +2020,7 @@ async fn build_page_at(
         // its snapshot.
         let memo = ledger
             .get(&memo_key)
-            .and_then(ClaudeRequestCensusRecord::family_memo)
+            .and_then(|record| record.family_memo())
             .map(|(revision, memo)| (*revision, memo));
         let (removed_change, basis, unavailable) = match (complete, memo) {
             (false, _) => (None, None, Some("body_incomplete")),
@@ -2112,7 +2114,7 @@ async fn build_page_at(
             if let (Some(key), Some(due)) = (key, entity.due_unix) {
                 let revision = ledger
                     .get(&store::money_key("dirty:", key))
-                    .map(ClaudeRequestCensusRecord::money_revision)
+                    .map(|record| record.money_revision())
                     .unwrap_or_else(|| Sha256::digest(key.as_bytes()).into());
                 if !ledger.put_money(
                     store::money_key("due:", key),
@@ -2636,19 +2638,14 @@ fn note_message_record(
     };
     let next = ClaudeRequestCensusRecord::message_record(record, capture.message_only_hashes());
     if let Some((root, member)) = logical_family_member(index, key) {
-        if !ledger.bind_file(
-            key,
-            root,
-            member,
-            record.birth().map(|birth| birth.unix_seconds),
-        ) {
+        if !ledger.bind_file(key, root, member, record.birth()) {
             counts.message_records_refused += 1;
             return;
         }
     }
-    ledger.note_rebuilt(key);
     let message = message_key(key);
-    if ledger.get(&message) == Some(&next) {
+    if ledger.get(&message).is_some_and(|old| old.matches(&next)) {
+        ledger.note_rebuilt(key);
         return;
     }
     let hashes = next.request_hashes().len();
@@ -2656,6 +2653,7 @@ fn note_message_record(
     let fits = census.hash_headroom() >= hashes
         && census.serialized_headroom() >= hashes * 11 + message.len() + 512;
     if fits && ledger.insert(message, next) == ClaudeRequestCensusInsert::Stored {
+        ledger.note_rebuilt(key);
         counts.message_records_written += 1;
     } else {
         counts.message_records_refused += 1;
@@ -2677,10 +2675,9 @@ fn prune_message_records(
         .take(MESSAGE_PRUNE_PER_PAGE)
         .map(|(key, record)| {
             let file = &key[MESSAGE_KEY_PREFIX.len()..];
-            let current = index
-                .claude_request_census
-                .get(file)
-                .is_some_and(|file| file.same_fingerprint(record) && file.retired().is_none());
+            let current = index.claude_request_census.get(file).is_some_and(|file| {
+                file.money_revision() == record.money_revision() && file.retired().is_none()
+            });
             (key.clone(), current)
         })
         .collect::<Vec<_>>();
@@ -3218,7 +3215,11 @@ pub(crate) fn money_due(support_dir: &Path, index_key: &str, now: u64) -> bool {
     request_owned_live(support_dir) && store::scheduled(support_dir, index_key, now)
 }
 
-fn revision_of(record: &ClaudeRequestCensusRecord, deadline: Instant) -> Option<[u8; 32]> {
+fn revision_of<'a>(
+    record: impl Into<custody::RecordRef<'a>>,
+    deadline: Instant,
+) -> Option<[u8; 32]> {
+    let record = record.into();
     let mut hash = Sha256::new();
     hash.update(record.money_revision());
     for hashes in record.request_hashes().chunks(1024) {
@@ -3266,6 +3267,7 @@ fn schedule_evidence(
     let key_charge = index
         .claude_request_census
         .records()
+        .map(|(key, record)| (key, custody::RecordRef::from(record)))
         .chain(ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX))
         .chain(ledger.census().records_with_prefix(MESSAGE_KEY_PREFIX))
         .fold(0_usize, |bytes, (key, _)| {
@@ -3350,7 +3352,10 @@ fn schedule_evidence(
             let holder = if watch.starts_with("watch:m:") {
                 ledger.get(&message_key(candidate))
             } else {
-                index.claude_request_census.get(candidate)
+                index
+                    .claude_request_census
+                    .get(candidate)
+                    .map(custody::RecordRef::from)
             };
             if let Some(holder) = holder {
                 for requests in holder.request_hashes().chunks(1024) {
@@ -3394,7 +3399,10 @@ fn schedule_evidence(
         {
             ledger.get(&key)
         } else {
-            index.claude_request_census.get(&key)
+            index
+                .claude_request_census
+                .get(&key)
+                .map(custody::RecordRef::from)
         };
         let Some(record) = record.filter(|record| !record.is_birth_stub()) else {
             continue;
@@ -3425,7 +3433,10 @@ fn schedule_evidence(
             let holder = if key.starts_with(MESSAGE_KEY_PREFIX) {
                 ledger.get(&message_key(candidate))
             } else {
-                index.claude_request_census.get(candidate)
+                index
+                    .claude_request_census
+                    .get(candidate)
+                    .map(custody::RecordRef::from)
             };
             if let Some(holder) = holder {
                 for requests in holder.request_hashes().chunks(1024) {
@@ -3561,7 +3572,7 @@ pub(crate) fn prepare_money_offers_receipt(
             let observed = ledger
                 .get(&discovery_key)
                 .filter(|record| record.money_revision() == discovery)
-                .map_or_else(|| page_now(support_dir), ClaudeRequestCensusRecord::window);
+                .map_or_else(|| page_now(support_dir), |record| record.window());
             if !ledger.put_money(
                 discovery_key,
                 ClaudeRequestCensusRecord::money_debt(discovery, observed),
@@ -3618,7 +3629,7 @@ pub(crate) fn prepare_money_offers_receipt(
             let revision = ledger
                 .get(&dirty)
                 .or_else(|| ledger.get(&store::money_key("due:", key)))
-                .map(ClaudeRequestCensusRecord::money_revision)
+                .map(|record| record.money_revision())
                 .unwrap_or_else(|| Sha256::digest(entry.source_file_fingerprint.as_bytes()).into());
             let due_key = store::money_key("due:", key);
             if ledger.get(&due_key).is_none()
@@ -4124,7 +4135,7 @@ pub(crate) fn note_adoption_outcomes_receipt(
             ledger
                 .get(&record_key)
                 .filter(|old| old.money_revision() == revision && matches!(old.window(), 3 | 4 | 6))
-                .map_or(proposed, ClaudeRequestCensusRecord::window)
+                .map_or(proposed, |record| record.window())
         } else {
             proposed
         };
@@ -4135,9 +4146,39 @@ pub(crate) fn note_adoption_outcomes_receipt(
         rates[1] += u64::from(state == 1);
         rates[2] += u64::from(state == 2);
         rates[3] += u64::from(matches!(state, 3 | 6));
-        if !ledger.put_money(
+        let owner = index
+            .files
+            .keys()
+            .filter(|path| {
+                logical_family_member(index, path)
+                    .is_some_and(|(r, m)| r == root && m == item.source_session_id)
+            })
+            .min_by_key(|path| selection::primary_order(index, path))
+            .map(String::as_str)
+            .or_else(|| {
+                index
+                    .claude_money_files
+                    .iter()
+                    .find(|(_, state)| {
+                        state.synthetic_body.is_some()
+                            && state.root == root
+                            && state.member == item.source_session_id
+                    })
+                    .map(|(key, _)| key.as_str())
+            });
+        let Some(owner) = owner else {
+            return MoneyReceipt::Refused;
+        };
+        if !ledger.put_entity(
+            owner,
             record_key,
             ClaudeRequestCensusRecord::money_debt(revision, state),
+            custody::EntityBinding {
+                root: root.into(),
+                member: item.source_session_id.clone(),
+                context: prefix.clone(),
+                body: item.snapshot_fingerprint.clone(),
+            },
         ) {
             return MoneyReceipt::Refused;
         }
@@ -4150,7 +4191,7 @@ pub(crate) fn note_adoption_outcomes_receipt(
     let observed = ledger
         .get(&rates_key)
         .filter(|old| old.money_revision() == revision)
-        .map_or_else(|| page_now(support_dir), ClaudeRequestCensusRecord::window);
+        .map_or_else(|| page_now(support_dir), |record| record.window());
     if rates[0] > 0
         && !ledger.put_money(
             rates_key,
@@ -4161,9 +4202,16 @@ pub(crate) fn note_adoption_outcomes_receipt(
     }
     let durable = store::checkpoint_receipt(support_dir, &mut ledger);
     let mut counts = [0_u64; 7];
-    for (_, record) in ledger.census().records_with_prefix("adopt:member:v1:") {
-        if let Some(count) = counts.get_mut(record.window() as usize) {
-            *count += 1;
+    if let Some(_counts_funds) =
+        ShadowReservation::admit(ledger.census().record_count().saturating_mul(128))
+    {
+        let mut entities = BTreeSet::new();
+        for (key, record) in ledger.census().records_with_prefix("adopt:member:v1:") {
+            if entities.insert(key) {
+                if let Some(count) = counts.get_mut(record.window() as usize) {
+                    *count += 1;
+                }
+            }
         }
     }
     eprintln!("claude_request_money adoption_offered={} adoption_local_held={} adoption_server_held={} adoption_refused={} adoption_accepted={} adoption_below_retention_floor={} adoption_refused_stale_again={}",
@@ -4214,7 +4262,8 @@ pub(crate) fn settle_below_retention_floor(
         return false;
     };
     let revision = Sha256::digest(entry.source_file_fingerprint.as_bytes()).into();
-    ledger.put_money(
+    ledger.put_entity(
+        key,
         store::money_key(
             "adopt:member:v1:",
             &logical_family_member(index, key)
@@ -4222,6 +4271,16 @@ pub(crate) fn settle_below_retention_floor(
                 .unwrap_or_else(|| key.to_owned()),
         ),
         ClaudeRequestCensusRecord::money_debt(revision, 5),
+        custody::EntityBinding {
+            root: logical_family_member(index, key)
+                .map(|(root, _)| root)
+                .unwrap_or_default(),
+            member: logical_family_member(index, key)
+                .map(|(_, member)| member)
+                .unwrap_or_default(),
+            context: adoption_prefix(index),
+            body: entry.source_file_fingerprint.clone(),
+        },
     ) && store::checkpoint(support_dir, &mut ledger)
 }
 
@@ -4433,7 +4492,7 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         ClaudeLedgerAcquire::Loading => return MoneyReceipt::Pending,
         ClaudeLedgerAcquire::Unavailable => return MoneyReceipt::Refused,
     };
-    if ledger.metadata_checkpoint {
+    if ledger.metadata_checkpoint || ledger.has_pending_checkpoint() {
         let receipt = store::checkpoint_receipt(support, &mut ledger);
         ledger.metadata_checkpoint = receipt == MoneyReceipt::Pending;
         // Consuming this slice's receipt completes housekeeping for this
@@ -4441,13 +4500,9 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         return receipt;
     }
     let deadline = Instant::now() + Duration::from_millis(100);
-    let Some(_funds) = ShadowReservation::admit(
-        index
-            .files
-            .len()
-            .saturating_mul(512)
-            .saturating_add(256 * 512),
-    ) else {
+    let Some(_funds) =
+        ShadowReservation::admit(ledger.census().primary_projection_bytes(index.files.len()))
+    else {
         return MoneyReceipt::Refused;
     };
     let mut roots = BTreeSet::new();
@@ -4462,21 +4517,6 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
                 "adopt:member:v1:",
                 &format!("{root}/{member}"),
             ));
-        }
-    }
-    for key in index.files.keys() {
-        if Instant::now() >= deadline {
-            return MoneyReceipt::Refused;
-        }
-        if let Some((root, member)) = logical_family_member(index, key) {
-            let birth = index
-                .claude_request_census
-                .get(key)
-                .and_then(ClaudeRequestCensusRecord::birth)
-                .map(|birth| birth.unix_seconds);
-            if !ledger.bind_file(key, root, member, birth) {
-                return MoneyReceipt::Refused;
-            }
         }
     }
     let prefix = adoption_prefix(index);
@@ -4512,13 +4552,41 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         let stale_adoption = key.starts_with("adopt:entity:")
             && key != &format!("{prefix}rates")
             && key != &format!("{prefix}route")
-            || key.starts_with("adopt:member:v1:") && !entities.contains(key);
+            || key.starts_with("adopt:member:v1:")
+                && !entities.contains(key)
+                && ledger.census().retirable_entity(key);
         if stale_trace || stale_adoption {
             obsolete.push(key.clone());
         }
     }
     ledger.metadata_cursor = cursor.unwrap_or_default();
-    if obsolete.is_empty() {
+    let reclaimed = !obsolete.is_empty();
+    for key in obsolete {
+        ledger.remove(&key);
+    }
+    for key in index.files.keys() {
+        if Instant::now() >= deadline {
+            return MoneyReceipt::Refused;
+        }
+        if let Some((root, member)) = logical_family_member(index, key) {
+            let birth = index
+                .claude_request_census
+                .get(key)
+                .and_then(|record| record.birth());
+            if !ledger.bind_file(key, root, member, birth) {
+                return MoneyReceipt::Refused;
+            }
+        }
+    }
+    if !ledger.promote(index, deadline) {
+        return MoneyReceipt::Refused;
+    }
+    if ledger.promotions_pending() {
+        let receipt = store::checkpoint_receipt(support, &mut ledger);
+        ledger.metadata_checkpoint = receipt == MoneyReceipt::Pending;
+        return receipt;
+    }
+    if !reclaimed {
         // ACK settlement may have queued a receipt after the prior finish's
         // last await. Drain it BEFORE adoption reads the custody barrier. A
         // completed diagnostic memo alone never pauses the next scan.
@@ -4530,9 +4598,7 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         ledger.metadata_checkpoint = receipt == MoneyReceipt::Pending;
         return receipt;
     }
-    for key in obsolete {
-        ledger.remove(&key);
-    }
+
     // Publish this bounded slice before adoption pause reads the ledger. A
     // resumed preparation consumes its receipt once, then advances the scan.
     // Restart before publication restores conservative old metadata only.
@@ -5281,7 +5347,7 @@ mod scheduling_reconciliation_tests {
         let scratch = crate::test_scratch::ScratchDir::new("money-watch-flush-ack");
         let support = scratch.join("support");
         let mut ledger = ClaudeLedger::new_for_test();
-        let watch = store::money_key("watch:", "/fixture/holder.jsonl");
+        let watch = store::money_key("watch:r:", "/fixture/holder.jsonl");
         ledger.insert(
             watch.clone(),
             ClaudeRequestCensusRecord::money_debt([1; 32], 0),

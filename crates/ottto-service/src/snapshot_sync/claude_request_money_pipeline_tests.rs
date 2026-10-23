@@ -1500,6 +1500,9 @@ fn p2a_literal_503_resends_byte_identical_after_progress_restart() {
     for record in progress.quarantined_fingerprints.values_mut() {
         record.retry_after_unix_seconds = 0;
     }
+    // Production prepares destination-scoped retry leases after loading the
+    // saved progress. Expiring a timer alone does not lease the exact body.
+    assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
     let mut retried = Vec::new();
     upload_resumable_batches_with_body_witness(
         &items,
@@ -1712,6 +1715,18 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
     let duplicate = fixture.root.join(format!("{MONEY_PIPELINE_COPY}.jsonl"));
     std::fs::copy(&original, &duplicate).unwrap(); // preserve the content session id
     let mut index = ScanIndex::default();
+    // This fixture exercises the revision-3 parser posture, as production
+    // does before alias census/identity certification.
+    index.activate_effective_upload_body_witness_revision(3);
+    std::fs::create_dir_all(fixture.support.join("snapshots")).unwrap();
+    std::fs::write(
+        fixture
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+        b"",
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&fixture.support);
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
         std::slice::from_ref(&fixture.root),
@@ -1781,7 +1796,6 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
     assert_eq!(requests, PIPELINE_SESSIONS.len() as u64);
     assert_eq!(ids.len(), PIPELINE_SESSIONS.len());
 }
-
 
 #[test]
 #[serial(client_report)]

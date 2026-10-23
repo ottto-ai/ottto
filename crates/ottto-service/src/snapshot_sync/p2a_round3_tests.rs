@@ -504,9 +504,20 @@ impl P2aControl {
                     receipt.allocation.allocations, receipt.shared_admission_peak,
                     receipt.allocation.requested_peak_with_overlap <= receipt.funds);
                 assert!(receipt.pairs <= receipt.offered);
-                assert!(receipt.shared_admission_peak <= crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES);
+                assert!(
+                    receipt.shared_admission_peak
+                        <= crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES
+                );
                 if receipt.admitted {
                     assert_eq!(receipt.funds, receipt.required);
+                    assert!(
+                        receipt.allocation.requested_peak_with_overlap <= receipt.funds,
+                        "settlement scratch exceeded its prepaid funds: {receipt:?}"
+                    );
+                    assert!(
+                        receipt.allocation.usable_peak_with_overlap <= receipt.funds,
+                        "native settlement scratch exceeded its prepaid funds: {receipt:?}"
+                    );
                 } else {
                     assert_eq!(receipt.funds, 0);
                     assert_eq!(receipt.pairs, 0);
@@ -1938,7 +1949,7 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     let _live = money::LiveForTest::new(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
-        let vacant=money::store::LEDGER_MAX_RECORDS-ledger.census().record_count();
+        let vacant = money::store::LEDGER_MAX_RECORDS - ledger.census().record_count();
         for n in 0..vacant {
             assert_eq!(
                 ledger.insert(
@@ -2040,7 +2051,7 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
             ),
             ClaudeRequestCensusInsert::Stored
         );
-        let vacant=money::store::LEDGER_MAX_RECORDS-ledger.census().record_count();
+        let vacant = money::store::LEDGER_MAX_RECORDS - ledger.census().record_count();
         for n in 1..=vacant {
             assert_eq!(
                 ledger.insert(
@@ -2331,7 +2342,75 @@ fn p2a_gate_off_m4_money_operation_receipt() {
         }
         assert!(skipped > 0, "actual finish must observe the OFF branch");
         assert_eq!(before, money_saved_ledger_files(&control.support));
-        assert!(control.offers().iter().all(|item| item["usage_accounting_contract"] != money::REQUEST_OWNED_CONTRACT));
+        assert!(control
+            .offers()
+            .iter()
+            .all(|item| item["usage_accounting_contract"] != money::REQUEST_OWNED_CONTRACT));
         eprintln!("MONEY_OFF_OPERATIONS history={history} saved_files={} scratch_allocations=0 scratch_admission=0 money_boundary_attempts={io:?} off_finishes={skipped} preexisting_seed_stat_excluded=true not_syscalls=true", before.len());
     }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_settlement_admission_refusal_keeps_exact_debt_after_ack_and_restart() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    control.cycle();
+    let _live = money::LiveForTest::new(&control.support);
+    let (result, receipts) = crate::retry_allocation_probe::measure_money_settlements(|| {
+        crate::retry_allocation_probe::refuse_money_settlement_for_test(|| control.cycle_result())
+    });
+    assert!(
+        result.is_err(),
+        "settlement refusal must not certify a selected save"
+    );
+    assert!(receipts.iter().any(|receipt| receipt.required > 0
+        && !receipt.admitted
+        && receipt.funds == 0
+        && receipt.pairs == 0));
+    assert!(!money_resume::pending_for_test(&control.support));
+    assert!(
+        control
+            .offers()
+            .iter()
+            .any(|item| item["usage_accounting_contract"] == money::REQUEST_OWNED_CONTRACT),
+        "exercise a real POST before settlement refusal"
+    );
+    let key = control.transcript().to_string_lossy().into_owned();
+    let debt = money::store::with_ledger_for_test(&control.support, |ledger| {
+        let due = ledger
+            .get(&money::store::money_key("due:", &key))
+            .map(|record| record.to_owned_record());
+        let dirty = ledger
+            .get(&money::store::money_key("dirty:", &key))
+            .map(|record| record.to_owned_record());
+        assert!(due.is_some() && dirty.is_some());
+        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+        (due, dirty)
+    })
+    .unwrap();
+    money::store::reload_for_test(&control.support).unwrap();
+    let restarted = money::store::with_ledger_for_test(&control.support, |ledger| {
+        (
+            ledger
+                .get(&money::store::money_key("due:", &key))
+                .map(|record| record.to_owned_record()),
+            ledger
+                .get(&money::store::money_key("dirty:", &key))
+                .map(|record| record.to_owned_record()),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        restarted, debt,
+        "exact revisions/deadlines survive post-ACK admission refusal"
+    );
+    eprintln!("MONEY_SETTLEMENT_REFUSAL actual_post=true selected_save_certified=false exact_due_dirty_restart=true injected_admission_refusal=true");
 }

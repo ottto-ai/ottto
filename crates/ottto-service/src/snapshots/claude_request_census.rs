@@ -217,7 +217,8 @@ pub(crate) struct ClaudeTelemetryAudit {
 /// First-seen creation time of one physical file, with the identity of the
 /// object it was read from. A different device or inode is a different
 /// object, so its birth is never carried onto the new one.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ClaudeRequestBirth {
     pub(crate) unix_seconds: u64,
     pub(crate) device: u64,
@@ -449,10 +450,41 @@ impl ClaudeRequestCensusRecord {
     }
 
     pub(crate) fn custody_watch(revision: [u8; 32], hashes: Vec<u64>) -> Self {
+        Self::custody_shared_watch(revision, shared_hashes(hashes))
+    }
+    pub(crate) fn custody_shared_watch(revision: [u8; 32], hashes: Option<Arc<[u64]>>) -> Self {
+        let shape = if hashes.as_ref().is_some_and(|hashes| !hashes.is_empty()) {
+            ClaudeRequestCensusShape::Exact
+        } else {
+            ClaudeRequestCensusShape::Empty
+        };
         Self {
-            request_hashes: shared_hashes(hashes),
+            shape,
+            request_hashes: hashes,
             ..Self::bookkeeping(revision, 0)
         }
+    }
+    pub(crate) fn custody_message(
+        revision: [u8; 32],
+        window: u64,
+        hashes: Option<Arc<[u64]>>,
+        known: bool,
+    ) -> Self {
+        let mut record = Self::custody_shared_watch(revision, hashes);
+        record.window = window;
+        if !known {
+            record.shape = ClaudeRequestCensusShape::Lossy;
+        }
+        record
+    }
+    pub(crate) fn custody_is_current(&self) -> bool {
+        self.current_derivation()
+            && matches!(
+                self.shape,
+                ClaudeRequestCensusShape::Exact | ClaudeRequestCensusShape::Empty
+            )
+            && !self.unverified_or_twin()
+            && self.retired.is_none()
     }
 
     /// A `sweep:` record: cursor bytes, the sweep's start and its state.
@@ -734,103 +766,12 @@ impl ClaudeRequestCensus {
             .filter(|(_, record)| !record.is_birth_stub())
     }
 
-    #[cfg(test)]
-    pub(crate) fn records_after(
-        &self,
-        cursor: &str,
-    ) -> impl Iterator<Item = (&String, &ClaudeRequestCensusRecord)> {
-        self.records.range::<str, _>((
-            std::ops::Bound::Excluded(cursor),
-            std::ops::Bound::Unbounded,
-        ))
-    }
-
     pub(crate) fn hash_total(&self) -> usize {
         self.hash_total
     }
 
-    /// Records held (birth stubs included).
-    #[cfg(test)]
-    pub(crate) fn record_count(&self) -> usize {
-        self.records.len()
-    }
-
     pub(crate) fn serialized_total(&self) -> usize {
         self.serialized_total
-    }
-
-    /// Serialized bytes a full record may still take before the tombstone
-    /// reserve (what the ledger admits its growth against).
-    #[cfg(test)]
-    pub(crate) fn serialized_headroom(&self) -> usize {
-        (MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES)
-            .saturating_sub(self.serialized_total)
-    }
-
-    /// Hashes a record may still add.
-    #[cfg(test)]
-    pub(crate) fn hash_headroom(&self) -> usize {
-        MAX_CLAUDE_REQUEST_CENSUS_HASHES.saturating_sub(self.hash_total)
-    }
-
-    /// The records whose keys start with `prefix`, in key order.
-    #[cfg(test)]
-    pub(crate) fn records_with_prefix<'a>(
-        &'a self,
-        prefix: &'a str,
-    ) -> impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)> + 'a {
-        self.records
-            .range::<str, _>((
-                std::ops::Bound::Included(prefix),
-                std::ops::Bound::Unbounded,
-            ))
-            .take_while(move |(key, _)| key.starts_with(prefix))
-            .filter(|(_, record)| !record.is_birth_stub())
-    }
-
-    /// Heap this census holds, measured: its shared buffers, boxed ledger
-    /// groups, keys and its map slots (a B-tree slot share at two-thirds
-    /// node occupancy). One copy: the ledger is never cloned. None when
-    /// `deadline` passes during the walk (checked before every record).
-    #[cfg(test)]
-    pub(crate) fn resident_bytes(&self, deadline: std::time::Instant) -> Option<usize> {
-        let node =
-            (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3
-                / 2;
-        self.records
-            .iter()
-            .try_fold(0_usize, |bytes, (key, record)| {
-                if std::time::Instant::now() >= deadline {
-                    return None;
-                }
-                let ledger = record.ledger.as_ref().map_or(0, |fields| {
-                    std::mem::size_of::<ClaudeLedgerFields>()
-                        + fields.facts.as_ref().map_or(0, |facts| facts.len())
-                });
-                Some(
-                    bytes
-                        .saturating_add(node)
-                        .saturating_add(key.capacity())
-                        .saturating_add(shared_hashes_bytes(&record.request_hashes))
-                        .saturating_add(ledger),
-                )
-            })
-    }
-
-    /// Move every record of `other` in (a ledger shard), each against the
-    /// budgets like a decoded record and against `max_records` in total (a
-    /// new key past it is dropped). True when every record was kept.
-    #[cfg(test)]
-    pub(crate) fn absorb(&mut self, other: Self, max_records: usize) -> bool {
-        let mut kept = true;
-        for (key, record) in other.records {
-            if self.records.len() >= max_records && !self.records.contains_key(&key) {
-                kept = false;
-                continue;
-            }
-            kept &= self.insert_decoded(key, record);
-        }
-        kept
     }
 
     fn charge(&mut self, key: &str, record: &ClaudeRequestCensusRecord, sign: bool) {
@@ -914,15 +855,6 @@ impl ClaudeRequestCensus {
         if let Some(old) = self.records.remove(key) {
             self.charge(key, &old, false);
         }
-    }
-
-    /// Remove `key`'s record and return it, uncharged (its hashes move to
-    /// the caller; nothing is copied).
-    #[cfg(test)]
-    pub(crate) fn take(&mut self, key: &str) -> Option<ClaudeRequestCensusRecord> {
-        let old = self.records.remove(key)?;
-        self.charge(key, &old, false);
-        Some(old)
     }
 
     /// Invalidate `key`'s record but keep its first-seen birth in place, so a
