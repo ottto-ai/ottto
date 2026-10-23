@@ -88,9 +88,7 @@ impl MainAdmission {
     pub(crate) fn from_census(census: &ClaudeRequestCensus) -> Self {
         let mut reference = Self::default();
         for (key, record) in &census.records {
-            let mut record = record.clone();
-            record.safety = None;
-            record.safety_hashes = None;
+            let record = record.clone();
             reference.charge(key, &record, true);
             reference.records.insert(key.clone(), record);
         }
@@ -118,11 +116,9 @@ impl MainAdmission {
     pub(crate) fn insert_for_test(
         &mut self,
         key: &str,
-        mut record: ClaudeRequestCensusRecord,
+        record: impl Into<SafetyRecord>,
     ) -> ClaudeRequestCensusInsert {
-        record.safety = None;
-        record.safety_hashes = None;
-        self.insert(key.to_owned(), record)
+        self.insert(key.to_owned(), record.into().core)
     }
     fn charge(&mut self, key: &str, record: &ClaudeRequestCensusRecord, add: bool) {
         let hashes = record.request_hashes().len();
@@ -299,3 +295,9 @@ pub(crate) struct MainRecordLayout {
     /// never in the scan index): boxed so transcript records stay small.
     ledger: Option<Box<ClaudeLedgerFields>>,
 }
+
+// Frozen main resident/admission formula; the layout fields above are frozen.
+pub(crate) const MAIN_RECORD_RESIDENT_OVERHEAD_BYTES: usize =
+    (std::mem::size_of::<String>() + std::mem::size_of::<MainRecordLayout>()) * 3 / 2
+        + std::mem::size_of::<ClaudeLedgerFields>()
+        + 2 * std::mem::size_of::<usize>();

@@ -182,3 +182,10 @@ impl Serialize for SafetyBase64<'_> {
         serializer.collect_str(self)
     }
 }
+
+impl crate::heap_layout_bound::HeapLayoutBound for SafetyHashes {
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(self.resident_bytes())
+    }
+}

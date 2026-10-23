@@ -12,7 +12,7 @@ safety; the same oldest-retired queue and incomplete marker apply.
 
 The existing root shadow metadata stores `s` with up to 4,096 SHA-256 local key ids, their first
 incomplete timestamp, cumulative reclaimed hashes and a sticky overflow flag.
-Missing or malformed persisted metadata closes strong shadow comparison.
+Missing `s` is empty on an upgrade with no `x`/`sb` records; it is closed when extension records exist. Malformed or duplicate metadata stays closed.
 The bounded key marker is charged as shadow metadata; record serialization and
 active-plus-safety hash storage retain their existing 47/48 MiB boundaries.
 Healthy complete-terminal prune or full authorized reconstruction removes a
@@ -56,7 +56,7 @@ never a D2 decision or money activation switch. OFF creates no optional safety
 fields or retired buffer, uses main's in-place MONEY retirement, emits no new
 shadow line, and skips joins, digests, owner-pair work and extra serialization.
 Previously persisted safety still receives safe reclamation/marker handling.
-Missing old safety remains closed when shadow diagnostics are later enabled.
+Old retired or lossy records without required safety remain migration debt when shadow diagnostics are enabled.
 
 Retired safety is a persistent chain of immutable 256-hash chunks. Reclaim
 advances the head, copies no retained hash, and preserves old checkpoint clones.
@@ -108,3 +108,46 @@ on save when no new safety exists (and remains closed in memory); empty legacy
 indexes do not acquire new metadata. The OFF stamp fast path avoids a global
 atomic when no view has ever existed. CPU receipts retain the first-terminal
 sample and add five alternating steady-state samples, reporting their median.
+
+
+Round 4 moves `x`/`sb` into an optional census side map. The shared MONEY record
+returns to main's inline layout. Compiled layout and frozen main load-charge /
+resident-bound assertions accompany the existing M4-scale ledger save/load
+fixture. No side map exists in ordinary OFF operation. OFF terminals run main's
+core prune/recount/retirement directly; safety accounting, mutation digests,
+legacy diffs and shadow counters require the diagnostic switch or retained
+safety. Pricing borrows the core record and counts optional fields separately;
+it never clones ledger facts or a retained hash buffer.
+
+Under byte pressure, retiree `x`/`sb` is stripped oldest-first before active `x`
+(oldest window first). Active request hashes and facts remain untouched. The
+bounded root marker is separate from the 48 MiB record budget: 4,096 fixed
+64-character key ids plus scalar fields fit below its 512 KiB decode envelope.
+`safety_metadata_reclaimed_active` counts active metadata losses. Native
+selected restore may invalidate the admitted key to a birth stub; the tested
+fallback preserves peer truncation and its marker through save/restart, keeping
+the strong comparison closed.
+
+`ac` describes bytes consumed for the bound candidate revision. A later growth
+is a new revision; `unread_due_to_growth` counts those observations without
+turning a consumed bound into global unread debt. Dirty old-window evidence
+cannot cover a walked-but-unparsed key. Unread alarms identify only a SHA-256
+key hash prefix (eight hex digits) and acquisition cause. Stale-window pending
+is uncomparable and does not enter invalid/other difference counters.
+`dirty_unparsed_keys_known` and `shadow_decision_taps_known` remain false until
+their taps exist; zero decision counters are phase-B construction, not observed
+activation evidence. MONEY census hash/byte counters keep their original core
+meaning; separate safety counters describe retained physical overhead.
+
+`safety_compact_decode_recovered` counts accepted compact inventories whose
+main-style pretty core census exceeds the old raw decode envelope. This
+MONEY-accepted format boundary expansion is intentional. An old-binary round
+trip loses `x`, `sb` and `s`: reclaimed retired records then become migration
+debt, and an Exact record loses an `ac=false` restriction. Such downgrade round
+trips remain outside the safety guarantee; no schema or derivation bump is used.
+
+Prior Round-3 CI OFF measurements at 12,400 files / 700,000 hashes were zero
+added save bytes, +8,515 microseconds on the first terminal (+0.78%) and
++18,240 microseconds on the five-sample steady median (+4.89%). That overhead
+was rejected. Round-4 receipts must demonstrate at most 0.5% OFF CPU and zero
+added save bytes on the same fixture; source changes alone are not a receipt.

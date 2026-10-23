@@ -4463,3 +4463,23 @@ fn native_comparison_matching_prepays_hit_and_no_hit_before_scratch_allocation()
         eprintln!("native_comparison_matching_budget: hit={hit} pressure={pressure} unknown={unknown} refused_before_alloc={} protected_recovery={recovery_bytes} input_unchanged=true", pressure || unknown);
     }
 }
+
+/// SOURCE F3: exercise native held selected restore, atomic save and restart.
+#[test]
+fn native_selected_restore_keeps_reclaim_marker_when_admitted_key_becomes_birth_stub() {
+    let _mode = claude_request_census::d2_shadow_mode_for_test(true);
+    if !native_positive_layout_for_test(
+        "native_selected_restore_keeps_reclaim_marker_when_admitted_key_becomes_birth_stub",
+    ) {
+        return;
+    }
+    let (fixture, mut index, _scan, mut fallback, previous, path) =
+        native_comparison_selected_fallback_fixture();
+    let key = local_index_key(&fixture.dir.join(format!("{FALLBACK_COPY}.jsonl")));
+    claude_request_census::seed_selected_reclaim_for_test(&mut index, &key);
+    fallback.restore_selected(&mut index, &previous).unwrap();
+    claude_request_census::assert_selected_reclaim_closed_for_test(&index, &key);
+    index.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    claude_request_census::assert_selected_reclaim_closed_for_test(&loaded, &key);
+}

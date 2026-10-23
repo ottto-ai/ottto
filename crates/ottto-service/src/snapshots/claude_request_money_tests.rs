@@ -1258,9 +1258,28 @@ fn money_telemetry_retires_only_under_pressure() {
             (u64::MAX - quarter as u64..u64::MAX).collect(),
         ),
     );
+    let mut main =
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            ledger.census(),
+        );
+    let oldest = telemetry_key("root-1");
+    let mut retired = main.take(&oldest).unwrap();
+    retired.retire();
+    assert_eq!(
+        main.insert_for_test(&oldest, retired),
+        ClaudeRequestCensusInsert::Stored
+    );
     assert_eq!(
         crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger),
         1
+    );
+    assert_eq!(
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            ledger.census()
+        )
+        .bytes(),
+        main.bytes(),
+        "telemetry pressure retirement matches frozen-main core bytes"
     );
     // The oldest last append (root-1) went first.
     assert_eq!(
@@ -2623,6 +2642,10 @@ fn money_rows_follow_audited_rewrites() {
 #[test]
 #[serial_test::serial(claude_request_money_shadow)]
 fn money_m4_sized_ledger_and_page_are_measured() {
+    store::assert_main_load_admission_for_test(12 * 1024 * 1024);
+    for len in [0, 95, 96, 97, 8 * 1024 * 1024, 48 * 1024 * 1024] {
+        store::assert_main_load_admission_for_test(len);
+    }
     use crate::claude_local_otel::telemetry_tail::save_sweep;
     const FILES: usize = 11_500;
     const FILE_HASHES: u64 = 61;
@@ -2927,7 +2950,10 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
 
     // Actual phase-B retirement: safety stays charged, MONEY hashes empty.
     let mut reserved = before;
-    let mut retained = reserved.take(OLD).expect("retired original");
+    let mut retained = reserved
+        .take(OLD)
+        .expect("retired original")
+        .with_safety_for_test();
     retained.retire_transcript_preserving_safety();
     assert!(retained.request_hashes().is_empty());
     assert_eq!(retained.duplicate_safety_hashes().len(), half);
@@ -2946,7 +2972,7 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
         new.request_hashes()
     );
     assert_eq!(
-        reserved.get(OLD).unwrap().duplicate_safety_hashes().len(),
+        reserved.duplicate_safety_hashes_for_test(OLD).len(),
         half - 1
     );
     assert_eq!(reserved.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
@@ -3007,7 +3033,8 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
     );
     // A natural unchanged reparse must remain money-retired even when its
     // reconstructed full safety set no longer fits after NEW's admission.
-    let mut rebuilt = money_record('a', (0..half as u64).collect());
+    let rebuilt = money_record('a', (0..half as u64).collect());
+    let mut rebuilt = rebuilt.with_safety_for_test();
     rebuilt.retire_transcript_preserving_safety();
     assert_eq!(
         reserved_index
@@ -3021,10 +3048,92 @@ fn money_retired_safety_reclaim_preserves_main_active_admission() {
         .expect("retirement survives pressure");
     assert_eq!(rebuilt.retired(), Some(half as u64));
     assert!(rebuilt.request_hashes().is_empty());
-    assert_eq!(rebuilt.duplicate_safety_hashes().len(), half - 1);
+    assert_eq!(
+        reserved_index
+            .claude_request_census_for_test()
+            .duplicate_safety_hashes_for_test(OLD)
+            .len(),
+        half - 1
+    );
     assert_eq!(
         scope(&reserved_index),
         main_scope,
         "reparse preserves scoped MONEY bytes"
     );
+}
+
+/// Safety metadata and retirement must not alter unchanged MONEY selectors.
+/// Main inputs are reconstructed by the frozen main record/admission algorithm.
+#[test]
+fn money_two_owner_and_owned_after_retirement_match_frozen_main_records() {
+    use crate::snapshots::claude_request_census::main_reference::MainAdmission;
+    fn arm(shadow: bool) -> (Vec<u8>, Vec<ClaudeRequestVerdict>, BTreeSet<String>) {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(shadow);
+        let mut fixture = MoneyLedger::new(&["req_shared"], &[], &["req_shared"]);
+        fixture.claim("A", &["req_shared"], 100);
+        fixture.claim("B", &["req_shared"], 200);
+        let none = BTreeMap::new();
+        let mut outcomes = vec![
+            fixture.classify("req_shared", &fixture.a, "A", &none),
+            fixture.classify("req_shared", &fixture.b, "B", &none),
+        ];
+        assert_eq!(
+            outcomes[0],
+            ClaudeRequestVerdict::Counted(ClaudeCountedBy::TwoOwnerWinner)
+        );
+        assert_eq!(
+            outcomes[1],
+            ClaudeRequestVerdict::Removed(ClaudeRemovedBy::TwoOwnerLoser)
+        );
+        if shadow {
+            let mut retired = fixture
+                .index
+                .claude_request_census_mut_for_test()
+                .take(&fixture.a)
+                .unwrap()
+                .with_safety_for_test();
+            retired.retire_transcript_preserving_safety();
+            assert_eq!(
+                fixture
+                    .index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&fixture.a, retired),
+                ClaudeRequestCensusInsert::Stored
+            );
+        } else {
+            let mut main =
+                MainAdmission::from_census(fixture.index.claude_request_census_for_test());
+            let mut retired = main.take(&fixture.a).unwrap();
+            retired.retire();
+            assert_eq!(
+                main.insert_for_test(&fixture.a, retired),
+                ClaudeRequestCensusInsert::Stored
+            );
+            *fixture.index.claude_request_census_mut_for_test() = main.into_census();
+        }
+        fixture.ledger.remove(&telemetry_key("A"));
+        fixture.ledger.remove(&telemetry_key("B"));
+        let after = fixture.classify("req_shared", &fixture.b, "B", &none);
+        assert_eq!(after, ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned));
+        outcomes.push(after);
+        let scope = ClaudeLedgerScope::build(
+            &fixture.index,
+            &fixture.ledger,
+            &BTreeSet::from(["-repo"]),
+            &BTreeSet::from(["A", "B"]),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(scope.family_complete("A") && scope.family_complete("B"));
+        let retired_roots = crate::snapshots::claude_request_ledger::roots_with_retired_records(
+            fixture.index.claude_request_census_for_test(),
+        );
+        assert!(retired_roots.contains("A"));
+        (
+            serde_json::to_vec(&scope.debt).unwrap(),
+            outcomes,
+            retired_roots,
+        )
+    }
+    assert_eq!(arm(true), arm(false));
 }

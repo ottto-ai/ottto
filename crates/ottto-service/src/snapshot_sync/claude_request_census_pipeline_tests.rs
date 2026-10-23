@@ -112,8 +112,9 @@ fn census_parity_page_facts(fixture: &PipelineFixture, page: &PipelinePage) -> s
 /// a terminal authority family (h559 correction debt is never dropped by a
 /// record), a held change and plain appends. Returns each page's facts and
 /// the final record count.
-fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usize) {
+fn census_parity_arm(name: &str, records: bool, shadow: bool) -> (Vec<serde_json::Value>, usize) {
     let _source_manifests = SourceManifestTestGuard::new();
+    let _shadow = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(shadow);
     let fixture = PipelineFixture::new(name);
     if !records {
         crate::snapshots::claude_request_census::disable_records_under_for_test(&fixture.root);
@@ -181,6 +182,9 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
         after.bound_to_retained_witness,
         "reset keeps the original proof binding"
     );
+    if shadow {
+        crate::snapshots::claude_request_census::seed_pipeline_safety_cases_for_test(&mut index);
+    }
     index.save(&fixture.index_path).expect("save scan index");
     fixture.append(PIPELINE_HELD_SESSION, "req_0_2");
     run(
@@ -213,8 +217,10 @@ fn census_parity_arm(name: &str, records: bool) -> (Vec<serde_json::Value>, usiz
 #[test]
 #[serial(source_manifests)]
 fn census_records_change_no_pipeline_decision() {
-    let (with_records, record_count) = census_parity_arm("claude-census-parity-records", true);
-    let (control, control_record_count) = census_parity_arm("claude-census-parity-control", false);
+    let (with_records, record_count) =
+        census_parity_arm("claude-census-parity-records", true, false);
+    let (control, control_record_count) =
+        census_parity_arm("claude-census-parity-control", false, false);
     assert!(record_count > 0, "the records arm wrote records");
     assert_eq!(control_record_count, 0, "the control arm wrote none");
     assert!(with_records.len() >= 4, "{} pages", with_records.len());
@@ -471,4 +477,19 @@ fn census_every_offered_and_held_body_matches_control() {
     );
     assert_eq!(records_reset_owed, control_reset_owed);
     assert_eq!(records, control);
+}
+
+/// Phase-B ON shadow versus production-OFF: retired, lossy, alias and refused
+/// metadata across held selected pages, checkpoint/reload and later windows.
+#[test]
+#[serial(source_manifests)]
+fn phase_b_safety_changes_no_pipeline_decision_across_restart_and_holds() {
+    let (shadow, count) = census_parity_arm("phase-b-pipeline-shadow", true, true);
+    let (main, main_count) = census_parity_arm("phase-b-pipeline-off", true, false);
+    assert!(count > 0 && main_count > 0);
+    assert!(shadow.len() >= 4);
+    assert_eq!(shadow.len(), main.len());
+    for (page, (shadow, main)) in shadow.iter().zip(&main).enumerate() {
+        assert_eq!(shadow, main, "phase B pipeline page {page}");
+    }
 }

@@ -941,3 +941,18 @@ pub(crate) fn restore_for_test(ledger: &mut ClaudeLedger, saves: &[&ClaudeLedger
         ledger.restore(&shards, meta);
     }
 }
+
+#[cfg(test)]
+pub(crate) fn assert_main_load_admission_for_test(len: usize) {
+    let overhead =
+        super::super::claude_request_census::main_reference::MAIN_RECORD_RESIDENT_OVERHEAD_BYTES;
+    assert_eq!(RECORD_RESIDENT_OVERHEAD_BYTES, overhead);
+    let expected = len
+        .saturating_mul(4)
+        .saturating_add((len / 96 + 1).min(65_536).saturating_mul(overhead));
+    assert_eq!(load_charge(len), expected);
+    assert_eq!(
+        LEDGER_RESIDENT_BOUND_BYTES,
+        65_536 * overhead + 2 * 48 * 1024 * 1024
+    );
+}

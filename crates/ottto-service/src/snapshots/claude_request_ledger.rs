@@ -838,6 +838,8 @@ pub(crate) struct ClaudeLedgerStateCounts {
     /// Transcript records carrying a census `u` / without one (unknown).
     pub(crate) transcript_u_known: u64,
     pub(crate) transcript_u_unknown: u64,
+    pub(crate) safety_hashes: u64,
+    pub(crate) safety_serialized_bytes: u64,
     pub(crate) census_hashes: u64,
     pub(crate) census_serialized_bytes: u64,
     pub(crate) telemetry_records: u64,
@@ -867,8 +869,10 @@ pub(crate) fn ledger_state_counts(
     let late = || Instant::now() >= deadline;
     let (aged, vanished) = super::claude_request_census::transcript_retirements();
     let mut counts = ClaudeLedgerStateCounts {
-        census_hashes: census.hash_total() as u64,
-        census_serialized_bytes: census.serialized_total() as u64,
+        safety_hashes: census.safety_hash_total() as u64,
+        safety_serialized_bytes: census.safety_serialized_total() as u64,
+        census_hashes: census.money_hash_total() as u64,
+        census_serialized_bytes: census.money_serialized_total() as u64,
         transcript_retired_aged: aged,
         transcript_dropped_vanished: vanished,
         ..ClaudeLedgerStateCounts::default()
@@ -925,8 +929,10 @@ pub(crate) fn refresh_state_totals(
     ledger: Option<&ClaudeLedger>,
 ) {
     let (aged, vanished) = super::claude_request_census::transcript_retirements();
-    counts.census_hashes = census.hash_total() as u64;
-    counts.census_serialized_bytes = census.serialized_total() as u64;
+    counts.census_hashes = census.money_hash_total() as u64;
+    counts.safety_hashes = census.safety_hash_total() as u64;
+    counts.safety_serialized_bytes = census.safety_serialized_total() as u64;
+    counts.census_serialized_bytes = census.money_serialized_total() as u64;
     counts.transcript_retired_aged = aged;
     counts.transcript_dropped_vanished = vanished;
     if let Some(ledger) = ledger {
