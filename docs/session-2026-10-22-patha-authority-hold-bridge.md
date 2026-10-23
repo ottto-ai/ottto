@@ -27,12 +27,17 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   upload context. Native comparison is separate: its own native census can
   still re-prove and rebind a RetryPending family, as before this change.
 - Before that gate, a raw-complete census retires every RetryPending family
-  it proves wholly absent (no member path left after reconciliation,
-  including a member that vanished beneath its present parent). The ordinary
-  whole-family disappearance rule needs a complete census, which the debt
-  itself would otherwise withhold forever once no member remains to advance
-  the failure count. Only the record and its pending entry go; absence earns
-  no acceptance, and a present held family stays held.
+  it proves wholly absent: no member path is indexed, observed by the
+  completed raw traversal, or named as its residue (this includes a member
+  that vanished beneath its present parent, and excludes a live member that
+  only parses as residue, for example after a historical replay reset). The
+  ordinary whole-family disappearance rule needs a complete census, which the
+  debt itself would otherwise withhold forever once no member remains to
+  advance the failure count. Only the record and its pending entry go,
+  removed in place; absence earns no acceptance, and a present held family
+  stays held. The check is one pass over that membership evidence into a set
+  of borrowed roots, at most one per RetryPending record, priced against the
+  parked overlap budget first; a refused price retires nothing.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -69,8 +74,11 @@ held root that is never carried, debt beside an existing mark, and the C1a
 latch surviving debt. Unit tests cover the bound predicate, a held root that is
 never an unchanged-proof root, and debt beside a retryable server conflict.
 Ordinary-fallback absence tests (native comparison absent) retire a wholly
-removed RetryPending family on a single-page traversal and after a
-parent-present removal, and keep a still-present held family withheld.
+removed RetryPending family and its pending on a single-page traversal and
+after a parent-present removal. Controls keep the family, its pending and the
+withheld census when it is still present, when only a subagent transcript is
+left, when its only member is observed but unindexed residue after a replay
+reset, and when the retirement scratch is refused.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

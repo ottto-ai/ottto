@@ -2284,6 +2284,21 @@ const ABSENCE_CYCLE: PipelineCycle<'static> = PipelineCycle {
     ..BRIDGE_CYCLE
 };
 
+impl PipelineFixture {
+    /// Seed the pending proof a RetryPending family retains from the census
+    /// window that proved it, so the absence tests see it go or stay.
+    fn seed_retry_pending_family_pending(&self, session: &str) {
+        let mut index = ScanIndex::load(&self.index_path).expect("load scan index");
+        index.insert_claude_usage_family_pending_for_test(session, "2026-08-01T00:00:00Z");
+        index.save(&self.index_path).expect("save scan index");
+        let index = ScanIndex::load(&self.index_path).expect("reload scan index");
+        assert!(index.claude_usage_family_pending_retained_for_test(session));
+        assert!(index
+            .claude_authority_record_for_test(session)
+            .is_some_and(|record| record.family_pending_retained));
+    }
+}
+
 /// Walk ordinary traversals (native comparison is absent from this fixture)
 /// until one completes its census, at most `walks` of them.
 fn walk_until_census_complete(
@@ -2347,6 +2362,12 @@ fn assert_absent_family_retired(
             .is_none(),
         "{shape}: the absent family's record retires"
     );
+    assert!(
+        !last
+            .index
+            .claude_usage_family_pending_retained_for_test(session),
+        "{shape}: the absent family's pending retires with its record"
+    );
     assert_eq!(
         last.index.claude_usage_authority_pending_count(),
         0,
@@ -2366,6 +2387,7 @@ fn absent_retry_pending_family_retires_on_a_single_page_ordinary_census() {
     let mut fixture = PipelineFixture::new("patha-absent-retry-pending-single-page");
     let baseline = fixture.baseline();
     fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    fixture.seed_retry_pending_family_pending(PIPELINE_SESSIONS[2]);
     std::fs::remove_file(fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[2])))
         .expect("remove the held family's only member");
     // Every remaining transcript fits on one page.
@@ -2385,6 +2407,7 @@ fn absent_retry_pending_family_retires_after_a_parent_present_removal() {
     let fixture = PipelineFixture::new("patha-absent-retry-pending-parent-present");
     let baseline = fixture.baseline();
     fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    fixture.seed_retry_pending_family_pending(PIPELINE_SESSIONS[2]);
     let member = fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[2]));
     let first = fixture.page(
         "2026-08-02T09:00:00Z",
@@ -2441,6 +2464,7 @@ fn present_retry_pending_family_stays_held_beside_the_absence_retirement() {
     let mut fixture = PipelineFixture::new("patha-present-retry-pending-control");
     let baseline = fixture.baseline();
     let revision = fixture.seed_retry_pending_authority(PIPELINE_SESSIONS[2]);
+    fixture.seed_retry_pending_family_pending(PIPELINE_SESSIONS[2]);
     fixture.page_files = 8;
     let pages = fixture.walk(9, &ABSENCE_CYCLE);
     let last = pages.last().expect("terminal page");
@@ -2465,5 +2489,160 @@ fn present_retry_pending_family_stays_held_beside_the_absence_retirement() {
             .get(PIPELINE_SESSIONS[2]),
         Some(&revision)
     );
+    assert!(
+        record.family_pending_retained,
+        "the present family keeps its pending"
+    );
     assert_eq!(last.index.claude_usage_authority_pending_count(), 1);
+}
+
+/// What a present RetryPending family keeps beside the absence retirement:
+/// its record, still retrying, its pending, and the withheld ordinary census.
+fn assert_present_family_held(last: &PipelinePage, session: &str, shape: &str) {
+    assert!(
+        !last.scan.census_complete,
+        "{shape}: the present held family withholds the ordinary census"
+    );
+    let record = last
+        .index
+        .claude_authority_record_for_test(session)
+        .unwrap_or_else(|| panic!("{shape}: the present family stays quarantined"));
+    assert!(!record.terminal, "{shape}: the family keeps retrying");
+    assert!(
+        record.family_pending_retained,
+        "{shape}: the present family keeps its pending"
+    );
+    assert!(
+        last.index
+            .claude_usage_family_pending_retained_for_test(session),
+        "{shape}"
+    );
+    assert_eq!(
+        last.index.claude_usage_authority_pending_count(),
+        1,
+        "{shape}"
+    );
+}
+
+/// Re-review r2-F1a: a live member that the completed raw traversal observed
+/// but did not index is present. After a historical replay reset dropped its
+/// delivery entry, the held family's only member re-parses as terminal
+/// residue (a dropped response), so it is never recorded in the index; the
+/// census names it as residue. The family's record and pending survive and
+/// the ordinary census stays withheld.
+#[test]
+#[serial(source_manifests)]
+fn observed_unindexed_retry_pending_member_keeps_its_family_after_a_replay_reset() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("patha-observed-unindexed-retry-pending");
+    let baseline = fixture.baseline();
+    let session = PIPELINE_SESSIONS[2];
+    let key = PipelineFixture::key(&baseline, session);
+    fixture.seed_retry_pending_authority(session);
+    fixture.seed_retry_pending_family_pending(session);
+    // A response whose fork marker lacks its message is dropped: the file
+    // stays readable, carries usage, and parses only as residue.
+    let invalid_fork = serde_json::json!({
+        "timestamp": "2026-08-02T07:00:30Z",
+        "type": "assistant",
+        "sessionId": session,
+        "forkedFrom": {"sessionId": "census-parent"},
+        "requestId": "req_2_dropped",
+        "message": {
+            "id": "msg_2_dropped",
+            "model": "claude-haiku-4-5",
+            "usage": {"input_tokens": 10, "output_tokens": 10},
+        },
+    });
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .open(fixture.root.join(format!("{session}.jsonl")))
+        .expect("open the held family's member");
+    file.write_all(format!("{invalid_fork}\n").as_bytes())
+        .expect("append a dropped response");
+    drop(file);
+    let cycle = PipelineCycle {
+        replay_generation: "replay-generation-reset",
+        historical_replay: true,
+        ..ABSENCE_CYCLE
+    };
+    // Fixture assumption: the production reset drops the member's delivery
+    // entry and keeps the family's authority record and pending.
+    let mut reset = ScanIndex::load(&fixture.index_path).expect("load scan index");
+    reset.prepare_historical_replay(cycle.replay_generation.to_string());
+    assert!(!reset.files.contains_key(&key));
+    assert!(reset.claude_authority_record_for_test(session).is_some());
+    assert!(reset.claude_usage_family_pending_retained_for_test(session));
+    fixture.page_files = 8;
+    let pages = fixture.walk(9, &cycle);
+    assert_eq!(pages.len(), 1, "a single-page traversal");
+    let last = pages.last().expect("terminal page");
+    assert_eq!(
+        last.scan.census_residue_index_key_count, 1,
+        "the raw census completed and named the member as residue"
+    );
+    assert!(
+        !last.index.files.contains_key(&key),
+        "the member is observed but not indexed"
+    );
+    assert!(fixture.root.join(format!("{session}.jsonl")).is_file());
+    assert_present_family_held(last, session, "observed-unindexed");
+}
+
+/// Control: a family whose root transcript is gone but whose subagent
+/// transcript is present is not absent; it stays held.
+#[test]
+#[serial(source_manifests)]
+fn retry_pending_family_with_only_a_subagent_left_stays_held() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("patha-subagent-only-retry-pending");
+    fixture.baseline();
+    let session = TERMINAL_FAMILY_ROOT;
+    fixture.seed_retry_pending_authority(session);
+    fixture.seed_retry_pending_family_pending(session);
+    std::fs::remove_file(fixture.root.join(format!("{session}.jsonl")))
+        .expect("remove the family root transcript");
+    let agent = TERMINAL_FAMILY_AGENTS[0];
+    std::fs::create_dir_all(fixture.root.join(session).join("subagents"))
+        .expect("create subagents directory");
+    std::fs::write(
+        fixture.subagent_path(agent),
+        pipeline_subagent_line(agent, "req_agent_only", 0),
+    )
+    .expect("write the remaining subagent transcript");
+    fixture.page_files = 8;
+    let pages = fixture.walk(9, &ABSENCE_CYCLE);
+    assert_present_family_held(
+        pages.last().expect("terminal page"),
+        session,
+        "subagent-only",
+    );
+}
+
+/// Re-review r2-F1b: the retirement scratch is priced before use, and a
+/// refused price fails closed. The absent family stays held and the census
+/// withheld until a census whose scratch is admitted retires it.
+#[test]
+#[serial(source_manifests)]
+fn refused_absence_scratch_keeps_an_absent_family_held() {
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mut fixture = PipelineFixture::new("patha-absent-retry-pending-refused-scratch");
+    let baseline = fixture.baseline();
+    let session = PIPELINE_SESSIONS[2];
+    fixture.seed_retry_pending_authority(session);
+    fixture.seed_retry_pending_family_pending(session);
+    std::fs::remove_file(fixture.root.join(format!("{session}.jsonl")))
+        .expect("remove the held family's only member");
+    fixture.page_files = 8;
+    let refused = {
+        let _refuse = crate::snapshots::RefuseClaudeAbsentFamilyScratchForTest::new();
+        fixture.walk(9, &ABSENCE_CYCLE)
+    };
+    assert_present_family_held(
+        refused.last().expect("terminal page"),
+        session,
+        "refused scratch",
+    );
+    let traversals = walk_until_census_complete(&fixture, 10, 3);
+    assert_absent_family_retired(&traversals, &baseline, session, "admitted scratch");
 }

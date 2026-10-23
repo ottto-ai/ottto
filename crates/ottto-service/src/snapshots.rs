@@ -7716,6 +7716,47 @@ fn claude_unchanged_proof_scratch_admitted(families: usize, legacy_prefix_hashes
             .is_some()
 }
 
+#[cfg(test)]
+thread_local! {
+    static REFUSE_CLAUDE_ABSENT_FAMILY_SCRATCH_FOR_TEST: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// While alive, this thread refuses the absent-family retirement scratch, so
+/// a raw-complete census retires no RetryPending family.
+#[cfg(test)]
+pub(crate) struct RefuseClaudeAbsentFamilyScratchForTest(bool);
+
+#[cfg(test)]
+impl RefuseClaudeAbsentFamilyScratchForTest {
+    pub(crate) fn new() -> Self {
+        Self(REFUSE_CLAUDE_ABSENT_FAMILY_SCRATCH_FOR_TEST.with(|cell| cell.replace(true)))
+    }
+}
+
+#[cfg(test)]
+impl Drop for RefuseClaudeAbsentFamilyScratchForTest {
+    fn drop(&mut self) {
+        REFUSE_CLAUDE_ABSENT_FAMILY_SCRATCH_FOR_TEST.with(|cell| cell.set(self.0));
+    }
+}
+
+/// Price the absent-family retirement scratch (one borrowed root per
+/// RetryPending record) against the existing parked overlap budget, with the
+/// same full-node pricing as the unchanged-proof scratch. An unsupported
+/// layout or a refused price retires nothing.
+fn claude_absent_family_scratch_admitted(retry_pending_roots: usize) -> bool {
+    #[cfg(test)]
+    if REFUSE_CLAUDE_ABSENT_FAMILY_SCRATCH_FOR_TEST.with(std::cell::Cell::get) {
+        return false;
+    }
+    if !crate::heap_layout_bound::layout_supported() {
+        return false;
+    }
+    let mut cost = crate::heap_layout_bound::Counter::new(crate::source_rotation::PARKED_BUDGET);
+    crate::heap_layout_bound::tree_nodes::<&str, ()>(retry_pending_roots, &mut cost).is_some()
+}
+
 /// Proven families of one complete closed-fence terminal whose earlier-page
 /// members need no replay, as `root -> true`. Every member of such a family
 /// was parsed in this census window under the same witness this terminal
@@ -23943,7 +23984,10 @@ impl OwnedSourceScan {
                 // RetryPending family it proves wholly absent, so a vanished
                 // family's debt cannot withhold the census below forever.
                 if raw_census_complete && source == SnapshotSource::ClaudeCode {
-                    let retired = index.retire_absent_retry_pending_claude_families();
+                    let retired = index.retire_absent_retry_pending_claude_families(
+                        &traversal_snapshot.observed_index_keys,
+                        &traversal_snapshot.residue.index_keys,
+                    );
                     if retired > 0 {
                         eprintln!(
                             "local snapshot census retired {retired} wholly absent RetryPending \
@@ -35118,6 +35162,42 @@ impl ScanIndex {
         );
     }
 
+    /// The pending proof a demoted family retains from the census window that
+    /// proved it: one entry per witness member, with no request occurrence.
+    #[cfg(test)]
+    pub(crate) fn insert_claude_usage_family_pending_for_test(
+        &mut self,
+        root_session_id: &str,
+        census_window_end: &str,
+    ) {
+        let members = self
+            .claude_usage_family_witnesses
+            .get(root_session_id)
+            .expect("the family retains a witness")
+            .member_request_id_fingerprints
+            .keys()
+            .map(|member| (member.clone(), BTreeSet::new()))
+            .collect();
+        self.claude_usage_family_pending.insert(
+            root_session_id.to_string(),
+            ClaudeUsageFamilyPending {
+                census_window_end: census_window_end.to_string(),
+                member_request_id_hashes: members,
+                member_occurrences: BTreeMap::new(),
+                invalid: false,
+            },
+        );
+    }
+
+    #[cfg(test)]
+    pub(crate) fn claude_usage_family_pending_retained_for_test(
+        &self,
+        root_session_id: &str,
+    ) -> bool {
+        self.claude_usage_family_pending
+            .contains_key(root_session_id)
+    }
+
     /// A well-formed RetryPending family quarantine bound to the family's
     /// already retained witness, recording `members` (member session id to
     /// source revision).
@@ -35364,43 +35444,67 @@ impl ScanIndex {
     }
 
     /// Path-(a) bridge: retire every RetryPending family that a raw-complete
-    /// census proves wholly absent. Bounded reconciliation has already
-    /// removed each vanished path from `files`, so a root with no remaining
-    /// member path has no member on disk. Only the record and its pending
-    /// entry go; nothing is accepted, and the retained witness is pruned by
-    /// the next complete census as before. A present family stays held.
+    /// census proves wholly absent. A family is present while any member path
+    /// is indexed, observed by the completed raw traversal, or named by its
+    /// residue: a readable member that parses as non-progressing residue
+    /// (for example after a historical replay reset dropped its delivery
+    /// entry) is never indexed but is still on disk. Only the record and its
+    /// pending entry of a family with none of those go; nothing is accepted,
+    /// and the retained witness is pruned by the next complete census as
+    /// before. A present family stays held.
     ///
     /// This runs independently of the census gate that RetryPending debt
     /// imposes: the ordinary whole-family disappearance rule needs a complete
     /// census, which that very debt would otherwise withhold forever once no
     /// member remains to advance the failure count.
-    fn retire_absent_retry_pending_claude_families(&mut self) -> usize {
-        if self.claude_usage_authority_pending_count() == 0 {
+    ///
+    /// Cost: one pass over the existing membership evidence, probing the
+    /// quarantine by borrowed root, into a scratch set of borrowed roots that
+    /// holds at most one entry per RetryPending record and is priced before
+    /// use. A refused price retires nothing, which keeps every family held.
+    fn retire_absent_retry_pending_claude_families(
+        &mut self,
+        observed_index_keys: &BTreeSet<String>,
+        residue_index_keys: &BTreeSet<String>,
+    ) -> usize {
+        let retry_pending = self.claude_usage_authority_pending_count();
+        if retry_pending == 0 || !claude_absent_family_scratch_admitted(retry_pending) {
             return 0;
         }
-        let present_roots = self
+        let quarantine = &self.claude_usage_authority_quarantine;
+        let mut present = BTreeSet::<&str>::new();
+        for index_key in self
             .files
             .keys()
-            .filter_map(|index_key| {
-                claude_index_path_member_ref(Path::new(index_key))
-                    .map(|member| member.root.to_string())
-            })
-            .collect::<BTreeSet<_>>();
-        let absent = self
-            .claude_usage_authority_quarantine
-            .iter()
-            .filter(|(root_session_id, record)| {
+            .chain(observed_index_keys)
+            .chain(residue_index_keys)
+        {
+            if present.len() == retry_pending {
+                break;
+            }
+            let Some(member) = claude_index_path_member_ref(Path::new(index_key)) else {
+                continue;
+            };
+            if quarantine.get(member.root).is_some_and(|record| {
                 record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
-                    && !present_roots.contains(root_session_id.as_str())
-            })
-            .map(|(root_session_id, _)| root_session_id.clone())
-            .collect::<Vec<_>>();
-        for root_session_id in &absent {
-            self.claude_usage_authority_quarantine
-                .remove(root_session_id);
-            self.claude_usage_family_pending.remove(root_session_id);
+            }) {
+                present.insert(member.root);
+            }
         }
-        absent.len()
+        let family_pending = &mut self.claude_usage_family_pending;
+        let mut retired = 0;
+        self.claude_usage_authority_quarantine
+            .retain(|root_session_id, record| {
+                let absent = record.disposition
+                    == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                    && !present.contains(root_session_id.as_str());
+                if absent {
+                    family_pending.remove(root_session_id);
+                    retired += 1;
+                }
+                !absent
+            });
+        retired
     }
 
     pub(crate) fn claude_usage_authority_terminal_entity_count(&self) -> usize {
