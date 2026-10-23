@@ -4,10 +4,14 @@ fn p2a_scan(root: &Path, support: &Path, index: &mut ScanIndex) -> SourceScanRes
     index.activate_upload_context("already-admitted-context".into());
     index.activate_effective_upload_body_witness_revision(3);
     index.adopt_effective_upload_body_witness_revision_monotonically();
-    index.load_claude_reemission_exclusions(support);
-    // A selection may yield while its writer receipt is pending. Re-enter
-    // the real scan (fresh captures) once that receipt is available.
+    // Match the production preflight after a writer yield: consume metadata
+    // receipts before refreshing the index's derived adoption-pause snapshot.
     for _ in 0..24 {
+        if money::reclaim_metadata(support, index) == money::MoneyReceipt::Pending {
+            money::store::flush();
+            continue;
+        }
+        index.load_claude_reemission_exclusions(support);
         let result = scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
             &[root.to_owned()],

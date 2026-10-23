@@ -878,10 +878,13 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
                 .quarantined_fingerprints
                 .get_mut(&protected_fp)
                 .unwrap();
-            record.retry_after_unix_seconds = current_unix_seconds() + 86400;
+            record.retry_after_unix_seconds = current_unix_seconds() + 6 * 3600;
             if terminal {
                 record.disposition = SnapshotQuarantineDisposition::UnprovenTerminal;
+                record.failed_reconstruction_count = MAX_SNAPSHOT_RECONSTRUCTION_FAILURES;
+                record.retry_after_unix_seconds = 0;
             }
+            assert!(snapshot_quarantine_deadline_is_bounded(record), "quiet-page fixture must survive production bounded decoding");
             assert!(
                 record.hold.is_none(),
                 "this is v1 custody, not a money server hold"

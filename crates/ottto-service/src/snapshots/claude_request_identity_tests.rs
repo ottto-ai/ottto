@@ -4213,11 +4213,21 @@ fn p2a_identity_entity(
     for (id, occurrence) in &item.claude_usage_occurrences {
         let (hour, _) =
             activity_bucket_from_timestamp(occurrence.timestamp.as_deref().unwrap()).unwrap();
-        let (_, context, _) = build_row_identity(
+        let (row_key, mut context, _) = build_row_identity(
             occurrence.model.as_deref().unwrap(),
             &occurrence.selector,
             occurrence.reasoning_effort.as_deref(),
         );
+        // Grain keys preserve the billing and effort columns hoisted out of
+        // the reduced selector context, as the production body builder does.
+        for (name, value) in row_key.billing_fields() {
+            if let Some(value) = value {
+                context.insert(name.to_owned(), value.to_owned());
+            }
+        }
+        if let Some(effort) = &occurrence.reasoning_effort {
+            context.insert("reasoning_effort".into(), effort.clone());
+        }
         entity.counted.push(ClaudeCountedContribution {
             key: (hour, occurrence.model.clone().unwrap(), context),
             origin: None,

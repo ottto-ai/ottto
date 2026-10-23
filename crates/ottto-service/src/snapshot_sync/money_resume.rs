@@ -196,7 +196,14 @@ fn graph_bytes<T: crate::heap_layout_bound::HeapLayoutBound>(graph: &T) -> Resul
         graph,
         crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES,
     )
-    .ok_or_else(admission_refused)
+    .ok_or_else(|| {
+        #[cfg(test)]
+        eprintln!(
+            "MONEY_OWNED_GRAPH_REFUSAL type={}",
+            std::any::type_name::<T>()
+        );
+        admission_refused()
+    })
 }
 
 /// One moving charge for the actual retained inputs. Refreshing replaces its
@@ -395,7 +402,16 @@ fn start_admitted(
         .and_then(|bytes| {
             crate::heap_layout_bound::completed_bound(&scan, limit - bytes).map(|next| bytes + next)
         })
-        .ok_or_else(admission_refused)?;
+        .ok_or_else(|| {
+            #[cfg(test)]
+            eprintln!(
+                "MONEY_OWNED_GRAPH_REFUSAL stage=retained preparation={:?} index={:?} scan={:?}",
+                crate::heap_layout_bound::completed_bound(&preparation, limit),
+                crate::heap_layout_bound::completed_bound(&index, limit),
+                crate::heap_layout_bound::completed_bound(&scan, limit)
+            );
+            admission_refused()
+        })?;
     // Pay only the metadata that is actually copied outside the moved input
     // graphs. In particular, never duplicate either entire index's charge.
     let context_bytes = graph_bytes(&preparation.receipt_client)?

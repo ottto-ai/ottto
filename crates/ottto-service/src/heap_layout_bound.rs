@@ -375,7 +375,10 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentRuntimeDefaults; captured
 
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusDiagnostic; code, severity, message, observed_at, retry_after, account_identifier_hash, organization_identifier_hash, account_label, scope);
 
+// The closed unit-only protocol enums below own no heap and cannot grow
+// through a shared Arc. Exhaustive matches retain the proof when types change.
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnosticScope {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Source | Self::Account | Self::Organization => c.add(0),
@@ -384,6 +387,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnost
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnosticSeverity {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Info | Self::Warning | Self::Error => c.add(0),
@@ -394,6 +398,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentDiagnost
 crate::heap_layout_bound::fields!(ottto_protocol::AgentStatusPlanObservation; observed_at, evidence_method, source_session_id, provider, billing_provider, model_provider, billing_channel, auth_mode, gateway_provider, subscription_product, plan_type, account_label, account_id, organization_label, organization_id, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, billing_identity_confidence, confidence, is_current);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusConfidence {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::High | Self::Medium | Self::Low | Self::Unknown => c.add(0),
@@ -404,6 +409,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusCo
 crate::heap_layout_bound::fields!(ottto_protocol::AgentCapabilityGap; capability, status, detail);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCapabilityStatus {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Supported | Self::Unsupported | Self::Unknown => c.add(0),
@@ -418,6 +424,7 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentContextPostureSummary; se
 crate::heap_layout_bound::fields!(ottto_protocol::AgentContextSessionPeak; peak_fill_tokens, context_window_tokens, peak_fill_percent, over_window);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentContextCompleteness {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::FullPressure | Self::WindowSizeOnly | Self::Unavailable | Self::Unknown => {
@@ -430,6 +437,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentContextC
 crate::heap_layout_bound::fields!(ottto_protocol::AgentContextPressureSample; at, active_tokens, max_tokens, used_percent, remaining_tokens);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentContextState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Available | Self::Unsupported | Self::Unknown => c.add(0),
@@ -442,6 +450,7 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditBalance; name, stat
 crate::heap_layout_bound::fields!(ottto_protocol::AgentCreditGrant; grant_key, grant_type, status, granted_at, starts_at, expires_at, resets_included, resets_left, clears, title, usable_now);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditBalanceKind {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::UsageCredits
@@ -455,6 +464,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditBalance
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantsState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Complete
@@ -467,6 +477,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantsS
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantsUnavailableCause {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Reader => c.add(0),
@@ -475,6 +486,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantsU
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantType {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::RateLimitReset | Self::Credit | Self::Unknown => c.add(0),
@@ -483,6 +495,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantTy
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantStatus {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Available | Self::Redeeming | Self::Redeemed | Self::Paused | Self::Unknown => {
@@ -493,6 +506,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::CreditGrantSt
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCreditBalanceUnit {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Credits | Self::Usd | Self::Tokens | Self::Resets | Self::Unknown => c.add(0),
@@ -501,6 +515,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCreditBa
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentQuotaWindowFreshness {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Fresh | Self::Stale | Self::Unsupported | Self::Error | Self::Unknown => c.add(0),
@@ -509,6 +524,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentQuotaWin
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCreditBalanceStatus {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Ok
@@ -524,6 +540,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentCreditBa
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentQuotaWindowStatus {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Ok
@@ -539,6 +556,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentQuotaWin
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentQuotaWindowScope {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Source | Self::Account | Self::Organization | Self::Model | Self::Unknown => {
@@ -555,6 +573,7 @@ crate::heap_layout_bound::fields!(ottto_protocol::AgentAvailableModelStatus; id,
 crate::heap_layout_bound::fields!(ottto_protocol::AgentAccountStatus; login_state, provider, auth_method, email, account_id, organization_id, organization_label, plan_type, subscription_product, billing_channel, subscription_period_start, subscription_period_end, subscription_period_last_checked_at, account_identifier_hash, organization_identifier_hash, superseded_account_identifier_hash, superseded_organization_identifier_hash, credential_fingerprint_hash, billing_identity_evidence, claude_quota_access_state, claude_anchor_durability, claude_anchor_health, billing_identity_confidence, confidence);
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeAccountAnchorHealthV1 {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Healthy
@@ -567,6 +586,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeAccount
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeAccountAnchorDurabilityV1 {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Anchored | Self::DefaultOnly | Self::Unresolved => c.add(0),
@@ -575,6 +595,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeAccount
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeQuotaAccessState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Full
@@ -588,6 +609,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::ClaudeQuotaAc
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentLoginState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::SignedIn | Self::SignedOut | Self::Unknown | Self::Unsupported => c.add(0),
@@ -596,6 +618,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentLoginSta
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusCollectionMethod {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::AppServer
@@ -611,6 +634,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusCo
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Available
@@ -625,6 +649,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::AgentStatusSt
 }
 
 impl crate::heap_layout_bound::HeapLayoutBound for ottto_protocol::SourceKind {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
         match self {
             Self::Codex | Self::ClaudeCode | Self::Pi => c.add(0),
@@ -647,6 +672,7 @@ impl HeapLayoutBound for std::time::SystemTime {
 crate::heap_layout_bound::fields!(ottto_protocol::AgentQuotaWindow; name, scope, status, freshness, observed_at, model, account_label, account_identifier_hash, organization_identifier_hash, window_seconds, started_at, started_at_basis, resets_at, quota, remaining, used_percent, left_percent, limit_cents, used_cents, remaining_cents, group, severity, is_active, spend_control_reached, rate_limit_reached_type, limit_id);
 
 impl HeapLayoutBound for ottto_protocol::LocalAccountState {
+    const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
         match self {
             Self::NotConnected
@@ -694,6 +720,41 @@ mod sampled_scalar_buffer_tests {
         }
         assert!(completed_bound(&vec![UnknownZero], usize::MAX).is_none());
     }
+    #[test]
+    fn immutable_status_collection_completes_without_admitting_mutable_graphs() {
+        if !layout_supported() {
+            return;
+        }
+        let status = ottto_protocol::AgentStatusSnapshot {
+            source: ottto_protocol::SourceKind::ClaudeCode,
+            status: ottto_protocol::AgentStatusState::Available,
+            collection_method: ottto_protocol::AgentStatusCollectionMethod::ManualFallback,
+            captured_at: "2026-08-02T08:00:00Z".into(),
+            expires_at: "2026-08-02T09:00:00Z".into(),
+            account: None,
+            model: None,
+            quota_windows: Vec::new(),
+            credit_balances: Vec::new(),
+            context: None,
+            capabilities: Vec::new(),
+            plan_observations: Vec::new(),
+            diagnostics: Vec::new(),
+            runtime_defaults: None,
+        };
+        let shared = Arc::new(crate::agent_status::AgentStatusCollection {
+            snapshots: vec![status.clone()],
+            source_health_snapshot: status,
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        });
+        let bytes = completed_bound(&shared, 1024 * 1024)
+            .expect("immutable status enum leaves have stable heap");
+        assert!(bytes > 0);
+        assert!(completed_bound(&shared, bytes - 1).is_none());
+        let mutable = Arc::new(Mutex::new(shared));
+        assert!(completed_bound(&mutable, 1024 * 1024).is_none());
+    }
+
     // Test-only enforcement: requiring coverage never changes runtime admission.
     fn require_layout_coverage(
         supported: bool,

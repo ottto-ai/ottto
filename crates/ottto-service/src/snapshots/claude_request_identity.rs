@@ -503,7 +503,15 @@ impl Grouping {
     }
 
     fn get(&self, bucket_start: &str, row_key: &RowKey) -> Option<&RowGroup> {
-        self.groups.get(bucket_start)?.get(row_key)
+        let found = self
+            .groups
+            .get(bucket_start)
+            .and_then(|rows| rows.get(row_key));
+        #[cfg(test)]
+        if found.is_none() {
+            eprintln!("REQUEST_MONEY_REPRODUCE missing_key test={:?} bucket={bucket_start} expected={row_key:?} groups={:?}", std::thread::current().name(), self.groups.iter().map(|(bucket, rows)| (bucket, rows.keys().collect::<Vec<_>>())).collect::<Vec<_>>());
+        }
+        found
     }
 
     /// Drops every tag that rests on transcript markers: the org-only and
@@ -766,7 +774,8 @@ fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligi
     if row_counts(row) != amounts.counts {
         #[cfg(test)]
         eprintln!(
-            "REQUEST_MONEY_REPRODUCE counts row={:?} grouped={:?}",
+            "REQUEST_MONEY_REPRODUCE counts test={:?} row={:?} grouped={:?}",
+            std::thread::current().name(),
             row_counts(row),
             amounts.counts
         );
@@ -783,7 +792,8 @@ fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligi
             _ => {
                 #[cfg(test)]
                 eprintln!(
-                    "REQUEST_MONEY_REPRODUCE cost_field={index} row={wire:?} grouped={:?}",
+                    "REQUEST_MONEY_REPRODUCE cost_field={index} test={:?} row={wire:?} grouped={:?}",
+                    std::thread::current().name(),
                     amounts.wire(index)
                 );
                 return Err(Ineligible::RowsNotReproduced);
