@@ -494,7 +494,7 @@ fn shadow_off(support_dir: &Path, now: u64) -> bool {
 /// ledger). A refused handoff owes the day its row in memory.
 fn publish_off(support_dir: &Path, now: u64) {
     let Some(reservation) = ShadowReservation::admit(1024) else {
-        owe_coverage(support_dir, now, true);
+        owe_coverage(support_dir, now, false);
         return;
     };
     let job = WriteJob {
@@ -529,7 +529,7 @@ fn publish_off(support_dir: &Path, now: u64) {
         reservations: vec![reservation],
     };
     if store::submit_unledgered(job).is_err() {
-        owe_coverage(support_dir, now, true);
+        owe_coverage(support_dir, now, false);
     }
 }
 
@@ -1223,6 +1223,7 @@ pub(crate) fn shadow_page_at(
     census_complete: bool,
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
+    store::prime_credit_for_test(support_dir, utc_day(now));
     let coverage = coverage::InterimFamilyCoverage {
         census_complete,
         ..Default::default()
@@ -1268,12 +1269,6 @@ fn shadow_page_with_coverage(
         rows: Default::default(),
         scope: Default::default(),
     };
-    // Intent is durable before admission, including a refused/dropped page.
-    // No clean-shutdown hook exists: retaining intent errs toward a cut line.
-    if !ensure_run_intent(support_dir, now) {
-        owe_coverage(support_dir, now, true);
-        return refuse(&end, None, index, snapshots.len(), counts);
-    }
     let scope_key = shadow_scope(support_dir);
     let Some(root_funds) = ShadowReservation::admit(snapshots.len().saturating_mul(64)) else {
         counts.refused_budget = 1;
@@ -1618,6 +1613,13 @@ fn shadow_page_with_coverage(
                 rows = failure_rows(root, reason, state, now, snapshot, ledger, &mut counts);
             }
         }
+        if !rows.row.old_available {
+            if let Some(members) = indexed_members.get(root) {
+                rows.row.revision = hex_revision(&union_revision(members));
+                rows.row.members_total = members.len().max(items.len());
+                rows.row.absent_old_unknown = members.len().saturating_sub(items.len()) as u64;
+            }
+        }
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);
         let digest = semantic_digest(&mut rows);
@@ -1723,7 +1725,7 @@ fn build_slice(
     let deadline = end.deadline;
     let now = end.now;
     let roots = BTreeSet::from([root]);
-    let by_root = BTreeMap::from([(root, items.to_vec())]);
+    let items = items.to_vec();
     let key_of = |root: &str, member: &str| {
         member_keys
             .get(&(root.to_owned(), member.to_owned()))
@@ -1749,23 +1751,17 @@ fn build_slice(
                     Some(ClaudeRootRows::default())
                 }
                 Some(ClaudeRootTelemetry::Current) => match ledger.get(&telemetry_key(root)) {
-                    Some(record) if budget.charge(row_charge(record.request_hashes().len())) => {
-                        match ClaudeRootRows::from_record_by(record, deadline) {
-                            Some(rows) => {
-                                end.rows.roots_from_facts += 1;
-                                end.rows.rows_decoded += rows.len() as u64;
-                                Some(rows)
-                            }
-                            None => {
-                                end.rows.roots_unavailable += 1;
-                                None
-                            }
+                    Some(record) => match ClaudeRootRows::from_record_by(record, deadline) {
+                        Some(rows) => {
+                            end.rows.roots_from_facts += 1;
+                            end.rows.rows_decoded += rows.len() as u64;
+                            Some(rows)
                         }
-                    }
-                    Some(_) => {
-                        end.rows.roots_refused_memory += 1;
-                        None
-                    }
+                        None => {
+                            end.rows.roots_unavailable += 1;
+                            None
+                        }
+                    },
                     None => {
                         end.rows.roots_unavailable += 1;
                         None
@@ -1875,7 +1871,8 @@ fn build_slice(
     let retired_roots =
         claude_request_ledger::roots_with_retired_records(&index.claude_request_census);
 
-    for (&root, items) in &by_root {
+    {
+        let items = &items;
         if Instant::now() >= deadline {
             return Err("deadline");
         }
@@ -1949,10 +1946,8 @@ fn build_slice(
             counts.possible_retired_copies += body.units.requests;
         }
         let union = union_revision(members);
-        return Ok((body, union, absent_old, absent_old_unknown));
+        Ok((body, union, absent_old, absent_old_unknown))
     }
-
-    Err("unbuilt")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2219,7 +2214,7 @@ fn hand_off(
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) {
     if reservation.is_none() {
-        owe_coverage(end.support_dir, end.now, true);
+        owe_coverage(end.support_dir, end.now, false);
         counts.batch_dropped = 1;
         return;
     }
@@ -2319,7 +2314,7 @@ fn hand_off_reserved_buffer(
     if let Err(job) = outcome {
         counts.batch_dropped = 1;
         counts.family_memos_withheld += job.memos.len() as u64;
-        owe_coverage(end.support_dir, end.now, true);
+        owe_coverage(end.support_dir, end.now, false);
     }
 }
 
@@ -2589,32 +2584,6 @@ fn process_epoch() -> u64 {
 }
 
 const RUN_MARKER: &str = ".claude-request-money-run.json";
-static RUN_DAYS: Mutex<BTreeMap<PathBuf, BTreeSet<u64>>> = Mutex::new(BTreeMap::new());
-
-/// Sync a small marker and its rename before admitting page work. A marker
-/// is retained until process exit; without a shutdown hook every restart
-/// conservatively cuts custody for all days touched by the prior process.
-fn ensure_run_intent(support_dir: &Path, now: u64) -> bool {
-    let Ok(mut runs) = RUN_DAYS.lock() else {
-        return false;
-    };
-    if !runs.contains_key(support_dir) {
-        note_unclean_run(support_dir);
-    }
-    let days = runs.entry(support_dir.to_path_buf()).or_default();
-    let day = now / 86_400;
-    if days.contains(&day) {
-        return true;
-    }
-    let first = days.first().copied().unwrap_or(day).min(day) * 86_400;
-    let last = days.last().copied().unwrap_or(day).max(day) * 86_400;
-    if !open_run_marker(support_dir, (first, last)) {
-        return false;
-    }
-    days.insert(day);
-    true
-}
-
 fn open_run_marker(support_dir: &Path, days: (u64, u64)) -> bool {
     std::fs::create_dir_all(support_dir).is_ok()
         && store::write_atomic(
@@ -2623,21 +2592,48 @@ fn open_run_marker(support_dir: &Path, days: (u64, u64)) -> bool {
         )
 }
 
-fn note_unclean_run(support_dir: &Path) {
+fn note_unclean_run(support_dir: &Path, observed: u64) -> bool {
     let path = support_dir.join(RUN_MARKER);
     let read = std::fs::metadata(&path)
         .ok()
         .filter(|meta| meta.len() <= 128)
         .and_then(|_| std::fs::read(&path).ok())
         .and_then(|bytes| serde_json::from_slice::<(u64, u64)>(&bytes).ok());
+    let mut persisted = true;
     if let Some((first, last)) = read {
-        // Bounded by retention, and covers intermediate midnight crossings.
-        let oldest = last.saturating_sub(6 * 86_400);
-        for day in (first.max(oldest) / 86_400)..=(last / 86_400) {
+        for day in (first.max(observed.saturating_sub(6 * 86_400)) / 86_400)
+            ..=(last.min(observed) / 86_400)
+        {
             owe_coverage(support_dir, day * 86_400, true);
+            persisted &= owed_path(
+                &support_dir.join("diagnostics"),
+                &day_stamp(day * 86_400).unwrap_or_default(),
+            )
+            .is_file();
         }
     } else if path.exists() {
-        owe_coverage(support_dir, now_unix(), true);
+        owe_coverage(support_dir, observed, true);
+        persisted = owed_path(
+            &support_dir.join("diagnostics"),
+            &day_stamp(observed).unwrap_or_default(),
+        )
+        .is_file();
+    }
+    persisted
+}
+
+/// Drain a snapshot outside the mutex: fsync never blocks the producer's
+/// in-memory debt latch. A wake job closes the idle-writer race.
+fn persist_coverage_debt() {
+    let debts = COVERAGE_OWED
+        .lock()
+        .ok()
+        .map(|mut owed| std::mem::take(&mut *owed))
+        .unwrap_or_default();
+    for (dir, days) in debts {
+        for observed in days.into_values() {
+            owe_coverage(&dir, observed, true);
+        }
     }
 }
 
@@ -2679,6 +2675,9 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) {
             .entry(day)
             .or_insert(observed_unix);
         *slot = (*slot).min(observed_unix);
+    }
+    if !durable {
+        store::wake_writer();
     }
 }
 
@@ -2771,6 +2770,35 @@ fn ends_mid_line(path: &Path) -> bool {
     file.seek(SeekFrom::End(-1)).is_ok() && file.read_exact(&mut last).is_ok() && last[0] != b'\n'
 }
 
+fn ends_with_seal(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    #[derive(serde::Deserialize)]
+    struct Seal {
+        row: String,
+        #[serde(default)]
+        truncated: bool,
+    }
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let Ok(size) = file.metadata().map(|meta| meta.len()) else {
+        return false;
+    };
+    let len = size.min(JSONL_SEAL_RESERVE_BYTES) as usize;
+    let mut tail = [0_u8; JSONL_SEAL_RESERVE_BYTES as usize];
+    if file.seek(SeekFrom::End(-(len as i64))).is_err()
+        || file.read_exact(&mut tail[..len]).is_err()
+    {
+        return false;
+    }
+    tail[..len]
+        .split(|byte| *byte == b'\n')
+        .rev()
+        .find(|line| !line.is_empty())
+        .and_then(|line| serde_json::from_slice::<Seal>(line).ok())
+        .is_some_and(|row| row.row == "page" && row.truncated)
+}
+
 /// Rows appended to one day's file, each serialized straight into the
 /// batch's stream buffer (no copy of the rows), under the day's cap.
 struct DayFile {
@@ -2807,7 +2835,7 @@ impl DayFile {
             written,
             size: size + u64::from(open_row && size < JSONL_DAY_CAP_BYTES),
             room,
-            sealed: false,
+            sealed: ends_with_seal(path),
         }
     }
 
@@ -2903,6 +2931,10 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
             continue;
         }
         let mut file = DayFile::open(&day_path(&dir, &day), 0, 0);
+        if file.sealed {
+            settle_owed(&dir, &day);
+            continue;
+        }
         if file.push_false(&CoverageRow::owed(observed)) && file.finish() {
             outcome.owed_written += 1;
             settle_owed(&dir, &day);
@@ -2914,7 +2946,7 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
     let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>();
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
-    if file.size > room {
+    if file.sealed || file.size > room {
         // A terminal PARTIAL row already seals this day. Never append past it.
         outcome.truncated = rows;
         return outcome;
@@ -3016,9 +3048,6 @@ pub(crate) fn owe_coverage_for_test(support_dir: &Path, observed_unix: u64, dura
 /// A restart: the process's owed-coverage latch is gone (the markers stay).
 #[cfg(test)]
 pub(crate) fn forget_owed_coverage_for_test(support_dir: &Path) {
-    if let Ok(mut runs) = RUN_DAYS.lock() {
-        runs.remove(support_dir);
-    }
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
         owed.remove(support_dir);
     }
@@ -3090,5 +3119,32 @@ mod bounded_tests {
         assert_eq!(first, semantic_digest(&mut rows));
         rows.row.p1_reasons = vec!["deadline"];
         assert_ne!(first, semantic_digest(&mut rows));
+    }
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn early_terminal_seal_survives_reopen_below_byte_limit() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-early-seal");
+        let path = scratch.join("day.jsonl");
+        let mut file = DayFile::open(&path, 0, JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES);
+        let mut seal = CoverageRow::owed(1_786_000_000);
+        seal.truncated = true;
+        assert!(file.push_false(&seal));
+        assert!(file.finish());
+        assert!(
+            std::fs::metadata(&path).unwrap().len()
+                < JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES
+        );
+        let before = std::fs::read(&path).unwrap();
+        let mut reopened = DayFile::open(&path, 0, JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES);
+        assert!(reopened.sealed);
+        assert!(!reopened.push(&CoverageRow::owed(1_786_000_001)));
+        assert!(reopened.finish());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

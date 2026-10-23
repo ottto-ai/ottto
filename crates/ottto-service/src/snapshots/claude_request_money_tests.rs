@@ -1778,6 +1778,7 @@ fn money_shadow_panics_are_contained_and_it_can_be_turned_off() {
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             true,
+            &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage::default(),
         );
         store::flush();
         crate::snapshots::claude_request_money::take_shadow_lines_for_test().len()

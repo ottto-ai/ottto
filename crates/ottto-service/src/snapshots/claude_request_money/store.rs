@@ -144,6 +144,9 @@ pub(crate) struct ClaudeLedger {
     save_day: u64,
     /// Save bytes attempted on `save_day` (persisted before each save).
     pub(crate) save_bytes_today: u64,
+    /// Non-refundable quota credit persisted by the writer before use.
+    save_credit: usize,
+    credit_pending: bool,
     /// Why the last page took no save while shards were dirty.
     pub(crate) save_held: Option<SaveHeld>,
     /// Families with a row in a batch whose result has not come back (process
@@ -158,6 +161,7 @@ pub(crate) enum SaveHeld {
     Interval,
     /// The day's `SAVE_DAILY_BYTES` would be passed.
     DailyCap,
+    CreditPending,
 }
 
 /// What one page's save may take: the UTC day and the coalescing interval.
@@ -183,6 +187,8 @@ impl ClaudeLedger {
             last_save: None,
             save_day: 0,
             save_bytes_today: 0,
+            save_credit: 0,
+            credit_pending: false,
             save_held: None,
             in_flight: BTreeMap::new(),
         }
@@ -300,9 +306,13 @@ impl ClaudeLedger {
         if policy.utc_day > self.save_day {
             self.save_day = policy.utc_day;
             self.save_bytes_today = 0;
+            self.save_credit = 0;
         }
-        let room = SAVE_BYTES_PER_PAGE
-            .min(SAVE_DAILY_BYTES.saturating_sub(self.save_bytes_today as usize));
+        if self.save_credit == 0 {
+            self.request_credit(policy.support_dir, policy.utc_day);
+            return None;
+        }
+        let room = SAVE_BYTES_PER_PAGE.min(self.save_credit);
         // The day's room, not the save's bound, decides what stays dirty.
         let day_bound = room < SAVE_BYTES_PER_PAGE;
         let meta_bytes = self.shard_bytes[META] + 2;
@@ -334,7 +344,10 @@ impl ClaudeLedger {
         // A zero meta goes before any data shard, or nothing goes.
         if bytes > room || !selected.contains(&true) && !zero_first && !meta_last {
             if day_bound {
-                self.save_held = Some(SaveHeld::DailyCap);
+                // A shard cannot use the remaining credit. Abandon it without
+                // refund and ask the writer for a fresh, durable reservation.
+                self.save_credit = 0;
+                self.request_credit(policy.support_dir, policy.utc_day);
             }
             return None;
         }
@@ -387,23 +400,9 @@ impl ClaudeLedger {
             buffer.push(b'}');
             buffer
         };
-        // Reserve durably before any save can enter the outbox. Never refund:
-        // a dropped job or restart must not spend the same day's room twice.
-        self.save_bytes_today = self.save_bytes_today.saturating_add(bytes as u64);
-        let dir = policy.support_dir.join(LEDGER_DIR);
-        if std::fs::create_dir_all(&dir).is_err()
-            || !write_atomic(
-                &dir.join(SAVE_BUDGET_FILE),
-                format!(
-                    "{{\"day\":{},\"bytes\":{}}}",
-                    self.save_day, self.save_bytes_today
-                )
-                .as_bytes(),
-            )
-        {
-            self.save_bytes_today = SAVE_DAILY_BYTES as u64;
-            return None;
-        }
+        // Credit was synced on the writer thread before the producer saw
+        // it. Queued/dropped saves and restart never refund that reservation.
+        self.save_credit -= bytes;
         self.last_save = Some(Instant::now());
         let mut save = ClaudeLedgerSave::default();
         for (shard, buffer) in buffers {
@@ -422,6 +421,17 @@ impl ClaudeLedger {
         }
         self.next_save = next_save;
         Some((save, reservation))
+    }
+
+    fn request_credit(&mut self, support_dir: &Path, day: u64) {
+        if self.credit_pending {
+            self.save_held = Some(SaveHeld::CreditPending);
+        } else if self.save_bytes_today >= SAVE_DAILY_BYTES as u64 {
+            self.save_held = Some(SaveHeld::DailyCap);
+        } else if submit(Job::Reserve(support_dir.to_path_buf(), day)).is_ok() {
+            self.credit_pending = true;
+            self.save_held = Some(SaveHeld::CreditPending);
+        }
     }
 
     /// A batch that did not reach the disk: its shards are dirty again (a
@@ -518,6 +528,8 @@ pub(crate) struct WriteResult {
 }
 
 enum Job {
+    Reserve(PathBuf, u64),
+    Wake,
     Load(PathBuf),
     Write(Box<WriteJob>),
     #[cfg(test)]
@@ -534,6 +546,45 @@ enum Slot {
 }
 
 static LEDGERS: Mutex<BTreeMap<PathBuf, Slot>> = Mutex::new(BTreeMap::new());
+#[derive(Clone, Copy)]
+struct Credit {
+    day: u64,
+    reserved: u64,
+    bytes: usize,
+}
+static CREDITS: Mutex<BTreeMap<PathBuf, Credit>> = Mutex::new(BTreeMap::new());
+
+/// Only the writer (and synchronous store fixtures) calls this. Charge an
+/// entire <=8 MiB ticket before granting it. Unspent ticket bytes are lost
+/// on restart, so accounting is deliberately conservative.
+fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
+    let dir = support_dir.join(LEDGER_DIR);
+    let (saved_day, saved_bytes) = load_budget(&dir);
+    let used = if day > saved_day { 0 } else { saved_bytes };
+    let amount = SAVE_BYTES_PER_PAGE.min(SAVE_DAILY_BYTES.saturating_sub(used as usize));
+    let total = used.saturating_add(amount as u64);
+    let granted = day >= saved_day
+        && amount > 0
+        && std::fs::create_dir_all(&dir).is_ok()
+        && write_atomic(
+            &dir.join(SAVE_BUDGET_FILE),
+            format!("{{\"day\":{day},\"bytes\":{total}}}").as_bytes(),
+        );
+    Credit {
+        day: saved_day.max(day),
+        reserved: if granted {
+            total
+        } else {
+            SAVE_DAILY_BYTES as u64
+        },
+        bytes: if granted { amount } else { 0 },
+    }
+}
+
+pub(super) fn wake_writer() {
+    let _ = submit(Job::Wake);
+}
+
 static RESULTS: Mutex<BTreeMap<PathBuf, Vec<WriteResult>>> = Mutex::new(BTreeMap::new());
 static WRITER: OnceLock<Option<Mutex<SyncSender<Job>>>> = OnceLock::new();
 
@@ -716,6 +767,18 @@ pub(crate) fn submit_unledgered(job: WriteJob) -> Result<(), Box<WriteJob>> {
 /// its ledger: unwritten shards are dirty again; memos come back to the
 /// caller, which moves the published ones.
 pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec<WriteResult> {
+    if let Some(credit) = CREDITS
+        .lock()
+        .ok()
+        .and_then(|mut credits| credits.remove(support_dir))
+    {
+        ledger.credit_pending = false;
+        if credit.day >= ledger.save_day {
+            ledger.save_day = credit.day;
+            ledger.save_bytes_today = credit.reserved;
+            ledger.save_credit = credit.bytes;
+        }
+    }
     let results = RESULTS
         .lock()
         .ok()
@@ -742,13 +805,23 @@ fn run_writer(receiver: Receiver<Job>) {
     loop {
         let job = match receiver.try_recv() {
             Ok(job) => job,
-            Err(TryRecvError::Empty) => match receiver.recv() {
-                Ok(job) => job,
-                Err(_) => break,
-            },
+            Err(TryRecvError::Empty) => {
+                super::persist_coverage_debt();
+                match receiver.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            }
             Err(TryRecvError::Disconnected) => break,
         };
         match job {
+            Job::Reserve(dir, day) => {
+                let credit = reserve_credit(&dir, day);
+                if let Ok(mut credits) = CREDITS.lock() {
+                    credits.insert(dir, credit);
+                }
+            }
+            Job::Wake => super::persist_coverage_debt(),
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
                 if let Ok(mut ledgers) = LEDGERS.lock() {
@@ -770,14 +843,13 @@ fn run_writer(receiver: Receiver<Job>) {
                 let lost_ack = job.jsonl.fault == super::PageFault::LostAck;
                 let (support_dir, result) = write(*job, failed);
                 QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                if !lost_ack {
-                    if let Ok(mut results) = RESULTS.lock() {
-                        results.entry(support_dir).or_default().push(result);
-                    }
+                if let (false, Ok(mut results)) = (lost_ack, RESULTS.lock()) {
+                    results.entry(support_dir).or_default().push(result);
                 }
             }
             #[cfg(test)]
             Job::Flush(done) => {
+                super::persist_coverage_debt();
                 let _ = done.send(());
             }
             #[cfg(test)]
@@ -808,6 +880,7 @@ pub(crate) struct WriterState {
     /// A meta carrying debt failed: until one lands, no data shard (and no
     /// meta advance) is written, whichever batch it comes in.
     debt_unwritten: bool,
+    run_days: Option<(u64, u64)>,
 }
 
 fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
@@ -819,7 +892,31 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         save,
         reservations,
     } = job;
-    let outcome = super::write_jsonl(&support_dir, &mut jsonl);
+    let ready = match failed.run_days {
+        Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
+        previous => {
+            let recovered = previous.is_some() || super::note_unclean_run(&support_dir, jsonl.now);
+            let days = previous.map_or(
+                (jsonl.now / 86_400 * 86_400, jsonl.now + 86_400),
+                |(first, last)| (first.min(jsonl.now), last.max(jsonl.now + 86_400)),
+            );
+            if recovered && super::open_run_marker(&support_dir, days) {
+                failed.run_days = Some(days);
+                true
+            } else {
+                false
+            }
+        }
+    };
+    let outcome = if ready {
+        super::write_jsonl(&support_dir, &mut jsonl)
+    } else {
+        super::owe_coverage(&support_dir, jsonl.now, true);
+        super::JsonlOutcome {
+            failed: 1,
+            ..Default::default()
+        }
+    };
     for (memo, family) in memos
         .iter_mut()
         .filter(|memo| memo.row)
@@ -830,7 +927,7 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
             memo.basis = None;
         }
     }
-    let save_failed = jsonl.fault == super::PageFault::SaveFailure;
+    let save_failed = !ready || jsonl.fault == super::PageFault::SaveFailure;
     let jsonl = outcome;
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
         if save_failed {
@@ -1092,10 +1189,33 @@ fn test_budget_dir() -> &'static Path {
             .join(format!(
                 "ottto-save-budget-{}-{:?}",
                 std::process::id(),
-                std::thread::current().id()
+                super::next_snapshot()
             ))
             .into_boxed_path(),
     )
+}
+
+#[cfg(test)]
+fn credit_for_test(ledger: &mut ClaudeLedger, policy: SavePolicy<'_>) {
+    if ledger.save_credit == 0 && ledger.save_bytes_today < SAVE_DAILY_BYTES as u64 {
+        let credit = reserve_credit(policy.support_dir, policy.utc_day);
+        ledger.save_day = credit.day;
+        ledger.save_bytes_today = credit.reserved;
+        ledger.save_credit = credit.bytes;
+    }
+}
+
+/// Prime asynchronous durable credit for direct synchronous page fixtures.
+/// Production pages only request credit and continue; they never wait.
+#[cfg(test)]
+pub(crate) fn prime_credit_for_test(support_dir: &Path, day: u64) {
+    if let ClaudeLedgerAcquire::Ready(mut ledger) = acquire(support_dir) {
+        if ledger.save_credit == 0 && !ledger.credit_pending {
+            ledger.request_credit(support_dir, day);
+        }
+        drop(ledger);
+        flush();
+    }
 }
 
 /// A save every call, on today's budget.
@@ -1118,10 +1238,12 @@ pub(crate) fn save_page_for_test(
     ledger: &mut ClaudeLedger,
     failed: &mut WriterState,
 ) -> Option<(usize, bool, usize)> {
-    let (save, _reservation) = ledger.take_save(SavePolicy {
+    let policy = SavePolicy {
         support_dir,
         ..policy_for_test(Instant::now() + Duration::from_secs(60))
-    })?;
+    };
+    credit_for_test(ledger, policy);
+    let (save, _reservation) = ledger.take_save(policy)?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
     ledger.restore(&unwritten, meta);
     Some((save.shards(), save.meta_first.is_some(), unwritten.len()))
@@ -1150,9 +1272,9 @@ pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn take_save_for_test(ledger: &mut ClaudeLedger) -> Option<ClaudeLedgerSave> {
-    ledger
-        .take_save(policy_for_test(Instant::now() + Duration::from_secs(60)))
-        .map(|(save, _reservation)| save)
+    let policy = policy_for_test(Instant::now() + Duration::from_secs(60));
+    credit_for_test(ledger, policy);
+    ledger.take_save(policy).map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
@@ -1160,9 +1282,9 @@ pub(crate) fn take_save_by_for_test(
     ledger: &mut ClaudeLedger,
     deadline: Instant,
 ) -> Option<ClaudeLedgerSave> {
-    ledger
-        .take_save(policy_for_test(deadline))
-        .map(|(save, _reservation)| save)
+    let policy = policy_for_test(deadline);
+    credit_for_test(ledger, policy);
+    ledger.take_save(policy).map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
@@ -1206,6 +1328,7 @@ mod bounded_save_tests {
             support_dir: &dir,
             ..policy_for_test(Instant::now() + Duration::from_secs(30))
         };
+        credit_for_test(&mut ledger, policy);
         let (save, reservation) = ledger.take_save(policy).expect("reserved save");
         let charged = ledger.save_bytes_today;
         assert!(charged >= save.bytes() as u64 && charged <= SAVE_DAILY_BYTES as u64);
