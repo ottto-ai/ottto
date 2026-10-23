@@ -2770,3 +2770,74 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
         });
     assert!(!awaits(&scene, &parsed), "an unavailable census");
 }
+
+/// Stage 1 S1-a (§7 exclusion row 31, owner default NO): the proof hook
+/// never spends a continuation page's leftover. On the production
+/// continuation pass (`begin_codex_continuation_side_pass`) with a leftover
+/// that proves the owed child on an ordinary page, nothing is read, no job
+/// starts and the entry is unchanged; the ordinary control spends it.
+#[test]
+fn the_proof_hook_spends_no_continuation_leftover() {
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-continuation-leftover");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    assert_eq!(continuation.kind, CodexPageKind::Continuation);
+    let owed = scene.owed_entry();
+    for _ in 0..3 {
+        let mut page = page_with(leftover);
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            page.singleton_remaining(Limits::current()),
+            leftover,
+            "the leftover is untouched"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None, "no job");
+        assert_eq!(scene.owed_entry(), owed);
+    }
+    let mut page = page_with(leftover);
+    scene.hook(&cache, &mut page);
+    assert!(
+        page.singleton_remaining(Limits::current()) < leftover,
+        "the ordinary page spends it"
+    );
+}
+
+/// Stage 1 S1-a (§7 exclusion row 32): the side sweep never runs on the
+/// production continuation pass, with no held job either: an orphan side
+/// record and the sweep cursor stay as they are until an ordinary page.
+#[test]
+fn the_side_sweep_never_runs_on_a_continuation_pass() {
+    let mut scene = Scene::owed("hook-continuation-sweep");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    let orphan = "/nonexistent/s1a-orphan-rollout.jsonl".to_owned();
+    let record = scene.index.codex_parent_side[&local_index_key(&scene.parent)].clone();
+    scene.index.codex_parent_side.insert(orphan.clone(), record);
+    let side = serde_json::to_value(&scene.index.codex_parent_side).unwrap();
+    let cursor = scene.index.codex_parent_side_cursor.clone();
+    for _ in 0..3 {
+        let mut page = PageBudget::default();
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            serde_json::to_value(&scene.index.codex_parent_side).unwrap(),
+            side,
+            "not swept"
+        );
+        assert_eq!(scene.index.codex_parent_side_cursor, cursor);
+    }
+    scene.hook(&cache, &mut PageBudget::default());
+    assert!(!scene.index.codex_parent_side.contains_key(&orphan));
+}

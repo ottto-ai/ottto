@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 818,
-  "content_sha256": "29f82e9417ec241be2115a7df8b8a4dc4087d43efa5df3b36cc3647274478640",
+  "content_sha256": "70e524a5127c4d60d40eed4d6e18c2401ab6ac3bbece3cdcfc98281ada2fa067",
   "files": [
     {
       "executable": false,
@@ -1581,8 +1581,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b535b9078aeb4eb4aea179d52f8404ef6d5156f2044b704a19cbad71a7f2cbae",
-      "size_bytes": 3351842
+      "sha256": "15cd6d38fd9c0ea5538435231daaefe6eaccbe8f215b02a580aec3e2f632189c",
+      "size_bytes": 3358636
     },
     {
       "executable": false,
@@ -1868,8 +1868,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_proof_use_tests.rs",
-      "sha256": "e15124425bc94ad5fbd149ff645555cdd737e1be2af1485eeab3ebb1b57b1011",
-      "size_bytes": 108329
+      "sha256": "f81ea8ad9e718ae7fd7db1f6d00502637ca024117a3d04ed0ca32142f604de1c",
+      "size_bytes": 111293
     },
     {
       "executable": false,
@@ -1882,8 +1882,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_side_read_tests.rs",
-      "sha256": "0048a51c4320d40e85d653ff67c99df47663c80e525c7a695f1d6263d789f4fc",
-      "size_bytes": 20538
+      "sha256": "5cae448454a65ca747b90a8073b8d674176b14f782880dd5525e54971633000e",
+      "size_bytes": 22989
     },
     {
       "executable": false,
@@ -2022,15 +2022,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor.rs",
-      "sha256": "d5f7050184cac666b2b84bd9c8bf3dc98d9bcc9d9893579d1edc82095961665f",
-      "size_bytes": 221789
+      "sha256": "e39f4046484608fe0f387bde74b83a3efc1183fc360bad4aed5ca1499224bbd7",
+      "size_bytes": 232887
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "68f82968de3c373b1fce4f2a1a51d0b778856ba32ec7de70f1d255bb16075e96",
-      "size_bytes": 389332
+      "sha256": "b7221f6eb186300bccbcd5a7a58b2134da0e36fcb6dc313044972cfe856de9cb",
+      "size_bytes": 412606
     },
     {
       "executable": false,

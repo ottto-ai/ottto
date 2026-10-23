@@ -9662,3 +9662,602 @@ fn a_release_without_a_measure_drops_no_proof() {
     assert!(!cursor_held());
     refuses(overflow, "poisoned cursor");
 }
+
+// Stage 1 S1-a (`stage1/c14c15-answer.md` §7): continuation pages. Inert in
+// production; these drive `OwnedSourceScan::new_continuation` directly.
+
+/// Steps `scan` to completion with the collector's post-policy finalization
+/// (as `page_selections`).
+fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    for _ in 0..100_000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+    panic!("the continuation page did not finish");
+}
+
+/// One continuation page of the paused job whose member index keys are
+/// `members`, over `root` (`days`, `curve` as the ordinary pages used).
+#[allow(clippy::too_many_arguments)]
+fn continuation_page_in(
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    namespace: &str,
+    collected_at: &str,
+    days: u64,
+    curve: bool,
+    members: &BTreeSet<String>,
+    tweak: impl Fn(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new_continuation(
+        std::slice::from_ref(&root.to_path_buf()),
+        index,
+        collected_at,
+        days,
+        10,
+        false,
+        curve,
+        members,
+    );
+    tweak(&mut scan);
+    finish_page(scan.with_sampled_acquisition(Arc::clone(cache), Scope(namespace.into())))
+}
+
+/// `continuation_page_in` over a `ScanRoot` page's settings.
+fn continuation_page(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    members: &BTreeSet<String>,
+    tweak: impl Fn(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    continuation_page_in(
+        &fixture.root,
+        index,
+        cache,
+        "cursor-fixture",
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        true,
+        members,
+        tweak,
+    )
+}
+
+fn page_clock(cache: &SharedCache) -> (u64, u64) {
+    cache
+        .with_cursor(|cursor| (cursor.rotation.page, cursor.proof_rotation.page))
+        .unwrap()
+}
+
+fn paused_unavailable_resumes(cache: &SharedCache) -> Option<u32> {
+    cache
+        .with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => job.cursor.as_ref().map(|meta| meta.unavailable_resumes),
+            Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+        })
+        .flatten()
+}
+
+/// A `ScanRoot` page that leaves SESSION's job paused (scaled budgets), and
+/// the job's member keys.
+fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex, BTreeSet<String>) {
+    let (index, _) = page(fixture, ScanIndex::default(), Some(Arc::clone(cache)));
+    assert_eq!(counter(cache, |c| c.jobs_paused), 1, "{}", counters(cache));
+    let members = cache.paused_members_for_test().expect("paused job");
+    assert_eq!(
+        members,
+        BTreeSet::from([local_index_key(&fixture.file(SESSION))])
+    );
+    (index, members)
+}
+
+/// §7 D: a continuation page selects only the paused job's pending paths:
+/// it resumes the job and leaves every other pending path queued and
+/// unread. It never plans or starts an attempt (`jobs_started`,
+/// `groups_started` unchanged) and pages the job to its one completion,
+/// with the unpaged read's output.
+#[test]
+fn continuation_selects_only_job_paths_and_never_starts_attempts() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let other = fixture.file(SESSION_B);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        // SESSION_B was read as a singleton; queue it again as a fresh
+        // census member the next ordinary page would select.
+        let template = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .find(|pending| pending.path == fixture.file(SESSION))
+            .cloned()
+            .expect("the paused job's path stays pending");
+        let traversal = index.traversal.as_mut().unwrap();
+        if !traversal.pending_candidates.iter().any(|p| p.path == other) {
+            let mut queued = template;
+            queued.path = other.clone();
+            traversal.pending_candidates.push_back(queued);
+        }
+        let entry = |index: &ScanIndex| {
+            serde_json::to_value(index.files.get(&local_index_key(&other))).unwrap()
+        };
+        let other_entry = entry(&index);
+        let started = counter(&cache, |c| c.jobs_started);
+        let groups = counter(&cache, |c| c.groups_started);
+        let mut published = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page(&fixture, index, &cache, &members, |_| {});
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(counter(&cache, |c| c.jobs_started), started);
+            assert_eq!(counter(&cache, |c| c.groups_started), groups);
+            assert!(pending_hint(&index, &other).is_some(), "still queued");
+            assert_eq!(entry(&index), other_entry, "never read");
+            assert!(scan.continuation_ticket().is_none(), "S1-a mints none");
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                published = Some(scan);
+                break;
+            }
+            assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert!(cache.cursor_slot_free());
+        // Only the job's file publishes, as the unpaged read does.
+        let unpaged = fingerprints(&unpaged);
+        let published = fingerprints(&published);
+        assert!(!published.is_empty());
+        assert!(published
+            .iter()
+            .all(|fingerprint| unpaged.contains(fingerprint)));
+    });
+}
+
+/// §7 D (N3): group preparation on a continuation page. The paused group's
+/// selected members are job-owned, so preparation requeues them and starts
+/// no group attempt; the resume pages the same job. `groups_started` stays
+/// one from the first ordinary page to the completion.
+#[test]
+fn continuation_prepares_no_group_attempt() {
+    use crate::snapshots::codex_file_join::tests::usage;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const AT: &str = "2026-10-06T23:00:00Z";
+    fn chain(prefix: &str, created: &str, start: u64) -> Vec<u8> {
+        let mut body = codex_line(json!({"type": "session_meta", "timestamp": created,
+            "payload": {"id": OWNER, "timestamp": created}}));
+        for i in 0..30_u64 {
+            let after = start + 10 * (i + 1);
+            body.extend(codex_line(json!({"type": "token_usage_record",
+                "timestamp": "2026-10-01T10:01:00Z", "payload": {"thread_id": OWNER,
+                "response_id": format!("{prefix}-{i}"), "usage": usage(10),
+                "thread_token_usage": usage(after)}})));
+            let at = format!(
+                "2026-10-01T{:02}:{:02}:{:02}Z",
+                10 + after / 3600,
+                after / 60 % 60,
+                after % 60
+            );
+            body.extend(codex_line(json!({"type": "event_msg", "timestamp": at,
+                "payload": {"type": "token_count", "info": {"last_token_usage": usage(10),
+                "total_token_usage": usage(after)}}})));
+        }
+        body
+    }
+    let dir = Temp::new("group-continuation", b"");
+    fs::remove_file(&dir.0).unwrap();
+    let sessions = dir.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("a.jsonl"),
+        chain("a", "2026-10-01T10:00:00Z", 0),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join("b.jsonl"),
+        chain("b", "2026-10-01T10:30:00Z", 300),
+    )
+    .unwrap();
+    let ordinary = |index: ScanIndex, cache: &Arc<SharedCache>| {
+        finish_page(
+            OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions),
+                index,
+                AT,
+                7,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            )
+            .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into())),
+        )
+    };
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        // Ordinary pages until the group job pauses (a group whose probes
+        // outran a page takes a page of its own first).
+        let mut index = ScanIndex::default();
+        for _ in 0..8 {
+            index = ordinary(index, &cache).0;
+            if cache.paused_members_for_test().is_some() {
+                break;
+            }
+        }
+        let first = cache.counters_for_test();
+        assert_eq!(first.groups_started, 1, "{first:?}");
+        assert!(first.jobs_paused > 0, "{first:?}");
+        let members = cache.paused_members_for_test().expect("paused group");
+        assert_eq!(members.len(), 2, "both members belong to the job");
+        let started = first.jobs_started;
+        for _ in 0..128 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page_in(
+                &sessions,
+                index,
+                &cache,
+                "group-fixture",
+                AT,
+                7,
+                false,
+                &members,
+                |_| {},
+            );
+            index = next;
+            let now = cache.counters_for_test();
+            assert_eq!(now.groups_started, 1, "never restarted: {now:?}");
+            assert_eq!(now.jobs_started, started, "{now:?}");
+            assert_eq!(now.jobs_resumed, resumed + 1, "{now:?}");
+            if now.jobs_certified + now.jobs_uncertified > 0 {
+                assert!(cache.cursor_slot_free());
+                return;
+            }
+            assert!(
+                scan.snapshots.is_empty(),
+                "a paused group publishes nothing"
+            );
+        }
+        panic!(
+            "group job did not complete: {:?}",
+            cache.counters_for_test()
+        );
+    });
+}
+
+/// §7 D: during the bounded walk (pending directories), a continuation page
+/// selects nothing, resumes nothing and does not advance the walk.
+#[test]
+fn continuation_during_walk_is_noop() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let walking = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .front()
+            .cloned()
+            .expect("pending path");
+        let mut directory = walking;
+        directory.path = fixture.root.clone();
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_directories
+            .push_back(directory);
+        let before = cache.counters_for_test();
+        let directories = |index: &ScanIndex| {
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_directories
+                .iter()
+                .map(|pending| pending.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let walk = directories(&index);
+        let (index, scan) = continuation_page(&fixture, index, &cache, &members, |_| {});
+        let after = cache.counters_for_test();
+        assert_eq!(after.jobs_resumed, before.jobs_resumed, "{after:?}");
+        assert_eq!(after.jobs_started, before.jobs_started);
+        assert_eq!(directories(&index), walk, "the walk did not advance");
+        assert!(
+            pending_hint(&index, &path).is_some(),
+            "the job path stays queued"
+        );
+        assert!(!cache.cursor_slot_free(), "still paused");
+        assert!(scan.snapshots.is_empty());
+    });
+}
+
+/// §7 E: a continuation page never ticks the cursor page clock (nor the
+/// proof rotation's); an ordinary page ticks it once.
+#[test]
+fn continuation_does_not_advance_rotation_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let clock = page_clock(&cache);
+        for _ in 0..3 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, _) = continuation_page(&fixture, index, &cache, &members, |_| {});
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(page_clock(&cache), clock, "no tick");
+        }
+        page(&fixture, index, Some(Arc::clone(&cache)));
+        assert_eq!(page_clock(&cache), (clock.0 + 1, clock.0 + 1));
+    });
+}
+
+/// §7 E: waiters keep their turn across continuation pages. A waiter ahead
+/// of a newcomer stays active and ahead for any number of continuation
+/// pages; `WAITER_ACTIVE_PAGES` ordinary pages retire it.
+#[test]
+fn waiters_keep_turn_across_continuation_pages() {
+    let cache = SharedCache::default();
+    let scope = Scope("waiters".into());
+    let note = |continuation: bool| {
+        let mut page = PageBudget::default();
+        if continuation {
+            page.set_continuation();
+        }
+        page.note_page(&cache, &scope);
+        assert!(page.continuation() == continuation);
+    };
+    cache
+        .with_cursor(|cursor| cursor.rotation.wait("waiter"))
+        .unwrap();
+    note(false);
+    let ahead = || {
+        cache
+            .with_cursor(|cursor| {
+                (
+                    cursor.rotation.turn("waiter"),
+                    cursor.rotation.turn("newcomer"),
+                )
+            })
+            .unwrap()
+    };
+    assert_eq!(ahead(), (true, false));
+    for _ in 0..2 * WAITER_ACTIVE_PAGES {
+        note(true);
+        assert_eq!(ahead(), (true, false), "the waiter keeps its turn");
+    }
+    for _ in 0..WAITER_ACTIVE_PAGES {
+        note(false);
+    }
+    assert_eq!(ahead(), (true, true), "ordinary pages retire the waiter");
+}
+
+/// §7 E2: unavailable resumes count ordinary pages only. Continuation pages
+/// whose evidence is unavailable defer the job without counting, however
+/// many; the job then still ends after exactly `UNAVAILABLE_RESUMES`
+/// ordinary pages.
+#[test]
+fn e2_counts_only_ordinary_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    let flipped = |scan: &mut OwnedSourceScan| {
+        scan.sidecar_census_complete = false;
+        scan.context_curve_enabled = !scan.context_curve_enabled;
+    };
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let pages = u64::from(UNAVAILABLE_RESUMES) + 2;
+        for page in 1..=pages {
+            let (next, _) = continuation_page(&fixture, index, &cache, &members, flipped);
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), page);
+            assert_eq!(paused_unavailable_resumes(&cache), Some(0), "uncounted");
+        }
+        assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        for page in 1..=u64::from(UNAVAILABLE_RESUMES) {
+            let (next, _, _) = page_steps(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                flipped,
+                10_000,
+            );
+            index = next;
+            if page < u64::from(UNAVAILABLE_RESUMES) {
+                assert_eq!(paused_unavailable_resumes(&cache), Some(page as u32));
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_unavailable_ended),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(cache.cursor_slot_free());
+        assert_eq!(pending_hint(&index, &path), None, "dequeued");
+    });
+}
+
+/// §7 E2: a continuation page never evicts another namespace's job, stale
+/// or not; an ordinary page of that namespace evicts a stale one.
+#[test]
+fn continuation_never_evicts_a_foreign_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        // Stale: its namespace has not paged for `NAMESPACE_STALE_PAGES`.
+        cache
+            .with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES)
+            .unwrap();
+        assert!(cache.cursor_resume(&Scope("other".into()), true).is_none());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        assert!(!cache.cursor_slot_free());
+        assert!(cache.cursor_resume(&Scope("other".into()), false).is_none());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert!(cache.cursor_slot_free());
+    });
+}
+
+/// §7 A: no page mints a ticket in S1-a. A paused job's attempt is not
+/// known to be accelerated (`accelerate` is S1-b), so its pause mints none;
+/// nor does a page that completes its job, an uncached page, or a page with
+/// no cursor job.
+#[test]
+fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    let (_, uncached) = page(&fixture, ScanIndex::default(), None);
+    assert!(uncached.continuation_ticket().is_none(), "no cursor");
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
+        let paused = cache
+            .with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => job.cursor.as_ref().map(accelerated),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+            })
+            .flatten();
+        assert_eq!(paused, Some(None), "accelerate is unknown");
+        assert!(scan.continuation_ticket().is_none(), "unaccelerated: none");
+        let port = CodexCursorPort::new(Arc::clone(&cache));
+        assert_eq!(port.ticket_for(&scan), None);
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            assert!(scan.continuation_ticket().is_none());
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                return;
+            }
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+/// §7 ready refusals: `cursor_continuation_ready` refuses a foreign,
+/// stale or restarted ticket, and an unaccelerated attempt (unknown in
+/// S1-a, so even the exact paused attempt is refused). A refused ticket
+/// names no members. No IO: only the cursor lock.
+#[test]
+fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        let exact = cache.paused_ticket_for_test().expect("paused job");
+        let ready = |ticket: &CodexCursorTicket| cache.cursor_continuation_ready(ticket);
+        assert_eq!(ready(&exact), Err(ReadyRefusal::Unaccelerated));
+        assert_eq!(cache.continuation_members(&exact), None);
+        let port = CodexCursorPort::new(Arc::clone(&cache));
+        assert!(!port.ready(&exact));
+        assert_eq!(port.members(&exact), None);
+        let foreign = CodexCursorTicket {
+            namespace: ticket_digest(b"namespace", &[b"other"]),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&foreign), Err(ReadyRefusal::Foreign));
+        let other_file = CodexCursorTicket {
+            key: ticket_digest(b"rotation_key", &[b"cursor-fixture", b"/other"]),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&other_file), Err(ReadyRefusal::Stale));
+        let other_generation = CodexCursorTicket {
+            fence: Some(ticket_digest(b"fence", &[b"another generation"])),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&other_generation), Err(ReadyRefusal::Stale));
+        let restarted_attempt = CodexCursorTicket {
+            started: exact.started + 1,
+            ..exact.clone()
+        };
+        assert_eq!(ready(&restarted_attempt), Err(ReadyRefusal::Restarted));
+        let restarted_cache = CodexCursorTicket {
+            epoch: exact.epoch.wrapping_add(1),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&restarted_cache), Err(ReadyRefusal::Restarted));
+        // A fresh cache (a process restart) never matches, and an empty
+        // slot of the same cursor state is stale.
+        let fresh = SharedCache::default();
+        assert_eq!(
+            fresh.cursor_continuation_ready(&exact),
+            Err(ReadyRefusal::Restarted)
+        );
+        let epoch = fresh.with_cursor(|cursor| cursor.id).unwrap();
+        assert_eq!(
+            fresh.cursor_continuation_ready(&CodexCursorTicket {
+                epoch,
+                ..exact.clone()
+            }),
+            Err(ReadyRefusal::Stale)
+        );
+        // The digests bind full, length-prefixed values.
+        assert_ne!(
+            ticket_digest(b"rotation_key", &[b"ab", b"c"]),
+            ticket_digest(b"rotation_key", &[b"a", b"bc"])
+        );
+        assert_eq!(
+            crate::heap_layout_bound::bound(&exact, usize::MAX),
+            Some(std::mem::size_of::<CodexCursorTicket>()),
+            "fixed-size, inline"
+        );
+    });
+}

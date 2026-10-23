@@ -192,9 +192,13 @@ pub(in crate::snapshots) struct PageBudget {
     /// diagnostics window (`SharedCache::cursor_diagnostics`). Boxed so the
     /// by-value scan object stays small.
     window_start: Option<Box<Counters>>,
+    /// Stage 1 (E): a continuation page (`OwnedSourceScan::new_continuation`).
+    /// It only resumes, never ticks the cursor page clock and never counts
+    /// toward E2. Inert until the continuation entry is enabled.
+    continuation: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
-    disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start);
+    disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -291,9 +295,31 @@ impl PageBudget {
         !std::mem::replace(&mut self.proof_claimed, true)
     }
 
+    /// Stage 1 (E): this scan object is a continuation page.
+    pub(in crate::snapshots) fn continuation(&self) -> bool {
+        self.continuation
+    }
+
+    /// Stage 1 (E): mark this scan object a continuation page, before its
+    /// first step.
+    pub(in crate::snapshots) fn set_continuation(&mut self) {
+        self.continuation = true;
+    }
+
     /// Advance the cursor page clock once per scan object (K7, K10). The
     /// diagnostics window opens under this same lock (no extra lock).
+    ///
+    /// Stage 1 (E): a continuation page opens its diagnostics window but
+    /// never ticks the clock, so waiters keep their turn and a paused job's
+    /// staleness counts ordinary pages only. It neither reads nor clears the
+    /// proof-due record: a continuation page never reaches the proof hook.
     pub(in crate::snapshots) fn note_page(&mut self, cache: &SharedCache, namespace: &Scope) {
+        if self.continuation {
+            if !std::mem::replace(&mut self.page_noted, true) {
+                self.window_start = cache.with_cursor(|cursor| Box::new(cursor.counters));
+            }
+            return;
+        }
         if !std::mem::replace(&mut self.page_noted, true) {
             let mut skipped = false;
             self.window_start = cache.with_cursor(|cursor| {
@@ -1742,6 +1768,238 @@ fn record_paused_charge(job: &mut OwnedActiveFile, charge: usize) {
 /// debt or grants read budget.
 pub(in crate::snapshots) fn shrink_paused_buffer(buf: &mut Vec<u8>) {
     buf.shrink_to(buf.len().max(PAUSED_BUFFER_BYTES));
+}
+
+/// Stage 1 hunk A (`stage1/c14c15-answer.md` §1): the cursor binding of one
+/// paused attempt, minted only at the single pause site and checked by
+/// `SharedCache::cursor_continuation_ready` before a continuation page loads
+/// its index. Fixed-size and inline (no heap). The namespace, rotation key
+/// and census generation are bound by length-prefixed SHA-256 digests; the
+/// attempt itself by its exact opened-object stamp and start second, and the
+/// process-local cursor state by its identity. A digest match therefore never
+/// readies a job on its own: the same opened object at the same start in the
+/// same cursor state must also be paused there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CodexCursorTicket {
+    /// `CursorState::id` of the cache that paused the job: a fresh cache (a
+    /// process restart) never matches.
+    epoch: u64,
+    namespace: [u8; 32],
+    key: [u8; 32],
+    /// The job's census generation (K7 fence), when it has one.
+    fence: Option<[u8; 32]>,
+    stamp_open: OpenStamp,
+    started: u64,
+}
+
+impl HeapLayoutBound for CodexCursorTicket {
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // Digests, `OpenStamp` and integers only: nothing on the heap.
+        c.add(0)
+    }
+}
+
+impl CodexCursorTicket {
+    fn of(epoch: u64, meta: &JobMeta) -> Self {
+        Self {
+            epoch,
+            namespace: ticket_digest(b"namespace", &[meta.namespace.as_bytes()]),
+            key: ticket_digest(
+                b"rotation_key",
+                &[meta.namespace.as_bytes(), meta.key.as_bytes()],
+            ),
+            fence: meta
+                .fence
+                .as_deref()
+                .map(|fence| ticket_digest(b"fence", &[fence.as_bytes()])),
+            stamp_open: meta.stamp_open.clone(),
+            started: meta.started,
+        }
+    }
+}
+
+fn ticket_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(b"codex_continuation_ticket:v1\0");
+    hasher.update(domain);
+    for part in parts {
+        hasher.update((part.len() as u64).to_be_bytes());
+        hasher.update(part);
+    }
+    let mut digest = [0_u8; 32];
+    digest.copy_from_slice(&hasher.finalize());
+    digest
+}
+
+/// Stage 1 (§6): whether this attempt may ask for continuation pages.
+/// `JobMeta.accelerate` lands with the guard (S1-b, after #665); until then
+/// it is unknown, and unknown never mints or readies a ticket (fail closed).
+fn accelerated(_meta: &JobMeta) -> Option<bool> {
+    None
+}
+
+/// Stage 1 (§6, E2): the ordinary-equivalent time one resumed page adds to
+/// its attempt (ordinary: the elapsed time; continuation: at least the
+/// ordinary interval). `JobMeta.equiv_secs` lands with the guard (S1-b);
+/// until then the coverage is unknown (`None`) and nothing accrues.
+fn accrue_equivalent(_meta: &mut JobMeta, _continuation: bool) -> Option<std::time::Duration> {
+    None
+}
+
+/// Why `cursor_continuation_ready` refused a ticket. Every refusal sends the
+/// next page to the ordinary cadence.
+#[cfg_attr(not(test), allow(dead_code))] // Read by StateMissing's adapter (inert).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) enum ReadyRefusal {
+    /// The cursor state is poisoned.
+    Unavailable,
+    /// Another cursor state (a restarted cache), or the same file's attempt
+    /// restarted (another opened object or start).
+    Restarted,
+    /// No paused job, or the paused job is another file or generation.
+    Stale,
+    /// The paused job belongs to another namespace.
+    Foreign,
+    /// The attempt is not known to be accelerated (S1-a: always).
+    Unaccelerated,
+}
+
+/// The paused job `ticket` names, under the cursor lock (no IO).
+fn ready_job<'a>(
+    cursor: &'a CursorState,
+    ticket: &CodexCursorTicket,
+) -> std::result::Result<&'a OwnedActiveFile, ReadyRefusal> {
+    if cursor.id != ticket.epoch {
+        return Err(ReadyRefusal::Restarted);
+    }
+    let Slot::Paused(job) = &cursor.slot else {
+        return Err(ReadyRefusal::Stale);
+    };
+    let Some(meta) = job.cursor.as_ref() else {
+        return Err(ReadyRefusal::Stale);
+    };
+    let now = CodexCursorTicket::of(cursor.id, meta);
+    if now.namespace != ticket.namespace {
+        return Err(ReadyRefusal::Foreign);
+    }
+    if now.key != ticket.key || now.fence != ticket.fence {
+        return Err(ReadyRefusal::Stale);
+    }
+    if now.stamp_open != ticket.stamp_open || now.started != ticket.started {
+        return Err(ReadyRefusal::Restarted);
+    }
+    if accelerated(meta) != Some(true) {
+        return Err(ReadyRefusal::Unaccelerated);
+    }
+    Ok(job)
+}
+
+impl SharedCache {
+    /// Stage 1 hunk A: the ticket of a job about to pause at the page's
+    /// exhausted cursor budget, taken before `CursorLease::pause` consumes
+    /// it; the caller keeps it only when the pause returns `Paused`. None for
+    /// a file without a cursor job, a budget not exhausted, or an attempt not
+    /// known to be accelerated (S1-a: every attempt, fail closed).
+    pub(in crate::snapshots) fn continuation_ticket(
+        &self,
+        job: &OwnedActiveFile,
+        page: &PageBudget,
+    ) -> Option<CodexCursorTicket> {
+        let meta = job.cursor.as_ref()?;
+        if !page.cursor_exhausted(Limits::current()) || accelerated(meta) != Some(true) {
+            return None;
+        }
+        let epoch = self.with_cursor(|cursor| cursor.id)?;
+        Some(CodexCursorTicket::of(epoch, meta))
+    }
+
+    /// `cursor_continuation_ready`: whether `ticket`'s attempt is still the
+    /// paused job, for its namespace, in this cursor state, and accelerated.
+    /// Under the cursor lock, with no IO.
+    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    pub(in crate::snapshots) fn cursor_continuation_ready(
+        &self,
+        ticket: &CodexCursorTicket,
+    ) -> std::result::Result<(), ReadyRefusal> {
+        self.with_cursor(|cursor| ready_job(cursor, ticket).map(|_| ()))
+            .unwrap_or(Err(ReadyRefusal::Unavailable))
+    }
+
+    /// Stage 1 (D): the index keys of a ready ticket's job members: the only
+    /// paths a continuation page selects. None unless the ticket is ready.
+    #[cfg_attr(not(test), allow(dead_code))] // StateMissing's entry (inert).
+    pub(in crate::snapshots) fn continuation_members(
+        &self,
+        ticket: &CodexCursorTicket,
+    ) -> Option<BTreeSet<String>> {
+        self.with_cursor(|cursor| {
+            ready_job(cursor, ticket).ok().map(|job| {
+                job_files(job)
+                    .into_iter()
+                    .map(|file| local_index_key(&file.path))
+                    .collect()
+            })
+        })?
+    }
+
+    /// Tests only: the ticket the paused job would carry if it were
+    /// accelerated (S1-b's `accelerate` is unknown in S1-a).
+    #[cfg(test)]
+    pub(in crate::snapshots) fn paused_ticket_for_test(&self) -> Option<CodexCursorTicket> {
+        self.with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => job
+                .cursor
+                .as_ref()
+                .map(|meta| CodexCursorTicket::of(cursor.id, meta)),
+            _ => None,
+        })?
+    }
+
+    /// Tests only: the paused job's member index keys, whatever its ticket.
+    #[cfg(test)]
+    pub(in crate::snapshots) fn paused_members_for_test(&self) -> Option<BTreeSet<String>> {
+        self.with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => Some(
+                job_files(job)
+                    .into_iter()
+                    .map(|file| local_index_key(&file.path))
+                    .collect(),
+            ),
+            _ => None,
+        })?
+    }
+}
+
+/// Stage 1 (N2): the cursor side of a continuation page, as inherent
+/// methods. StateMissing's `CursorContinuation` adapter wraps it in its own
+/// file; nothing in production builds one while continuation pages are
+/// disabled.
+#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
+pub(crate) struct CodexCursorPort {
+    cache: Arc<SharedCache>,
+}
+
+#[cfg_attr(not(test), allow(dead_code))] // StateMissing's adapter (inert).
+impl CodexCursorPort {
+    pub(crate) fn new(cache: Arc<SharedCache>) -> Self {
+        Self { cache }
+    }
+
+    /// Hunk A: the ticket a just-finished Codex page's pause minted.
+    pub(crate) fn ticket_for(&self, scan: &SourceScanResult) -> Option<CodexCursorTicket> {
+        scan.continuation_ticket().cloned()
+    }
+
+    /// `cursor_continuation_ready`, before the page loads its index.
+    pub(crate) fn ready(&self, ticket: &CodexCursorTicket) -> bool {
+        self.cache.cursor_continuation_ready(ticket).is_ok()
+    }
+
+    /// Hunk D: the member index keys the continuation page selects
+    /// (`OwnedSourceScan::new_continuation`); None unless `ready`.
+    pub(crate) fn members(&self, ticket: &CodexCursorTicket) -> Option<BTreeSet<String>> {
+        self.cache.continuation_members(ticket)
+    }
 }
 
 impl CursorLease {
@@ -4060,9 +4318,12 @@ impl SharedCache {
     /// files wait their rotation turn. Only a stale job (not paused or
     /// resumed for `NAMESPACE_STALE_PAGES` cursor pages, so its namespace
     /// stopped scanning) is evicted; its path restarts in its namespace.
+    /// A continuation page (Stage 1, E2) never evicts: it only resumes its
+    /// own namespace's job.
     pub(in crate::snapshots) fn cursor_resume(
         self: &Arc<Self>,
         namespace: &Scope,
+        continuation: bool,
     ) -> Option<(Box<OwnedActiveFile>, CursorLease)> {
         let (job, token) = self.with_cursor(|cursor| {
             let Slot::Paused(job) = &cursor.slot else {
@@ -4075,6 +4336,9 @@ impl SharedCache {
             let live = job.cursor.is_some()
                 && cursor.rotation.page.saturating_sub(cursor.slot_touched) < NAMESPACE_STALE_PAGES;
             if foreign {
+                if continuation {
+                    return None;
+                }
                 if live {
                     cursor.counters.namespace_busy += 1;
                     return None;
@@ -4369,6 +4633,9 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     pub(in crate::snapshots) flags: &'a BTreeMap<String, (bool, bool)>,
     /// The state and sidecar census are complete this page (R1-M1).
     pub(in crate::snapshots) census_complete: bool,
+    /// Stage 1 (E2): this is a continuation page; it never counts toward
+    /// `UNAVAILABLE_RESUMES` and never evicts another namespace's job.
+    pub(in crate::snapshots) continuation: bool,
 }
 
 /// How `resume_paused_job` used the page.
@@ -4392,7 +4659,10 @@ pub(in crate::snapshots) fn resume_paused_job(
     targets: DisclosureTargets<'_>,
 ) -> Resumed {
     let sampling = context.sampling;
-    let Some((mut job, lease)) = sampling.cache.cursor_resume(&sampling.namespace) else {
+    let Some((mut job, lease)) = sampling
+        .cache
+        .cursor_resume(&sampling.namespace, context.continuation)
+    else {
         return Resumed::Idle;
     };
     // E2: a path that no longer names the held object (archived, renamed,
@@ -4440,6 +4710,9 @@ pub(in crate::snapshots) fn resume_paused_job(
         Resume::Valid => {
             if let Some(meta) = job.cursor.as_mut() {
                 meta.unavailable_resumes = 0;
+                // Stage 1 (§6): the call site of the equivalent-time
+                // accrual; its coverage is unknown until S1-b.
+                let _ = accrue_equivalent(meta, context.continuation);
             }
             // This page also selected the job's paths; read them once,
             // through the job, and keep them pending so the census still
@@ -4452,7 +4725,12 @@ pub(in crate::snapshots) fn resume_paused_job(
         }
         // Unavailable evidence is not a member change: the job waits in the
         // slot, its path pending (K9), for at most `UNAVAILABLE_RESUMES`
-        // consecutive pages (E2).
+        // consecutive ordinary pages (E2). A continuation page only defers:
+        // it never counts, so it cannot end the job early (Stage 1).
+        Resume::Unavailable if context.continuation => match lease.defer(job) {
+            PauseEnd::Paused => None,
+            PauseEnd::StateBound(job, disclosure) => Some((job, disclosure)),
+        },
         Resume::Unavailable => {
             let waited = job.cursor.as_mut().map_or(UNAVAILABLE_RESUMES, |meta| {
                 meta.unavailable_resumes = meta.unavailable_resumes.saturating_add(1);
