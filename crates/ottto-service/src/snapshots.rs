@@ -36364,10 +36364,8 @@ impl ScanIndex {
             })
     }
 
-    /// Source-aware daemon load, before replay preparation can save/advance
-    /// the generation. The durable exclusion marker is the active signal:
-    /// there is no separate durable adoption-complete marker. A quarantine
-    /// rebuild returns the same empty generation-0 index as an absent file.
+    /// `load_for_snapshot_source_with_origin` without the origin.
+    #[cfg(test)]
     pub(crate) fn load_for_snapshot_source(
         path: &Path,
         source: SnapshotSource,
@@ -36376,8 +36374,12 @@ impl ScanIndex {
         Ok(Self::load_for_snapshot_source_with_origin(path, source, support_dir)?.0)
     }
 
-    /// `load_for_snapshot_source` plus what the load found (StateMissing M3):
-    /// a missing or quarantined file is a fresh index whatever it holds.
+    /// Source-aware daemon load, before replay preparation can save/advance
+    /// the generation. The durable exclusion marker is the active signal:
+    /// there is no separate durable adoption-complete marker. A quarantine
+    /// rebuild returns the same empty generation-0 index as an absent file.
+    /// It also returns what the load found (StateMissing M3): a missing or
+    /// quarantined file is a fresh index whatever it holds.
     pub(crate) fn load_for_snapshot_source_with_origin(
         path: &Path,
         source: SnapshotSource,
