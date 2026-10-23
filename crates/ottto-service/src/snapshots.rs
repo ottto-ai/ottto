@@ -104,7 +104,7 @@ use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
 pub(crate) use claude_history_upgrade::{PriorHistory, MAX_GATED_CLAUDE_REVISION};
-use claude_reemission_exclusions::{ListState, ReemissionExclusions};
+use claude_reemission_exclusions::{ListState, MemberDirStamp, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
     ClaudeResponseBook, ClaudeSelectorTable, CompactClaudeResponseRecord, CompactClaudeSelector,
@@ -9531,6 +9531,18 @@ impl ClaudeIndexPathMemberRef<'_> {
 /// The re-emission list's seen-marker: prior-history evidence for the gate.
 pub(crate) fn claude_reemission_seen_marker_path(support_dir: &Path) -> PathBuf {
     ReemissionExclusions::seen_marker_path(support_dir)
+}
+
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Member-directory walks the re-emission closure started on this thread.
+#[cfg(test)]
+pub(crate) fn claude_reemission_member_walks_for_test() -> usize {
+    CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST.with(std::cell::Cell::get)
 }
 
 fn claude_index_path_member_ref(path: &Path) -> Option<ClaudeIndexPathMemberRef<'_>> {
@@ -36063,6 +36075,7 @@ impl ScanIndex {
         self.effective_upload_body_witness_revision_excluded_source_files
             .clear();
         self.claude_history_emission = HistoryEmission::default();
+        self.claude_reemission_exclusions.begin_pass();
     }
 
     /// Claude only (MONEY P2), after activating: re-read a file only when its
@@ -36218,7 +36231,7 @@ impl ScanIndex {
         birth_unix_seconds: Option<u64>,
         page: &mut HistoryPage,
     ) -> HistoryDecision {
-        self.close_claude_reemission_list_over_root_members(candidate);
+        self.close_claude_reemission_list_over_family_members(candidate);
         let key = local_index_key(&candidate.path);
         let extent = |size_bytes, modified_unix_seconds, modified_unix_nanos| {
             claude_history_upgrade::FileExtent {
@@ -36262,35 +36275,101 @@ impl ScanIndex {
     }
 
     /// StateMissing M1: a list line may name only a member (`root_stem`). On a
-    /// fresh or replayed index the member is not indexed yet when its root is
-    /// decided, so the load-time closure cannot list the root. Before a root's
-    /// decision, close the list over the members on disk under
-    /// `<root>/subagents/`. The walk is bounded; past the bound, or on a
-    /// directory or entry it cannot read, the root is treated as listed
-    /// (held, never sent).
-    fn close_claude_reemission_list_over_root_members(&mut self, candidate: &CandidateFile) {
+    /// fresh or replayed index the family's members are not indexed yet when
+    /// one of them is decided, so the load-time closure cannot list the root.
+    /// Before the decision of any family candidate, root or subagent, whether
+    /// or not the root file exists and in whatever order the family arrives:
+    /// a listed member lists its root, and otherwise the list is closed over
+    /// the members on disk under `<root>/subagents/`. The walk is bounded;
+    /// past the bound, or on a directory or entry it cannot read, the root is
+    /// treated as listed (held, never sent).
+    ///
+    /// A walk that found no listed member is remembered for the rest of the
+    /// pass (`begin_pass` clears it), with the directory stamp taken before
+    /// it; a later candidate of the family stats the directory again and
+    /// walks again unless the stamp is unchanged. A member created after the
+    /// walk changes the directory's modification time, so it cannot hide
+    /// behind the memo. Only a flat walk of a directory last modified well
+    /// before the walk began is remembered, so nested directories and a
+    /// coarse filesystem clock fall back to walking every time.
+    fn close_claude_reemission_list_over_family_members(&mut self, candidate: &CandidateFile) {
         const MAX_MEMBER_ENTRIES: usize = 4_096;
-        if self.claude_reemission_exclusions.is_empty()
-            || self.claude_reemission_excluded(candidate)
-        {
+        /// A member directory modified this close to the walk is not
+        /// remembered: on a coarse filesystem clock (whole or even seconds) a
+        /// change after the walk could keep the same stamp.
+        const QUIET_BEFORE_WALK: std::time::Duration = std::time::Duration::from_secs(10);
+        if self.claude_reemission_exclusions.is_empty() {
             return;
         }
         let Some(member) = claude_index_path_member_ref(&candidate.path) else {
             return;
         };
-        if member.subagent_stem.is_some() {
+        let root = member.root;
+        if let Some(stem) = member.subagent_stem {
+            // A listed member lists its root, so a later sibling is held
+            // even when its own walk is remembered or never runs.
+            self.claude_reemission_exclusions
+                .close_over_roots(std::iter::once((root, stem)));
+        }
+        if self.claude_reemission_excluded(candidate) {
             return;
         }
-        let root = member.root.to_owned();
-        let mut pending = vec![candidate.path.with_extension("").join("subagents")];
+        let root_directory;
+        let subagents = if member.subagent_stem.is_some() {
+            // The nearest `subagents` ancestor, as the member parser reads it.
+            let Some(subagents) = candidate
+                .path
+                .parent()
+                .and_then(|parent| {
+                    parent.ancestors().find(|ancestor| {
+                        ancestor.file_name().and_then(std::ffi::OsStr::to_str) == Some("subagents")
+                    })
+                })
+                .filter(|subagents| {
+                    subagents
+                        .parent()
+                        .and_then(Path::file_name)
+                        .and_then(std::ffi::OsStr::to_str)
+                        == Some(root)
+                })
+            else {
+                self.claude_reemission_exclusions.list_root(root);
+                return;
+            };
+            subagents
+        } else {
+            root_directory = candidate.path.with_extension("").join("subagents");
+            root_directory.as_path()
+        };
+        // `None` when the directory cannot be stamped: it is walked, never
+        // remembered.
+        let walk_started = SystemTime::now();
+        let stamp: Option<MemberDirStamp> = match fs::metadata(subagents) {
+            Ok(metadata) => metadata
+                .modified()
+                .ok()
+                .map(|modified| Some((modified, metadata.ino()))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(None),
+            Err(_) => None,
+        };
+        if stamp.is_some_and(|stamp| {
+            self.claude_reemission_exclusions
+                .members_walked(root, &stamp)
+        }) {
+            return;
+        }
+        #[cfg(test)]
+        CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST.with(|walks| walks.set(walks.get() + 1));
+        let mut pending = vec![subagents.to_path_buf()];
         let mut members = Vec::new();
         let mut visited = 0_usize;
+        let mut flat = true;
         while let Some(directory) = pending.pop() {
             let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
                 Err(_) => {
-                    self.claude_reemission_exclusions.list_root(&root);
+                    self.claude_reemission_exclusions.list_root(root);
                     return;
                 }
             };
@@ -36303,10 +36382,11 @@ impl ScanIndex {
                 // Past the bound, or an entry that cannot be read (it may be
                 // a listed member): hold the root.
                 let Some((path, kind)) = readable else {
-                    self.claude_reemission_exclusions.list_root(&root);
+                    self.claude_reemission_exclusions.list_root(root);
                     return;
                 };
                 if kind.is_dir() {
+                    flat = false;
                     pending.push(path);
                 } else if kind.is_file() {
                     members.push(path);
@@ -36321,6 +36401,23 @@ impl ScanIndex {
                 .filter(|member| member.root == root)
                 .filter_map(|member| Some((member.root, member.subagent_stem?))),
         );
+        if !flat
+            || self.claude_reemission_exclusions.excludes(root, None)
+            || self.claude_reemission_exclusions.state() == ListState::ClosureOverflow
+        {
+            return;
+        }
+        let quiet = |stamp: &MemberDirStamp| {
+            stamp.map_or(true, |(modified, _)| {
+                modified
+                    .checked_add(QUIET_BEFORE_WALK)
+                    .is_some_and(|quiet_at| quiet_at <= walk_started)
+            })
+        };
+        if let Some(stamp) = stamp.filter(quiet) {
+            self.claude_reemission_exclusions
+                .note_members_walked(root, stamp);
+        }
     }
 
     /// Record a gated candidate before its parse, with the entry's upload
