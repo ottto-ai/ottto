@@ -92,6 +92,9 @@ pub(crate) const SAVE_DAILY_BYTES: usize = 64 * 1024 * 1024;
 const SAVE_BUDGET_FILE: &str = "save-budget.json";
 /// Physical attempted shard writes, charged on the writer's UTC clock.
 const WRITE_BUDGET_FILE: &str = "write-budget.json";
+/// Ledger-owned identity/high-water metadata, independent of replaceable
+/// day counters. Fresh migration is allowed only before this durable witness.
+const QUOTA_WITNESS_FILE: &str = "ledger-identity.json";
 /// The load waits this long, in steps, for each shard's admission; then it
 /// gives up (nothing is lost: the next page asks for the load again).
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
@@ -1166,8 +1169,9 @@ fn load_budget(dir: &Path) -> (u64, u64) {
 }
 
 /// Reads and repairs accounting only on the serialized writer (or store
-/// fixtures). Missing accounting initializes a fresh allowance for upgrades;
-/// damaged accounting quarantines one day. Persist that date once: tomorrow
+/// fixtures). Missing accounting initializes fresh only on the first ledger
+/// migration; later loss and damaged accounting quarantine one day. Persist
+/// that date once: tomorrow
 /// must not become a new hold. Both retain the valid sibling's high-water day.
 fn load_counter(dir: &Path, name: &str) -> (u64, u64) {
     let counters = load_counters(dir, super::utc_day(super::now_unix()));
@@ -1213,19 +1217,51 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
     };
     // Read both before repairing either: a valid sibling's high-water day
     // survives clock rollback, and first initialization cannot hide damage.
-    let saved = read(SAVE_BUDGET_FILE);
-    let written = read(WRITE_BUDGET_FILE);
+    let mut saved = read(SAVE_BUDGET_FILE);
+    let mut written = read(WRITE_BUDGET_FILE);
+    let witness = read(QUOTA_WITNESS_FILE);
+    let first_initialization = matches!(witness, ReadCounter::Missing);
     let valid_day = |counter: &ReadCounter| match counter {
         ReadCounter::Valid((day, _)) => *day,
         _ => 0,
     };
-    let high_day = day.max(valid_day(&saved)).max(valid_day(&written));
+    let high_day = day
+        .max(valid_day(&saved))
+        .max(valid_day(&written))
+        .max(valid_day(&witness));
+    let exhausted = (high_day, SAVE_DAILY_BYTES as u64);
+    let persist = |name: &str, value: Counter| {
+        std::fs::create_dir_all(dir).is_ok()
+            && write_atomic(
+                &dir.join(name),
+                format!("{{\"day\":{},\"bytes\":{}}}", value.0, value.1).as_bytes(),
+            )
+    };
+    if matches!(witness, ReadCounter::Damaged) {
+        // Repair counters before repairing a damaged identity: a crash at
+        // either point cannot reinterpret corruption as a first migration.
+        if !persist(SAVE_BUDGET_FILE, exhausted) || !persist(WRITE_BUDGET_FILE, exhausted) {
+            return (exhausted, exhausted);
+        }
+        saved = ReadCounter::Valid(exhausted);
+        written = ReadCounter::Valid(exhausted);
+    }
+    // Persist first initialization and each new maximum day BEFORE any
+    // fresh counter/ticket/write. A crash here can only lose today's credit.
+    if (!matches!(witness, ReadCounter::Valid((seen, _)) if seen == high_day))
+        && !persist(QUOTA_WITNESS_FILE, (high_day, 0))
+    {
+        return (exhausted, exhausted);
+    }
+    if day < valid_day(&witness) {
+        return (exhausted, exhausted);
+    }
     let repair = |name: &str, counter| match counter {
         ReadCounter::Valid(value) => value,
         _ => {
             let initial = (
                 high_day,
-                if matches!(counter, ReadCounter::Missing) {
+                if first_initialization && matches!(counter, ReadCounter::Missing) {
                     0
                 } else {
                     SAVE_DAILY_BYTES as u64
@@ -1233,12 +1269,7 @@ fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
             );
             // Do not publish a reset before the atomic file and directory
             // sync succeed. Failure remains closed and is retried next read.
-            if std::fs::create_dir_all(dir).is_ok()
-                && write_atomic(
-                    &dir.join(name),
-                    format!("{{\"day\":{},\"bytes\":{}}}", initial.0, initial.1).as_bytes(),
-                )
-            {
+            if persist(name, initial) {
                 initial
             } else {
                 (high_day, SAVE_DAILY_BYTES as u64)
@@ -1665,7 +1696,7 @@ mod bounded_save_tests {
 
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
-    fn broken_or_missing_accounting_preserves_loaded_siblings_and_applies_upgrade_policy() {
+    fn broken_or_deleted_accounting_preserves_siblings_and_exhausts_initialized_day() {
         for missing in [false, true] {
             let scratch = crate::test_scratch::ScratchDir::new("money-quota-load");
             let mut ledger = ClaudeLedger::new_for_test();
@@ -1688,31 +1719,17 @@ mod bounded_save_tests {
             } else {
                 std::fs::write(path, b"broken").unwrap();
             }
-            let physical_used = load_counter(&scratch.join(LEDGER_DIR), WRITE_BUDGET_FILE).1;
             let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
             assert_eq!(loaded.get(key), Some(&record));
             assert!(!loaded.load_damaged);
-            assert_eq!(
-                loaded.save_bytes_today,
-                if missing { 0 } else { SAVE_DAILY_BYTES as u64 }
-            );
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
             // Exercise the actual async writer request, not just the parser.
             assert!(submit(Job::Reserve(scratch.to_path_buf(), loaded.save_day)).is_ok());
             flush();
             take_results(&scratch, &mut loaded);
-            assert_eq!(
-                loaded.save_credit,
-                if missing { SAVE_BYTES_PER_PAGE } else { 0 }
-            );
+            assert_eq!(loaded.save_credit, 0);
             assert_eq!(loaded.get(key), Some(&record));
-            assert_eq!(
-                loaded.save_bytes_today,
-                if missing {
-                    physical_used + SAVE_BYTES_PER_PAGE as u64
-                } else {
-                    SAVE_DAILY_BYTES as u64
-                }
-            );
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
         }
     }
     #[test]
@@ -1743,6 +1760,8 @@ mod bounded_save_tests {
                     .2,
                 0
             );
+            // Model an actual pre-witness upgrade, not deletion after use.
+            std::fs::remove_file(dir.join(QUOTA_WITNESS_FILE)).unwrap();
             for counter in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
                 if name.is_none() || name == Some(counter) {
                     let path = dir.join(counter);
@@ -1792,6 +1811,63 @@ mod bounded_save_tests {
         }
         println!("MONEY_P1B_QUOTA_RECOVERY upgrade_hold_days=0 corrupt_hold_days=1 missing_save_hold_days=0 next_day_ticket={} rollback_grant=0", SAVE_BYTES_PER_PAGE);
     }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn deleting_both_counters_after_spending_never_grants_repeat_credit() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-quota-deletion");
+        let dir = scratch.join(LEDGER_DIR);
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let tomorrow = super::super::utc_day(midnight + 86_400);
+        let key = "fam:deletion-sibling";
+        let record =
+            ClaudeRequestCensusRecord::family_record([3; 32], midnight, Default::default());
+        let mut ledger = ClaudeLedger::new_for_test();
+        ledger.insert(key.to_owned(), record.clone());
+        assert_eq!(
+            save_page_for_test(&scratch, &mut ledger, &mut WriterState::default())
+                .unwrap()
+                .2,
+            0
+        );
+        assert!(dir.join(QUOTA_WITNESS_FILE).exists());
+        // Spend the remainder after the first non-refundable save ticket.
+        while reserve_credit(&scratch, today).bytes > 0 {}
+        for _ in 0..3 {
+            for name in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            restart_for_test(&scratch);
+            let loaded = load(&scratch).unwrap();
+            assert_eq!(loaded.get(key), Some(&record));
+            assert_eq!(reserve_credit(&scratch, today).bytes, 0);
+            assert_eq!(
+                load_counters(&dir, today),
+                (
+                    (today, SAVE_DAILY_BYTES as u64),
+                    (today, SAVE_DAILY_BYTES as u64)
+                )
+            );
+            WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight].into());
+            assert!(!write_shard(&dir, 0, b"{}"));
+        }
+        assert_eq!(
+            reserve_credit(&scratch, tomorrow).bytes,
+            SAVE_BYTES_PER_PAGE
+        );
+        // The ledger witness retains the maximum day even if BOTH counters
+        // disappear and the wall clock rolls back.
+        for name in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        restart_for_test(&scratch);
+        assert_eq!(reserve_credit(&scratch, today).bytes, 0);
+        assert_eq!(reserve_credit(&scratch, tomorrow).bytes, 0);
+        let later = super::super::utc_day(midnight + 2 * 86_400);
+        assert_eq!(reserve_credit(&scratch, later).bytes, SAVE_BYTES_PER_PAGE);
+        println!("MONEY_P1B_QUOTA_DELETION restarts=3 same_day_extra_tickets=0 rollback_grant=0 next_day_ticket={SAVE_BYTES_PER_PAGE}");
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn quota_repair_keeps_sibling_high_water_and_failed_repairs_closed() {
