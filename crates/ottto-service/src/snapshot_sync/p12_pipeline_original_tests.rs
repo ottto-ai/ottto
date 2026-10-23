@@ -708,6 +708,7 @@ impl RearmFixture {
                     RearmUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     })),
                     RearmUpload::AckLost => Err(anyhow!(
                         "synthetic request offered; response ACK unavailable"
@@ -747,6 +748,7 @@ impl RearmFixture {
                 comparison_completion
                     .as_mut()
                     .map(NativeSelectedRestore::Paid),
+                Some(UnsettledUploadCause::Shed),
             )
             .expect("checkpoint shed page");
             return RearmPage {

@@ -324,6 +324,73 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
+/// The fold builds Claude sizes from the retained boundaries and owned
+/// requests, so a Tail pass that sees the next request gives the full read's
+/// sizes. Rebuilt here with every request owned, as for an exclusive root.
+#[test]
+fn sampled_native_claude_compaction_sizes_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let rebuilt = |mut items: Vec<SnapshotItem>| {
+        let mut item = items.remove(0);
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        rebuild_claude_context_posture(&mut item, &owned, None);
+        item
+    };
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "compactMetadata":{"trigger":"manual","preTokens":900000}}));
+    let (retained, _, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+    assert!(retained.is_some());
+    let first = rebuilt(items);
+    assert_eq!(
+        first.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: "2026-10-07T10:30:05Z".to_string(),
+            before: first.first_turn_context_tokens,
+            after: None,
+            trigger: Some("manual".to_string()),
+        }]
+    );
+
+    fixture.append(&usage(source, 40, 1, "claude-opus-4-8"));
+    let (_, mode, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
+    assert_eq!(mode, ReadMode::Tail);
+    let tail = rebuilt(items);
+    let mut full = parse_claude_code_jsonl_file_with_artifacts(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        false,
+    )
+    .unwrap();
+    apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
+    let full = rebuilt(full);
+    assert_eq!(
+        tail.compaction_events[0].before,
+        first.first_turn_context_tokens
+    );
+    assert_eq!(
+        tail.compaction_events[0].after,
+        tail.last_turn_context_tokens
+    );
+    assert!(tail.compaction_events[0].after.is_some());
+    assert_eq!(tail.compaction_events, full.compaction_events);
+    assert_eq!(tail.local_context_points, full.local_context_points);
+}
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -2680,6 +2747,75 @@ fn sampled_production_recent_tail_survives_older_full_scan_pressure() {
             production_scan(&live, source, ScanIndex::default(), None, "scan-pressure");
         assert_eq!(production_body(source, tail), production_body(source, full));
     }
+}
+
+/// U1a-2a: `unsealed` is set on both `retain_reduction` returns, and a side
+/// certificate carries the same bit without a retained copy or any
+/// `cache_lifecycle` event (U-T64(d)).
+#[test]
+fn side_certificate_reports_unsealed_without_cache_events() {
+    use crate::local_resource_diagnostics::cache_lifecycle::{observe, Counts};
+    let fixture = Fixture::new(SnapshotSource::Codex);
+    fixture.append(&usage(SnapshotSource::Codex, 100, 0, "gpt-5.5"));
+    let certify = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        assert!(matches!(
+            parser.prepare_acquisition(None, &scope, None, 100).unwrap(),
+            ReadMode::Full(_)
+        ));
+        while !parser.step().unwrap() {}
+        observe(|| parser.certify_without_retention(&scope, 100).unwrap())
+    };
+    let retain = |fixture: &Fixture| {
+        let (mut parser, _, scope) = native_parser(fixture, SnapshotSource::Codex);
+        parser.prepare_acquisition(None, &scope, None, 100).unwrap();
+        while !parser.step().unwrap() {}
+        observe(|| {
+            parser
+                .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+                .unwrap()
+                .unwrap()
+        })
+    };
+    let len = fixture.0.metadata().unwrap().len();
+    let (sealed, sealed_events) = retain(&fixture);
+    assert!(!sealed.unsealed);
+    assert_eq!(sealed_events.retention_unsealed_eof, 0);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("a complete loss-free read is certified");
+    };
+    assert_eq!(held, len);
+    assert!(!completed.unsealed);
+    assert!(completed.reduction.is_none());
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
+
+    // A valid final row without its newline is applied at native EOF.
+    let mut file = OpenOptions::new().append(true).open(&fixture.0).unwrap();
+    serde_json::to_writer(&mut file, &usage(SnapshotSource::Codex, 140, 1, "gpt-5.5")).unwrap();
+    drop(file);
+    let grown = fixture.0.metadata().unwrap().len();
+    let (unsealed, unsealed_events) = retain(&fixture);
+    assert!(unsealed.unsealed);
+    assert!(unsealed.reduction.is_none());
+    assert_eq!(unsealed_events.retention_unsealed_eof, 1);
+    let (certificate, events) = certify(&fixture);
+    assert_eq!(events, Counts::default());
+    let sampled_jsonl::SideCertificate::Certified {
+        completed,
+        len: held,
+    } = certificate
+    else {
+        panic!("an unsealed read is still certified through its sealed prefix");
+    };
+    assert_eq!(held, grown);
+    assert!(completed.unsealed);
+    assert_eq!(completed.checkpoint.sealed_offset(), len);
 }
 
 /// Codex rollout with two compaction shapes: a marker followed by an exact

@@ -6,6 +6,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub(crate) mod cache_lifecycle;
 pub(crate) mod codex_memo_lifecycle;
+#[cfg_attr(not(test), allow(dead_code))] // first production callers are the side rows
+pub(crate) mod codex_side_lifecycle;
 
 const SCHEMA_VERSION: u8 = 2;
 
@@ -36,6 +38,51 @@ pub(crate) fn codex_memo_lifecycle_totals(source: &str) {
 /// session scalars for a resource limit (SOURCE Amendment 7). Counts only.
 pub(crate) fn claude_context_resource_withhold(counts: &impl Serialize) {
     traversal_point("claude_context_resource_withhold", "claude_code", counts);
+}
+
+/// Cumulative shared-process Codex parent side-record totals (U1a-2a):
+/// lifetime counters plus last-measured gauges, NOT events attributed to the
+/// finishing page/source. Codex scans only.
+pub(crate) fn codex_side_lifecycle_totals(source: &str) {
+    if source == "codex" {
+        traversal_point(
+            "process_codex_side_lifecycle_totals",
+            "codex",
+            &codex_side_lifecycle::snapshot(),
+        );
+    }
+}
+
+/// The two point lines of one side read (`codex_side_lifecycle::SideReadGuard`).
+pub(crate) enum SideReadPoint {
+    Start { pseq: u64, attempts: u8 },
+    End { pseq: u64, abandoned: bool },
+}
+
+/// One content-free line per side read start or end, on the existing
+/// best-effort stderr carrier. With `process_id`, a start that has no matching
+/// end before a new `process_id` is the only crash evidence; nothing is
+/// persisted, and no CPU/RSS sample is taken.
+pub(crate) fn side_read_point(point: SideReadPoint) {
+    #[derive(Serialize)]
+    struct Start {
+        pseq: u64,
+        attempts: u8,
+    }
+    #[derive(Serialize)]
+    struct End {
+        pseq: u64,
+        #[serde(skip_serializing_if = "std::ops::Not::not")]
+        abandoned: bool,
+    }
+    match point {
+        SideReadPoint::Start { pseq, attempts } => {
+            traversal_point("side_read_start", "codex", &Start { pseq, attempts })
+        }
+        SideReadPoint::End { pseq, abandoned } => {
+            traversal_point("side_read_end", "codex", &End { pseq, abandoned })
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -1190,6 +1237,97 @@ mod tests {
         assert_eq!(actual[0]["stage"], record["stage"]);
         let (_, none) = capture(|| codex_memo_lifecycle_totals("claude_code"));
         assert!(none.is_empty());
+    }
+
+    #[test]
+    fn codex_side_lifecycle_record_is_bounded_and_explicitly_process_global() {
+        let (_, records) = capture(|| {
+            traversal_point(
+                "process_codex_side_lifecycle_totals",
+                "codex",
+                &codex_side_lifecycle::Record::maximum(),
+            );
+        });
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record["stage"], "process_codex_side_lifecycle_totals");
+        assert_eq!(record["source"], "codex");
+        let keys: Vec<_> = record["counts"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        // Option B: exactly ten lifetime totals and five last-measured gauges.
+        assert_eq!(
+            keys,
+            [
+                "side_ledger_entries",
+                "side_ledger_evictions",
+                "side_not_due",
+                "side_proof_drops",
+                "side_proof_release_drops",
+                "side_reads_ended",
+                "side_reads_started",
+                "side_record_bytes",
+                "side_records",
+                "side_records_written",
+                "side_refusals",
+                "side_request_bytes",
+                "side_requests",
+                "side_requests_rearmed",
+                "side_requests_tombstoned",
+            ]
+        );
+        assert!(record["counts"]
+            .as_object()
+            .unwrap()
+            .values()
+            .all(|value| *value == u64::MAX));
+        assert!(record["observation"]["shared_process_cpu_delta_us"].is_null());
+        assert!(record["observation"]["process_lifetime_max_rss_bytes"].is_null());
+        let width = serde_json::to_string(record).unwrap().len();
+        println!("CODEX_SIDE_LIFECYCLE_MAX_WIDTH bytes={width}");
+        assert!(width < 2048);
+        let (_, actual) = capture(|| codex_side_lifecycle_totals("codex"));
+        assert_eq!(actual.len(), 1);
+        assert_eq!(actual[0]["stage"], record["stage"]);
+        let (_, none) = capture(|| codex_side_lifecycle_totals("claude_code"));
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn side_read_lines_are_one_start_and_at_most_one_end_per_read() {
+        use codex_side_lifecycle::{observe, SideReadGuard};
+        let ((_, lines), counts) = observe(|| {
+            capture(|| {
+                SideReadGuard::start(3).end();
+                drop(SideReadGuard::start(7));
+            })
+        });
+        assert_eq!(counts.side_reads_started, 2);
+        assert_eq!(counts.side_reads_ended, 2);
+        let stages: Vec<_> = lines.iter().map(|line| line["stage"].clone()).collect();
+        assert_eq!(
+            stages,
+            [
+                "side_read_start",
+                "side_read_end",
+                "side_read_start",
+                "side_read_end"
+            ]
+        );
+        assert_eq!(lines[0]["counts"]["attempts"], 3);
+        assert_eq!(lines[0]["counts"]["pseq"], lines[1]["counts"]["pseq"]);
+        assert!(lines[1]["counts"].get("abandoned").is_none());
+        assert_eq!(lines[2]["counts"]["pseq"], lines[3]["counts"]["pseq"]);
+        assert_ne!(lines[0]["counts"]["pseq"], lines[2]["counts"]["pseq"]);
+        assert_eq!(lines[3]["counts"]["abandoned"], true);
+        for line in &lines {
+            assert_eq!(line["source"], "codex");
+            assert!(line["process_id"].is_u64());
+            assert!(serde_json::to_string(line).unwrap().len() < 2048);
+        }
     }
 
     #[test]

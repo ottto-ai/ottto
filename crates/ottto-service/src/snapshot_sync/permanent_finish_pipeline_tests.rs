@@ -621,3 +621,8 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
 pub(crate) mod prior_index_lifetime_tests {
     include!("prior_index_lifetime_tests.rs");
 }
+
+// Same real prepare/finish pipeline; owns a test-thread re-offer clock.
+pub(crate) mod reason_reoffer_pipeline_tests {
+    include!("reason_reoffer_pipeline_tests.rs");
+}

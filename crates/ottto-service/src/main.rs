@@ -110,6 +110,20 @@ enum Command {
         #[arg(long = "private-upload-payload-out")]
         private_upload_payload_out: Option<PathBuf>,
     },
+    /// Inspect (`--plan`, read-only) or remove (`--apply`) abandoned snapshot
+    /// checkpoint temp files under a support directory. `--apply` refuses the
+    /// daemon's own support directory, which the daemon cleans at startup.
+    #[command(hide = true)]
+    LocalStateSweep {
+        #[arg(long)]
+        support_dir: PathBuf,
+        #[arg(long, conflicts_with = "apply", required_unless_present = "apply")]
+        plan: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -246,6 +260,20 @@ fn main() -> Result<()> {
                 &mut output,
             )?;
         }
+        Command::LocalStateSweep {
+            support_dir,
+            plan: _,
+            apply,
+            json,
+        } => {
+            #[cfg(unix)]
+            ottto_service::run_local_state_sweep_command(&support_dir, apply, json)?;
+            #[cfg(not(unix))]
+            {
+                let _ = (support_dir, apply, json);
+                anyhow::bail!("local-state-sweep is supported only on unix");
+            }
+        }
         Command::Status { json } => {
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
@@ -275,12 +303,7 @@ fn main() -> Result<()> {
                 ottto_service::control_plane_health::mark_serving(
                     ottto_service::control_plane_health::ControlTransport::UnixSocket,
                 );
-                cleanup_legacy_services_at_startup();
-                if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
-                    eprintln!("pending relay credential recovery deferred");
-                }
-                ottto_service::claude_browser_auth::recover_at_startup();
-                ottto_service::codex_sign_in::recover_at_startup();
+                prepare_to_serve(!once);
                 let token = load_or_create_control_token()?;
                 let daemon = LocalDaemon::new(
                     local_machine(),
@@ -318,12 +341,7 @@ fn main() -> Result<()> {
             } else {
                 ottto_service::control_plane_health::ControlTransport::UnixSocket
             });
-            cleanup_legacy_services_at_startup();
-            if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
-                eprintln!("pending relay credential recovery deferred");
-            }
-            ottto_service::claude_browser_auth::recover_at_startup();
-            ottto_service::codex_sign_in::recover_at_startup();
+            prepare_to_serve(true);
             let token = load_or_create_control_token()?;
             let daemon = LocalDaemon::new(
                 local_machine(),
@@ -511,6 +529,59 @@ impl ServiceCommand {
             | ServiceCommand::WriteLaunchAgent { json, .. }
             | ServiceCommand::Bootstrap { json, .. } => *json,
         }
+    }
+}
+
+/// Startup work of `serve` and `serve-xpc`, in the order it runs. All of it
+/// runs before the control token, the daemon, its relays and any listener;
+/// the local state sweep runs last, after the recovery hooks and before any
+/// snapshot worker can start a save.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupStep {
+    CleanupLegacyServices,
+    RecoverPendingDeviceCredential,
+    RecoverClaudeBrowserAuth,
+    RecoverCodexSignIn,
+    SweepLocalState,
+}
+
+fn startup_steps(sweep_local_state: bool) -> Vec<StartupStep> {
+    let mut steps = vec![
+        StartupStep::CleanupLegacyServices,
+        StartupStep::RecoverPendingDeviceCredential,
+        StartupStep::RecoverClaudeBrowserAuth,
+        StartupStep::RecoverCodexSignIn,
+    ];
+    if sweep_local_state && cfg!(unix) {
+        steps.push(StartupStep::SweepLocalState);
+    }
+    steps
+}
+
+fn run_startup_step(step: StartupStep) {
+    match step {
+        StartupStep::CleanupLegacyServices => cleanup_legacy_services_at_startup(),
+        StartupStep::RecoverPendingDeviceCredential => {
+            if ottto_service::control::recover_pending_device_credential_at_startup().is_err() {
+                eprintln!("pending relay credential recovery deferred");
+            }
+        }
+        StartupStep::RecoverClaudeBrowserAuth => {
+            ottto_service::claude_browser_auth::recover_at_startup()
+        }
+        StartupStep::RecoverCodexSignIn => ottto_service::codex_sign_in::recover_at_startup(),
+        StartupStep::SweepLocalState => {
+            #[cfg(unix)]
+            ottto_service::sweep_local_state_at_startup();
+        }
+    }
+}
+
+/// Everything `serve` and `serve-xpc` do before their first relay or
+/// listener. `serve --once` skips the local state sweep.
+fn prepare_to_serve(sweep_local_state: bool) {
+    for step in startup_steps(sweep_local_state) {
+        run_startup_step(step);
     }
 }
 
@@ -857,8 +928,89 @@ fn current_os() -> OperatingSystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
     use std::ffi::OsString;
     use std::fs;
+
+    #[test]
+    fn local_state_sweep_needs_exactly_one_of_plan_and_apply() {
+        let parse = |flags: &[&str]| {
+            let mut args = vec!["ottto-service", "local-state-sweep", "--support-dir", "/x"];
+            args.extend_from_slice(flags);
+            Cli::try_parse_from(args).map(|cli| cli.command)
+        };
+        assert!(parse(&["--plan", "--apply"]).is_err());
+        assert!(parse(&[]).is_err());
+        assert!(matches!(
+            parse(&["--plan"]),
+            Ok(Some(Command::LocalStateSweep {
+                plan: true,
+                apply: false,
+                ..
+            }))
+        ));
+        assert!(matches!(
+            parse(&["--apply", "--json"]),
+            Ok(Some(Command::LocalStateSweep {
+                plan: false,
+                apply: true,
+                json: true,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn local_state_sweep_is_hidden_from_help() {
+        let help = Cli::command().render_long_help().to_string();
+        assert!(help.contains("serve-xpc"), "{help}");
+        assert!(!help.contains("local-state-sweep"), "{help}");
+    }
+
+    #[test]
+    fn local_state_sweep_runs_last_in_startup_and_only_without_once() {
+        let recovery = [
+            StartupStep::CleanupLegacyServices,
+            StartupStep::RecoverPendingDeviceCredential,
+            StartupStep::RecoverClaudeBrowserAuth,
+            StartupStep::RecoverCodexSignIn,
+        ];
+        let mut with_sweep = recovery.to_vec();
+        if cfg!(unix) {
+            with_sweep.push(StartupStep::SweepLocalState);
+        }
+        assert_eq!(startup_steps(true), with_sweep);
+        assert_eq!(startup_steps(false), recovery.to_vec());
+    }
+
+    /// `serve` and `serve-xpc` finish their startup steps, including the
+    /// local state sweep, before they build the daemon and start relays.
+    #[test]
+    fn local_state_sweep_and_recovery_precede_relays_in_serve_commands() {
+        let source = include_str!("main.rs");
+        let source = &source[..source.find("#[cfg(test)]\nmod tests {").unwrap()];
+        let arm = |start: &str, end: &str| {
+            let from = source.find(start).expect("command arm");
+            &source[from..from + source[from..].find(end).expect("next arm")]
+        };
+        for (arm, prepare) in [
+            (
+                arm("Command::Serve { socket, once } =>", "Command::ServeXpc {"),
+                "prepare_to_serve(!once);",
+            ),
+            (
+                arm("Command::ServeXpc {", "Command::Service { command } =>"),
+                "prepare_to_serve(true);",
+            ),
+        ] {
+            let at = |needle: &str| arm.find(needle).unwrap_or_else(|| panic!("{needle}"));
+            assert_eq!(arm.matches("prepare_to_serve(").count(), 1, "{arm}");
+            assert!(at(prepare) < at("load_or_create_control_token()"), "{arm}");
+            assert!(at(prepare) < at("LocalDaemon::new("), "{arm}");
+            assert!(at(prepare) < at("start_builtin_relays(&daemon)"), "{arm}");
+            assert!(!arm.contains("sweep_local_state_at_startup"), "{arm}");
+        }
+    }
 
     #[test]
     fn service_bootstrap_clears_disabled_state_before_bootstrap() {
