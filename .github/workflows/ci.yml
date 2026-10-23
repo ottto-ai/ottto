@@ -159,6 +159,21 @@ jobs:
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
           CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
           CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          # Isolated processes measure current RSS with the same pre-generated
+          # M4 input and armed P1 resident; allocator audits stay inactive.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_RSS_OUTPUT="$RUNNER_TEMP/money-base-rss.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_rss_fixture_receipt -- --nocapture
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_RSS_OUTPUT="$RUNNER_TEMP/money-head-rss.json" cargo test -p ottto-service --lib --locked money_gate_off_rss_fixture_receipt -- --nocapture
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_ISOLATED_RSS=1 cargo test -p ottto-service --lib --locked money_m4_sized_ledger_and_page_are_measured -- --nocapture
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          base = json.loads((root / "money-base-rss.json").read_text())
+          head = json.loads((root / "money-head-rss.json").read_text())
+          assert base["ledger_hashes"] == head["ledger_hashes"] == 554400
+          result = {"baseline_release": "0.1.189", "baseline_source": "dba838f067ed58f8d45f6af1a6cabae1e08fc837", "base_rss_bytes": base["rss_median_bytes"], "head_rss_bytes": head["rss_median_bytes"], "delta_bytes": head["rss_median_bytes"] - base["rss_median_bytes"], "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
+          (root / "money-rss-comparison.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
+          PY
           diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         if: always()

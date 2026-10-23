@@ -1168,6 +1168,10 @@ fn money_gate_off_saved_fixture_receipt() {
             "OFF must not write the saved money ledger"
         );
         let saved_value = serde_json::to_value(&saved).unwrap();
+        if history == 0 {
+            let field_bytes = saved_value.as_object().unwrap().iter().map(|(key, value)| (key, serde_json::to_vec(value).unwrap().len())).collect::<BTreeMap<_, _>>();
+            eprintln!("MONEY_GATE_OFF_INDEX_FIELDS {}", serde_json::to_string(&field_bytes).unwrap());
+        }
         if let Ok(output) = std::env::var("OTTTO_MONEY_PARITY_OUTPUT") {
             let path = format!("{output}.index-{history}.json");
             std::fs::write(path, serde_json::to_vec_pretty(&saved_value).unwrap()).unwrap();
@@ -1373,4 +1377,83 @@ fn money_saved_ledger_files(support: &Path) -> Vec<(String, u64, String, std::ti
         .collect::<Vec<_>>();
     files.sort();
     files
+}
+
+// Run in its own exact-filter process, after the shared saved-input generator.
+// No allocator audit is active: these are current kernel RSS samples, not
+// born-in-scope allocation peaks or the parallel suite's lifetime maximum.
+fn money_fixture_rss_bytes() -> u64 {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap()
+        * 1024
+}
+
+#[test]
+#[serial]
+#[serial(claude_request_money_shadow)]
+fn money_gate_off_rss_fixture_receipt() {
+    let (Ok(base), Ok(output)) = (
+        std::env::var("OTTTO_MONEY_PARITY_ROOT"),
+        std::env::var("OTTTO_MONEY_RSS_OUTPUT"),
+    ) else {
+        return;
+    };
+    let base = PathBuf::from(base);
+    assert!(
+        base.join("m4-saved-inputs/index.json").exists(),
+        "prepare shared inputs in a separate process first"
+    );
+    let support = PathBuf::from(format!("{output}.state"));
+    if support.exists() {
+        std::fs::remove_dir_all(&support).unwrap();
+    }
+    std::fs::create_dir_all(&support).unwrap();
+    let index: ScanIndex = serde_json::from_value(money_m4_saved_inputs(&base, &support)).unwrap();
+    use crate::snapshots::claude_request_money as money;
+    money::enable_shadow_for_test(&support);
+    drop(money::store::acquire(&support));
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let (records, hashes) = loop {
+        if let Some(counts) = money::store::with_ledger_for_test(&support, |ledger| {
+            (
+                ledger.census().record_count(),
+                ledger.census().hash_total_for_test(),
+            )
+        }) {
+            break counts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "P1 resident load did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(hashes, 554_400);
+    money::shadow_page_at(
+        &support,
+        &[],
+        &index,
+        &Default::default(),
+        &Default::default(),
+        true,
+        1_785_653_000,
+    );
+    money::store::flush();
+    let _ = money_fixture_rss_bytes();
+    let mut samples = [0_u64; 3];
+    for sample in &mut samples {
+        *sample = money_fixture_rss_bytes();
+    }
+    samples.sort_unstable();
+    let receipt = serde_json::json!({"rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
+    std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    eprintln!("MONEY_RSS_OFF_FIXTURE median_bytes={} samples={samples:?} p1_shadow_enabled=true live_gate=false hashes={hashes} matched_source_build_fixture=true release_daemon_rss=false", samples[1]);
 }

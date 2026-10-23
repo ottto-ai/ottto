@@ -2765,8 +2765,28 @@ fn money_m4_sized_ledger_and_page_are_measured() {
             debt: 0,
         },
     );
+    fn fixture_rss() -> u64 {
+        let output = std::process::Command::new("/bin/ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+        assert!(output.status.success());
+        std::str::from_utf8(&output.stdout).unwrap().trim().parse::<u64>().unwrap() * 1024
+    }
+    // Touch the test-only pointer inventory before either sample so its fixed
+    // pages do not masquerade as live daemon custody growth.
+    let _ = crate::retry_allocation_probe::measure_caller_thread(|| ());
+    let p1_resident_rss = std::env::var_os("OTTTO_MONEY_ISOLATED_RSS").is_some().then(|| {
+        let _ = fixture_rss();
+        let mut samples = [fixture_rss(), fixture_rss(), fixture_rss()];
+        samples.sort_unstable();
+        samples[1]
+    });
     let (_, live_native) = crate::retry_allocation_probe::measure_caller_thread(||
         super::claude_request_money::custody_tests::admit_m4(&mut ledger, &index, now));
+    if let Some(p1_resident_rss) = p1_resident_rss {
+        let mut samples = [fixture_rss(), fixture_rss(), fixture_rss()];
+        samples.sort_unstable();
+        let live_resident_rss = samples[1];
+        eprintln!("MONEY_RSS_LIVE_FIXTURE p1_resident_bytes={p1_resident_rss} live_resident_bytes={live_resident_rss} delta_bytes={} current_kernel_rss=true observer_inventory_warmed=true isolated_test_process=true live_custody_admission=true release_daemon_rss=false", i128::from(live_resident_rss) - i128::from(p1_resident_rss));
+    }
     let build_ms = started.elapsed().as_millis();
     let index_census = index.claude_request_census_for_test();
     let index_bytes = index_census.exact_serialized_len_for_test();
