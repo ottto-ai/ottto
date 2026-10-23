@@ -1707,8 +1707,10 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
     ) -> Result<String> {
+        // The shared upload agent follows redirects and pools nothing (see
+        // `timeout_agent`), so a per-call credential agent loses no warm socket.
         self.issue_relay_token_with_agent(
-            &self.agent,
+            &credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
             device,
             device_secret,
             source,
@@ -3001,7 +3003,16 @@ fn validate_cloud_session_scan_receipt(
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
-    crate::retry_tls::agent_builder()
+    with_snapshot_timeouts(crate::retry_tls::agent_builder(), read_timeout)
+}
+
+/// `timeout_agent` for a request that carries the device secret: no redirects.
+fn credential_timeout_agent(read_timeout: Duration) -> ureq::Agent {
+    with_snapshot_timeouts(crate::retry_tls::credential_agent_builder(), read_timeout)
+}
+
+fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -> ureq::Agent {
+    builder
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
@@ -3086,14 +3097,13 @@ fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Durat
     if dns_timeout.is_zero() || request_timeout.is_zero() {
         return Err(anyhow!("cloud-session request deadline is too small"));
     }
-    let agent = crate::retry_tls::agent_builder()
+    // Cloud-session requests carry either the long-lived device secret or
+    // a relay bearer token. Never let ureq replay either credential to a
+    // redirect target; a 3xx is handled as an ordinary non-success status.
+    let agent = crate::retry_tls::credential_agent_builder()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
         .timeout_read(request_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
-        // Cloud-session requests carry either the long-lived device secret or
-        // a relay bearer token. Never let ureq replay either credential to a
-        // redirect target; a 3xx is handled as an ordinary non-success status.
-        .redirects(0)
         .max_idle_connections(0)
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,
@@ -3212,6 +3222,32 @@ mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    #[test]
+    fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let device = LocalDeviceBinding {
+            device_id: "device-synthetic".to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        };
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let secret = format!("synthetic-snapshot-device-secret-{}", &status[..3]);
+            let backend = RedirectingBackend::start(status);
+            assert!(SnapshotApiClient::new(backend.base_url.clone())
+                .issue_relay_token(&device, &secret, SnapshotSource::Codex)
+                .is_err());
+            let request = backend.finish();
+            assert!(
+                request.starts_with("POST /api/v1/telemetry/devices/device-synthetic/relay-token ")
+            );
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
+    }
 
     #[test]
     fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {

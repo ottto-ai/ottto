@@ -55,6 +55,22 @@ pub(crate) fn agent_builder() -> ureq::AgentBuilder {
 pub(crate) fn agent() -> ureq::Agent {
     agent_builder().build()
 }
+/// Every request that carries an Ottto credential in a header or its body
+/// (relay device secret, setup-run, setup-claim and install-session tokens,
+/// support claims, ingest keys) starts here. Pinned ureq follows 301/302/303
+/// (and 307/308 for bodiless methods) and replays every header except
+/// `Authorization` and `Cookie` to the `Location` target, so a misconfigured
+/// or compromised server could collect the credential on another host. These
+/// requests never follow a redirect; a 3xx comes back as an ordinary
+/// unexpected response. Header values stay out of logs because the `log`
+/// dependency compiles out ureq's debug-level request prelude (see the
+/// workspace `Cargo.toml`).
+pub(crate) fn credential_agent_builder() -> ureq::AgentBuilder {
+    agent_builder().redirects(0)
+}
+pub(crate) fn credential_agent() -> ureq::Agent {
+    credential_agent_builder().build()
+}
 impl TlsConnector for WebPkiTls {
     fn connect(
         &self,
@@ -406,6 +422,41 @@ impl ReadWrite for DeadlineIo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_agent_keeps_custom_secret_headers_out_of_logs_and_redirects() {
+        use super::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        for header in [
+            "X-Ottto-Device-Secret",
+            "X-Ottto-Setup-Run-Token",
+            "X-Ottto-Setup-Claim-Token",
+            "X-Ottto-Install-Session-Token",
+            "X-Ottto-Support-Claim",
+            "X-Ottto-Device-Credential-Preparation-Secret",
+            "X-API-Key",
+        ] {
+            for status in ["302 Found", "307 Temporary Redirect"] {
+                for method in ["GET", "POST"] {
+                    let secret = format!("synthetic-{method}-{}", &status[..3]);
+                    let backend = RedirectingBackend::start(status);
+                    let url = format!("{}/api/v1/probe", backend.base_url);
+                    let result = credential_agent()
+                        .request(method, &url)
+                        .set(header, &secret)
+                        .timeout(Duration::from_secs(5))
+                        .call();
+                    let response = result.expect("an unfollowed 3xx is a response");
+                    assert_eq!(response.status(), status[..3].parse::<u16>().unwrap());
+                    let request = backend.finish();
+                    assert!(request.contains(&format!("{header}: {secret}")));
+                    assert_never_logged(&secret);
+                }
+            }
+        }
+    }
     #[derive(Debug)]
     struct Bytes(std::io::Cursor<Vec<u8>>);
     impl Read for Bytes {
@@ -1248,5 +1299,141 @@ mod tests {
             })
             .collect();
         assert!(connector_tls.is_empty(), "{connector_tls:?}");
+    }
+}
+
+/// Fixtures for credential-transport regressions: a logger that accepts every
+/// record, as a host program enabling ureq debug output would install, and a
+/// one-shot backend that redirects to a second loopback host.
+#[cfg(test)]
+pub(crate) mod credential_test_support {
+    use std::io::{ErrorKind, Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::{Mutex, Once};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    static RECORDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    struct HostLogger;
+
+    static HOST_LOGGER: HostLogger = HostLogger;
+
+    impl log::Log for HostLogger {
+        fn enabled(&self, _metadata: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            let line = format!("{} {}", record.target(), record.args());
+            RECORDS
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(line);
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn captured() -> Vec<String> {
+        RECORDS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Install the accept-everything logger at the most verbose runtime level
+    /// and prove it receives records for ureq's own target.
+    pub(crate) fn install_host_logger() {
+        static INSTALL: Once = Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&HOST_LOGGER).expect("no other logger in the test binary");
+        });
+        log::set_max_level(log::LevelFilter::Trace);
+        log::info!(target: "ureq::unit", "host-logger-canary");
+        assert!(captured()
+            .iter()
+            .any(|line| line == "ureq::unit host-logger-canary"));
+    }
+
+    /// No record the host logger received holds `secret`. Call after the
+    /// request under test returned and after `install_host_logger`.
+    pub(crate) fn assert_never_logged(secret: &str) {
+        assert!(!log::log_enabled!(target: "ureq::unit", log::Level::Debug));
+        let leaked = captured()
+            .iter()
+            .filter(|line| line.contains(secret))
+            .count();
+        assert_eq!(leaked, 0, "a credential reached the host logger");
+    }
+
+    /// A backend that answers its first request with `status` and a
+    /// `Location` on a second loopback host nobody serves.
+    pub(crate) struct RedirectingBackend {
+        pub(crate) base_url: String,
+        target: TcpListener,
+        server: JoinHandle<String>,
+    }
+
+    impl RedirectingBackend {
+        pub(crate) fn start(status: &str) -> Self {
+            let target = TcpListener::bind("127.0.0.1:0").expect("bind redirect target");
+            target.set_nonblocking(true).expect("nonblocking target");
+            let location = format!("http://{}/captured", target.local_addr().unwrap());
+            let listener = TcpListener::bind("127.0.0.1:0").expect("bind backend");
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let status = status.to_string();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let request = read_request(&mut stream);
+                let response = format!(
+                    "HTTP/1.1 {status}\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write redirect");
+                request
+            });
+            Self {
+                base_url,
+                target,
+                server,
+            }
+        }
+
+        /// The request the redirecting backend saw. Panics if the client
+        /// contacted the redirect target at all.
+        pub(crate) fn finish(self) -> String {
+            let request = self.server.join().expect("redirecting backend");
+            assert!(
+                matches!(self.target.accept(), Err(error) if error.kind() == ErrorKind::WouldBlock),
+                "the client followed the redirect to a second host"
+            );
+            request
+        }
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 1024];
+        loop {
+            if let Some(end) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let body_len = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                if request.len() >= end + 4 + body_len {
+                    break;
+                }
+            }
+            match stream.read(&mut buffer) {
+                Ok(0) | Err(_) => break,
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
     }
 }

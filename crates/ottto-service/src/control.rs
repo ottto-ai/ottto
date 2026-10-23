@@ -8770,9 +8770,7 @@ fn release_device_without_setup_run(api_base_url: &str, release: &DeviceReleaseP
         &api_base_url,
         &format!("/api/v1/telemetry/devices/{}/release", release.device_id),
     );
-    crate::retry_tls::agent_builder()
-        .redirects(0)
-        .build()
+    crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", &release.device_secret)
@@ -13015,16 +13013,25 @@ fn issue_source_relay_token(
 ) -> Result<String, LocalApiError> {
     let (device, device_secret) = crate::snapshot_client::load_snapshot_device_credentials()
         .map_err(|error| LocalApiError::LocalOperationFailed(error.to_string()))?;
+    request_source_relay_token(api_base_url, &device, &device_secret, source)
+}
+
+fn request_source_relay_token(
+    api_base_url: &str,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: &SourceKind,
+) -> Result<String, LocalApiError> {
     let url = api_url_with_base(
         api_base_url,
         &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
     );
-    let response: RelayTokenApiResponse = crate::retry_tls::agent()
+    let response: RelayTokenApiResponse = crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
-        .set("X-Ottto-Device-Secret", &device_secret)
+        .set("X-Ottto-Device-Secret", device_secret)
         .timeout(BACKEND_REQUEST_TIMEOUT)
-        .send_json(relay_token_request_payload(&device, source_slug(source)))
+        .send_json(relay_token_request_payload(device, source_slug(source)))
         .map_err(|error| backend_error_from_ureq(&url, error))?
         .into_json()
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))?;
@@ -15950,7 +15957,8 @@ fn backend_post_json_with_timeout<T: DeserializeOwned>(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<T, LocalApiError> {
-    let mut request = crate::retry_tls::agent()
+    // Backend calls carry tokens, secrets or claims in headers or bodies.
+    let mut request = crate::retry_tls::credential_agent()
         .post(url)
         .set("Accept", "application/json")
         .timeout(timeout);
@@ -15984,7 +15992,8 @@ fn backend_get_json_with_timeout<T: DeserializeOwned>(
     headers: &[(&str, &str)],
     timeout: Duration,
 ) -> Result<T, LocalApiError> {
-    let mut request = crate::retry_tls::agent()
+    // Every caller authenticates with a header credential.
+    let mut request = crate::retry_tls::credential_agent()
         .get(url)
         .set("Accept", "application/json")
         .timeout(timeout);
@@ -23398,6 +23407,83 @@ for line in sys.stdin:
             target.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
+    }
+
+    #[test]
+    #[serial]
+    fn credential_backend_calls_never_follow_redirects_or_reach_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        let _lock = lock_backend_test_env();
+        install_host_logger();
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let code = &status[..3];
+
+            // Setup-run token on a POST (disconnect, events, scan results).
+            let secret = format!("synthetic-run-token-post-{code}");
+            let backend = RedirectingBackend::start(status);
+            let url = format!(
+                "{}/api/v1/setup-runs/run/local-client/disconnect",
+                backend.base_url
+            );
+            let result: Result<serde_json::Value, LocalApiError> = backend_post_json(
+                &url,
+                &json!({"reason": "logout"}),
+                &[("X-Ottto-Setup-Run-Token", secret.as_str())],
+            );
+            assert!(
+                result.is_err(),
+                "{status}: an unfollowed 3xx is not a success"
+            );
+            let request = backend.finish();
+            assert!(request.contains(&format!("X-Ottto-Setup-Run-Token: {secret}")));
+            assert_never_logged(&secret);
+
+            // Setup-run token on a GET (agent reads, next action polling).
+            let secret = format!("synthetic-run-token-get-{code}");
+            let backend = RedirectingBackend::start(status);
+            let url = format!("{}/api/v1/setup-runs/run/agent/costs", backend.base_url);
+            let result: Result<serde_json::Value, LocalApiError> =
+                backend_get_json(&url, &[("X-Ottto-Setup-Run-Token", secret.as_str())]);
+            assert!(
+                result.is_err(),
+                "{status}: an unfollowed 3xx is not a success"
+            );
+            let request = backend.finish();
+            assert!(request.starts_with("GET /api/v1/setup-runs/run/agent/costs "));
+            assert!(request.contains(&format!("X-Ottto-Setup-Run-Token: {secret}")));
+            assert_never_logged(&secret);
+
+            // Device secret on the relay-token request.
+            let secret = format!("synthetic-device-secret-relay-{code}");
+            let backend = RedirectingBackend::start(status);
+            let device = LocalDeviceBinding {
+                device_id: "device-synthetic".to_string(),
+                machine_id: None,
+                sources: vec!["codex".to_string()],
+            };
+            assert!(request_source_relay_token(
+                &backend.base_url,
+                &device,
+                &secret,
+                &SourceKind::Codex
+            )
+            .is_err());
+            let request = backend.finish();
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+
+            // Device secret on the ended-run release.
+            let secret = format!("synthetic-device-secret-release-{code}");
+            let backend = RedirectingBackend::start(status);
+            let proof = device_release_proof("device-synthetic".to_string(), secret.clone())
+                .expect("complete proof");
+            assert!(!release_device_without_setup_run(&backend.base_url, &proof));
+            let request = backend.finish();
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
     }
 
     #[test]
