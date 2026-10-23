@@ -1504,11 +1504,18 @@ fn money_gate_off_rss_fixture_receipt() {
         .census()
         .resident_bytes(Instant::now() + Duration::from_secs(60))
         .unwrap();
+    let mut query_key_capacity = 0;
     let keys = measured
         .census()
         .records()
-        .map(|(key, _)| key.to_string())
+        .map(|(key, _)| {
+            query_key_capacity += key.capacity();
+            key.to_string()
+        })
         .collect::<Vec<_>>();
+    let legacy_node_bytes = keys.len() * (std::mem::size_of::<String>()
+        + std::mem::size_of::<crate::snapshots::claude_request_census::ClaudeRequestCensusRecord>()) * 3 / 2;
+    let mut legacy_heap_bytes = 0;
     for key in keys {
         let bytes = serde_json::to_vec(&BTreeMap::from([(
             key.as_str(),
@@ -1517,6 +1524,10 @@ fn money_gate_off_rss_fixture_receipt() {
         .unwrap();
         let decoded = crate::snapshots::claude_request_census::decode_ledger_shard(&bytes).unwrap();
         let record = decoded.get(&key).unwrap().clone();
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut counter = Counter::new(usize::MAX);
+        record.heap_bound(&mut counter).unwrap();
+        legacy_heap_bytes += counter.bytes;
         assert_eq!(
             measured.insert(key, record),
             crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored
@@ -1530,7 +1541,7 @@ fn money_gate_off_rss_fixture_receipt() {
             assert_eq!(unwritten, 0);
         }
     });
-    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
+    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "p1_map_node_bytes":legacy_node_bytes, "query_key_capacity":query_key_capacity, "p1_record_heap_bytes":legacy_heap_bytes, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
     std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
     eprintln!("MONEY_RSS_OFF_FIXTURE median_bytes={} samples={samples:?} p1_shadow_enabled=true live_gate=false hashes={hashes} matched_source_build_fixture=true release_daemon_rss=false", samples[1]);
 }

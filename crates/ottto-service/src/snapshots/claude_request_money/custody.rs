@@ -120,7 +120,15 @@ impl PartialEq<str> for QueryKey {
     fn eq(&self, key: &str) -> bool {
         match self {
             Self::Standard(prefix) => key.starts_with(Self::PREFIXES[*prefix as usize]),
-            Self::Binding(_) => self.to_string() == key,
+            Self::Binding(binding) => match binding.as_ref() {
+                BindingKey::Text(text) => text == key,
+                BindingKey::Digest(prefix, digest) => {
+                    key.strip_prefix(BINDING_PREFIXES[*prefix as usize])
+                        .and_then(super::super::claude_request_census::decode_fingerprint)
+                        .as_ref()
+                        == Some(digest)
+                }
+            },
         }
     }
 }
@@ -396,11 +404,37 @@ impl FileCustody {
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct TelemetryCustody {
     current: Option<Box<Slot>>,
+    memo: Option<Box<Slot>>,
+    live: Option<Box<TelemetryLive>>,
+}
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub(super) struct TelemetryLive {
     seen_r: Option<Box<Slot>>,
     trace: Option<Box<Slot>>,
     delivery: Delivery,
     adoption: Option<Box<Slot>>,
-    memo: Option<Box<Slot>>,
+}
+impl std::ops::Deref for TelemetryCustody {
+    type Target = TelemetryLive;
+    fn deref(&self) -> &TelemetryLive {
+        static EMPTY: std::sync::OnceLock<TelemetryLive> = std::sync::OnceLock::new();
+        self.live
+            .as_deref()
+            .unwrap_or_else(|| EMPTY.get_or_init(TelemetryLive::default))
+    }
+}
+impl std::ops::DerefMut for TelemetryCustody {
+    fn deref_mut(&mut self) -> &mut TelemetryLive {
+        self.live.get_or_insert_with(Default::default)
+    }
+}
+impl TelemetryLive {
+    fn is_empty(&self) -> bool {
+        self.seen_r.is_none()
+            && self.trace.is_none()
+            && self.adoption.is_none()
+            && self.delivery.slots().next().is_none()
+    }
 }
 impl TelemetryCustody {
     fn slots(&self) -> impl Iterator<Item = &Slot> {
@@ -835,11 +869,21 @@ impl Custody {
                     file.live = None;
                 }
             }
+            if let Some(file) = self.telemetry.get_mut(&a.carrier) {
+                if file.live.as_deref().is_some_and(TelemetryLive::is_empty) {
+                    file.live = None;
+                }
+            }
             return old;
         }
         let old = std::mem::replace(self.slot_mut(a)?, slot.map(Box::new)).map(|slot| *slot);
         if let Some(file) = self.files.get_mut(&a.carrier) {
             if file.live.as_deref().is_some_and(FileLive::is_empty) {
+                file.live = None;
+            }
+        }
+        if let Some(file) = self.telemetry.get_mut(&a.carrier) {
+            if file.live.as_deref().is_some_and(TelemetryLive::is_empty) {
                 file.live = None;
             }
         }
@@ -1061,6 +1105,9 @@ impl Custody {
                         .as_ref()
                         .map_or(0, |(root, member)| root.capacity() + member.capacity());
             }
+            if let Carrier::Telemetry(file) = carrier {
+                bytes += usize::from(file.live.is_some()) * std::mem::size_of::<TelemetryLive>();
+            }
             for slot in carrier.slots() {
                 let mut count = Counter::new(usize::MAX);
                 match &slot.value {
@@ -1113,6 +1160,10 @@ impl Custody {
                         + entity.body.capacity();
                 }
             }
+        }
+        #[cfg(test)]
+        if std::env::var_os("OTTTO_MONEY_RSS_OUTPUT").is_some() {
+            self.print_off_layout_for_test(bytes);
         }
         Some(bytes)
     }
@@ -2036,17 +2087,24 @@ impl Custody {
                     if self.telemetry.contains_key(&key) {
                         return None;
                     }
-                    self.telemetry.insert(
-                        key.clone(),
-                        TelemetryCustody {
-                            current,
+                    let mut telemetry = TelemetryCustody {
+                        current,
+                        memo: decode(wire.memo, None)?,
+                        live: Some(Box::new(TelemetryLive {
                             seen_r,
                             trace: decode(wire.trace, None)?,
                             delivery,
                             adoption: decode(wire.adoption, None)?,
-                            memo: decode(wire.memo, None)?,
-                        },
-                    );
+                        })),
+                    };
+                    if telemetry
+                        .live
+                        .as_deref()
+                        .is_some_and(TelemetryLive::is_empty)
+                    {
+                        telemetry.live = None;
+                    }
+                    self.telemetry.insert(key.clone(), telemetry);
                 }
                 "control" if key == CONTROL => {
                     if wire.fields.len() > 16 {
@@ -2304,6 +2362,110 @@ impl Serialize for Custody {
 }
 #[cfg(test)]
 impl Custody {
+    // Called only by the isolated OFF fixture, outside the allocation audit.
+    // This partitions the exact resident estimator rather than subtracting a
+    // projected saving from RSS. The common fixture separately partitions P1.
+    fn print_off_layout_for_test(&self, total: usize) {
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut parts = BTreeMap::<&str, usize>::new();
+        parts.insert(
+            "globals",
+            std::mem::size_of::<Self>() + self.ever.capacity() * 32,
+        );
+        for (key, carrier) in self.entries() {
+            *parts.entry("carrier_keys").or_default() += key.capacity();
+            *parts.entry("map_slots").or_default() += carrier.inline_bytes();
+            *parts.entry("field_slots").or_default() += carrier.spare_slot_bytes();
+            match carrier {
+                Carrier::File(file) => {
+                    *parts.entry("physical_paths").or_default() +=
+                        file.path.as_ref().map_or(0, String::capacity);
+                    *parts.entry("live_metadata").or_default() += usize::from(file.live.is_some())
+                        * std::mem::size_of::<FileLive>()
+                        + file
+                            .logical
+                            .as_ref()
+                            .map_or(0, |(a, b)| a.capacity() + b.capacity());
+                }
+                Carrier::Telemetry(file) => {
+                    *parts.entry("live_metadata").or_default() +=
+                        usize::from(file.live.is_some()) * std::mem::size_of::<TelemetryLive>();
+                }
+                _ => {}
+            }
+            for slot in carrier.slots() {
+                *parts.entry("field_slots").or_default() += std::mem::size_of::<Slot>();
+                *parts.entry("independent_keys").or_default() += slot.key.capacity();
+                let facts = slot.value.view().facts().map_or(0, <[u8]>::len);
+                let mut hashes = slot.value.request_hashes().len() * 8
+                    + usize::from(!slot.value.request_hashes().is_empty())
+                        * 2
+                        * std::mem::size_of::<usize>();
+                let current = match carrier {
+                    Carrier::File(file) if slot.key.starts_with("watch:m:") => {
+                        file.current_m.as_deref()
+                    }
+                    Carrier::Telemetry(file) if slot.key.starts_with("watch:r:") => {
+                        file.current.as_deref()
+                    }
+                    _ => None,
+                };
+                if let Some(current) = current {
+                    if let (Some(a), Some(b)) = (
+                        current.value.view().shared_request_hashes(),
+                        slot.value.view().shared_request_hashes(),
+                    ) {
+                        if std::sync::Arc::ptr_eq(&a, &b) {
+                            hashes = 0;
+                        }
+                    }
+                }
+                *parts.entry("hash_payload").or_default() += hashes;
+                *parts.entry("fact_payload").or_default() += facts;
+                match &slot.value {
+                    Value::Evidence(record) => {
+                        let mut counter = Counter::new(usize::MAX);
+                        record.heap_bound(&mut counter).unwrap();
+                        let owned_hashes = record.request_hashes().len() * 8
+                            + usize::from(!record.request_hashes().is_empty())
+                                * 2
+                                * std::mem::size_of::<usize>();
+                        *parts.entry("evidence_headers").or_default() +=
+                            std::mem::size_of::<Record>() + counter.bytes - facts - owned_hashes;
+                    }
+                    Value::Message(value) => {
+                        *parts.entry("typed_payload").or_default() += value.extra_bytes()
+                    }
+                    Value::Memo(_) => {
+                        *parts.entry("typed_payload").or_default() += std::mem::size_of::<Memo>()
+                    }
+                    Value::Sweep(_) => {
+                        *parts.entry("typed_payload").or_default() += std::mem::size_of::<Sweep>()
+                    }
+                    _ => {}
+                }
+                if let Some(entity) = &slot.entity {
+                    *parts.entry("bindings").or_default() += std::mem::size_of::<CompactEntity>()
+                        + entity.root.capacity()
+                        + entity.member.capacity()
+                        + entity.context.len()
+                        + entity.body.capacity();
+                }
+            }
+        }
+        assert_eq!(parts.values().sum::<usize>(), total);
+        // Before this change TelemetryCustody reserved current + memo plus all
+        // TelemetryLive fields inline (96 bytes); now it holds three pointers.
+        let old_telemetry =
+            2 * std::mem::size_of::<Option<Box<Slot>>>() + std::mem::size_of::<TelemetryLive>();
+        let removed = self.telemetry.len()
+            * ((std::mem::size_of::<String>() + old_telemetry) * 3 / 2
+                - (std::mem::size_of::<String>() + std::mem::size_of::<TelemetryCustody>()) * 3
+                    / 2);
+        eprintln!("MONEY_OFF_LAYOUT total={total} parts={} file_count={} telemetry_count={} file_bytes={} telemetry_bytes={} slot_bytes={} p1_record_bytes={} removed_inline_telemetry_bytes={removed} pre_lazy_telemetry_resident={}",
+            serde_json::to_string(&parts).unwrap(), self.files.len(), self.telemetry.len(), std::mem::size_of::<FileCustody>(), std::mem::size_of::<TelemetryCustody>(), std::mem::size_of::<Slot>(), std::mem::size_of::<Record>(), total + removed);
+    }
+
     pub(crate) fn resident_components_for_test(&self) -> (usize, usize, usize, usize) {
         let mut hashes = 0;
         let mut facts = 0;
@@ -2816,6 +2978,54 @@ mod compact_layout_tests {
             custody.files.values().all(|file| file.live.is_none()),
             "P1-only carriers have no live slots"
         );
+        let telemetry_key = "otel:00112233-4455-6677-8899-aabbccddeeff";
+        assert_eq!(
+            custody.insert(
+                telemetry_key.into(),
+                Record::custody_message([5; 32], 7, None, true)
+            ),
+            Insert::Stored
+        );
+        assert!(
+            custody
+                .telemetry
+                .values()
+                .all(|carrier| carrier.live.is_none()),
+            "P1 telemetry has no live scaffold"
+        );
+        let telemetry_watch = "watch:r:otel:00112233-4455-6677-8899-aabbccddeeff";
+        assert_eq!(
+            custody.insert(
+                telemetry_watch.into(),
+                Record::custody_shared_watch([5; 32], None)
+            ),
+            Insert::Stored
+        );
+        assert!(custody
+            .telemetry
+            .values()
+            .all(|carrier| carrier.live.is_some()));
+        custody.remove(telemetry_watch);
+        assert!(
+            custody
+                .telemetry
+                .values()
+                .all(|carrier| carrier.live.is_none()),
+            "clearing the last live field releases its scaffold"
+        );
+        let before = custody.clone();
+        let excessive: std::sync::Arc<[u64]> = (0..=MAX_HASHES as u64).collect::<Vec<_>>().into();
+        assert_eq!(
+            custody.insert(
+                telemetry_watch.into(),
+                Record::custody_shared_watch([9; 32], Some(excessive))
+            ),
+            Insert::Refused
+        );
+        assert_eq!(
+            custody, before,
+            "refusal restores allocation-free P1 telemetry and accounting"
+        );
         for (key, value) in [
             (
                 watch.clone(),
@@ -2864,6 +3074,10 @@ mod compact_layout_tests {
                 65536
             ));
         }
+        assert!(decoded
+            .telemetry
+            .values()
+            .all(|carrier| carrier.live.is_none()));
         assert_eq!(queries(&decoded), queries(&custody));
         assert_eq!(decoded.record_count(), custody.record_count());
         let before = decoded.clone();
@@ -2877,5 +3091,32 @@ mod compact_layout_tests {
             "refusal retains bindings, clocks, fields and all accounting"
         );
         assert_eq!(decoded.get(&message).unwrap().money_revision(), [1; 32]);
+        assert_eq!(
+            decoded.insert(
+                telemetry_watch.into(),
+                Record::custody_shared_watch([6; 32], Some(std::sync::Arc::from([4_u64, 5])))
+            ),
+            Insert::Stored
+        );
+        let telemetry_carrier = format!("telemetry:{}", &telemetry_key[5..]);
+        let carrier = Carrier::Telemetry(decoded.telemetry.get(&telemetry_carrier).unwrap());
+        let mut restarted = Custody::default();
+        assert!(restarted.absorb_entry(
+            telemetry_carrier,
+            &serde_json::to_string(&carrier).unwrap(),
+            65536
+        ));
+        assert_eq!(
+            restarted
+                .get(telemetry_watch)
+                .map(|record| record.to_owned_record()),
+            decoded
+                .get(telemetry_watch)
+                .map(|record| record.to_owned_record())
+        );
+        assert!(restarted
+            .telemetry
+            .values()
+            .all(|carrier| carrier.live.is_some()));
     }
 }

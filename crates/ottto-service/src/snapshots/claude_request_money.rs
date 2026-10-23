@@ -2193,22 +2193,25 @@ async fn build_page_at(
     counts
 }
 
-/// Build once, publish the P1 comparison, then apply only certified members.
-/// Protected entities keep the existing body; failed builds become local holds.
-#[allow(clippy::too_many_arguments)] // Shared evidence and identity remain separately owned.
 pub(crate) fn is_protected_item(index: &ScanIndex, item: &SnapshotItem) -> bool {
     index
         .claude_reemission_exclusions
         .protected_root(claude_snapshot_family_root_ref(item))
 }
 
+pub(crate) struct LivePageEvidence<'a> {
+    pub(crate) api: &'a ClaudeLocalOtelLoadReport,
+    pub(crate) trace: &'a ClaudeTraceOwnershipLoadReport,
+    pub(crate) census_complete: bool,
+}
+
+/// Build once, publish the P1 comparison, then apply only certified members.
+/// Protected entities keep the existing body; failed builds become local holds.
 pub(crate) async fn live_page_resume(
     support_dir: &Path,
     snapshots: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
-    api: &ClaudeLocalOtelLoadReport,
-    trace: &ClaudeTraceOwnershipLoadReport,
-    census_complete: bool,
+    evidence: LivePageEvidence<'_>,
     identity: Option<&mut super::claude_request_identity::ScanEvidence<'_>>,
     groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
 ) -> BTreeSet<String> {
@@ -2217,9 +2220,9 @@ pub(crate) async fn live_page_resume(
         support_dir,
         snapshots,
         index,
-        api,
-        trace,
-        census_complete,
+        evidence.api,
+        evidence.trace,
+        evidence.census_complete,
         page_now(support_dir),
         true,
         &mut output,

@@ -28,7 +28,7 @@ impl Message {
             .unwrap_or(&[])
     }
     pub(super) fn known(&self) -> bool {
-        self.payload.as_ref().is_none_or(|p| p.known)
+        self.payload.as_ref().map_or(true, |p| p.known)
     }
     pub(super) fn extra_bytes(&self) -> usize {
         usize::from(self.payload.is_some()) * std::mem::size_of::<MessagePayload>()

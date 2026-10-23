@@ -8631,9 +8631,11 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             support_dir,
             &mut scan_result.snapshots,
             index,
-            &api_report,
-            &trace_report,
-            census_complete,
+            crate::snapshots::claude_request_money::LivePageEvidence {
+                api: &api_report,
+                trace: &trace_report,
+                census_complete,
+            },
             identity_evidence.as_mut(),
             &mut groupings,
         )

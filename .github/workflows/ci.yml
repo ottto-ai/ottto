@@ -190,7 +190,18 @@ jobs:
           print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
           delta = head["ledger_resident_bytes"] - base["ledger_resident_bytes"]
           print(f'MONEY_M4_DELTA_VS_189 base_resident={base["ledger_resident_bytes"]} head_off_resident={head["ledger_resident_bytes"]} delta={delta} base_load_peak={base["load_native_peak"]} head_off_load_peak={head["load_native_peak"]} base_save_peak={base["save_native_peak"]} head_off_save_peak={head["save_native_peak"]} base_rss={base["rss_median_bytes"]} head_off_rss={head["rss_median_bytes"]} rss_delta={result["delta_bytes"]} resident_is_structural=true peaks_are_native_usable=true matched_observer_slots=1048576')
-          assert delta <= 0, "gate-OFF resident layout must not grow over 0.1.189"
+          # P1 evidence now has a physical carrier, a typed field slot and a
+          # separately boxed telemetry record. Live delivery/watch fields are
+          # absent while OFF (MONEY_OFF_LAYOUT prints the exact partition).
+          # Budget the shared representation, not live scaffold or an RSS
+          # subtraction. Ceilings are measured against the 0.1.189 source build.
+          MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES = 2 * 1024 * 1024
+          MONEY_OFF_RSS_BUDGET_BYTES = 1024 * 1024
+          base_split = {k: base[k] for k in ("p1_map_node_bytes", "query_key_capacity", "p1_record_heap_bytes")}
+          assert sum(base_split.values()) == base["ledger_resident_bytes"], base_split
+          print("MONEY_OFF_SHARED_REPRESENTATION " + json.dumps({"base_split": base_split, "shared_layout_delta": delta, "structural_budget_bytes": MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES, "rss_delta": result["delta_bytes"], "rss_budget_bytes": MONEY_OFF_RSS_BUDGET_BYTES}, sort_keys=True))
+          assert delta <= MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES, "gate-OFF shared P1 layout exceeds its 2 MiB budget"
+          assert result["delta_bytes"] <= MONEY_OFF_RSS_BUDGET_BYTES, "gate-OFF RSS exceeds its 1 MiB budget"
 
           PY
           diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
