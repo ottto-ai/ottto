@@ -1127,6 +1127,7 @@ fn x_out_coverage_witness_names_every_finished_field() {
             compaction_timestamps: _,                       // D
             compaction_events: _,                           // K (empty on Claude)
             local_context_points: _,                        // K (empty on Claude)
+            first_own_request_at: _,                        // K (None at finish; #698)
             compaction_total_pre_tokens: _,                 // I
             compaction_total_post_tokens: _,                // I
             compaction_total_cumulative_dropped_tokens: _,  // I
