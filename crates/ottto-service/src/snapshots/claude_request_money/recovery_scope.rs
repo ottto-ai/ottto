@@ -84,6 +84,12 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
     let deadline = Instant::now() + Duration::from_millis(2);
     let scope = store::recovery_evidence(support, |ledger| {
         let mut scope = original.clone();
+        let frozen_files = original
+            .roots
+            .values()
+            .flatten()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
         if !scope.valid() {
             return None;
         }
@@ -148,6 +154,7 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
                 });
                 let messages = message.map_or(&[][..], |r| r.request_hashes());
                 if !scope.roots.contains_key(&root)
+                    && !frozen_files.contains(key.as_str())
                     && !overlaps(requests, &scope.requests)
                     && !overlaps(messages, &scope.messages)
                 {

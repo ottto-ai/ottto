@@ -917,7 +917,10 @@ pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> boo
         || catalog.entries.iter().any(|m| {
             !m.ack_saved
                 && (root.is_some_and(|r| m.scope.roots.contains_key(r))
-                    || m.entities.iter().any(|e| e.files.iter().any(|f| f == key)))
+                    || m.scope
+                        .roots
+                        .values()
+                        .any(|files| files.iter().any(|f| f == key)))
         })
 }
 /// Close each unresolved component against current evidence once for the page.
