@@ -137,6 +137,26 @@ fi
 grep -q "manifest source_commit must be a lowercase 40-character git commit SHA" \
   /tmp/public-manifest-source-commit.out
 
+derived_root="$tmp_dir/derived-root"
+cp -R "$base" "$derived_root"
+rm "$derived_root/PUBLIC_EXPORT_MANIFEST.json"
+set +e
+PUBLIC_MANIFEST_REPO_ROOT="$derived_root" "$SCRIPT" >/tmp/public-manifest-root-derived.out 2>&1
+root_status=$?
+set -e
+if [[ "$root_status" -ne 2 ]]; then
+  echo "Expected root mode without a manifest to exit 2, got $root_status" >&2
+  exit 1
+fi
+grep -q "PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree, not committed" \
+  /tmp/public-manifest-root-derived.out
+grep -q "scripts/public_repo_manifest.sh --facts" /tmp/public-manifest-root-derived.out
+if "$SCRIPT" --staged-output "$derived_root" >/tmp/public-manifest-staged-missing.out 2>&1; then
+  echo "Expected a staged bundle without a manifest to fail manifest check" >&2
+  exit 1
+fi
+grep -q "required manifest is missing" /tmp/public-manifest-staged-missing.out
+
 git_checkout="$tmp_dir/git-checkout"
 mkdir -p "$git_checkout/scripts"
 cat > "$git_checkout/.gitignore" <<'EOF'
