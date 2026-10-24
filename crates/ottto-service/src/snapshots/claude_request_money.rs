@@ -94,8 +94,9 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 /// The shared per-page I/O budget of every shadow reader.
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
-/// Total synchronous allowance under SNAPSHOT_SYNC_LOCK, in every build.
-/// Includes closing failure rows and handoff; the writer runs separately.
+/// Synchronous shadow-call allowance in every build, including closing
+/// and handoff. Native parsing/finalizers precede this call under the lock;
+/// capture work has its own 100 ms cumulative allowance.
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
 /// Leave bounded closing work inside the total, rather than after expiry.
 const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
