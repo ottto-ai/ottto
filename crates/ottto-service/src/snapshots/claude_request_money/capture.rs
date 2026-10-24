@@ -94,26 +94,27 @@ fn plan_next_page_while<'a>(
     drop(old);
     let mut funds = Funds::default();
     if !funds
-        .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, usize), &str)>()))
+        .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>()))
     {
         return false;
     }
     let mut selected = BTreeMap::new();
-    // Stable oldest-64 selection without an uninterruptible whole-page sort.
+    // Oldest-64 selection with the producer's same (turn, family key)
+    // total order, without an uninterruptible whole-page sort.
     let mut oldest = BTreeMap::new();
-    for (at, (key, turn)) in keys.enumerate() {
+    for (key, turn) in keys {
         if !within_deadline()
             || !funds.spend(
                 key.len()
                     + MAP_ENTRY_BYTES
                     + std::mem::size_of::<String>()
-                    + std::mem::size_of::<u64>(),
+                    + std::mem::size_of::<(u64, bool)>(),
             )
         {
             return false;
         }
         selected.insert(key.to_owned(), (turn, false));
-        oldest.insert((turn, at), key);
+        oldest.insert((turn, key), key);
         if oldest.len() > NEXT_PAGE_FAMILIES {
             let _ = oldest.pop_last();
         }

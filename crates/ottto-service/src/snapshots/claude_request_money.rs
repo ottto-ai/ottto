@@ -1393,7 +1393,9 @@ fn shadow_page_with_coverage(
             (*root, key, turn)
         })
         .collect::<Vec<_>>();
-    order.sort_by_key(|(_, _, turn)| *turn);
+    // The capture plan uses this same total order. Stable input ordering
+    // differs after a rotation and cannot break equal-turn ties safely.
+    order.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1)));
     let capture_turns = order
         .iter()
         .take(capture::NEXT_PAGE_FAMILIES)

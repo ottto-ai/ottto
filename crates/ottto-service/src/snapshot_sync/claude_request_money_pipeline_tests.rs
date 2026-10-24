@@ -1597,14 +1597,20 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
         let mut built = BTreeSet::new();
         let mut constructed = BTreeSet::new();
         let mut max_wall_us = 0;
-        for page in 0..pages {
+        for page in 0..pages + 2 {
             money::capture::begin_page(&fixture.support);
             let mut index = ScanIndex::default(); // every page is genuinely Full
             let full = scan(&mut index);
             assert_eq!(full.scanned_file_count, family_count);
             assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), serde_json::to_vec(&baseline.snapshots).unwrap());
             assert_eq!(serde_json::to_vec(&index).unwrap(), serde_json::to_vec(&baseline_index).unwrap());
-            let captured_roots = money::capture::keys_for_test(&fixture.support).iter().take(money::capture::NEXT_PAGE_FAMILIES)
+            let mut current_captures = money::capture::keys_for_test(&fixture.support);
+            // A cold page captures all these small roots; only the first64
+            // in the canonical scheduling order can be consumed. Following
+            // pages must capture exactly their planned eligible subset.
+            current_captures.sort_by_cached_key(|(key, _)| crate::snapshots::claude_request_census::family_key(
+                std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()));
+            let captured_roots = current_captures.iter().take(money::capture::NEXT_PAGE_FAMILIES)
                 .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
                 .collect::<BTreeSet<_>>();
             let started = std::time::Instant::now();
@@ -1630,6 +1636,10 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
                     built.insert(row["family"].as_str().unwrap().to_owned());
                 }
             }
+            if page + 1 == pages {
+                assert_eq!(if ack_mode == "sealed" { &constructed } else { &built }, &expected,
+                    "all {family_count} families must build within the original {pages} Full pages ({ack_mode})");
+            }
         }
         money::set_page_fault_for_test(money::PageFault::None);
         if ack_mode == "sealed" {
@@ -1639,7 +1649,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             // captured roots alone cannot substitute for emitted bodies.
             assert_eq!(built, expected, "all {family_count} families must publish built bodies within {pages} Full pages");
         }
-        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", if ack_mode == "sealed" { constructed.len() } else { built.len() });
+        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
         money::disable_shadow_for_test(&fixture.support);
     }
 }
