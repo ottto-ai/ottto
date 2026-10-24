@@ -3638,3 +3638,89 @@ fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
         u64::MAX
     ));
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_partial_200_records_only_covering_siblings() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let sibling = "22222222-2222-4222-8222-222222222222";
+    let original = std::fs::read_to_string(control.transcript()).unwrap();
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{sibling}.jsonl")),
+        original
+            .replace(IDENTITY_PIPELINE_ROOT, sibling)
+            .replace("req_1", "partial-sibling-1")
+            .replace("req_2", "partial-sibling-2"),
+    )
+    .unwrap();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+    }
+    let attempt = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(attempt.entities.len(), 2);
+    control.restart();
+    *control.server.outcome.lock().unwrap() = FinishOutcome::PartialConflict;
+    let _clock = money::PageClockForTest::new(&control.support, now + 300);
+    control.cycle();
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[0], posts[1],
+        "partial outcomes never reshape the retained POST"
+    );
+    drop(posts);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let progress = SnapshotUploadProgress::load(
+        &snapshot_upload_progress_path(&control.index_path),
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    assert!(progress
+        .accepted_body_witnesses
+        .get(&attempt.entities[0].fingerprint)
+        .is_some_and(|w| w == &attempt.entities[0].witness));
+    assert!(!progress
+        .accepted_fingerprints
+        .contains(&attempt.entities[1].fingerprint));
+    assert!(progress
+        .quarantined_fingerprints
+        .contains_key(&attempt.entities[1].fingerprint));
+    assert!(unknown_recovery::active_for_test(&control.support)
+        .iter()
+        .all(|m| m.ack_saved));
+    for file in &attempt.entities[1].files {
+        assert!(
+            money::money_due(&control.support, file, u64::MAX),
+            "conflict debt remains owed"
+        );
+        assert_ne!(
+            control.saved().files[file].effective_upload_body_witness_revision,
+            3
+        );
+    }
+    control.restart();
+    control.recovery_startup(now + 300);
+    assert!(
+        unknown_recovery::due(&control.support, now + 3600)
+            .unwrap()
+            .0
+            .is_empty(),
+        "complete partial ACK hands conflicting siblings to ordinary retry custody"
+    );
+}

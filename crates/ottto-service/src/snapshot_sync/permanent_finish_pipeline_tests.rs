@@ -13,6 +13,7 @@ enum FinishOutcome {
     },
     MoneyHeld,
     MoneyRefused,
+    PartialConflict,
     LiteralSkew,
     Basis(&'static str),
     MoneyRouteUnavailable,
@@ -191,7 +192,12 @@ impl FinishServer {
                             })
                         })
                         .collect::<Vec<_>>();
-                    if matches!(outcome, FinishOutcome::Accept | FinishOutcome::Basis(_)) {
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Accept
+                            | FinishOutcome::Basis(_)
+                            | FinishOutcome::PartialConflict
+                    ) {
                         let mut entities = items.iter().map(|item| {
                             assert!(item.get("cache_observations").is_none());
                             assert!(item.get("context_curve").is_none());
@@ -209,6 +215,10 @@ impl FinishServer {
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
                                 "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
                         }).collect::<Vec<_>>();
+                        let partial = matches!(outcome, FinishOutcome::PartialConflict);
+                        if partial {
+                            entities.truncate(1);
+                        }
                         let basis = if let FinishOutcome::Basis(basis) = outcome {
                             for entity in &mut entities {
                                 entity["unchanged_basis"] = basis.into();
@@ -217,12 +227,12 @@ impl FinishServer {
                         } else {
                             false
                         };
-                        serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
+                        serde_json::json!({"accepted":entities.len(),"sessions_reconciled":entities.len(),
                             "session_ids":[],"disabled":false,"disabled_reason":null,
                             "entity_ack_contract":"snapshot_entity_ack:v1",
                             "accepted_entities":if basis { Vec::new() } else { entities.clone() },
                             "unchanged_entities":if basis { entities } else { Vec::new() },
-                            "rejected_entities":[],"conflict_entities":[]})
+                            "rejected_entities":[],"conflict_entities":if partial { references.into_iter().skip(1).collect::<Vec<_>>() } else { Vec::new() }})
                     } else {
                         serde_json::json!({"accepted":0,"sessions_reconciled":0,"session_ids":[],
                         "disabled":false,"disabled_reason":null,
