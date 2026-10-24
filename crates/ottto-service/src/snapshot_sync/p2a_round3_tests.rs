@@ -813,15 +813,16 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                     assert_eq!(event["counts"]["cause_unavailable"], 0, "{event}");
                 }
             }
-            if live {
+            let history_vetoed = cause == "rebuild" || live && cause == "real_change";
+            if history_vetoed {
                 assert_eq!(
                     cause_count, 0,
-                    "revision 3 holds every protected selection before POST"
+                    "held history never reaches the POST counter"
                 );
                 assert_eq!(
                     control.offers().len(),
                     before,
-                    "protected {cause} cannot bypass the revision-3 gate"
+                    "protected {cause} cannot bypass the history gate (live={live})"
                 );
                 assert!(control
                     .saved()
@@ -830,12 +831,21 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                     .all(|entry| entry.effective_upload_body_witness_revision != 3));
                 continue;
             }
-            // Revision 2 still syncs ordinary protected changes. Keep the original
-            // actual-POST conservation assertions on that permitted policy row.
-            assert_eq!(
-                cause_count, 0,
-                "live-only diagnostics stay inert under revision 2"
-            );
+            // Revision 2 permits genuine changes; a newly discovered alias is
+            // fresh under both rows. The alias still resolves to the protected
+            // logical family at the money boundary: retain the actual-POST,
+            // positive cause-counter and no-new-money controls for that case.
+            if live {
+                assert!(
+                    cause_count > 0,
+                    "protected fresh alias is counted at its actual POST boundary"
+                );
+            } else {
+                assert_eq!(
+                    cause_count, 0,
+                    "live-only diagnostics stay inert under revision 2"
+                );
+            }
             let offers = control.offers();
             assert!(
                 offers.len() > before,
