@@ -3884,3 +3884,62 @@ fn p2a_unknown_last_replay_saved_ack_failed_selection_stays_known_at_expiry() {
     );
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 4);
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_retry_after_crossing_deadline_expires_without_replay() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::HttpFailure {
+        status: 429,
+        retry_after: 172800,
+    });
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle_deferred();
+    }
+    let attempt = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(attempt.deadline, now + 86400);
+    assert!(attempt.not_before >= attempt.deadline);
+    control.restart();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 86399);
+        control.cycle();
+    }
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "neither the 30-minute ordinary cap nor a recovery slot shortens Retry-After"
+    );
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 86400);
+        control.cycle();
+    }
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        2,
+        "expiry releases only UNKNOWN; the next POST is an ordinary gated offer"
+    );
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(control.support.join("claude-money-recovery/status")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["unknown_outcome_unresolved"], 1);
+}
