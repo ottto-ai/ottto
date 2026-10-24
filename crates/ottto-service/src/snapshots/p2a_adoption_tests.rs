@@ -1344,6 +1344,22 @@ fn p2a_below_floor_adoption_does_not_skip_a_new_transcript_request() {
     for activity in index.snapshot_activity_at.values_mut() {
         *activity = Some("2026-04-30T23:59:59Z".into());
     }
+    index.activate_upload_context("already-admitted-context".into());
+    index.activate_effective_upload_body_witness_revision(3);
+    index.adopt_effective_upload_body_witness_revision_monotonically();
+    let mut ready = false;
+    for _ in 0..24 {
+        match money::reclaim_metadata(&support, &index) {
+            money::MoneyReceipt::Pending => money::store::flush(),
+            money::MoneyReceipt::Ready => {
+                ready = true;
+                break;
+            }
+            money::MoneyReceipt::Refused => panic!("metadata fixture admission refused"),
+        }
+    }
+    assert!(ready, "metadata checkpoint must converge before the parse");
+    index.load_claude_reemission_exclusions(&support);
     let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
     let path = root.join(format!("{session}.jsonl"));
     use std::io::Write as _;
@@ -1352,9 +1368,29 @@ fn p2a_below_floor_adoption_does_not_skip_a_new_transcript_request() {
         "requestId":"after-floor", "message":{"id":"after-floor-message", "model":"claude-haiku-4-5",
         "usage":{"input_tokens":7,"output_tokens":1}}
     })).unwrap();
-    let scan = p2a_scan(&root, &support, &mut index);
-    assert!(scan.scanned_file_count > 0, "a changed file cannot settle from stale activity");
-    assert!(scan.snapshots.iter().any(|item| item.source_session_id == session && item.request_count >= 2),
-        "the actual parser must include the new request");
+    // Keep this actual parse result across its writer checkpoint, as the
+    // production continuation does. p2a_scan retries a fresh scan after a
+    // checkpoint and would discard the changed-file graph under test here.
+    let scan = scan_source_roots_with_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&root),
+        &mut index,
+        "2026-08-23T18:40:00Z",
+        BACKFILL_WINDOW_DAYS,
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        true,
+    )
+    .unwrap();
+    assert!(
+        scan.scanned_file_count > 0,
+        "a changed file cannot settle from stale activity"
+    );
+    assert!(
+        scan.snapshots
+            .iter()
+            .any(|item| item.source_session_id == session && item.request_count >= 2),
+        "the actual parser must include the new request"
+    );
+    money::store::forget_for_test(&support);
     let _ = fs::remove_dir_all(home);
 }
