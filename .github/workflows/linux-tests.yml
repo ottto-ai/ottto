@@ -36,6 +36,14 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends libsqlite3-dev zsh
 
+      # Credential-path checks reject group/world-writable ancestors such as
+      # /tmp (1777). macOS hands each user a private TMPDIR; mirror that.
+      - name: Private temp directory
+        run: |
+          set -euo pipefail
+          install -d -m 0700 "$RUNNER_TEMP/tmp"
+          echo "TMPDIR=$RUNNER_TEMP/tmp" >> "$GITHUB_ENV"
+
       - name: Install pinned Rust toolchain
         run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
 
@@ -55,7 +63,8 @@ jobs:
 
       - name: Runtime tests
         # Print a failing assertion when it happens, not only after the suite.
-        run: cargo test --workspace --locked -- --nocapture
+        # Keep going past a failing test binary so one run lists every failure.
+        run: cargo test --workspace --locked --no-fail-fast -- --nocapture
 
       - name: Connector tests
         run: cargo test --manifest-path crates/Cargo.toml --workspace --locked
