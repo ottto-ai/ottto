@@ -46,7 +46,12 @@ and `census_duplicate_rebuild_exhausted` plus a rate-limited
 the key's record next decodes clean. A read that starts spends its grant even
 if the failed pass is never saved. At most 512 keys are tracked, one compact
 line each in the saved index; past that, or after a malformed guard, new keys
-are refused for one window.
+are refused for one window. Only well-formed fingerprints (64 lowercase hex)
+are rearmed. The fingerprint a grant emptied is saved outside the shadow, in
+the strictly decoded root field `claude_census_rebuild_priors`, so a malformed,
+duplicated or closed shadow cannot make a rearm free: an orphaned grant gets
+its fingerprint back, stays exhausted for one window, and is counted in
+`census_duplicate_rebuild_orphaned` with a `cause=orphaned_rearm` alarm.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes

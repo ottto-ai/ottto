@@ -1735,6 +1735,7 @@ fn census_shadow_counts_encoding_is_bounded() {
         decode_ambiguous_keys: usize::MAX,
         decode_duplicate_keys_dropped: u64::MAX,
         census_duplicate_rebuild_exhausted: u64::MAX,
+        census_duplicate_rebuild_orphaned: u64::MAX,
         producer_refused_keys: usize::MAX,
         shadow_post_save_mismatch_keys: usize::MAX,
         legacy_compare_families: usize::MAX,
@@ -1839,7 +1840,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 5996;
+const CENSUS_SHADOW_WORST_BYTES: usize = 6053;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
@@ -2763,7 +2764,7 @@ fn census_duplicate_rebuild_future_stamp_refuses_until_a_clean_decode() {
         let fingerprint = original.files[&key].source_file_fingerprint.clone();
         let future = N3_T0 + 30 * N3_DAY;
         let guard =
-            serde_json::json!({ "k": { (bound::key_id(&key)): format!("0:{future},{future}:") } });
+            serde_json::json!({ "k": { (bound::key_id(&key)): format!("0:{future},{future}") } });
         let path = scratch.join("index.json");
         std::fs::write(
             &path,
@@ -2824,8 +2825,8 @@ fn census_duplicate_rebuild_key_cap_fails_closed() {
         let fingerprint = original.files[&key].source_file_fingerprint.clone();
         let tracked = (0..bound::MAX_TRACKED_KEYS)
             .map(|slot| {
-                // Full-size entries: the saved (pretty) guard must still decode.
-                let entry = format!("0:{N3_T0},{N3_T0}:{}", hex_fingerprint('a'));
+                // Full entries: the saved (pretty) guard must still decode.
+                let entry = format!("0:{N3_T0},{N3_T0}");
                 (format!("{slot:016x}"), serde_json::json!(entry))
             })
             .collect::<serde_json::Map<_, _>>();
@@ -2898,6 +2899,304 @@ fn census_duplicate_rebuild_same_process_failure_spends_an_attempt() {
         let mut index = ScanIndex::load(&path).unwrap();
         assert!(bound::exhausted(&index, &key));
         assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+        assert_eq!(census_exhausted_counter(&mut index), 1);
+    }
+}
+
+/// Both rebuild counters, as the census line reports them.
+fn census_rebuild_counters(index: &mut ScanIndex) -> (u64, u64) {
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        index,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        FIRST_WINDOW,
+    );
+    let line = serde_json::to_value(ClaudeDuplicateCensusCounts {
+        request_census: Some(counts),
+        ..Default::default()
+    })
+    .unwrap();
+    let counters = (
+        counts.census_duplicate_rebuild_exhausted,
+        counts.census_duplicate_rebuild_orphaned,
+    );
+    assert_eq!(
+        (
+            line["request_census"]["census_duplicate_rebuild_exhausted"].as_u64(),
+            line["request_census"]["census_duplicate_rebuild_orphaned"].as_u64(),
+        ),
+        (Some(counters.0), Some(counters.1))
+    );
+    counters
+}
+
+/// MONEY P1: a saved grant whose shadow guard is later lost (malformed,
+/// duplicated or closed) is an orphan. It counts as spent, not free: its
+/// fingerprint is restored from the strictly decoded priors, repeated failed
+/// or discarded scans never re-read it, and the orphan counter and alarm
+/// fire. One window later it gets at most one more rebuild.
+#[test]
+fn census_duplicate_rebuild_orphaned_by_a_lost_guard_stays_spent() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for corruption in ["malformed_shadow", "duplicated_shadow", "malformed_guard"] {
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-orphan");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            std::fs::write(&path, census_duplicate_rebuild_raw(&original, &key, None)).unwrap();
+
+            // One grant, saved before any read; its prior lives outside the shadow.
+            let clock = bound::set_now(N3_T0);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            drop(clock);
+            let mut saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["claude_census_rebuild_priors"][bound::key_id(&key)],
+                serde_json::json!(fingerprint)
+            );
+            assert!(saved["claude_request_census_shadow"]["n"].is_object());
+            assert!(
+                saved["claude_request_census"][&key].is_null(),
+                "no ambiguous record remains"
+            );
+
+            // One corruption event drops the guard.
+            let raw = match corruption {
+                "malformed_shadow" => {
+                    saved["claude_request_census_shadow"] = serde_json::json!("corrupt");
+                    serde_json::to_string(&saved).unwrap()
+                }
+                "duplicated_shadow" => {
+                    let shadow =
+                        serde_json::to_string(&saved["claude_request_census_shadow"]).unwrap();
+                    saved["claude_request_census_shadow"] = serde_json::json!("DUPLICATE_SHADOW");
+                    serde_json::to_string(&saved).unwrap().replace(
+                        "\"DUPLICATE_SHADOW\"",
+                        &format!("{shadow},\"claude_request_census_shadow\":{shadow}"),
+                    )
+                }
+                _ => {
+                    saved["claude_request_census_shadow"]["n"] = serde_json::json!("corrupt");
+                    serde_json::to_string(&saved).unwrap()
+                }
+            };
+            std::fs::write(&path, raw).unwrap();
+
+            // Repeated failed or discarded scans, across restarts: never rearmed.
+            for cycle in 1..=4_u64 {
+                bound::restart();
+                let _clock = bound::set_now(N3_T0 + 60 * cycle);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    index.files[&key].source_file_fingerprint, fingerprint,
+                    "{corruption}: orphan restored, not rearmed"
+                );
+                assert!(index.claude_request_census_for_test().get(&key).is_none());
+                assert_eq!(census_rebuild_counters(&mut index), (1, 1), "{corruption}");
+                assert_eq!(census_rebuild_counters(&mut index), (1, 1), "{corruption}");
+                assert_eq!(
+                    census_rebuild_alarms(&key, "orphaned_rearm"),
+                    cycle as usize,
+                    "{corruption}: one alarm per process"
+                );
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                let mut working = ScanIndex::load(&path).unwrap();
+                assert_eq!(working.files[&key].source_file_fingerprint, fingerprint);
+                note_duplicate_rebuild_started(&mut working, Path::new(&key));
+                drop(working);
+            }
+
+            // A saved cycle keeps the orphan spent and counted after a restart.
+            bound::restart();
+            let clock = bound::set_now(N3_T0 + N3_DAY);
+            let index = ScanIndex::load(&path).unwrap();
+            assert!(bound::exhausted(&index, &key), "{corruption}");
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![N3_T0 + N3_DAY; 2],
+                "spent for the whole window"
+            );
+            index.save(&path).unwrap();
+            bound::restart();
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+            assert!(bound::exhausted(&index, &key));
+            assert_eq!(
+                bound::prior(&index, &key).as_deref(),
+                Some(fingerprint.as_str()),
+                "kept while pending"
+            );
+            assert_eq!(census_rebuild_counters(&mut index), (1, 1), "{corruption}");
+            drop(clock);
+
+            // One window later: at most one more rebuild, saved before its read.
+            bound::restart();
+            let _clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+            assert_eq!(bound::attempts(&index, &key), vec![N3_T0 + 8 * N3_DAY + 1]);
+            assert_eq!(
+                bound::prior(&index, &key).as_deref(),
+                Some(fingerprint.as_str())
+            );
+            assert_eq!(
+                census_rebuild_counters(&mut index),
+                (0, 0),
+                "orphan count expired"
+            );
+        }
+    }
+}
+
+/// SOURCE hardening: duplicate corruption, then exhaustion, then a clean
+/// decode, then expiry. The checkpoint then carries no `n` and no priors, and
+/// its shadow field is the bytes main's serializer writes for that state.
+#[test]
+fn census_duplicate_rebuild_expiry_after_a_clean_decode_leaves_main_shadow_bytes() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-expiry");
+        let (root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let fingerprint = original.files[&key].source_file_fingerprint.clone();
+        let path = scratch.join("index.json");
+        std::fs::write(&path, census_duplicate_rebuild_raw(&original, &key, None)).unwrap();
+        for day in [0, 1] {
+            bound::restart();
+            let _clock = bound::set_now(N3_T0 + day * N3_DAY);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+        }
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + 2 * N3_DAY);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(bound::exhausted(&index, &key));
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+        assert_eq!(census_exhausted_counter(&mut index), 1);
+        index.save(&path).unwrap();
+
+        // New content rebuilds the record (SourceChanged); it decodes clean.
+        census_write(
+            &root,
+            "duplicate.jsonl",
+            &[
+                census_response("duplicate", Some("req-duplicate"), "msg-duplicate", 1, 10),
+                census_response(
+                    "duplicate",
+                    Some("req-duplicate-2"),
+                    "msg-duplicate-2",
+                    2,
+                    10,
+                ),
+            ],
+        );
+        let mut index = ScanIndex::load(&path).unwrap();
+        census_scan(&root, &mut index, SECOND_WINDOW);
+        assert!(index.claude_request_census_for_test().get(&key).is_some());
+        index.save(&path).unwrap();
+        drop(clock);
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + 3 * N3_DAY);
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(!bound::pending(&index, &key));
+        assert_eq!(
+            bound::attempts(&index, &key).len(),
+            2,
+            "stamps kept in window"
+        );
+        index.save(&path).unwrap();
+        drop(clock);
+
+        // Both stamps expire: the guard is empty and leaves the checkpoint.
+        bound::restart();
+        let _clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
+        let index = ScanIndex::load(&path).unwrap();
+        index.save(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved["claude_request_census_shadow"].get("n").is_none());
+        assert!(saved.get("claude_census_rebuild_priors").is_none());
+        let index = ScanIndex::load(&path).unwrap();
+        let (written, main) = bound::shadow_bytes(&index);
+        assert_eq!(written, main);
+        assert_eq!(
+            saved["claude_request_census_shadow"],
+            serde_json::from_str::<serde_json::Value>(&main).unwrap()
+        );
+    }
+}
+
+/// MONEY P2: a fingerprint not in the real format (here 128 control bytes) is
+/// refused at insert and never saved, so a nearly full guard plus the
+/// adversarial duplicate saves and reloads intact.
+#[test]
+fn census_duplicate_rebuild_refuses_malformed_fingerprints_at_insert() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-format");
+        let (_root, mut original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let adversarial = "\u{1}".repeat(128);
+        original
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clone_from(&adversarial);
+        let tracked = (0..bound::MAX_TRACKED_KEYS - 1)
+            .map(|slot| {
+                (
+                    format!("{slot:016x}"),
+                    serde_json::json!(format!("0:{N3_T0},{N3_T0}")),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let path = scratch.join("index.json");
+        std::fs::write(
+            &path,
+            census_duplicate_rebuild_raw(
+                &original,
+                &key,
+                Some(serde_json::json!({ "k": tracked })),
+            ),
+        )
+        .unwrap();
+        let _clock = bound::set_now(N3_T0 + N3_DAY);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            index.files[&key].source_file_fingerprint, adversarial,
+            "not rearmed"
+        );
+        assert_eq!(bound::prior(&index, &key), None);
+        assert!(bound::attempts(&index, &key).is_empty());
+        assert_eq!(census_exhausted_counter(&mut index), 1);
+        assert_eq!(census_rebuild_alarms(&key, "fingerprint_format"), 1);
+        index.save(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert!(saved.get("claude_census_rebuild_priors").is_none());
+        bound::restart();
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            bound::tracked_open(&index),
+            Some(bound::MAX_TRACKED_KEYS - 1),
+            "the saved guard decodes intact"
+        );
+        assert_eq!(index.files[&key].source_file_fingerprint, adversarial);
         assert_eq!(census_exhausted_counter(&mut index), 1);
     }
 }

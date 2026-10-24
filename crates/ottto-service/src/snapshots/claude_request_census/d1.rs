@@ -21,7 +21,10 @@ pub(super) fn measure(
     counts.would_open_flips = state.would_open_flips;
     counts.derivation_drift = state.derivation_drift;
     counts.decode_duplicate_keys_dropped = state.decode_duplicate_keys_dropped;
-    counts.census_duplicate_rebuild_exhausted = rebuild_bound::terminal(index);
+    (
+        counts.census_duplicate_rebuild_exhausted,
+        counts.census_duplicate_rebuild_orphaned,
+    ) = rebuild_bound::terminal(index);
     // Main's census contains only these core records. Keep its byte and heap
     // meaning even when OFF encounters safety left by a previous ON run.
     counts.json_bytes = serialized_len(&index.claude_request_census.records);

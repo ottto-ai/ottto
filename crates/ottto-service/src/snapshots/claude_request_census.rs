@@ -3553,6 +3553,7 @@ pub(crate) fn persist_duplicate_rebuild_grants(
     rebuild_bound::persist_grants(index, path)
 }
 
+pub(crate) use rebuild_bound::deserialize_priors as deserialize_duplicate_rebuild_priors;
 #[cfg(test)]
 pub(crate) use rebuild_bound::test_support as duplicate_rebuild_test_support;
 
@@ -3579,7 +3580,8 @@ pub(super) fn serialize_shadow_counts<S: Serializer>(
                 && !counts.safety_incomplete
                 && !counts.safety_incomplete_overflow
                 && counts.decode_duplicate_keys_dropped == 0
-                && counts.census_duplicate_rebuild_exhausted == 0 =>
+                && counts.census_duplicate_rebuild_exhausted == 0
+                && counts.census_duplicate_rebuild_orphaned == 0 =>
         {
             serializer.serialize_some(&d1::CountsLine(counts))
         }
@@ -3731,7 +3733,10 @@ pub(crate) fn prepare_claude_request_census_terminal(
     state.would_open = Some(counts.would_open);
     counts.would_open_flips = state.would_open_flips;
     counts.derivation_drift = state.derivation_drift;
-    counts.census_duplicate_rebuild_exhausted = rebuild_bound::terminal(index);
+    (
+        counts.census_duplicate_rebuild_exhausted,
+        counts.census_duplicate_rebuild_orphaned,
+    ) = rebuild_bound::terminal(index);
     counts.json_bytes = serialized_bytes(&index.claude_request_census);
     counts.census_evidence_bytes = counts.json_bytes.saturating_add(serialized_len(
         &index.claude_request_census.safety_incomplete,
