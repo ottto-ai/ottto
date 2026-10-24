@@ -3535,6 +3535,59 @@ fn census_duplicate_rebuild_missing_prior_never_re_reads() {
 
 const MAX_N3_REARMS_PER_WINDOW: usize = 2;
 
+/// Autoreview r9 P1: once the grant's parse rebuilt the record, a later
+/// independent rearm (other work clearing the fingerprint) is saved as it is,
+/// never overwritten with the prior, and still reads after the reload.
+#[test]
+fn census_duplicate_rebuild_save_keeps_an_independent_rearm_after_the_rebuild() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-independent");
+        let (root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let path = scratch.join("index.json");
+        census_rebuild_saved_grant(&path, &original, &key);
+        let _clock = bound::set_now(N3_T0 + 60);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+        census_scan(&root, &mut index, SECOND_WINDOW);
+        assert!(index.claude_request_census_for_test().get(&key).is_some());
+        let rebuilt = index.files[&key].source_file_fingerprint.clone();
+        assert!(!rebuilt.is_empty());
+        // Independent reparse debt on the same file after the rebuild.
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+        index.save(&path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["files"][&key]["source_file_fingerprint"],
+            serde_json::json!(""),
+            "the independent rearm is saved, not the prior"
+        );
+        bound::restart();
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(
+            !bound::pending(&index, &key),
+            "the rebuild cleared the bound"
+        );
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+        assert_eq!(
+            census_rebuild_decision(&index, &key, &rebuilt),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::Rearmed)
+            ),
+            "the independent debt still reads"
+        );
+    }
+}
+
 /// MONEY P1b: a malformed, duplicated or truncated priors field is decoded in
 /// isolation and refused. Every index entry and the key's attempt history are
 /// kept (no whole-index reset), no rebuild is granted on that load, and the

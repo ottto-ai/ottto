@@ -617,8 +617,8 @@ pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
         })
 }
 
-/// Save (MONEY P1a): an entry emptied by an outstanding grant is written with
-/// its prior. The rearm itself lives only in the guard, so a save by a binary
+/// Save (MONEY P1a): an entry emptied by an outstanding grant (its record not
+/// yet rebuilt) is written with its prior. The rearm itself lives only in the guard, so a save by a binary
 /// without it, a lost guard or lost priors leave the real fingerprint, never
 /// a free rearm. Returns the keys `clear_saved` empties again after the write.
 pub(crate) fn fill_saved(index: &mut ScanIndex) -> Vec<String> {
@@ -634,10 +634,14 @@ pub(crate) fn fill_saved(index: &mut ScanIndex) -> Vec<String> {
             continue;
         }
         let id = key_id(key);
+        // Only an unpaid rearm: once the key's record is rebuilt, an empty
+        // fingerprint is other work's reparse debt and is saved as it is.
         let granted = guard
             .keys
             .get(&id)
-            .is_some_and(|tracked| tracked.has(PENDING) && !tracked.has(EXHAUSTED));
+            .is_some_and(|tracked| tracked.has(PENDING) && !tracked.has(EXHAUSTED))
+            && (index.claude_request_census.ambiguous.contains(key)
+                || index.claude_request_census.get(key).is_none());
         if let Some(prior) = index
             .claude_census_rebuild_priors
             .get(&id)
