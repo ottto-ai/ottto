@@ -3018,7 +3018,7 @@ fn census_duplicate_rebuild_orphaned_by_a_lost_guard_stays_spent() {
             // A saved cycle keeps the orphan spent and counted after a restart.
             bound::restart();
             let clock = bound::set_now(N3_T0 + N3_DAY);
-            let index = ScanIndex::load(&path).unwrap();
+            let mut index = ScanIndex::load(&path).unwrap();
             assert!(bound::exhausted(&index, &key), "{corruption}");
             assert_eq!(
                 bound::attempts(&index, &key),
@@ -3110,7 +3110,7 @@ fn census_duplicate_rebuild_expiry_after_a_clean_decode_leaves_main_shadow_bytes
         drop(clock);
         bound::restart();
         let clock = bound::set_now(N3_T0 + 3 * N3_DAY);
-        let index = ScanIndex::load(&path).unwrap();
+        let mut index = ScanIndex::load(&path).unwrap();
         assert!(!bound::pending(&index, &key));
         assert_eq!(
             bound::attempts(&index, &key).len(),
@@ -3123,7 +3123,7 @@ fn census_duplicate_rebuild_expiry_after_a_clean_decode_leaves_main_shadow_bytes
         // Both stamps expire: the guard is empty and leaves the checkpoint.
         bound::restart();
         let _clock = bound::set_now(N3_T0 + 8 * N3_DAY + 1);
-        let index = ScanIndex::load(&path).unwrap();
+        let mut index = ScanIndex::load(&path).unwrap();
         index.save(&path).unwrap();
         let saved: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
