@@ -187,43 +187,47 @@ pub(crate) fn scan_holders<'a>(
 ) -> Option<ClaudeRequestHolders<'a>> {
     let mut holders = ClaudeRequestHolders::default();
     let late = || Instant::now() >= deadline;
-    for (key, record) in index.records() {
-        let ClaudeRequestHolders {
-            transcript,
-            overflow,
-            compared,
-            ..
-        } = &mut holders;
-        if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
-                hold(transcript, overflow, &mut *charge, hash, key)
-            })
-        {
-            return None;
+    // An empty request target has no intersections. Avoid reconstructing
+    // every telemetry query key on quiet shadow pages; M remains independent.
+    if !page_hashes.is_empty() {
+        for (key, record) in index.records() {
+            let ClaudeRequestHolders {
+                transcript,
+                overflow,
+                compared,
+                ..
+            } = &mut holders;
+            if late()
+                || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
+                    hold(transcript, overflow, &mut *charge, hash, key)
+                })
+            {
+                return None;
+            }
         }
-    }
-    for (key, record) in ledger.records_with_prefix(TELEMETRY_KEY_PREFIX) {
-        let ClaudeRequestHolders {
-            telemetry,
-            overflow,
-            compared,
-            ..
-        } = &mut holders;
-        if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
-                if !charge(HOLD_BYTES.saturating_add(key.len())) {
-                    return false;
-                }
-                let list = telemetry.entry(hash).or_default();
-                if list.len() < MAX_HOLDERS_PER_HASH {
-                    list.push(key.clone());
-                } else {
-                    overflow.insert(hash);
-                }
-                true
-            })
-        {
-            return None;
+        for (key, record) in ledger.records_with_prefix(TELEMETRY_KEY_PREFIX) {
+            let ClaudeRequestHolders {
+                telemetry,
+                overflow,
+                compared,
+                ..
+            } = &mut holders;
+            if late()
+                || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
+                    if !charge(HOLD_BYTES.saturating_add(key.len())) {
+                        return false;
+                    }
+                    let list = telemetry.entry(hash).or_default();
+                    if list.len() < MAX_HOLDERS_PER_HASH {
+                        list.push(key.clone());
+                    } else {
+                        overflow.insert(hash);
+                    }
+                    true
+                })
+            {
+                return None;
+            }
         }
     }
     if !page_message_hashes.is_empty() {
@@ -458,6 +462,11 @@ impl ClaudeLedgerScope {
         page_roots: &BTreeSet<&str>,
         deadline: Instant,
     ) -> Option<Self> {
+        // No page group or family can receive debt. Preserve the deadline
+        // contract without decoding every unrelated file's logical identity.
+        if page_groups.is_empty() && page_roots.is_empty() {
+            return (Instant::now() < deadline).then(Self::default);
+        }
         let mut scope = Self::default();
         let mut birth_stats = 0_usize;
         // Every indexed file, and every retained census record of a member

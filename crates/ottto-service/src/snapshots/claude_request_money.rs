@@ -1937,8 +1937,11 @@ async fn build_page_at(
         deadline,
         unbuilt_older: std::cell::Cell::new(0),
     };
-    let retired_roots =
-        claude_request_ledger::roots_with_retired_records(&index.claude_request_census);
+    let retired_roots = if by_root.is_empty() {
+        BTreeSet::new()
+    } else {
+        claude_request_ledger::roots_with_retired_records(&index.claude_request_census)
+    };
 
     let mut bodies = Vec::with_capacity(by_root.len());
     let mut late = false;
