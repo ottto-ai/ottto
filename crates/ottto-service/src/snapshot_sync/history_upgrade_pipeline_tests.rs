@@ -890,6 +890,16 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
             "held files never re-parse"
         );
         assert!(again.uploaded.is_empty());
+        let lines = crate::snapshots::scan_index_containment_lines_for_test();
+        let census = lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("local snapshot census: source=claude_code "))
+            .unwrap();
+        assert!(
+            census.contains("retained_carried_entries=3 history_held_carried_entries=3"),
+            "{census}"
+        );
         assert_acks(&again.index);
         assert_eq!(
             serde_json::to_value(&again.index).unwrap()["accepted_rebuild_incidence"],

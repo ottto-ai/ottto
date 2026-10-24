@@ -6070,7 +6070,8 @@ pub fn finalize_scan_after_policy_with_body_witness(
             })
         })
         .map(|(_, members)| members.len())
-        .sum::<usize>();
+        .sum::<usize>()
+        .saturating_add(index.claude_history_emission.skipped_carried_entries);
     emit_scan_index_containment_line(format!(
         "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried}",
         source.api_slug(), result.census_complete
@@ -25540,6 +25541,16 @@ impl OwnedSourceScan {
                     HistoryDecision::Held(_)
                         if (adoption_only || correction_only) && !comparison_target =>
                     {
+                        if source == SnapshotSource::ClaudeCode {
+                            let carried = index
+                                .accepted_rebuild_incidence
+                                .get(&local_index_key(&candidate.path))
+                                .map_or(0, BTreeSet::len);
+                            index.claude_history_emission.skipped_carried_entries = index
+                                .claude_history_emission
+                                .skipped_carried_entries
+                                .saturating_add(carried);
+                        }
                         decision = CandidateDecision::Skip;
                     }
                     HistoryDecision::Held(hold) => {
