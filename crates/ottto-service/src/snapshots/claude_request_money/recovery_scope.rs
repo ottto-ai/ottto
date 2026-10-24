@@ -180,6 +180,9 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
                     scope.messages.len(),
                 )
             {
+                if !scope.valid() {
+                    return None;
+                }
                 for files in scope.roots.values_mut() {
                     files.sort();
                     files.dedup();
