@@ -1224,6 +1224,7 @@ fn money_armed_cycle_saves_the_baseline_index() {
     // This fixture requires a saved-ledger starting point. Prime the
     // asynchronous ticket before the cycle rather than racing two fast
     // pages against writer fsync. Production pages still never wait.
+    money::store::flush(); // make room for the nonblocking reservation
     money::store::prime_credit_for_test(&fixture.support, 0);
     fixture.traversal(8, &MONEY_PIPELINE_CYCLE);
     money::store::forget_for_test(&fixture.support);
