@@ -707,6 +707,14 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
     }
     let pending = catalog.entries.iter().find_map(|m| {
         let reason = m.terminal.or_else(|| {
+            if m.ack_saved {
+                // A saved complete ACK has already ended UNKNOWN. Keep bytes
+                // through the selected-save barrier, but never reinterpret a
+                // successful last replay as exhausted UNKNOWN. At the hard
+                // privacy deadline (or binding loss), retire known custody;
+                // selected-file debt still requires its ordinary saved proof.
+                return (m.binding != binding || now >= m.deadline).then_some(Reason::Resolved);
+            }
             if money::recovery_released(support, &m.lineage) {
                 Some(Reason::Released)
             } else if m.binding != binding {

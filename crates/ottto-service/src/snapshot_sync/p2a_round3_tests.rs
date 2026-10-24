@@ -3724,3 +3724,86 @@ fn p2a_unknown_partial_200_records_only_covering_siblings() {
         "complete partial ACK hands conflicting siblings to ordinary retry custody"
     );
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_last_replay_saved_ack_failed_selection_stays_known_at_expiry() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let _reset = P2aConflictReset;
+    let now = current_unix_seconds();
+    for elapsed in [0, 300, 3600] {
+        let _clock = money::PageClockForTest::new(&control.support, now + elapsed);
+        control.cycle();
+        control.restart();
+    }
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    P2A_INDEX_CONFLICT.with(|state| *state.borrow_mut() = Some(control.index_path.clone()));
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 21600);
+        assert!(
+            control.cycle_result().is_err(),
+            "fail selected save after the last replay ACK"
+        );
+    }
+    let attempts = unknown_recovery::active_for_test(&control.support);
+    assert_eq!(attempts.len(), 1);
+    assert!(attempts[0].ack_saved);
+    assert_eq!(attempts[0].posts, 4);
+    assert!(attempts[0].terminal.is_none());
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert_eq!(posts.len(), 4);
+    assert!(posts.iter().all(|body| body == &posts[0]));
+    drop(posts);
+    control.restart();
+    control.recovery_startup(now + 21601);
+    assert!(
+        unknown_recovery::active_for_test(&control.support)[0]
+            .terminal
+            .is_none(),
+        "the physical cap cannot turn a durably known ACK back into UNKNOWN"
+    );
+    assert!(unknown_recovery::due(&control.support, now + 21601)
+        .unwrap()
+        .0
+        .is_empty());
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    control.recovery_startup(now + 86400);
+    assert!(
+        unknown_recovery::active_for_test(&control.support).is_empty(),
+        "hard expiry still deletes bytes"
+    );
+    let root = control.support.join("claude-money-recovery");
+    let status: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.join("status")).unwrap()).unwrap();
+    assert_eq!(status["unknown_outcome_unresolved"], 0);
+    for file in std::fs::read_dir(root).unwrap() {
+        let path = file.unwrap().path();
+        if path.extension().and_then(|s| s.to_str()) == Some("receipt") {
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+            assert_eq!(receipt["outcome"], "resolved");
+        }
+    }
+    assert!(
+        money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ),
+        "privacy retirement never certifies the failed selected save"
+    );
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 4);
+}
