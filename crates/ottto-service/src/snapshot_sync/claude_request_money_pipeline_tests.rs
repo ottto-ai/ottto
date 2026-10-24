@@ -1489,6 +1489,10 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let mut following_index = ScanIndex::default();
     let reread = scan(&mut following_index);
     assert_eq!(reread.scanned_file_count, armed.scanned_file_count, "fresh index must Full-reparse every selected file");
+    // Fixture parity serialization is native/setup work. Finish it before
+    // starting the admitted finalizer probe's fixed money wall clock.
+    assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&reread.snapshots).unwrap());
+    assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&following_index).unwrap());
     let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &following_index);
     money::capture::purge_scope_for_test(&fixture.support);
     money::capture::begin_page(&fixture.support);
@@ -1506,8 +1510,6 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(captured_deferred > 0, "Full capture plan must include prior incomplete capture turns");
     assert_eq!(captured_deferred, following_captures.len(),
         "every following capture must target a prior incomplete family, rather than repeat an already built one");
-    assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&reread.snapshots).unwrap());
-    assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&following_index).unwrap());
     let (following, following_elapsed) = run(&reread, &following_index, now + 1);
     assert_eq!(following.refused_deadline, 0, "{following:?}");
     let next_rows = money_jsonl_rows(&fixture.support);
