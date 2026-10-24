@@ -5187,6 +5187,61 @@ fn interrupted_install_with_lost_index_resets_all_scopes_without_replay() {
 }
 
 #[test]
+fn crash_during_install_before_index_save_resets_without_replay() {
+    let env = Env::uninstalled("composition-install-crash");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    write_records(&a, &claude_turn(&cwd, day, 1));
+    write_records(&b, &claude_turn(&cwd, day, 2));
+    // This build's install writes its record, then stops before saving
+    // its index: the record stays, the index is lost.
+    let stats = env.run(Source::Claude, now, None);
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    assert!(install_path(&env.state, Source::Claude.label()).exists());
+    let at_reset = [&a, &b].map(|path| fs::metadata(path).unwrap().len());
+
+    // The next run is a reset, not a second install: every file is pinned
+    // at its end and nothing is read.
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(
+        (
+            stats.agent_resets,
+            stats.install_forward_only,
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.files_read
+        ),
+        (1, 2, 0, 0, 0)
+    );
+    // The reset commits the next day, still reading nothing.
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (stats.scopes_committed, stats.bytes_new + stats.bytes_repair),
+        (1, 0)
+    );
+
+    // Only what is appended after the reset is read.
+    let appended = claude_turn(&cwd, day, 3);
+    for path in [&a, &b] {
+        append_records(path, &appended);
+    }
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.agent_resets),
+        (2 * body(&appended).len() as u64, 0, 0)
+    );
+    let scope = env.scope(Source::Claude);
+    for (name, size) in ["a.jsonl", "b.jsonl"].iter().zip(at_reset) {
+        assert_eq!(scope.files[*name].origin, Some(size));
+    }
+    env.cleanup();
+}
+
+#[test]
 fn reset_marker_survives_a_crash_before_scope_state_moves() {
     let env = Env::new("composition-marker-reset");
     let now = base_now();

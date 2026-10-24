@@ -16,6 +16,9 @@ effect that backlog was a backfill of those files' earlier content.
 - A transcript born after the install record's cutoff (the last saved scan
   start) is still new and is read from offset zero as new bytes, outside the
   repair budget. This is unchanged.
+  A file born after the install's start but found by that same first walk
+  is still pinned at its end, so its first seconds are not read; this fits
+  "no backfill".
 - An install made by an earlier build keeps its saved state. Pins waiting for a
   full read still drain within the repair budget, newest first, until none are
   left. No backlog is dropped.
@@ -34,5 +37,6 @@ bytes, which is how sessions reach the reader under the new rule.
 needed a waiting full read now build the state that an earlier build's install
 left behind. New tests cover: an install with sessions in flight reads 0 bytes
 from them on day 1, a file created after the install is read from 0, an earlier
-build's backlog keeps draining, and an agent reset starts in-flight files at
-their end.
+build's backlog keeps draining, an agent reset starts in-flight files at
+their end, and a crash during an install before its index is saved resets
+on the next run and reads 0 bytes from existing files.
