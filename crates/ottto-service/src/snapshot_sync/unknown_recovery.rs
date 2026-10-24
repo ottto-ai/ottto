@@ -1752,7 +1752,8 @@ pub(super) async fn replay_due(
         if !admitted(index, support, &binding, &m, guard)? {
             let mut cancelled = m;
             cancelled.posts -= 1;
-            let updated = wait(outcome_ticket(support, cancelled, None, now(support))?).await?;
+            let reason = (guard == LiteralPermit::DenyAll).then_some(Reason::RevisionDowngrade);
+            let updated = wait(outcome_ticket(support, cancelled, reason, now(support))?).await?;
             replace(support, updated)?;
             continue;
         }

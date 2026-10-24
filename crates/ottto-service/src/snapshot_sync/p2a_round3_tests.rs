@@ -2925,6 +2925,106 @@ fn recovery_offer_difference(offers: &[serde_json::Value]) -> String {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_late_revision_deny_contract_releases_without_post_charge() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle_deferred();
+    control.recovery_startup(now);
+    let original = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert!(original.entities.iter().any(|entity| entity.literal));
+    let mut index = control.saved();
+    index.activate_upload_context(original.context.clone());
+    index.activate_effective_upload_body_witness_revision(3);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let progress_path = snapshot_upload_progress_path(&control.index_path);
+    let mut progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    drop(clock);
+    let _due = money::PageClockForTest::new(&control.support, now + 300);
+    let checks = std::cell::Cell::new(0);
+    let denied = std::cell::RefCell::new(None);
+    money_resume::drive_for_test(unknown_recovery::replay_due(
+        &control.support,
+        &mut index,
+        &mut progress,
+        &progress_path,
+        &control.client,
+        &control.device,
+        "device-secret",
+        "otm_test",
+        &namespace,
+        original.policy,
+        || {
+            checks.set(checks.get() + 1);
+            if checks.get() == 2 {
+                let charged = unknown_recovery::active_for_test(&control.support)
+                    .pop()
+                    .unwrap();
+                assert_eq!(
+                    (charged.posts, charged.slot),
+                    (2, 1),
+                    "real durable counter cut point"
+                );
+                // Required owner-B guard contract: the active row downgrades
+                // while the counter writer is pending. No guard is reimplemented.
+                *denied.borrow_mut() = Some(unknown_recovery::guard_for_test(
+                    unknown_recovery::LiteralPermit::DenyAll,
+                ));
+            }
+            Ok(())
+        },
+    ))
+    .unwrap();
+    assert_eq!(checks.get(), 2);
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    let after = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (after.posts, after.slot),
+        (1, 1),
+        "a gate veto does not charge a physical POST"
+    );
+    assert_eq!(
+        after.terminal,
+        Some(unknown_recovery::Reason::RevisionDowngrade)
+    );
+    assert!(!progress
+        .accepted_fingerprints
+        .contains(&original.entities[0].fingerprint));
+    control.recovery_startup(now + 300);
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(control.support.join("claude-money-recovery/status")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["unknown_outcome_unresolved"], 1);
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
