@@ -1734,9 +1734,12 @@ pub(crate) struct ClaudeRequestCensusShadowState {
 crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete, rebuild_bound);
 
 impl ClaudeRequestCensusShadowState {
+    /// Malformed: the safety marker and the N3 rebuild guard close (a lost
+    /// guard must not replenish rebuild attempts, SI-724-B3).
     fn closed() -> Self {
         Self {
             safety_incomplete: Some(SafetyIncomplete::closed()),
+            rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
             ..Self::default()
         }
     }
@@ -2171,10 +2174,9 @@ impl<R: std::io::Read> CensusRead<R> {
             state.decode_duplicate_keys_dropped =
                 state.decode_duplicate_keys_dropped.saturating_add(count);
         }
-        // Existing candidate selection treats an empty fingerprint as
-        // Parse(Rearmed). The debt persists through save/restart until the next
-        // authorized transcript pass rebuilds its record, at most twice per
-        // key per seven days.
+        // MONEY N3: the next authorized transcript pass re-reads the key
+        // (Parse(Rearmed), fingerprint untouched) to rebuild its record, at
+        // most twice per key per seven days.
         rebuild_bound::apply(index, self.priors_refused);
     }
 
@@ -2183,7 +2185,11 @@ impl<R: std::io::Read> CensusRead<R> {
             index.claude_request_census = ClaudeRequestCensus::default();
         }
         if self.duplicate_shadow {
-            index.claude_request_census_shadow = ClaudeRequestCensusShadowState::default();
+            // Which copy holds the rebuild guard is unknown: close it.
+            index.claude_request_census_shadow = ClaudeRequestCensusShadowState {
+                rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
+                ..ClaudeRequestCensusShadowState::default()
+            };
         }
     }
 
@@ -2749,9 +2755,13 @@ impl<'de> Visitor<'de> for ShadowStateVisitor {
             }
             if field == "n" {
                 let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
-                state.rebuild_bound = Some(Box::new(rebuild_bound::DuplicateRebuildGuard::decode(
-                    raw.get(),
-                )));
+                // A repeated guard is ambiguous (SI-724-B3): closed, never
+                // last-wins.
+                state.rebuild_bound = Some(Box::new(if state.rebuild_bound.is_some() {
+                    rebuild_bound::DuplicateRebuildGuard::closed()
+                } else {
+                    rebuild_bound::DuplicateRebuildGuard::decode(raw.get())
+                }));
                 continue;
             }
             let value = map.next_value::<Loose>()?;
@@ -3673,15 +3683,12 @@ pub(crate) fn persist_duplicate_rebuild_grants(
 }
 
 pub(crate) use rebuild_bound::deserialize_priors as deserialize_duplicate_rebuild_priors;
-// MONEY N3: candidate selection skips a held rearm; a save writes each
-// outstanding grant's entry with its prior fingerprint, then empties it again
-// (`rebuild_bound::fill_saved`).
-pub(crate) use rebuild_bound::held as duplicate_rebuild_held;
+// MONEY N3: candidate selection re-reads a granted key's unchanged transcript
+// and skips an earlier checkpoint's held rearm.
 #[cfg(test)]
 pub(crate) use rebuild_bound::test_support as duplicate_rebuild_test_support;
 pub(crate) use rebuild_bound::{
-    clear_saved as clear_saved_duplicate_rebuild_priors,
-    fill_saved as fill_saved_duplicate_rebuild_priors,
+    held as duplicate_rebuild_held, rearmed as duplicate_rebuild_rearmed,
 };
 
 /// A parse that reaches no record (a failed finish, or a native comparison

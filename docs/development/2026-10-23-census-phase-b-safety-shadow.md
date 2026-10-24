@@ -31,41 +31,54 @@ MONEY accepts this corruption-only difference subject to durable counting and
 next-pass reconstruction. `decode_duplicate_keys_dropped` is cumulative and
 persists as root shadow `a`; it is present in the census line with OFF too.
 Both persisted decoder paths retain ambiguous key identities across normalization
-and clear only those indexed source fingerprints, using the existing
-`Parse(Rearmed)` path. Save/restart preserves that debt; the next ordinary
-transcript scan rebuilds the record. A successful rebuild clears the key's
-ambiguity, while the corruption count and sticky safety marker retain history.
+and grant that key's transcript one `Parse(Rearmed)` read. The grant lives in
+the rebuild guard and the load's transient set only: the indexed source
+fingerprint is never written. Save/restart preserves the debt (the guard), and
+the next ordinary transcript scan rebuilds the record. A successful rebuild
+clears the key's ambiguity, while the corruption count and sticky safety marker
+retain history.
 
 That rearm is bounded per key: at most two rebuilds per rolling seven days
 (`claude_request_census/rebuild_bound.rs`, shadow `n`). The daemon saves each
 grant stamp before its scan can read, so restarts and crashes count; a future
-stamp counts as recent. Past the bound the key keeps its last indexed
-fingerprint (no re-read), its record stays absent, its duplicate stays counted,
-and `census_duplicate_rebuild_exhausted` plus a rate-limited
-`key_hash8`/`cause` alarm make it visible. It clears when the window passes or
-the key's record next decodes clean. A read that starts spends its grant even
-if the failed pass is never saved. At most 512 keys are tracked, one compact
-line each in the saved index; past that, or after a malformed guard, new keys
-are refused for one window. Only well-formed fingerprints (64 lowercase hex)
-are rearmed. The fingerprint a grant emptied is saved outside the shadow, in
-the root field `claude_census_rebuild_priors`, so a malformed, duplicated or
-closed shadow cannot make a rearm free: an orphaned grant gets its fingerprint
-back, stays exhausted for one window, and is counted in
-`census_duplicate_rebuild_orphaned` with a `cause=orphaned_rearm` alarm.
+stamp counts as recent. Past the bound the key is not re-read, its record stays
+absent, its duplicate stays counted, and `census_duplicate_rebuild_exhausted`
+plus a rate-limited `key_hash8`/`cause` alarm make it visible. It clears when
+the key's record next decodes clean; the window passing allows only a new
+counted attempt. A read that starts spends its grant even if the failed pass is
+never saved. At most 512 keys are tracked, one compact line each in the saved
+index; past that new keys are refused for one window. Only well-formed
+fingerprints (64 lowercase hex) are rearmed.
 
-A rearm is never saved. The index writes a granted entry with its prior
-fingerprint, and a load empties it again only while the guard still holds the
-grant. A downgrade, an older binary's save or corruption that erases both the
-guard and the priors therefore leaves the real fingerprint: no rearm and no
-re-read. A pending key whose emptied fingerprint has no prior (an entry saved
-empty before this rule) is held: candidate selection skips it, it stays counted
-as exhausted with a `cause=prior_missing` alarm, and only new transcript
-content, a clean decode or the key leaving the index releases it. The index
-reader decodes the priors field in isolation: a malformed, duplicated or
-truncated field keeps every entry and the attempt history, grants no rebuild on
-that load, is re-derived from the entries at the next save, and is counted in
-`census_rebuild_priors_decode_refused` for one window
-(`cause=priors_decode_refused`).
+Identity rearms always win (SI-724-B1). The contract-5 latch, family proof
+corrections, stale-family uncarries and committable subsets clear the same
+fingerprint independently. Because the bound never writes it, they stay visible
+to their own consumers, are saved as they are, and are re-offered after any
+reload; the bound never restores, overwrites or holds them, whether its grant
+for that key is outstanding or exhausted. Whatever erases the guard (a
+downgrade, an older binary's save, corruption) erases only the rearm: the entry
+keeps its real fingerprint and is not re-read (MONEY P1a).
+
+A lost or ambiguous guard never replenishes the allowance (SI-724-B3): a
+malformed `n`, a repeated `n` or key id, a malformed or duplicated shadow
+state, or a saved prior whose key the guard no longer holds (an orphan, counted
+in `census_duplicate_rebuild_orphaned` with a `cause=orphaned_rearm` alarm)
+closes admission for one window (`cause=guard_state_closed`).
+
+Earlier checkpoints of this branch saved a rearm as an empty fingerprint, with
+the fingerprint it emptied in the root field `claude_census_rebuild_priors` (or
+inside the guard). Only that pair, a pending key plus its prior, positively
+marks an empty fingerprint as the bound's own (SI B2 condition 2). It takes a
+counted attempt, or past the bound it is held (candidate selection skips it,
+`cause=legacy_rearm_held`) until the window allows one; it is never restored.
+An empty fingerprint without that marker takes the ordinary path and is
+re-offered. The priors field is decoded in isolation, by the index reader and
+by the field's own lenient decoder on a plain Serde path. A malformed,
+duplicated, truncated or wrong-type field never fails the index decode: every
+entry, binding, ACK and latch is kept, the priors are dropped, admission closes
+for one window, and `census_rebuild_priors_decode_refused` counts it
+(`cause=priors_decode_refused`). All of these counters and alarms are
+count-only.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes

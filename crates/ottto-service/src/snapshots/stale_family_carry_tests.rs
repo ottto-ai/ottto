@@ -1341,3 +1341,124 @@ fn c1b_defensive_carry_reset_rearms_every_member_and_replays_the_passed_one() {
     );
     assert_eq!(index.claude_stale_family_carry.replay.len(), 1);
 }
+
+/// SI-724-B1 and SI B2 condition 2: a real identity re-arm (the contract-5
+/// latch, or an owed family proof correction, refuses the carry, so the
+/// stale family re-arms as BASE does) of a key the MONEY N3 rebuild bound has
+/// an outstanding grant for, or has exhausted, survives save, reload and
+/// candidate selection: the file is re-offered, never restored, overwritten
+/// or held. So is the re-arm when the grant is on another key, and when the
+/// key's guard is lost after the save. OFF and ON.
+#[test]
+fn c1b_identity_rearm_wins_over_the_census_rebuild_bound() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    const NOW: u64 = 1_790_000_000;
+    let n3_key = carry_key(CARRY_ROOT, None);
+    let other = carry_key(CARRY_OTHER, None);
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for control in ["identity_contract_latched", "authority_correction_debt"] {
+            for (n3, grant_key) in [
+                ("outstanding", &n3_key),
+                ("exhausted", &n3_key),
+                ("other_key", &other),
+                ("lost_guard", &n3_key),
+            ] {
+                let case = format!("shadow={enabled} {control} {n3}");
+                bound::restart();
+                let _clock = bound::set_now(NOW);
+                let scratch = crate::test_scratch::ScratchDir::new("carry-identity-wins");
+                let path = scratch.join("index.json");
+                let mut index = carry_index();
+                if control == "identity_contract_latched" {
+                    index.claude_request_identity_contract_changed = true;
+                } else {
+                    carry_unbound_quarantine(&mut index, true);
+                }
+                let before = carry_index();
+                let grant_fp = index.files[grant_key].source_file_fingerprint.clone();
+                // The bound's saved state for the key: a pending grant with one
+                // attempt, or pending and exhausted with both.
+                let tracked = if n3 == "exhausted" {
+                    format!("5:{NOW},{NOW}")
+                } else {
+                    format!("1:{NOW}")
+                };
+                let mut value = serde_json::to_value(&index).unwrap();
+                value["claude_request_census_shadow"] = serde_json::json!({
+                    "n": { "k": { (bound::key_id(grant_key)): tracked } }
+                });
+                std::fs::write(&path, value.to_string()).unwrap();
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    index.files[grant_key].source_file_fingerprint, grant_fp,
+                    "{case}: N3 never writes the fingerprint"
+                );
+                let decision = index.source_fingerprint_decision(
+                    grant_key,
+                    &index.files[grant_key],
+                    &grant_fp,
+                );
+                if n3 == "exhausted" {
+                    assert!(bound::exhausted(&index, grant_key), "{case}");
+                    assert_eq!(decision, (CandidateDecision::Skip, None), "{case}");
+                } else {
+                    assert_eq!(decision, rearmed, "{case}: the grant is outstanding");
+                }
+
+                // The real identity re-arm, in the same process.
+                carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+                for key in carry_family_keys() {
+                    assert!(
+                        index.files[&key].source_file_fingerprint.is_empty(),
+                        "{case}: {key} re-armed by identity"
+                    );
+                }
+                index.save(&path).unwrap();
+                if n3 == "lost_guard" {
+                    let mut saved: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    saved["claude_request_census_shadow"]["n"] = serde_json::json!("corrupt");
+                    std::fs::write(&path, saved.to_string()).unwrap();
+                }
+
+                bound::restart();
+                let index = ScanIndex::load(&path).unwrap();
+                for key in carry_family_keys() {
+                    let entry = &index.files[&key];
+                    assert!(
+                        entry.source_file_fingerprint.is_empty(),
+                        "{case}: {key} saved as it is, never restored"
+                    );
+                    assert!(!bound::held(&index, &key), "{case}: {key} never held");
+                    assert_eq!(
+                        index.source_fingerprint_decision(
+                            &key,
+                            entry,
+                            &before.files[&key].source_file_fingerprint
+                        ),
+                        rearmed,
+                        "{case}: {key} re-offered"
+                    );
+                }
+                if n3 == "other_key" {
+                    // The other key's bound is unaffected: its second and last
+                    // attempt was spent by the restart's load.
+                    assert_eq!(
+                        index.files[&other].source_file_fingerprint, grant_fp,
+                        "{case}"
+                    );
+                    assert!(bound::exhausted(&index, &other), "{case}");
+                    assert_eq!(bound::attempts(&index, &other), vec![NOW, NOW]);
+                }
+                if n3 == "lost_guard" {
+                    assert_eq!(bound::tracked_open(&index), None, "{case}: closed");
+                }
+            }
+        }
+    }
+}

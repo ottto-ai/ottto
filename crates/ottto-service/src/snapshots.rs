@@ -3151,10 +3151,11 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_true"
     )]
     claude_history_move_released: bool,
-    /// MONEY N3: the fingerprint each outstanding duplicate-key rebuild grant
-    /// emptied, by census key id. Outside the shadow state on purpose: decoded
-    /// strictly, like the entries it restores, so losing the shadow's guard
-    /// cannot make a rearm free (`claude_request_census/rebuild_bound.rs`).
+    /// MONEY N3, legacy marker: the fingerprint an earlier checkpoint's
+    /// duplicate-key rebuild emptied, by census key id. Written only while
+    /// such an empty entry is outstanding; current grants never touch an
+    /// entry. Decoded in isolation, never failing the index decode
+    /// (`claude_request_census/rebuild_bound.rs`).
     #[serde(
         default,
         skip_serializing_if = "BTreeMap::is_empty",
@@ -37793,8 +37794,6 @@ impl ScanIndex {
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file = File::create(&temp_path)
             .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
-        // MONEY N3: a rearm is never written; its entry keeps its prior.
-        let filled = claude_request_census::fill_saved_duplicate_rebuild_priors(self);
         let result = (|| -> Result<()> {
             {
                 let mut writer = BufWriter::new(&mut file);
@@ -37810,7 +37809,6 @@ impl ScanIndex {
                 .with_context(|| format!("replace scan index {}", path.display()))?;
             sync_checkpoint_parent(path)
         })();
-        claude_request_census::clear_saved_duplicate_rebuild_priors(self, filled);
         if result.is_err() {
             self.generation = previous_generation;
             let _ = fs::remove_file(&temp_path);
@@ -39437,7 +39435,9 @@ impl ScanIndex {
 
     /// The last gate, for an unchanged transcript: its indexed fingerprint
     /// against the current one. An empty indexed fingerprint is a rearm,
-    /// unless MONEY N3 holds it (nothing can restore it): then it is skipped.
+    /// unless MONEY N3 holds an earlier checkpoint's rearm: then it is
+    /// skipped. A MONEY N3 grant re-reads the unchanged transcript without
+    /// touching its fingerprint, so independent rearms stay visible.
     fn source_fingerprint_decision(
         &self,
         key: &str,
@@ -39445,6 +39445,12 @@ impl ScanIndex {
         current: &str,
     ) -> (CandidateDecision, Option<CandidateParseReason>) {
         if entry.source_file_fingerprint == current {
+            if claude_request_census::duplicate_rebuild_rearmed(self, key) {
+                return (
+                    CandidateDecision::Parse,
+                    Some(CandidateParseReason::Rearmed),
+                );
+            }
             return (CandidateDecision::Skip, None);
         }
         if !entry.source_file_fingerprint.is_empty() {
