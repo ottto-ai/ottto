@@ -2301,7 +2301,7 @@ fn money_message_only_copies_pick_one_owner() {
     .expect("scope");
     let empty_claims = BTreeMap::new();
     let empty_events = BTreeMap::new();
-    let empty_sessions = BTreeMap::new();
+    let empty_sessions = BTreeMap::<String, String>::new();
     let empty_traces = BTreeMap::new();
     let ctx = ClaudeClassifyContext {
         index: &index,

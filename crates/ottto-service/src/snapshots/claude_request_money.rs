@@ -47,11 +47,12 @@ pub(crate) mod store;
 
 use super::claude_request_census::{
     claude_request_hash, family_key, fingerprint_matches, message_key, telemetry_key,
-    ClaudeFamilyMemo, ClaudeFamilyPublication, ClaudeRequestCensusInsert,
+    ClaudeFamilyMemo, ClaudeFamilyPublication, ClaudeRequestCensus, ClaudeRequestCensusInsert,
     ClaudeRequestCensusRecord, FAMILY_KEY_PREFIX, MESSAGE_KEY_PREFIX, TELEMETRY_KEY_PREFIX,
 };
 use super::claude_request_ledger::{
-    self, ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeUndecidedBy,
+    self, ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeScopeFiles,
+    ClaudeUndecidedBy,
 };
 use super::{
     claude_index_path_family_member, claude_snapshot_family_root_ref,
@@ -109,6 +110,10 @@ const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
 /// or loaded page can spend the whole body window on it and defer every
 /// family, page after page. Closing slices stay bounded by the close deadline.
 const FIRST_FAMILY_CLOSE_RESERVE: Duration = Duration::from_millis(70);
+/// Common setup (acknowledgements, telemetry, retirement) stops this far
+/// before the first scheduled family's floor: that family's own setup and
+/// body always have this window.
+const FIRST_FAMILY_SETUP_RESERVE: Duration = Duration::from_millis(60);
 const TELEMETRY_MAX_ELAPSED: Duration = Duration::from_millis(20);
 /// A growing structure's admission step.
 const GROWTH_STEP_BYTES: usize = 256 * 1024;
@@ -558,9 +563,11 @@ pub(crate) enum PageFault {
     LateAtHandOff,
     /// Dense-page fixture: optional work is already out of time at entry.
     BodyDeadline,
-    /// Fixed setup used the whole body window; only the first scheduled
-    /// family's floor remains.
+    /// Common setup used everything up to its stop, and later families
+    /// have no window: only the first scheduled family's remains.
     SetupOverrun,
+    /// Common setup used everything up to its stop.
+    SetupStall,
     /// The batch's admission is refused.
     BatchRefused,
     WriteFailure,
@@ -734,7 +741,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) native_us: u64,
     pub(crate) writer_us: u64,
     pub(crate) result_apply_us: u64,
-    /// Time through shared family preparation, before optional body slices.
+    /// Time through common setup, before the first family's own inputs
+    /// and body (its stop is a fixed reserve before that family's floor).
     pub(crate) family_setup_us: u64,
     /// Producer work accounting for the unreached family suffix.
     pub(crate) deferred_close_us: u64,
@@ -1266,41 +1274,190 @@ pub(crate) fn guarded_for_test(run: impl FnOnce()) -> (bool, u64) {
     (panicked, SHADOW_PANICS.load(Ordering::Acquire))
 }
 
-/// Index keys of each page (root, member) and the indexed members of each
-/// page root.
-type FamilyMembers = (
-    BTreeMap<(String, String), Vec<String>>,
-    BTreeMap<String, BTreeSet<String>>,
-);
+/// What the reached families' bodies read of the index, gathered when the
+/// schedule first reaches a family: one borrowed walk of the index keys.
+struct PageFiles<'i> {
+    /// The scheduled families' files, and every group's.
+    files: ClaudeScopeFiles<'i>,
+    /// Index keys of each scheduled (root, member).
+    member_keys: BTreeMap<(String, String), Vec<String>>,
+    /// The indexed members of each scheduled root.
+    indexed_members: BTreeMap<String, BTreeSet<String>>,
+    /// The groups of the scheduled families' own files (§3.1 scope).
+    page_groups: BTreeSet<&'i str>,
+}
 
 /// None when the deadline passed.
-fn family_members(
-    index: &ScanIndex,
-    roots: &BTreeSet<&str>,
+fn page_files<'i>(
+    index: &'i ScanIndex,
+    capture_turns: &BTreeSet<&str>,
+    by_root: &BTreeMap<&str, Vec<&SnapshotItem>>,
     deadline: Instant,
-) -> Option<FamilyMembers> {
+) -> Option<PageFiles<'i>> {
+    let files = ClaudeScopeFiles::walk(index, capture_turns, deadline)?;
     let mut member_keys = BTreeMap::<(String, String), Vec<String>>::new();
-    let mut members = BTreeMap::<String, BTreeSet<String>>::new();
-    for key in index.files.keys() {
-        if Instant::now() >= deadline {
-            return None;
+    let mut indexed_members = BTreeMap::<String, BTreeSet<String>>::new();
+    for key in files.roots.values().flatten() {
+        // Residue records name no current member.
+        if !index.files.contains_key(*key) {
+            continue;
         }
         let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
             continue;
         };
-        if !roots.contains(root.as_str()) || index.confirmed_empty_files.contains(key) {
-            continue;
-        }
-        members
+        indexed_members
             .entry(root.clone())
             .or_default()
             .insert(member.clone());
         member_keys
             .entry((root, member))
             .or_default()
-            .push(key.clone());
+            .push((*key).to_owned());
     }
-    Some((member_keys, members))
+    let mut page_groups = BTreeSet::new();
+    for (root, items) in by_root {
+        for item in items {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            let Some([key]) = member_keys
+                .get(&((*root).to_owned(), item.source_session_id.clone()))
+                .map(Vec::as_slice)
+            else {
+                continue;
+            };
+            if let Some(group) = index
+                .files
+                .get_key_value(key)
+                .and_then(|(key, _)| claude_request_ledger::claude_project_group(key))
+            {
+                page_groups.insert(group);
+            }
+        }
+    }
+    Some(PageFiles {
+        files,
+        member_keys,
+        indexed_members,
+        page_groups,
+    })
+}
+
+/// Add family `root`, and the scoped groups its files name, to the page
+/// scope. None when the deadline passed.
+fn add_family_scope(
+    scope: &mut ClaudeLedgerScope,
+    index: &ScanIndex,
+    census: &ClaudeRequestCensus,
+    files: &PageFiles<'_>,
+    root: &str,
+    deadline: Instant,
+) -> Option<()> {
+    let keys = files.files.roots.get(root).map_or(&[][..], Vec::as_slice);
+    for key in keys {
+        if let Some(group) = claude_request_ledger::claude_project_group(key)
+            .filter(|group| files.page_groups.contains(group))
+        {
+            scope.add_group(index, census, group, &files.files.groups[group], deadline)?;
+        }
+    }
+    scope.add_family(index, census, root, keys, deadline)
+}
+
+/// The page roots' own telemetry rows, for every reached family's
+/// classification: a claim by any page root's row decides another family's
+/// unit, so this one walk covers the rows of every page root.
+struct PageClaims<'k> {
+    page_claims: BTreeMap<u64, Vec<&'k str>>,
+    first_event: BTreeMap<String, u64>,
+}
+
+/// The telemetry key of each page root with rows, from its admitted
+/// scheduling key.
+fn page_claim_keys<'r>(
+    order: &[(&'r str, String, u64)],
+    api_report: &ClaudeLocalOtelLoadReport,
+) -> Vec<(&'r str, String)> {
+    order
+        .iter()
+        .filter(|(root, _, _)| api_report.evidence.contains_key(*root))
+        .map(|(root, key, _)| {
+            (
+                *root,
+                format!("{TELEMETRY_KEY_PREFIX}{}", &key[FAMILY_KEY_PREFIX.len()..]),
+            )
+        })
+        .collect()
+}
+
+/// None when the deadline passed.
+fn page_claims<'k>(
+    keys: &'k [(&str, String)],
+    api_report: &ClaudeLocalOtelLoadReport,
+    deadline: Instant,
+) -> Option<PageClaims<'k>> {
+    let mut claims = PageClaims {
+        page_claims: BTreeMap::new(),
+        first_event: BTreeMap::new(),
+    };
+    for (root, key) in keys {
+        for row in api_report.evidence.get(*root).into_iter().flatten() {
+            if Instant::now() >= deadline {
+                return None;
+            }
+            claims
+                .page_claims
+                .entry(claude_request_hash(&row.request_id))
+                .or_default()
+                .push(key);
+            let clock = crate::claude_local_otel::telemetry_tail::event_unix(&row.observed_at);
+            claims
+                .first_event
+                .entry(key.clone())
+                .and_modify(|at: &mut u64| *at = (*at).min(clock))
+                .or_insert(clock);
+        }
+    }
+    Some(claims)
+}
+
+/// Page roots' session ids by telemetry key. The schedule already holds
+/// each root's digest; it is indexed only when a classification asks.
+struct PageSessions<'o> {
+    order: &'o [(&'o str, String, u64)],
+    by_digest: std::cell::OnceCell<BTreeMap<&'o str, &'o str>>,
+}
+
+impl claude_request_ledger::ClaudePageSessions for PageSessions<'_> {
+    fn page_session(&self, key: &str) -> Option<String> {
+        let digest = key.strip_prefix(TELEMETRY_KEY_PREFIX)?;
+        self.by_digest
+            .get_or_init(|| {
+                self.order
+                    .iter()
+                    .map(|(root, key, _)| (&key[FAMILY_KEY_PREFIX.len()..], *root))
+                    .collect()
+            })
+            .get(digest)
+            .map(|root| (*root).to_owned())
+    }
+}
+
+/// The rest of the writer's acknowledgements, once per page, after the
+/// first scheduled family had its window.
+fn apply_rest(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    counts: &mut ClaudeRequestMoneyShadowCounts,
+    deadline: Instant,
+    done: &mut bool,
+) {
+    if std::mem::replace(done, true) {
+        return;
+    }
+    let applying = Instant::now();
+    apply_results(support_dir, ledger, counts, deadline);
+    counts.result_apply_us += applying.elapsed().as_micros() as u64;
 }
 
 /// What one page hands to the writer and the log.
@@ -1339,6 +1496,12 @@ pub(crate) fn shadow_page_at(
         census_complete,
         now,
     )
+}
+
+/// Money time at which common setup stops (with no capture time).
+#[cfg(test)]
+pub(crate) fn setup_stop_for_test() -> Duration {
+    PAGE_MAX_ELAPSED - FIRST_FAMILY_CLOSE_RESERVE - FIRST_FAMILY_SETUP_RESERVE
 }
 
 #[cfg(test)]
@@ -1552,9 +1715,14 @@ fn shadow_page_body(
         }
     };
     let ledger: &mut ClaudeLedger = &mut guard;
+    // Common setup stops here, whatever it still has: the first scheduled
+    // family's own setup and body keep the window up to their floor. The
+    // acknowledgements left resume after that family.
+    let setup_deadline = first_family_deadline - FIRST_FAMILY_SETUP_RESERVE;
     let applying = Instant::now();
-    apply_results(support_dir, ledger, &mut counts, deadline);
+    apply_results(support_dir, ledger, &mut counts, setup_deadline);
     counts.result_apply_us = applying.elapsed().as_micros() as u64;
+    let mut applied_rest = false;
     if std::mem::take(&mut ledger.load_damaged) {
         counts.ledger_load_damaged = 1;
         drop_certificate(ledger);
@@ -1589,7 +1757,7 @@ fn shadow_page_body(
     let mut work = ClaudeLedgerWork::new(
         WORK_MAX_BYTES,
         WORK_MAX_STATS,
-        deadline.min(Instant::now() + TELEMETRY_MAX_ELAPSED),
+        setup_deadline.min(Instant::now() + TELEMETRY_MAX_ELAPSED),
     );
     let unloaded = order
         .iter()
@@ -1608,102 +1776,40 @@ fn shadow_page_body(
     end.tail = tail;
     counts.work_stopped = u64::from(work.stopped);
     counts.telemetry_retired_pressure =
-        claude_request_ledger::retire_telemetry_under_pressure(ledger, deadline);
+        claude_request_ledger::retire_telemetry_under_pressure(ledger, setup_deadline);
     if counts.telemetry_retired_pressure > 0 {
         drop_certificate(ledger);
     }
     prune_message_records(ledger, index, &mut counts);
-    // Only scheduled families can be reached, so their body inputs are
-    // gathered for them alone. Body inputs may run out of time too. Their
-    // absence closes every body; the pre-admitted failure rows still publish.
-    let (member_keys, indexed_members) =
-        family_members(index, &capture_turns, first_family_deadline).unwrap_or_default();
+    #[cfg(test)]
+    if faulted(PageFault::SetupOverrun) || faulted(PageFault::SetupStall) {
+        // Common setup used everything up to its stop.
+        std::thread::sleep(setup_deadline.saturating_duration_since(Instant::now()));
+    }
+    // Only scheduled families can be reached. Their body inputs are gathered
+    // when the schedule reaches them, in its order: a family the page never
+    // reaches costs only its deadline row.
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
-    let mut captures = BTreeMap::new();
-    let mut groups_owned = BTreeSet::new();
     for item in snapshots {
         let root = claude_snapshot_family_root_ref(item);
-        if !capture_turns.contains(root) {
-            continue;
-        }
-        by_root.entry(root).or_default().push(item);
-        if Instant::now() >= first_family_deadline {
-            continue;
-        }
-        if let Some(keys) = member_keys
-            .get(&(root.to_owned(), item.source_session_id.clone()))
-            .filter(|keys| keys.len() == 1)
-        {
-            let key = &keys[0];
-            if let Some(group) = claude_request_ledger::claude_project_group(key) {
-                groups_owned.insert(group.to_owned());
-            }
-            let fingerprints = [
-                item.source_file_fingerprint.as_deref(),
-                index
-                    .files
-                    .get(key)
-                    .map(|entry| entry.source_file_fingerprint.as_str()),
-            ];
-            if let Some((fingerprint, capture)) =
-                fingerprints.iter().flatten().find_map(|fingerprint| {
-                    capture::take_capture(&scope_key, key, fingerprint)
-                        .map(|capture| (*fingerprint, capture))
-                })
-            {
-                counts.captures_taken += 1;
-                note_message_record(ledger, index, key, fingerprint, &capture, &mut counts);
-                captures.insert((root.to_owned(), item.source_session_id.clone()), capture);
-            }
+        if capture_turns.contains(root) {
+            by_root.entry(root).or_default().push(item);
         }
     }
-    purge_captures(&scope_key, &mut counts);
-    let page_groups = groups_owned.iter().map(String::as_str).collect();
-    let scope = ClaudeLedgerScope::build(
-        index,
-        ledger.census(),
-        &page_groups,
-        &roots,
-        first_family_deadline,
-    );
-    if let Some(scope) = &scope {
-        end.scope = scope.debt;
-    }
+    // Captures deposited after this belong to the next parse.
+    let purge_at = Instant::now();
+    let mut purged = false;
+    let mut captures = BTreeMap::new();
+    let located = std::cell::OnceCell::<Option<PageFiles<'_>>>::new();
+    let claim_keys = std::cell::OnceCell::new();
+    let claims = std::cell::OnceCell::<Option<PageClaims<'_>>>::new();
+    let mut scope = ClaudeLedgerScope::default();
+    let sessions = PageSessions {
+        order: &order,
+        by_digest: Default::default(),
+    };
+    let mut reached_turns = Vec::new();
     let holder_view = ClaudeHolderView::of(coverage_view);
-    // Retain cross-root live claims even when another family is oversized.
-    // Both keys use the same canonical SHA-256 root digest. Reuse the
-    // admitted scheduling key instead of hashing every page root again.
-    let root_keys = order
-        .iter()
-        .map(|(root, key, _)| {
-            (
-                *root,
-                format!("{TELEMETRY_KEY_PREFIX}{}", &key[FAMILY_KEY_PREFIX.len()..]),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
-    let mut page_claims = BTreeMap::<u64, Vec<&str>>::new();
-    let mut sessions = BTreeMap::new();
-    let mut first_event = BTreeMap::new();
-    for (&root, key) in &root_keys {
-        sessions.insert(key.clone(), root.to_owned());
-        if let Some(rows) = api_report.evidence.get(root) {
-            for row in rows {
-                if Instant::now() >= first_family_deadline {
-                    break;
-                }
-                page_claims
-                    .entry(claude_request_hash(&row.request_id))
-                    .or_default()
-                    .push(key);
-                let clock = crate::claude_local_otel::telemetry_tail::event_unix(&row.observed_at);
-                first_event
-                    .entry(key.clone())
-                    .and_modify(|at: &mut u64| *at = (*at).min(clock))
-                    .or_insert(clock);
-            }
-        }
-    }
     let mut families = Vec::with_capacity(roots.len());
     let mut memos = Vec::with_capacity(roots.len());
     let mut reservations = vec![base, root_funds];
@@ -1724,13 +1830,24 @@ fn shadow_page_body(
     for position in 0..order.len() {
         if position > 0 {
             end.deadline = later_families;
+            apply_rest(
+                support_dir,
+                ledger,
+                &mut counts,
+                deadline,
+                &mut applied_rest,
+            );
         }
         let body_deadline = end.deadline;
         let (root, key, turn) = order[position].clone();
-        if !capture_turns.contains(root)
-            || scope.is_none()
-            || preflight_check(end.deadline).is_err()
-        {
+        if !capture_turns.contains(root) || preflight_check(end.deadline).is_err() {
+            apply_rest(
+                support_dir,
+                ledger,
+                &mut counts,
+                deadline,
+                &mut applied_rest,
+            );
             let deferred_started = Instant::now();
             // Closing hashes only the admitted canonical failure template.
             // Identity/day/epoch suppression is a producer decision, before
@@ -1800,6 +1917,81 @@ fn shadow_page_body(
             break;
         }
         let items = &by_root[root];
+        // The first reached family gathers the page inputs: the index walk,
+        // the scheduled families' captures and the page roots' claims.
+        if located.get().is_none() {
+            let files = page_files(index, &capture_turns, &by_root, body_deadline);
+            if let Some(member_keys) = files.as_ref().map(|files| &files.member_keys) {
+                for (root, items) in &by_root {
+                    for item in items {
+                        if Instant::now() >= body_deadline {
+                            break;
+                        }
+                        let Some([key]) = member_keys
+                            .get(&((*root).to_owned(), item.source_session_id.clone()))
+                            .map(Vec::as_slice)
+                        else {
+                            continue;
+                        };
+                        let fingerprints = [
+                            item.source_file_fingerprint.as_deref(),
+                            index
+                                .files
+                                .get(key)
+                                .map(|entry| entry.source_file_fingerprint.as_str()),
+                        ];
+                        if let Some((fingerprint, capture)) =
+                            fingerprints.iter().flatten().find_map(|fingerprint| {
+                                capture::take_capture(&scope_key, key, fingerprint)
+                                    .map(|capture| (*fingerprint, capture))
+                            })
+                        {
+                            counts.captures_taken += 1;
+                            note_message_record(
+                                ledger,
+                                index,
+                                key,
+                                fingerprint,
+                                &capture,
+                                &mut counts,
+                            );
+                            captures.insert(
+                                ((*root).to_owned(), item.source_session_id.clone()),
+                                capture,
+                            );
+                        }
+                    }
+                }
+            }
+            counts.captures_purged += capture::purge_before(&scope_key, purge_at);
+            purged = true;
+            let _ = located.set(files);
+        }
+        let files = located.get().and_then(Option::as_ref);
+        let claimed = files.and_then(|_| {
+            claims
+                .get_or_init(|| {
+                    page_claims(
+                        claim_keys.get_or_init(|| page_claim_keys(&order, api_report)),
+                        api_report,
+                        body_deadline,
+                    )
+                })
+                .as_ref()
+        });
+        // Then this family's own scope: its files and their groups.
+        let prepared = match (files, claimed) {
+            (Some(files), Some(_)) => add_family_scope(
+                &mut scope,
+                index,
+                ledger.census(),
+                files,
+                root,
+                body_deadline,
+            )
+            .ok_or("deadline"),
+            _ => Err("deadline"),
+        };
         let mut family_captures = BTreeMap::new();
         for item in items {
             if Instant::now() >= body_deadline {
@@ -1811,15 +2003,17 @@ fn shadow_page_body(
             }
         }
         let capture_consumed = !family_captures.is_empty();
-        let scratch = family_preflight(
-            root,
-            items,
-            &family_captures,
-            ledger,
-            api_report,
-            trace_report,
-            body_deadline,
-        );
+        let scratch = prepared.and_then(|()| {
+            family_preflight(
+                root,
+                items,
+                &family_captures,
+                ledger,
+                api_report,
+                trace_report,
+                body_deadline,
+            )
+        });
         let state = coverage_view.family(root);
         let mut basis = None;
         let mut rows;
@@ -1828,23 +2022,23 @@ fn shadow_page_body(
         match slice {
             Ok(reservation) => {
                 let mut budget = ShadowBudget::new(reservation);
+                let files = files.expect("admitted body requires the page files");
+                let claims = claimed.expect("admitted body requires the page claims");
                 let result = build_slice(
                     root,
                     items,
-                    &member_keys,
-                    &indexed_members,
+                    &files.member_keys,
+                    &files.indexed_members,
                     family_captures,
                     ledger,
                     index,
                     api_report,
                     trace_report,
                     &root_states,
-                    &page_claims,
-                    &first_event,
+                    &claims.page_claims,
+                    &claims.first_event,
                     &sessions,
-                    scope
-                        .as_ref()
-                        .expect("admitted body requires a complete scope walk"),
+                    &scope,
                     holder_view,
                     &mut budget,
                     &mut end,
@@ -1891,7 +2085,7 @@ fn shadow_page_body(
             }
         }
         if !rows.row.old_available && !rows.row.p1_reasons.contains(&"deadline") {
-            if let Some(members) = indexed_members.get(root) {
+            if let Some(members) = files.and_then(|files| files.indexed_members.get(root)) {
                 if let Some(revision) = union_revision_by(members, body_deadline) {
                     rows.row.revision = hex_revision(&revision);
                 }
@@ -1946,7 +2140,7 @@ fn shadow_page_body(
             deferred: None,
         });
         if capture_consumed {
-            order[position].2 = now;
+            reached_turns.push(position);
         }
         if unchanged {
             counts.unchanged += 1;
@@ -1958,6 +2152,14 @@ fn shadow_page_body(
             }
             families.push(rows);
         }
+    }
+    if !purged {
+        counts.captures_purged += capture::purge_before(&scope_key, purge_at);
+    }
+    end.scope = scope.debt;
+    drop(sessions);
+    for position in reached_turns {
+        order[position].2 = now;
     }
     if faulted(PageFault::LateAtHandOff) || faulted(PageFault::BatchRefused) {
         counts.refused_deadline = u64::from(faulted(PageFault::LateAtHandOff));
@@ -2179,7 +2381,7 @@ fn build_slice(
     root_states: &BTreeMap<String, ClaudeRootTelemetry>,
     page_claims: &BTreeMap<u64, Vec<&str>>,
     first_event: &BTreeMap<String, u64>,
-    sessions: &BTreeMap<String, String>,
+    sessions: &dyn claude_request_ledger::ClaudePageSessions,
     scope: &ClaudeLedgerScope,
     holder_view: ClaudeHolderView,
     budget: &mut ShadowBudget,
