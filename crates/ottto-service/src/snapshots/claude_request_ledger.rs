@@ -187,6 +187,9 @@ pub(crate) fn scan_holders<'a>(
 ) -> Option<ClaudeRequestHolders<'a>> {
     let mut holders = ClaudeRequestHolders::default();
     let late = || Instant::now() >= deadline;
+    if late() {
+        return None;
+    }
     // An empty request target has no intersections. Avoid reconstructing
     // every telemetry query key on quiet shadow pages; M remains independent.
     if !page_hashes.is_empty() {
@@ -1247,6 +1250,62 @@ mod unbuilt_lifecycle_tests {
             _ => unreachable!(),
         }
         index
+    }
+
+    #[test]
+    fn empty_targets_allocate_no_unrelated_keys_and_message_targets_still_resolve() {
+        let index = index(0);
+        let mut ledger = store::ClaudeLedger::new_for_test();
+        let own = index.claude_request_census.get(OWN).unwrap();
+        ledger.insert(telemetry_key("unrelated-root"), record('a', NOW));
+        ledger.insert(
+            message_key(OWN),
+            ClaudeRequestCensusRecord::message_record(own, vec![9]),
+        );
+        let ((holders, scope), allocations) =
+            crate::retry_allocation_probe::measure_caller_thread(|| {
+                (
+                    scan_holders(
+                        &index.claude_request_census,
+                        ledger.census(),
+                        &[],
+                        &[],
+                        deadline(),
+                        &mut |_| true,
+                    )
+                    .unwrap(),
+                    ClaudeLedgerScope::build(
+                        &index,
+                        ledger.census(),
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        deadline(),
+                    )
+                    .unwrap(),
+                )
+            });
+        assert_eq!(allocations.allocations, 0);
+        assert_eq!(holders.compared, 0);
+        assert_eq!(scope.debt, ClaudeScopeDebt::default());
+        let messages = scan_holders(
+            &index.claude_request_census,
+            ledger.census(),
+            &[],
+            &[9],
+            deadline(),
+            &mut |_| true,
+        )
+        .unwrap();
+        assert_eq!(messages.message_holders(9), &[OWN]);
+        assert!(messages.telemetry_holders(9).is_empty());
+        assert!(ClaudeLedgerScope::build(
+            &index,
+            ledger.census(),
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            Instant::now() - Duration::from_secs(1)
+        )
+        .is_none());
     }
 
     fn classify(
