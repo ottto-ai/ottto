@@ -315,7 +315,8 @@ fn workflow_journals_are_excluded_before_resolving_composition_ids() {
 #[test]
 fn measured_start_does_not_suppress_prompts_after_a_dormant_prefix() {
     for source in [Source::Claude, Source::Codex] {
-        let env = Env::new("composition-dormant-measured-start");
+        // The first run is the install: the file starts at its end.
+        let env = Env::uninstalled("composition-dormant-measured-start");
         let now = base_now();
         let path = env.root.join(match source {
             Source::Claude => "p/s.jsonl",

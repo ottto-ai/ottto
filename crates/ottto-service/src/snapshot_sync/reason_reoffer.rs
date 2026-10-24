@@ -569,6 +569,9 @@ pub(super) struct ReofferCounts {
     pub(super) deferred_budget: usize,
     pub(super) outside_policy_window: usize,
     pub(super) invalid_extension: usize,
+    /// Current distinct exact-body cooldown debt, including entities not yet
+    /// visited on a bounded page or whose ordinary retry timer is not due.
+    pub(super) cooldown_conflict_deferred: usize,
 }
 
 impl ReofferCounts {
@@ -578,7 +581,7 @@ impl ReofferCounts {
              due={} selected={} legacy_selected={} attempted={} attempted_bytes={} gate_held={} ineligible_unbound={} clock_bound_skipped={} accepted={} \
              unchanged_unstored={} refused_same={} refused_other={} retryable={} shed={} \
              failed={} not_materialized={} deferred_budget={} outside_policy_window={} \
-             invalid_extension_process={}",
+             cooldown_conflict_deferred={} invalid_extension_process={}",
             self.due,
             self.selected,
             self.legacy_selected,
@@ -597,6 +600,7 @@ impl ReofferCounts {
             self.not_materialized,
             self.deferred_budget,
             self.outside_policy_window,
+            self.cooldown_conflict_deferred,
             self.invalid_extension,
         )
     }
