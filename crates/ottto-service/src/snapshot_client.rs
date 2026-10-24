@@ -287,10 +287,15 @@ fn parse_retry_after_with_cap(value: &str, now: OffsetDateTime, cap: Duration) -
 /// envelope is a few hundred bytes; a longer body is not recognized.
 const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
 
-fn shed_from_response(status: u16, response: ureq::Response, retry_cap: Duration) -> UploadShed {
-    let retry_after = response
-        .header("Retry-After")
-        .and_then(|value| parse_retry_after_with_cap(value, OffsetDateTime::now_utc(), retry_cap));
+fn shed_from_response(status: u16, response: ureq::Response, retained: bool) -> UploadShed {
+    let retry_after = response.header("Retry-After").and_then(|value| {
+        let now = OffsetDateTime::now_utc();
+        if retained {
+            parse_retry_after_with_cap(value, now, Duration::from_secs(24 * 3600))
+        } else {
+            parse_retry_after(value, now)
+        }
+    });
     let mut excerpt = Vec::new();
     let code = response
         .into_reader()
@@ -2186,15 +2191,7 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let shed = shed_from_response(
-                    code,
-                    response,
-                    if retained.is_some() {
-                        Duration::from_secs(24 * 3600)
-                    } else {
-                        MAX_HONOURED_RETRY_AFTER
-                    },
-                );
+                let shed = shed_from_response(code, response, retained.is_some());
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,

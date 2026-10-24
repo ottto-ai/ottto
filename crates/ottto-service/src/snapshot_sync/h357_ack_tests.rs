@@ -2081,6 +2081,7 @@ fn shared_budget_source_page(
             &mut ledger,
             true,
             &mut inplace_retry,
+            None,
             |batch, enforce_head_cas| {
                 let stage = usize::from(enforce_head_cas);
                 calls.push(stage);
@@ -2103,6 +2104,7 @@ fn shared_budget_source_page(
             |item| Some(item.source_session_id.as_str()),
             |_| false,
             &mut inplace_retry,
+            None,
             |batch| {
                 calls.push(2);
                 if calls.iter().filter(|seen| **seen == 2).count() <= sheds[2] {
