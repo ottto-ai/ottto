@@ -1730,8 +1730,12 @@ pub(crate) struct ClaudeRequestCensusShadowState {
     safety_incomplete: Option<SafetyIncomplete>,
     /// MONEY N3: per-key duplicate-rebuild stamps (`rebuild_bound`).
     rebuild_bound: Option<Box<rebuild_bound::DuplicateRebuildGuard>>,
+    /// MONEY N3: the guard's latest stamp, saved beside it (`"nw"`) so a save
+    /// that drops `n` alone is seen as a lost guard while it is recent. 0
+    /// when the guard holds no stamp.
+    rebuild_witness: u64,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete, rebuild_bound);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete, rebuild_bound, rebuild_witness);
 
 impl ClaudeRequestCensusShadowState {
     /// Malformed: the safety marker and the N3 rebuild guard close (a lost
@@ -1965,6 +1969,9 @@ impl Serialize for ClaudeRequestCensusShadowState {
         if let Some(guard) = &self.rebuild_bound {
             map.serialize_entry("n", guard)?;
         }
+        if self.rebuild_witness > 0 {
+            map.serialize_entry("nw", &self.rebuild_witness)?;
+        }
         map.end()
     }
 }
@@ -2177,7 +2184,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // MONEY N3: the next authorized transcript pass re-reads the key
         // (Parse(Rearmed), fingerprint untouched) to rebuild its record, at
         // most twice per key per seven days.
-        rebuild_bound::apply(index, self.priors_refused);
+        rebuild_bound::apply(index, self.priors_refused, self.seen_priors);
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
@@ -2774,6 +2781,12 @@ impl<'de> Visitor<'de> for ShadowStateVisitor {
                 ("f", Loose::U64(flips)) => state.would_open_flips = flips,
                 ("d", Loose::U64(drift)) => state.derivation_drift = drift,
                 ("a", Loose::U64(dropped)) => state.decode_duplicate_keys_dropped = dropped,
+                // A repeated witness keeps the latest stamp, a malformed one
+                // reads as recent (fail closed).
+                ("nw", Loose::U64(stamp)) => {
+                    state.rebuild_witness = state.rebuild_witness.max(stamp);
+                }
+                ("nw", _) => state.rebuild_witness = u64::MAX,
                 _ => {}
             }
         }
@@ -5772,6 +5785,7 @@ mod reader_regression_tests {
                 decode_duplicate_keys_dropped: 0,
                 safety_incomplete: None,
                 rebuild_bound: None,
+                rebuild_witness: 0,
             },
             ..ScanIndex::default()
         };

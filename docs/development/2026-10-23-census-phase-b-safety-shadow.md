@@ -59,24 +59,32 @@ for that key is outstanding or exhausted. Whatever erases the guard (a
 downgrade, an older binary's save, corruption) erases only the rearm: the entry
 keeps its real fingerprint and is not re-read (MONEY P1a).
 
-A lost or ambiguous guard never replenishes the allowance (SI-724-B3): a
-malformed `n`, a repeated `n` or key id, a malformed or duplicated shadow
-state, or a saved prior whose key the guard no longer holds (an orphan, counted
-in `census_duplicate_rebuild_orphaned` with a `cause=orphaned_rearm` alarm)
-closes admission for one window (`cause=guard_state_closed`).
+A lost or ambiguous guard never replenishes the allowance (SI-724-B3, MONEY
+724f P1): a malformed `n`, a repeated `n` or key id, a malformed or duplicated
+shadow state, a saved prior whose key the guard no longer holds (an orphan,
+`cause=orphaned_rearm`), or a missing `n` with evidence of earlier activity
+(the shadow's window witness `nw`, the guard's latest stamp saved beside it,
+still inside the window, or a priors field present; `cause=guard_lost`) closes
+admission for one window (`cause=guard_state_closed`). Orphans and lost guards
+count in `census_duplicate_rebuild_orphaned`. Only a checkpoint with no such
+evidence starts a fresh guard; main's own save drops `n` and `nw` together,
+and main has no duplicate-key rearm.
 
-Earlier checkpoints of this branch saved a rearm as an empty fingerprint, with
-the fingerprint it emptied in the root field `claude_census_rebuild_priors` (or
-inside the guard). Only that pair, a pending key plus its prior, positively
-marks an empty fingerprint as the bound's own (SI B2 condition 2). It takes a
-counted attempt, or past the bound it is held (candidate selection skips it,
-`cause=legacy_rearm_held`) until the window allows one; it is never restored.
-An empty fingerprint without that marker takes the ordinary path and is
-re-offered. The priors field is decoded in isolation, by the index reader and
+Earlier checkpoints of this branch saved a rearm as an empty fingerprint (its
+prior in the root field `claude_census_rebuild_priors` or inside the guard).
+The current form flags every key whose fingerprint it has seen intact, so the
+guard positively records an earlier checkpoint's rearm: a pending key without
+that flag. Its empty fingerprint is the bound's own (SI B2 condition 2, MONEY
+P1a), with or without its prior: it is held (candidate selection skips it,
+`cause=legacy_rearm_held`, counted as exhausted) and read only through a
+counted attempt the daemon saves before its scan, at most two per window; it
+is never restored. An empty fingerprint of a current-form key, or of a key the
+guard does not hold, takes the ordinary path and is re-offered. The priors
+field is decoded in isolation, by the index reader and
 by the field's own lenient decoder on a plain Serde path. A malformed,
 duplicated, truncated or wrong-type field never fails the index decode: every
-entry, binding, ACK and latch is kept, the priors are dropped, admission closes
-for one window, and `census_rebuild_priors_decode_refused` counts it
+entry, binding, ACK and latch is kept, the priors are dropped (marking never
+depends on them), admission closes for one window, and `census_rebuild_priors_decode_refused` counts it
 (`cause=priors_decode_refused`). All of these counters and alarms are
 count-only.
 

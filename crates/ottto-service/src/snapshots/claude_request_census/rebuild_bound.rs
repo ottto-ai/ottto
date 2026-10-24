@@ -31,24 +31,30 @@
 //!   and counted for one window.
 //! - A lost or ambiguous guard closes admission for one window (SI-724-B3):
 //!   a malformed `n`, a duplicated `n` or key id, a malformed or duplicated
-//!   shadow state, or a saved prior whose key the guard no longer holds (an
-//!   orphan, counted in `census_duplicate_rebuild_orphaned`). Rebuilds already
-//!   spent cannot be replenished by losing the guard.
-//! - Earlier checkpoints saved a rearm as an empty fingerprint, with the
-//!   fingerprint it emptied in `claude_census_rebuild_priors` (or inside the
-//!   guard). Only that pair, a pending key plus its prior, positively marks an
-//!   empty fingerprint as this bound's own (SI B2 condition 2). It takes a
-//!   counted attempt, or past the bound it is held (candidate selection skips
-//!   it) until the window allows one. It is never restored. An empty
-//!   fingerprint without that marker (another mechanism's rearm, or a lost
-//!   guard or priors field) takes the ordinary path and is re-offered.
+//!   shadow state, a saved prior whose key the guard no longer holds (an
+//!   orphan), or a missing `n` with evidence of earlier activity: the
+//!   shadow's window witness (`nw`, the guard's latest stamp, saved beside
+//!   `n`) still inside the window, or a priors field present. Orphans and
+//!   missing guards count in `census_duplicate_rebuild_orphaned`. Only a
+//!   checkpoint with no such evidence starts a fresh guard. Rebuilds already
+//!   spent cannot be replenished by losing the guard (MONEY 724f P1).
+//! - Earlier checkpoints saved a rearm as an empty fingerprint (its prior in
+//!   `claude_census_rebuild_priors` or inside the guard). The guard positively
+//!   records such a key: pending, saved without `CURRENT`. Its empty
+//!   fingerprint is this bound's own (SI B2 condition 2, MONEY P1a), with or
+//!   without its prior: it is held (candidate selection skips it, counted and
+//!   alarmed) and read only through a counted attempt this load stamps and the
+//!   daemon saves before its scan, at most the bound per window. It is never
+//!   restored. An empty fingerprint of a current-form key, or of a key the
+//!   guard does not hold (another mechanism's rearm, or a lost guard), takes
+//!   the ordinary path and is re-offered.
 //! - The priors field is decoded in isolation (MONEY P1b): by the index
 //!   reader, and by the field's own lenient decoder on a plain Serde path. A
 //!   malformed, duplicated, oversized, truncated or wrong-type field never
 //!   fails the index decode: every entry, binding, ACK and latch is kept, the
-//!   priors are dropped (their marked keys take the ordinary path), admission
-//!   closes for one window, and `census_rebuild_priors_decode_refused` counts
-//!   it. Counters and alarms are count-only.
+//!   priors are dropped (marking never depends on them), admission closes for
+//!   one window, and `census_rebuild_priors_decode_refused` counts it.
+//!   Counters and alarms are count-only.
 //!
 //! A key whose fingerprint was already empty when its duplicate was found is
 //! another mechanism's rearm; this bound does not track it.
@@ -74,6 +80,12 @@ const EXHAUSTED: u8 = 4;
 /// Exhausted, with an earlier checkpoint's marked empty fingerprint:
 /// skipped (never read, never restored) until a counted attempt is allowed.
 const HELD: u8 = 8;
+/// Tracked in the current form, whose rearm never writes the fingerprint: set
+/// whenever the key's fingerprint is seen intact, so an empty fingerprint of
+/// this key is never this bound's own (SI-724-B1). A pending key without it
+/// was saved by an earlier checkpoint, whose rearm emptied the fingerprint:
+/// that empty fingerprint is positively this bound's (MONEY P1a).
+const CURRENT: u8 = 16;
 
 /// The persisted guard (`"n"` in the shadow state).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,7 +309,7 @@ impl DuplicateRebuildGuard {
                             && key.attempts.len() <= MAX_ATTEMPTS_PER_WINDOW
                             && key.legacy_prior.as_ref().map_or(0, String::len)
                                 <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
-                            && key.flags & !(PENDING | STARTED | EXHAUSTED | HELD) == 0
+                            && key.flags & !(PENDING | STARTED | EXHAUSTED | HELD | CURRENT) == 0
                     })
             })
             .unwrap_or_else(Self::closed)
@@ -329,6 +341,28 @@ impl DuplicateRebuildGuard {
     fn refuse_untracked(&mut self, now: u64) {
         self.untracked_refused = self.untracked_refused.saturating_add(1);
         self.untracked_refused_at = now;
+    }
+
+    /// The window witness saved beside the guard: its latest stamp, or 0
+    /// when it holds none (it then leaves the checkpoint with the guard).
+    fn latest_stamp(&self) -> u64 {
+        let counters = [
+            (self.untracked_refused, self.untracked_refused_at),
+            (self.orphaned, self.orphaned_at),
+            (self.priors_refused, self.priors_refused_at),
+        ];
+        self.keys
+            .values()
+            .flat_map(|key| key.attempts.iter().copied())
+            .chain(self.closed_at)
+            .chain(
+                counters
+                    .into_iter()
+                    .filter(|(count, _)| *count > 0)
+                    .map(|(_, at)| at),
+            )
+            .max()
+            .unwrap_or(0)
     }
 
     fn exhausted_keys(&self) -> u64 {
@@ -422,11 +456,14 @@ fn emit_alarm(line: String) {
 
 /// Decode-time decision for every fresh ambiguous key, every pending key and
 /// every saved prior. Replaces the unconditional rearm; cheap no-op on a
-/// healthy index. `priors_refused`: the reader refused the priors field.
-/// Never writes an index entry: a grant is recorded in the guard and the
-/// load's transient set only.
-pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
+/// healthy index. `priors_refused`: the reader refused the priors field;
+/// `priors_seen`: the field was present at all. Never writes an index entry:
+/// a grant is recorded in the guard and the load's transient set only.
+pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bool) {
+    let witness = index.claude_request_census_shadow.rebuild_witness;
     if !priors_refused
+        && !priors_seen
+        && witness == 0
         && index.claude_request_census.ambiguous.is_empty()
         && index.claude_request_census_shadow.rebuild_bound.is_none()
         && index.claude_census_rebuild_priors.is_empty()
@@ -434,21 +471,39 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
         return;
     }
     let now = now_unix();
-    let mut guard = index
-        .claude_request_census_shadow
-        .rebuild_bound
-        .take()
-        .map_or_else(DuplicateRebuildGuard::default, |guard| *guard);
+    // MONEY 724f P1: a missing guard is fresh only without evidence of
+    // earlier activity. With its window witness still recent, or a priors
+    // field present, it was lost (an external or older save dropped it): its
+    // spent attempts are unknown, so admission closes for one window. A
+    // refused priors field closes it below on its own.
+    let mut lost = false;
+    let mut guard = match index.claude_request_census_shadow.rebuild_bound.take() {
+        Some(guard) => *guard,
+        None => {
+            let mut stamp = witness;
+            lost = !priors_refused && (priors_seen || (witness != 0 && recent(&mut stamp, now)));
+            if lost {
+                DuplicateRebuildGuard::closed()
+            } else {
+                DuplicateRebuildGuard::default()
+            }
+        }
+    };
     if guard.closed_at == Some(UNSTAMPED) {
         guard.closed_at = Some(now);
     }
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
+    if lost && priors.is_empty() {
+        // Counted like an orphan; a saved prior counts as one below instead.
+        guard.orphaned = guard.orphaned.saturating_add(1);
+        guard.orphaned_at = now;
+    }
     if priors_refused {
-        // Which empty fingerprints are this bound's own is unknown this load:
-        // trust no marker (a duplicated field's first copy included), so
-        // every empty fingerprint takes the ordinary path, and admit nothing
-        // for one window.
+        // Trust none of the priors (a duplicated field's first copy
+        // included) and admit nothing for one window. Marking comes from the
+        // guard, so this bound's own empty fingerprints stay held (MONEY
+        // P1a); every other empty fingerprint takes the ordinary path.
         priors.clear();
         guard.priors_refused = guard.priors_refused.saturating_add(1);
         guard.priors_refused_at = now;
@@ -506,7 +561,11 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
         } else if priors_refused {
             Some("priors_decode_refused")
         } else if guard.closed_at.is_some() {
-            Some("guard_state_closed")
+            Some(if lost {
+                "guard_lost"
+            } else {
+                "guard_state_closed"
+            })
         } else if guard.keys.len() >= MAX_TRACKED_KEYS {
             Some("tracked_key_cap")
         } else {
@@ -559,15 +618,22 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
             continue;
         }
         let empty = entry.source_file_fingerprint.is_empty();
+        if !empty {
+            // Seen intact: from now on an empty fingerprint is never this
+            // bound's own.
+            tracked.flags |= CURRENT;
+        }
         // Only an earlier checkpoint's rearm is an empty fingerprint this
-        // bound owns: a pending key with its saved prior.
-        let marked = empty && priors.contains_key(id);
+        // bound owns: a pending key the guard holds in the earlier form,
+        // with or without its saved prior (MONEY P1a).
+        let marked = empty && !tracked.has(CURRENT);
         if !marked {
             priors.remove(id);
         }
         if empty && !marked {
-            // SI-724-B1: another mechanism's rearm, or a lost marker. It reads
-            // as it is; this bound never holds, restores or overwrites it.
+            // SI-724-B1: another mechanism's rearm of a current-form key. It
+            // reads as it is; this bound never holds, restores or overwrites
+            // it.
             tracked.flags &= !HELD;
             continue;
         }
@@ -584,9 +650,11 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
         }
         if open && tracked.attempts.len() < MAX_ATTEMPTS_PER_WINDOW {
             tracked.attempts.push(now);
-            tracked.flags = PENDING;
+            tracked.flags = PENDING | (tracked.flags & CURRENT);
             transient.grants.push(id.clone());
-            // A marked entry is already empty and reads as Rearmed.
+            // A marked entry is already empty and reads as Rearmed: this
+            // counted attempt is its only authorization, saved before the
+            // daemon's scan (`persist_grants`).
             if !empty {
                 transient.rearmed.insert(key.clone());
             }
@@ -594,7 +662,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
             // Refused, never a free rearm. A marked empty fingerprint is held
             // (candidate selection skips it) until the window allows a new
             // counted attempt; it is never restored.
-            tracked.flags = PENDING | EXHAUSTED;
+            tracked.flags = PENDING | EXHAUSTED | (tracked.flags & CURRENT);
             if marked {
                 tracked.flags |= HELD;
             }
@@ -609,6 +677,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
         .keys
         .retain(|_, key| key.has(PENDING) || !key.attempts.is_empty());
     index.claude_census_rebuild_priors = priors;
+    index.claude_request_census_shadow.rebuild_witness = guard.latest_stamp();
     index.claude_request_census_shadow.rebuild_bound = (!guard.is_empty()).then(|| Box::new(guard));
     index.claude_request_census.rebuild_transient = transient;
 }
@@ -718,7 +787,9 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64) {
         .iter()
         .map(|(id, cause)| {
             let retry_after = match *cause {
-                "guard_state_closed" => guard.closed_at.unwrap_or(guard.untracked_refused_at),
+                "guard_state_closed" | "guard_lost" => {
+                    guard.closed_at.unwrap_or(guard.untracked_refused_at)
+                }
                 "orphaned_rearm" => guard.orphaned_at,
                 "priors_decode_refused" => guard.priors_refused_at,
                 _ => guard.untracked_refused_at,
@@ -819,6 +890,29 @@ pub(crate) mod test_support {
             .and_then(|guard| guard.keys.get(&key_id(key)))
             .is_some_and(|key| key.has(PENDING))
     }
+    /// `key` is tracked in the current form (its fingerprint seen intact).
+    pub(crate) fn current_form(index: &ScanIndex, key: &str) -> bool {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .and_then(|guard| guard.keys.get(&key_id(key)))
+            .is_some_and(|key| key.has(CURRENT))
+    }
+    /// The window witness saved beside the guard (`"nw"`).
+    pub(crate) fn witness(index: &ScanIndex) -> u64 {
+        index.claude_request_census_shadow.rebuild_witness
+    }
+    /// The stamps of `key` in the guard as saved at `path` (none without one).
+    pub(crate) fn saved_stamps(path: &Path, key: &str) -> Vec<u64> {
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        saved["claude_request_census_shadow"]["n"]["k"][key_id(key)]
+            .as_str()
+            .and_then(|tracked| serde_json::from_value::<TrackedKey>(tracked.into()).ok())
+            .map(|tracked| tracked.attempts)
+            .unwrap_or_default()
+    }
 }
 
 #[cfg(test)]
@@ -843,7 +937,7 @@ mod tests {
                     // Pending: only a pending key keeps a saved prior.
                     let key = TrackedKey {
                         attempts: vec![u64::MAX; MAX_ATTEMPTS_PER_WINDOW],
-                        flags: PENDING | STARTED | EXHAUSTED | HELD,
+                        flags: PENDING | STARTED | EXHAUSTED | HELD | CURRENT,
                         legacy_prior: None,
                     };
                     (id, key)
