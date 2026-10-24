@@ -1274,30 +1274,31 @@ pub(crate) fn guarded_for_test(run: impl FnOnce()) -> (bool, u64) {
     (panicked, SHADOW_PANICS.load(Ordering::Acquire))
 }
 
-/// What the reached families' bodies read of the index, gathered when the
-/// schedule first reaches a family: one borrowed walk of the index keys.
-struct PageFiles<'i> {
-    /// The scheduled families' files, and every group's.
-    files: ClaudeScopeFiles<'i>,
-    /// Index keys of each scheduled (root, member).
+/// One reached family's view of the page's index walk.
+struct FamilyFiles<'i> {
+    /// Index keys of each (root, member) of the family.
     member_keys: BTreeMap<(String, String), Vec<String>>,
-    /// The indexed members of each scheduled root.
+    /// The family's indexed members.
     indexed_members: BTreeMap<String, BTreeSet<String>>,
-    /// The groups of the scheduled families' own files (§3.1 scope).
-    page_groups: BTreeSet<&'i str>,
+    /// The groups of the family's own item files: the only groups its units
+    /// consult (§3.1 scope).
+    groups: BTreeSet<&'i str>,
 }
 
 /// None when the deadline passed.
-fn page_files<'i>(
+fn family_files<'i>(
     index: &'i ScanIndex,
-    capture_turns: &BTreeSet<&str>,
-    by_root: &BTreeMap<&str, Vec<&SnapshotItem>>,
+    files: &ClaudeScopeFiles<'i>,
+    root: &str,
+    items: &[&SnapshotItem],
     deadline: Instant,
-) -> Option<PageFiles<'i>> {
-    let files = ClaudeScopeFiles::walk(index, capture_turns, deadline)?;
+) -> Option<FamilyFiles<'i>> {
     let mut member_keys = BTreeMap::<(String, String), Vec<String>>::new();
     let mut indexed_members = BTreeMap::<String, BTreeSet<String>>::new();
-    for key in files.roots.values().flatten() {
+    for key in files.roots.get(root).into_iter().flatten() {
+        if Instant::now() >= deadline {
+            return None;
+        }
         // Residue records name no current member.
         if !index.files.contains_key(*key) {
             continue;
@@ -1314,53 +1315,44 @@ fn page_files<'i>(
             .or_default()
             .push((*key).to_owned());
     }
-    let mut page_groups = BTreeSet::new();
-    for (root, items) in by_root {
-        for item in items {
-            if Instant::now() >= deadline {
-                return None;
-            }
-            let Some([key]) = member_keys
-                .get(&((*root).to_owned(), item.source_session_id.clone()))
-                .map(Vec::as_slice)
-            else {
-                continue;
-            };
-            if let Some(group) = index
-                .files
-                .get_key_value(key)
-                .and_then(|(key, _)| claude_request_ledger::claude_project_group(key))
-            {
-                page_groups.insert(group);
-            }
+    let mut groups = BTreeSet::new();
+    for item in items {
+        let Some([key]) = member_keys
+            .get(&(root.to_owned(), item.source_session_id.clone()))
+            .map(Vec::as_slice)
+        else {
+            continue;
+        };
+        if let Some(group) = index
+            .files
+            .get_key_value(key)
+            .and_then(|(key, _)| claude_request_ledger::claude_project_group(key))
+        {
+            groups.insert(group);
         }
     }
-    Some(PageFiles {
-        files,
+    Some(FamilyFiles {
         member_keys,
         indexed_members,
-        page_groups,
+        groups,
     })
 }
 
-/// Add family `root`, and the scoped groups its files name, to the page
+/// Add family `root`, and the groups of its own item files, to the page
 /// scope. None when the deadline passed.
 fn add_family_scope(
     scope: &mut ClaudeLedgerScope,
     index: &ScanIndex,
     census: &ClaudeRequestCensus,
-    files: &PageFiles<'_>,
+    files: &ClaudeScopeFiles<'_>,
+    family: &FamilyFiles<'_>,
     root: &str,
     deadline: Instant,
 ) -> Option<()> {
-    let keys = files.files.roots.get(root).map_or(&[][..], Vec::as_slice);
-    for key in keys {
-        if let Some(group) = claude_request_ledger::claude_project_group(key)
-            .filter(|group| files.page_groups.contains(group))
-        {
-            scope.add_group(index, census, group, &files.files.groups[group], deadline)?;
-        }
+    for group in &family.groups {
+        scope.add_group(index, census, group, &files.groups[group], deadline)?;
     }
+    let keys = files.roots.get(root).map_or(&[][..], Vec::as_slice);
     scope.add_family(index, census, root, keys, deadline)
 }
 
@@ -1801,9 +1793,7 @@ fn shadow_page_body(
     }
     // Captures deposited after this belong to the next parse.
     let purge_at = Instant::now();
-    let mut purged = false;
-    let mut captures = BTreeMap::new();
-    let located = std::cell::OnceCell::<Option<PageFiles<'_>>>::new();
+    let located = std::cell::OnceCell::<Option<ClaudeScopeFiles<'_>>>::new();
     let claim_keys = std::cell::OnceCell::new();
     let claims = std::cell::OnceCell::<Option<PageClaims<'_>>>::new();
     let mut scope = ClaudeLedgerScope::default();
@@ -1920,57 +1910,11 @@ fn shadow_page_body(
             break;
         }
         let items = &by_root[root];
-        // The first reached family gathers the page inputs: the index walk,
-        // the scheduled families' captures and the page roots' claims.
-        if located.get().is_none() {
-            let files = page_files(index, &capture_turns, &by_root, body_deadline);
-            if let Some(member_keys) = files.as_ref().map(|files| &files.member_keys) {
-                for (root, items) in &by_root {
-                    for item in items {
-                        if Instant::now() >= body_deadline {
-                            break;
-                        }
-                        let Some([key]) = member_keys
-                            .get(&((*root).to_owned(), item.source_session_id.clone()))
-                            .map(Vec::as_slice)
-                        else {
-                            continue;
-                        };
-                        let fingerprints = [
-                            item.source_file_fingerprint.as_deref(),
-                            index
-                                .files
-                                .get(key)
-                                .map(|entry| entry.source_file_fingerprint.as_str()),
-                        ];
-                        if let Some((fingerprint, capture)) =
-                            fingerprints.iter().flatten().find_map(|fingerprint| {
-                                capture::take_capture(&scope_key, key, fingerprint)
-                                    .map(|capture| (*fingerprint, capture))
-                            })
-                        {
-                            counts.captures_taken += 1;
-                            note_message_record(
-                                ledger,
-                                index,
-                                key,
-                                fingerprint,
-                                &capture,
-                                &mut counts,
-                            );
-                            captures.insert(
-                                ((*root).to_owned(), item.source_session_id.clone()),
-                                capture,
-                            );
-                        }
-                    }
-                }
-            }
-            counts.captures_purged += capture::purge_before(&scope_key, purge_at);
-            purged = true;
-            let _ = located.set(files);
-        }
-        let files = located.get().and_then(Option::as_ref);
+        // The page's one index walk and its page roots' claims, when the
+        // schedule first reaches a family.
+        let files = located
+            .get_or_init(|| ClaudeScopeFiles::walk(index, &capture_turns, body_deadline))
+            .as_ref();
         let claimed = files.and_then(|_| {
             claims
                 .get_or_init(|| {
@@ -1982,29 +1926,58 @@ fn shadow_page_body(
                 })
                 .as_ref()
         });
-        // Then this family's own scope: its files and their groups.
-        let prepared = match (files, claimed) {
-            (Some(files), Some(_)) => add_family_scope(
+        // Then this family's own members, captures and scope, in that order:
+        // its captures' message records precede its scope's debt.
+        let family = match (files, claimed) {
+            (Some(files), Some(_)) => family_files(index, files, root, items, body_deadline),
+            _ => None,
+        };
+        let mut family_captures = BTreeMap::new();
+        if let Some(family) = &family {
+            for item in items {
+                if Instant::now() >= body_deadline {
+                    break;
+                }
+                let Some([key]) = family
+                    .member_keys
+                    .get(&(root.to_owned(), item.source_session_id.clone()))
+                    .map(Vec::as_slice)
+                else {
+                    continue;
+                };
+                let fingerprints = [
+                    item.source_file_fingerprint.as_deref(),
+                    index
+                        .files
+                        .get(key)
+                        .map(|entry| entry.source_file_fingerprint.as_str()),
+                ];
+                if let Some((fingerprint, capture)) =
+                    fingerprints.iter().flatten().find_map(|fingerprint| {
+                        capture::take_capture(&scope_key, key, fingerprint)
+                            .map(|capture| (*fingerprint, capture))
+                    })
+                {
+                    counts.captures_taken += 1;
+                    note_message_record(ledger, index, key, fingerprint, &capture, &mut counts);
+                    family_captures
+                        .insert((root.to_owned(), item.source_session_id.clone()), capture);
+                }
+            }
+        }
+        let prepared = match (files, &family) {
+            (Some(files), Some(family)) => add_family_scope(
                 &mut scope,
                 index,
                 ledger.census(),
                 files,
+                family,
                 root,
                 body_deadline,
             )
             .ok_or("deadline"),
             _ => Err("deadline"),
         };
-        let mut family_captures = BTreeMap::new();
-        for item in items {
-            if Instant::now() >= body_deadline {
-                break;
-            }
-            let key = (root.to_owned(), item.source_session_id.clone());
-            if let Some(capture) = captures.remove(&key) {
-                family_captures.insert(key, capture);
-            }
-        }
         let capture_consumed = !family_captures.is_empty();
         let scratch = prepared.and_then(|()| {
             family_preflight(
@@ -2025,13 +1998,13 @@ fn shadow_page_body(
         match slice {
             Ok(reservation) => {
                 let mut budget = ShadowBudget::new(reservation);
-                let files = files.expect("admitted body requires the page files");
+                let family = family.as_ref().expect("admitted body requires its files");
                 let claims = claimed.expect("admitted body requires the page claims");
                 let result = build_slice(
                     root,
                     items,
-                    &files.member_keys,
-                    &files.indexed_members,
+                    &family.member_keys,
+                    &family.indexed_members,
                     family_captures,
                     ledger,
                     index,
@@ -2088,7 +2061,10 @@ fn shadow_page_body(
             }
         }
         if !rows.row.old_available && !rows.row.p1_reasons.contains(&"deadline") {
-            if let Some(members) = files.and_then(|files| files.indexed_members.get(root)) {
+            if let Some(members) = family
+                .as_ref()
+                .and_then(|family| family.indexed_members.get(root))
+            {
                 if let Some(revision) = union_revision_by(members, body_deadline) {
                     rows.row.revision = hex_revision(&revision);
                 }
@@ -2156,9 +2132,8 @@ fn shadow_page_body(
             families.push(rows);
         }
     }
-    if !purged {
-        counts.captures_purged += capture::purge_before(&scope_key, purge_at);
-    }
+    // Captures of families the page did not reach.
+    counts.captures_purged += capture::purge_before(&scope_key, purge_at);
     end.scope = scope.debt;
     drop(sessions);
     for position in reached_turns {
