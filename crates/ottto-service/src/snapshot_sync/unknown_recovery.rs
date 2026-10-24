@@ -468,7 +468,8 @@ fn unwritten_receipts(root: &Path, active: &[Manifest]) -> usize {
         })
         .count()
 }
-fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
+fn prune_receipts(root: &Path, now: u64, active: &[Manifest], extra: usize) -> Result<()> {
+    let reserved = unwritten_receipts(root, active).saturating_add(extra);
     let mut count = 0;
     let mut bytes = 0;
     for entry in fs::read_dir(root)? {
@@ -478,7 +479,16 @@ fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
         }
         let encoded = read_capped(&file, 1024)?;
         let receipt: Receipt = serde_json::from_slice(&encoded)?;
-        if now / 86400 >= receipt.time_day.saturating_add(RECEIPT_TTL / 86400) {
+        let slot = file
+            .file_name()
+            .and_then(|s| s.to_str())
+            .and_then(|s| s.strip_prefix("receipt-"))
+            .and_then(|s| s.strip_suffix(".receipt"))
+            .and_then(|s| s.parse::<u16>().ok());
+        let retirement_proof =
+            slot.is_some_and(|slot| active.iter().any(|m| m.receipt_slot == Some(slot)));
+        if !retirement_proof && now / 86400 >= receipt.time_day.saturating_add(RECEIPT_TTL / 86400)
+        {
             fs::remove_file(file)?;
         } else {
             count += 1;
@@ -494,7 +504,7 @@ fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
 fn load_for_startup(root: &Path, now: u64) -> Result<Vec<Manifest>> {
     let entries = load(root)?;
     if root.exists() {
-        prune_receipts(root, now, unwritten_receipts(root, &entries))?;
+        prune_receipts(root, now, &entries, 0)?;
         publish_status(root, now, entries.len())?;
     }
     Ok(entries)
@@ -504,8 +514,8 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     private_dir(&root)?;
     sync_dir(&support)?;
     let active = load(&root)?;
-    prune_receipts(&root, m.created, unwritten_receipts(&root, &active) + 1)?;
-    if load(&root)?.len() >= ACTIVE_MAX || body.len() > BODY_MAX {
+    prune_receipts(&root, m.created, &active, 1)?;
+    if active.len() >= ACTIVE_MAX || body.len() > BODY_MAX {
         return Err(fault());
     }
     m.length = body.len();
@@ -529,7 +539,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
 fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Result<()> {
     let root = dir(&support);
     let active = load(&root)?;
-    prune_receipts(&root, now, unwritten_receipts(&root, &active))?;
+    prune_receipts(&root, now, &active, 0)?;
     if m.terminal != Some(reason) {
         m.terminal = Some(reason);
         write_manifest(&root, &m)?;
@@ -573,6 +583,7 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
             atomic(&root, &receipt_path, &serde_json::to_vec(&receipt)?)?;
         }
     }
+    drop(active);
     // UNKNOWN's receipt AND existing bounded release latch precede deletion.
     // Known custody instead has its saved ACK and selected-save/expiry proof.
     // A failed commit never evicts an unresolved body to admit another send.
@@ -593,7 +604,11 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
         Err(error) => return Err(error.into()),
     }
     sync_dir(&root)?;
-    publish_status(&root, now, load(&root)?.len())?;
+    let remaining = load(&root)?;
+    // A crashed retirement may be resumed after receipt TTL. Keep its original
+    // proof until payload/marker deletion, then expire it without renewing age.
+    prune_receipts(&root, now, &remaining, 0)?;
+    publish_status(&root, now, remaining.len())?;
     if reason != Reason::Resolved {
         crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
     }
@@ -2261,7 +2276,7 @@ mod tests {
         assert_eq!(receipts[0].outcome, "unknown_outcome_unresolved");
         assert_eq!(receipts[1].outcome, "unknown_outcome_unresolved");
         assert!(load(&root).unwrap().is_empty());
-        prune_receipts(&root, (receipts[0].time_day + 35) * 86400, 0).unwrap();
+        prune_receipts(&root, (receipts[0].time_day + 35) * 86400, &[], 0).unwrap();
         assert!(!root.join("receipt-0000.receipt").exists());
         assert!(!root.join("receipt-0001.receipt").exists());
     }
@@ -2296,6 +2311,49 @@ mod tests {
         assert!(!existing_recovery_state(&scratch).unwrap());
         forget(&scratch);
         money::store::forget_for_test(&scratch);
+    }
+
+    #[test]
+    fn receipt_ttl_does_not_destroy_a_pending_retirement_proof_or_renew_its_age() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-unknown-retirement-ttl");
+        let (m, body) = specimen(1000);
+        let mut m = capture(scratch.to_path_buf(), m, &body).unwrap();
+        m.terminal = Some(Reason::Expired);
+        m.receipt_slot = Some(0);
+        let receipt_at = m.deadline;
+        write_manifest(&dir(&scratch), &m).unwrap();
+        let receipt = Receipt {
+            outcome: "unknown_outcome_unresolved".into(),
+            reason: Reason::Expired,
+            entities: m.entities.len(),
+            age_hours: 24,
+            time_day: receipt_at / 86400,
+            attempts: 0,
+            hash8: m.id[..8].into(),
+        };
+        let receipt_path = dir(&scratch).join("receipt-0000.receipt");
+        atomic(
+            &dir(&scratch),
+            &receipt_path,
+            &serde_json::to_vec(&receipt).unwrap(),
+        )
+        .unwrap();
+        let later = (receipt.time_day + 35) * 86400;
+        prune_receipts(&dir(&scratch), later, std::slice::from_ref(&m), 0).unwrap();
+        assert!(
+            receipt_path.exists(),
+            "the body still needs its committed retirement proof"
+        );
+        terminal(scratch.to_path_buf(), m.clone(), Reason::Expired, later).unwrap();
+        assert!(!path(&dir(&scratch), &m.id, "body").unwrap().exists());
+        assert!(!path(&dir(&scratch), &m.id, "json").unwrap().exists());
+        assert!(
+            !receipt_path.exists(),
+            "the original receipt expires instead of being written with a new day"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir(&scratch).join("status")).unwrap()).unwrap();
+        assert_eq!(status["unknown_outcome_unresolved"], 0);
     }
 
     #[test]
