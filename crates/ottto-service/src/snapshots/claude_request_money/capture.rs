@@ -20,7 +20,7 @@
 
 use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageTotals};
 use super::ClaudeMoneyTokens;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -69,47 +69,56 @@ static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 /// turns. Gating optional capture leaves native file/finalizer order alone.
 /// All members of a chosen family remain eligible, within the original caps.
 pub(crate) const NEXT_PAGE_FAMILIES: usize = 64;
-/// One plan key's admission: its bytes, a map entry, the `String` and the
-/// (turn, eligible) value.
+/// One plan entry's admission: its key bytes, a map entry, the `String`
+/// and the (turn, build) value. An eligible-set entry is charged the same.
 fn plan_key_bytes(key: &str) -> usize {
-    key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>() + std::mem::size_of::<(u64, bool)>()
+    key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>() + std::mem::size_of::<(u64, u64)>()
 }
 
-/// What the scope's last page decided for the next parse's optional
-/// captures. Once a scope has had a page it always has one (MONEY decision:
-/// fail closed, never stale): a complete plan, the oldest-64 fallback, all
-/// families (a page of at most 64), or none.
+/// What the scope's pages decided for the next parse's optional captures.
+/// Once a scope has had a page it always has one (MONEY decision: fail
+/// closed, never stale). Each page updates the scope's plan in place: its
+/// funds and the turns of families consumed on earlier pages (possibly
+/// still unacknowledged) carry over; the eligible set is replaced.
 struct Plan {
-    keys: BTreeMap<String, (u64, bool)>,
-    /// A family the plan does not list: eligible after a complete plan
-    /// (it was not on that page, e.g. another native page) or an
-    /// all-families page; never after a fallback or a closed plan, which
-    /// list only what they allow.
+    /// The scheduling turn of each family the scope's pages listed, and the
+    /// build that last saw it (a complete build drops the others).
+    turns: BTreeMap<String, (u64, u64)>,
+    turn_funds: Funds,
+    /// The families the next parse may capture: the oldest 64 of a complete
+    /// build, or the fallback's.
+    eligible: BTreeSet<String>,
+    eligible_funds: Funds,
+    /// A family the plan does not list is eligible after a complete build
+    /// (another native page's family); never after a fallback or a closed
+    /// plan.
     unlisted_eligible: bool,
-    _funds: Funds,
+    /// A page of at most 64 families: every file is eligible.
+    all: bool,
+    build: u64,
     created: Instant,
 }
 
 impl Plan {
     /// Nothing optional is captured.
     fn closed() -> Self {
-        Self::marker(false)
-    }
-
-    fn marker(unlisted_eligible: bool) -> Self {
         Self {
-            keys: BTreeMap::new(),
-            unlisted_eligible,
-            _funds: Funds::default(),
+            turns: BTreeMap::new(),
+            turn_funds: Funds::default(),
+            eligible: BTreeSet::new(),
+            eligible_funds: Funds::default(),
+            unlisted_eligible: false,
+            all: false,
+            build: 0,
             created: Instant::now(),
         }
     }
 }
 
 /// Every holder keeps this lock for one map operation (microseconds:
-/// `begin` and `scheduling_turn` do one lookup; replacing or forgetting a
-/// plan swaps it and drops the old one after unlocking), so planning takes
-/// it blocking rather than failing on contention.
+/// `begin` and `scheduling_turn` do one lookup; installing or forgetting a
+/// plan swaps it and drops the replaced one after unlocking), so planning
+/// takes it blocking rather than failing on contention.
 static PLANS: Mutex<BTreeMap<PathBuf, Plan>> = Mutex::new(BTreeMap::new());
 
 /// Why a page's complete plan was not installed.
@@ -127,8 +136,8 @@ pub(super) enum PlanFailure {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum PlanInstall {
     Complete,
-    /// Only the oldest 64 not consumed this page (and this page's consumed
-    /// turns) are listed; nothing else is captured.
+    /// Only the oldest 64 not consumed this page are eligible; nothing
+    /// else is captured.
     Fallback(PlanFailure),
     /// Not even the fallback could be funded or installed: nothing optional
     /// is captured.
@@ -144,12 +153,13 @@ impl PlanInstall {
     }
 }
 
-/// Replace the scope's plan. `keys` is every page family with its turn after
-/// this page's updates; `fallback` lists the oldest 64 not consumed this
-/// page (eligible) and this page's consumed families (with their new
-/// turns, not eligible). The walk over `keys` is bounded by its funds (the
-/// capture ceiling) and stops at `deadline`; then only the fallback is
-/// installed, which is O(64) work, never the old plan.
+/// Update the scope's plan for the next parse. `keys` is every page family
+/// with its turn after this page's updates; `fallback` lists the oldest 64
+/// not consumed this page (eligible) and this page's consumed families
+/// (with their new turns, not eligible). The walk over `keys` is bounded
+/// by its funds (the capture ceiling) and stops at `deadline`; then only
+/// the fallback becomes eligible, which is O(64) work, never the old plan's
+/// eligible families.
 pub(super) fn plan_next_page<'a>(
     scope: &Path,
     keys: impl Iterator<Item = (&'a str, u64)>,
@@ -171,45 +181,51 @@ fn plan_next_page_while<'a>(
     fallback: impl Iterator<Item = (&'a str, u64, bool)>,
     within_deadline: impl FnMut() -> bool,
 ) -> PlanInstall {
-    // Close the scope first: until a replacement is installed the next
-    // parse captures nothing optional, and the old plan's funds (dropped
-    // here, after unlocking) are free for the replacement.
-    let Some(old) = swap_plan(scope, Plan::closed()) else {
+    // Take the scope's plan out, leaving it closed: until the update is
+    // installed, the next parse captures nothing optional. The update
+    // reuses the plan's funds and turns (an expired plan starts empty).
+    let Some(taken) = swap_plan(scope, Plan::closed()) else {
         return PlanInstall::Closed(PlanFailure::Lock);
     };
-    drop(old);
-    let failure = match complete_plan(keys, within_deadline) {
-        Ok(plan) => {
-            return match swap_plan(scope, plan) {
-                Some(_) => PlanInstall::Complete,
-                None => PlanInstall::Closed(PlanFailure::Lock),
-            };
+    let mut plan = taken
+        .filter(|plan| !plan.all && plan.created.elapsed() < CAPTURE_TTL)
+        .unwrap_or_else(Plan::closed);
+    let installed = match complete_plan(&mut plan, keys, within_deadline) {
+        Ok(()) => PlanInstall::Complete,
+        Err(failure) => {
+            if fallback_plan(&mut plan, fallback) {
+                PlanInstall::Fallback(failure)
+            } else {
+                PlanInstall::Closed(failure)
+            }
         }
-        Err(failure) => failure,
     };
-    let Some(plan) = fallback_plan(fallback) else {
-        return PlanInstall::Closed(failure);
-    };
+    plan.created = Instant::now();
     match swap_plan(scope, plan) {
-        Some(_) => PlanInstall::Fallback(failure),
+        Some(_) => installed,
         None => PlanInstall::Closed(PlanFailure::Lock),
     }
 }
 
+/// Update every page family's turn in place and select the oldest 64. On
+/// failure the plan keeps the turns updated so far (each no older than
+/// before) and its old eligible set, which the fallback replaces.
 fn complete_plan<'a>(
+    plan: &mut Plan,
     keys: impl Iterator<Item = (&'a str, u64)>,
     mut within_deadline: impl FnMut() -> bool,
-) -> Result<Plan, PlanFailure> {
+) -> Result<(), PlanFailure> {
     if !within_deadline() {
         return Err(PlanFailure::Deadline);
     }
-    let mut funds = Funds::default();
-    if !funds
+    let mut oldest_funds = Funds::default();
+    if !oldest_funds
         .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>()))
     {
         return Err(PlanFailure::Funds);
     }
-    let mut selected = BTreeMap::new();
+    plan.build += 1;
+    let build = plan.build;
     // Oldest-64 selection with the producer's same (turn, family key)
     // total order, without an uninterruptible whole-page sort.
     let mut oldest = BTreeMap::new();
@@ -217,53 +233,79 @@ fn complete_plan<'a>(
         if !within_deadline() {
             return Err(PlanFailure::Deadline);
         }
-        if !funds.spend(plan_key_bytes(key)) {
-            return Err(PlanFailure::Funds);
+        if let Some(entry) = plan.turns.get_mut(key) {
+            *entry = (turn, build);
+        } else {
+            if !plan.turn_funds.spend(plan_key_bytes(key)) {
+                return Err(PlanFailure::Funds);
+            }
+            plan.turns.insert(key.to_owned(), (turn, build));
         }
-        selected.insert(key.to_owned(), (turn, false));
         oldest.insert((turn, key), key);
         if oldest.len() > NEXT_PAGE_FAMILIES {
             let _ = oldest.pop_last();
         }
     }
+    let mut eligible_funds = Funds::default();
+    let mut eligible = BTreeSet::new();
     for key in oldest.values() {
         if !within_deadline() {
             return Err(PlanFailure::Deadline);
         }
-        selected.get_mut(*key).expect("admitted plan key").1 = true;
+        if !eligible_funds.spend(plan_key_bytes(key)) {
+            return Err(PlanFailure::Funds);
+        }
+        eligible.insert((*key).to_owned());
     }
     if !within_deadline() {
         return Err(PlanFailure::Deadline);
     }
-    Ok(Plan {
-        keys: selected,
-        unlisted_eligible: true,
-        _funds: funds,
-        created: Instant::now(),
-    })
+    // Families this page does not list leave the plan, with their funds.
+    let mut freed = 0;
+    plan.turns.retain(|key, (_, seen)| {
+        let keep = *seen == build;
+        if !keep {
+            freed += plan_key_bytes(key);
+        }
+        keep
+    });
+    plan.turn_funds.refund(freed);
+    plan.eligible = eligible;
+    plan.eligible_funds = eligible_funds;
+    plan.unlisted_eligible = true;
+    Ok(())
 }
 
-/// At most 64 eligible and 64 consumed entries, funded like plan keys.
-fn fallback_plan<'a>(entries: impl Iterator<Item = (&'a str, u64, bool)>) -> Option<Plan> {
-    let mut funds = Funds::default();
-    let mut keys = BTreeMap::new();
-    let mut eligible = 0;
+/// Replace the eligible set with the fallback's (at most 64) and record
+/// this page's consumed turns; false (nothing eligible) when funds refuse.
+fn fallback_plan<'a>(plan: &mut Plan, entries: impl Iterator<Item = (&'a str, u64, bool)>) -> bool {
+    plan.unlisted_eligible = false;
+    plan.eligible = BTreeSet::new();
+    plan.eligible_funds = Funds::default();
+    let mut eligible_funds = Funds::default();
+    let mut eligible = BTreeSet::new();
     for (key, turn, allowed) in entries {
-        if allowed && eligible == NEXT_PAGE_FAMILIES {
+        if allowed && eligible.len() == NEXT_PAGE_FAMILIES {
             continue;
         }
-        if !funds.spend(plan_key_bytes(key)) {
-            return None;
+        if let Some(entry) = plan.turns.get_mut(key) {
+            entry.0 = turn;
+        } else {
+            if !plan.turn_funds.spend(plan_key_bytes(key)) {
+                return false;
+            }
+            plan.turns.insert(key.to_owned(), (turn, plan.build));
         }
-        eligible += usize::from(allowed);
-        keys.insert(key.to_owned(), (turn, allowed));
+        if allowed {
+            if !eligible_funds.spend(plan_key_bytes(key)) {
+                return false;
+            }
+            eligible.insert(key.to_owned());
+        }
     }
-    Some(Plan {
-        keys,
-        unlisted_eligible: false,
-        _funds: funds,
-        created: Instant::now(),
-    })
+    plan.eligible = eligible;
+    plan.eligible_funds = eligible_funds;
+    true
 }
 
 /// Install `plan` for `scope`, returning the plan it replaced (to be dropped
@@ -275,7 +317,7 @@ fn swap_plan(scope: &Path, plan: Plan) -> Option<Option<Plan>> {
     let replaced = {
         let mut plans = PLANS.lock().ok()?;
         for (other, old) in plans.iter_mut() {
-            if other != scope && old.created.elapsed() >= CAPTURE_TTL && !old.keys.is_empty() {
+            if other != scope && old.created.elapsed() >= CAPTURE_TTL && !old.turns.is_empty() {
                 let created = old.created;
                 expired.push(std::mem::replace(
                     old,
@@ -292,9 +334,16 @@ fn swap_plan(scope: &Path, plan: Plan) -> Option<Option<Plan>> {
     Some(replaced)
 }
 
-/// A page of at most 64 families: every family stays eligible.
+/// A page of at most 64 families: every file stays eligible (as when such
+/// a page kept no plan).
 pub(super) fn plan_all_families(scope: &Path) {
-    let _ = swap_plan(scope, Plan::marker(true));
+    let _ = swap_plan(
+        scope,
+        Plan {
+            all: true,
+            ..Plan::closed()
+        },
+    );
 }
 
 /// Selection and finalizers share this scheduling state, including turns
@@ -308,7 +357,7 @@ pub(super) fn scheduling_turn(scope: &Path, key: &str, published: u64) -> u64 {
             plans
                 .get(scope)
                 .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
-                .and_then(|plan| plan.keys.get(key))
+                .and_then(|plan| plan.turns.get(key))
                 .map(|(turn, _)| *turn)
         })
         .unwrap_or(0)
@@ -323,22 +372,21 @@ pub(super) fn forget_plan(scope: &Path) {
 }
 
 /// Whether the parse of `path` may capture optionally: always before the
-/// scope's first page and after a page of at most 64 families (as when
-/// those kept no plan); otherwise only a family its live plan allows (an
-/// expired plan allows nothing).
+/// scope's first page and after a page of at most 64 families; otherwise
+/// only a family its live plan allows (an expired plan allows nothing).
 fn capture_eligible(scope: &Path, path: &Path) -> bool {
     PLANS.lock().is_ok_and(|plans| {
         let Some(plan) = plans.get(scope) else {
             return true;
         };
-        if plan.keys.is_empty() && plan.unlisted_eligible {
+        if plan.all {
             return true;
         }
         plan.created.elapsed() < CAPTURE_TTL
             && super::super::claude_index_path_member_ref(path).is_some_and(|member| {
-                plan.keys
-                    .get(&super::family_key(member.root))
-                    .map_or(plan.unlisted_eligible, |(_, eligible)| *eligible)
+                let key = super::family_key(member.root);
+                plan.eligible.contains(&key)
+                    || (plan.unlisted_eligible && !plan.turns.contains_key(&key))
             })
     })
 }
@@ -512,6 +560,19 @@ impl Funds {
         }
         self.used = used;
         true
+    }
+}
+
+impl Funds {
+    /// `bytes` admitted earlier are no longer used: whole chunks no longer
+    /// needed go back to the ceiling.
+    fn refund(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
+        let surplus = (self.held - self.used) / FUNDS_CHUNK_BYTES * FUNDS_CHUNK_BYTES;
+        if surplus > 0 {
+            CAPTURE_RESERVED.fetch_sub(surplus, Ordering::AcqRel);
+            self.held -= surplus;
+        }
     }
 }
 
@@ -1053,13 +1114,11 @@ pub(crate) fn capture_reserved() -> usize {
 pub(crate) fn planned_families_for_test(
     scope: &Path,
 ) -> Option<std::collections::BTreeSet<String>> {
-    PLANS.lock().unwrap().get(scope).map(|plan| {
-        plan.keys
-            .iter()
-            .filter(|(_, (_, eligible))| *eligible)
-            .map(|(key, _)| key.clone())
-            .collect()
-    })
+    PLANS
+        .lock()
+        .unwrap()
+        .get(scope)
+        .map(|plan| plan.eligible.clone())
 }
 
 /// Whether `begin` would capture `path` now (its scope armed and its plan
@@ -1074,9 +1133,20 @@ pub(crate) fn capture_eligible_for_test(path: &Path) -> bool {
 #[cfg(test)]
 pub(crate) fn plan_allows_capture_for_test(scope: &Path) -> Option<bool> {
     PLANS.lock().unwrap().get(scope).map(|plan| {
-        plan.created.elapsed() < CAPTURE_TTL
-            && (plan.unlisted_eligible || plan.keys.values().any(|(_, eligible)| *eligible))
+        plan.all
+            || plan.created.elapsed() < CAPTURE_TTL
+                && (plan.unlisted_eligible || !plan.eligible.is_empty())
     })
+}
+
+/// Capture funds the scope's plan holds.
+#[cfg(test)]
+pub(crate) fn plan_funds_for_test(scope: &Path) -> usize {
+    PLANS
+        .lock()
+        .unwrap()
+        .get(scope)
+        .map_or(0, |plan| plan.turn_funds.held + plan.eligible_funds.held)
 }
 
 /// Accepted cumulative work, including work whose resident capture was dropped.
@@ -1236,11 +1306,12 @@ mod bounded_tests {
         planned_families_for_test(support).expect("a page installs a plan")
     }
 
-    /// MONEY decision (fail closed, never stale; supersedes "keep the funded
-    /// old plan until a complete replacement installs"): a page whose
-    /// complete plan cannot be built releases the old plan first and
-    /// installs only the oldest-64 fallback, never a partial plan and never
-    /// the old plan's eligibility.
+    /// MONEY decision (fail closed, never stale; supersedes "keep the old
+    /// plan until a complete replacement installs"): a page whose complete
+    /// plan cannot be built makes only the oldest-64 fallback eligible,
+    /// never a partial selection and never the old plan's eligible
+    /// families. The update reuses the old plan's funds and keeps earlier
+    /// pages' unacknowledged turns.
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn capture_plan_stops_at_expiry_and_installs_only_the_fallback() {
@@ -1295,8 +1366,8 @@ mod bounded_tests {
         );
         assert_eq!(
             capture_reserved(),
-            before + FUNDS_CHUNK_BYTES,
-            "interrupted plan refunds all admitted metadata; only the 65-entry fallback is funded"
+            before + plan_funds_for_test(&support),
+            "an interrupted plan holds only its installed funds: no admission leaks"
         );
         assert_eq!(
             eligible_families(&support),
@@ -1337,10 +1408,15 @@ mod bounded_tests {
         );
         assert_eq!(
             capture_reserved(),
-            before + FUNDS_CHUNK_BYTES,
-            "the old plan's funds are released; only the fallback is funded"
+            funded,
+            "the update reuses the old plan's funds; the partial walk adds none"
         );
-        assert!(capture_reserved() < funded);
+        assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
+        assert_eq!(
+            scheduling_turn(&support, &keys[300], 0),
+            300,
+            "mid-walk expiry must preserve unacknowledged consumed turns"
+        );
         assert_eq!(
             scheduling_turn(&support, &keys[0], 0),
             9001,
@@ -1361,15 +1437,15 @@ mod bounded_tests {
             "never the stale plan's eligibility"
         );
         let plans = PLANS.lock().unwrap();
-        assert!(!plans[&support].keys[&keys[0]].1);
+        assert!(!plans[&support].eligible.contains(&keys[0]));
         assert!(
-            !plans[&support].keys.contains_key(&keys[200]) && !plans[&support].unlisted_eligible,
+            !plans[&support].eligible.contains(&keys[200]) && !plans[&support].unlisted_eligible,
             "interruption never changes the next Full to all-eligible"
         );
         drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
-        println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES} fallback_eligible={} fallback_funds={FUNDS_CHUNK_BYTES} stale_plan_installed=0", visited.get(), checks.get(), fallback_families.len());
+        println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES} fallback_eligible={} plan_funds={funded} stale_plan_installed=0 carried_turn=300", visited.get(), checks.get(), fallback_families.len());
     }
 
     /// The next parse's captures follow the fallback: a family the page
