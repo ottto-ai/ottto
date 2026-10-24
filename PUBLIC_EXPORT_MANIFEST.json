@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 840,
-  "content_sha256": "80bcfe98a26f0facc3e9bef573bffd8534b84547843bcf4625e6ee1ca725d9cf",
+  "content_sha256": "22b5c96316156cc2cc51929ab95b670c60afae35b911f08f24687cd016dc12df",
   "files": [
     {
       "executable": false,
@@ -1791,8 +1791,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/rebuild_bound.rs",
-      "sha256": "ab4bb6dfe6088a6b49e8d225b0854c2f59abf0030ba809b82023073e185a98a3",
-      "size_bytes": 17769
+      "sha256": "67a0eb52abe6c9d7d8150967aac204d4b1f91e2954774bc9f861b827054b07db",
+      "size_bytes": 19756
     },
     {
       "executable": false,
@@ -1805,8 +1805,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census_tests.rs",
-      "sha256": "2300dc219b0aba63452999ab4709eadb56444c444155f06e102e0b7dbf84bc8f",
-      "size_bytes": 109765
+      "sha256": "0a9ffe7a74ad0dd4f627d3fb0f0dbd37f10a17b839da0dac7f540b933f46f7f3",
+      "size_bytes": 112015
     },
     {
       "executable": false,
@@ -2344,8 +2344,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "dacaeee597f2a7aabb4e2ec2b32b13338a90fd97a1dbe8dfbc64543282e0eadb",
-      "size_bytes": 15278
+      "sha256": "5640b6bac747c996c2b7c3544769c8fbbf45803abdfc6ad5e9f950cee95e06ad",
+      "size_bytes": 15394
     },
     {
       "executable": false,
@@ -5883,7 +5883,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T06:13:15+00:00",
+  "generated_at": "2026-10-24T06:19:49+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 841,
   "public_roots": [
@@ -5922,5 +5922,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "45003aeca319b317977e642f10c8581167c0cf65"
+  "source_commit": "1ca206d2f82105e777b04a60913bed5d3f130984"
 }

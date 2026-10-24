@@ -43,8 +43,10 @@ stamp counts as recent. Past the bound the key keeps its last indexed
 fingerprint (no re-read), its record stays absent, its duplicate stays counted,
 and `census_duplicate_rebuild_exhausted` plus a rate-limited
 `key_hash8`/`cause` alarm make it visible. It clears when the window passes or
-the key's record next decodes clean. At most 1,024 keys are tracked; past that,
-or after a malformed guard, new keys are refused for one window.
+the key's record next decodes clean. A read that starts spends its grant even
+if the failed pass is never saved. At most 512 keys are tracked, one compact
+line each in the saved index; past that, or after a malformed guard, new keys
+are refused for one window.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes

@@ -27,10 +27,12 @@ use super::*;
 
 pub(super) const WINDOW_SECONDS: u64 = 7 * 24 * 60 * 60;
 pub(super) const MAX_ATTEMPTS_PER_WINDOW: usize = 2;
-/// Fits the shadow field's 512 KiB decode cap next to a full `s` marker
-/// (about 112 B per tracked key).
-pub(crate) const MAX_TRACKED_KEYS: usize = 1_024;
-const MAX_GUARD_RAW_BYTES: usize = 192 * 1024;
+/// The index is saved pretty-printed: one tracked key is one line of about
+/// 120 B (184 B with the longest accepted prior). 512 keys stay far below
+/// this guard's own cap, and with a full `s` marker (about 311 KiB) below the
+/// shadow field's 512 KiB decode cap, so saved state never closes itself.
+pub(crate) const MAX_TRACKED_KEYS: usize = 512;
+const MAX_GUARD_RAW_BYTES: usize = 128 * 1024;
 const MAX_ALARMS_PER_TERMINAL: usize = 8;
 /// `closed_at` value of a guard that must be stamped at its next apply.
 const UNSTAMPED: u64 = u64::MAX;
@@ -55,23 +57,60 @@ pub(crate) struct DuplicateRebuildGuard {
 }
 crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, closed_at);
 
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// One compact string per key, `"<flags>:<stamp>,<stamp>:<prior>"`, so the
+/// pretty-printed index spends one line on it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TrackedKey {
     /// Rearm stamps (unix seconds), at most the two most recent.
-    #[serde(default, rename = "t", skip_serializing_if = "Vec::is_empty")]
     attempts: Vec<u64>,
     /// The indexed fingerprint before the first rearm, restored when refused.
-    #[serde(default, rename = "p", skip_serializing_if = "Option::is_none")]
     prior: Option<String>,
-    #[serde(default, rename = "f", skip_serializing_if = "is_zero_flags")]
     flags: u8,
 }
 crate::heap_layout_bound::fields!(TrackedKey; attempts, prior, flags);
 
-fn is_zero(value: &u64) -> bool {
-    *value == 0
+impl Serialize for TrackedKey {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let attempts = self
+            .attempts
+            .iter()
+            .map(u64::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        serializer.collect_str(&format_args!(
+            "{}:{attempts}:{}",
+            self.flags,
+            self.prior.as_deref().unwrap_or_default()
+        ))
+    }
 }
-fn is_zero_flags(value: &u8) -> bool {
+impl<'de> Deserialize<'de> for TrackedKey {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let malformed = || <D::Error as serde::de::Error>::custom("rebuild guard key");
+        let text = String::deserialize(deserializer)?;
+        let mut parts = text.splitn(3, ':');
+        let (Some(flags), Some(attempts), Some(prior)) = (parts.next(), parts.next(), parts.next())
+        else {
+            return Err(malformed());
+        };
+        let attempts = if attempts.is_empty() {
+            Vec::new()
+        } else {
+            attempts
+                .split(',')
+                .map(str::parse::<u64>)
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| malformed())?
+        };
+        Ok(Self {
+            attempts,
+            prior: (!prior.is_empty()).then(|| prior.to_owned()),
+            flags: flags.parse().map_err(|_| malformed())?,
+        })
+    }
+}
+
+fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
@@ -113,13 +152,8 @@ impl DuplicateRebuildGuard {
                         id.len() == 16
                             && lower_hex(id.as_bytes())
                             && key.attempts.len() <= MAX_ATTEMPTS_PER_WINDOW
-                            && match &key.prior {
-                                Some(prior) => {
-                                    !prior.is_empty()
-                                        && prior.len() <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
-                                }
-                                None => true,
-                            }
+                            && key.prior.as_ref().map_or(0, String::len)
+                                <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
                             && key.flags & !(PENDING | STARTED | EXHAUSTED) == 0
                     })
             })
@@ -264,13 +298,16 @@ pub(super) fn apply(index: &mut ScanIndex) {
             if entry.source_file_fingerprint.is_empty() {
                 continue;
             }
-            let cause = if guard.closed_at.is_some() {
-                Some("guard_state_closed")
-            } else if guard.keys.len() >= MAX_TRACKED_KEYS {
-                Some("tracked_key_cap")
-            } else {
-                None
-            };
+            let cause =
+                if entry.source_file_fingerprint.len() > MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES {
+                    Some("fingerprint_unbounded")
+                } else if guard.closed_at.is_some() {
+                    Some("guard_state_closed")
+                } else if guard.keys.len() >= MAX_TRACKED_KEYS {
+                    Some("tracked_key_cap")
+                } else {
+                    None
+                };
             if let Some(cause) = cause {
                 guard.refuse_untracked(now);
                 if transient.refusals.len() < MAX_ALARMS_PER_TERMINAL {
@@ -281,7 +318,9 @@ pub(super) fn apply(index: &mut ScanIndex) {
         }
         let tracked = guard.keys.entry(id.clone()).or_default();
         tracked.flags |= PENDING;
-        if !entry.source_file_fingerprint.is_empty() {
+        if !entry.source_file_fingerprint.is_empty()
+            && entry.source_file_fingerprint.len() <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
+        {
             tracked.prior = Some(entry.source_file_fingerprint.clone());
         }
         resolved.insert(id, key.clone());
@@ -350,6 +389,8 @@ pub(super) fn apply(index: &mut ScanIndex) {
 }
 
 /// A Claude parse is starting: the current rearm of this key is being spent.
+/// The process-local grant is consumed too, so a working index discarded
+/// after a failed read still counts the next rearm.
 pub(crate) fn note_started(index: &mut ScanIndex, path: &Path) {
     let Some(guard) = index.claude_request_census_shadow.rebuild_bound.as_mut() else {
         return;
@@ -357,12 +398,10 @@ pub(crate) fn note_started(index: &mut ScanIndex, path: &Path) {
     if !guard.keys.values().any(|key| key.has(PENDING)) {
         return;
     }
-    if let Some(key) = guard
-        .keys
-        .get_mut(&key_id(&super::super::local_index_key(path)))
-        .filter(|key| key.has(PENDING))
-    {
+    let id = key_id(&super::super::local_index_key(path));
+    if let Some(key) = guard.keys.get_mut(&id).filter(|key| key.has(PENDING)) {
         key.flags |= STARTED;
+        with_persisted(|set| set.remove(&id));
     }
 }
 
@@ -480,6 +519,15 @@ pub(crate) mod test_support {
             .as_ref()
             .and_then(|guard| guard.keys.get(&key_id(key)))
             .is_some_and(|key| key.has(EXHAUSTED))
+    }
+    /// Tracked keys of a guard that decoded (not closed).
+    pub(crate) fn tracked_open(index: &ScanIndex) -> Option<usize> {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .filter(|guard| guard.closed_at.is_none())
+            .map(|guard| guard.keys.len())
     }
     pub(crate) fn pending(index: &ScanIndex, key: &str) -> bool {
         index

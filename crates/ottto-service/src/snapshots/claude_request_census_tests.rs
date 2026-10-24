@@ -2763,7 +2763,7 @@ fn census_duplicate_rebuild_future_stamp_refuses_until_a_clean_decode() {
         let fingerprint = original.files[&key].source_file_fingerprint.clone();
         let future = N3_T0 + 30 * N3_DAY;
         let guard =
-            serde_json::json!({ "k": { (bound::key_id(&key)): { "t": [future, future] } } });
+            serde_json::json!({ "k": { (bound::key_id(&key)): format!("0:{future},{future}:") } });
         let path = scratch.join("index.json");
         std::fs::write(
             &path,
@@ -2823,7 +2823,11 @@ fn census_duplicate_rebuild_key_cap_fails_closed() {
         let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
         let fingerprint = original.files[&key].source_file_fingerprint.clone();
         let tracked = (0..bound::MAX_TRACKED_KEYS)
-            .map(|slot| (format!("{slot:016x}"), serde_json::json!({ "t": [N3_T0] })))
+            .map(|slot| {
+                // Full-size entries: the saved (pretty) guard must still decode.
+                let entry = format!("0:{N3_T0},{N3_T0}:{}", hex_fingerprint('a'));
+                (format!("{slot:016x}"), serde_json::json!(entry))
+            })
             .collect::<serde_json::Map<_, _>>();
         assert!(!tracked.contains_key(&bound::key_id(&key)));
         let path = scratch.join("index.json");
@@ -2849,11 +2853,51 @@ fn census_duplicate_rebuild_key_cap_fails_closed() {
         index.save(&path).unwrap();
         bound::restart();
         let mut index = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            bound::tracked_open(&index),
+            Some(bound::MAX_TRACKED_KEYS),
+            "a full saved guard decodes"
+        );
         assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
         assert_eq!(
             census_exhausted_counter(&mut index),
             1,
             "counted for one window"
         );
+    }
+}
+
+/// A read that starts and then fails before any checkpoint spends its grant,
+/// even inside one daemon process whose working index is discarded.
+#[test]
+fn census_duplicate_rebuild_same_process_failure_spends_an_attempt() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-failure");
+        let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let fingerprint = original.files[&key].source_file_fingerprint.clone();
+        let path = scratch.join("index.json");
+        std::fs::write(&path, census_duplicate_rebuild_raw(&original, &key, None)).unwrap();
+        for (second, attempts) in [(0, 1), (60, 2)] {
+            let _clock = bound::set_now(N3_T0 + second);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+            assert_eq!(bound::attempts(&index, &key).len(), attempts);
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            let mut working = ScanIndex::load(&path).unwrap();
+            assert_eq!(bound::attempts(&working, &key).len(), attempts);
+            note_duplicate_rebuild_started(&mut working, Path::new(&key));
+            drop(working);
+        }
+        let _clock = bound::set_now(N3_T0 + 120);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(bound::exhausted(&index, &key));
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+        assert_eq!(census_exhausted_counter(&mut index), 1);
     }
 }
