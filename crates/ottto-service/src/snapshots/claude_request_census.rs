@@ -192,7 +192,8 @@ pub(crate) struct ClaudeLedgerSweep {
 
 /// One family's last complete shadow body (`fam:` records): what the next
 /// removal delta is bound to. The record's fingerprint is the union
-/// revision (member set) it was built over.
+/// revision (member set) it was built over; its window is when a row of the
+/// family was last published (the shadow's scheduling time).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct ClaudeFamilyMemo {
     pub(crate) removed_requests: u64,
@@ -200,6 +201,24 @@ pub(crate) struct ClaudeFamilyMemo {
     /// The snapshot id of the family row this memo describes: a later
     /// removal delta names it as its basis.
     pub(crate) snapshot: u64,
+    /// The family's last published row (None: none since JSONL v3).
+    pub(crate) published: Option<ClaudeFamilyPublication>,
+}
+
+/// What the family's last published row said, and when: the shadow skips
+/// writing an unchanged row only against a publication of this UTC day by
+/// this process.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct ClaudeFamilyPublication {
+    /// UTC day as `yyyymmdd`.
+    pub(crate) utc_day: u64,
+    /// Digest of the row's canonical content.
+    pub(crate) digest: u64,
+    /// The publishing process's epoch.
+    pub(crate) epoch: u64,
+    /// The page clock of the last synced publication, including a failure:
+    /// pages take the least recently published families first.
+    pub(crate) attempted: u64,
 }
 
 /// A bounded audit of `[0, target_offset)` in progress across pages.
@@ -588,8 +607,8 @@ pub(crate) fn message_key(index_key: &str) -> String {
 /// The `fam:` key of a root session.
 pub(crate) fn family_key(root_session_id: &str) -> String {
     format!(
-        "{FAMILY_KEY_PREFIX}{:x}",
-        Sha256::digest(root_session_id.as_bytes())
+        "{FAMILY_KEY_PREFIX}{}",
+        LowerHex(&Sha256::digest(root_session_id.as_bytes()))
     )
 }
 
@@ -598,8 +617,8 @@ pub(crate) fn family_key(root_session_id: &str) -> String {
 /// root spelled two ways can never share or split a record.
 pub(crate) fn telemetry_key(root_session_id: &str) -> String {
     format!(
-        "{TELEMETRY_KEY_PREFIX}{:x}",
-        Sha256::digest(root_session_id.as_bytes())
+        "{TELEMETRY_KEY_PREFIX}{}",
+        LowerHex(&Sha256::digest(root_session_id.as_bytes()))
     )
 }
 
@@ -717,9 +736,22 @@ impl ClaudeRequestCensus {
         &'a self,
         prefix: &'a str,
     ) -> impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)> + 'a {
+        self.records_with_prefix_after(prefix, "")
+    }
+
+    /// Resume a prefix walk without rescanning records before its cursor.
+    pub(crate) fn records_with_prefix_after<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)> + 'a {
         self.records
             .range::<str, _>((
-                std::ops::Bound::Included(prefix),
+                if after < prefix {
+                    std::ops::Bound::Included(prefix)
+                } else {
+                    std::ops::Bound::Excluded(after)
+                },
                 std::ops::Bound::Unbounded,
             ))
             .take_while(move |(key, _)| key.starts_with(prefix))
@@ -770,8 +802,11 @@ impl ClaudeRequestCensus {
     }
 
     fn charge(&mut self, key: &str, record: &ClaudeRequestCensusRecord, sign: bool) {
-        let hashes = record.hash_count();
         let bytes = entry_serialized_bytes(key, record);
+        self.charge_totals(record.hash_count(), bytes, sign);
+    }
+
+    fn charge_totals(&mut self, hashes: usize, bytes: usize, sign: bool) {
         if sign {
             self.hash_total += hashes;
             self.serialized_total = self.serialized_total.saturating_add(bytes);
@@ -792,20 +827,26 @@ impl ClaudeRequestCensus {
         if let Some(old) = self.records.remove(&key) {
             self.charge(&key, &old, false);
         }
-        let fits = |census: &Self, record: &ClaudeRequestCensusRecord, limit: usize| {
-            census
-                .hash_total
-                .checked_add(record.hash_count())
-                .is_some_and(|total| total <= MAX_CLAUDE_REQUEST_CENSUS_HASHES)
-                && census
-                    .serialized_total
-                    .checked_add(entry_serialized_bytes(&key, record))
-                    .is_some_and(|total| total <= limit)
-        };
+        // Acknowledging a dense page inserts thousands of small family
+        // records under the sync deadline. Reuse the exact byte count for
+        // admission and charging instead of serializing each one twice.
+        let mut bytes = entry_serialized_bytes(&key, &record);
+        let fits =
+            |census: &Self, record: &ClaudeRequestCensusRecord, bytes: usize, limit: usize| {
+                census
+                    .hash_total
+                    .checked_add(record.hash_count())
+                    .is_some_and(|total| total <= MAX_CLAUDE_REQUEST_CENSUS_HASHES)
+                    && census
+                        .serialized_total
+                        .checked_add(bytes)
+                        .is_some_and(|total| total <= limit)
+            };
         let mut outcome = ClaudeRequestCensusInsert::Stored;
         if !fits(
             self,
             &record,
+            bytes,
             MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES - TOMBSTONE_RESERVE_BYTES,
         ) {
             record.shape = ClaudeRequestCensusShape::OverBudget;
@@ -815,11 +856,17 @@ impl ClaudeRequestCensus {
                 fields.facts = None;
             }
             outcome = ClaudeRequestCensusInsert::Tombstone;
-            if !fits(self, &record, MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES) {
+            bytes = entry_serialized_bytes(&key, &record);
+            if !fits(
+                self,
+                &record,
+                bytes,
+                MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES,
+            ) {
                 return ClaudeRequestCensusInsert::Refused;
             }
         }
-        self.charge(&key, &record, true);
+        self.charge_totals(record.hash_count(), bytes, true);
         self.records.insert(key, record);
         outcome
     }
@@ -1003,6 +1050,12 @@ impl Serialize for ClaudeRequestCensusRecord {
             map.serialize_entry("fr", &memo.removed_requests)?;
             map.serialize_entry("ft", &memo.removed_tokens)?;
             map.serialize_entry("fs", &memo.snapshot)?;
+            if let Some(published) = &memo.published {
+                map.serialize_entry("fd", &published.utc_day)?;
+                map.serialize_entry("fh", &published.digest)?;
+                map.serialize_entry("fe", &published.epoch)?;
+                map.serialize_entry("fa", &published.attempted)?;
+            }
         }
         if let Some(facts) = &ledger.facts {
             map.serialize_entry("f", &BytesBase64(facts))?;
@@ -1635,10 +1688,10 @@ impl<'de> Visitor<'de> for RecordVisitor {
         Ok(None)
     }
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        const FIELDS: [&str; 37] = [
+        const FIELDS: [&str; 41] = [
             "v", "fp", "w", "s", "tw", "u", "h", "b", "f", "bi", "bd", "bn", "r", "ur", "ut", "to",
             "td", "tn", "ta", "tc", "tl", "tv", "tw2", "tm", "te", "tk", "xa", "xs", "xp", "xq",
-            "xk", "m", "sk", "sd", "fr", "ft", "fs",
+            "xk", "m", "sk", "sd", "fr", "ft", "fs", "fd", "fh", "fe", "fa",
         ];
         let mut seen = 0_u64;
         let mut malformed = false;
@@ -1735,7 +1788,15 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 None
             }
         };
-        let (Some(birth), Some(old_path_usage), Some(tail), Some(audit), Some(sweep), Some(family)) = (
+        let (
+            Some(birth),
+            Some(old_path_usage),
+            Some(tail),
+            Some(audit),
+            Some(sweep),
+            Some(family),
+            Some(published),
+        ) = (
             group(&["bi", "bd", "bn"]),
             group(&["ur", "ut"]),
             group(&[
@@ -1744,9 +1805,15 @@ impl<'de> Visitor<'de> for RecordVisitor {
             group(&["xa", "xs", "xp", "xq", "xk"]),
             group(&["sk", "sd"]),
             group(&["fr", "ft", "fs"]),
-        ) else {
+            group(&["fd", "fh", "fe", "fa"]),
+        )
+        else {
             return Ok(None);
         };
+        // A publication belongs to a family memo.
+        if published.is_some() && family.is_none() {
+            return Ok(None);
+        }
         let retired = scalar("r");
         let modified = scalar("m");
         let audit = audit.map(|values| ClaudeTelemetryAudit {
@@ -1791,6 +1858,12 @@ impl<'de> Visitor<'de> for RecordVisitor {
             removed_requests: values[0],
             removed_tokens: values[1],
             snapshot: values[2],
+            published: published.map(|values| ClaudeFamilyPublication {
+                utc_day: values[0],
+                digest: values[1],
+                epoch: values[2],
+                attempted: values[3],
+            }),
         });
         // Facts belong to a telemetry record and hold exactly one fact per
         // hash; anything else is malformed.
@@ -1990,7 +2063,16 @@ impl<'de> Visitor<'de> for LooseVisitor {
 struct LowerHex<'a>(&'a [u8]);
 impl fmt::Display for LowerHex<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.iter().try_for_each(|byte| write!(f, "{byte:02x}"))
+        const DIGITS: &[u8; 16] = b"0123456789abcdef";
+        let mut text = [0_u8; 64];
+        for chunk in self.0.chunks(32) {
+            for (slot, byte) in text.chunks_exact_mut(2).zip(chunk) {
+                slot[0] = DIGITS[usize::from(byte >> 4)];
+                slot[1] = DIGITS[usize::from(byte & 15)];
+            }
+            f.write_str(std::str::from_utf8(&text[..chunk.len() * 2]).map_err(|_| fmt::Error)?)?;
+        }
+        Ok(())
     }
 }
 impl Serialize for LowerHex<'_> {
@@ -3278,5 +3360,96 @@ mod reader_regression_tests {
             assert!(source.interruptions > 0);
             assert_eq!(serde_json::to_value(decoded).expect("decoded"), expected);
         }
+    }
+}
+
+#[cfg(test)]
+mod memo_accounting_tests {
+    use super::*;
+
+    #[test]
+    fn batched_hex_keeps_canonical_bytes_for_all_values_and_chunk_edges() {
+        let bytes = (0..=255).collect::<Vec<u8>>();
+        for len in [0, 1, 31, 32, 33, 63, 64, 255, 256] {
+            let expected = bytes[..len]
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>();
+            assert_eq!(LowerHex(&bytes[..len]).to_string(), expected);
+            assert_eq!(
+                serde_json::to_vec(&LowerHex(&bytes[..len])).unwrap(),
+                serde_json::to_vec(&expected).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn batched_root_keys_preserve_the_shared_canonical_digest() {
+        for root in [
+            "",
+            "abc",
+            "root/with\\escapes",
+            "משפחה",
+            "10000000-1234-4567-890a-123456789abc",
+        ] {
+            let digest = format!("{:x}", Sha256::digest(root.as_bytes()));
+            let family = family_key(root);
+            assert_eq!(family, format!("{FAMILY_KEY_PREFIX}{digest}"));
+            assert_eq!(
+                telemetry_key(root),
+                format!("{TELEMETRY_KEY_PREFIX}{digest}")
+            );
+            assert_eq!(
+                telemetry_key(root),
+                format!(
+                    "{TELEMETRY_KEY_PREFIX}{}",
+                    &family[FAMILY_KEY_PREFIX.len()..]
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn dense_memo_insert_replace_remove_keeps_exact_serialized_accounting() {
+        let mut census = ClaudeRequestCensus::default();
+        for generation in 0..2 {
+            for at in 0..2051_u64 {
+                let key = family_key(&format!("family-{at}"));
+                let memo = ClaudeFamilyMemo {
+                    removed_requests: if generation == 0 { u64::MAX } else { at },
+                    removed_tokens: at * 100,
+                    snapshot: at + generation * 2051,
+                    published: Some(ClaudeFamilyPublication {
+                        utc_day: 20261024,
+                        digest: u64::MAX - at,
+                        epoch: 123456789,
+                        attempted: 1792790000 + generation,
+                    }),
+                };
+                assert_eq!(
+                    census.insert(
+                        key,
+                        ClaudeRequestCensusRecord::family_record([at as u8; 32], at, memo)
+                    ),
+                    ClaudeRequestCensusInsert::Stored
+                );
+            }
+            let exact = census
+                .records
+                .iter()
+                .map(|(key, record)| {
+                    serde_json::to_vec(key).unwrap().len()
+                        + serde_json::to_vec(record).unwrap().len()
+                        + 2
+                })
+                .sum::<usize>();
+            assert_eq!(census.serialized_total, exact);
+            assert_eq!(census.hash_total, 0);
+        }
+        for at in 0..2051 {
+            census.remove(&family_key(&format!("family-{at}")));
+        }
+        assert_eq!(census.serialized_total, 0);
+        assert_eq!(census.hash_total, 0);
     }
 }
