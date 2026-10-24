@@ -47,13 +47,16 @@ static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 
 /// Cumulative work allowance, independent of resident refunds. Reset once,
 /// before the page's native finalizers. Time counts capture work, not parsing:
-/// `micros` sums the money sections only, and `first` (the first money
-/// finalizer) dates the native time between them for the receipt alone.
+/// `micros` sums the ended money sections only, `section` is the start of
+/// the one running (admission checks count it before it ends), and `first`
+/// (the first money finalizer) dates the native time between them for the
+/// receipt alone.
 #[derive(Default)]
 struct Work {
     input: usize,
     comparisons: usize,
     micros: u64,
+    section: Option<Instant>,
     first: Option<Instant>,
     exhausted: bool,
 }
@@ -173,32 +176,48 @@ pub(crate) fn begin_page(scope: &Path) {
     }
 }
 
+#[cfg(test)]
+fn start_clock(scope: &Path, first: Instant) {
+    if let Ok(mut pages) = WORK.lock() {
+        start_page_clock(pages.entry(scope.to_path_buf()).or_default(), first);
+    }
+}
+
 /// The page's money clock starts with its first money finalizer, never at
 /// native page start. It counts money sections only (`MoneyTimer`): native
 /// time between or after finalizers is never charged (MONEY decision,
 /// superseding the one absolute wall deadline).
-fn start_clock(scope: &Path, first: Instant) {
-    if let Ok(mut pages) = WORK.lock() {
-        let work = pages.entry(scope.to_path_buf()).or_default();
-        if work.first.is_none() {
-            *work = Work {
-                first: Some(first),
-                ..Default::default()
-            };
-        }
+fn start_page_clock(work: &mut Work, first: Instant) {
+    if work.first.is_none() {
+        *work = Work {
+            first: Some(first),
+            ..Default::default()
+        };
     }
 }
 
+/// One money section. Its time is added when it ends; while it runs, the
+/// outermost section's start lets admission checks charge it already.
 struct MoneyTimer {
     scope: PathBuf,
     started: Instant,
+    owns_section: bool,
 }
 impl MoneyTimer {
     fn new(scope: &Path, started: Instant) -> Self {
-        start_clock(scope, started);
+        let owns_section = WORK.lock().is_ok_and(|mut pages| {
+            let work = pages.entry(scope.to_path_buf()).or_default();
+            start_page_clock(work, started);
+            if work.section.is_some() {
+                return false;
+            }
+            work.section = Some(started);
+            true
+        });
         Self {
             scope: scope.to_path_buf(),
             started,
+            owns_section,
         }
     }
 }
@@ -209,6 +228,9 @@ impl Drop for MoneyTimer {
             work.micros = work
                 .micros
                 .saturating_add(self.started.elapsed().as_micros() as u64);
+            if self.owns_section {
+                work.section = None;
+            }
         }
     }
 }
@@ -253,10 +275,13 @@ fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
         let work = pages.entry(scope.to_path_buf()).or_default();
         let input = work.input.saturating_add(bytes);
         let comparisons = work.comparisons.saturating_add(comparisons);
+        let running = work
+            .section
+            .map_or(0, |section| section.elapsed().as_micros() as u64);
         if work.exhausted
             || input > PAGE_INPUT_BYTES
             || comparisons > PAGE_COMPARISONS
-            || work.micros >= PAGE_CAPTURE_US
+            || work.micros.saturating_add(running) >= PAGE_CAPTURE_US
         {
             work.exhausted = true;
             return false;
@@ -614,6 +639,30 @@ impl ClaudeResponseCapture {
             return;
         }
         self.units.push(unit);
+    }
+
+    /// The request hash a displaced response needs. Only an armed capture
+    /// hashes the id (the native parse keeps it unhashed), so this is money
+    /// work: timed and admitted against the page's capture input first.
+    pub(crate) fn request_hash(&mut self, request_id: &str) -> Option<u64> {
+        let _timer = MoneyTimer::new(&self.scope, Instant::now());
+        if self.refused {
+            return None;
+        }
+        if !spend_work(&self.scope, request_id.len(), 0) {
+            self.refuse();
+            return None;
+        }
+        let mut hash = None;
+        super::guarded(|| {
+            hash = Some(super::super::claude_request_census::claude_request_hash(
+                request_id,
+            ))
+        });
+        if hash.is_none() {
+            self.refuse();
+        }
+        hash
     }
 
     /// A response the occurrence map replaced under the same request id.
@@ -1062,6 +1111,57 @@ mod bounded_tests {
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
         println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES}", visited.get(), checks.get());
+    }
+
+    /// Admission inside a running money section charges its time already;
+    /// the section's time is added once when it ends.
+    #[test]
+    fn a_running_money_section_counts_before_it_ends() {
+        let scope = PathBuf::from("money-clock-running-section");
+        begin_page(&scope);
+        {
+            let _section = MoneyTimer::new(&scope, Instant::now());
+            assert!(spend_work(&scope, 1, 1), "a fresh section is admitted");
+        }
+        let short = work_for_test(&scope).2;
+        assert!(short < PAGE_CAPTURE_US, "{short}");
+        {
+            let _section = MoneyTimer::new(
+                &scope,
+                Instant::now() - Duration::from_micros(PAGE_CAPTURE_US),
+            );
+            assert!(
+                !spend_work(&scope, 1, 1),
+                "a section that has run 100 ms refuses before it ends"
+            );
+        }
+        assert!(work_for_test(&scope).2 >= short + PAGE_CAPTURE_US);
+        assert!(
+            WORK.lock().unwrap()[&scope].section.is_none(),
+            "an ended section stops charging"
+        );
+    }
+
+    /// Hashing a displaced response's request id is shadow-only work: it is
+    /// timed and admitted against the capture input, and refused once the
+    /// capture allowance is spent.
+    #[test]
+    fn displaced_request_hashing_is_timed_and_admitted_capture_work() {
+        let scope = PathBuf::from("money-request-hash-work");
+        begin_page(&scope);
+        let mut capture = ClaudeResponseCapture {
+            scope: scope.clone(),
+            ..Default::default()
+        };
+        assert_eq!(
+            capture.request_hash("req-1"),
+            Some(crate::snapshots::claude_request_census::claude_request_hash("req-1"))
+        );
+        assert_eq!(work_for_test(&scope).0, "req-1".len());
+        WORK.lock().unwrap().get_mut(&scope).unwrap().micros = PAGE_CAPTURE_US;
+        assert_eq!(capture.request_hash("req-2"), None);
+        assert!(capture.is_refused());
+        assert_eq!(capture.request_hash("req-3"), None);
     }
 
     #[test]

@@ -15737,10 +15737,6 @@ impl SnapshotAccumulator {
                 }
             }
             if let Some(request_id) = response.request_id.take() {
-                let request_hash = capture
-                    .is_some()
-                    .then(|| claude_request_census::claude_request_hash(&request_id));
-                let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
                 let selector = match shared_selectors.get(&response.selector) {
                     Some(shared) => Arc::clone(shared),
                     None => {
@@ -15750,7 +15746,7 @@ impl SnapshotAccumulator {
                     }
                 };
                 let prior_occurrence = self.claude_usage_occurrences.insert(
-                    request_id,
+                    request_id.clone(),
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
                         usage: response.usage.clone(),
@@ -15762,6 +15758,14 @@ impl SnapshotAccumulator {
                         effective_input_context,
                     },
                 );
+                // Shadow-only: just a response that displaces an earlier one
+                // under its request id needs the hash, as timed and admitted
+                // capture work.
+                let request_hash = match (capture.as_deref_mut(), &prior_occurrence) {
+                    (Some(capture), Some(_)) => capture.request_hash(&request_id),
+                    _ => None,
+                };
+                let request_id_was_new = self.claude_usage_request_ids.insert(request_id);
                 // Progressive rows for one response were merged by response
                 // key above. Reaching this point twice for one provider request
                 // id therefore means two distinct responses claim the same
