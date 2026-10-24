@@ -1166,7 +1166,9 @@ pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 
 
 #[cfg(test)]
 mod unbuilt_lifecycle_tests {
-    use super::super::claude_request_census::{ClaudeRequestBirth, ClaudeRequestCensusShape};
+    use super::super::claude_request_census::{
+        telemetry_key, ClaudeRequestBirth, ClaudeRequestCensusShape,
+    };
     use super::super::claude_request_money::{store, update_unbuilt_lifecycle, UNBUILT_RELEASED};
     use super::*;
     use std::time::Duration;
