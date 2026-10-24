@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "d6aca78005e03681642be88861cf1d4163798ebf44dad0f1e5dfae52ac6713a4",
+  "content_sha256": "ef7fa7901ceff8951ab5136dc1380ed126b98d4876e1316f8c16c9de5a31a9f7",
   "files": [
     {
       "executable": false,
@@ -692,8 +692,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status.rs",
-      "sha256": "bb2e1405270d94957a7f30646be80c0f688e78e0de9b1f63cd0fd23d5418774d",
-      "size_bytes": 1638788
+      "sha256": "1d8b9a9468b074b2b34ca918608a85a340bd770c30f2535da3e3d781565dff4e",
+      "size_bytes": 1641034
     },
     {
       "executable": false,
@@ -706,8 +706,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/agent_status/codex_credit_grants.rs",
-      "sha256": "bf63a4f36ee37b4a179c782c1e3280c055047629db20cf383b94999464ae3821",
-      "size_bytes": 78256
+      "sha256": "6613433b626bb365c94895695564230235f92813224c5bcb689f18a36a3b9a72",
+      "size_bytes": 79213
     },
     {
       "executable": false,
