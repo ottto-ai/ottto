@@ -155,7 +155,7 @@ jobs:
           export OTTTO_MONEY_PARITY_ROOT="$RUNNER_TEMP/money-saved-inputs"
           # Separate targets force each source tree to compile independently.
           # Shared targets can reuse the base binary after a worktree switch.
-          git worktree add --detach "$RUNNER_TEMP/money-base" dba838f067ed58f8d45f6af1a6cabae1e08fc837
+          git worktree add --detach "$RUNNER_TEMP/money-base" 8b1c7309720f6963b2b871d7543aea91977daa10
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
           # Match the test-only observer's fixed storage in both binaries.
           # Runtime source, measured allocations and overflow assertions stay intact.
@@ -202,16 +202,16 @@ jobs:
               return int(statistics.median(receipt[field] for receipt in receipts))
           base_footprint, head_footprint = median(base_runs, "phys_footprint_bytes"), median(head_runs, "phys_footprint_bytes")
           base_rss, head_rss = median(base_runs, "rss_median_bytes"), median(head_runs, "rss_median_bytes")
-          result = {"baseline_release": "0.1.189", "baseline_source": "dba838f067ed58f8d45f6af1a6cabae1e08fc837", "runs_per_side": len(runs), "base_phys_footprint_bytes": base_footprint, "head_phys_footprint_bytes": head_footprint, "footprint_delta_bytes": head_footprint - base_footprint, "base_footprint_runs": [r["phys_footprint_bytes"] for r in base_runs], "head_footprint_runs": [r["phys_footprint_bytes"] for r in head_runs], "base_rss_bytes": base_rss, "head_rss_bytes": head_rss, "rss_delta_bytes_info": head_rss - base_rss, "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
+          result = {"baseline_ref": "saved-main", "baseline_source": "8b1c7309720f6963b2b871d7543aea91977daa10", "runs_per_side": len(runs), "base_phys_footprint_bytes": base_footprint, "head_phys_footprint_bytes": head_footprint, "footprint_delta_bytes": head_footprint - base_footprint, "base_footprint_runs": [r["phys_footprint_bytes"] for r in base_runs], "head_footprint_runs": [r["phys_footprint_bytes"] for r in head_runs], "base_rss_bytes": base_rss, "head_rss_bytes": head_rss, "rss_delta_bytes_info": head_rss - base_rss, "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
           (root / "money-rss-comparison.json").write_text(json.dumps(result, indent=2) + "\n")
           print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
           delta = head["ledger_resident_bytes"] - base["ledger_resident_bytes"]
-          print(f'MONEY_M4_DELTA_VS_189 base_resident={base["ledger_resident_bytes"]} head_off_resident={head["ledger_resident_bytes"]} delta={delta} base_load_peak={base["load_native_peak"]} head_off_load_peak={head["load_native_peak"]} base_save_peak={base["save_native_peak"]} head_off_save_peak={head["save_native_peak"]} base_footprint={base_footprint} head_off_footprint={head_footprint} footprint_delta={result["footprint_delta_bytes"]} base_rss={base_rss} head_off_rss={head_rss} rss_delta_info={result["rss_delta_bytes_info"]} resident_is_structural=true peaks_are_native_usable=true matched_observer_slots=1048576')
+          print(f'MONEY_M4_DELTA_VS_MAIN base_resident={base["ledger_resident_bytes"]} head_off_resident={head["ledger_resident_bytes"]} delta={delta} base_load_peak={base["load_native_peak"]} head_off_load_peak={head["load_native_peak"]} base_save_peak={base["save_native_peak"]} head_off_save_peak={head["save_native_peak"]} base_footprint={base_footprint} head_off_footprint={head_footprint} footprint_delta={result["footprint_delta_bytes"]} base_rss={base_rss} head_off_rss={head_rss} rss_delta_info={result["rss_delta_bytes_info"]} resident_is_structural=true peaks_are_native_usable=true matched_observer_slots=1048576')
           # P1 evidence now has a physical carrier, a typed field slot and a
           # separately boxed telemetry record. Live delivery/watch fields are
           # absent while OFF (MONEY_OFF_LAYOUT prints the exact partition).
           # Budget the shared representation, not live scaffold or an RSS
-          # subtraction. Ceilings are measured against the 0.1.189 source build.
+          # subtraction. Ceilings are measured against the pinned main source build.
           # Memory is gated on the kernel's physical footprint (dirty and
           # compressed memory), median of five alternating runs per side. ps RSS
           # also counts clean file-backed code pages and reclaimable pages; for
