@@ -306,6 +306,13 @@ def prepare_output() -> Path:
     return temp_dir
 
 
+def normalized_mode(mode: int) -> int:
+    # Git keeps only the executable bit. Write the modes a clean checkout gets
+    # under umask 022 so the manifest equals the one public_repo_manifest.sh
+    # derives from the commit tree, whatever the exporter's umask.
+    return 0o755 if mode & 0o111 else 0o644
+
+
 def write_special_public_export_files(temp_dir: Path, mapped_roots: list[str]) -> None:
     public_export_dir = temp_dir / "public-export"
     public_export_dir.mkdir(parents=True, exist_ok=True)
@@ -337,6 +344,8 @@ def write_special_public_export_files(temp_dir: Path, mapped_roots: list[str]) -
         "# No private repository rewrite rules should remain after staging.\n",
         encoding="utf-8",
     )
+    for dest in (roots_dest, path_map_dest, rewrite_rules_dest):
+        os.chmod(dest, 0o644)
 
 
 def copy_candidates(temp_dir: Path, candidates: list[str], rewrites: list[tuple[str, str, str]]) -> tuple[dict[str, str], dict[str, int]]:
@@ -366,7 +375,7 @@ def copy_candidates(temp_dir: Path, candidates: list[str], rewrites: list[tuple[
                     text = text.replace(literal, replacement)
             output = text.encode("utf-8")
         dest_abs.write_bytes(output)
-        os.chmod(dest_abs, stat.S_IMODE(source_abs.stat().st_mode))
+        os.chmod(dest_abs, normalized_mode(stat.S_IMODE(source_abs.stat().st_mode)))
     return destinations, rewrite_counts
 
 

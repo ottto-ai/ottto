@@ -405,6 +405,9 @@ mod tests {
             last_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            compaction_events: Vec::new(),
+            first_own_request_at: None,
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -414,6 +417,8 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
+            claude_file_birth_verdict: None,
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
@@ -538,7 +543,7 @@ mod tests {
 
     #[test]
     fn codex_personal_pro_and_team_surface_as_separate_detected_uses() {
-        // THE KEY CASE: Codex history with a Personal Pro context and a Singular
+        // THE KEY CASE: Codex history with a Personal Pro context and a Acme
         // Team context under the same OpenAI identity. plan_type and the
         // secondary-reset day bucket differ, so the plan_fingerprints differ and
         // the two MUST surface as distinct detected uses (never collapsed onto a

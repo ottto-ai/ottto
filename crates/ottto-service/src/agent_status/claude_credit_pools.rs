@@ -57,6 +57,8 @@ const ONE_TIME_POOLS_MAX: usize = 16;
 /// While the account was active this recently (a session for it written on
 /// this Mac), the account is in use and its slot is the active slot.
 pub(super) const ACTIVE_WINDOW_SECONDS: u64 = 30 * 60;
+/// A stalled activity feed can preserve the active cadence for at most 2 h.
+const MAX_ACTIVITY_FEED_LAG_SECONDS: u64 = 2 * 60 * 60;
 /// In-use account: one read per 5 min. A fresh local statusLine reading for
 /// the exact binding stands in for it (`agent_status`), so the provider is
 /// called only when that free local data is older than this.
@@ -632,32 +634,39 @@ pub(super) fn write_claude_read_schedule(
 }
 
 /// The account's read slot (design R7: active-account freshness): the active
-/// slot while the account was active in the last 30 min, else the default
+/// slot while the account was active within the feed's last 30 min, else the default
 /// (unused-account) slot. With `activity_cadence` off every slot is the
 /// default slot.
 pub(super) fn claude_usage_slot_seconds(
     schedule: &ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
+    feed_fresh_at: Option<u64>,
     default_slot_seconds: u64,
     activity_cadence: bool,
     now: u64,
 ) -> u64 {
-    if activity_cadence && claude_binding_in_use(schedule, latest_activity_at, now) {
+    if activity_cadence && claude_binding_in_use(schedule, latest_activity_at, feed_fresh_at, now) {
         return ACTIVE_SLOT_SECONDS;
     }
     default_slot_seconds
 }
 
 /// Whether the binding is in use on this Mac: a session for it was written in
-/// the last 30 min (the scan's latest sighting, or the one kept in `schedule`).
+/// the feed's last 30 min (the latest sighting, or the one kept in `schedule`).
+/// Unknown freshness or a feed lagging more than 2 h uses the wall clock.
 pub(super) fn claude_binding_in_use(
     schedule: &ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
+    feed_fresh_at: Option<u64>,
     now: u64,
 ) -> bool {
+    let activity_clock = feed_fresh_at
+        .map(|at| at.min(now))
+        .filter(|at| now.saturating_sub(*at) <= MAX_ACTIVITY_FEED_LAG_SECONDS)
+        .unwrap_or(now);
     schedule
         .activity_at(latest_activity_at)
-        .is_some_and(|at| now.saturating_sub(at) <= ACTIVE_WINDOW_SECONDS)
+        .is_some_and(|at| activity_clock.saturating_sub(at) <= ACTIVE_WINDOW_SECONDS)
 }
 
 /// Whether the binding's "not before next slot" hold applies now.
@@ -888,6 +897,15 @@ pub(super) fn label_credit_freshness(
             AgentQuotaWindowFreshness::Stale
         };
     }
+}
+
+/// How far the last completed Claude scan observed activity. Reconciliation
+/// time cannot stand in for its start: a long scan may finish with old sightings.
+pub(super) fn claude_activity_feed_fresh_at(
+    reconciliation: Option<&ActiveSessionReconciliation>,
+) -> Option<u64> {
+    let at = parse_instant(reconciliation?.scan_started_at.as_deref()?)?;
+    u64::try_from(at.unix_timestamp()).ok()
 }
 
 /// Latest Claude session activity the daemon's active-session scan attributed
@@ -2045,7 +2063,7 @@ mod tests {
         assert!(!schedule.observe_activity(None));
         assert!(!schedule.observe_activity(Some(900)));
         assert_eq!(schedule.last_activity_at, Some(1_000));
-        let slot = |now| claude_usage_slot_seconds(&schedule, None, 2_400, true, now);
+        let slot = |now| claude_usage_slot_seconds(&schedule, None, None, 2_400, true, now);
         assert_eq!(slot(1_000 + 20 * 60), ACTIVE_SLOT_SECONDS);
         assert_eq!(slot(1_000 + 31 * 60), 2_400);
         // Unused, however long: the unused-account gate, never a longer slot.
@@ -2054,7 +2072,7 @@ mod tests {
         // Kill switch: the unused-account gate everywhere.
         for now in [1_000 + 20 * 60, 1_000 + 31 * 60, 1_000 + 6 * 3_600 + 1] {
             assert_eq!(
-                claude_usage_slot_seconds(&schedule, Some(now), 2_400, false, now),
+                claude_usage_slot_seconds(&schedule, Some(now), None, 2_400, false, now),
                 2_400
             );
         }
@@ -2100,14 +2118,68 @@ mod tests {
         assert!(claude_binding_in_use(
             &schedule,
             Some(10_000 - 30 * 60),
+            None,
             10_000
         ));
         assert!(!claude_binding_in_use(
             &schedule,
             Some(10_000 - 31 * 60),
+            None,
             10_000
         ));
-        assert!(!claude_binding_in_use(&schedule, None, 10_000));
+        assert!(!claude_binding_in_use(&schedule, None, None, 10_000));
+    }
+
+    #[test]
+    fn in_use_survives_a_stalled_activity_scan() {
+        let activity_at = 10_000;
+        let now = activity_at + 45 * 60;
+        let mut schedule = ClaudeReadSchedule::default();
+        schedule.observe_activity(Some(activity_at));
+        let mut reconciliation: ActiveSessionReconciliation = serde_json::from_value(json!({
+            "scan_started_at": rfc3339(activity_at - 30),
+            "reconciled_at": rfc3339(now),
+            "changed_session_count": 0,
+            "sessions": []
+        }))
+        .unwrap();
+        let slot = |feed: Option<&ActiveSessionReconciliation>, now| {
+            claude_usage_slot_seconds(
+                &schedule,
+                claude_latest_activity_at(feed, "a", "o"),
+                claude_activity_feed_fresh_at(feed),
+                DEFAULT_SLOT,
+                true,
+                now,
+            )
+        };
+        assert_eq!(slot(Some(&reconciliation), now), ACTIVE_SLOT_SECONDS);
+        // A newly completed scan sees no newer activity: return to idle.
+        reconciliation.scan_started_at = Some(rfc3339(activity_at + 40 * 60));
+        assert_eq!(slot(Some(&reconciliation), now), DEFAULT_SLOT);
+        // A dead scanner cannot preserve the active slot indefinitely.
+        let scan_at = activity_at - 30;
+        reconciliation.scan_started_at = Some(rfc3339(scan_at));
+        assert_eq!(
+            slot(
+                Some(&reconciliation),
+                scan_at + MAX_ACTIVITY_FEED_LAG_SECONDS
+            ),
+            ACTIVE_SLOT_SECONDS
+        );
+        assert_eq!(
+            slot(
+                Some(&reconciliation),
+                scan_at + MAX_ACTIVITY_FEED_LAG_SECONDS + 1
+            ),
+            DEFAULT_SLOT
+        );
+        // Missing, older and invalid feed metadata retain wall-clock judging.
+        assert_eq!(slot(None, now), DEFAULT_SLOT);
+        for scan_at in [None, Some("invalid".to_string()), Some(rfc3339(now + 60))] {
+            reconciliation.scan_started_at = scan_at;
+            assert_eq!(slot(Some(&reconciliation), now), DEFAULT_SLOT);
+        }
     }
 
     /// A stored reading holding the given sections.
@@ -2181,7 +2253,8 @@ mod tests {
         fn pass(&mut self, now: u64, activity: Option<u64>, passive_fetched_at: Option<u64>) {
             let since = claude_observe_caller_binding(&mut self.callers, "default", "a/o", now);
             self.schedule.observe_activity(activity);
-            let slot = claude_usage_slot_seconds(&self.schedule, activity, DEFAULT_SLOT, true, now);
+            let slot =
+                claude_usage_slot_seconds(&self.schedule, activity, None, DEFAULT_SLOT, true, now);
             if !claude_reading_due(self.last_reading_at, self.next_refresh_after, slot, now) {
                 return;
             }
@@ -3225,6 +3298,70 @@ mod tests {
         super::super::request_claude_explicit_refresh();
         assert!(app(respond_recognized).result.is_ok());
         assert_eq!(harness.requests(), 2);
+    }
+
+    /// "Background limit refresh" off: the daemon's own passes read no
+    /// Claude account, the default login included, and serve the stored
+    /// reading. A person's Refresh, a setup check and a read outside a pass
+    /// (an account check) still read; switching it on resumes the schedule.
+    #[test]
+    #[serial_test::serial]
+    fn background_refresh_off_stops_scheduled_reads_for_every_login() {
+        use super::super::ClaudeOAuthUsageCaller::{Default as DefaultLogin, RegisteredSlot};
+        use crate::provider_calls::{with_trigger, Trigger};
+        let harness = VariantHarness::new("background-refresh-off");
+        let settings = ottto_core::FileClaudeConfigSlotSettingsStore::default();
+        settings.set_upkeep_consent(1, false).expect("turn off");
+        let slot = || RegisteredSlot("slot-variant".to_string());
+        let now = super::super::current_unix_seconds();
+        let pass = |caller| {
+            super::super::with_claude_pass(false, now, || {
+                harness.collect_as(caller, respond_recognized)
+            })
+        };
+
+        // Due with nothing stored: no request for either login, and the
+        // status says why.
+        harness.due(ClaudeReadSchedule::default());
+        for caller in [DefaultLogin, slot()] {
+            assert_eq!(
+                pass(caller).result.err().as_deref(),
+                Some(super::super::CLAUDE_BACKGROUND_REFRESH_OFF_MESSAGE)
+            );
+        }
+        assert_eq!(harness.requests(), 0);
+
+        // A setup check reads, even inside a pass.
+        assert!(with_trigger(Trigger::Setup, || pass(DefaultLogin))
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 1);
+
+        // Due again: the pass serves the stored reading, no request.
+        harness.due_keeping_reading();
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert!(pass(slot()).result.is_ok());
+        assert_eq!(harness.requests(), 1);
+
+        // An account check runs outside any pass: it reads.
+        assert!(harness
+            .collect_as(slot(), respond_recognized)
+            .result
+            .is_ok());
+        assert_eq!(harness.requests(), 2);
+
+        // A person's Refresh reads in the daemon's pass.
+        harness.due_keeping_reading();
+        super::super::request_claude_explicit_refresh();
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert_eq!(harness.requests(), 3);
+
+        // On again: the schedule reads a due account.
+        harness.due_keeping_reading();
+        settings.set_upkeep_consent(1, true).expect("turn on");
+        super::super::claude_explicit_refresh_request().at = 0;
+        assert!(pass(DefaultLogin).result.is_ok());
+        assert_eq!(harness.requests(), 4);
     }
 
     /// At least 5 minutes between reads of one account, measured from the

@@ -15,14 +15,15 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use ottto_protocol::{
-    ActiveSession, ActiveSessionReconciliation, AgentLoginState, AgentStatusConfidence,
-    AgentStatusPlanObservation, AgentStatusSnapshot,
+    ActiveSession, ActiveSessionCompaction, ActiveSessionContextPoint, ActiveSessionReconciliation,
+    AgentLoginState, AgentStatusConfidence, AgentStatusPlanObservation, AgentStatusSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use time::{format_description::well_known::Rfc3339, Duration, OffsetDateTime};
 
 use crate::snapshots::{
-    bounded_compaction_timestamps, SnapshotItem, SnapshotModelUsage, SnapshotSource,
+    bounded_compaction_events, bounded_compaction_timestamps, LocalContextPoint,
+    SnapshotCompactionEvent, SnapshotItem, SnapshotModelUsage, SnapshotSource,
     SnapshotUploadPolicy, CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS,
 };
 
@@ -66,6 +67,7 @@ pub fn reconcile_active_sessions(
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
     upload_policy: SnapshotUploadPolicy,
+    scan_started_at: Option<&str>,
     reconciled_at: &str,
 ) -> Result<ActiveSessionReconciliation> {
     let policy = serde_json::to_string(&upload_policy)?;
@@ -74,6 +76,7 @@ pub fn reconcile_active_sessions(
         source,
         snapshots,
         agent_status,
+        scan_started_at,
         reconciled_at,
         Some(&policy),
         crate::agent_status::claude_session_registrations,
@@ -92,17 +95,20 @@ pub fn clear_active_sessions(
         source,
         &[],
         None,
+        None,
         reconciled_at,
         None,
         crate::agent_status::claude_session_registrations,
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reconcile_with_registrations(
     support_dir: &Path,
     source: SnapshotSource,
     snapshots: &[SnapshotItem],
     agent_status: Option<&AgentStatusSnapshot>,
+    scan_started_at: Option<&str>,
     reconciled_at: &str,
     carry_policy: Option<&str>,
     registrations: impl FnOnce() -> crate::claude_session_registrations::Registrations,
@@ -111,7 +117,13 @@ fn reconcile_with_registrations(
     let mut cache = read_cache(&path);
     let now = OffsetDateTime::parse(reconciled_at, &Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc());
-    let activity_cutoff = now - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
+    // A slow scan may observe live work long before it reconciles. Its start
+    // bounds what activity it could have observed; the ceiling still uses now.
+    let activity_clock = scan_started_at
+        .and_then(|at| OffsetDateTime::parse(at, &Rfc3339).ok())
+        .unwrap_or(now)
+        .min(now);
+    let activity_cutoff = activity_clock - Duration::minutes(ACTIVE_ACTIVITY_WINDOW_MINUTES);
     let activity_ceiling = now + Duration::minutes(5);
     let watermark_cutoff = now - Duration::days(WATERMARK_RETENTION_DAYS);
 
@@ -299,6 +311,7 @@ fn reconcile_with_registrations(
         .registration_evidence
         .retain(|session_id, _| listed.contains(session_id.as_str()));
     let reconciliation = ActiveSessionReconciliation {
+        scan_started_at: scan_started_at.map(str::to_string),
         reconciled_at: reconciled_at.to_string(),
         changed_session_count,
         sessions,
@@ -387,6 +400,10 @@ fn active_session_from_snapshot(
         peak_context_fill_tokens: snapshot.peak_context_fill_tokens,
         compaction_count: snapshot.compaction_count,
         compaction_timestamps,
+        compaction_events: active_session_compactions(&snapshot.compaction_events),
+        first_turn_context_tokens: snapshot.first_turn_context_tokens,
+        last_turn_context_tokens: snapshot.last_turn_context_tokens,
+        context_points: active_session_context_points(&snapshot.local_context_points),
         input_tokens: Some(snapshot.input_tokens),
         cache_read_tokens: Some(snapshot.cache_read_tokens),
         cache_creation_5m_tokens: Some(snapshot.cache_creation_5m_tokens),
@@ -415,6 +432,32 @@ fn active_session_from_snapshot(
         latest_model,
         latest_reasoning_effort,
     }
+}
+
+/// The uploaded compaction list, bounded the same way as the timestamps the
+/// row carries, with the app's key names.
+fn active_session_compactions(events: &[SnapshotCompactionEvent]) -> Vec<ActiveSessionCompaction> {
+    bounded_compaction_events(events.to_vec())
+        .into_iter()
+        .map(|event| ActiveSessionCompaction {
+            at: event.at,
+            before_tokens: event.before,
+            after_tokens: event.after,
+            trigger: event.trigger,
+        })
+        .collect()
+}
+
+fn active_session_context_points(points: &[LocalContextPoint]) -> Vec<ActiveSessionContextPoint> {
+    points
+        .iter()
+        .map(|point| {
+            (
+                i64::from(point.at_unix_seconds),
+                u64::from(point.prompt_tokens),
+            )
+        })
+        .collect()
 }
 
 /// The model + effort tier this session was most recently seen running.
@@ -961,7 +1004,8 @@ fn write_cache(path: &Path, cache: &ActiveSessionCache) -> Result<()> {
     };
     std::fs::create_dir_all(parent)
         .with_context(|| format!("create active session cache dir {}", parent.display()))?;
-    let payload = serde_json::to_vec_pretty(cache).context("serialize active session cache")?;
+    // Compact: the status path reads this whole file on every poll.
+    let payload = serde_json::to_vec(cache).context("serialize active session cache")?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = File::create(&temp_path)
         .with_context(|| format!("create active session cache temp {}", temp_path.display()))?;
@@ -1141,6 +1185,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("reconciliation");
@@ -1195,6 +1240,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &snapshots,
+            None,
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
@@ -1254,6 +1300,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             registrations,
@@ -1289,6 +1336,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             &[],
             None,
+            None,
             "2026-07-19T10:10:00Z",
             Some("policy"),
             || panic!("no registration acquisition without new activity"),
@@ -1312,6 +1360,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[],
+            None,
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
@@ -1339,6 +1388,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[older, newer],
+            None,
             None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
@@ -1375,6 +1425,7 @@ mod tests {
                 SnapshotSource::ClaudeCode,
                 std::slice::from_ref(&snapshot),
                 None,
+                None,
                 "2026-07-19T10:05:00Z",
                 Some("policy"),
                 registrations,
@@ -1398,6 +1449,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             registrations,
@@ -1419,6 +1471,7 @@ mod tests {
             SnapshotSource::ClaudeCode,
             std::slice::from_ref(&snapshot),
             None,
+            None,
             "2026-07-19T10:05:00Z",
             Some("policy"),
             BTreeMap::new,
@@ -1432,6 +1485,7 @@ mod tests {
             &dir,
             SnapshotSource::ClaudeCode,
             &[],
+            None,
             None,
             "2026-07-19T10:30:00Z",
             Some("policy"),
@@ -1457,15 +1511,82 @@ mod tests {
     }
 
     #[test]
+    fn long_scan_keeps_activity_seen_after_scan_start_and_advances_watermark() {
+        let dir = temp_dir("long-scan");
+        let snapshot = test_snapshot("live", "2026-07-19T10:06:00Z");
+        let result = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[
+                snapshot,
+                test_snapshot("old", "2026-07-19T09:44:00Z"),
+                test_snapshot("future", "2026-07-19T10:46:00Z"),
+            ],
+            None,
+            test_policy(),
+            Some("2026-07-19T10:00:00Z"),
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        assert_eq!(result.changed_session_count, 1);
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_session_id, "live");
+        let cache = read_cache(&active_session_cache_path(&dir, SnapshotSource::ClaudeCode));
+        assert_eq!(cache.watermarks["live"], "2026-07-19T10:06:00Z");
+        assert_eq!(cache.reconciliation, Some(result.clone()));
+        assert_eq!(
+            result.scan_started_at.as_deref(),
+            Some("2026-07-19T10:00:00Z")
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn scan_start_after_reconciliation_uses_reconciliation_cutoff() {
+        let dir = temp_dir("scan-clock-rollback");
+        let result = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::ClaudeCode,
+            &[test_snapshot("live", "2026-07-19T10:35:00Z")],
+            None,
+            test_policy(),
+            Some("2026-07-19T11:00:00Z"),
+            "2026-07-19T10:40:00Z",
+        )
+        .unwrap();
+        assert_eq!(result.sessions.len(), 1);
+        assert_eq!(result.sessions[0].source_session_id, "live");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn requires_advanced_recent_activity_and_preserves_compaction_times() {
         let dir = temp_dir("advanced");
-        let snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        let mut snapshot = test_snapshot("s1", "2026-07-19T10:04:00Z");
+        snapshot.last_turn_context_tokens = Some(59_000);
+        snapshot.compaction_events = vec![crate::snapshots::SnapshotCompactionEvent {
+            at: "2026-07-19T09:59:00Z".to_string(),
+            before: Some(100),
+            after: Some(59_000),
+            trigger: None,
+        }];
+        snapshot.local_context_points = vec![
+            LocalContextPoint {
+                at_unix_seconds: 1_784_454_600, // 2026-07-19T09:50:00Z
+                prompt_tokens: 90,
+            },
+            LocalContextPoint {
+                at_unix_seconds: 1_784_455_440, // 2026-07-19T10:04:00Z
+                prompt_tokens: 59_000,
+            },
+        ];
         let first = reconcile_active_sessions(
             &dir,
             SnapshotSource::Codex,
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1474,6 +1595,38 @@ mod tests {
             first.sessions[0].compaction_timestamps,
             vec!["2026-07-19T09:59:00Z"]
         );
+        let session = &first.sessions[0];
+        assert_eq!(
+            session.compaction_events,
+            [ActiveSessionCompaction {
+                at: "2026-07-19T09:59:00Z".to_string(),
+                before_tokens: Some(100),
+                after_tokens: Some(59_000),
+                trigger: None,
+            }]
+        );
+        assert_eq!(session.first_turn_context_tokens, Some(90));
+        assert_eq!(session.last_turn_context_tokens, Some(59_000));
+        assert_eq!(
+            session.context_points,
+            [(1_784_454_600, 90), (1_784_455_440, 59_000),]
+        );
+        // The list file is compact JSON, and a quiet scan carries the row
+        // with its points and sizes unchanged.
+        let written = std::fs::read(active_session_cache_path(&dir, SnapshotSource::Codex))
+            .expect("read list file");
+        assert!(!written.contains(&b'\n'));
+        let quiet = reconcile_active_sessions(
+            &dir,
+            SnapshotSource::Codex,
+            &[],
+            None,
+            test_policy(),
+            None,
+            "2026-07-19T10:06:00Z",
+        )
+        .expect("quiet reconciliation");
+        assert_eq!(quiet.sessions, first.sessions);
 
         let unchanged = reconcile_active_sessions(
             &dir,
@@ -1481,6 +1634,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:10:00Z",
         )
         .expect("unchanged reconciliation");
@@ -1499,6 +1653,7 @@ mod tests {
             std::slice::from_ref(&busy),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1511,6 +1666,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:15:00Z",
         )
         .expect("quiet reconciliation");
@@ -1525,6 +1681,7 @@ mod tests {
             &[busy.clone(), other],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:17:00Z",
         )
         .expect("mixed reconciliation");
@@ -1543,6 +1700,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:20:00Z",
         )
         .expect("later reconciliation");
@@ -1566,6 +1724,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1584,6 +1743,7 @@ mod tests {
             &[stripped],
             None,
             policy,
+            None,
             "2026-07-19T10:08:00Z",
         )
         .expect("rebuilt reconciliation");
@@ -1604,6 +1764,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1617,6 +1778,7 @@ mod tests {
             &[],
             None,
             policy,
+            None,
             "2026-07-19T10:08:00Z",
         )
         .expect("policy-change reconciliation");
@@ -1638,6 +1800,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             Some(&status),
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1652,6 +1815,7 @@ mod tests {
             &[],
             Some(&status),
             test_policy(),
+            None,
             "2026-07-19T10:06:00Z",
         )
         .expect("agreeing reconciliation");
@@ -1672,6 +1836,7 @@ mod tests {
             &[],
             Some(&conflicting),
             test_policy(),
+            None,
             "2026-07-19T10:07:00Z",
         )
         .expect("conflicting reconciliation");
@@ -1722,6 +1887,7 @@ mod tests {
             std::slice::from_ref(&snapshot),
             None,
             test_policy(),
+            None,
             "2026-07-19T10:05:00Z",
         )
         .expect("first reconciliation");
@@ -1735,6 +1901,7 @@ mod tests {
             &[],
             None,
             test_policy(),
+            None,
             "2026-07-19T10:07:00Z",
         )
         .expect("next reconciliation");
@@ -2756,6 +2923,9 @@ mod tests {
             first_turn_context_tokens: Some(90),
             compaction_count: Some(1),
             compaction_timestamps: vec!["2026-07-19T09:59:00Z".to_string()],
+            compaction_events: Vec::new(),
+            first_own_request_at: None,
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -2765,6 +2935,8 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
+            claude_file_birth_verdict: None,
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,

@@ -227,6 +227,11 @@ struct ApcFixture {
     next_sequence: std::cell::Cell<u64>,
     page_files: std::cell::Cell<usize>,
     cutoff: std::cell::Cell<Option<&'static str>>,
+    /// Opt-in baseline for the production BASE finish's moving native receipt.
+    /// Old APC tests keep their original collector and fold unchanged.
+    retain_native_terminal: std::cell::Cell<bool>,
+    native_terminal_seen: std::cell::Cell<bool>,
+    census_before_fold: std::cell::Cell<bool>,
 }
 
 impl ApcFixture {
@@ -253,6 +258,9 @@ impl ApcFixture {
             next_sequence: std::cell::Cell::new(1),
             page_files: std::cell::Cell::new(APC_PAGE_FILES),
             cutoff: std::cell::Cell::new(None),
+            retain_native_terminal: std::cell::Cell::new(false),
+            native_terminal_seen: std::cell::Cell::new(false),
+            census_before_fold: std::cell::Cell::new(false),
         };
         for (session, path) in [
             (
@@ -450,25 +458,80 @@ impl ApcFixture {
         let mut index = before.clone();
         index.activate_upload_context("upload-context-apc".to_string());
         index.activate_effective_upload_body_witness_revision(
-            EFFECTIVE_UPLOAD_BODY_WITNESS_REVISION,
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode),
         );
         let committed_index = index.clone();
-        let mut scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
-            std::slice::from_ref(&self.root),
-            &mut index,
-            collected_at,
-            183,
-            self.page_files.get(),
-            &self.support,
-        )
-        .expect("scan bounded Claude page");
+        let (mut scan, mut native_completion) = if self.retain_native_terminal.get() {
+            let mut state = crate::snapshots::OwnedSourceScan::new(
+                SnapshotSource::ClaudeCode,
+                std::slice::from_ref(&self.root),
+                index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                true,
+                Some(&self.support),
+                &[],
+                false,
+                true,
+            );
+            state.enable_native_comparison();
+            loop {
+                if state.native_comparison_ready() {
+                    // The same BASE continuation used without a controller.
+                    state.resume_native_comparison_base();
+                }
+                match state.step(None) {
+                    crate::snapshots::OwnedSourceScanStep::Pending(next) => state = next,
+                    crate::snapshots::OwnedSourceScanStep::Complete {
+                        index: completed,
+                        scan,
+                        terminal_native_traversal,
+                    } => {
+                        index = completed;
+                        self.native_terminal_seen
+                            .set(terminal_native_traversal.is_some());
+                        break (
+                            scan,
+                            crate::snapshots::claude_native_comparison::Completion::base(
+                                terminal_native_traversal,
+                            ),
+                        );
+                    }
+                }
+            }
+        } else {
+            self.native_terminal_seen.set(false);
+            let scan = crate::snapshots::scan_source_roots_with_test_limit_and_claude_support(
+                std::slice::from_ref(&self.root),
+                &mut index,
+                collected_at,
+                183,
+                self.page_files.get(),
+                &self.support,
+            )
+            .expect("scan bounded Claude page");
+            (scan, None)
+        };
+        self.census_before_fold.set(scan.census_complete);
         let parsed = scan
             .snapshots
             .iter()
             .map(|item| item.source_session_id.clone())
             .collect();
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        let (mut disposition, _, _) = if self.retain_native_terminal.get() {
+            apply_claude_local_evidence_to_scan_with_comparison(
+                &self.support,
+                &mut scan,
+                &mut index,
+                None,
+                None,
+                native_completion.as_mut(),
+                None,
+            )
+        } else {
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index)
+        };
         self.stamp_owners(&mut scan);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -612,6 +675,7 @@ impl ApcFixture {
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
@@ -650,6 +714,7 @@ impl ApcFixture {
                                     body_witness_digest: None,
                                     head_etag: None,
                                     head_challenge: None,
+                                    unchanged_basis: None,
                                 })
                                 .collect(),
                         };
@@ -2475,4 +2540,177 @@ fn locked_partial_checkpoint_requested_bytes_receipt() {
                 .expect("write checkpoint receipt");
         }
     }
+}
+
+/// Real bounded pages, BASE native terminal, selected save and production load.
+#[test]
+#[serial(source_manifests)]
+fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_quarantine() {
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "native terminal needs supported layout"
+    );
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("authority-retry-native-terminal", false);
+    let established = fixture.establish();
+    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
+    fixture.retain_native_terminal.set(true);
+    // New real request cannot reconstruct from W0; paired evidence lets the
+    // next raw-complete native terminal prove W1 despite the withheld census.
+    fixture.append_family_request(Some(APC_AGENTS[0]), "req_recovered", 4);
+    for number in 0..APC_MAX_PAGES {
+        let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
+        let target = fixture.native_terminal_seen.get()
+            && !fixture.census_before_fold.get()
+            && page.record_before().is_some_and(|record| !record.terminal);
+        if !target {
+            fixture.assert_durable(&page, 10);
+            continue;
+        }
+        assert!(number > 0);
+        assert!(page.parsed.is_disjoint(&apc_family_sessions()));
+        let before = page.record_before().unwrap();
+        assert!(before.bound_to_retained_witness);
+        assert_eq!(before.proven_witness_fingerprint, established.proven);
+        assert_eq!(
+            fixture.quarantined_index_count(),
+            0,
+            "withheld native terminal must not quarantine the whole index"
+        );
+        assert!(page.index.generation > 0);
+        let record = page.record().expect("RetryPending record survives reproof");
+        assert!(record.bound_to_retained_witness);
+        assert_ne!(record.proven_witness_fingerprint, established.proven);
+        assert_eq!(
+            record.failed_reconstruction_count,
+            before.failed_reconstruction_count
+        );
+        assert_eq!(
+            record.retry_after_unix_seconds,
+            before.retry_after_unix_seconds
+        );
+        assert_eq!(
+            record.member_source_file_fingerprints,
+            before.member_source_file_fingerprints
+        );
+        assert!(
+            record.correction.is_none(),
+            "held bodies earn no correction grant"
+        );
+        assert_eq!(
+            page.index.snapshot_unproven_terminal_count(),
+            page.before.snapshot_unproven_terminal_count()
+        );
+        let reloaded = ScanIndex::load(&fixture.index_path).unwrap();
+        assert_eq!(reloaded.generation, page.index.generation);
+        fixture.assert_durable(&page, 10);
+        return;
+    }
+    panic!("PRECONDITION_NOT_REACHED: withheld raw-complete native terminal with RetryPending");
+}
+
+/// CONTROLLED: after a natural authority record forms, its persisted binding
+/// is broken by hand. Load drops only that record, re-arms only its family's
+/// members, and real pages re-read those unchanged members: the record
+/// re-forms bound to the current witness, or with no witness left the family
+/// stays unproven residue with no record. Nothing is stranded.
+#[test]
+#[serial(source_manifests)]
+fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("authority-unbound-rearm", false);
+    fixture.establish();
+    let family = apc_family_sessions();
+    fixture.append_family_request(Some(APC_AGENTS[0]), "req_unbound", 4);
+    let formed = (0..2 * APC_MAX_PAGES).any(|number| {
+        let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
+        fixture.assert_durable(&page, 10);
+        page.record().is_some()
+    });
+    assert!(
+        formed,
+        "PRECONDITION_NOT_REACHED: a natural authority record"
+    );
+
+    let checkpoint = ScanIndex::load(&fixture.index_path).expect("load bound index");
+    let record = checkpoint
+        .claude_authority_record_for_test(APC_ROOT)
+        .expect("natural authority record persists");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
+            .expect("decode saved index");
+    // A held family can already be re-armed. Seed nonempty revisions (the
+    // record's where retained, otherwise a controlled synthetic one) so this
+    // drop must clear every member before real pages prove they are re-read.
+    for (member, key) in ApcFixture::family_keys(&checkpoint) {
+        let revision = record
+            .member_source_file_fingerprints
+            .get(&member)
+            .cloned()
+            .unwrap_or_else(|| "5".repeat(64));
+        value["files"][&key]["source_file_fingerprint"] = serde_json::json!(revision);
+    }
+    value["claude_usage_authority_quarantine"][APC_ROOT]["proven_witness_fingerprint"] =
+        serde_json::json!("9".repeat(64));
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
+        .expect("write unbound index");
+
+    let (drops, rearmed) = crate::snapshots::claude_authority_drops_for_test();
+    let mut reread = BTreeSet::new();
+    let mut held = BTreeSet::new();
+    for number in 0..2 * APC_MAX_PAGES {
+        let page = fixture.page(&format!("2026-08-02T12:{number:02}:00Z"), ApcUpload::Accept);
+        fixture.assert_durable(&page, 12);
+        if number == 0 {
+            assert!(page.record_before().is_none(), "load drops the record");
+            let keys = ApcFixture::family_keys(&page.before);
+            assert_eq!(keys.len(), family.len());
+            assert!(
+                keys.values()
+                    .all(|key| page.before.files[key].source_file_fingerprint.is_empty()),
+                "every family member is re-armed"
+            );
+            let (now_drops, now_rearmed) = crate::snapshots::claude_authority_drops_for_test();
+            assert_eq!(now_drops, drops + 1, "one load drop and no save drop");
+            assert_eq!(now_rearmed - rearmed, family.len());
+        }
+        reread.extend(page.parsed.intersection(&family).cloned());
+        held.extend(page.held_sessions.intersection(&family).cloned());
+        if reread != family {
+            continue;
+        }
+        let witness = page
+            .index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT);
+        let outcome = match (witness, page.record()) {
+            (Some(witness), Some(record)) => {
+                assert!(record.bound_to_retained_witness);
+                assert_eq!(
+                    record.proven_witness_fingerprint, witness,
+                    "the record re-forms bound to the current witness"
+                );
+                "reformed_bound"
+            }
+            (None, record) => {
+                assert!(record.is_none(), "no witness forms no record");
+                "unproven_residue"
+            }
+            (Some(_), None) => {
+                assert!(held.is_empty(), "a family held again keeps a bound record");
+                "proven_without_hold"
+            }
+        };
+        let line = serde_json::json!({
+            "receipt": "claude_authority_unbound_drop_rearm:v1",
+            "outcome": outcome,
+            "reread_page_count": number + 1,
+            "family_member_count": family.len(),
+            "held_member_count": held.len(),
+        });
+        std::io::stderr()
+            .write_all(format!("{line}\n").as_bytes())
+            .expect("write drop receipt");
+        return;
+    }
+    panic!("the re-armed family is re-read within two bounded generations");
 }

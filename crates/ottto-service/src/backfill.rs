@@ -26,6 +26,57 @@ use crate::snapshots::{
 
 const BACKFILL_STATE_FILENAME: &str = "snapshot_backfill_state.json";
 
+/// Explicit protected-list intent, kept outside the rebuildable scan index.
+/// Malformed values and an unreadable backfill file are never positive absence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClaudeHistoryListIntent {
+    #[default]
+    Absent,
+    Set,
+    Unreadable,
+}
+
+impl ClaudeHistoryListIntent {
+    fn is_absent(&self) -> bool {
+        *self == Self::Absent
+    }
+}
+
+impl Serialize for ClaudeHistoryListIntent {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Absent => serializer.serialize_bool(false),
+            Self::Set => serializer.serialize_bool(true),
+            // Preserve unknown intent through load-modify-save and census clearing.
+            Self::Unreadable => serializer.serialize_str("unreadable"),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for ClaudeHistoryListIntent {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        Ok(match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Bool(true) => Self::Set,
+            serde_json::Value::Bool(false) => Self::Absent,
+            _ => Self::Unreadable,
+        })
+    }
+}
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeHistoryListIntent {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 /// Persisted bookkeeping: which parser versions have been retroactively
 /// reconciled. The daemon stores one entry per source slug.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -63,6 +114,30 @@ pub struct BackfillState {
     /// re-claims without meaning "resurrect pre-cutoff history").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backfill_cutoff_user_id: Option<String>,
+    /// The destination of the claim that set the cutoff, recorded before
+    /// installing its credentials. Legacy unbound cutoffs fail closed.
+    /// Claude history recorded for another destination is left to the cutoff (not the
+    /// history gate) only on this destination, so a later same-user re-claim
+    /// that keeps the cutoff on a new destination is gated (SOURCE h695 N1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backfill_cutoff_destination_namespace: Option<String>,
+    /// Set when this state stands in for a present but unreadable state file
+    /// (SOURCE F1a, StateMissing H1). Its history is unknown, so it counts as
+    /// prior history and arms no bootstrap or replay. Any writer that loads,
+    /// changes and saves keeps it, so the signal is never replaced by a plain
+    /// default.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub prior_history_unverified: bool,
+    /// The last claim completion returned an explicit `full` policy. Claude
+    /// history recorded only for another destination (a re-pair or account
+    /// move) is paced through the history gate only then; any other or
+    /// unknown policy holds it (SOURCE ruling, cross-org `full` move).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub claim_backfill_policy_full: bool,
+    /// Set only by a well-formed protected-list read, including an empty list.
+    /// Never automatically cleared by a claim, index rebuild or census.
+    #[serde(default, skip_serializing_if = "ClaudeHistoryListIntent::is_absent")]
+    pub(crate) claude_history_list_intent: ClaudeHistoryListIntent,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,28 +162,108 @@ pub fn backfill_state_path(state_dir: &Path) -> PathBuf {
     state_dir.join(BACKFILL_STATE_FILENAME)
 }
 
+/// A missing file is a positively empty state. A file that exists but cannot
+/// be opened or decoded fails closed: the default state marked
+/// `prior_history_unverified`.
 pub fn load_backfill_state(state_dir: &Path) -> BackfillState {
     let path = backfill_state_path(state_dir);
-    let Ok(file) = File::open(&path) else {
-        return BackfillState::default();
+    let unverified = || BackfillState {
+        prior_history_unverified: true,
+        claude_history_list_intent: ClaudeHistoryListIntent::Unreadable,
+        ..BackfillState::default()
     };
-    serde_json::from_reader(BufReader::new(file)).unwrap_or_default()
+    match File::open(&path) {
+        Ok(file) => serde_json::from_reader(BufReader::new(file)).unwrap_or_else(|_| unverified()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => BackfillState::default(),
+        Err(_) => unverified(),
+    }
 }
 
+// Serializes the monotone intent merge with publication. A writer holding a
+// pre-list-read state cannot erase intent recorded by another local writer.
+static BACKFILL_SAVE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()> {
+    let _save = BACKFILL_SAVE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("backfill save lock poisoned"))?;
+    save_backfill_state_locked(state_dir, state)
+}
+
+/// Caller holds BACKFILL_SAVE_LOCK across its entire read-modify-write.
+fn save_backfill_state_locked(state_dir: &Path, state: &BackfillState) -> Result<()> {
+    let mut state = state.clone();
+    let previous_intent = load_backfill_state(state_dir).claude_history_list_intent;
+    state.claude_history_list_intent = match (previous_intent, state.claude_history_list_intent) {
+        (ClaudeHistoryListIntent::Set, _) | (_, ClaudeHistoryListIntent::Set) => {
+            ClaudeHistoryListIntent::Set
+        }
+        (ClaudeHistoryListIntent::Unreadable, _) | (_, ClaudeHistoryListIntent::Unreadable) => {
+            ClaudeHistoryListIntent::Unreadable
+        }
+        _ => ClaudeHistoryListIntent::Absent,
+    };
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("create backfill state dir {}", state_dir.display()))?;
     let path = backfill_state_path(state_dir);
-    let payload = serde_json::to_vec_pretty(state).context("serialize backfill state to JSON")?;
+    let payload = serde_json::to_vec_pretty(&state).context("serialize backfill state to JSON")?;
     let temp_path = path.with_extension("json.tmp");
     let mut temp = File::create(&temp_path)
         .with_context(|| format!("create backfill temp {}", temp_path.display()))?;
     temp.write_all(&payload)
         .with_context(|| format!("write backfill temp {}", temp_path.display()))?;
-    temp.sync_all().ok();
+    temp.sync_all().context("sync backfill state")?;
     std::fs::rename(&temp_path, &path)
         .with_context(|| format!("rename backfill state into place {}", path.display()))?;
+    File::open(state_dir)
+        .and_then(|directory| directory.sync_all())
+        .context("sync backfill state directory")?;
     Ok(())
+}
+
+/// Update the latest durable state while excluding saves, other updates and
+/// installation reset. An unchanged on-disk state needs no write or fsync.
+pub(crate) fn update_backfill_state(
+    state_dir: &Path,
+    update: impl FnOnce(&mut BackfillState),
+) -> Result<()> {
+    let _save = BACKFILL_SAVE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("backfill save lock poisoned"))?;
+    let mut state = load_backfill_state(state_dir);
+    let before = state.clone();
+    update(&mut state);
+    if state == before {
+        return Ok(());
+    }
+    save_backfill_state_locked(state_dir, &state)
+}
+
+/// A good list read is the only automatic transition to Set. A Set value
+/// loaded from disk under the lock succeeds without rewriting the file.
+pub(crate) fn record_claude_history_list_intent(state_dir: &Path) -> Result<()> {
+    update_backfill_state(state_dir, |state| {
+        state.claude_history_list_intent = ClaudeHistoryListIntent::Set;
+    })
+}
+
+/// Deliberate installation reset shares the save lock: a transaction already
+/// holding it finishes before deletion; later updates reload the empty state.
+pub(crate) fn remove_backfill_state(state_dir: &Path) -> Result<()> {
+    let _save = BACKFILL_SAVE_LOCK
+        .lock()
+        .map_err(|_| anyhow::anyhow!("backfill save lock poisoned"))?;
+    let path = backfill_state_path(state_dir);
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if metadata.is_dir() => std::fs::remove_dir_all(&path),
+        Ok(_) => std::fs::remove_file(&path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => Err(error),
+    }
+    .context("remove backfill state during installation reset")?;
+    File::open(state_dir)
+        .and_then(|directory| directory.sync_all())
+        .context("sync removed backfill state directory")
 }
 
 /// Apply the server-issued backfill policy from a claim/switch completion.
@@ -122,46 +277,75 @@ pub fn save_backfill_state(state_dir: &Path, state: &BackfillState) -> Result<()
 ///   `full` on same-user re-claims precisely because the daemon must not
 ///   resurrect pre-cutoff history it skipped earlier.
 ///
+/// Every claim also records whether its policy was an explicit `full`
+/// (`claim_backfill_policy_full`).
+///
 /// Idempotent: re-applying the same completion (daemon restart, retried
 /// confirm) converges on the same persisted state.
+#[cfg(test)]
 pub fn apply_claim_backfill_policy(
     state_dir: &Path,
     policy: Option<&str>,
     cutoff_at: Option<&str>,
     user_id: &str,
 ) -> Result<()> {
-    let mut state = load_backfill_state(state_dir);
-    let parsed_cutoff = cutoff_at.and_then(parse_rfc3339);
-    let new_cutoff = match (policy, parsed_cutoff) {
-        (Some("from"), Some(_)) => cutoff_at.map(str::to_string),
-        (Some("from"), None) => {
-            eprintln!(
+    apply_claim_backfill_policy_for_destination(state_dir, policy, cutoff_at, user_id, None)
+}
+
+/// Persist the cutoff's claim destination before its credentials become active.
+/// Missing legacy destination evidence never grants an ungated exception.
+pub fn apply_claim_backfill_policy_for_destination(
+    state_dir: &Path,
+    policy: Option<&str>,
+    cutoff_at: Option<&str>,
+    user_id: &str,
+    destination_namespace: Option<&str>,
+) -> Result<()> {
+    update_backfill_state(state_dir, |state| {
+        state.claim_backfill_policy_full = policy == Some("full");
+        let parsed_cutoff = cutoff_at.and_then(parse_rfc3339);
+        let new_cutoff = match (policy, parsed_cutoff) {
+            (Some("from"), Some(_)) => cutoff_at.map(str::to_string),
+            (Some("from"), None) => {
+                eprintln!(
                 "ottto-service: claim completion returned backfill_policy=from without a usable cutoff timestamp; falling back to full backfill"
             );
-            None
+                None
+            }
+            _ => None,
+        };
+        if let Some(cutoff) = new_cutoff {
+            // A new cutoff belongs to this claim's destination. Re-applying
+            // that completion converges; a later same-user full claim cannot
+            // bind an old cutoff to its new destination.
+            if state.backfill_cutoff_at.as_deref() != Some(cutoff.as_str())
+                || state.backfill_cutoff_user_id.as_deref() != Some(user_id)
+                || state.backfill_cutoff_destination_namespace.is_none()
+            {
+                state.backfill_cutoff_destination_namespace =
+                    destination_namespace.map(str::to_string);
+            }
+            state.backfill_cutoff_at = Some(cutoff);
+            state.backfill_cutoff_user_id = Some(user_id.to_string());
+        } else if state.backfill_cutoff_user_id.as_deref() != Some(user_id) {
+            // Full-backfill policy: keep a same-user cutoff, clear a
+            // different-user one.
+            state.backfill_cutoff_at = None;
+            state.backfill_cutoff_user_id = None;
+            state.backfill_cutoff_destination_namespace = None;
         }
-        _ => None,
-    };
-    if let Some(cutoff) = new_cutoff {
-        if state.backfill_cutoff_at.as_deref() == Some(cutoff.as_str())
-            && state.backfill_cutoff_user_id.as_deref() == Some(user_id)
-        {
-            return Ok(());
-        }
-        state.backfill_cutoff_at = Some(cutoff);
-        state.backfill_cutoff_user_id = Some(user_id.to_string());
-        return save_backfill_state(state_dir, &state);
-    }
-    // Full-backfill policy: keep a same-user cutoff, clear a different-user one.
-    if state.backfill_cutoff_at.is_none() && state.backfill_cutoff_user_id.is_none() {
-        return Ok(());
-    }
-    if state.backfill_cutoff_user_id.as_deref() == Some(user_id) {
-        return Ok(());
-    }
-    state.backfill_cutoff_at = None;
-    state.backfill_cutoff_user_id = None;
-    save_backfill_state(state_dir, &state)
+    })
+}
+
+/// StateMissing N2: a Claude census completed under the history gate clears
+/// the unverified marker. The gate's cutoff then keeps the rebuilt history
+/// gated, so the marker no longer has to suppress Claude's bootstrap and
+/// replay. Reloads first, as the completion writer does, so a concurrent
+/// claim is not clobbered.
+pub fn clear_prior_history_unverified(state_dir: &Path) -> Result<()> {
+    update_backfill_state(state_dir, |state| {
+        state.prior_history_unverified = false;
+    })
 }
 
 fn parse_rfc3339(value: &str) -> Option<time::OffsetDateTime> {
@@ -280,12 +464,17 @@ pub fn pending_backfill_sources_for_destination(
     state: &BackfillState,
     destination_namespace_hash: &str,
 ) -> Vec<SnapshotSource> {
+    // An unreadable state arms no Claude bootstrap or replay (StateMissing
+    // H1): its Claude history is unknown, and a replay would drop the index's
+    // entries before the history gate's cutoff exists. Codex and Pi are not
+    // gated by it (N2).
     [
         SnapshotSource::ClaudeCode,
         SnapshotSource::Codex,
         SnapshotSource::Pi,
     ]
     .into_iter()
+    .filter(|source| !(state.prior_history_unverified && *source == SnapshotSource::ClaudeCode))
     .filter(|source| {
         source_needs_backfill(state, *source, current_historical_replay(*source))
             || state
@@ -418,7 +607,7 @@ pub fn spawn_backfill_thread(
     artifacts_enabled: bool,
 ) -> std::thread::JoinHandle<Result<BackfillReport>> {
     std::thread::spawn(move || {
-        let mut state = load_backfill_state(&state_dir);
+        let state = load_backfill_state(&state_dir);
         let pending = pending_backfill_sources(&state);
         if pending.is_empty() {
             return Ok(state.last_report.clone().unwrap_or_default());
@@ -427,12 +616,13 @@ pub fn spawn_backfill_thread(
             run_backfill(&home_dir, &pending, &collected_at, artifacts_enabled, None)?;
         apply_backfill_cutoff(&mut snapshots, &state);
         deliver(snapshots).context("deliver backfill snapshots to sync pipeline")?;
-        for source in &pending {
-            mark_backfill_complete(&mut state, *source);
-        }
-        state.last_completed_at = Some(report.completed_at.clone());
-        state.last_report = Some(report.clone());
-        save_backfill_state(&state_dir, &state)?;
+        update_backfill_state(&state_dir, |state| {
+            for source in &pending {
+                mark_backfill_complete(state, *source);
+            }
+            state.last_completed_at = Some(report.completed_at.clone());
+            state.last_report = Some(report.clone());
+        })?;
         sink.notify_completed(&report);
         Ok(report)
     })
@@ -510,6 +700,9 @@ mod tests {
             first_turn_context_tokens: None,
             compaction_count: None,
             compaction_timestamps: Vec::new(),
+            compaction_events: Vec::new(),
+            first_own_request_at: None,
+            local_context_points: Vec::new(),
             compaction_total_pre_tokens: None,
             compaction_total_post_tokens: None,
             compaction_total_cumulative_dropped_tokens: None,
@@ -519,6 +712,8 @@ mod tests {
             claude_context_curve_identity_complete: false,
             claude_context_curve_request_index_complete: false,
             claude_context_curve_owned_start_proven: false,
+            claude_file_birth: Default::default(),
+            claude_file_birth_verdict: None,
             activity_summary: None,
             tool_usage: None,
             tool_usage_truncated: false,
@@ -706,6 +901,330 @@ mod tests {
         let state = BackfillState::default();
         let pending = pending_backfill_sources(&state);
         assert_eq!(pending.len(), 3);
+    }
+
+    /// SOURCE F1a, StateMissing H1: only a missing file is a fresh state. An
+    /// unreadable one arms nothing and keeps its marker through a writer
+    /// that loads, changes and saves.
+    #[test]
+    fn unreadable_state_fails_closed_and_keeps_its_marker() {
+        let dir = temp_dir("unreadable-state");
+        let missing = load_backfill_state(&dir);
+        assert_eq!(missing, BackfillState::default());
+        assert_eq!(
+            pending_backfill_sources_for_destination(&missing, "destination-a").len(),
+            3
+        );
+
+        fs::write(
+            backfill_state_path(&dir),
+            b"{\"completed_destination_namespaces\":",
+        )
+        .expect("write a truncated state");
+        let unreadable = load_backfill_state(&dir);
+        assert!(unreadable.prior_history_unverified);
+        let codex_and_pi = vec![SnapshotSource::Codex, SnapshotSource::Pi];
+        assert_eq!(
+            pending_backfill_sources_for_destination(&unreadable, "destination-a"),
+            codex_and_pi,
+            "only Claude is suppressed (N2)"
+        );
+
+        apply_claim_backfill_policy(&dir, Some("from"), Some("2026-07-06T10:00:00Z"), "user_a")
+            .expect("a claim rewrites the state");
+        let rewritten = load_backfill_state(&dir);
+        assert!(rewritten.prior_history_unverified, "the marker survives");
+        assert_eq!(
+            rewritten.backfill_cutoff_at.as_deref(),
+            Some("2026-07-06T10:00:00Z")
+        );
+        assert_eq!(
+            pending_backfill_sources_for_destination(&rewritten, "destination-a"),
+            codex_and_pi
+        );
+
+        // N2: the marker clears, and keeps the rest of the state.
+        clear_prior_history_unverified(&dir).expect("clear the marker");
+        let cleared = load_backfill_state(&dir);
+        assert!(!cleared.prior_history_unverified);
+        assert_eq!(
+            cleared.backfill_cutoff_at.as_deref(),
+            Some("2026-07-06T10:00:00Z")
+        );
+        assert!(
+            pending_backfill_sources_for_destination(&cleared, "destination-a")
+                .contains(&SnapshotSource::ClaudeCode)
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Deterministic stale-writer order: writer A observed the old state,
+    /// then claim B commits before A's update transaction. A must reload B's
+    /// cutoff under the lock, rather than saving its earlier whole-state copy.
+    #[test]
+    fn locked_update_preserves_claim_written_after_an_earlier_load() {
+        let dir = temp_dir("backfill-claim-interleaving");
+        let stale = load_backfill_state(&dir);
+        let cutoff = "2026-07-06T10:00:00Z";
+        apply_claim_backfill_policy_for_destination(
+            &dir,
+            Some("from"),
+            Some(cutoff),
+            "user-b",
+            Some("destination-b"),
+        )
+        .unwrap();
+        assert_eq!(stale.backfill_cutoff_at, None);
+        update_backfill_state(&dir, |state| {
+            assert!(
+                BACKFILL_SAVE_LOCK.try_lock().is_err(),
+                "load and closure share the save lock"
+            );
+            assert_eq!(state.backfill_cutoff_at.as_deref(), Some(cutoff));
+            state.last_completed_at = Some("2026-07-06T11:00:00Z".into());
+        })
+        .unwrap();
+        record_claude_history_list_intent(&dir).unwrap();
+        clear_prior_history_unverified(&dir).unwrap();
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at.as_deref(), Some(cutoff));
+        assert_eq!(state.backfill_cutoff_user_id.as_deref(), Some("user-b"));
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("destination-b")
+        );
+        assert!(!state.claim_backfill_policy_full);
+        assert_eq!(
+            state.claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        assert_eq!(
+            state.last_completed_at.as_deref(),
+            Some("2026-07-06T11:00:00Z")
+        );
+        apply_claim_backfill_policy_for_destination(
+            &dir,
+            Some("full"),
+            None,
+            "user-b",
+            Some("destination-c"),
+        )
+        .unwrap();
+        record_claude_history_list_intent(&dir).unwrap();
+        let full = load_backfill_state(&dir);
+        assert!(full.claim_backfill_policy_full);
+        assert_eq!(full.backfill_cutoff_at, state.backfill_cutoff_at);
+        assert_eq!(
+            full.backfill_cutoff_destination_namespace,
+            state.backfill_cutoff_destination_namespace
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn already_set_list_intent_keeps_file_content_and_mtime_without_writing() {
+        let dir = temp_dir("backfill-intent-no-write");
+        record_claude_history_list_intent(&dir).unwrap();
+        let path = backfill_state_path(&dir);
+        let before = fs::metadata(&path).unwrap();
+        let content = fs::read(&path).unwrap();
+        // A no-op must not even open/truncate/rename the save temp file.
+        let temp = path.with_extension("json.tmp");
+        fs::write(&temp, b"untouched temp sentinel").unwrap();
+        record_claude_history_list_intent(&dir).unwrap();
+        let after = fs::metadata(&path).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), content);
+        assert_eq!(after.modified().unwrap(), before.modified().unwrap());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(after.ino(), before.ino(), "no atomic replacement");
+        }
+        assert_eq!(fs::read(&temp).unwrap(), b"untouched temp sentinel");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn installation_reset_waits_for_an_inflight_update_then_removes_old_state() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let dir = temp_dir("backfill-reset-lock");
+        let (loaded_tx, loaded_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let writer_dir = dir.clone();
+        let writer = std::thread::spawn(move || {
+            update_backfill_state(&writer_dir, |state| {
+                state.backfill_cutoff_at = Some("2026-07-06T10:00:00Z".into());
+                state.backfill_cutoff_user_id = Some("old-user".into());
+                state.claim_backfill_policy_full = true;
+                loaded_tx.send(()).unwrap();
+                release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            })
+            .unwrap();
+        });
+        loaded_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (removed_tx, removed_rx) = mpsc::channel();
+        let reset_dir = dir.clone();
+        let reset = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            remove_backfill_state(&reset_dir).unwrap();
+            removed_tx.send(()).unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let while_writer_locked = removed_rx.recv_timeout(Duration::from_millis(100));
+        // Release before asserting so a failed exclusion assertion cannot
+        // strand either worker or poison the process-global save lock.
+        release_tx.send(()).unwrap();
+        writer.join().unwrap();
+        reset.join().unwrap();
+        assert!(
+            matches!(while_writer_locked, Err(mpsc::RecvTimeoutError::Timeout)),
+            "reset cannot finish while a save transaction is in flight"
+        );
+        assert!(
+            !backfill_state_path(&dir).exists(),
+            "old save finished before deletion"
+        );
+        record_claude_history_list_intent(&dir).unwrap();
+        let new_state = load_backfill_state(&dir);
+        assert_eq!(new_state.backfill_cutoff_at, None);
+        assert_eq!(new_state.backfill_cutoff_user_id, None);
+        assert!(!new_state.claim_backfill_policy_full);
+        remove_backfill_state(&dir).unwrap();
+        remove_backfill_state(&dir).unwrap();
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn durable_list_intent_is_tristate_and_survives_stale_writers_and_claims() {
+        let dir = temp_dir("list-intent-tristate");
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Absent
+        );
+        let stale = load_backfill_state(&dir);
+        record_claude_history_list_intent(&dir).unwrap();
+        save_backfill_state(&dir, &stale).unwrap();
+        apply_claim_backfill_policy(&dir, Some("full"), None, "new-user").unwrap();
+        clear_prior_history_unverified(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        for malformed in [
+            serde_json::json!(null),
+            serde_json::json!(1),
+            serde_json::json!("yes"),
+            serde_json::json!({"x":true}),
+        ] {
+            let state: BackfillState = serde_json::from_value(
+                serde_json::json!({"claude_history_list_intent": malformed}),
+            )
+            .unwrap();
+            assert_eq!(
+                state.claude_history_list_intent,
+                ClaudeHistoryListIntent::Unreadable
+            );
+            let roundtrip: BackfillState =
+                serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+            assert_eq!(
+                roundtrip.claude_history_list_intent,
+                ClaudeHistoryListIntent::Unreadable
+            );
+        }
+        std::fs::write(backfill_state_path(&dir), b"{").unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable
+        );
+        clear_prior_history_unverified(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Unreadable,
+            "N2 clearing cannot turn unreadable intent into Absent"
+        );
+        record_claude_history_list_intent(&dir).unwrap();
+        assert_eq!(
+            load_backfill_state(&dir).claude_history_list_intent,
+            ClaudeHistoryListIntent::Set
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// SOURCE ruling (cross-org move): each claim records whether its policy
+    /// was an explicit `full`; any other or unknown policy clears it.
+    #[test]
+    fn each_claim_records_whether_its_policy_was_full() {
+        let dir = temp_dir("claim-policy-full");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_b").expect("full claim");
+        assert!(load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, None, None, "user_b").expect("old backend");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("full"), None, "user_c").expect("full again");
+        apply_claim_backfill_policy(&dir, Some("from"), None, "user_c")
+            .expect("from without a cutoff");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        apply_claim_backfill_policy(&dir, Some("future"), None, "user_c").expect("unknown");
+        assert!(!load_backfill_state(&dir).claim_backfill_policy_full);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// SOURCE h695 N1: bind at claim persistence, before any bootstrap.
+    /// A same-user full re-claim keeps that binding even if it interrupts
+    /// the first claim's bootstrap. Legacy unbound cutoffs stay unbound.
+    #[test]
+    fn the_cutoff_binds_its_claim_destination_before_bootstrap() {
+        let dir = temp_dir("cutoff-destination");
+        let cutoff = "2026-07-06T10:00:00Z";
+        let claim = |policy, cutoff, user, destination| {
+            apply_claim_backfill_policy_for_destination(&dir, policy, cutoff, user, destination)
+                .expect("persist claim")
+        };
+        claim(Some("from"), Some(cutoff), "user_b", Some("dest-b"));
+        let first = load_backfill_state(&dir);
+        assert_eq!(
+            first.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        claim(Some("from"), Some(cutoff), "user_b", Some("dest-b"));
+        assert_eq!(load_backfill_state(&dir), first, "idempotent completion");
+        claim(Some("full"), None, "user_b", Some("dest-c"));
+        let mut state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at.as_deref(), Some(cutoff));
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        mark_backfill_complete_for_destination(&mut state, SnapshotSource::ClaudeCode, "dest-c");
+        assert_eq!(
+            state.backfill_cutoff_destination_namespace.as_deref(),
+            Some("dest-b")
+        );
+        claim(
+            Some("from"),
+            Some("2026-07-07T10:00:00Z"),
+            "user_c",
+            Some("dest-d"),
+        );
+        assert_eq!(
+            load_backfill_state(&dir)
+                .backfill_cutoff_destination_namespace
+                .as_deref(),
+            Some("dest-d")
+        );
+        claim(Some("full"), None, "user_d", Some("dest-e"));
+        let state = load_backfill_state(&dir);
+        assert_eq!(state.backfill_cutoff_at, None);
+        assert_eq!(state.backfill_cutoff_destination_namespace, None);
+        claim(Some("from"), Some(cutoff), "user_b", None);
+        claim(Some("full"), None, "user_b", Some("dest-f"));
+        assert_eq!(
+            load_backfill_state(&dir).backfill_cutoff_destination_namespace,
+            None
+        );
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -984,6 +1503,6 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id);
+crate::heap_layout_bound::fields!(BackfillState; completed_parser_versions, completed_replay_revisions, completed_destination_namespaces, last_completed_at, last_report, backfill_cutoff_at, backfill_cutoff_user_id, backfill_cutoff_destination_namespace, prior_history_unverified, claim_backfill_policy_full, claude_history_list_intent);
 
 crate::heap_layout_bound::fields!(BackfillReport; claude_code_session_count, codex_session_count, pi_session_count, claude_code_snapshot_count, codex_snapshot_count, pi_snapshot_count, completed_at);

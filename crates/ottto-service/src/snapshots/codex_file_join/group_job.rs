@@ -641,6 +641,8 @@ impl GroupBoot {
             cursor: None,
             charged_bytes: 0,
             hold_offset: None,
+            // U1a-2a: a group job is never a side read.
+            side_origin: None,
             admission,
             group: Some(Box::new(GroupJob {
                 key,

@@ -166,7 +166,11 @@ source by default; `--allow-rewrites` is reserved for legacy/test fixtures. The 
 every staged non-manifest file with SHA-256, size, mode, and executable-bit
 metadata plus a deterministic `content_sha256`; run
 `scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto`
-to verify that inventory before bootstrap. The generated tree must also pass
+to verify that inventory before bootstrap. This repository does not commit
+`PUBLIC_EXPORT_MANIFEST.json`: `scripts/public_repo_manifest.sh --digest` (or
+`--facts`) derives the same digest and counts from a commit's git tree, and the
+public-surface gate requires the self-exported bundle's manifest to equal the
+one derived from `HEAD`. The generated tree must also pass
 `scripts/public_repo_skeleton_check.sh`, which verifies the public repo shape
 for runtime crates, connectors, docs, release tooling, policies, CI, and agent
 adapters before bootstrap, and
@@ -182,7 +186,9 @@ consumers only validate against the pinned public manifest digest. Once the
 public repo is the runtime authority, run the same contract gate with
 `--require-public-authority`; it requires the private pin to name a
 `public_repo_commit` and verifies that the checked public root is a clean git
-checkout at that commit. Before any public commit or runtime move, run
+checkout at that commit. Without `--staged-output`, the gate derives the public
+manifest digest and counts from the checked root's `HEAD`. Before any public
+commit or runtime move, run
 `scripts/public_repo_secret_scan.sh --staged-output dist/public-export/ottto`
 to scan current export candidates, candidate path history, and the generated
 bundle for private paths and secret-like content.
@@ -419,7 +425,12 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   (or an older server that omits it) means the registration may still be
   active until its account disconnects the Mac on the Apps page (Disconnect). An
   account switch sends the same release for the previous device unless the new
-  binding reuses that device id. `local_only=true` is reserved for emergency local
+  binding reuses that device id. When Ottto has already ended this Mac's setup
+  run, an expired connection no longer blocks the release: the daemon presents
+  the same id and secret to `POST /api/v1/telemetry/devices/{device_id}/release`
+  and, once Ottto confirms, finishes the logout like a cloud logout
+  (`cloud_disconnected: false`, `device_released: true`).
+  `local_only=true` is reserved for emergency local
   cleanup when the backend cannot be reached or the website state is stale.
   Neither mode clears account/device identity while Cloud sessions still needs
   an exact backend DELETE confirmation; revoke it in the Ottto app, wait for

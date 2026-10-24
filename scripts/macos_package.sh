@@ -232,14 +232,27 @@ if [[ -z "$MIN_PROTOCOL_VERSION" ]]; then
 fi
 
 if [[ "$SKIP_BUILD" != "true" ]]; then
+  # Compilers record source paths (panic locations, debug maps). Map the build
+  # Mac's folders to neutral prefixes so shipped binaries do not carry them.
+  # rustc applies the last matching --remap-path-prefix, so the most specific
+  # folder comes last. --config arrays join any build.rustflags already set.
+  RUST_REMAP_FLAGS=()
+  for remap in "${HOME:-}=~" "${CARGO_HOME:-${HOME:-}/.cargo}=/cargo" "$ROOT=."; do
+    if [[ "$remap" == /* && "$remap" != *"'"* ]]; then
+      RUST_REMAP_FLAGS+=("'--remap-path-prefix=$remap'")
+    fi
+  done
+  RUST_REMAP_CONFIG="build.rustflags=[$(IFS=,; echo "${RUST_REMAP_FLAGS[*]}")]"
   (
     cd "$ROOT"
     OTTTO_RELEASE_VERSION="$VERSION" \
       OTTTO_RELEASE_CHANNEL="$CHANNEL" \
       GIT_COMMIT="$COMMIT" \
-      cargo build --release -p ottto-cli -p ottto-service
+      cargo build --release --config "$RUST_REMAP_CONFIG" -p ottto-cli -p ottto-service
   )
-  swift build -c release --package-path "$MAC_APP_ROOT"
+  swift build -c release --package-path "$MAC_APP_ROOT" \
+    -Xswiftc -file-prefix-map -Xswiftc "$MAC_APP_GIT_ROOT=." \
+    -Xlinker -oso_prefix -Xlinker "$MAC_APP_GIT_ROOT/"
 fi
 
 SWIFT_BUILD_DIR="$MAC_APP_ROOT/.build/release"
@@ -251,6 +264,17 @@ for binary in "$APP_EXECUTABLE" "$CLI_BINARY" "$DAEMON_BINARY"; do
   if [[ ! -x "$binary" ]]; then
     echo "Expected executable is missing: $binary" >&2
     exit 1
+  fi
+done
+
+# Report (never fail on) build-Mac home paths left in the shipped executables.
+# SwiftPM's generated Bundle.module accessor keeps one build-folder string that
+# no compiler flag maps; the app only uses it outside an .app bundle.
+for binary in "$APP_EXECUTABLE" "$CLI_BINARY" "$DAEMON_BINARY"; do
+  [[ -n "${HOME:-}" ]] || break
+  home_paths="$(strings -a "$binary" 2>/dev/null | grep -F "$HOME/" | grep -c -v -F "_OtttoCompanion.bundle" || true)"
+  if [[ "${home_paths:-0}" != "0" ]]; then
+    echo "::warning::$(basename "$binary") still contains $home_paths build-Mac home path string(s)"
   fi
 done
 

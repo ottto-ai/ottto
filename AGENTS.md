@@ -20,13 +20,16 @@
 
 - Use existing Cargo tooling and CI. Establish an affected baseline once, run
   compile/focused tests per code patch, then existing formatting, Clippy, and
-  affected-workspace tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
+  changed-crate tests at integration. See [.github/workflows/ci.yml](.github/workflows/ci.yml)
   for exact commands. Report failures and concrete unverified limits.
 - Add regression tests for changed decisions, not tests that mirror unchanged
   code. Preserve test discovery, fixtures, platform gates, and environment
   isolation when moving tests. Update source-path validators without weakening them.
-- Coordinate heavy builds; use macOS for native behavior. Use synthetic fixtures
-  rather than live credentials or provider accounts.
+- Locally, check and test only the crates you changed (`cargo check|test -p <crate>`).
+  Full-workspace `cargo build`/`cargo test` runs only in GitHub CI: push a PR and
+  read its result. Coordinate heavy local builds.
+- Use macOS for native behavior. Use synthetic fixtures rather than live
+  credentials or provider accounts.
 - No additional skill, dependency, coverage quota, report, or validation gate is
   required merely for refactoring. Use extra tooling only for a concrete need.
 - Before handing off or merging substantive changes, the implementing agent runs
@@ -41,6 +44,7 @@
   references, and operator paths. Follow the contribution/export tooling already
   in this repo.
 - New root export files need `public-export/roots.txt` and `public-export/path-map.tsv`
-  entries. Regenerate `PUBLIC_EXPORT_MANIFEST.json` from the intended clean,
-  Git-tracked export inventory; never include unrelated local files. Run relevant
+  entries. `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
+  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
+  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run relevant
   export/contract checks when their inputs change.

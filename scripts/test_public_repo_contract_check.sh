@@ -5,9 +5,22 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BUNDLE_SCRIPT="$ROOT/scripts/public_repo_export_bundle.sh"
 CONTRACT_SCRIPT="$ROOT/scripts/public_repo_contract_check.sh"
 PRIVATE_ROOT="$(cd "$ROOT/../.." && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$ROOT/scripts/public_repo_temp_cleanup.sh"
 
 tmp_dir="$(mktemp -d)"
-trap 'rm -rf "$tmp_dir"' EXIT
+script_completed=0
+cleanup_tmp_dir() {
+  local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "test_public_repo_contract_check: exited before completion" >&2
+    status=1
+  fi
+  public_repo_remove_temp_dir "test_public_repo_contract_check" "$tmp_dir" || true
+  exit "$status"
+}
+trap cleanup_tmp_dir EXIT
 
 output_dir="$tmp_dir/public-ottto"
 "$BUNDLE_SCRIPT" --output-dir "$output_dir" --force >/tmp/public-contract-bundle.out
@@ -1977,6 +1990,18 @@ cp -R "$output_dir" "$public_git"
 git -C "$public_git" init -q
 git -C "$public_git" config user.email "public-contract@example.invalid"
 git -C "$public_git" config user.name "Public Contract"
+# Disposable fixture: keep commit-triggered background gc/maintenance from
+# writing into .git while the EXIT trap removes it.
+git -C "$public_git" config gc.auto 0
+git -C "$public_git" config gc.autoDetach false
+git -C "$public_git" config maintenance.auto false
+git -C "$public_git" config core.fsmonitor false
+for key_value in "gc.auto=0" "gc.autoDetach=false" "maintenance.auto=false" "core.fsmonitor=false"; do
+  if [[ "$(git -C "$public_git" config --local --get "${key_value%%=*}")" != "${key_value#*=}" ]]; then
+    echo "Expected fixture repo to set ${key_value} locally" >&2
+    exit 1
+  fi
+done
 git -C "$public_git" add .
 git -C "$public_git" commit -qm "public runtime"
 public_commit="$(git -C "$public_git" rev-parse HEAD)"
@@ -2026,6 +2051,75 @@ fi
 grep -q "private runtime pin public_repo_commit.commit must match public root HEAD" \
   /tmp/public-contract-bad-public-authority.out
 
+# Without --staged-output the root is a git checkout and the manifest facts are
+# derived from its HEAD tree. Legacy match: the commit still tracks a manifest
+# that matches its tree.
+PUBLIC_CONTRACT_REPO_ROOT="$public_git" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$public_authority_private" \
+  --require-public-authority \
+  >/tmp/public-contract-git-legacy-match.out
+grep -q "private consumer file(s)" /tmp/public-contract-git-legacy-match.out
+
+# Derived: the public commit no longer tracks PUBLIC_EXPORT_MANIFEST.json, and
+# the pin digest still matches because the manifest never covers itself.
+public_derived="$tmp_dir/public-derived"
+cp -R "$public_git" "$public_derived"
+git -C "$public_derived" rm -q PUBLIC_EXPORT_MANIFEST.json
+git -C "$public_derived" commit -qm "derive public manifest"
+derived_private="$tmp_dir/public-derived-private"
+write_valid_private_consumers "$derived_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_public_commit_pin \
+  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$derived_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$(git -C "$public_derived" rev-parse HEAD)"
+PUBLIC_CONTRACT_REPO_ROOT="$public_derived" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$derived_private" \
+  --require-public-authority \
+  >/tmp/public-contract-git-derived.out
+grep -q "private consumer file(s)" /tmp/public-contract-git-derived.out
+if "$CONTRACT_SCRIPT" \
+  --staged-output "$public_derived" \
+  --private-repo-root "$derived_private" \
+  --require-public-authority \
+  >/tmp/public-contract-staged-without-manifest.out 2>&1; then
+  echo "Expected staged contract check to fail when the bundle carries no manifest" >&2
+  exit 1
+fi
+grep -q "required file is missing: PUBLIC_EXPORT_MANIFEST.json" \
+  /tmp/public-contract-staged-without-manifest.out
+if PUBLIC_CONTRACT_REPO_ROOT="$public_derived" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$derived_private" \
+  --private-runtime-pin "$bad_pin" \
+  >/tmp/public-contract-git-derived-bad-pin.out 2>&1; then
+  echo "Expected derived contract check to fail when the private runtime pin drifts" >&2
+  exit 1
+fi
+grep -q "private runtime pin content_sha256 must match public manifest content_sha256" \
+  /tmp/public-contract-git-derived-bad-pin.out
+
+# Legacy mismatch: the commit tracks a manifest that no longer matches its tree.
+public_stale="$tmp_dir/public-stale"
+cp -R "$public_git" "$public_stale"
+printf '\nEdited after the manifest was written.\n' >> "$public_stale/README.md"
+git -C "$public_stale" commit -qam "edit without regenerating the manifest"
+stale_private="$tmp_dir/public-stale-private"
+write_valid_private_consumers "$stale_private" "$public_git/PUBLIC_EXPORT_MANIFEST.json"
+write_public_commit_pin \
+  "$public_git/PUBLIC_EXPORT_MANIFEST.json" \
+  "$stale_private/backend/app/domain/local_platform/public_runtime_pin.json" \
+  "$(git -C "$public_stale" rev-parse HEAD)"
+if PUBLIC_CONTRACT_REPO_ROOT="$public_stale" "$CONTRACT_SCRIPT" \
+  --private-repo-root "$stale_private" \
+  --require-public-authority \
+  >/tmp/public-contract-git-legacy-mismatch.out 2>&1; then
+  echo "Expected contract check to fail when a tracked manifest does not match its commit tree" >&2
+  exit 1
+fi
+grep -q "public export manifest could not be derived from the public root HEAD" \
+  /tmp/public-contract-git-legacy-mismatch.out
+grep -q "tracked PUBLIC_EXPORT_MANIFEST.json at [0-9a-f]* does not match the commit tree" \
+  /tmp/public-contract-git-legacy-mismatch.out
+
 if "$CONTRACT_SCRIPT" \
   --staged-output "$output_dir" \
   --private-repo-root "$pin_private" \
@@ -2062,3 +2156,4 @@ grep -q "private backend registry loader must read root connectors/registry.gene
 grep -q "private frontend local-control client must send protocol version 15" /tmp/public-contract-broken-private.out
 
 echo "public_repo_contract_check tests passed"
+script_completed=1

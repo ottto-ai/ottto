@@ -124,7 +124,11 @@ policy files, GitHub Actions/Dependabot files, and Codex/Claude Code agent
 adapters, while rejecting private monorepo root paths. The manifest gate verifies that
 `PUBLIC_EXPORT_MANIFEST.json` matches every staged non-manifest file and
 rejects drift, missing files, extra files, symlinks, mode changes, executable
-bit changes, and content hash changes. Run
+bit changes, and content hash changes. The public repository never commits the
+manifest: `scripts/public_repo_manifest.sh` derives it from a commit's git tree
+(mode `0644`, or `0755` for executable blobs; the root manifest is excluded),
+`--compare` requires a bundle manifest to equal that derived manifest, and
+`--guard` fails when a commit still tracks the root manifest. Run
 `scripts/public_repo_contract_check.sh --staged-output ... --private-repo-root ...`
 to verify public CLI, protocol, setup, redaction, release, connector, and
 private consumer contracts. With a private root, the contract check also
@@ -133,7 +137,8 @@ the staged public manifest digest and file counts. After the public repository
 is the runtime authority, add `--require-public-authority`; the private pin must
 then use `authority_state: public_repo_commit`, record the `ottto-ai/ottto`
 commit and `PUBLIC_EXPORT_MANIFEST.json` digest, and the checked public root
-must be a clean git checkout at that commit. Then run
+must be a clean git checkout at that commit; without `--staged-output` the
+digest is derived from that checkout's `HEAD`. Then run
 `scripts/public_repo_secret_scan.sh --staged-output ...` before any public
 commit. That preflight scans current tracked export candidates, historical
 blobs for paths under export roots, and the root-shaped staged bundle for
@@ -189,6 +194,9 @@ evidence report.
   rules only as a regression guard.
 - Verify `PUBLIC_EXPORT_MANIFEST.json` with `public_repo_manifest_check.sh`
   before bootstrap and after applying the bundle to a clean public checkout.
+  Do not commit it to the public repository; derive it with
+  `public_repo_manifest.sh`. The cutover closeout derives it from the target
+  `HEAD` when a committed checkout carries none.
 - Run `public_repo_bootstrap_plan.sh` only against a public checkout whose
   `origin` remote resolves to `ottto-ai/ottto`; bootstrap reports store the
   normalized repository binding instead of the raw remote URL.

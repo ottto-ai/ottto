@@ -5301,6 +5301,7 @@ mod tests {
             browser_auth_supported: Some(true),
             auth_code_entry_supported: Some(true),
             retained_provisional_login_count: None,
+            consent_covers_limit_reads: None,
         };
         let mut existing = ClaudeConfigDirSlot::registered("/tmp/existing".to_string())
             .expect("descriptor")

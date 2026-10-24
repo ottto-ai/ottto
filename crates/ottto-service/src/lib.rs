@@ -20,6 +20,7 @@ mod codex_process_homes;
 mod codex_scan_diagnostics;
 pub mod codex_sign_in;
 pub(crate) mod command_env;
+mod composition_kinds;
 pub mod context_composition;
 mod context_file_counts;
 pub mod context_footprint;
@@ -34,6 +35,8 @@ pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
 mod local_resource_diagnostics;
+#[cfg(unix)]
+mod local_state_sweep;
 pub mod macos_service;
 pub mod mcp_inventory;
 pub(crate) mod net_resilience;
@@ -60,6 +63,9 @@ mod transcript_cache;
 pub mod unix_socket;
 pub mod upload_receipts;
 pub mod xpc_mach;
+
+#[cfg(unix)]
+pub use local_state_sweep::{run_local_state_sweep_command, sweep_local_state_at_startup};
 
 use crate::control::TerminalRefreshRejection;
 use crate::detected_uses::{prune_stale_detected_uses, DETECTED_USE_RETENTION_DAYS};
