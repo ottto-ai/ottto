@@ -1413,6 +1413,10 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
         let elapsed = started.elapsed(); // includes closing, emit and handoff
+        let combined = elapsed + std::time::Duration::from_micros(counts.capture_us);
+        println!("MONEY_P1B_SYNC_CAPTURE capture_us={} shadow_closing_us={} combined_us={} deadline_us=250000 ci_tolerance_us=25000", counts.capture_us, elapsed.as_micros(), combined.as_micros());
+        assert!(combined <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE,
+            "all pages must bound capture plus shadow and closing: {combined:?}: {counts:?}");
         assert!(elapsed <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE, "elapsed={elapsed:?}: {counts:?}");
         money::store::flush();
         (counts, elapsed)
