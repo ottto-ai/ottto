@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 841,
-  "content_sha256": "32746c5ba93a3ada2c3de5fa84de6e668b76566bc72fdf4a29b4b49e2ca369db",
+  "content_sha256": "cdb541bdb2de0c57afbde6b2afa23f788f9baf078d671cf514959e936225cf71",
   "files": [
     {
       "executable": false,
@@ -1812,8 +1812,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money.rs",
-      "sha256": "d25d0719059d0d40ada5972cb5bc21be416f6d1476f440898c5c032a14643b4f",
-      "size_bytes": 212360
+      "sha256": "2527255fbf88c7ebf2e5807644db5e9325405c9f1618dcff7daa63f4cb98ee22",
+      "size_bytes": 212522
     },
     {
       "executable": false,
@@ -5890,7 +5890,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T02:49:29+00:00",
+  "generated_at": "2026-10-24T03:29:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 842,
   "public_roots": [
@@ -5929,5 +5929,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "4117f8a6001fdc8451b767bad0890685d608b052"
+  "source_commit": "d825408402ca7c9f1ff952af8df5abb4aecfe543"
 }
