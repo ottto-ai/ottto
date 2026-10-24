@@ -2319,9 +2319,10 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
 // becomes side-planned, but #660's G4a (a side read is a singleton read)
 // exits before the G7 charge: no side read starts, no side ledger entry,
 // nothing is requeued, and `oversized_file_count` equals the control page's
-// (no request). The side state (requests, records, ledger) comes out exactly
-// as main's twin leaves it: the same request with P under the unpaged limit
-// but over the singleton, main's G4a exit for a side-planned file. Without
+// (no request). The side state (requests, records, ledger) and the emitted
+// snapshots (full `Debug` and serde equality) come out exactly as main's twin
+// leaves them: the same request with P under the unpaged limit but over the
+// singleton, main's G4a exit for a side-planned file. Without
 // the scaled limits the same request starts its side read, so the request
 // itself is due.
 #[test]
@@ -2390,8 +2391,8 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
         .insert(key.clone(), request);
     // (ii) Main's twin: singleton < P's length <= the unpaged limit.
     let twin = with_test_limits(1 << 20, len - 2, 64, || {
-        let (twin, _) = side_page(requested.clone(), &cache);
-        (twin, ledger_entry(cache.as_ref()))
+        let (twin, twin_scan) = side_page(requested.clone(), &cache);
+        (twin, ledger_entry(cache.as_ref()), twin_scan)
     });
     // (i) Production ordering, scaled: singleton < unpaged limit < P's length.
     with_test_unpaged_limit(len - 1, || {
@@ -2416,7 +2417,22 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             assert!(!pending(&after, &path));
             assert_eq!(treated.oversized_file_count, control.oversized_file_count);
             assert_eq!(treated.oversized_file_count, 0);
-            assert!(treated.snapshots.is_empty(), "main's Skip");
+            let lens = format!(
+                "snapshots: treated {}, twin {}, control {}",
+                treated.snapshots.len(),
+                twin.2.snapshots.len(),
+                control.snapshots.len()
+            );
+            assert_eq!(
+                format!("{:?}", treated.snapshots),
+                format!("{:?}", twin.2.snapshots),
+                "snapshots (Debug) as main's twin; {lens}"
+            );
+            assert_eq!(
+                serde_json::to_value(&treated.snapshots).unwrap(),
+                serde_json::to_value(&twin.2.snapshots).unwrap(),
+                "snapshots (serde) as main's twin; {lens}"
+            );
         })
     });
     // Control: the same request at production limits starts its side read.
