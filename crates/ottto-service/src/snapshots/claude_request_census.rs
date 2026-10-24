@@ -3493,15 +3493,13 @@ pub(crate) fn prepare_claude_request_census_terminal(
         *view = None;
         let census = &mut index.claude_request_census;
         let mut vanished = 0_u64;
+        // Main's `retain_keys` walk and dropped count verbatim; never an
+        // extra whole-census pass on the steady OFF terminal.
         census.records.retain(|key, record| {
-            let keep = !is_ledger_key(key)
+            let kept = !is_ledger_key(key)
                 && (index.files.contains_key(key) || observed_index_keys.contains(key));
-            // Charge disappearances inside main's existing retain walk, never
-            // with extra whole-census passes on the steady OFF terminal.
-            if !keep && !record.is_birth_stub() {
-                vanished += 1;
-            }
-            keep
+            vanished += u64::from(!kept && !record.is_birth_stub());
+            kept
         });
         census.hash_total = 0;
         census.serialized_total = 0;
@@ -6763,42 +6761,89 @@ mod phase_b_tests {
         assert_eq!(retained_bytes, 0);
         assert_eq!(metadata_bytes, 0);
         assert_eq!(checkpoint_delta, 0);
+        // Steady arms, interleaved ABAB: `main` runs the frozen main reference
+        // on the OFF arm's own record map (swapped in O(1) outside the clock),
+        // so both walk the same nodes, keys and hash buffers and only the code
+        // differs. `own_map` is the previous method (main on its separately
+        // cloned map), kept as a diagnostic of allocation-layout bias.
+        const STEADY_SAMPLES: usize = 9;
         let mut main_steady = Vec::new();
         let mut off_steady = Vec::new();
-        for sample in 0..5 {
-            let measure_main = |baseline: &mut main_reference::MainAdmission, index: &ScanIndex| {
-                let start = thread_cpu_micros().unwrap();
-                baseline.terminal(index, &BTreeSet::new(), window);
-                thread_cpu_micros().unwrap().saturating_sub(start)
-            };
-            let measure_off = |index: &mut ScanIndex| {
-                let start = thread_cpu_micros().unwrap();
-                let counts = prepare_claude_request_census_terminal(
-                    index,
-                    &BTreeSet::new(),
-                    &BTreeSet::new(),
-                    WINDOW,
-                    &mut None,
-                );
-                assert_eq!(counts.shadow_join_builds, 0);
-                thread_cpu_micros().unwrap().saturating_sub(start)
-            };
+        let mut own_map_steady = Vec::new();
+        let measure_main = |baseline: &mut main_reference::MainAdmission, index: &mut ScanIndex| {
+            baseline.swap_records(&mut index.claude_request_census);
+            let start = thread_cpu_micros().unwrap();
+            let (aged, dropped) = baseline.terminal(index, &BTreeSet::new(), window);
+            let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
+            baseline.swap_records(&mut index.claude_request_census);
+            assert_eq!((aged, dropped), (0, 0));
+            assert_eq!(
+                baseline.hash_total(),
+                index.claude_request_census.active_hash_total
+            );
+            assert_eq!(
+                baseline.serialized_total(),
+                index.claude_request_census.serialized_total
+            );
+            cpu
+        };
+        let measure_off = |index: &mut ScanIndex| {
+            let start = thread_cpu_micros().unwrap();
+            let counts = prepare_claude_request_census_terminal(
+                index,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                WINDOW,
+                &mut None,
+            );
+            let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
+            assert_eq!(counts.shadow_join_builds, 0);
+            cpu
+        };
+        let measure_own_map = |baseline: &mut main_reference::MainAdmission, index: &ScanIndex| {
+            let start = thread_cpu_micros().unwrap();
+            let (aged, dropped) = baseline.terminal(index, &BTreeSet::new(), window);
+            let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
+            assert_eq!((aged, dropped), (0, 0));
+            cpu
+        };
+        for sample in 0..STEADY_SAMPLES {
             if sample % 2 == 0 {
-                main_steady.push(measure_main(&mut steady_baseline, &index));
+                main_steady.push(measure_main(&mut steady_baseline, &mut index));
                 off_steady.push(measure_off(&mut index));
+                own_map_steady.push(measure_own_map(&mut steady_baseline, &index));
             } else {
+                own_map_steady.push(measure_own_map(&mut steady_baseline, &index));
                 off_steady.push(measure_off(&mut index));
-                main_steady.push(measure_main(&mut steady_baseline, &index));
+                main_steady.push(measure_main(&mut steady_baseline, &mut index));
             }
         }
-        main_steady.sort_unstable();
-        off_steady.sort_unstable();
-        let main_steady = main_steady[2];
-        let off_steady = off_steady[2];
+        let render = |samples: &[u64]| {
+            samples
+                .iter()
+                .map(u64::to_string)
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let (main_samples, off_samples, own_map_samples) = (
+            render(&main_steady),
+            render(&off_steady),
+            render(&own_map_steady),
+        );
+        let stats = |samples: &mut Vec<u64>| {
+            samples.sort_unstable();
+            (samples[samples.len() / 2], samples[0])
+        };
+        let (main_steady, main_min) = stats(&mut main_steady);
+        let (off_steady, off_min) = stats(&mut off_steady);
+        let (own_map_median, own_map_min) = stats(&mut own_map_steady);
+        let pct = |off: u64, main: u64| (off as f64 - main as f64) * 100.0 / main.max(1) as f64;
         let inline_delta = std::mem::size_of::<ClaudeRequestCensusRecord>()
             .saturating_sub(std::mem::size_of::<main_reference::MainRecordLayout>())
             * FILES;
-        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} steady_samples=5 main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=independent_main_money_maintenance excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, checkpoint_actual.len());
+        // Reported, never asserted: shared CI runners are too noisy for a
+        // 0.5% gate. Median and min deltas are both printed.
+        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} first_terminal_memory=distinct steady_samples={STEADY_SAMPLES} steady_order=ABAB steady_memory=shared main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} steady_median_delta_pct={:.3} main_steady_min_cpu_us={main_min} off_steady_min_cpu_us={off_min} steady_min_delta_us={} steady_min_delta_pct={:.3} own_map_main_median_cpu_us={own_map_median} own_map_main_min_cpu_us={own_map_min} own_map_vs_shared_main_median_pct={:.3} main_samples_us={main_samples} off_samples_us={off_samples} own_map_samples_us={own_map_samples} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=main_reference_shared_map counting_writer=main_serialized_len excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, pct(off_steady, main_steady), off_min as i128 - main_min as i128, pct(off_min, main_min), pct(own_map_median, main_steady), checkpoint_actual.len());
     }
 
     #[test]

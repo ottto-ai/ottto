@@ -107,7 +107,14 @@ views and elapsed-time observations. Missing legacy marker state stays absent
 on save when no new safety exists (and remains closed in memory); empty legacy
 indexes do not acquire new metadata. The OFF stamp fast path avoids a global
 atomic when no view has ever existed. CPU receipts retain the first-terminal
-sample and add five alternating steady-state samples, reporting their median.
+sample (separate record maps) and add nine ABAB-interleaved steady-state samples
+per arm. The steady main arm runs the frozen main reference on the OFF arm's own
+record map, swapped in outside the clock, so both arms walk the same nodes, keys
+and hash buffers. The reference counts bytes with main's unchanged
+`serialized_len`. Receipts report the median and minimum per arm, both deltas,
+and every raw sample. A diagnostic arm repeats the older method, with main on
+its separately cloned map, to expose allocation-layout bias. The 0.5% OFF target
+is reported, never asserted, because shared CI runners are too noisy for it.
 
 
 Round 4 moves `x`/`sb` into an optional census side map. The shared MONEY record

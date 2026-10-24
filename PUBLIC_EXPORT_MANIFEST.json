@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 837,
-  "content_sha256": "11b6c91489dbe848059b1a20990f5e2285c233251d6e3ebd8b8d118a77e42a6f",
+  "content_sha256": "1a708c0729d8bba61acffcac49e459afb3f459c92ffcabf63da1ee99e1f58188",
   "files": [
     {
       "executable": false,
@@ -1763,15 +1763,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "d0c38d091bd130d0db8d709e0682f852163c912ed7eee076625156c6299dc7f2",
-      "size_bytes": 293162
+      "sha256": "4f19e53a2c9c6da01166f3898d7415f47f1eeddfbb7332d25b25d1286a747d6f",
+      "size_bytes": 296052
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/main_reference.rs",
-      "sha256": "672c727a97ca04f152e67d7dc9ff3427f5ee6336d4277afd64382d0f1651321a",
-      "size_bytes": 12870
+      "sha256": "5ba62d6ee280664616e5e7fba81b6907db1d1365d08078598955af9ec2b3a8e0",
+      "size_bytes": 13569
     },
     {
       "executable": false,
@@ -2323,8 +2323,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "8d2dca887e0d5a0b2a1b136e2efba875a09488a0a42f1af4ff54e8f76e4d5cbf",
-      "size_bytes": 10329
+      "sha256": "fe033533e174f1ae3bb78554de12526c70f9ad669cff956751e6dff3c8fd25eb",
+      "size_bytes": 10876
     },
     {
       "executable": false,

@@ -1,6 +1,8 @@
 //! Frozen admission/record-wire algorithm from main4d09e46aae9ffb2ed3774139bedd5f9d606fa805.
 //! Test-only independence: never calls HEAD insert, charge, admission_bytes or
 //! its record serializer. Types/getters are shared; MONEY getters are unchanged.
+//! Byte counting runs through main's own `serialized_len` (unchanged by phase
+//! B), so the OFF CPU receipt compares one counting-writer instantiation.
 use super::*;
 // Freeze main's limits too: changing HEAD limits must not move this reference.
 const MAX_CLAUDE_REQUEST_CENSUS_HASHES: usize = 2_097_152;
@@ -110,6 +112,14 @@ impl MainAdmission {
     pub(crate) fn hash_total(&self) -> usize {
         self.hash_total
     }
+    pub(crate) fn serialized_total(&self) -> usize {
+        self.serialized_total
+    }
+    /// Exchange record maps (O(1)) so a CPU arm walks the very same nodes,
+    /// keys and hash buffers as the OFF arm: only the code differs.
+    pub(crate) fn swap_records(&mut self, census: &mut ClaudeRequestCensus) {
+        std::mem::swap(&mut self.records, &mut census.records);
+    }
     pub(crate) fn get(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
         self.records.get(key)
     }
@@ -134,11 +144,23 @@ impl MainAdmission {
     pub(crate) fn bytes(&self) -> Vec<u8> {
         serde_json::to_vec(self).unwrap()
     }
-    /// Main's MONEY maintenance at a healthy complete terminal. The D1 shadow
-    /// comparison is excluded from both timing arms, since OFF does no shadow work.
-    pub(crate) fn terminal(&mut self, index: &ScanIndex, observed: &BTreeSet<String>, window: u64) {
-        self.records.retain(|key, _| {
-            !is_ledger_key(key) && (index.files.contains_key(key) || observed.contains(key))
+    /// Main's MONEY maintenance at a healthy complete terminal: main's
+    /// `retain_keys` (with its dropped count), recount and
+    /// `retire_claude_transcript_records` (with its aged count), returned as
+    /// (aged, dropped). The D1 shadow comparison is excluded from both timing
+    /// arms, since OFF does no shadow work.
+    pub(crate) fn terminal(
+        &mut self,
+        index: &ScanIndex,
+        observed: &BTreeSet<String>,
+        window: u64,
+    ) -> (u64, u64) {
+        let mut dropped = 0_u64;
+        self.records.retain(|key, record| {
+            let kept =
+                !is_ledger_key(key) && (index.files.contains_key(key) || observed.contains(key));
+            dropped += u64::from(!kept && !record.is_birth_stub());
+            kept
         });
         self.hash_total = 0;
         self.serialized_total = 0;
@@ -147,11 +169,12 @@ impl MainAdmission {
             self.serialized_total += entry_bytes(key, record);
         }
         if window == 0 {
-            return;
+            return (0, dropped);
         }
         let cutoff = window.saturating_sub(CLAUDE_TRANSCRIPT_RETIREMENT_SECONDS);
         let files = &index.files;
         let census = self;
+        let mut aged = 0_u64;
         let mut freed = (0_usize, 0_usize);
         for (key, record) in census.records.iter_mut() {
             if record.is_birth_stub()
@@ -181,9 +204,11 @@ impl MainAdmission {
             let after = entry_bytes(key, record);
             freed.0 += before.0;
             freed.1 += before.1.saturating_sub(after);
+            aged += 1;
         }
         census.hash_total -= freed.0;
         census.serialized_total = census.serialized_total.saturating_sub(freed.1);
+        (aged, dropped)
     }
 }
 impl Serialize for MainAdmission {
@@ -196,24 +221,12 @@ impl Serialize for MainAdmission {
     }
 }
 fn entry_bytes(key: &str, record: &ClaudeRequestCensusRecord) -> usize {
-    // Frozen main counting writer: no allocation and no HEAD record serializer.
-    fn count(value: &impl Serialize) -> usize {
-        struct Count(usize);
-        impl std::io::Write for Count {
-            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-                self.0 = self.0.saturating_add(bytes.len());
-                Ok(bytes.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        let mut writer = Count(0);
-        serde_json::to_writer(&mut writer, value).unwrap();
-        writer.0
-    }
-    count(&key)
-        .saturating_add(count(&MainRecord(record)))
+    // Main's `entry_serialized_bytes` with main's own counting writer
+    // (`serialized_len`, byte-identical to main): no allocation and no HEAD
+    // record serializer. One writer instantiation also keeps the per-byte
+    // escape loop the same machine code in both CPU arms.
+    serialized_len(&key)
+        .saturating_add(serialized_len(&MainRecord(record)))
         .saturating_add(2)
 }
 
