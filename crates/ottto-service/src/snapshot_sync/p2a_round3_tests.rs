@@ -86,6 +86,8 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
         let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
         let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
         let _live = money::LiveForTest::new(&support);
+        let _replay_guard =
+            unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
         p2a_initialize_custody(&support);
         let server = FinishServer::new(outcome);
         let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
@@ -140,7 +142,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             // clean telemetry sweep finish. Bounded; it must then accept.
             6
         } else if ack_save_fault {
-            3 // Fault, immediate hold, then hold beyond the probe deadline.
+            4 // Failed ACK save, immediate hold, exact replay, then selected/debt convergence.
         } else {
             1
         };
@@ -160,8 +162,13 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             // deadline: elapsed time cannot turn an unknown ACK into proof.
             let _clock = money::PageClockForTest::new(
                 &support,
-                now + if ack_save_fault && cycle == 1 {
-                    1
+                now + if ack_save_fault {
+                    match cycle {
+                        0 => 0,
+                        1 => 1,
+                        2 => 300,
+                        _ => 301,
+                    }
                 } else {
                     cycle as u64 * 1801
                 },
@@ -229,7 +236,26 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 let (preparation, index, scan) =
                     collect_native_preparation_with_rotation(frame, false);
                 assert!(index.request_money_live_revision());
-                if ack_save_fault && cycle > 0 || ledger_fault && recovering {
+                if ack_save_fault && cycle > 0 {
+                    assert!(
+                        !index.request_money_adoption_paused(),
+                        "UNKNOWN cannot veto the entire context"
+                    );
+                    assert!(
+                        unknown_recovery::blocked_file(
+                            &support,
+                            &transcript.to_string_lossy(),
+                            None
+                        ),
+                        "the uncertain batch retains its contributing file"
+                    );
+                    assert!(
+                        scan.snapshots.is_empty(),
+                        "held file cannot create a successor offer"
+                    );
+                }
+
+                if ledger_fault && recovering {
                     assert!(
                         index.request_money_adoption_paused(),
                         "uncertain ACK/custody recovery must retain the history pause"
@@ -238,19 +264,6 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         !money::adoption_probe_due(&support, &index),
                         "unknown ACK/recovery cannot use a known-outcome probe"
                     );
-                    if ack_save_fault {
-                        money::store::with_ledger_for_test(&support, |ledger| {
-                            let rates = ledger
-                                .get(&format!("{}rates", money::adoption_prefix(&index)))
-                                .expect("offered outcome remains durably accounted");
-                            assert_ne!(
-                                rates.money_revision()[0] & 0x80,
-                                0,
-                                "the lost local ACK leaves the outcome unknown"
-                            );
-                        })
-                        .unwrap();
-                    }
                     assert!(
                         scan.snapshots.iter().all(|item| {
                             item.source_file_fingerprint
@@ -261,7 +274,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         }),
                         "local recovery parses must remain vetoed at emission"
                     );
-                } else {
+                } else if !(ack_save_fault && (1..=2).contains(&cycle)) {
                     assert!(!scan.snapshots.is_empty(),
                         "admitted selector must re-read the owed revision: {outcome:?}, conflict={conflict}, ledger_fault={ledger_fault}, ack_save_fault={ack_save_fault}, cycle={cycle}");
                 }
@@ -345,19 +358,19 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     progress_path.with_extension(format!("json.{}.tmp", std::process::id())),
                 )
                 .unwrap();
-            } else if ack_save_fault && cycle > 0 {
+            } else if ack_save_fault && (1..=2).contains(&cycle) {
                 assert!(
                     result.is_ok(),
                     "paused retry completes its local work: {result:?}"
                 );
                 assert!(
-                    paused,
-                    "failed ACK save must retain the unknown-outcome pause"
+                    unknown_recovery::blocked_file(&support, &transcript.to_string_lossy(), None),
+                    "failed ACK save must retain the batch-scoped unknown-outcome pause"
                 );
                 assert_eq!(
                     server.offered.lock().unwrap().len(),
-                    1,
-                    "an unknown ACK cannot re-offer, even after the probe deadline"
+                    if cycle == 1 { 1 } else { 2 },
+                    "only the due immutable replay can resolve the uncertain ACK"
                 );
                 assert!(saved
                     .files
@@ -373,6 +386,21 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     !saved.accepted_snapshot_fingerprint_recorded(fp),
                     "unknown local ACK must not become a selected acceptance"
                 );
+            } else if ack_save_fault && cycle == 3 {
+                assert!(
+                    result.is_ok(),
+                    "recovery selected-save convergence: {result:?}"
+                );
+                assert_eq!(server.offered.lock().unwrap().len(), 2);
+                assert!(saved
+                    .files
+                    .values()
+                    .all(|e| e.effective_upload_body_witness_revision == 3));
+                assert!(!money::money_due(
+                    &support,
+                    &transcript.to_string_lossy(),
+                    u64::MAX
+                ));
             } else if ledger_fault && cycle == 0 {
                 assert!(
                     server.offered.lock().unwrap().is_empty(),
@@ -650,6 +678,7 @@ impl P2aControl {
     }
     fn restart(&mut self) {
         money_resume::forget_for_test(&self.support);
+        unknown_recovery::forget(&self.support);
         crate::snapshots::claude_request_money::store::reload_for_test(&self.support).unwrap();
         self.daemon = test_daemon("otm_test");
     }
@@ -2717,4 +2746,390 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
             "ordinary quarantine jitter must not delay transient recovery"
         );
     }
+}
+
+// UNKNOWN recovery's transport is exercised through the real batch HTTP route.
+// The explicit test permit supplies owner B's pending LiteralGuard contract;
+// it is not evidence that the dependency has landed or that P2 can activate.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    for lost in [FinishOutcome::LostCommitted, FinishOutcome::LostUncommitted] {
+        let mut control = P2aControl::new(lost);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+        let original = control.server.raw_batches.lock().unwrap()[0].clone();
+        let committed_before = control.server.committed.lock().unwrap().len();
+        assert_eq!(
+            committed_before,
+            usize::from(matches!(lost, FinishOutcome::LostCommitted))
+        );
+        assert!(
+            !money::adoption_paused(&control.support, &control.saved()),
+            "unrelated work is not paused"
+        );
+        assert!(money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+        control.restart();
+        *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+        drop(clock);
+        let _early = money::PageClockForTest::new(&control.support, now + 299);
+        control.cycle();
+        assert_eq!(
+            control.server.raw_batches.lock().unwrap().len(),
+            1,
+            "no early replay after restart"
+        );
+        drop(_early);
+        let _due = money::PageClockForTest::new(&control.support, now + 300);
+        control.cycle();
+        let posts = control.server.raw_batches.lock().unwrap().clone();
+        assert_eq!(posts.len(), 2);
+        assert_eq!(
+            posts[1], original,
+            "no timestamp/CAS/token-contract/client-report reshaping"
+        );
+        assert_eq!(
+            control.server.committed.lock().unwrap().len(),
+            1,
+            "same-head convergence has one entity contribution"
+        );
+        control.cycle(); // consume durable selected-save release and ordinary debt settlement
+        assert!(control
+            .saved()
+            .files
+            .values()
+            .all(|e| e.effective_upload_body_witness_revision == 3));
+        assert!(!money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle();
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    assert_eq!(
+        unknown_recovery::current_literal_guard(
+            &control.saved(),
+            &unknown_recovery::active_for_test(&control.support)[0]
+        ),
+        unknown_recovery::LiteralPermit::Unavailable,
+        "missing dependency is closed"
+    );
+    control.restart();
+    drop(clock);
+    let _expired = money::PageClockForTest::new(&control.support, now + 86400);
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    control.cycle();
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        2,
+        "ordinary successor admission resumes after terminal receipt"
+    );
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|e| e.effective_upload_body_witness_revision == 3));
+    control.restart();
+    control.cycle();
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        2,
+        "restart cannot rearm the unresolved lineage"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for downgrade in [false, true] {
+        let control = P2aControl::new(FinishOutcome::LostCommitted);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+        let m = unknown_recovery::active_for_test(&control.support)
+            .pop()
+            .unwrap();
+        let mut index = control.saved();
+        index.activate_effective_upload_body_witness_revision(if downgrade { 2 } else { 3 });
+        if !downgrade {
+            std::fs::write(
+                control
+                    .support
+                    .join("snapshots/claude_code-reemission-exclusions.txt"),
+                format!("{:x}\n", Sha256::digest(m.entities[0].root.as_bytes())),
+            )
+            .unwrap();
+        }
+        let _guard = unknown_recovery::guard_for_test(if downgrade {
+            unknown_recovery::LiteralPermit::DenyAll
+        } else {
+            unknown_recovery::LiteralPermit::Permit
+        });
+        drop(clock);
+        let _due = money::PageClockForTest::new(&control.support, now + 300);
+        let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+        let progress_path = snapshot_upload_progress_path(&control.index_path);
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        money_resume::drive_for_test(unknown_recovery::replay_due(
+            &control.support,
+            &mut index,
+            &mut progress,
+            &progress_path,
+            &control.client,
+            &control.device,
+            "device-secret",
+            "otm_test",
+            &namespace,
+            || Ok(()),
+        ))
+        .unwrap();
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+        let after = unknown_recovery::active_for_test(&control.support)
+            .pop()
+            .unwrap();
+        assert_eq!(after.posts, 1, "denied gates do not spend POST slots");
+        assert_eq!(
+            after.terminal,
+            downgrade.then_some(unknown_recovery::Reason::RevisionDowngrade)
+        );
+        assert!(money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_mixed_batch_new_list_sends_none_unrelated_work_continues() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    let control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let clock = money::PageClockForTest::new(&control.support, now);
+    let sibling = "22222222-2222-4222-8222-222222222222";
+    let fresh = "33333333-3333-4333-8333-333333333333";
+    let original = std::fs::read_to_string(control.transcript()).unwrap();
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{sibling}.jsonl")),
+        original
+            .replace(IDENTITY_PIPELINE_ROOT, sibling)
+            .replace("req_1", "unknown-sibling-1")
+            .replace("req_2", "unknown-sibling-2"),
+    )
+    .unwrap();
+    control.cycle();
+    let pending = unknown_recovery::active_for_test(&control.support);
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].entities.len(),
+        2,
+        "one complete mixed batch is retained"
+    );
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    std::fs::write(
+        control
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+        format!("{:x}\n", Sha256::digest(sibling.as_bytes())),
+    )
+    .unwrap();
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{fresh}.jsonl")),
+        original
+            .replace(IDENTITY_PIPELINE_ROOT, fresh)
+            .replace("req_1", "unknown-fresh-1")
+            .replace("req_2", "unknown-fresh-2"),
+    )
+    .unwrap();
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    drop(clock);
+    let _due = money::PageClockForTest::new(&control.support, now + 300);
+    control.cycle();
+    let bodies = control.server.raw_batches.lock().unwrap().clone();
+    assert_eq!(
+        bodies.len(),
+        2,
+        "the only extra POST is unrelated fresh work"
+    );
+    let last: serde_json::Value = serde_json::from_str(&bodies[1]).unwrap();
+    let items = last["snapshots"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["source_session_id"], fresh);
+    assert!(unknown_recovery::active_for_test(&control.support).iter().any(|m|
+        m.id == pending[0].id && m.posts == 1 && m.sha256 == pending[0].sha256),
+        "new listing sends none of the retained batch, without spending its counter or mutating bytes");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_physical_three_replays_exhaustion_and_normal_return() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+    }
+    for (slot, elapsed) in [300, 3600, 21600].into_iter().enumerate() {
+        control.restart();
+        let _clock = money::PageClockForTest::new(&control.support, now + elapsed);
+        control.cycle();
+        let posts = control.server.raw_batches.lock().unwrap();
+        assert_eq!(
+            posts.len(),
+            slot + 2,
+            "one physical replay per original slot"
+        );
+        assert!(posts.iter().all(|body| body == &posts[0]));
+        assert!(control
+            .saved()
+            .files
+            .values()
+            .all(|e| e.effective_upload_body_witness_revision != 3));
+    }
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    let _clock = money::PageClockForTest::new(&control.support, now + 21601);
+    control.cycle();
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        5,
+        "terminal release permits a normal successor offer"
+    );
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|e| e.effective_upload_body_witness_revision == 3));
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    for stop in [true, false] {
+        crate::snapshots::restart_claude_reemission_stop_for_test();
+        let control = P2aControl::new(FinishOutcome::LostCommitted);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+        if stop {
+            crate::snapshots::latch_claude_reemission_stop_for_test();
+        } else {
+            std::fs::write(control.support.join("claude-request-owned-live.off"), b"").unwrap();
+        }
+        let mut index = control.saved();
+        index.activate_effective_upload_body_witness_revision(3);
+        drop(clock);
+        let _due = money::PageClockForTest::new(&control.support, now + 300);
+        let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+        let progress_path = snapshot_upload_progress_path(&control.index_path);
+        let mut progress = SnapshotUploadProgress::load(
+            &progress_path,
+            &namespace,
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+        .unwrap();
+        money_resume::drive_for_test(unknown_recovery::replay_due(
+            &control.support,
+            &mut index,
+            &mut progress,
+            &progress_path,
+            &control.client,
+            &control.device,
+            "device-secret",
+            "otm_test",
+            &namespace,
+            || Ok(()),
+        ))
+        .unwrap();
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+        assert_eq!(
+            unknown_recovery::active_for_test(&control.support)[0].posts,
+            1
+        );
+    }
+    crate::snapshots::restart_claude_reemission_stop_for_test();
 }

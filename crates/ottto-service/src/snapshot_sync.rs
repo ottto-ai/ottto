@@ -51,6 +51,7 @@ mod continuation;
 pub(crate) mod money_resume;
 mod reason_reoffer;
 mod rejection_log;
+pub(crate) mod unknown_recovery;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -5382,6 +5383,20 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    if source_money_resume(source, support_dir) {
+        let binding = unknown_recovery::binding(
+            &snapshot_upload_destination_namespace(device, device_secret),
+            client.recovery_origin(),
+            machine_id,
+            "",
+        );
+        if !unknown_recovery::startup(support_dir, &binding, unknown_recovery::now(support_dir))? {
+            return Err(crate::source_rotation::LocalRefusal(
+                "request money scheduling checkpoint pending",
+            )
+            .into());
+        }
+    }
     if source == SnapshotSource::ClaudeCode
         && money_resume::resume(device, device_secret, home, support_dir, daemon)?
     {
@@ -6193,6 +6208,21 @@ async fn finish_sync_source_resume(
         }
         Ok(())
     };
+    if source_money_resume(source, support_dir) {
+        unknown_recovery::replay_due(
+            support_dir,
+            &mut index,
+            &mut upload_progress,
+            &upload_progress_path,
+            client,
+            device,
+            device_secret,
+            machine_id,
+            &upload_destination_namespace,
+            ensure_authority,
+        )
+        .await?;
+    }
     codex_scan_diagnostics::after_existing_census_fence(
         source,
         support_dir,
@@ -6612,6 +6642,15 @@ async fn finish_sync_source_resume(
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
+    let mut recovery_send = unknown_recovery::SendState::default();
+    let recovery_binding = source_money_resume(source, support_dir).then(|| {
+        unknown_recovery::binding(
+            &upload_destination_namespace,
+            client.recovery_origin(),
+            machine_id,
+            "",
+        )
+    });
     let probes = scan_result
         .snapshots
         .iter()
@@ -6641,38 +6680,65 @@ async fn finish_sync_source_resume(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads_with_budget(
-            &probes,
-            source.api_slug(),
-            &mut upload_progress,
-            ordinary_bootstrap,
-            &mut inplace_retry,
-            |snapshots, enforce_head_cas| {
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: source.api_slug().to_string(),
-                    machine_id: machine_id.to_string(),
-                    collector_version: Some(collector_version()),
-                    snapshots,
-                    upload_policy,
-                    client_report: crate::client_report::ClientReport::empty(),
-                };
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
-                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                        reason,
-                    }));
-                }
+        bootstrap_deferred = loop {
+            let result = bootstrap_cache_heads_with_budget(
+                &probes,
+                source.api_slug(),
+                &mut upload_progress,
+                ordinary_bootstrap,
+                &mut inplace_retry,
+                |snapshots, enforce_head_cas| {
+                    let request = SnapshotBatchRequest {
+                        schema_version: SNAPSHOT_SCHEMA_VERSION,
+                        source: source.api_slug().to_string(),
+                        machine_id: machine_id.to_string(),
+                        collector_version: Some(collector_version()),
+                        snapshots,
+                        upload_policy,
+                        client_report: crate::client_report::ClientReport::empty(),
+                    };
+                    if let Err(reason) = validate_snapshot_batch_request(&request) {
+                        return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                            reason,
+                        }));
+                    }
+                    ensure_authority()?;
+                    let token = client.issue_relay_token(device, device_secret, source)?;
+                    ensure_authority()?;
+                    validate_joined(&request.snapshots)?;
+                    let response = if let Some(binding) = recovery_binding.as_deref() {
+                        unknown_recovery::initial_post(
+                            support_dir,
+                            &mut index,
+                            client,
+                            &token,
+                            &request,
+                            binding,
+                            enforce_head_cas,
+                            &mut recovery_send,
+                        )
+                    } else {
+                        client.upload_batch(&token, &request, enforce_head_cas)
+                    }?;
+                    response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+                    Ok(response)
+                },
+                |progress| progress.save(&upload_progress_path),
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.is::<unknown_recovery::Pending>())
+            {
+                unknown_recovery::captured(support_dir, &mut recovery_send).await?;
                 ensure_authority()?;
-                let token = client.issue_relay_token(device, device_secret, source)?;
-                ensure_authority()?;
-                validate_joined(&request.snapshots)?;
-                let response = client.upload_batch(&token, &request, enforce_head_cas)?;
-                response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
-                Ok(response)
-            },
-            |progress| progress.save(&upload_progress_path),
-        )
-        .inspect_err(log_bootstrap_failure("probe"))?;
+                continue;
+            }
+            if source_money_resume(source, support_dir) {
+                unknown_recovery::outcomes(support_dir).await?;
+            }
+            break result.inspect_err(log_bootstrap_failure("probe"))?;
+        };
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -6703,69 +6769,88 @@ async fn finish_sync_source_resume(
     })
     .flatten();
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
-        &scan_result.snapshots,
-        source.api_slug(),
-        &mut upload_progress,
-        &mut accepted,
-        |snapshot| snapshot.snapshot_fingerprint.as_str(),
-        snapshot_upload_body_witness,
-        |snapshot| Some(snapshot.source_session_id.as_str()),
-        |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-        &mut inplace_retry,
-        |snapshots| {
-            // A first Codex/Claude scan can spend several minutes parsing local
-            // history and retroactive backfill before the first upload. Relay
-            // tokens are intentionally short-lived, so mint them at the network
-            // boundary instead of reusing the pre-scan activity-hint token.
-            // Leased, not read: exactly one in-flight batch may claim the
-            // counters, and dropping the lease on any failure below leaves the
-            // losses owed instead of stranded.
-            let client_report = crate::client_report::lease();
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: source.api_slug().to_string(),
-                machine_id: machine_id.to_string(),
-                collector_version: Some(collector_version()),
-                snapshots,
-                upload_policy,
-                client_report: client_report.report().clone(),
-            };
-            let reconcile_class = request.snapshots.iter().all(|snapshot| {
-                legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-            });
-            debug_assert!(
-                reconcile_class
-                    || request.snapshots.iter().all(|snapshot| {
-                        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                    }),
-                "legacy reconciliation must stay isolated at a batch boundary"
-            );
-            if let Err(reason) = validate_snapshot_batch_request(&request) {
-                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                    reason,
-                }));
-            }
-            ensure_authority()?;
-            if request.snapshots.iter().any(|item| {
-                item.usage_accounting_contract.as_deref()
-                    == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-            }) && !crate::snapshots::claude_request_money::request_owned_live(support_dir)
-            {
-                return Err(anyhow!("request money live custody withdrawn"));
-            }
-            let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            ensure_authority()?;
-            validate_joined(&request.snapshots)?;
-            if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
-                crate::snapshots::claude_request_money::note_protected_offers(
-                    &index,
-                    protected_offer_causes.as_ref().map(|(causes, _)| causes),
-                    &request.snapshots,
+    let mut recovery_report = None::<crate::client_report::ClientReportLease>;
+    let upload_result = loop {
+        let result = upload_resumable_batches_with_body_witness_partitioned(
+            &scan_result.snapshots,
+            source.api_slug(),
+            &mut upload_progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |snapshot| Some(snapshot.source_session_id.as_str()),
+            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            &mut inplace_retry,
+            |snapshots| {
+                // A first Codex/Claude scan can spend several minutes parsing local
+                // history and retroactive backfill before the first upload. Relay
+                // tokens are intentionally short-lived, so mint them at the network
+                // boundary instead of reusing the pre-scan activity-hint token.
+                // Leased, not read: exactly one in-flight batch may claim the
+                // counters, and dropping the lease on any failure below leaves the
+                // losses owed instead of stranded.
+                let mut ordinary_report = None;
+                let client_report = if recovery_binding.is_some() {
+                    recovery_report.get_or_insert_with(crate::client_report::lease)
+                } else {
+                    ordinary_report.get_or_insert_with(crate::client_report::lease)
+                };
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: source.api_slug().to_string(),
+                    machine_id: machine_id.to_string(),
+                    collector_version: Some(collector_version()),
+                    snapshots,
+                    upload_policy,
+                    client_report: client_report.report().clone(),
+                };
+                let reconcile_class = request.snapshots.iter().all(|snapshot| {
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                });
+                debug_assert!(
+                    reconcile_class
+                        || request.snapshots.iter().all(|snapshot| {
+                            !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                        }),
+                    "legacy reconciliation must stay isolated at a batch boundary"
                 );
-            }
-            let response = client
-                .upload_batch(&upload_relay_token, &request, reconcile_class)
+                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                        reason,
+                    }));
+                }
+                ensure_authority()?;
+                if request.snapshots.iter().any(|item| {
+                    item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                }) && !crate::snapshots::claude_request_money::request_owned_live(support_dir)
+                {
+                    return Err(anyhow!("request money live custody withdrawn"));
+                }
+                let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
+                ensure_authority()?;
+                validate_joined(&request.snapshots)?;
+                if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
+                    crate::snapshots::claude_request_money::note_protected_offers(
+                        &index,
+                        protected_offer_causes.as_ref().map(|(causes, _)| causes),
+                        &request.snapshots,
+                    );
+                }
+                let response = if let Some(binding) = recovery_binding.as_deref() {
+                    unknown_recovery::initial_post(
+                        support_dir,
+                        &mut index,
+                        client,
+                        &upload_relay_token,
+                        &request,
+                        binding,
+                        reconcile_class,
+                        &mut recovery_send,
+                    )
+                } else {
+                    client.upload_batch(&upload_relay_token, &request, reconcile_class)
+                }
                 .inspect_err(|error| {
                     if error
                         .downcast_ref::<crate::snapshot_client::UploadShed>()
@@ -6778,62 +6863,80 @@ async fn finish_sync_source_resume(
                         );
                     }
                 })?;
-            response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
-            let request_fingerprints = request
-                .snapshots
-                .iter()
-                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                .collect::<BTreeSet<_>>();
-            require_normal_write_ack_for_legacy_reconciliation(
-                &response,
-                &request_fingerprints,
-                &legacy_reconciliation_pending,
-            )?;
-            // Clear only what this accepted request carried. A failed upload
-            // leaves the counters in place so the losses are reported on the
-            // next batch instead of vanishing with the request that died.
-            client_report.commit();
-            if request.snapshots.iter().any(|item| {
-                item.usage_accounting_contract.as_deref()
-                    == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-            }) {
-                crate::snapshots::claude_request_money::note_route_pause(
-                    support_dir,
-                    &index,
-                    false,
+                response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                let request_fingerprints = request
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                require_normal_write_ack_for_legacy_reconciliation(
+                    &response,
+                    &request_fingerprints,
+                    &legacy_reconciliation_pending,
+                )?;
+                if recovery_binding.is_some() {
+                    recovery_report.take().expect("batch report lease").commit();
+                } else {
+                    ordinary_report.take().expect("batch report lease").commit();
+                }
+                if request.snapshots.iter().any(|item| {
+                    item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                }) {
+                    crate::snapshots::claude_request_money::note_route_pause(
+                        support_dir,
+                        &index,
+                        false,
+                    );
+                }
+                Ok(response)
+            },
+            |progress| {
+                #[cfg(test)]
+                tests::permanent_finish_pipeline_tests::p2a_before_ack_save_for_test(
+                    &upload_progress_path,
                 );
-            }
-            Ok(response)
-        },
-        |progress| {
-            #[cfg(test)]
-            tests::permanent_finish_pipeline_tests::p2a_before_ack_save_for_test(
-                &upload_progress_path,
-            );
-            progress.save(&upload_progress_path)
-        },
-    )
-    .and_then(|result| {
-        if matches!(
-            result,
-            ResumableUploadResult::Completed
-                | ResumableUploadResult::Deferred { .. }
-                | ResumableUploadResult::Rejected { .. }
-        ) {
-            // A setup/account switch can replace the relay binding while a
-            // long historical scan is uploading. Never commit destination A's
-            // delivery cursor after the machine has moved to destination B.
-            ensure_authority()?;
-        }
-        Ok(result)
-    })
-    .map(|result| {
-        with_retained_refusal_conflicts(
-            with_bootstrap_deferred(result, bootstrap_deferred),
-            &index,
-            &upload_progress,
+                progress.save(&upload_progress_path)
+            },
         )
-    });
+        .and_then(|result| {
+            if matches!(
+                result,
+                ResumableUploadResult::Completed
+                    | ResumableUploadResult::Deferred { .. }
+                    | ResumableUploadResult::Rejected { .. }
+            ) {
+                // A setup/account switch can replace the relay binding while a
+                // long historical scan is uploading. Never commit destination A's
+                // delivery cursor after the machine has moved to destination B.
+                ensure_authority()?;
+            }
+            Ok(result)
+        })
+        .map(|result| {
+            with_retained_refusal_conflicts(
+                with_bootstrap_deferred(result, bootstrap_deferred),
+                &index,
+                &upload_progress,
+            )
+        });
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.is::<unknown_recovery::Pending>())
+        {
+            unknown_recovery::captured(support_dir, &mut recovery_send).await?;
+            ensure_authority()?;
+            continue;
+        }
+        if result.is_err() {
+            recovery_report.take();
+        }
+        break result;
+    };
+    if source_money_resume(source, support_dir) {
+        unknown_recovery::outcomes(support_dir).await?;
+    }
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
@@ -7078,7 +7181,22 @@ async fn finish_sync_source_resume(
     // A durable ACK does not prove the selected index committed. Retain the
     // due/dirty selection obligation through every failed CAS or save, even
     // for unchanged, already-adopted files. Each caller below has saved first.
+    let recovery_ack_durable = !upload_result.as_ref().err().is_some_and(|e| {
+        snapshot_upload_error_class(e) == Some(SnapshotUploadErrorClass::LocalState)
+    });
     let settle_saved_money = |saved: &ScanIndex| {
+        if source_money_resume(source, support_dir) && recovery_ack_durable {
+            if unknown_recovery::resolve_saved(
+                support_dir,
+                &upload_progress,
+                unknown_recovery::now(support_dir),
+            )
+            .is_err()
+            {
+                eprintln!("claude_request_money recovery_custody_fault=1");
+            }
+        }
+
         if let Some((settled, bodies, _funds)) = &money_settlement {
             crate::snapshots::claude_request_money::settle_money_acks(
                 support_dir,
@@ -9294,7 +9412,35 @@ where
                 .saturating_add(snapshot_packing_json_length(item)?);
         }
     }
-    let response = upload(batch)?;
+    let response = match upload(batch) {
+        Err(error) if error.is::<unknown_recovery::Deferred>() => {
+            let deferred = error.downcast_ref::<unknown_recovery::Deferred>().unwrap();
+            if deferred.reason.is_some() || deferred.route_unavailable {
+                for index in indices {
+                    let fp = fingerprint(&items[*index]);
+                    progress.quarantine_transient_body(
+                        fp,
+                        &body_witness(&items[*index]),
+                        deferred
+                            .not_before
+                            .max(current_unix_seconds().saturating_add(1800)),
+                    );
+                    if deferred.reason == Some(unknown_recovery::Reason::VersionSkew) {
+                        progress
+                            .quarantined_fingerprints
+                            .get_mut(fp)
+                            .unwrap()
+                            .version_skew_attempts = 1;
+                    }
+                }
+                persist(progress).map_err(|_| SnapshotLocalStateRejected {
+                    operation: "save recovery handoff",
+                })?;
+            }
+            return Err(error);
+        }
+        result => result?,
+    };
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
@@ -9710,6 +9856,11 @@ where
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
         match attempt {
+            Err(error) if error.is::<unknown_recovery::Deferred>() => {
+                return Ok(ResumableUploadResult::Deferred {
+                    count: indices.len(),
+                });
+            }
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }

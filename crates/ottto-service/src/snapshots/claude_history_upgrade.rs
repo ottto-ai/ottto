@@ -181,6 +181,7 @@ pub(crate) enum HistoryHold {
     UngatedRevision,
     /// Money custody is paused; every selection reason retains its old body.
     MoneyPaused,
+    UnknownOutcome,
     /// The list is unreadable, missing after install, unrecorded, or its
     /// family closure overflowed.
     ListPaused,
@@ -206,6 +207,7 @@ impl HistoryHold {
         match self {
             Self::UngatedRevision => "ungated_revision",
             Self::MoneyPaused => "money_paused",
+            Self::UnknownOutcome => "unknown_outcome",
             Self::ListPaused => "list_paused",
             Self::Listed => "listed",
             Self::NoListBirth => "no_list_birth",
@@ -244,6 +246,7 @@ pub(super) struct PolicyInputs<'a> {
     pub(super) latched: bool,
     pub(super) money_paused: bool,
     pub(super) money_probe_due: bool,
+    pub(super) unknown_outcome: bool,
     pub(super) active_revision: u64,
     /// The index's history cutoff (rebuilt or prior-install history).
     pub(super) history_cutoff_unix_seconds: Option<u64>,
@@ -264,7 +267,9 @@ pub(super) fn decide(
         .filter(|_| inputs.active_revision <= MAX_GATED_CLAUDE_REVISION);
     let money_held = inputs.money_paused
         && !(inputs.money_probe_due && page.reserve_money_probe(index_key, size_bytes));
-    let decision = if money_held {
+    let decision = if inputs.unknown_outcome {
+        HistoryDecision::Held(HistoryHold::UnknownOutcome)
+    } else if money_held {
         HistoryDecision::Held(HistoryHold::MoneyPaused)
     } else if inputs.active_revision == 3 && inputs.exclusions.pauses_adoption() {
         HistoryDecision::Held(HistoryHold::ListPaused)
@@ -306,7 +311,7 @@ pub(super) fn decide(
 /// policy holds, owed history is held up to the later of the fixed no-list
 /// cutoff and the saved history cutoff. Unknown birth is history. Under
 /// `Pace` nothing is held here; the budget paces it.
-fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
+pub(super) fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
     let hold = match inputs.no_list_policy {
         NoListPolicy::Pace => return None,
         NoListPolicy::HoldUnverified => HistoryHold::NoListBirth,
@@ -588,6 +593,7 @@ mod tests {
             birth_unix_seconds: Some(u64::MAX),
             latched: false,
             money_paused: false,
+            unknown_outcome: false,
             money_probe_due: false,
             active_revision: active,
             history_cutoff_unix_seconds: None,

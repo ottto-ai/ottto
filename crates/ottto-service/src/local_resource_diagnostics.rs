@@ -11,6 +11,10 @@ pub(crate) mod codex_side_lifecycle;
 
 const SCHEMA_VERSION: u8 = 2;
 
+pub(crate) fn claude_money_unknown_outcome(receipt: &impl Serialize) {
+    traversal_point("claude_money_unknown_outcome", "claude_code", receipt);
+}
+
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {

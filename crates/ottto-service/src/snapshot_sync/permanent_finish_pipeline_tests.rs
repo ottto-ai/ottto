@@ -5,6 +5,8 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 enum FinishOutcome {
     Accept,
+    LostCommitted,
+    LostUncommitted,
     MoneyHeld,
     MoneyRouteUnavailable,
     Permanent,
@@ -38,6 +40,8 @@ struct FinishServer {
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
+    raw_batches: Arc<Mutex<Vec<String>>>,
+    committed: Arc<Mutex<BTreeMap<String, String>>>,
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
     outcome: Arc<Mutex<FinishOutcome>>,
     before_post: FinishPostHook,
@@ -53,6 +57,10 @@ impl FinishServer {
         let done = stop.clone();
         let offered = Arc::new(Mutex::new(Vec::new()));
         let bodies = offered.clone();
+        let raw_batches = Arc::new(Mutex::new(Vec::new()));
+        let raw_posts = raw_batches.clone();
+        let committed = Arc::new(Mutex::new(BTreeMap::new()));
+        let stored = committed.clone();
         let terminal = Arc::new(Mutex::new(Vec::new()));
         let statuses = terminal.clone();
         let outcome = Arc::new(Mutex::new(outcome));
@@ -103,6 +111,25 @@ impl FinishServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    raw_posts.lock().unwrap().push(raw.to_owned());
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Accept | FinishOutcome::LostCommitted
+                    ) {
+                        for item in items {
+                            stored.lock().unwrap().insert(
+                                item["source_session_id"].as_str().unwrap().to_owned(),
+                                item["snapshot_fingerprint"].as_str().unwrap().to_owned(),
+                            );
+                        }
+                    }
+                    if matches!(
+                        outcome,
+                        FinishOutcome::LostCommitted | FinishOutcome::LostUncommitted
+                    ) {
+                        continue; // close a real batch connection without a response
+                    }
+
                     if let Some(hook) = post_hook.lock().unwrap().take() {
                         hook();
                     }
@@ -185,6 +212,8 @@ impl FinishServer {
             stop,
             worker: Some(worker),
             offered,
+            raw_batches,
+            committed,
             terminal,
             outcome,
             before_post,

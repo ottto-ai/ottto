@@ -588,6 +588,7 @@ enum Job {
         release: Receiver<()>,
     },
     Checkpoint(Box<CheckpointPayload>, ShadowReservation),
+    Recovery(Box<dyn FnOnce() + Send>, ShadowReservation),
 }
 
 enum Slot {
@@ -640,6 +641,7 @@ impl Job {
         match self {
             Self::Write(job) => job.queued_bytes(),
             Self::Checkpoint(payload, allocation) => payload.2.bytes() + allocation.bytes(),
+            Self::Recovery(_, allocation) => allocation.bytes(),
             _ => 0,
         }
     }
@@ -817,6 +819,10 @@ fn run_writer(receiver: Receiver<Job>) {
     let mut recovered = BTreeSet::new();
     while let Ok(job) = receiver.recv() {
         match job {
+            Job::Recovery(operation, allocation) => {
+                operation();
+                QUEUED_BYTES.fetch_sub(allocation.bytes(), Ordering::AcqRel);
+            }
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
                 if let Ok(mut ledgers) = LEDGERS.lock() {
@@ -868,6 +874,24 @@ fn run_writer(receiver: Receiver<Job>) {
             }
         }
     }
+}
+
+/// Recovery uses the existing bounded writer/outbox, never another worker or
+/// a filesystem wait while the sync owner holds its lock.
+pub(crate) fn recovery_job<T: Send + 'static>(
+    bytes: usize,
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> Option<Receiver<T>> {
+    let funds = ShadowReservation::admit(bytes)?;
+    let (done, result) = sync_channel(1);
+    submit(Job::Recovery(
+        Box::new(move || {
+            let _ = done.send(operation());
+        }),
+        funds,
+    ))
+    .ok()?;
+    Some(result)
 }
 
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
@@ -1758,11 +1782,13 @@ pub(super) fn adoption_paused(support_dir: &Path, prefix: &str, now: u64) -> boo
     let [total, local, holds, refused] = values[..] else {
         return pause(1);
     };
-    let paused = total & (1_u64 << 63) != 0
-        || total > 0
-            && (local.saturating_mul(100) > total
-                || refused.saturating_mul(100) >= total.saturating_mul(5)
-                || holds.saturating_mul(100) > total.saturating_sub(local));
+    // Legacy UNKNOWN-only rates are superseded by batch custody. A legacy
+    // missing body is an unresolved outcome, never reconstructed for replay.
+    let total = total & !(1_u64 << 63);
+    let paused = total > 0
+        && (local.saturating_mul(100) > total
+            || refused.saturating_mul(100) >= total.saturating_mul(5)
+            || holds.saturating_mul(100) > total.saturating_sub(local));
     paused && pause(4)
 }
 
@@ -1782,9 +1808,21 @@ pub(super) fn adoption_probe_due(support_dir: &Path, prefix: &str, now: u64) -> 
         && !ledger
             .get(&format!("{prefix}route"))
             .is_some_and(|record| record.window() > now)
-        && ledger.get(&format!("{prefix}rates")).is_some_and(|record| {
-            record.money_revision()[0] & 0x80 == 0 && now >= record.window().saturating_add(1800)
-        })
+        && ledger
+            .get(&format!("{prefix}rates"))
+            .is_some_and(|record| now >= record.window().saturating_add(1800))
+}
+
+pub(crate) fn recovery_released(support: &Path, lineage: &str) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return true;
+    };
+    match ledgers.get(support) {
+        Some(Slot::Ready(ledger)) => ledger
+            .get(&format!("adopt:entity:recovery-release:{lineage}"))
+            .is_some_and(|record| record.window() > 0),
+        _ => true,
+    }
 }
 
 pub(super) fn intent_run_id() -> &'static str {

@@ -836,6 +836,36 @@ impl Custody {
             .iter()
             .any(|slot| slot.key.starts_with("adopt:entity:"))
     }
+
+    /// Recompute current-context known outcomes. UNKNOWN is owned by retained
+    /// batch custody and contributes neither a veto nor a ratio denominator.
+    pub(super) fn adoption_rates(&self, context: &str) -> [u64; 4] {
+        let mut rates = [0; 4];
+        for slot in self
+            .files
+            .values()
+            .filter_map(|file| file.adoption.as_deref())
+            .chain(
+                self.telemetry
+                    .values()
+                    .filter_map(|file| file.adoption.as_deref()),
+            )
+        {
+            if !slot
+                .entity
+                .as_ref()
+                .is_some_and(|e| e.context.as_ref() == context)
+            {
+                continue;
+            }
+            let state = slot.value.window();
+            rates[0] += u64::from(state != 0);
+            rates[1] += u64::from(state == 1);
+            rates[2] += u64::from(state == 2);
+            rates[3] += u64::from(matches!(state, 3 | 6));
+        }
+        rates
+    }
     pub(super) fn recovery(&self) -> bool {
         self.control.recovery
     }

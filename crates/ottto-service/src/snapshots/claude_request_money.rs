@@ -4149,6 +4149,112 @@ pub(crate) fn adoption_prefix(index: &ScanIndex) -> String {
     )
 }
 
+pub(crate) fn recovery_now(support: &Path) -> u64 {
+    page_now(support)
+}
+
+/// A release latch shares the existing bounded control carrier. It is never
+/// evicted by receipt TTL or metadata reclamation while delivery debt exists.
+pub(crate) fn recovery_release_receipt(support: &Path, lineage: &str, now: u64) -> MoneyReceipt {
+    recovery_latch_receipt(support, lineage, Some(now))
+}
+
+pub(crate) fn recovery_finish_receipt(
+    support: &Path,
+    lineage: &str,
+    now: u64,
+    resolved: bool,
+) -> MoneyReceipt {
+    if !resolved {
+        return recovery_release_receipt(support, lineage, now);
+    }
+    let mut ledger = match store::acquire(support) {
+        ClaudeLedgerAcquire::Ready(ledger) => ledger,
+        ClaudeLedgerAcquire::Loading => return MoneyReceipt::Pending,
+        ClaudeLedgerAcquire::Unavailable => return MoneyReceipt::Refused,
+    };
+    ledger.remove(&format!("adopt:entity:recovery-release:{lineage}"));
+    store::checkpoint_receipt(support, &mut ledger)
+}
+
+pub(crate) fn recovery_reserve_receipt(support: &Path, lineage: &str) -> MoneyReceipt {
+    recovery_latch_receipt(support, lineage, None)
+}
+
+fn recovery_latch_receipt(support: &Path, lineage: &str, released: Option<u64>) -> MoneyReceipt {
+    let mut ledger = match store::acquire(support) {
+        ClaudeLedgerAcquire::Ready(ledger) => ledger,
+        ClaudeLedgerAcquire::Loading => return MoneyReceipt::Pending,
+        ClaudeLedgerAcquire::Unavailable => return MoneyReceipt::Refused,
+    };
+    let key = format!("adopt:entity:recovery-release:{lineage}");
+    let now = released.map_or(0, |now| now.max(1));
+    if ledger
+        .get(&key)
+        .is_none_or(|old| released.is_some() && old.window() == 0)
+        && !ledger.put_money(
+            key,
+            ClaudeRequestCensusRecord::money_debt(Sha256::digest(lineage.as_bytes()).into(), now),
+        )
+    {
+        return MoneyReceipt::Refused;
+    }
+    store::checkpoint_receipt(support, &mut ledger)
+}
+
+pub(crate) fn recovery_released(support: &Path, lineage: &str) -> bool {
+    store::recovery_released(support, lineage)
+}
+
+/// Old send intents did not retain wire bytes. Publish an unresolved episode
+/// before removing their global UNKNOWN bit; never rebuild those old bodies.
+pub(crate) fn recovery_legacy_receipt(support: &Path) -> (MoneyReceipt, Vec<String>) {
+    let mut ledger = match store::acquire(support) {
+        ClaudeLedgerAcquire::Ready(ledger) => ledger,
+        ClaudeLedgerAcquire::Loading => return (MoneyReceipt::Pending, Vec::new()),
+        ClaudeLedgerAcquire::Unavailable => return (MoneyReceipt::Refused, Vec::new()),
+    };
+    let legacy = ledger
+        .census()
+        .records_with_prefix("adopt:entity:v2:")
+        .filter(|(key, record)| key.ends_with("rates") && record.money_revision()[0] & 0x80 != 0)
+        .map(|(key, record)| {
+            let id = format!(
+                "{:x}",
+                Sha256::digest(
+                    format!("legacy_unknown:{key}:{:?}", record.money_revision()).as_bytes()
+                )
+            );
+            (key, id)
+        })
+        .collect::<Vec<_>>();
+    let mut episodes = Vec::new();
+    for (key, id) in legacy {
+        if ledger
+            .get(&format!("adopt:entity:recovery-release:{id}"))
+            .is_some_and(|r| r.window() > 0)
+        {
+            let prefix = key.strip_suffix("rates").unwrap();
+            let mut revision = [0; 32];
+            for (slot, value) in revision
+                .chunks_exact_mut(8)
+                .zip(ledger.census().adoption_rates(prefix))
+            {
+                slot.copy_from_slice(&value.to_be_bytes());
+            }
+            if !ledger.put_money(
+                key,
+                ClaudeRequestCensusRecord::money_debt(revision, page_now(support)),
+            ) {
+                return (MoneyReceipt::Refused, Vec::new());
+            }
+        } else {
+            episodes.push(id);
+        }
+    }
+    (store::checkpoint_receipt(support, &mut ledger), episodes)
+}
+
 /// State per indexed entity, not per POST. Repeated server holds never
 /// inflate the denominator or erase a refusal from conservation accounting.
 /// 0 offered, 1 local held, 2 server held, 3 refused, 4 accepted,
@@ -4199,10 +4305,9 @@ pub(crate) fn note_adoption_outcomes_receipt(
         } else {
             proposed
         };
-        rates[0] += 1;
-        if state == 0 {
-            rates[0] |= 1_u64 << 63;
-        }
+        // UNKNOWN is batch-scoped custody, never a global ratio denominator
+        // or veto. Recompute explicitly, including an empty resolved slice.
+        rates[0] += u64::from(state != 0);
         rates[1] += u64::from(state == 1);
         rates[2] += u64::from(state == 2);
         rates[3] += u64::from(matches!(state, 3 | 6));
@@ -4243,21 +4348,30 @@ pub(crate) fn note_adoption_outcomes_receipt(
             return MoneyReceipt::Refused;
         }
     }
+    let rates_key = format!("{prefix}rates");
+    if let Some(old) = ledger.get(&rates_key) {
+        if old.money_revision()[0] & 0x80 != 0 {
+            rates = ledger.census().adoption_rates(&prefix);
+        } else if rates[0] == 0 {
+            // Empty/UNKNOWN work cannot erase an independent known-outcome
+            // pause. It also cannot dilute its page denominator with history.
+            for (slot, bytes) in rates.iter_mut().zip(old.money_revision().chunks_exact(8)) {
+                *slot = u64::from_be_bytes(bytes.try_into().unwrap());
+            }
+        }
+    }
     let mut revision = [0; 32];
     for (slot, value) in revision.chunks_exact_mut(8).zip(rates) {
         slot.copy_from_slice(&value.to_be_bytes());
     }
-    let rates_key = format!("{prefix}rates");
     let observed = ledger
         .get(&rates_key)
         .filter(|old| old.money_revision() == revision)
         .map_or_else(|| page_now(support_dir), |record| record.window());
-    if rates[0] > 0
-        && !ledger.put_money(
-            rates_key,
-            ClaudeRequestCensusRecord::money_debt(revision, observed),
-        )
-    {
+    if !ledger.put_money(
+        rates_key,
+        ClaudeRequestCensusRecord::money_debt(revision, observed),
+    ) {
         return MoneyReceipt::Refused;
     }
     let durable = store::checkpoint_receipt(support_dir, &mut ledger);
@@ -4592,6 +4706,13 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
         }
     }
     let prefix = adoption_prefix(index);
+    let recovery_debt_settled = ledger.census().offer_total() == 0
+        && ledger
+            .census()
+            .records_with_prefix("dirty:")
+            .next()
+            .is_none()
+        && ledger.census().records_with_prefix("due:").next().is_none();
     let mut obsolete = Vec::new();
     let mut cursor = None;
     for (key, _) in ledger
@@ -4622,12 +4743,16 @@ pub(crate) fn reclaim_metadata(support: &Path, index: &ScanIndex) -> MoneyReceip
                     && ledger.get(&format!("watch:trace:v2:{root}")).is_none()
             });
         let stale_adoption = key.starts_with("adopt:entity:")
+            && !key.starts_with("adopt:entity:recovery-release:")
             && key != format!("{prefix}rates")
             && key != format!("{prefix}route")
             || key.starts_with("adopt:member:v1:")
                 && !entities.contains(&key)
                 && ledger.census().retirable_entity(&key);
-        if stale_trace || stale_adoption {
+        if stale_trace
+            || stale_adoption
+            || recovery_debt_settled && key.starts_with("adopt:entity:recovery-release:")
+        {
             obsolete.push(key.clone());
         }
     }
@@ -5027,7 +5152,10 @@ mod scheduling_reconciliation_tests {
         let inactive = ScanIndex::default();
         assert!(adoption_paused(&scratch, &inactive));
         assert!(!adoption_probe_due(&scratch, &inactive));
-        assert!(adoption_paused(&scratch, &active));
+        assert!(
+            adoption_paused(&scratch, &active),
+            "known local/held/refused ratios keep their authority"
+        );
         active.activate_upload_context("context-b".into());
         assert!(
             !adoption_paused(&scratch, &active),
@@ -5321,9 +5449,21 @@ mod scheduling_reconciliation_tests {
             )
             .unwrap();
             assert!(
-                adoption_paused(&scratch, &index),
-                "new context cannot inherit accepted state"
+                !adoption_paused(&scratch, &index),
+                "UNKNOWN cannot pause unrelated entities"
             );
+            store::with_ledger_for_test(&scratch, |ledger| {
+                let entity = format!("{}/{}", family_root(&item), item.source_session_id);
+                assert_eq!(
+                    ledger
+                        .get(&store::money_key("adopt:member:v1:", &entity))
+                        .unwrap()
+                        .window(),
+                    0,
+                    "new context cannot inherit accepted state"
+                );
+            })
+            .unwrap();
             crate::snapshot_sync::money_resume::drive_for_test(
                 crate::snapshot_sync::money_resume::until(|| {
                     note_adoption_outcomes_receipt(

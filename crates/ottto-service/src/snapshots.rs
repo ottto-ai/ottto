@@ -99,7 +99,8 @@ mod transcript_acquisition_tests;
 mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
-use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+pub(crate) use cache_observations::CacheObservations;
+use cache_observations::{OwnedRequest, RequestSlot};
 use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
@@ -1790,6 +1791,18 @@ pub struct SnapshotItem {
     /// account evidence.
     #[serde(skip)]
     pub(crate) claude_account_withheld_reason: Option<&'static str>,
+}
+
+pub(crate) trait ClaudeHistoryEmissionItem {
+    fn source_file_fingerprint(&self) -> Option<&str>;
+    fn immutable_unknown_replay(&self) -> bool {
+        false
+    }
+}
+impl ClaudeHistoryEmissionItem for SnapshotItem {
+    fn source_file_fingerprint(&self) -> Option<&str> {
+        self.source_file_fingerprint.as_deref()
+    }
 }
 
 /// Request evidence for this session's own billed requests names more than one
@@ -35983,6 +35996,11 @@ pub(crate) fn restart_claude_reemission_stop_for_test() {
     with_claude_reemission_stop(|stop| *stop = ClaudeReemissionStop::new());
 }
 
+#[cfg(test)]
+pub(crate) fn latch_claude_reemission_stop_for_test() {
+    with_claude_reemission_stop(|stop| stop.latched = true);
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CandidateDecision {
     Skip,
@@ -36414,6 +36432,13 @@ impl ScanIndex {
             && canonicalize_codex_identity_map(&mut self.codex_parent_ownership_ledgers)
     }
 
+    pub(crate) fn recovery_upload_context(&self) -> &str {
+        self.active_upload_context_fingerprint
+            .as_deref()
+            .or(self.upload_context_fingerprint.as_deref())
+            .unwrap_or("")
+    }
+
     pub fn activate_upload_context(&mut self, fingerprint: String) {
         self.active_upload_context_fingerprint = Some(fingerprint);
     }
@@ -36668,6 +36693,18 @@ impl ScanIndex {
                 birth_unix_seconds,
                 latched: claude_reemission_stop_latched(),
                 money_paused: self.active_request_money_adoption_paused,
+                unknown_outcome: self
+                    .active_request_money_support_dir
+                    .as_deref()
+                    .is_some_and(|support| {
+                        crate::snapshot_sync::unknown_recovery::blocked_file(
+                            support,
+                            &key,
+                            claude_request_money::logical_family_member(self, &key)
+                                .map(|(root, _)| root)
+                                .as_deref(),
+                        )
+                    }),
                 money_probe_due: self
                     .active_request_money_support_dir
                     .as_deref()
@@ -36824,14 +36861,66 @@ impl ScanIndex {
     /// Hook for resend paths outside the page (StateMissing #706 re-offer
     /// leases, #692 in-place resends): drop every item of a source file the
     /// history gate holds this cycle. They must call it on what they send.
-    pub(crate) fn retain_claude_history_emission_permitted(&self, items: &mut Vec<SnapshotItem>) {
+    pub(crate) fn retain_claude_history_emission_permitted<T: ClaudeHistoryEmissionItem>(
+        &self,
+        items: &mut Vec<T>,
+    ) {
         items.retain(|item| {
-            item.source_file_fingerprint
-                .as_deref()
-                .map_or(true, |fingerprint| {
-                    self.claude_history_emission_held(fingerprint).is_none()
-                })
+            item.source_file_fingerprint().map_or(true, |fingerprint| {
+                self.claude_history_emission_held(fingerprint)
+                    .map_or(true, |held| {
+                        held == HistoryHold::UnknownOutcome && item.immutable_unknown_replay()
+                    })
+            })
         });
+    }
+
+    /// Current-state half of immutable replay admission. This does not reserve
+    /// history again or grant a body-revision stamp. LiteralGuard is a separate
+    /// hard dependency, supplied by its owner after composition.
+    pub(crate) fn recovery_history_permitted(
+        &mut self,
+        support: &Path,
+        roots: &[(&str, &[String])],
+    ) -> bool {
+        self.load_claude_reemission_exclusions(support);
+        if claude_reemission_stop_latched()
+            || self.active_request_money_adoption_paused
+            || self.claude_reemission_exclusions.pauses_adoption()
+        {
+            return false;
+        }
+        for (root, files) in roots {
+            if self.claude_reemission_exclusions.protected_root(root) {
+                return false;
+            }
+            for file in *files {
+                // A missing selected file cannot lend its old reservation to
+                // another identity. Replays may not add new files or bytes.
+                let birth = self
+                    .claude_request_census
+                    .get(file)
+                    .and_then(|r| r.birth())
+                    .map(|b| b.unix_seconds);
+                if claude_history_upgrade::no_list_hold(&claude_history_upgrade::PolicyInputs {
+                    exclusions: &self.claude_reemission_exclusions,
+                    listed: false,
+                    birth_unix_seconds: birth,
+                    latched: false,
+                    money_paused: false,
+                    money_probe_due: false,
+                    unknown_outcome: false,
+                    active_revision: self.active_effective_upload_body_witness_revision,
+                    history_cutoff_unix_seconds: self.claude_history_cutoff_unix_seconds,
+                    no_list_policy: self.claude_no_list_policy,
+                })
+                .is_some()
+                {
+                    return false;
+                }
+            }
+        }
+        true
     }
 
     /// Finalize a held history file without its new bodies: an existing entry

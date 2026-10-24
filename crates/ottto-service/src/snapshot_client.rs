@@ -529,6 +529,11 @@ pub struct UploadFailureDiagnostics {
 }
 
 impl UploadFailureDiagnostics {
+    pub(crate) fn batch_http_status(&self) -> Option<u16> {
+        (self.endpoint == "snapshot_batch")
+            .then_some(self.http_status)
+            .flatten()
+    }
     fn http(
         operation: &'static str,
         endpoint: &'static str,
@@ -858,6 +863,50 @@ pub(crate) fn snapshot_ack_body_witness_version(
 }
 
 impl SnapshotBatchResponse {
+    /// Retained recovery validates the exact private manifest captured at the
+    /// original serialization boundary, never today's reconstructed bodies.
+    pub(crate) fn validate_recovery_ack<'a>(
+        &self,
+        entities: impl IntoIterator<Item = (&'a str, &'a str, Option<u64>, &'a str)>,
+        head_cas: bool,
+    ) -> Result<()> {
+        let entities = entities.into_iter().collect::<Vec<_>>();
+        if self.disabled {
+            if self.accepted != 0
+                || !self.accepted_entities.is_empty()
+                || !self.unchanged_entities.is_empty()
+                || !self.rejected_entities.is_empty()
+                || !self.conflict_entities.is_empty()
+            {
+                return Err(anyhow!("disabled recovery ACK contains entity outcomes"));
+            }
+            return Ok(());
+        }
+        if self.entity_ack_contract.as_deref() != Some(SNAPSHOT_ENTITY_ACK_CONTRACT) {
+            return Err(anyhow!("recovery requires complete entity ACK"));
+        }
+        self.validate_entity_ack_identities(entities.iter().map(|(s, f, _, _)| (*s, *f)))?;
+        self.validate_head_cas_ack(head_cas)?;
+        for reference in self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+        {
+            let (_, _, version, witness) = entities
+                .iter()
+                .find(|(s, f, _, _)| {
+                    *s == reference.source_session_id && *f == reference.snapshot_fingerprint
+                })
+                .ok_or_else(|| anyhow!("foreign recovery ACK"))?;
+            if version.is_some()
+                && (reference.body_witness_version != *version
+                    || reference.body_witness_digest.as_deref() != Some(*witness))
+            {
+                return Err(anyhow!("recovery ACK lacks exact body witness"));
+            }
+        }
+        Ok(())
+    }
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -1929,7 +1978,28 @@ impl SnapshotApiClient {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, None)
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, None, None)
+    }
+
+    pub(crate) fn recovery_origin(&self) -> &str {
+        &self.api_base_url
+    }
+
+    /// One identity POST, no auth, encoding, redirect or in-place resend.
+    /// The caller durably consumes its shared physical slot before this call.
+    pub(crate) fn upload_recovery_bytes(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+        bytes: &[u8],
+    ) -> Result<SnapshotBatchResponse> {
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(anyhow!("recovery wire body exceeds limit"));
+        }
+        #[cfg(not(test))]
+        self.require_bounded_snapshot_https()?;
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, None, Some(bytes))
     }
 
     /// Optional retry transport: fresh authority at every physical POST, one
@@ -1950,6 +2020,7 @@ impl SnapshotApiClient {
             request,
             enforce_head_cas,
             Some((budget, validate)),
+            None,
         )
     }
 
@@ -1962,6 +2033,7 @@ impl SnapshotApiClient {
             &mut crate::snapshot_retry::RetryBudget,
             &mut dyn FnMut() -> Result<()>,
         )>,
+        retained: Option<&[u8]>,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas
@@ -1969,25 +2041,35 @@ impl SnapshotApiClient {
                 .snapshots
                 .iter()
                 .any(|item| item.cache_observations.is_some());
-        let body = if retry.is_some() && enforce_head_cas {
-            crate::snapshot_retry::encode_json(
-                &request.wire_with_head_cas(),
-                crate::snapshot_retry::REQUEST_BYTES,
-            )
-        } else if retry.is_some() {
-            crate::snapshot_retry::encode_json(request, crate::snapshot_retry::REQUEST_BYTES)
-        } else if enforce_head_cas {
-            serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
+        let body = if let Some(bytes) = retained {
+            std::borrow::Cow::Borrowed(bytes)
         } else {
-            serde_json::to_vec(request).map_err(anyhow::Error::from)
-        }
-        .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+            std::borrow::Cow::Owned(
+                if retry.is_some() && enforce_head_cas {
+                    crate::snapshot_retry::encode_json(
+                        &request.wire_with_head_cas(),
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                } else if retry.is_some() {
+                    crate::snapshot_retry::encode_json(
+                        request,
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                } else if enforce_head_cas {
+                    serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
+                } else {
+                    serde_json::to_vec(request).map_err(anyhow::Error::from)
+                }
+                .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?,
+            )
+        };
         resources.serialized(body.len());
         let default_gzip = snapshot_upload_gzip_enabled();
-        let gzip_enabled = retry
-            .as_ref()
-            .map(|(budget, _)| budget.gzip_enabled(default_gzip))
-            .unwrap_or(default_gzip);
+        let gzip_enabled = retained.is_none()
+            && retry
+                .as_ref()
+                .map(|(budget, _)| budget.gzip_enabled(default_gzip))
+                .unwrap_or(default_gzip);
         let compressed = gzip_snapshot_batch(&body, gzip_enabled);
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
@@ -1996,7 +2078,19 @@ impl SnapshotApiClient {
                 let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
                 (agent, Some(timeout))
             } else {
-                (self.batch_agent.clone(), None)
+                (
+                    if retained.is_some() {
+                        ureq::AgentBuilder::new()
+                            .redirects(0)
+                            .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
+                            .timeout_read(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT)
+                            .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+                            .build()
+                    } else {
+                        self.batch_agent.clone()
+                    },
+                    None,
+                )
             };
             let request = agent
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
@@ -2043,7 +2137,7 @@ impl SnapshotApiClient {
             Ok(response) => {
                 let status = response.status();
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let decoded = if retry.is_some() {
+                let decoded = if retry.is_some() || retained.is_some() {
                     bounded_response_json(response, crate::snapshot_retry::RESPONSE_BYTES)
                 } else {
                     response
@@ -4724,6 +4818,7 @@ mod tests {
                     &request,
                     false,
                     Some((&mut budget, &mut validate)),
+                    None,
                 )
             });
             assert_eq!(result.is_err(), refuse_send);
@@ -4762,6 +4857,7 @@ mod tests {
                 Some((&mut budget, &mut || {
                     Err(anyhow!("synthetic presend refusal"))
                 })),
+                None,
             )
         });
         assert!(result.is_err());
