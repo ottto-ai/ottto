@@ -332,9 +332,12 @@ pub(crate) struct HistoryPage {
     pub(super) permitted: u64,
     /// Held candidates by (reason, list state).
     pub(super) denied: BTreeMap<(&'static str, &'static str), u64>,
+    /// Subagent members held as listed only through their family root, while
+    /// the root file is absent (StateMissing M1, SOURCE d680b524).
+    pub(super) family_closure_root_absent_excluded: u64,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, family_closure_root_absent_excluded);
 
 impl HistoryPage {
     /// Reserve this page's budget for one file. A file reserved earlier on
@@ -398,8 +401,13 @@ impl HistoryPage {
             .sum()
     }
 
+    pub(super) fn note_family_closure_root_absent(&mut self) {
+        self.family_closure_root_absent_excluded =
+            self.family_closure_root_absent_excluded.saturating_add(1);
+    }
+
     pub(super) fn any(&self) -> bool {
-        self.owed > 0 || !self.denied.is_empty()
+        self.owed > 0 || !self.denied.is_empty() || self.family_closure_root_absent_excluded > 0
     }
 
     /// `reason:list_state=count` pairs for the census line, or `none`.

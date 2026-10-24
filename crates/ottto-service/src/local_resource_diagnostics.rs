@@ -319,6 +319,37 @@ pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
         },
     );
 }
+static REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct ReemissionFamilyClosureRootAbsentExcluded {
+    claude_reemission_family_closure_root_absent_excluded: u64,
+    claude_reemission_family_closure_root_absent_excluded_total: u64,
+}
+
+/// Local counter (StateMissing M1, SOURCE d680b524): subagent members the
+/// history gate held only through their listed family root while the root
+/// file is absent. This page's count and a saturating process total. Counts
+/// only; no path, id or wire event.
+pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
+    let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_reemission_family_closure_root_absent_excluded",
+        "claude_code",
+        &ReemissionFamilyClosureRootAbsentExcluded {
+            claude_reemission_family_closure_root_absent_excluded: members,
+            claude_reemission_family_closure_root_absent_excluded_total: previous
+                .saturating_add(members),
+        },
+    );
+}
 /// Local alarm: the one-time Claude history re-read latched its stop until
 /// the daemon restarts (SOURCE Amendment 10), once when it sets and at most
 /// hourly as a reminder. Counts and hashed root refs only; no wire event.
@@ -855,6 +886,31 @@ mod tests {
             .as_u64()
             .unwrap();
         assert!(first >= 2 && second >= first + 3, "{first} {second}");
+    }
+    #[test]
+    fn family_closure_root_absent_exclusion_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_reemission_family_closure_root_absent_excluded(1);
+            claude_reemission_family_closure_root_absent_excluded(2);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_reemission_family_closure_root_absent_excluded"
+        );
+        assert_eq!(
+            lines[1]["counts"]["claude_reemission_family_closure_root_absent_excluded"],
+            2
+        );
+        let first = lines[0]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 1 && second >= first + 2, "{first} {second}");
     }
     fn max_read_counts() -> ReadCounts {
         let gate = AssessedBool {
