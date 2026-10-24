@@ -1219,10 +1219,6 @@ impl SnapshotUploadProgress {
                 progress
             }
             Ok(_) | Err(_) => {
-                #[cfg(test)]
-                if unknown_recovery::tracing_for_test() {
-                    eprintln!("MONEY_UNKNOWN_TRACE progress_load_invalid=true");
-                }
                 quarantine_invalid_progress(path)?;
                 return Ok(Self::new(
                     expected_destination_namespace_hash.to_string(),
@@ -5715,8 +5711,6 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("prepare_loaded", support_dir, &index, &upload_progress);
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
@@ -5872,8 +5866,6 @@ fn prepare_sync_source(
         upload_progress.save(&upload_progress_path)?;
     }
     drop(recovery_progress);
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("prepare_replay", support_dir, &index, &upload_progress);
     let active_legacy_reconciliation = upload_progress
         .active_quarantine_retries
         .intersection(&legacy_reconciliation_pending)
@@ -6307,8 +6299,6 @@ async fn finish_sync_source_resume(
         )
         .await
         .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
-        #[cfg(test)]
-        unknown_recovery::trace_for_test("replay_saved", support_dir, &index, &upload_progress);
     }
     codex_scan_diagnostics::after_existing_census_fence(
         source,
@@ -6554,15 +6544,6 @@ async fn finish_sync_source_resume(
         None
     };
     let retained_bodies = retained_progress.as_ref().map(|(bodies, _funds)| bodies);
-    #[cfg(test)]
-    if unknown_recovery::tracing_for_test() {
-        eprintln!(
-            "MONEY_UNKNOWN_TRACE scope_prepared={recovery_prepared} scope_count={:?}",
-            retained_bodies.map(BTreeMap::len)
-        );
-    }
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("retained_scope", support_dir, &index, &upload_progress);
     let mut current_fingerprints = index.current_snapshot_fingerprints();
     if let Some(bodies) = retained_bodies {
         current_fingerprints.extend(bodies.keys().cloned());
@@ -7154,8 +7135,6 @@ async fn finish_sync_source_resume(
         unknown_recovery::discard_unsaved_acks(support_dir);
         unknown_recovery::outcomes(support_dir).await?;
     }
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("uploaded", support_dir, &index, &upload_progress);
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
@@ -8037,11 +8016,7 @@ async fn finish_sync_source_resume(
     // A held scan can save successfully without selecting an earlier replay's
     // entity. Its ACK/hold remains the authoritative carrier until the real
     // selected-state handoff; retiring it here would force a successor POST.
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("cycle_retire_before", support_dir, &index, &upload_progress);
     upload_progress.finish_cycle_retaining(&upload_progress_path, retained_bodies)?;
-    #[cfg(test)]
-    unknown_recovery::trace_for_test("cycle_retire_after", support_dir, &index, &upload_progress);
 
     if let Some(count) = deferred_entity_count {
         let state = if held_only {

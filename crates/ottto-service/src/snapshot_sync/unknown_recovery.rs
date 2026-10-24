@@ -639,68 +639,6 @@ struct Catalog {
 }
 static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new());
 
-#[cfg(test)]
-thread_local! { static TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
-#[cfg(test)]
-pub(super) struct TraceForTest(bool);
-#[cfg(test)]
-impl TraceForTest {
-    pub fn enable() -> Self {
-        Self(TRACE.with(|flag| flag.replace(true)))
-    }
-}
-#[cfg(test)]
-impl Drop for TraceForTest {
-    fn drop(&mut self) {
-        TRACE.with(|flag| flag.set(self.0));
-    }
-}
-#[cfg(test)]
-pub(super) fn tracing_for_test() -> bool {
-    TRACE.with(std::cell::Cell::get)
-}
-#[cfg(test)]
-pub(super) fn trace_for_test(
-    phase: &str,
-    support: &Path,
-    index: &ScanIndex,
-    progress: &SnapshotUploadProgress,
-) {
-    if !tracing_for_test() {
-        return;
-    }
-    let live = money::request_owned_live(support);
-    let Ok(catalogs) = CATALOGS.lock() else {
-        return;
-    };
-    let attempts = catalogs.get(support).map(|c| c.entries.iter().take(4).map(|m| {
-        serde_json::json!({"ack":m.ack_saved,"terminal":m.terminal,"posts":m.posts,
-            "entities":m.entities.iter().take(4).map(|e| serde_json::json!({
-                "fp8":e.fingerprint.get(..8),"literal":e.literal,"files":e.files.len(),
-                "source_file":e.source_fingerprint.is_some(),
-                "family_files":index.files.keys().filter(|key|money::logical_family_member(index,key)
-                    .is_some_and(|(root,_)|root==e.root)).take(5).count(),
-                "accepted":progress.accepted_fingerprints.contains(&e.fingerprint),
-                "body":progress.accepted_body_witnesses.get(&e.fingerprint)==Some(&e.witness),
-                "retry":progress.active_quarantine_retries.contains(&e.fingerprint),
-                "quarantine":progress.quarantined_fingerprints.contains_key(&e.fingerprint),
-                "selected_accepted":index.accepted_snapshot_fingerprint_recorded(&e.fingerprint),
-                "selected_quarantine":index.quarantined_snapshot_fingerprints.contains_key(&e.fingerprint),
-                "tuples":e.files.iter().zip(&e.file_revisions).zip(&e.file_selections).take(4)
-                    .map(|((key,rev),selection)|serde_json::json!({
-                        "wanted":selection.revision,"actual":index.files.get(key).map(|f|f.effective_upload_body_witness_revision),
-                        "matches":index.selected_upload_tuple_recorded(key,rev,selection.group.as_deref(),selection.body.as_deref(),selection.revision)
-                    })).collect::<Vec<_>>()
-            })).collect::<Vec<_>>()})
-    }).collect::<Vec<_>>());
-    eprintln!(
-        "MONEY_UNKNOWN_TRACE {}",
-        serde_json::json!({"phase":phase,"live":live,"attempts":attempts,
-        "accepted":progress.accepted_fingerprints.len(),"bodies":progress.accepted_body_witnesses.len(),
-        "quarantines":progress.quarantined_fingerprints.len(),"index_files":index.files.len()})
-    );
-}
-
 /// Called before activity/token networking, including when the source's
 /// network backoff would otherwise skip its finish. Expiry does not need HTTP.
 pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
