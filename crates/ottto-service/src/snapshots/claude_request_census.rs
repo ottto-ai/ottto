@@ -5575,6 +5575,12 @@ mod phase_b_tests {
         ]);
         index.claude_request_census_shadow.derivation_drift = 7;
         let window = rfc3339_unix_seconds(WINDOW).unwrap();
+        // Keep this fixture active: main's normal 35-day retirement would
+        // otherwise remove the very duplicate hashes this control must see.
+        for entry in index.files.values_mut() {
+            entry.modified_unix_seconds = window;
+        }
+
         let observed = BTreeSet::new();
         let residue = BTreeSet::new();
         for (step, open) in [true, false, true].into_iter().enumerate() {
@@ -5672,11 +5678,16 @@ mod phase_b_tests {
                 "keys": [], "since": 7, "overflow": true, "reclaimed": 0
             }});
             let bytes = serde_json::to_vec(&value).unwrap();
+            // Pin actual loss on the original bytes. ON normalization records
+            // it on CensusRead::ambiguous_census and forwards a sanitized map,
+            // so the inner decoded census need not retain decode_lost itself.
+            let loaded = serde_json::from_slice::<ScanIndex>(&bytes).unwrap();
+            assert!(loaded.claude_request_census.decode_lost);
+
             for mut loaded in [
                 decode_index(bytes.as_slice()).unwrap(),
                 decode_bounded_index(&bytes).unwrap(),
             ] {
-                assert!(loaded.claude_request_census.decode_lost);
                 assert_eq!(
                     loaded
                         .claude_request_census
