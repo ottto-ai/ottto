@@ -1294,23 +1294,16 @@ fn the_ordinary_equivalent_is_unknown_while_failing_disabled_or_in_backoff() {
 
 #[test]
 fn run_page_hands_the_page_the_gated_ordinary_equivalent() {
-    for directive in [None, Some(Duration::from_secs(1800))] {
-        let world = World::new();
-        world
-            .cadence
-            .borrow_mut()
-            .set_server_min_interval(directive);
-        world.ordinary_page_asks(Duration::from_secs(5));
-        world.advance_to_due();
-        let mut port = FakePort::new(&world, &[End::Paused]);
-        let mut gates = FakeGates::allowed(&world);
-        let expected = world.cadence.borrow().ordinary_interval();
-        assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
-        assert_eq!(port.equivalents, vec![Some(expected)], "{directive:?}");
-        if let Some(directive) = directive {
-            assert_eq!(expected, directive);
-        }
-    }
+    // A server directive leaves no continuation due at all (the directive
+    // control above), so only the undirected cadence reaches a page here.
+    let world = World::new();
+    world.ordinary_page_asks(Duration::from_secs(5));
+    world.advance_to_due();
+    let mut port = FakePort::new(&world, &[End::Paused]);
+    let mut gates = FakeGates::allowed(&world);
+    let expected = world.cadence.borrow().ordinary_interval();
+    assert_eq!(run(&world, &mut port, &mut gates), Outcome::Paused);
+    assert_eq!(port.equivalents, vec![Some(expected)]);
 }
 
 /// K2/P-1: a ticket whose fixed lifetime ended before the page, or a clock
@@ -1887,7 +1880,8 @@ fn a_deferred_eof_commit_is_never_saved() {
         .and_then(|rest| rest.split("\n    }\n").next())
         .expect("the production deferral");
     assert!(defer.contains("drop(completion)"));
-    for forbidden in ["save", "complete_continuation_eof", "into_parts"] {
+    // The deferral's comment says nothing is saved; no save call follows.
+    for forbidden in [".save(", "save_", "complete_continuation_eof", "into_parts"] {
         assert!(!defer.contains(forbidden), "{forbidden}");
     }
     assert!(!source.contains(".save("), "the adapter saves nothing");
