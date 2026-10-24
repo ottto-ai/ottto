@@ -989,7 +989,8 @@ pub(super) fn discard_unsaved_acks(support: &Path) {
 
 pub(super) fn resolve_saved(
     support: &Path,
-    _progress: &SnapshotUploadProgress,
+    selected: &ScanIndex,
+    progress: &SnapshotUploadProgress,
     now: u64,
 ) -> Result<()> {
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
@@ -997,7 +998,18 @@ pub(super) fn resolve_saved(
         return Ok(());
     };
     for m in &mut catalog.entries {
-        if m.terminal.is_none() && m.ack_saved {
+        let selected_outcomes = m.entities.iter().all(|entity| {
+            selected.accepted_snapshot_fingerprint_recorded(&entity.fingerprint)
+                && progress.accepted_body_witnesses.get(&entity.fingerprint)
+                    == Some(&entity.witness)
+                || selected
+                    .quarantined_snapshot_fingerprints
+                    .get(&entity.fingerprint)
+                    .is_some_and(|record| {
+                        record.upload_body_witness.as_deref() == Some(entity.witness.as_str())
+                    })
+        });
+        if m.terminal.is_none() && m.ack_saved && selected_outcomes {
             // This in-memory mark is reached only AFTER ACK and selected saves.
             // Startup commits the release latch and count-only terminal receipt.
             m.terminal = Some(Reason::Resolved);

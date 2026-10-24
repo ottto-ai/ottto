@@ -1639,14 +1639,21 @@ impl SnapshotUploadProgress {
     /// semantic fingerprints mean an older accepted/quarantined progress entry
     /// could otherwise suppress the re-derived upload. Keep same-generation
     /// progress intact so page ACKs and conflict retries remain resumable.
+    #[cfg(test)]
     fn prepare_historical_replay(&mut self, generation: &str) -> bool {
+        self.prepare_historical_replay_retaining(generation, None)
+    }
+
+    fn prepare_historical_replay_retaining(
+        &mut self,
+        generation: &str,
+        retained_bodies: Option<&BTreeMap<String, String>>,
+    ) -> bool {
         if self.historical_replay_generation.as_deref() == Some(generation) {
             return false;
         }
         self.historical_replay_generation = Some(generation.to_string());
-        self.accepted_fingerprints.clear();
-        self.accepted_body_witnesses.clear();
-        self.quarantined_fingerprints.clear();
+        self.retain_recovery_outcomes(retained_bodies);
         for pending in self.pending_cache_heads.values_mut() {
             pending.settled_entities.clear();
             pending.reselected_heads.clear();
@@ -2299,22 +2306,52 @@ impl SnapshotUploadProgress {
         });
     }
 
+    #[cfg(test)]
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
+        self.finish_cycle_retaining(path, None)
+    }
+
+    fn retain_recovery_outcomes(&mut self, retained: Option<&BTreeMap<String, String>>) {
+        self.accepted_body_witnesses
+            .retain(|fp, witness| retained.is_some_and(|bodies| bodies.get(fp) == Some(witness)));
+        self.accepted_fingerprints
+            .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
+        self.quarantined_fingerprints.retain(|fp, record| {
+            retained.is_some_and(|bodies| {
+                bodies
+                    .get(fp)
+                    .is_some_and(|body| Some(body) == record.upload_body_witness.as_ref())
+            })
+        });
+    }
+
+    fn finish_cycle_retaining(
+        &mut self,
+        path: &Path,
+        retained: Option<&BTreeMap<String, String>>,
+    ) -> Result<()> {
         if self.permanent_rejections.is_empty()
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
+            && retained.map_or(true, BTreeMap::is_empty)
         {
             return self.clear(path);
         }
-        self.accepted_fingerprints.clear();
-        self.accepted_body_witnesses.clear();
+        self.accepted_body_witnesses
+            .retain(|fp, witness| retained.is_some_and(|bodies| bodies.get(fp) == Some(witness)));
+        self.accepted_fingerprints
+            .retain(|fp| self.accepted_body_witnesses.contains_key(fp));
         // A later conflict on the refused bytes is the stronger settlement
         // fact, even while the retained refusal gates its next daily offer.
         // Keep it in the same atomic ledger so an older index-only timer can
         // still be distinguished from this newer server answer on restart.
         self.quarantined_fingerprints.retain(|fingerprint, record| {
-            record.disposition == SnapshotQuarantineDisposition::RetryPending
+            retained.is_some_and(|bodies| {
+                bodies
+                    .get(fingerprint)
+                    .is_some_and(|body| Some(body) == record.upload_body_witness.as_ref())
+            }) || record.disposition == SnapshotQuarantineDisposition::RetryPending
                 && self
                     .permanent_rejections
                     .get(fingerprint)
@@ -5804,18 +5841,31 @@ fn prepare_sync_source(
         window_start_unix_seconds: reoffer_now
             .saturating_sub(receipt_window_days.saturating_mul(86_400)),
     };
+    // A replay epoch may reset disposable historical proof, but it cannot
+    // erase an immutable attempt's ACK or independent retry policy before
+    // those exact outcomes reach the selected index.
+    let recovery_progress = if source_money_resume(source, support_dir) {
+        Some(unknown_recovery::retained_progress_bodies(
+            support_dir,
+            &upload_progress,
+        )?)
+    } else {
+        None
+    };
     if prepare_upload_progress_for_cycle_with_reoffer(
         &mut upload_progress,
         &index,
         &replay_generation,
         historical_replay_pending,
         Some(&reoffer_scope),
+        recovery_progress.as_ref().map(|(bodies, _funds)| bodies),
     ) {
         // Claim the new generation before the potentially long historical
         // scan. This prevents ACKs from the prior revision from suppressing
         // identical entities and gives overlapping writers a CAS boundary.
         upload_progress.save(&upload_progress_path)?;
     }
+    drop(recovery_progress);
     let active_legacy_reconciliation = upload_progress
         .active_quarantine_retries
         .intersection(&legacy_reconciliation_pending)
@@ -7253,6 +7303,7 @@ async fn finish_sync_source_resume(
             && recovery_ack_durable
             && unknown_recovery::resolve_saved(
                 support_dir,
+                saved,
                 &upload_progress,
                 unknown_recovery::now(support_dir),
             )
@@ -7878,7 +7929,10 @@ async fn finish_sync_source_resume(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
-    upload_progress.finish_cycle(&upload_progress_path)?;
+    // A held scan can save successfully without selecting an earlier replay's
+    // entity. Its ACK/hold remains the authoritative carrier until the real
+    // selected-state handoff; retiring it here would force a successor POST.
+    upload_progress.finish_cycle_retaining(&upload_progress_path, retained_bodies)?;
 
     if let Some(count) = deferred_entity_count {
         let state = if held_only {
@@ -8007,6 +8061,7 @@ fn prepare_upload_progress_for_cycle(
         replay_generation,
         historical_replay_pending,
         None,
+        None,
     )
 }
 
@@ -8019,6 +8074,7 @@ fn prepare_upload_progress_for_cycle_with_reoffer(
     replay_generation: &str,
     historical_replay_pending: bool,
     reoffer: Option<&reason_reoffer::Scope<'_>>,
+    retained_bodies: Option<&BTreeMap<String, String>>,
 ) -> bool {
     if !historical_replay_pending {
         return upload_progress.prepare_quarantine_and_reason_retries(
@@ -8028,7 +8084,8 @@ fn prepare_upload_progress_for_cycle_with_reoffer(
     }
 
     let same_index_replay = index.historical_replay_generation_matches(replay_generation);
-    let mut progress_changed = upload_progress.prepare_historical_replay(replay_generation);
+    let mut progress_changed =
+        upload_progress.prepare_historical_replay_retaining(replay_generation, retained_bodies);
     if same_index_replay {
         progress_changed |=
             upload_progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints);
