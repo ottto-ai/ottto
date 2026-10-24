@@ -5128,7 +5128,14 @@ fn auth_start(
     authorization: &RequestAuthorization,
 ) -> Result<AuthStartResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
-    if status.account.state == LocalAccountState::Connected && status.account.user.is_some() {
+    // A connected Mac whose setup run Ottto no longer accepts can only recover
+    // through a fresh claim: Verify and `ottto doctor` tell the user to sign
+    // in, so refusing here would dead-end them. The claim keeps the bound
+    // user, and completing it for that user replaces the dead binding.
+    if status.account.state == LocalAccountState::Connected
+        && status.account.user.is_some()
+        && !daemon.connected_setup_run_needs_reconnect()?
+    {
         return Err(LocalApiError::InvalidRequest(
             "This Mac is already connected. Run `ottto account` to view it, or `ottto logout` before pairing a different account."
                 .to_string(),
@@ -14373,6 +14380,7 @@ fn verify_source_unchecked(
             if backend_error_indicates_account_gone(&error) {
                 let _ = daemon.mark_account_not_found();
             }
+            record_verify_refresh_rejection(daemon, &connection, &error);
             let result = verification_result_with_config(
                     source,
                     config,
@@ -14542,16 +14550,35 @@ fn verify_source_unchecked(
                     &failure_message,
                 )
             }
-            Err(error) => verification_result_for_backend_error_with_config(
-                source,
-                config,
-                Some(smoke_after),
-                &error,
-            ),
+            Err(error) => {
+                record_verify_refresh_rejection(daemon, &connection, &error);
+                verification_result_for_backend_error_with_config(
+                    source,
+                    config,
+                    Some(smoke_after),
+                    &error,
+                )
+            }
         }
     };
     daemon.record_verification_result(&result)?;
     Ok(result)
+}
+
+/// Record an authoritative terminal refresh answer met during Verify, the
+/// same way agent reads do (`observe_setup_run_read`), so local health stops
+/// reporting the dead run as complete and Sign-in may reconnect this Mac.
+/// Anything other than a terminal refresh rejection says nothing about the
+/// run and is ignored; an outcome for a since-replaced binding is dropped by
+/// the daemon.
+fn record_verify_refresh_rejection(
+    daemon: &LocalDaemon,
+    binding: &LocalConnectionBinding,
+    error: &LocalApiError,
+) {
+    if let Some(rejection) = terminal_refresh_rejection(error) {
+        let _ = daemon.record_setup_run_read_rejected(binding, rejection);
+    }
 }
 
 /// Re-run source verification from inside the daemon (the background
@@ -21665,6 +21692,99 @@ for line in sys.stdin:
                 if message.contains("already connected") && message.contains("ottto logout")
         ));
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+    }
+
+    #[test]
+    fn verify_of_ended_setup_run_lets_sign_in_reconnect_the_connected_mac() {
+        const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("verify-ended-setup-run");
+        let secret_root = telemetry_key_store_root("verify-ended-setup-run-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "device_test".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                sources: vec!["claude_code".to_string()],
+            })
+            .expect("persist relay device binding");
+        KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .save("device_secret_test")
+            .expect("persist relay device secret");
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let script = Arc::new(Mutex::new(SetupRunReadScript {
+            read: (401, EXPIRED),
+            refresh: (401, EXPIRED),
+        }));
+        let api_base_url = expired_setup_run_read_server(calls.clone(), script);
+        let connection = LocalConnectionBinding {
+            setup_run_id: "setup_expired".to_string(),
+            setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            machine_id: Some("machine_test".to_string()),
+            claim_code: None,
+            api_base_url,
+        };
+        FileConnectionStore::default()
+            .save(&connection)
+            .expect("persist connection binding");
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(connection));
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        // While Ottto has said nothing terminal, a connected Mac refuses a
+        // competing claim.
+        let error = auth_start(&daemon, &authorization)
+            .expect_err("healthy connected Mac refuses a new claim");
+        assert!(matches!(
+            error,
+            LocalApiError::InvalidRequest(message) if message.contains("already connected")
+        ));
+
+        // Verify meets the ended run on the device-secret refresh and records it.
+        let result =
+            verify_source(&daemon, &authorization, SourceKind::ClaudeCode, false).expect("verify");
+        assert_eq!(result.status, SourceVerificationStatus::ReconnectRequired);
+        assert!(calls
+            .lock()
+            .expect("calls lock")
+            .iter()
+            .any(|path| path.contains("/local-client/refresh")));
+        let health = daemon
+            .status("token")
+            .expect("status")
+            .canonical_health
+            .expect("canonical health");
+        assert_eq!(
+            health.account.setup_run_state,
+            ottto_protocol::LocalSetupRunState::Rejected
+        );
+
+        // Sign-in, which Verify told the user to use, may now claim over the
+        // bound account instead of dead-ending on "already connected".
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reconnect".to_string(),
+                claim_token: "token_reconnect".to_string(),
+                nonce: "nonce_reconnect".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+        let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
+        assert_eq!(response.claim_code, "claim_reconnect");
+        assert_eq!(
+            response.account.user.as_ref().map(|user| user.id.as_str()),
+            connected_account()
+                .user
+                .as_ref()
+                .map(|user| user.id.as_str()),
+            "the reconnect claim keeps the bound user"
+        );
     }
 
     /// A connected Mac with a device credential and a setup run bound to

@@ -1532,6 +1532,19 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// True when this Mac is bound to an account but has no usable setup run:
+    /// no setup-run binding is left, or Ottto's latest authoritative answer
+    /// for the binding was terminal (an ended run or a refused device
+    /// credential). Sign-in may then start a fresh claim over the bound
+    /// account; completing it for the same user replaces the binding.
+    pub(crate) fn connected_setup_run_needs_reconnect(&self) -> Result<bool, LocalApiError> {
+        if self.connection_for_authorized_client()?.is_none() {
+            return Ok(true);
+        }
+        let state = self.state()?;
+        Ok(latest_setup_run_read_rejection(&state.local_health_events).is_some())
+    }
+
     /// Clear a recorded setup-run read rejection after a successful read
     /// that started with the current binding. Only the rejection that was
     /// already current when the read started is cleared: reads of one
