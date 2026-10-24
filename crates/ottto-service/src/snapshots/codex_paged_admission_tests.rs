@@ -2313,3 +2313,98 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
         })
     });
 }
+
+// C-S1 (#660 side read x FC1): an unchanged `Bounded` parent over the
+// unpaged limit with a due side request is opened with no size refusal and
+// becomes side-planned, but #660's G4a (a side read is a singleton read)
+// exits before the G7 charge: no side read starts, no side ledger entry,
+// the request is untouched, nothing is requeued, and `oversized_file_count`
+// equals the control page's (no request). Without the scaled limits the
+// same request starts its side read, so the request itself is due.
+#[test]
+fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
+    use sampled_scan::side_ledger::{parent_of, GateOpen, LedgerKey};
+    if !layout() {
+        return;
+    }
+    const NS: u128 = 0xfc1c;
+    let fixture = Root::new(&[(SESSION, 3)]);
+    let path = fixture.file(SESSION);
+    let key = local_index_key(&path);
+    let len = fixture.len(SESSION);
+    let at = side_now(&File::open(&path).unwrap()).expect("stamp");
+    let side_page = |index: ScanIndex, cache: &Arc<SharedCache>| {
+        let mut scan = OwnedSourceScan::new(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&fixture.root),
+            index,
+            NOW,
+            BACKFILL_WINDOW_DAYS,
+            10,
+            false,
+            None,
+            &[],
+            false,
+            true,
+        )
+        .with_sampled_acquisition(Arc::clone(cache), Scope("fc1-side-fixture".into()))
+        .with_codex_side_pass(Some(CodexSidePass {
+            ns: NS,
+            gate: GateOpen {
+                side_allowed: true,
+                first_in_process: false,
+            },
+            index_path: PathBuf::from("/nonexistent/fc1-side-index.json"),
+            kind: CodexPageKind::Ordinary,
+        }));
+        for _ in 0..64 {
+            match scan.step(None) {
+                OwnedSourceScanStep::Pending(next) => scan = next,
+                OwnedSourceScanStep::Complete { index, scan, .. } => return (index, scan),
+            }
+        }
+        panic!("the page did not finish");
+    };
+    let ledger_entry = |cache: &SharedCache| {
+        cache
+            .side_ledger()
+            .get(&LedgerKey {
+                ns: NS,
+                p: parent_of(&key),
+                dev: at.dev_ino.0,
+                ino: at.dev_ino.1,
+            })
+            .copied()
+    };
+    let cache = Arc::new(SharedCache::default());
+    let (settled, first) = side_page(ScanIndex::default(), &cache);
+    assert!(!first.snapshots.is_empty(), "page 1 parsed P");
+    let request = SideRequest::created(at, len, 0, 0);
+    let mut requested = settled.clone();
+    requested
+        .codex_parent_side_requests
+        .insert(key.clone(), request);
+    // Production ordering, scaled: singleton < unpaged limit < P's length.
+    let after = with_test_unpaged_limit(len - 1, || {
+        with_test_limits(1 << 20, len - 2, 64, || {
+            let (_, control) = side_page(settled.clone(), &cache);
+            let before = counters(&cache);
+            let ((after, treated), counts) = observe(|| side_page(requested.clone(), &cache));
+            assert_eq!(counts.side_reads_started, 0, "{counts:?}");
+            assert_eq!(counts.side_reads_ended, 0, "{counts:?}");
+            assert!(ledger_entry(cache.as_ref()).is_none(), "no G7 charge");
+            assert_eq!(after.codex_parent_side_requests.get(&key), Some(&request));
+            assert!(after.codex_parent_side.is_empty());
+            assert_eq!(counters(&cache).deferred, before.deferred, "no requeue");
+            assert!(!pending(&after, &path));
+            assert_eq!(treated.oversized_file_count, control.oversized_file_count);
+            assert_eq!(treated.oversized_file_count, 0);
+            assert!(treated.snapshots.is_empty(), "main's Skip");
+            after
+        })
+    });
+    // Control: the same request at production limits starts its side read.
+    let (_, counts) = observe(|| side_page(after, &cache));
+    assert_eq!(counts.side_reads_started, 1, "{counts:?}");
+}
