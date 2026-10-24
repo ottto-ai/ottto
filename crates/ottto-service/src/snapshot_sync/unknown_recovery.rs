@@ -1639,8 +1639,9 @@ mod tests {
             store::with_ledger_for_test(&scratch, |ledger| {
                 if legacy {
                     let mut rates = [0; 32]; rates[..8].copy_from_slice(&((1_u64 << 63) | 1).to_be_bytes());
-                    assert!(ledger.put_money(format!("adopt:entity:v2:{}:rates", "aa".repeat(32)),
-                        crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt(rates, 1000)));
+                    assert_eq!(ledger.insert(format!("adopt:entity:v2:{}:rates", "aa".repeat(32)),
+                        crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt(rates, 1000)),
+                        crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored);
                 }
                 assert!(store::checkpoint_for_test(&scratch, ledger));
             }).unwrap();
