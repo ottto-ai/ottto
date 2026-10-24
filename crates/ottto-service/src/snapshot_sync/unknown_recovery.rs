@@ -1588,17 +1588,18 @@ pub(super) async fn replay_due(
                 if let Some(reason) = transition.0 {
                     let previous = progress.clone();
                     for e in &m.entities {
-                        progress.quarantine_transient_body(
-                            &e.fingerprint,
-                            &e.witness,
-                            now(support).saturating_add(1800),
-                        );
-                        if reason == Reason::VersionSkew {
-                            progress
-                                .quarantined_fingerprints
-                                .get_mut(&e.fingerprint)
-                                .unwrap()
-                                .version_skew_attempts = 1;
+                        if reason == Reason::VersionSkew && e.literal {
+                            progress.quarantine_literal_version_skew_body(
+                                &e.fingerprint,
+                                &e.witness,
+                                now(support),
+                            );
+                        } else {
+                            progress.quarantine_transient_body(
+                                &e.fingerprint,
+                                &e.witness,
+                                now(support).saturating_add(1800),
+                            );
                         }
                     }
                     if progress.save(progress_path).is_err() {

@@ -1923,6 +1923,26 @@ impl SnapshotUploadProgress {
         record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
     }
 
+    fn quarantine_literal_version_skew_body(
+        &mut self,
+        fingerprint: &str,
+        witness: &str,
+        now: u64,
+    ) -> u64 {
+        let attempts = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .map_or(1, |record| record.version_skew_attempts.saturating_add(1))
+            .min(5);
+        let delay = (1_800_u64 << (attempts - 1)).min(21_600);
+        self.quarantine_transient_body(fingerprint, witness, now.saturating_add(delay));
+        self.quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("retry inserted")
+            .version_skew_attempts = attempts;
+        delay
+    }
+
     fn quarantine_transient_body(
         &mut self,
         fingerprint: &str,
@@ -9444,19 +9464,25 @@ where
             if deferred.reason.is_some() || deferred.route_unavailable {
                 for index in indices {
                     let fp = fingerprint(&items[*index]);
-                    progress.quarantine_transient_body(
-                        fp,
-                        &body_witness(&items[*index]),
-                        deferred
-                            .not_before
-                            .max(current_unix_seconds().saturating_add(1800)),
-                    );
-                    if deferred.reason == Some(unknown_recovery::Reason::VersionSkew) {
-                        progress
-                            .quarantined_fingerprints
-                            .get_mut(fp)
-                            .unwrap()
-                            .version_skew_attempts = 1;
+                    let literal_skew = deferred.reason == Some(unknown_recovery::Reason::VersionSkew)
+                        && serde_json::to_value(&items[*index]).ok().is_some_and(|body| {
+                            body.get("usage_accounting_contract").and_then(serde_json::Value::as_str)
+                                == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                        });
+                    if literal_skew {
+                        progress.quarantine_literal_version_skew_body(
+                            fp,
+                            &body_witness(&items[*index]),
+                            current_unix_seconds(),
+                        );
+                    } else {
+                        progress.quarantine_transient_body(
+                            fp,
+                            &body_witness(&items[*index]),
+                            deferred
+                                .not_before
+                                .max(current_unix_seconds().saturating_add(1800)),
+                        );
                     }
                 }
                 persist(progress).map_err(|_| SnapshotLocalStateRejected {
@@ -9924,22 +9950,11 @@ where
                         continue;
                     }
                     let fp = fingerprint(&items[*index]);
-                    let attempts = progress
-                        .quarantined_fingerprints
-                        .get(fp)
-                        .map_or(1, |record| record.version_skew_attempts.saturating_add(1))
-                        .min(5);
-                    let delay = (1_800_u64 << (attempts - 1)).min(21_600);
-                    progress.quarantine_transient_body(
+                    let delay = progress.quarantine_literal_version_skew_body(
                         fp,
                         &body_witness(&items[*index]),
-                        current_unix_seconds().saturating_add(delay),
+                        current_unix_seconds(),
                     );
-                    let record = progress
-                        .quarantined_fingerprints
-                        .get_mut(fp)
-                        .expect("retry inserted");
-                    record.version_skew_attempts = attempts;
                     retry_after = retry_after.max(delay);
                 }
                 persist(progress).map_err(|_| {

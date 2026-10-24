@@ -3561,3 +3561,80 @@ fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
         }
     }
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+    }
+    let attempt = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    let entity = &attempt.entities[0];
+    assert!(entity.literal);
+    let progress_path = snapshot_upload_progress_path(&control.index_path);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let mut progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    // This same body already carries a version-skew hold from an earlier
+    // ordinary attempt. Its own saved retry policy survives UNKNOWN recovery.
+    progress.quarantine_transient_body(&entity.fingerprint, &entity.witness, now);
+    progress
+        .quarantined_fingerprints
+        .get_mut(&entity.fingerprint)
+        .unwrap()
+        .version_skew_attempts = 2;
+    progress.save(&progress_path).unwrap();
+    control.restart();
+    *control.server.outcome.lock().unwrap() = FinishOutcome::LiteralSkew;
+    let _clock = money::PageClockForTest::new(&control.support, now + 300);
+    control.cycle();
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert_eq!(
+        posts.len(),
+        2,
+        "no adaptive split or fallback on the retained 422"
+    );
+    assert_eq!(posts[0], posts[1]);
+    drop(posts);
+    let updated = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        updated.terminal,
+        Some(unknown_recovery::Reason::VersionSkew)
+    );
+    assert_eq!(updated.posts, 2);
+    let progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    let hold = &progress.quarantined_fingerprints[&entity.fingerprint];
+    assert_eq!(hold.version_skew_attempts, 3);
+    assert_eq!(hold.retry_after_unix_seconds, now + 300 + 7200);
+    assert!(!progress.accepted_fingerprints.contains(&entity.fingerprint));
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+}

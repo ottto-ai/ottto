@@ -13,6 +13,7 @@ enum FinishOutcome {
     },
     MoneyHeld,
     MoneyRefused,
+    LiteralSkew,
     Basis(&'static str),
     MoneyRouteUnavailable,
     Permanent,
@@ -138,6 +139,14 @@ impl FinishServer {
 
                     if let Some(hook) = post_hook.lock().unwrap().take() {
                         hook();
+                    }
+                    if matches!(outcome, FinishOutcome::LiteralSkew) {
+                        bounded_native_response(
+                            &mut stream,
+                            "422 Unprocessable Entity",
+                            r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"extra_forbidden"}]}"#,
+                        );
+                        continue;
                     }
                     if let FinishOutcome::HttpFailure {
                         status,
