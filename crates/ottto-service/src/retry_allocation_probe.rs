@@ -171,7 +171,9 @@ mod process {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    const SLOTS: usize = 65_536;
+    // Test-only pointer inventory for large old/new/checkpoint overlaps.
+    // This increases audit bookkeeping capacity, never a runtime memory cap.
+    const SLOTS: usize = 1_048_576;
     #[derive(Clone, Copy)]
     struct Entry {
         pointer: usize,
@@ -548,6 +550,22 @@ mod tests {
         assert_eq!((audit.allocations, audit.deallocations), (2, 1));
         assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
         drop(grown);
+    }
+
+    #[test]
+    fn caller_audit_tracks_more_than_legacy_pointer_capacity() {
+        let (blocks, audit) = measure_caller_thread(|| {
+            (0..80_000)
+                .map(|_| Box::new([1_u8; 16]))
+                .collect::<Vec<_>>()
+        });
+        assert_eq!(blocks.len(), 80_000);
+        assert!(audit.allocations >= 80_000);
+        assert!(audit.requested_peak_with_overlap >= 80_000 * 16);
+        assert_eq!(
+            blocks.iter().map(|block| u64::from(block[0])).sum::<u64>(),
+            80_000
+        );
     }
 
     fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {

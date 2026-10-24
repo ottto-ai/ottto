@@ -24,8 +24,7 @@ use crate::snapshots::claude_request_money::rows::ClaudeRootRows;
 use crate::snapshots::claude_request_money::store::{self, ClaudeLedger};
 use crate::snapshots::claude_request_money::{
     claude_cache_creation, claude_response_conflict_order, enable_shadow_for_test,
-    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation,
-    ClaudeMoneyTokens,
+    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation, ClaudeMoneyTokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -278,9 +277,15 @@ fn money_birth_is_carried_only_for_the_same_object() {
     let totals = census.totals_for_test();
     census.invalidate_keeping_birth_for_test(key);
     assert!(census.get(key).is_none());
-    assert!(census.record_for_test(key).unwrap().is_birth_stub_for_test());
+    assert!(census
+        .record_for_test(key)
+        .unwrap()
+        .is_birth_stub_for_test());
     assert_eq!(census.len_for_test(), 0);
-    assert!(census.totals_for_test().0 < totals.0, "the hashes are freed");
+    assert!(
+        census.totals_for_test().0 < totals.0,
+        "the hashes are freed"
+    );
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
     assert_eq!(
         census.carried_birth_for_test(key, Some(reread)),
@@ -322,7 +327,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
     let birth = parser
         .claude_opened_birth
         .expect("the test file system must report file birth");
-    assert!(parser.accumulator.claude_file_birth.is_root_with_birth_for_test());
+    assert!(parser
+        .accumulator
+        .claude_file_birth
+        .is_root_with_birth_for_test());
     let created = expected
         .created()
         .expect("created")
@@ -330,7 +338,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         .expect("after the epoch");
     assert_eq!(birth.unix_seconds, created.as_secs());
     #[cfg(unix)]
-    assert_eq!((birth.device, birth.inode), (expected.dev(), expected.ino()));
+    assert_eq!(
+        (birth.device, birth.inode),
+        (expected.dev(), expected.ino())
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -355,6 +366,7 @@ fn money_birth_floor_makes_placeholder_births_unknown() {
 /// record ever reaches D1's join, counts or member statuses.
 #[test]
 fn money_ledger_records_are_invisible_to_d1() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let root = "a1111111-1111-4111-8111-111111111111";
     let otel = telemetry_key(root);
     assert!(otel.starts_with(TELEMETRY_KEY_PREFIX));
@@ -450,6 +462,7 @@ fn money_ledger_records_are_invisible_to_d1() {
 /// record drops its hashes and keeps their count, through save and load.
 #[test]
 fn money_transcript_records_retire_after_35_days() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let window = crate::snapshots::rfc3339_unix_seconds(MONEY_WINDOW).unwrap();
     let mut index = ScanIndex::default();
     // (name, record mtime age, entry mtime age, seed, record seed)
@@ -500,7 +513,18 @@ fn money_transcript_records_retire_after_35_days() {
         assert_eq!(record.retired_for_test(), None, "{name}");
         assert_eq!(record.request_hashes_for_test(), &[1, 2, 3], "{name}");
     }
-    assert_eq!(census.hash_total_for_test(), 9);
+    assert_eq!(
+        census
+            .records()
+            .map(|(_, record)| record.request_hashes().len())
+            .sum::<usize>(),
+        9
+    );
+    assert_eq!(
+        census.hash_total_for_test(),
+        15,
+        "nine active plus six retired-safety hashes"
+    );
 }
 
 /// A telemetry record's facts for `count` synthetic rows of `session`.
@@ -531,6 +555,7 @@ fn money_facts(session: &str, count: usize) -> Box<[u8]> {
 /// insert is the exact serialized size.
 #[test]
 fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let mut census = ClaudeRequestCensus::default();
     let birth = ClaudeRequestBirth {
         unix_seconds: 1_700_000_000,
@@ -588,7 +613,12 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let otel = telemetry_key("root");
     ledger.insert_for_test(
         &otel,
-        ClaudeRequestCensusRecord::telemetry(vec![2, 3], money_facts("root", 2), tail, 1_700_000_000),
+        ClaudeRequestCensusRecord::telemetry(
+            vec![2, 3],
+            money_facts("root", 2),
+            tail,
+            1_700_000_000,
+        ),
     );
     ledger.insert_for_test(
         &message_key("/money/projects/c.jsonl"),
@@ -629,13 +659,21 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let telemetry = loaded.record_for_test(&otel).unwrap();
     assert_eq!(telemetry.tail().copied(), Some(tail));
     assert_eq!(telemetry.facts(), Some(&money_facts("root", 2)[..]));
-    let sweep = loaded.record_for_test("sweep:tail").unwrap().sweep().unwrap();
-    assert_eq!((*sweep.0, sweep.1, sweep.2.debt), ([9; 32], 1_700_000_300, 1));
-    let memo = loaded.record_for_test("fam:x").unwrap().family_memo().unwrap();
+    let sweep = loaded
+        .record_for_test("sweep:tail")
+        .unwrap()
+        .sweep()
+        .unwrap();
     assert_eq!(
-        (memo.1.removed_tokens, memo.1.snapshot),
-        (900, 5)
+        (*sweep.0, sweep.1, sweep.2.debt),
+        ([9; 32], 1_700_000_300, 1)
     );
+    let memo = loaded
+        .record_for_test("fam:x")
+        .unwrap()
+        .family_memo()
+        .unwrap();
+    assert_eq!((memo.1.removed_tokens, memo.1.snapshot), (900, 5));
     let messages = loaded
         .record_for_test(&message_key("/money/projects/c.jsonl"))
         .unwrap();
@@ -704,7 +742,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     );
     with("b-wrong-type", "b", serde_json::json!([1, 2]));
     // Facts belong to a telemetry record (with a tail).
-    with("f-without-tail", "f", serde_json::json!(encode(&money_facts("r", 2)[..])));
+    with(
+        "f-without-tail",
+        "f",
+        serde_json::json!(encode(&money_facts("r", 2)[..])),
+    );
     with("f-not-base64", "f", serde_json::json!("!!!!"));
     with("bi-negative", "bi", serde_json::json!(-1));
     with("bi-string", "bi", serde_json::json!("1"));
@@ -767,7 +809,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     for (field, value) in [("xa", 11), ("xs", 0), ("xp", 0), ("xq", 0), ("xk", 0)] {
         tail[field] = serde_json::json!(value);
     }
-    assert_eq!(money_decode_one(tail.clone()), None, "audit target past offset");
+    assert_eq!(
+        money_decode_one(tail.clone()),
+        None,
+        "audit target past offset"
+    );
     tail["xa"] = serde_json::json!(10);
     assert!(money_decode_one(tail.clone()).is_some());
     // Facts must hold exactly one fact per hash.
@@ -830,6 +876,7 @@ fn money_serialized_budget_keeps_a_tombstone_reserve() {
 /// full census under the serialized budget).
 #[test]
 fn money_census_round_trips_at_the_hash_cap() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
     let mut census = ClaudeRequestCensus::default();
     assert_eq!(
         census.insert_for_test(
@@ -935,7 +982,10 @@ impl MoneyTail {
         now: u64,
         work: &mut ClaudeLedgerWork,
         roots: &[&str],
-    ) -> (ClaudeTelemetryTailCounts, BTreeMap<String, ClaudeRootTelemetry>) {
+    ) -> (
+        ClaudeTelemetryTailCounts,
+        BTreeMap<String, ClaudeRootTelemetry>,
+    ) {
         let out = ClaudeTelemetryTail::advance(&self.support, ledger, now, budget, roots, work);
         // Moving hashes in and out never leaves the budget totals behind.
         let census = ledger.census();
@@ -1209,9 +1259,28 @@ fn money_telemetry_retires_only_under_pressure() {
             (u64::MAX - quarter as u64..u64::MAX).collect(),
         ),
     );
+    let mut main =
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            ledger.census(),
+        );
+    let oldest = telemetry_key("root-1");
+    let mut retired = main.take(&oldest).unwrap();
+    retired.retire();
+    assert_eq!(
+        main.insert_for_test(&oldest, retired),
+        ClaudeRequestCensusInsert::Stored
+    );
     assert_eq!(
         crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger, Instant::now() + Duration::from_secs(30)),
         1
+    );
+    assert_eq!(
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            ledger.census()
+        )
+        .bytes(),
+        main.bytes(),
+        "telemetry pressure retirement matches frozen-main core bytes"
     );
     // The oldest last append (root-1) went first.
     assert_eq!(
@@ -1369,7 +1438,8 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     race_reads_for_test(Some(Box::new(|path: &Path| {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         let modified = file.metadata().unwrap().modified().unwrap();
-        file.set_modified(modified + Duration::from_secs(1)).unwrap();
+        file.set_modified(modified + Duration::from_secs(1))
+            .unwrap();
     })));
     let (counts, roots) = run(&mut ledger);
     assert!(counts.files_raced >= 1, "{counts:?}");
@@ -1522,8 +1592,15 @@ fn money_lost_claims_are_durable_debt() {
         "the debt first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
-    assert_eq!(telemetry_complete_through(&loaded), 0, "no certificate covers it");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "no certificate covers it"
+    );
 
     // A sweep advance is not written while that shard's write has failed.
     save_sweep(
@@ -1540,7 +1617,10 @@ fn money_lost_claims_are_durable_debt() {
         store::save_page_for_test(&support, &mut ledger, &mut failed),
         Some((2, false, 1))
     );
-    assert_eq!(telemetry_complete_through(&store::load_for_test(&support)), 0);
+    assert_eq!(
+        telemetry_complete_through(&store::load_for_test(&support)),
+        0
+    );
 
     // Once the shard is written, the advance follows it.
     std::fs::remove_dir_all(&staged).unwrap();
@@ -1588,7 +1668,9 @@ fn money_failed_debt_meta_blocks_later_batches() {
     // A later change, queued before the first batch's result comes back.
     let other = (0..)
         .map(|number| telemetry_key(&format!("other-{number}")))
-        .find(|key| store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel))
+        .find(|key| {
+            store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel)
+        })
         .unwrap();
     let _ = ledger.insert(other.clone(), record(1));
     let second = store::take_save_for_test(&mut ledger).expect("the later batch");
@@ -1643,7 +1725,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         complete_through,
         debt: 0,
     };
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_000, sweep(1_799_000_000));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_000,
+        sweep(1_799_000_000),
+    );
     money_save_all(&support, &mut ledger);
 
     ledger.remove(&otel);
@@ -1655,7 +1743,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
     let dropped = store::take_save_for_test(&mut ledger).expect("the zero batch");
     store::restore_for_test(&mut ledger, &[&dropped]);
     // A clean sweep advances the certificate before the retry.
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_600, sweep(1_800_000_500));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_600,
+        sweep(1_800_000_500),
+    );
     let staged = store::shard_path_for_test(&support, &otel).with_extension("json.tmp");
     std::fs::create_dir_all(staged.join("blocked")).unwrap();
     let mut failed = store::WriterState::default();
@@ -1665,7 +1759,10 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         "the zero meta first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
     assert_eq!(
         telemetry_complete_through(&loaded),
         0,
@@ -1714,7 +1811,11 @@ fn money_dirty_sweep_wrap_keeps_the_certificate_zero() {
     }
     money_save_all(&tail.support, &mut ledger);
     let mut loaded = store::load_for_test(&tail.support);
-    assert_eq!(telemetry_complete_through(&loaded), 0, "a restart loads the zero");
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "a restart loads the zero"
+    );
 
     // The line completes: the next clean sweep certifies again.
     tail.append(partial, rest);
@@ -1950,7 +2051,10 @@ fn money_facts_round_trip_compactly() {
     assert!(!facts::valid(&blob, rows.len() - 1));
     assert_eq!(facts::header_of_for_test(&blob), Some(header.clone()));
     let per_row = facts::body_len(&blob) as f64 / rows.len() as f64;
-    eprintln!("MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}", rows.len());
+    eprintln!(
+        "MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}",
+        rows.len()
+    );
     assert!(per_row <= 24.0, "{per_row}");
     let hashes = (1..=rows.len() as u64).collect::<Vec<_>>();
     let record = ClaudeRequestCensusRecord::telemetry(
@@ -1990,7 +2094,10 @@ struct MoneyLedger {
 }
 
 fn money_hashes(ids: &[&str]) -> Vec<u64> {
-    let mut hashes = ids.iter().map(|id| claude_request_hash(id)).collect::<Vec<_>>();
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
     hashes.sort_unstable();
     hashes
 }
@@ -2227,15 +2334,18 @@ fn money_scope_debt_blocks_negative_membership_claims() {
     // A retained record of a member the index no longer lists (residue):
     // its ids are no holder, so it blocks too.
     let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
-    ledger.index.claude_request_census_mut_for_test().insert_for_test(
-        "/m/projects/-repo/R.jsonl",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &money_fingerprint('d'),
-            7,
-            ClaudeRequestCensusShape::Lossy,
-            vec![1],
-        ),
-    );
+    ledger
+        .index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            "/m/projects/-repo/R.jsonl",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &money_fingerprint('d'),
+                7,
+                ClaudeRequestCensusShape::Lossy,
+                vec![1],
+            ),
+        );
     assert_eq!(
         ledger.classify("req_own", &ledger.b, "B", &none),
         ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
@@ -2504,7 +2614,8 @@ fn money_rows_follow_audited_rewrites() {
     (&file).write_all(rewritten.as_bytes()).unwrap();
     // A later rewrite: its mtime moves past the last read's second.
     let modified = file.metadata().unwrap().modified().unwrap();
-    file.set_modified(modified + Duration::from_secs(5)).unwrap();
+    file.set_modified(modified + Duration::from_secs(5))
+        .unwrap();
     drop(file);
     // The tail sees the touched file; the next day's audit catches it (an
     // idle untouched sidecar waits for the 30-day sample); the tail
@@ -2531,6 +2642,10 @@ fn money_rows_follow_audited_rewrites() {
 #[test]
 #[serial_test::serial(claude_request_money_shadow)]
 fn money_m4_sized_ledger_and_page_are_measured() {
+    store::assert_main_load_admission_for_test(12 * 1024 * 1024);
+    for len in [0, 95, 96, 97, 8 * 1024 * 1024, 48 * 1024 * 1024] {
+        store::assert_main_load_admission_for_test(len);
+    }
     use crate::claude_local_otel::telemetry_tail::save_sweep;
     const FILES: usize = 11_500;
     const FILE_HASHES: u64 = 61;
@@ -2558,7 +2673,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         )
         .unwrap();
         std::fs::write(
-            store_dir.join(format!("{:x}.jsonl", sha2::Sha256::digest(session.as_bytes()))),
+            store_dir.join(format!(
+                "{:x}.jsonl",
+                sha2::Sha256::digest(session.as_bytes())
+            )),
             money_api_line(session, &request, "2026-08-02T07:00:00Z"),
         )
         .unwrap();
@@ -2733,8 +2851,16 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     store::flush();
     let counts = page(&index);
     store::flush();
-    assert_eq!(counts.ledger_loading + counts.ledger_unavailable, 0, "{counts:?}");
-    assert_eq!(counts.refused_budget + counts.refused_deadline, 0, "{counts:?}");
+    assert_eq!(
+        counts.ledger_loading + counts.ledger_unavailable,
+        0,
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.refused_budget + counts.refused_deadline,
+        0,
+        "{counts:?}"
+    );
     assert_eq!(counts.ledger_load_damaged, 0, "{counts:?}");
     assert_eq!(counts.families, sessions.len() as u64, "{counts:?}");
     eprintln!(
@@ -2757,7 +2883,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         counts.admission_bytes,
         counts.admitted_peak_bytes,
         counts.elapsed_us,
-        counts.units_counted + counts.units_removed + counts.units_undecided + counts.units_immature,
+        counts.units_counted
+            + counts.units_removed
+            + counts.units_undecided
+            + counts.units_immature,
         counts.families,
     );
     assert_eq!(reserved_for_test(), 0);
@@ -2770,6 +2899,243 @@ fn census_len(support: &Path) -> usize {
 fn census_hashes(support: &Path) -> usize {
     store::with_ledger_for_test(support, |ledger| ledger.census().hash_total_for_test())
         .unwrap_or(0)
+}
+
+/// The #722 pressure reproducer, now using actual retirement safety and
+/// bounded reclaim. The control uses main's unchanged MONEY retirement.
+/// Admission, scoped debt and completeness must remain byte-identical.
+#[test]
+fn money_retired_safety_reclaim_preserves_main_active_admission() {
+    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
+    const OLD: &str = "/money/projects/old.jsonl";
+    const CURRENT: &str = "/money/projects/current.jsonl";
+    const NEW: &str = "/money/projects/new.jsonl";
+    let half = MAX_CLAUDE_REQUEST_CENSUS_HASHES / 2;
+    let old = money_record('a', (0..half as u64).collect());
+    let current = money_record('b', (half as u64..(2 * half) as u64).collect());
+    let new = money_record('c', vec![MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64]);
+    let mut before = ClaudeRequestCensus::default();
+    assert_eq!(
+        before.insert_for_test(OLD, old.clone()),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(
+        before.insert_for_test(CURRENT, current),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(before.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+
+    // Main's retirement frees the old slots and leaves the record money-retired.
+    let mut main =
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            &before,
+        );
+    let mut retired = main.take(OLD).expect("old record");
+    retired.retire();
+    assert_eq!(retired.retired(), Some(half as u64));
+    assert!(retired.request_hashes().is_empty());
+    assert_eq!(
+        main.insert_for_test(OLD, retired),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(main.hash_total(), half);
+    assert_eq!(
+        main.insert_for_test(NEW, new.clone()),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(
+        main.get(NEW).unwrap().request_hashes(),
+        new.request_hashes()
+    );
+
+    // Actual phase-B retirement: safety stays charged, MONEY hashes empty.
+    let mut reserved = before;
+    let mut retained = reserved
+        .take(OLD)
+        .expect("retired original")
+        .with_safety_for_test();
+    retained.retire_transcript_preserving_safety();
+    assert!(retained.request_hashes().is_empty());
+    assert_eq!(retained.duplicate_safety_hashes().len(), half);
+    assert_eq!(
+        reserved.insert_for_test(OLD, retained),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert_eq!(reserved.hash_headroom(), 0);
+    assert_eq!(
+        reserved.insert_for_test(NEW, new.clone()),
+        ClaudeRequestCensusInsert::Stored
+    );
+    assert!(!reserved.get(NEW).unwrap().over_budget());
+    assert_eq!(
+        reserved.get(NEW).unwrap().request_hashes(),
+        new.request_hashes()
+    );
+    assert_eq!(
+        reserved.duplicate_safety_hashes_for_test(OLD).len(),
+        half - 1
+    );
+    assert_eq!(reserved.hash_total(), MAX_CLAUDE_REQUEST_CENSUS_HASHES);
+
+    assert_eq!(
+        crate::snapshots::claude_request_census::main_reference::MainAdmission::from_census(
+            &reserved
+        )
+        .bytes(),
+        main.bytes(),
+        "independent main admission wire bytes at full hash pressure"
+    );
+
+    // Show the resulting existing MONEY decision, not just a budget statistic.
+    let mut main_index = ScanIndex::default();
+    let mut entry = manifest_index_entry(Some("body"));
+    entry.source_file_fingerprint = money_fingerprint('c');
+    main_index.files.insert(NEW.to_owned(), entry);
+    *main_index.claude_request_census_mut_for_test() = main.into_census();
+    let mut reserved_index = main_index.clone();
+    *reserved_index.claude_request_census_mut_for_test() = reserved;
+    for (key, seed) in [(OLD, 'a'), (CURRENT, 'b')] {
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = money_fingerprint(seed);
+        main_index.files.insert(key.to_owned(), entry.clone());
+        reserved_index.files.insert(key.to_owned(), entry);
+    }
+    let ledger = ClaudeRequestCensus::default();
+    let scope = |index: &ScanIndex| {
+        let scope = ClaudeLedgerScope::build(
+            index,
+            &ledger,
+            &BTreeSet::new(),
+            &BTreeSet::from(["new", "old", "current"]),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .expect("scope admitted");
+        (
+            scope.family_complete("new"),
+            serde_json::to_vec(&scope.debt).expect("scoped MONEY debt"),
+        )
+    };
+    let main_scope = scope(&main_index);
+    assert!(main_scope.0, "main admits the active transcript");
+    assert_eq!(
+        scope(&reserved_index),
+        main_scope,
+        "MONEY completeness and scoped-debt bytes equal main"
+    );
+    assert!(!claude_census_disjointness_complete(
+        &reserved_index,
+        MONEY_WINDOW,
+        true
+    ));
+    assert_eq!(
+        claude_census_member_status(&reserved_index, NEW, MONEY_WINDOW, true),
+        ClaudeCensusMemberStatus::SafetyIncomplete
+    );
+    // A natural unchanged reparse must remain money-retired even when its
+    // reconstructed full safety set no longer fits after NEW's admission.
+    let rebuilt = money_record('a', (0..half as u64).collect());
+    let mut rebuilt = rebuilt.with_safety_for_test();
+    rebuilt.retire_transcript_preserving_safety();
+    assert_eq!(
+        reserved_index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(OLD, rebuilt),
+        ClaudeRequestCensusInsert::Stored
+    );
+    let rebuilt = reserved_index
+        .claude_request_census_for_test()
+        .get(OLD)
+        .expect("retirement survives pressure");
+    assert_eq!(rebuilt.retired(), Some(half as u64));
+    assert!(rebuilt.request_hashes().is_empty());
+    assert_eq!(
+        reserved_index
+            .claude_request_census_for_test()
+            .duplicate_safety_hashes_for_test(OLD)
+            .len(),
+        half - 1
+    );
+    assert_eq!(
+        scope(&reserved_index),
+        main_scope,
+        "reparse preserves scoped MONEY bytes"
+    );
+}
+
+/// Safety metadata and retirement must not alter unchanged MONEY selectors.
+/// Main inputs are reconstructed by the frozen main record/admission algorithm.
+#[test]
+fn money_two_owner_and_owned_after_retirement_match_frozen_main_records() {
+    use crate::snapshots::claude_request_census::main_reference::MainAdmission;
+    fn arm(shadow: bool) -> (Vec<u8>, Vec<ClaudeRequestVerdict>, BTreeSet<String>) {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(shadow);
+        let mut fixture = MoneyLedger::new(&["req_shared"], &[], &["req_shared"]);
+        fixture.claim("A", &["req_shared"], 100);
+        fixture.claim("B", &["req_shared"], 200);
+        let none = BTreeMap::new();
+        let mut outcomes = vec![
+            fixture.classify("req_shared", &fixture.a, "A", &none),
+            fixture.classify("req_shared", &fixture.b, "B", &none),
+        ];
+        assert_eq!(
+            outcomes[0],
+            ClaudeRequestVerdict::Counted(ClaudeCountedBy::TwoOwnerWinner)
+        );
+        assert_eq!(
+            outcomes[1],
+            ClaudeRequestVerdict::Removed(ClaudeRemovedBy::TwoOwnerLoser)
+        );
+        if shadow {
+            let mut retired = fixture
+                .index
+                .claude_request_census_mut_for_test()
+                .take(&fixture.a)
+                .unwrap()
+                .with_safety_for_test();
+            retired.retire_transcript_preserving_safety();
+            assert_eq!(
+                fixture
+                    .index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&fixture.a, retired),
+                ClaudeRequestCensusInsert::Stored
+            );
+        } else {
+            let mut main =
+                MainAdmission::from_census(fixture.index.claude_request_census_for_test());
+            let mut retired = main.take(&fixture.a).unwrap();
+            retired.retire();
+            assert_eq!(
+                main.insert_for_test(&fixture.a, retired),
+                ClaudeRequestCensusInsert::Stored
+            );
+            *fixture.index.claude_request_census_mut_for_test() = main.into_census();
+        }
+        fixture.ledger.remove(&telemetry_key("A"));
+        fixture.ledger.remove(&telemetry_key("B"));
+        let after = fixture.classify("req_shared", &fixture.b, "B", &none);
+        assert_eq!(after, ClaudeRequestVerdict::Counted(ClaudeCountedBy::Owned));
+        outcomes.push(after);
+        let scope = ClaudeLedgerScope::build(
+            &fixture.index,
+            &fixture.ledger,
+            &BTreeSet::from(["-repo"]),
+            &BTreeSet::from(["A", "B"]),
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+        assert!(scope.family_complete("A") && scope.family_complete("B"));
+        let retired_roots = crate::snapshots::claude_request_ledger::roots_with_retired_records(
+            fixture.index.claude_request_census_for_test(),
+        );
+        assert!(retired_roots.contains("A"));
+        (
+            serde_json::to_vec(&scope.debt).unwrap(),
+            outcomes,
+            retired_roots,
+        )
+    }
+    assert_eq!(arm(true), arm(false));
 }
 
 #[test]

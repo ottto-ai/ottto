@@ -103,6 +103,7 @@ fn apc_terminal_fixture() -> ScanIndex {
     index.claude_usage_family_pending.insert(
         APC_ROOT.to_string(),
         ClaudeUsageFamilyPending {
+            diagnostic_invalid_causes: 0,
             census_window_end: APC_WINDOW.to_string(),
             member_request_id_hashes: BTreeMap::new(),
             member_occurrences: BTreeMap::new(),
@@ -2463,6 +2464,7 @@ fn demotion_after_same_call_reproof_binds_current_witness() {
         Some(observations),
         None,
         &BTreeMap::new(),
+        None,
     );
     assert!(disposition
         .quarantined_source_session_ids
@@ -2501,6 +2503,7 @@ fn witness_removed_while_member_demotes_does_not_quarantine_index() {
         None,
         None,
         &BTreeMap::new(),
+        None,
     );
     assert!(
         !index.claude_usage_family_witnesses.contains_key(&root),

@@ -297,6 +297,7 @@ mod tests {
         index.claude_usage_family_pending.insert(
             "private-session".into(),
             super::super::ClaudeUsageFamilyPending {
+                diagnostic_invalid_causes: 0,
                 census_window_end: T0.into(),
                 member_request_id_hashes: Default::default(),
                 member_occurrences: Default::default(),
@@ -671,6 +672,7 @@ mod tests {
             plain.claude_usage_family_pending.insert(
                 "private-session".into(),
                 super::super::ClaudeUsageFamilyPending {
+                    diagnostic_invalid_causes: 0,
                     census_window_end: T0.into(),
                     member_request_id_hashes: Default::default(),
                     member_occurrences: Default::default(),

@@ -697,6 +697,7 @@ fn a_missing_foreign_or_refused_proof_installs_nothing() {
 
 fn parsed(parent: Option<&str>) -> ParsedJsonlFile {
     ParsedJsonlFile {
+        census_source_unchanged: false,
         snapshots: Vec::new(),
         report: JsonlReadReport::default(),
         recognized_usage_drop_count: 0,

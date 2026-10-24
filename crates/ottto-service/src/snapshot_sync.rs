@@ -2738,6 +2738,12 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     } else {
         committable.save(index_path)?;
     }
+    if let Some(view) = correction_scan.and_then(|scan| scan.claude_request_census_view.as_ref()) {
+        let counts = view.qualify_saved(&committable);
+        if let Ok(line) = serde_json::to_string(&counts) {
+            eprintln!("local snapshot sync: request_census partial_post_save={line}");
+        }
+    }
     Ok(committable)
 }
 
@@ -5563,6 +5569,12 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    // MONEY N3: a duplicate-key rebuild stamp is durable before this cycle's
+    // scan can re-read the transcript, so a crash cannot erase the attempt.
+    crate::snapshots::claude_request_census::persist_duplicate_rebuild_grants(
+        &mut index,
+        &index_path,
+    )?;
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
@@ -7049,6 +7061,12 @@ fn finish_sync_source(
         &manifest_window_start,
         &manifest_window_end,
     )?;
+    if let Some(view) = scan_result.claude_request_census_view.as_ref() {
+        let qualified = view.qualify_saved(&index);
+        if let Ok(line) = serde_json::to_string(&qualified) {
+            eprintln!("local snapshot sync: request_census post_save={line}");
+        }
+    }
     note_codex_side_saved(daemon, &index_path, true, side_mark);
     if upload_fully_settled
         && native_comparison_lease
