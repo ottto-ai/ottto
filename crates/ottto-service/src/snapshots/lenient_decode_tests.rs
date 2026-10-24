@@ -1139,9 +1139,14 @@ fn main_depth_resource_refuses_but_admitted_bad_grammar_still_quarantines() {
         "{\"files\":{},\"unknown\":01}",
         "{\"files\":{},\"unknown\":1e}",
     ] {
+        // Independent grammar cases each get their first rebuild; a shared
+        // checkpoint would correctly refuse the second inside the cooldown.
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-admitted-bad-grammar");
+        let path = scratch.as_ref().join("index.json");
         fs::write(&path, invalid).unwrap();
         ScanIndex::load(&path).unwrap();
         assert!(!path.exists());
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
     }
 }
 

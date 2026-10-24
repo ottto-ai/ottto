@@ -724,6 +724,40 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
         "an installed empty list paces history; the marker was not there at load"
     );
     fixture.corrupt_index();
+    let current_bytes = std::fs::read(&fixture.index_path).unwrap();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(std::fs::read(&fixture.index_path).unwrap(), current_bytes);
+    // This second incident occurs after the seven-day cooldown. Model elapsed
+    // time in the fixture's rename stamp, retaining the exact prior witness.
+    let backups = std::fs::read_dir(&fixture.base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("claude-scan-index.corrupt.")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    let prior_bytes = std::fs::read(&backups[0]).unwrap();
+    let prior_stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        - 8 * 24 * 60 * 60 * 1_000_000_000;
+    let older_backup = fixture.base.join(format!(
+        "claude-scan-index.corrupt.{}.{prior_stamp}.json",
+        std::process::id()
+    ));
+    std::fs::rename(&backups[0], &older_backup).unwrap();
+    assert_eq!(std::fs::read(&older_backup).unwrap(), prior_bytes);
     let latched = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
     assert!(latched.uploaded.is_empty(), "{:?}", latched.uploaded);
     let newcomer = "a7777777-7777-4777-8777-777777777777";
