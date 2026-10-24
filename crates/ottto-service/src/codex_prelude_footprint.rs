@@ -995,6 +995,7 @@ pub(crate) fn build_request(inputs: RequestInputs<'_>) -> Option<ContextFootprin
         skills,
         custom_agents: Vec::new(),
         mcp_tools: Vec::new(),
+        instruction_inventory: None,
     })
 }
 
