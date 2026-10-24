@@ -303,6 +303,7 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         || id_lineage(&m.id) != m.lineage
         || !valid_digest(&m.sha256)
         || !valid_digest(&m.binding)
+        || m.terminal == Some(Reason::Resolved) && !m.ack_saved
         || m.posts == 0
         || m.posts > 4
         || m.slot > 3
@@ -385,7 +386,19 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             entities: Vec::new(),
             terminal: Some(Reason::CorruptCustody),
         });
-        if m.terminal != Some(Reason::CorruptCustody) {
+        let retirement_committed = m.terminal == Some(Reason::Resolved) && m.ack_saved
+            || m.terminal.is_some()
+                && m.receipt_slot.is_some_and(|slot| {
+                    read_capped(&root.join(format!("receipt-{slot:04}.receipt")), 1024)
+                        .ok()
+                        .and_then(|bytes| serde_json::from_slice::<Receipt>(&bytes).ok())
+                        .is_some_and(|receipt| {
+                            receipt.outcome == "unknown_outcome_unresolved"
+                                && Some(receipt.reason) == m.terminal
+                                && receipt.hash8 == m.id[..8]
+                        })
+                });
+        if m.terminal != Some(Reason::CorruptCustody) && !retirement_committed {
             let bytes = read_capped(&path(root, &m.id, "body")?, BODY_MAX);
             if !bytes
                 .as_ref()
@@ -462,6 +475,10 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
     let root = dir(&support);
     let active = load(&root)?;
     prune_receipts(&root, now, unwritten_receipts(&root, &active))?;
+    if m.terminal != Some(reason) {
+        m.terminal = Some(reason);
+        write_manifest(&root, &m)?;
+    }
     let receipt = Receipt {
         outcome: if reason == Reason::Resolved {
             "resolved"
@@ -504,12 +521,21 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
     // UNKNOWN's receipt AND existing bounded release latch precede deletion.
     // Known custody instead has its saved ACK and selected-save/expiry proof.
     // A failed commit never evicts an unresolved body to admit another send.
-    for extension in ["json", "body", "json.tmp", "body.tmp"] {
+    for extension in ["body", "body.tmp", "json.tmp"] {
         match fs::remove_file(path(&root, &m.id, extension)?) {
             Ok(()) => (),
             Err(e) if e.kind() == ErrorKind::NotFound => (),
             Err(e) => return Err(e.into()),
         }
+    }
+    // Keep the authoritative retirement marker until payload deletion is
+    // durable. Restart can finish it without inventing another unresolved
+    // receipt, even if the payload is already gone.
+    sync_dir(&root)?;
+    match fs::remove_file(path(&root, &m.id, "json")?) {
+        Ok(()) => (),
+        Err(error) if error.kind() == ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
     }
     sync_dir(&root)?;
     let mut unresolved = 0_u64;
@@ -1786,6 +1812,77 @@ mod tests {
                 load(&dir(&scratch)).unwrap().is_empty(),
                 "switching back cannot reconstruct an old replay"
             );
+            forget(&scratch);
+            store::forget_for_test(&scratch);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn committed_terminal_marker_survives_a_crash_after_payload_deletion() {
+        for known in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-retirement-restart");
+            let _live = money::LiveForTest::new(&scratch);
+            store::reload_for_test(&scratch).unwrap();
+            store::with_ledger_for_test(&scratch, |ledger| {
+                assert!(store::checkpoint_for_test(&scratch, ledger));
+            })
+            .unwrap();
+            let (mut m, body) = specimen(1000);
+            m.ack_saved = known;
+            let mut m = capture(scratch.to_path_buf(), m, &body).unwrap();
+            let reason = if known {
+                Reason::Resolved
+            } else {
+                Reason::Expired
+            };
+            m.terminal = Some(reason);
+            if !known {
+                m.receipt_slot = Some(0);
+                let receipt = Receipt {
+                    outcome: "unknown_outcome_unresolved".into(),
+                    reason,
+                    entities: 1,
+                    age_hours: 24,
+                    time_day: 1,
+                    attempts: 0,
+                    hash8: m.id[..8].into(),
+                };
+                atomic(
+                    &dir(&scratch),
+                    &dir(&scratch).join("receipt-0000.receipt"),
+                    &serde_json::to_vec(&receipt).unwrap(),
+                )
+                .unwrap();
+            }
+            write_manifest(&dir(&scratch), &m).unwrap();
+            fs::remove_file(path(&dir(&scratch), &m.id, "body").unwrap()).unwrap();
+            sync_dir(&dir(&scratch)).unwrap();
+            // This is the committed deletion boundary before manifest unlink.
+            let recovered = load(&dir(&scratch)).unwrap();
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(recovered[0].terminal, Some(reason));
+            startup_ready(&scratch, &m.binding, m.deadline);
+            assert!(load(&dir(&scratch)).unwrap().is_empty());
+            let receipts = fs::read_dir(dir(&scratch))
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        == Some("receipt")
+                })
+                .count();
+            assert_eq!(
+                receipts,
+                usize::from(!known),
+                "restart cannot double-count a terminal outcome"
+            );
+            let status: serde_json::Value =
+                serde_json::from_slice(&fs::read(dir(&scratch).join("status")).unwrap()).unwrap();
+            assert_eq!(status["unknown_outcome_unresolved"], usize::from(!known));
             forget(&scratch);
             store::forget_for_test(&scratch);
         }
