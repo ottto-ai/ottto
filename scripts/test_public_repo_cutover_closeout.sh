@@ -241,16 +241,66 @@ fi
 grep -q "target origin remote is missing" /tmp/public-cutover-closeout-missing-remote.out
 git -C "$target" remote add origin git@github.com:ottto-ai/ottto.git
 
+# A committed public checkout does not track PUBLIC_EXPORT_MANIFEST.json: the
+# closeout derives the manifest facts from the target HEAD instead.
 rm "$target/PUBLIC_EXPORT_MANIFEST.json"
 if "$CLOSEOUT_SCRIPT" \
   --target-dir "$target" \
-  --report "$tmp_dir/missing-manifest-closeout.json" \
+  --report "$tmp_dir/dirty-derived-closeout.json" \
   --skip-surface-ci \
-  >/tmp/public-cutover-closeout-missing-manifest.out 2>&1; then
-  echo "Expected missing target manifest to fail closeout" >&2
+  >/tmp/public-cutover-closeout-dirty-derived.out 2>&1; then
+  echo "Expected a dirty target without a manifest to fail closeout" >&2
   exit 1
 fi
-grep -q "target is missing required public file: PUBLIC_EXPORT_MANIFEST.json" \
-  /tmp/public-cutover-closeout-missing-manifest.out
+grep -q "target has no PUBLIC_EXPORT_MANIFEST.json, so its manifest is derived from HEAD; the target must be a clean checkout" \
+  /tmp/public-cutover-closeout-dirty-derived.out
+
+git -C "$target" config gc.auto 0
+git -C "$target" config maintenance.auto false
+git -C "$target" add -A
+git -C "$target" commit -qm "public bootstrap without committed manifest"
+derived_head="$(git -C "$target" rev-parse HEAD)"
+"$CLOSEOUT_SCRIPT" \
+  --target-dir "$target" \
+  --report "$tmp_dir/derived-closeout.json" \
+  --skip-surface-ci \
+  >/tmp/public-cutover-closeout-derived.out
+grep -q "ready_to_commit=true" /tmp/public-cutover-closeout-derived.out
+grep -q "verify target self-export matches target HEAD" /tmp/public-cutover-closeout-derived.out
+python3 - "$tmp_dir/derived-closeout.json" "$apply_report" "$derived_head" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1], encoding="utf-8"))
+apply_report = json.load(open(sys.argv[2], encoding="utf-8"))
+manifest = report["manifest"]
+assert report["ready_to_commit"] is True
+assert report["target"]["head"] == sys.argv[3]
+assert report["target"]["status_count"] == 0
+assert manifest["schema_version"] == 1
+assert manifest["source_commit"] == sys.argv[3]
+assert manifest["content_sha256"] == apply_report["bundle"]["content_sha256"]
+assert manifest["output_file_count"] == apply_report["bundle"]["output_file_count"]
+assert manifest["file_record_count"] == apply_report["bundle"]["file_record_count"]
+assert manifest["file_record_count"] + 1 == manifest["output_file_count"]
+assert "scripts/" in manifest["public_roots"]
+assert report["checks"]["manifest"] == "passed"
+assert report["checks"]["skeleton"] == "passed"
+PY
+
+private_source="$tmp_dir/private-source"
+mkdir -p "$private_source/backend" "$private_source/frontend"
+git -C "$private_source" init -q
+if "$CLOSEOUT_SCRIPT" \
+  --target-dir "$target" \
+  --source-repo-root "$private_source" \
+  --report "$tmp_dir/private-derived-closeout.json" \
+  --skip-surface-ci \
+  >/tmp/public-cutover-closeout-private-derived.out 2>&1; then
+  echo "Expected private consumer closeout without a bundle manifest to fail" >&2
+  exit 1
+fi
+grep -q "private consumer contract checks need the PUBLIC_EXPORT_MANIFEST.json of an applied export bundle" \
+  /tmp/public-cutover-closeout-private-derived.out
 
 echo "public_repo_cutover_closeout tests passed"

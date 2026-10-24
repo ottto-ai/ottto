@@ -4,7 +4,7 @@ use crate::snapshots::SnapshotSource;
 use crate::LocalDaemon;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine;
-use ottto_core::{FileConnectionStore, FileDeviceStore};
+use ottto_core::{FileConnectionStore, FileDeviceStore, LocalDeviceBinding};
 use ottto_protocol::{
     LocalControlCommand, LocalControlRequest, RelayRuntimeState, RelayState, StableMessage,
 };
@@ -1221,17 +1221,42 @@ fn response_from_ureq(response: ureq::Response) -> Result<ForwardResponse> {
 
 fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<String> {
     let (device, device_secret) = load_snapshot_device_credentials()?;
+    request_relay_token(api_base_url, &device, &device_secret, source)
+}
+
+fn request_relay_token(
+    api_base_url: &str,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+) -> Result<String> {
     let url = format!(
         "{}/api/v1/telemetry/devices/{}/relay-token",
         api_base_url.trim_end_matches('/'),
         device.device_id
     );
-    let response: RelayTokenResponse = upstream_http_agent()
+    // The device secret never rides the pooled forwarding agent: that agent
+    // follows redirects. A token is issued rarely, so a fresh agent with the
+    // same timeouts and fallback resolver costs one handshake.
+    let response = crate::retry_tls::credential_agent_builder()
+        .timeout_connect(RELAY_UPSTREAM_CONNECT_TIMEOUT)
+        .timeout_read(RELAY_UPSTREAM_READ_TIMEOUT)
+        .timeout_write(RELAY_UPSTREAM_WRITE_TIMEOUT)
+        .resolver(crate::net_resilience::shared_fallback_resolver())
+        .build()
         .post(&url)
         .set("Accept", "application/json")
-        .set("X-Ottto-Device-Secret", &device_secret)
-        .send_json(relay_token_request_payload(&device, source.api_slug()))
-        .map_err(|error| anyhow!("issue relay token failed: {error}"))?
+        .set("X-Ottto-Device-Secret", device_secret)
+        .send_json(relay_token_request_payload(device, source.api_slug()))
+        .map_err(|error| anyhow!("issue relay token failed: {error}"))?;
+    // With redirects off a 3xx arrives as `Ok`; only a 2xx carries a token.
+    if !(200..300).contains(&response.status()) {
+        return Err(anyhow!(
+            "issue relay token failed: unexpected status {}",
+            response.status()
+        ));
+    }
+    let response: RelayTokenResponse = response
         .into_json()
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
     Ok(response.token)
@@ -1612,6 +1637,36 @@ mod tests {
         LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
         MachineIdentity, OperatingSystem,
     };
+
+    #[test]
+    fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let device = LocalDeviceBinding {
+            device_id: "device-synthetic".to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        };
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let secret = format!("synthetic-otlp-device-secret-{}", &status[..3]);
+            let backend = RedirectingBackend::start(status);
+            assert!(request_relay_token(
+                &backend.base_url,
+                &device,
+                &secret,
+                SnapshotSource::Codex
+            )
+            .is_err());
+            let request = backend.finish();
+            assert!(
+                request.starts_with("POST /api/v1/telemetry/devices/device-synthetic/relay-token ")
+            );
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
+    }
 
     const TOKEN: &str = "test-control-token";
 
