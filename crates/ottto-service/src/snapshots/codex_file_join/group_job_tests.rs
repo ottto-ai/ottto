@@ -1516,6 +1516,7 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
             artifacts: false,
             context_curve: false,
             index: &previous,
+            paged: false,
         })
         .unwrap();
     let no_scope = |_: &CandidateFile| None;

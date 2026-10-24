@@ -542,7 +542,6 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
-                ReadAdmission::Unpaged,
             )
             .unwrap();
             assert!(census.observed_index_keys.contains(&key));
@@ -555,6 +554,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    ReadAdmission::Unpaged,
                 )
             });
             assert!(opened.is_none());
@@ -1188,6 +1188,7 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
+                ReadAdmission::Unpaged,
             )
         });
         assert!(opened.is_none());
@@ -1276,6 +1277,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    ReadAdmission::Unpaged,
                 )
                 .is_none());
             }
