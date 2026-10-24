@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "c1bf10e1b4dc354583ef1b726f1f11b9dd306324e84724da144e85c0bc779354",
+  "content_sha256": "ba587cbb364018f4b5feffea32d302c1945159321a14f86cfc8b51f321821d70",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "bca52bd22e886293f9d0db218e2fb2e26311774e5ca2d5d1f01d979efc7d812f",
-      "size_bytes": 931843
+      "sha256": "b75ae99ffbf06eced2001565f1df2622951f0737e5aa4f9be419b5ea80100d06",
+      "size_bytes": 932125
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs",
-      "sha256": "e924adf5a064197de09785e40d339f02004ccd1c45e7d42db5123c9d4d92426c",
-      "size_bytes": 74728
+      "sha256": "59b09a597d281354a08de29c3d911a36faba0f0b41ee2c1a0e83a12dad2bf978",
+      "size_bytes": 75833
     },
     {
       "executable": false,
@@ -1588,8 +1588,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/reason_reoffer_pipeline_tests.rs",
-      "sha256": "95b3453e600eaca1b3af481e55569a46a3cf82fa1f0d2670b285a8494696b7f4",
-      "size_bytes": 83727
+      "sha256": "8412304f34ffae359e357f705bbb4d2afa244d62de80cb1e8acdbcde461a82f6",
+      "size_bytes": 85044
     },
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "22a61e0bcb5cf623f3d2ad689c74c61d12ace5b01fcb9b5669de9737b5b72b81",
-      "size_bytes": 3521680
+      "sha256": "c8960bfbe5df463fa6cace2e41b98e9fbe2b960b56e0cb42208e403f43529c8e",
+      "size_bytes": 3522643
     },
     {
       "executable": false,
@@ -1679,8 +1679,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/census_convergence_tests.rs",
-      "sha256": "7ecceed78d81deacca09d9a515fb9361131a01fcd45e7d67c6bf0953ed72a389",
-      "size_bytes": 123852
+      "sha256": "ef848cded0056e06f86315c9adb1d562339ff95ae0047daae49caaa0407377ac",
+      "size_bytes": 125293
     },
     {
       "executable": false,
@@ -5841,7 +5841,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T05:01:24+00:00",
+  "generated_at": "2026-10-24T05:33:16+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 835,
   "public_roots": [
@@ -5880,5 +5880,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "1d36563b9e373878c5a7eaaa560453512d31a858"
+  "source_commit": "cf9f6a38293380e47c66f565303f8d682ebbc8a5"
 }
