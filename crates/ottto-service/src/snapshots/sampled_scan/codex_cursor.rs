@@ -196,9 +196,16 @@ pub(in crate::snapshots) struct PageBudget {
     /// It only resumes, never ticks the cursor page clock and never counts
     /// toward E2. Inert until the continuation entry is enabled.
     continuation: bool,
+    /// Stage 1 (§6): a continuation page's ordinary interval
+    /// (StateMissing's input); `None` is unknown coverage.
+    ordinary_equivalent: Option<InlineDuration>,
+    /// Stage 1 (EOF seam): a cursor attempt committed on this scan object
+    /// and its native finish succeeded (`cursor_published`).
+    committed: bool,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
-    disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation);
+    disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation,
+    ordinary_equivalent, committed);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -215,6 +222,15 @@ pub(in crate::snapshots) enum StartPlan {
     /// generation (K7 fence): it is processed for this generation and its
     /// next large read waits for the next one, so it is not requeued.
     Fenced,
+}
+
+/// What the Stage 1 guard reads at a singleton's large start
+/// (`SharedCache::cursor_plan_paced`): the file as opened now, and the index
+/// whose receipt and replay scope keys its pace slot (`pace_key`).
+#[derive(Clone, Copy)]
+pub(in crate::snapshots) struct PaceProbe<'a> {
+    pub(in crate::snapshots) file: &'a File,
+    pub(in crate::snapshots) index: &'a ScanIndex,
 }
 
 /// Why `cursor_start` did not start a job.
@@ -301,9 +317,32 @@ impl PageBudget {
     }
 
     /// Stage 1 (E): mark this scan object a continuation page, before its
-    /// first step.
-    pub(in crate::snapshots) fn set_continuation(&mut self) {
+    /// first step, standing for `ordinary_equivalent` of the ordinary
+    /// cadence (`None`: unknown, so its resumed attempt loses acceleration).
+    pub(in crate::snapshots) fn set_continuation(
+        &mut self,
+        ordinary_equivalent: Option<std::time::Duration>,
+    ) {
         self.continuation = true;
+        self.ordinary_equivalent = ordinary_equivalent.map(InlineDuration);
+    }
+
+    /// Stage 1 (§6): the ordinary interval this continuation page stands for.
+    pub(in crate::snapshots) fn ordinary_equivalent(&self) -> Option<std::time::Duration> {
+        self.ordinary_equivalent
+            .map(|InlineDuration(duration)| duration)
+    }
+
+    /// Stage 1 (EOF seam): a cursor attempt committed here and its native
+    /// finish succeeded.
+    pub(in crate::snapshots) fn note_committed(&mut self) {
+        self.committed = true;
+    }
+
+    /// Stage 1 (EOF seam): this continuation page committed its job: the
+    /// only page StateMissing may hand to `EofCompletion::new`.
+    pub(in crate::snapshots) fn continuation_committed(&self) -> bool {
+        self.continuation && self.committed
     }
 
     /// Advance the cursor page clock once per scan object (K7, K10). The
@@ -636,9 +675,65 @@ pub(in crate::snapshots) struct JobMeta {
     /// E1: this read's withheld final record was applied at a genuine
     /// unchanged EOF on its completion step (`apply_eof_record`).
     eof_applied: bool,
+    /// Stage 1 guard (§6): this attempt's pacing facts, inline.
+    pace: JobPace,
 }
 crate::heap_layout_bound::fields!(JobMeta; key, namespace, stamp_open, started, dependencies,
-    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge, eof_applied);
+    owner, counting, fence, census_trusted, pages, unavailable_resumes, charge, eof_applied,
+    pace);
+
+/// Stage 1 guard (`stage1/c14c15-answer.md` §6): one cursor attempt's
+/// pacing facts, inline in its `JobMeta`, so the job's own walk
+/// (`paused_charge`, through `size_of_val`) charges them once; nothing here
+/// owns heap. `equiv_secs` is the attempt's ordinary-equivalent duration up
+/// to its last resumed page, kept as a checked `Duration` so an attempt with
+/// no continuation page has exactly its elapsed time. `None` is unknown
+/// coverage, which also clears `accelerate` for the rest of the attempt.
+#[derive(Clone, Copy, Debug)]
+pub(in crate::snapshots) struct JobPace {
+    /// The attempt's `PaceTable` key (`pace_key`); zero for a group job,
+    /// which is never paced and never accelerated.
+    key: [u64; 2],
+    started_mono: std::time::Instant,
+    last_page_mono: std::time::Instant,
+    equiv_secs: Option<std::time::Duration>,
+    /// The attempt may ask for continuation pages (a ticket).
+    accelerate: bool,
+}
+
+impl JobPace {
+    /// An attempt starting at `now`, with no continuation pages yet.
+    fn new(key: [u64; 2], now: std::time::Instant, accelerate: bool) -> Self {
+        Self {
+            key,
+            started_mono: now,
+            last_page_mono: now,
+            equiv_secs: Some(std::time::Duration::ZERO),
+            accelerate,
+        }
+    }
+}
+
+impl HeapLayoutBound for JobPace {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // A key, two `Instant`s, a `Duration` and a flag: nothing on the heap.
+        c.add(0)
+    }
+}
+
+/// A `Duration` held inline (no heap), for the page's ordinary equivalent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct InlineDuration(std::time::Duration);
+
+impl HeapLayoutBound for InlineDuration {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)
+    }
+}
 
 /// The counting view of `candidate`'s index entries (K8): what a fresh
 /// singleton parser would be configured with now. Recorded at job start,
@@ -1143,6 +1238,11 @@ pub(in crate::snapshots) struct Counters {
     pub(in crate::snapshots) parent_namespace_refused: u64,
     pub(in crate::snapshots) parent_restart_slot_evicted: u64,
     pub(in crate::snapshots) parent_match_unmarked: u64,
+    /// Stage 1 guard (RAM/test only; not in the diagnostics projection): a
+    /// large ordinary start deferred before its last attempt's ordinary
+    /// equivalent (§6). Owed, like any deferral: never a waiter, a skip, a
+    /// loss or a completion, and no completeness meaning.
+    pub(in crate::snapshots) deferred_paced: u64,
 }
 crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resumed,
     jobs_certified, jobs_uncertified, jobs_invalidated, jobs_member_changed, jobs_state_bound,
@@ -1153,7 +1253,7 @@ crate::heap_layout_bound::fields!(Counters; jobs_started, jobs_paused, jobs_resu
     jobs_unavailable_ended, memo_hits, memo_records, parked_hits, groups_started,
     group_memo_hits, join_in_progress_members, groups_fenced, probe_bound, join_terminal_debt,
     parent_witness_refused, parent_witness_evicted, parent_namespace_refused,
-    parent_restart_slot_evicted, parent_match_unmarked);
+    parent_restart_slot_evicted, parent_match_unmarked, deferred_paced);
 
 /// A `JoinStateBound` file waits here until its object or reduction
 /// dependencies change. Its job ran out of a build constant
@@ -1280,6 +1380,325 @@ fn bounded_insert<V>(
         }
     }
     map.insert(key.to_owned(), value);
+}
+
+/// Stage 1 guard (§6): the longest deferral a changed revision waits, in
+/// seconds (`new_off = min(1 h, equivalent)`).
+const PACE_NEW_BYTES_SECS: u32 = 3_600;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests only: this thread's pace clock, and a forced failure of every
+    /// checked elapsed-time computation (`pace_clock_failure_is_unknown`).
+    static PACE_CLOCK: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+    static PACE_CLOCK_FAIL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests only: run `body` with the pace clock at `now` (`None`: the real
+/// clock) and its checked elapsed times failing when `fail`.
+#[cfg(test)]
+pub(in crate::snapshots) fn with_pace_clock<T>(
+    now: Option<std::time::Instant>,
+    fail: bool,
+    body: impl FnOnce() -> T,
+) -> T {
+    struct Reset(Option<std::time::Instant>, bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PACE_CLOCK.with(|clock| clock.set(self.0));
+            PACE_CLOCK_FAIL.with(|failing| failing.set(self.1));
+        }
+    }
+    let _reset = Reset(
+        PACE_CLOCK.with(|clock| clock.replace(now)),
+        PACE_CLOCK_FAIL.with(|failing| failing.replace(fail)),
+    );
+    body()
+}
+
+/// The pace clock: monotonic, excluding system sleep on macOS (a sleep only
+/// lengthens a deferral).
+fn pace_now() -> std::time::Instant {
+    #[cfg(test)]
+    if let Some(now) = PACE_CLOCK.with(std::cell::Cell::get) {
+        return now;
+    }
+    std::time::Instant::now()
+}
+
+#[cfg(test)]
+fn pace_clock_failed() -> bool {
+    PACE_CLOCK_FAIL.with(std::cell::Cell::get)
+}
+
+#[cfg(not(test))]
+fn pace_clock_failed() -> bool {
+    false
+}
+
+/// Checked `later - earlier`. None (unknown coverage): a clock failure.
+fn pace_elapsed(
+    later: std::time::Instant,
+    earlier: std::time::Instant,
+) -> Option<std::time::Duration> {
+    if pace_clock_failed() {
+        return None;
+    }
+    later.checked_duration_since(earlier)
+}
+
+/// Checked `base + secs`. None (unknown coverage) only past the platform's
+/// `Instant` range, which a `u32` of seconds after a real `Instant` cannot
+/// reach on a 64-bit target; every None arm is still fail-closed.
+fn pace_after(base: std::time::Instant, secs: u32) -> Option<std::time::Instant> {
+    base.checked_add(std::time::Duration::from_secs(u64::from(secs)))
+}
+
+/// Whole seconds covering `duration` (rounded up, so narrowing never
+/// shortens a deadline). None when they do not fit a `u32` offset.
+fn pace_offset(duration: std::time::Duration) -> Option<u32> {
+    let secs = duration
+        .as_secs()
+        .checked_add(u64::from(duration.subsec_nanos() > 0))?;
+    u32::try_from(secs).ok()
+}
+
+/// The pace key of `key` (a singleton's index key) in `namespace` under the
+/// receipt and replay `scope` (`group_scope`): the first 16 bytes of a
+/// length-prefixed SHA-256 of the three. Another namespace, scope or path is
+/// another key; a collision is caught by the slot's exact object fields
+/// (`PaceTable::verdict`) and never borrows coverage.
+pub(in crate::snapshots) fn pace_key(namespace: &str, scope: &str, key: &str) -> [u64; 2] {
+    let digest = ticket_digest(
+        b"pace_key",
+        &[namespace.as_bytes(), scope.as_bytes(), key.as_bytes()],
+    );
+    let mut high = [0_u8; 8];
+    let mut low = [0_u8; 8];
+    high.copy_from_slice(&digest[..8]);
+    low.copy_from_slice(&digest[8..16]);
+    [u64::from_be_bytes(high), u64::from_be_bytes(low)]
+}
+
+/// One huge key's last attempt (§6): when it started, the revision it
+/// started on, and the offsets after `last_start` before which its next
+/// attempt may not start (`same_off` on the same revision, `new_off` on a
+/// changed one). Both are zero until the attempt's ordinary equivalent
+/// exceeds its elapsed time, which only a continuation page can make it do.
+/// The key is two `u64`s, not a `u128` (align 16 would grow the slot).
+#[derive(Clone, Debug)]
+struct PaceSlot {
+    key: [u64; 2],
+    last_start: std::time::Instant,
+    rev: OpenStamp,
+    new_off: u32,
+    same_off: u32,
+}
+
+/// Stage 1 guard state (§6, condition 4), inline in `CursorState` and so in
+/// `size_of::<SharedCache>()`: no heap, never walked. Cursor admission
+/// charges it through `bound(CursorState)` (`size_of_val`); the whole-cache
+/// bound through the `Arc`'s `size_of::<SharedCache>()`; `context_overhead`
+/// leaves it out, since its release math adds `state_for_main` beside it.
+/// `unknown_until` is the latest deadline a lossy eviction or an unknown
+/// coverage forgot: until then a key with no slot starts unaccelerated. A
+/// restart is a fresh, empty table.
+#[derive(Debug)]
+pub(in crate::snapshots) struct PaceTable {
+    slots: [Option<PaceSlot>; ROTATION_KEYS],
+    unknown_until: Option<std::time::Instant>,
+}
+
+const _: () = assert!(std::mem::size_of::<Option<PaceSlot>>() <= 96);
+const _: () = assert!(std::mem::size_of::<PaceTable>() <= 6_160);
+
+impl Default for PaceTable {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| None),
+            unknown_until: None,
+        }
+    }
+}
+
+impl HeapLayoutBound for PaceTable {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        // Fixed slots of keys, `Instant`s, `OpenStamp`s and offsets.
+        c.add(0)
+    }
+}
+
+/// The guard's start rule for one large ordinary start (§6 table).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaceVerdict {
+    /// Before the last attempt's ordinary-equivalent eligibility.
+    Defer,
+    /// Today's start; `accelerate` only with known coverage.
+    Start { accelerate: bool },
+}
+
+impl PaceTable {
+    fn position(&self, key: [u64; 2]) -> Option<usize> {
+        self.slots
+            .iter()
+            .position(|slot| slot.as_ref().is_some_and(|slot| slot.key == key))
+    }
+
+    /// When `slot` stops deferring anything. None: a clock failure.
+    fn expiry(slot: &PaceSlot) -> Option<std::time::Instant> {
+        pace_after(slot.last_start, slot.same_off.max(slot.new_off))
+    }
+
+    fn unknown_at(&self, now: std::time::Instant) -> bool {
+        self.unknown_until.is_some_and(|until| now < until)
+    }
+
+    /// Raise `unknown_until` to `until` (never lowered).
+    fn hold_unknown(&mut self, until: std::time::Instant) {
+        self.unknown_until = Some(self.unknown_until.map_or(until, |held| held.max(until)));
+    }
+
+    /// The start rule for `key`, whose file is now `rev`. A slot of another
+    /// object under the same key (a replaced file or a key collision) still
+    /// defers its changed-revision offset and then starts unaccelerated: a
+    /// mismatch never shortens a deferral and never borrows coverage. Any
+    /// clock failure is unknown coverage: today's start, unaccelerated.
+    fn verdict(&self, key: [u64; 2], rev: &OpenStamp, now: std::time::Instant) -> PaceVerdict {
+        let Some(slot) = self
+            .position(key)
+            .and_then(|index| self.slots[index].as_ref())
+        else {
+            return PaceVerdict::Start {
+                accelerate: !self.unknown_at(now),
+            };
+        };
+        let same_object = slot.rev.dev == rev.dev && slot.rev.ino == rev.ino;
+        let offset = if same_object && slot.rev == *rev {
+            slot.same_off
+        } else {
+            slot.new_off
+        };
+        match pace_after(slot.last_start, offset) {
+            Some(eligible) if now < eligible => PaceVerdict::Defer,
+            Some(_) if same_object => PaceVerdict::Start { accelerate: true },
+            // Another object: free only once the slot has expired.
+            Some(_) => PaceVerdict::Start {
+                accelerate: Self::expiry(slot).is_some_and(|expiry| now >= expiry)
+                    && !self.unknown_at(now),
+            },
+            None => PaceVerdict::Start { accelerate: false },
+        }
+    }
+
+    /// A free slot, else an expired one (lossless), else the one expiring
+    /// first, whose deadline `unknown_until` then covers (lossy). None: a
+    /// clock failure leaves no eviction provable.
+    fn place(&mut self, now: std::time::Instant) -> Option<usize> {
+        if let Some(free) = self.slots.iter().position(Option::is_none) {
+            return Some(free);
+        }
+        let mut earliest: Option<(usize, std::time::Instant)> = None;
+        for (index, slot) in self.slots.iter().enumerate() {
+            let expiry = Self::expiry(slot.as_ref()?)?;
+            if now >= expiry {
+                return Some(index);
+            }
+            if earliest.map_or(true, |(_, first)| expiry < first) {
+                earliest = Some((index, expiry));
+            }
+        }
+        let (index, expiry) = earliest?;
+        self.hold_unknown(expiry);
+        Some(index)
+    }
+
+    /// `cursor_start` success: write the attempt's slot at `now`, with zero
+    /// offsets. Its own key's slot is rewritten unless it is a live slot of
+    /// another object (then none is written). False: no slot, so the
+    /// attempt is unaccelerated.
+    fn begin(&mut self, key: [u64; 2], rev: &OpenStamp, now: std::time::Instant) -> bool {
+        let index = match self.position(key) {
+            Some(index) => {
+                let Some(slot) = self.slots[index].as_ref() else {
+                    return false;
+                };
+                let same_object = slot.rev.dev == rev.dev && slot.rev.ino == rev.ino;
+                if !same_object && !Self::expiry(slot).is_some_and(|expiry| now >= expiry) {
+                    return false;
+                }
+                index
+            }
+            None => match self.place(now) {
+                Some(index) => index,
+                None => return false,
+            },
+        };
+        self.slots[index] = Some(PaceSlot {
+            key,
+            last_start: now,
+            rev: rev.clone(),
+            new_off: 0,
+            same_off: 0,
+        });
+        true
+    }
+
+    /// At every pause and end of the attempt `pace`: rewrite its slot's
+    /// offsets from its ordinary equivalent so far (the accrued pages plus
+    /// the ordinary time since the last one): `same_off = equivalent`,
+    /// `new_off = min(1 h, equivalent)`, rounded up and never below the
+    /// recorded ones. An equivalent not above the elapsed time (no
+    /// continuation surplus) keeps them zero, so the guard never paces an
+    /// attempt that had no continuation page. Unknown coverage (a clock
+    /// failure, an overflow) forgets the slot, with `unknown_until` past its
+    /// deadline and at least the changed-revision offset ahead; returns
+    /// false then. An attempt without a slot changes nothing.
+    fn record(&mut self, pace: &JobPace, now: std::time::Instant) -> bool {
+        let Some(index) = self.slots.iter().position(|slot| {
+            slot.as_ref()
+                .is_some_and(|slot| slot.key == pace.key && slot.last_start == pace.started_mono)
+        }) else {
+            return pace.equiv_secs.is_some();
+        };
+        let equivalent = pace
+            .equiv_secs
+            .and_then(|equiv| equiv.checked_add(pace_elapsed(now, pace.last_page_mono)?));
+        let elapsed = pace_elapsed(now, pace.started_mono);
+        let offsets = equivalent.zip(elapsed).and_then(|(equivalent, elapsed)| {
+            if equivalent <= elapsed {
+                return Some((0, 0));
+            }
+            let same = pace_offset(equivalent)?;
+            Some((same, same.min(PACE_NEW_BYTES_SECS)))
+        });
+        let Some((same, new)) = offsets else {
+            let expiry = self.slots[index]
+                .take()
+                .and_then(|slot| Self::expiry(&slot));
+            for until in [expiry, pace_after(now, PACE_NEW_BYTES_SECS)]
+                .into_iter()
+                .flatten()
+            {
+                self.hold_unknown(until);
+            }
+            return false;
+        };
+        if let Some(slot) = self.slots[index].as_mut() {
+            slot.same_off = slot.same_off.max(same);
+            slot.new_off = slot.new_off.max(new);
+        }
+        true
+    }
+}
+
+impl CursorState {
+    /// `PaceTable::record` for `pace` now, under the cursor lock.
+    fn pace_record(&mut self, pace: &JobPace) -> bool {
+        self.pace.record(pace, pace_now())
+    }
 }
 
 /// One owner's L-1 provenance: (LRU tick, member keys joined by '\0').
@@ -1488,6 +1907,8 @@ pub(in crate::snapshots) struct CursorState {
     /// work due, and whether its current page reached the hook. One entry:
     /// a later namespace's due hook replaces it (under-counting only).
     proof_due: Option<(String, bool)>,
+    /// Stage 1 guard (§6): huge keys' last attempts (inline, never walked).
+    pace: PaceTable,
 }
 
 impl Default for CursorState {
@@ -1514,6 +1935,7 @@ impl Default for CursorState {
             proof_retired: RetiredProofs::default(),
             proof_rotation: Rotation::default(),
             proof_due: None,
+            pace: PaceTable::default(),
         }
     }
 }
@@ -1543,6 +1965,9 @@ impl HeapLayoutBound for CursorState {
             proof_retired: _,
             proof_rotation,
             proof_due,
+            // Stage 1 guard: inline slots and deadline, no heap; charged once
+            // through this state's `size_of_val` (`bound`).
+            pace: _,
         } = self;
         // The paused job was walked once when it paused; its charge stays
         // fixed while it sits here because nothing mutates a paused parser.
@@ -1831,19 +2256,44 @@ fn ticket_digest(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
     digest
 }
 
-/// Stage 1 (§6): whether this attempt may ask for continuation pages.
-/// `JobMeta.accelerate` lands with the guard (S1-b, after #665); until then
-/// it is unknown, and unknown never mints or readies a ticket (fail closed).
-fn accelerated(_meta: &JobMeta) -> Option<bool> {
-    None
+/// Stage 1 (§6): whether this attempt may ask for continuation pages: it
+/// started with known coverage (`PaceTable::verdict`, a recorded slot) and
+/// its coverage stayed known since. Only false ever refuses; it reads the
+/// job's own inline flag, so no lock is taken.
+fn accelerated(meta: &JobMeta) -> bool {
+    meta.pace.accelerate
 }
 
-/// Stage 1 (§6, E2): the ordinary-equivalent time one resumed page adds to
-/// its attempt (ordinary: the elapsed time; continuation: at least the
-/// ordinary interval). `JobMeta.equiv_secs` lands with the guard (S1-b);
-/// until then the coverage is unknown (`None`) and nothing accrues.
-fn accrue_equivalent(_meta: &mut JobMeta, _continuation: bool) -> Option<std::time::Duration> {
-    None
+/// Stage 1 (§6, E2): add one resumed page's ordinary-equivalent time to its
+/// attempt and return it: the elapsed time since the job's last page, or on
+/// a continuation page `max(elapsed, ordinary)`, where `ordinary` is the
+/// interval the ordinary cadence would have used for that gap (StateMissing's
+/// input; `None` is unknown). A clock failure, an overflow or an unknown
+/// interval makes the attempt's coverage unknown for good and disables its
+/// acceleration (no further ticket).
+fn accrue_equivalent(
+    meta: &mut JobMeta,
+    continuation: bool,
+    ordinary: Option<std::time::Duration>,
+) -> Option<std::time::Duration> {
+    let pace = &mut meta.pace;
+    let now = pace_now();
+    let added = pace_elapsed(now, pace.last_page_mono).and_then(|elapsed| {
+        if continuation {
+            ordinary.map(|ordinary| elapsed.max(ordinary))
+        } else {
+            Some(elapsed)
+        }
+    });
+    pace.last_page_mono = now;
+    pace.equiv_secs = pace
+        .equiv_secs
+        .zip(added)
+        .and_then(|(equiv, added)| equiv.checked_add(added));
+    if pace.equiv_secs.is_none() {
+        pace.accelerate = false;
+    }
+    pace.equiv_secs.and(added)
 }
 
 /// Why `cursor_continuation_ready` refused a ticket. Every refusal sends the
@@ -1860,7 +2310,8 @@ pub(in crate::snapshots) enum ReadyRefusal {
     Stale,
     /// The paused job belongs to another namespace.
     Foreign,
-    /// The attempt is not known to be accelerated (S1-a: always).
+    /// The attempt is not accelerated: it started without known coverage,
+    /// or its coverage became unknown.
     Unaccelerated,
 }
 
@@ -1888,7 +2339,7 @@ fn ready_job<'a>(
     if now.stamp_open != ticket.stamp_open || now.started != ticket.started {
         return Err(ReadyRefusal::Restarted);
     }
-    if accelerated(meta) != Some(true) {
+    if !accelerated(meta) {
         return Err(ReadyRefusal::Unaccelerated);
     }
     Ok(job)
@@ -1899,14 +2350,20 @@ impl SharedCache {
     /// exhausted cursor budget, taken before `CursorLease::pause` consumes
     /// it; the caller keeps it only when the pause returns `Paused`. None for
     /// a file without a cursor job, a budget not exhausted, or an attempt not
-    /// known to be accelerated (S1-a: every attempt, fail closed).
+    /// accelerated.
+    ///
+    /// Lock order (S1-b): the pause site holds no lock here. The lease is a
+    /// slot token, not a lock; `accelerated` reads the job's own flag; the one
+    /// `with_cursor` below takes only the cursor lock, with neither the
+    /// retained nor the side lock held, and calls no locking helper inside
+    /// (`CursorHeld` asserts a relock in debug builds).
     pub(in crate::snapshots) fn continuation_ticket(
         &self,
         job: &OwnedActiveFile,
         page: &PageBudget,
     ) -> Option<CodexCursorTicket> {
         let meta = job.cursor.as_ref()?;
-        if !page.cursor_exhausted(Limits::current()) || accelerated(meta) != Some(true) {
+        if !page.cursor_exhausted(Limits::current()) || !accelerated(meta) {
             return None;
         }
         let epoch = self.with_cursor(|cursor| cursor.id)?;
@@ -1943,7 +2400,7 @@ impl SharedCache {
     }
 
     /// Tests only: the ticket the paused job would carry if it were
-    /// accelerated (S1-b's `accelerate` is unknown in S1-a).
+    /// accelerated, whatever its `accelerate`.
     #[cfg(test)]
     pub(in crate::snapshots) fn paused_ticket_for_test(&self) -> Option<CodexCursorTicket> {
         self.with_cursor(|cursor| match &cursor.slot {
@@ -2039,6 +2496,7 @@ impl CursorLease {
             self.end(|cursor| {
                 cursor.counters.jobs_state_bound += 1;
                 if let Some(meta) = job.cursor.as_ref() {
+                    cursor.pace_record(&meta.pace);
                     cursor.invalidations.remove(&meta.key);
                     let used = cursor.tick();
                     // A group parks under its live member's boot stamp, the
@@ -2087,7 +2545,13 @@ impl CursorLease {
                 record_paused_charge(&mut job, credit.bytes());
                 self.store(job, credit, |counters| counters.jobs_frame_returned += 1);
             }
-            None => self.end(|cursor| cursor.counters.jobs_lost += 1),
+            None => self.end(|cursor| {
+                // Stage 1: a lost attempt keeps its equivalent (§6).
+                if let Some(meta) = job.cursor.as_ref() {
+                    cursor.pace_record(&meta.pace);
+                }
+                cursor.counters.jobs_lost += 1;
+            }),
         }
     }
 
@@ -2099,6 +2563,13 @@ impl CursorLease {
         let mut job = Some(job);
         let mut credit = Some(credit);
         self.end(|cursor| {
+            // Stage 1 (§6): every pause rewrites the attempt's pace offsets;
+            // unknown coverage disables its acceleration from here on.
+            if let Some(meta) = job.as_mut().and_then(|job| job.cursor.as_mut()) {
+                if !cursor.pace_record(&meta.pace) {
+                    meta.pace.accelerate = false;
+                }
+            }
             if matches!(cursor.slot, Slot::ActiveElsewhere { token: held } if held == token) {
                 cursor.slot = Slot::Paused(job.take().expect("job moved once"));
                 let credit = credit.take().expect("credit settled once");
@@ -2302,20 +2773,24 @@ pub(in crate::snapshots) fn finish_job(
     }
     let key = rotation_key(&meta.namespace, &meta.key);
     let mut member_changed = false;
-    let update = |cursor: &mut CursorState| match &result {
-        Ok(_) | Err(Some(PrefixRefusal::Lossy)) => {
-            cursor.invalidations.remove(&meta.key);
-            cursor.rotation.complete(&key, meta.fence.as_deref());
-            if fragment.is_some() {
-                cursor.counters.sealed_fragment_withheld += 1;
-            }
-        }
-        Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
-        Err(None) => cursor.counters.jobs_deferred_inputs += 1,
-        Err(Some(PrefixRefusal::Invalidated(_) | PrefixRefusal::Dependency)) => {
-            member_changed = invalidated(cursor, &meta.key);
-            if member_changed {
+    let update = |cursor: &mut CursorState| {
+        // Stage 1 (§6): every end rewrites the attempt's pace offsets.
+        cursor.pace_record(&meta.pace);
+        match &result {
+            Ok(_) | Err(Some(PrefixRefusal::Lossy)) => {
+                cursor.invalidations.remove(&meta.key);
                 cursor.rotation.complete(&key, meta.fence.as_deref());
+                if fragment.is_some() {
+                    cursor.counters.sealed_fragment_withheld += 1;
+                }
+            }
+            Err(Some(PrefixRefusal::AuditDue)) => cursor.counters.jobs_audit_restarted += 1,
+            Err(None) => cursor.counters.jobs_deferred_inputs += 1,
+            Err(Some(PrefixRefusal::Invalidated(_) | PrefixRefusal::Dependency)) => {
+                member_changed = invalidated(cursor, &meta.key);
+                if member_changed {
+                    cursor.rotation.complete(&key, meta.fence.as_deref());
+                }
             }
         }
     };
@@ -2653,6 +3128,8 @@ pub(in crate::snapshots) fn end_group_lease(lease: CursorLease, job: &OwnedActiv
     let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
     lease.end(|cursor| {
         if let (Some(meta), Some(rotation)) = (meta, rotation.as_ref()) {
+            // Stage 1: a group has no pace slot; this records nothing.
+            cursor.pace_record(&meta.pace);
             cursor.invalidations.remove(&meta.key);
             cursor.rotation.complete(rotation, meta.fence.as_deref());
         }
@@ -4077,11 +4554,53 @@ impl SharedCache {
         key: &str,
         fence: Option<&str>,
     ) -> StartPlan {
+        self.cursor_plan_paced(
+            page,
+            limits,
+            expected,
+            slot_free,
+            cursor_enabled,
+            namespace,
+            key,
+            fence,
+            None,
+        )
+    }
+
+    /// `cursor_plan` with the Stage 1 guard (§6) for a singleton: on an
+    /// ordinary page, a large start that rotation would grant (`Cursor`,
+    /// `expected` above the singleton budget) is deferred while its key's
+    /// last attempt's ordinary-equivalent eligibility is ahead
+    /// (`PaceTable::verdict`). A paced deferral is an ordinary `Defer`: the
+    /// caller requeues the file, owed. It is never recorded as a waiter (it
+    /// leaves `rotation.waiting`, so it blocks no turn) and is neither a
+    /// completion, a fence, a skip nor a loss; it counts `deferred_paced`.
+    /// The file's stamp is read before the cursor lock (no IO under it); an
+    /// unreadable stamp plans as today (the start then refuses it).
+    #[allow(clippy::too_many_arguments)]
+    pub(in crate::snapshots) fn cursor_plan_paced(
+        &self,
+        page: &mut PageBudget,
+        limits: Limits,
+        expected: u64,
+        slot_free: bool,
+        cursor_enabled: bool,
+        namespace: &Scope,
+        key: &str,
+        fence: Option<&str>,
+        pace: Option<PaceProbe<'_>>,
+    ) -> StartPlan {
         let plan = page.plan(limits, expected, slot_free, cursor_enabled);
         if !matches!(plan, StartPlan::Cursor | StartPlan::Defer) || expected <= limits.singleton {
             return plan;
         }
         page.note_page(self, namespace);
+        let paced = pace
+            .filter(|_| plan == StartPlan::Cursor && !page.continuation())
+            .and_then(|probe| {
+                let rev = OpenStamp::capture(probe.file).ok()?;
+                Some((pace_key(&namespace.0, &group_scope(probe.index), key), rev))
+            });
         let key = rotation_key(&namespace.0, key);
         self.with_cursor(|cursor| {
             if cursor.rotation.fenced(&key, fence) {
@@ -4096,6 +4615,13 @@ impl SharedCache {
             }
             if plan == StartPlan::Defer {
                 cursor.rotation.wait(&key);
+            }
+            if let Some((pace_key, rev)) = paced.as_ref() {
+                if cursor.pace.verdict(*pace_key, rev, pace_now()) == PaceVerdict::Defer {
+                    cursor.rotation.waiting.remove(&key);
+                    cursor.counters.deferred_paced += 1;
+                    return StartPlan::Defer;
+                }
             }
             plan
         })
@@ -4179,7 +4705,11 @@ impl SharedCache {
         let Ok(stamp_open) = OpenStamp::capture(job.parser.reader.reader.get_ref()) else {
             return Err(refuse(StartRefusal::Unstartable));
         };
-        let token = self
+        // Stage 1 guard (§6): the attempt's slot is written with the claim.
+        // It is accelerated only with known coverage and a recorded slot.
+        let pace_key = pace_key(&namespace.0, &group_scope(index), &key);
+        let now = pace_now();
+        let (token, accelerate) = self
             .with_cursor(|cursor| {
                 if !matches!(cursor.slot, Slot::Empty) {
                     return None;
@@ -4190,7 +4720,12 @@ impl SharedCache {
                 cursor.slot_key = Some(key.clone());
                 cursor.rotation.waiting.remove(&waiter);
                 cursor.counters.jobs_started += 1;
-                Some(token)
+                let known = matches!(
+                    cursor.pace.verdict(pace_key, &stamp_open, now),
+                    PaceVerdict::Start { accelerate: true }
+                );
+                let recorded = cursor.pace.begin(pace_key, &stamp_open, now);
+                Some((token, known && recorded))
             })
             .flatten()
             .ok_or(StartRefusal::Busy)?;
@@ -4215,6 +4750,7 @@ impl SharedCache {
             unavailable_resumes: 0,
             charge: None,
             eof_applied: false,
+            pace: JobPace::new(pace_key, now, accelerate),
         });
         Ok(CursorLease {
             cache: Arc::clone(self),
@@ -4307,6 +4843,8 @@ impl SharedCache {
             unavailable_resumes: 0,
             charge: None,
             eof_applied: false,
+            // Stage 1: a group is never paced or accelerated (no slot).
+            pace: JobPace::new([0; 2], pace_now(), false),
         });
         Ok(CursorLease {
             cache: Arc::clone(self),
@@ -4344,6 +4882,10 @@ impl SharedCache {
                 if live {
                     cursor.counters.namespace_busy += 1;
                     return None;
+                }
+                // Stage 1 (§6): the evicted attempt keeps its equivalent.
+                if let Some(pace) = job.cursor.as_ref().map(|meta| meta.pace) {
+                    cursor.pace_record(&pace);
                 }
                 cursor.slot = Slot::Empty;
                 cursor.slot_key = None;
@@ -4395,6 +4937,10 @@ impl SharedCache {
             .map(|meta| (rotation_key(&meta.namespace, &meta.key), meta.fence.clone()));
         let mut member_changed = false;
         lease.end(|cursor| {
+            // Stage 1 (§6): the invalidated attempt keeps its equivalent.
+            if let Some(meta) = job.cursor.as_ref() {
+                cursor.pace_record(&meta.pace);
+            }
             member_changed = invalidated(cursor, &key);
             if member_changed {
                 if let Some((waiter, fence)) = rotation.as_ref() {
@@ -4638,6 +5184,9 @@ pub(in crate::snapshots) struct ResumeContext<'a> {
     /// Stage 1 (E2): this is a continuation page; it never counts toward
     /// `UNAVAILABLE_RESUMES` and never evicts another namespace's job.
     pub(in crate::snapshots) continuation: bool,
+    /// Stage 1 (§6): the ordinary interval a continuation page stands for
+    /// (`PageBudget::ordinary_equivalent`); `None` is unknown coverage.
+    pub(in crate::snapshots) ordinary_equivalent: Option<std::time::Duration>,
 }
 
 /// How `resume_paused_job` used the page.
@@ -4712,9 +5261,9 @@ pub(in crate::snapshots) fn resume_paused_job(
         Resume::Valid => {
             if let Some(meta) = job.cursor.as_mut() {
                 meta.unavailable_resumes = 0;
-                // Stage 1 (§6): the call site of the equivalent-time
-                // accrual; its coverage is unknown until S1-b.
-                let _ = accrue_equivalent(meta, context.continuation);
+                // Stage 1 (§6): this page's ordinary-equivalent time; an
+                // unknown one disables the attempt's acceleration.
+                let _ = accrue_equivalent(meta, context.continuation, context.ordinary_equivalent);
             }
             // This page also selected the job's paths; read them once,
             // through the job, and keep them pending so the census still
@@ -4792,6 +5341,10 @@ fn end_unavailable(
     let rotation = meta.map(|meta| rotation_key(&meta.namespace, &meta.key));
     lease.end(|cursor| {
         cursor.counters.jobs_unavailable_ended += 1;
+        // Stage 1 (§6): the ended attempt keeps its equivalent.
+        if let Some(meta) = meta {
+            cursor.pace_record(&meta.pace);
+        }
         // Missing evidence is not evidence of stability: the file's count
         // of real invalidations is kept (R2-L1).
         if let (Some(meta), Some(rotation)) = (meta, rotation.as_ref()) {

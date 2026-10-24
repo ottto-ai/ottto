@@ -2376,6 +2376,7 @@ fn live_job_charge_is_estimated_between_bounded_walks() {
         unavailable_resumes: 0,
         charge: None,
         eof_applied: false,
+        pace: JobPace::new([0; 2], std::time::Instant::now(), false),
     };
     assert_eq!(meta.charge_estimate(0, 64), None, "the first step walks");
     meta.record_charge(1_000, 10, 64);
@@ -9728,7 +9729,8 @@ fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
 }
 
 /// One continuation page of the paused job whose member index keys are
-/// `members`, over `root` (`days`, `curve` as the ordinary pages used).
+/// `members`, over `root` (`days`, `curve` as the ordinary pages used),
+/// standing for `ordinary` of the ordinary cadence (§6).
 #[allow(clippy::too_many_arguments)]
 fn continuation_page_in(
     root: &Path,
@@ -9739,6 +9741,7 @@ fn continuation_page_in(
     days: u64,
     curve: bool,
     members: &BTreeSet<String>,
+    ordinary: Option<std::time::Duration>,
     tweak: impl Fn(&mut OwnedSourceScan),
 ) -> (ScanIndex, SourceScanResult) {
     let mut scan = OwnedSourceScan::new_continuation(
@@ -9750,12 +9753,15 @@ fn continuation_page_in(
         false,
         curve,
         members,
+        ordinary,
     );
     tweak(&mut scan);
     finish_page(scan.with_sampled_acquisition(Arc::clone(cache), Scope(namespace.into())))
 }
 
-/// `continuation_page_in` over a `ScanRoot` page's settings.
+/// `continuation_page_in` over a `ScanRoot` page's settings, with today's
+/// production ordinary equivalent (`None`: unknown, so the resumed attempt
+/// loses its acceleration and mints no further ticket).
 fn continuation_page(
     fixture: &ScanRoot,
     index: ScanIndex,
@@ -9772,6 +9778,7 @@ fn continuation_page(
         BACKFILL_WINDOW_DAYS,
         true,
         members,
+        None,
         tweak,
     )
 }
@@ -9853,7 +9860,10 @@ fn continuation_selects_only_job_paths_and_never_starts_attempts() {
             assert_eq!(counter(&cache, |c| c.groups_started), groups);
             assert!(pending_hint(&index, &other).is_some(), "still queued");
             assert_eq!(entry(&index), other_entry, "never read");
-            assert!(scan.continuation_ticket().is_none(), "S1-a mints none");
+            assert!(
+                scan.continuation_ticket().is_none(),
+                "an unknown ordinary equivalent ends the attempt's acceleration"
+            );
             if counter(&cache, |c| c.jobs_certified) > 0 {
                 published = Some(scan);
                 break;
@@ -9965,6 +9975,7 @@ fn continuation_prepares_no_group_attempt() {
                 7,
                 false,
                 &members,
+                None,
                 |_| {},
             );
             index = next;
@@ -10076,7 +10087,7 @@ fn waiters_keep_turn_across_continuation_pages() {
     let note = |continuation: bool| {
         let mut page = PageBudget::default();
         if continuation {
-            page.set_continuation();
+            page.set_continuation(None);
         }
         page.note_page(&cache, &scope);
         assert!(page.continuation() == continuation);
@@ -10183,10 +10194,11 @@ fn continuation_never_evicts_a_foreign_job() {
     });
 }
 
-/// §7 A: no page mints a ticket in S1-a. A paused job's attempt is not
-/// known to be accelerated (`accelerate` is S1-b), so its pause mints none;
-/// nor does a page that completes its job, an uncached page, or a page with
-/// no cursor job.
+/// §7 A: a ticket only for a paused, valid, budget-exhausted, accelerated
+/// attempt. A fresh key's attempt is accelerated, so every pause of its
+/// ordinary pages mints one (`ticket_for` reads it); the page that completes
+/// the job, an uncached page, a page whose cursor budget is not exhausted and
+/// an unaccelerated attempt mint none. Ordinary-only pages never pace.
 #[test]
 fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -10205,15 +10217,47 @@ fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
                 Slot::Empty | Slot::ActiveElsewhere { .. } => None,
             })
             .flatten();
-        assert_eq!(paused, Some(None), "accelerate is unknown");
-        assert!(scan.continuation_ticket().is_none(), "unaccelerated: none");
+        assert_eq!(paused, Some(true), "a fresh key's attempt is accelerated");
+        let minted = scan
+            .continuation_ticket()
+            .cloned()
+            .expect("paused: a ticket");
+        assert_eq!(Some(&minted), cache.paused_ticket_for_test().as_ref());
         let port = CodexCursorPort::new(Arc::clone(&cache));
-        assert_eq!(port.ticket_for(&scan), None);
+        assert_eq!(port.ticket_for(&scan), Some(minted));
+        // The pause site's own conditions, on the resumed job.
+        let (mut job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused job");
+        let limits = Limits::current();
+        let fresh = PageBudget::default();
+        let mut exhausted = PageBudget::default();
+        exhausted.charge(true, limits.cursor);
+        assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+        assert!(
+            cache.continuation_ticket(&job, &fresh).is_none(),
+            "not exhausted"
+        );
+        assert!(cache.continuation_ticket(&job, &exhausted).is_some());
+        job.cursor.as_mut().unwrap().pace.accelerate = false;
+        assert!(
+            cache.continuation_ticket(&job, &exhausted).is_none(),
+            "unaccelerated"
+        );
+        job.cursor.as_mut().unwrap().pace.accelerate = true;
+        assert!(matches!(lease.pause(job), PauseEnd::Paused));
         for _ in 0..64 {
             let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
             index = next;
-            assert!(scan.continuation_ticket().is_none());
+            assert_eq!(
+                scan.continuation_ticket().is_some(),
+                cache.paused_members_for_test().is_some(),
+                "a ticket exactly when the page paused the job: {}",
+                counters(&cache)
+            );
             if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(scan.continuation_ticket().is_none(), "completed: none");
+                assert_eq!(counter(&cache, |c| c.deferred_paced), 0);
                 return;
             }
         }
@@ -10221,9 +10265,9 @@ fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
     });
 }
 
-/// §7 ready refusals: `cursor_continuation_ready` refuses a foreign,
-/// stale or restarted ticket, and an unaccelerated attempt (unknown in
-/// S1-a, so even the exact paused attempt is refused). A refused ticket
+/// §7 ready: `cursor_continuation_ready` readies the exact paused,
+/// accelerated attempt (its members are the job's), and refuses a foreign,
+/// stale or restarted ticket and an unaccelerated attempt. A refused ticket
 /// names no members. No IO: only the cursor lock.
 #[test]
 fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
@@ -10236,11 +10280,28 @@ fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
         paused_singleton(&fixture, &cache);
         let exact = cache.paused_ticket_for_test().expect("paused job");
         let ready = |ticket: &CodexCursorTicket| cache.cursor_continuation_ready(ticket);
+        let port = CodexCursorPort::new(Arc::clone(&cache));
+        assert_eq!(ready(&exact), Ok(()));
+        let members = cache.paused_members_for_test();
+        assert!(members.is_some());
+        assert_eq!(cache.continuation_members(&exact), members);
+        assert!(port.ready(&exact));
+        assert_eq!(port.members(&exact), members);
+        let set_accelerate = |accelerate: bool| {
+            cache
+                .with_cursor(|cursor| {
+                    if let Slot::Paused(job) = &mut cursor.slot {
+                        job.cursor.as_mut().unwrap().pace.accelerate = accelerate;
+                    }
+                })
+                .unwrap();
+        };
+        set_accelerate(false);
         assert_eq!(ready(&exact), Err(ReadyRefusal::Unaccelerated));
         assert_eq!(cache.continuation_members(&exact), None);
-        let port = CodexCursorPort::new(Arc::clone(&cache));
         assert!(!port.ready(&exact));
         assert_eq!(port.members(&exact), None);
+        set_accelerate(true);
         let foreign = CodexCursorTicket {
             namespace: ticket_digest(b"namespace", &[b"other"]),
             ..exact.clone()
@@ -10291,5 +10352,802 @@ fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
             Some(std::mem::size_of::<CodexCursorTicket>()),
             "fixed-size, inline"
         );
+    });
+}
+
+// Stage 1 S1-b (`stage1/c14c15-answer.md` §6, §7 Guard row; conditions 2 and
+// 4): the accelerate guard, its pace table and their accounting.
+
+fn rev(ino: u64, extent: u64) -> OpenStamp {
+    OpenStamp {
+        dev: 1,
+        ino,
+        extent,
+        modified: (1, 0),
+        changed: (1, 0),
+    }
+}
+
+fn secs(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n)
+}
+
+/// A job's `JobMeta` around `pace` (accrual tests).
+fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
+    JobMeta {
+        key: "key".into(),
+        namespace: "namespace".into(),
+        stamp_open: OpenStamp::capture(&File::open(&temp.0).unwrap()).unwrap(),
+        started: 0,
+        dependencies: None,
+        owner: None,
+        counting: String::new(),
+        fence: None,
+        census_trusted: true,
+        pages: 1,
+        unavailable_resumes: 0,
+        charge: None,
+        eof_applied: false,
+        pace,
+    }
+}
+
+/// `key`'s attempt begun at `t0` on `rev`, whose ordinary equivalent is
+/// `equivalent` at its last page `at`, recorded there (a pause or an end).
+fn paced(
+    table: &mut PaceTable,
+    key: [u64; 2],
+    rev: &OpenStamp,
+    t0: std::time::Instant,
+    equivalent: std::time::Duration,
+    at: std::time::Instant,
+) {
+    assert!(table.begin(key, rev, t0));
+    let mut pace = JobPace::new(key, t0, true);
+    pace.equiv_secs = Some(equivalent);
+    pace.last_page_mono = at;
+    assert!(table.record(&pace, at));
+}
+
+fn offsets(table: &PaceTable, key: [u64; 2]) -> Option<(u32, u32)> {
+    let slot = table.slots[table.position(key)?].as_ref()?;
+    Some((slot.same_off, slot.new_off))
+}
+
+const START: PaceVerdict = PaceVerdict::Start { accelerate: true };
+const START_UNACCELERATED: PaceVerdict = PaceVerdict::Start { accelerate: false };
+
+/// §7 Guard: an ordinary page accrues its elapsed time; a continuation page
+/// at least the ordinary interval it stands for. The same revision then waits
+/// the whole ordinary equivalent after the attempt's start, to the second
+/// (rounded up), and no longer.
+#[test]
+fn paced_same_revision_waits_ordinary_equivalent() {
+    let temp = Temp::new("pace-same", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "scope", "/a");
+    let same = rev(7, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    with_pace_clock(Some(t0 + secs(10)), false, || {
+        assert_eq!(accrue_equivalent(&mut meta, false, None), Some(secs(10)));
+    });
+    with_pace_clock(Some(t0 + secs(20)), false, || {
+        // Ten seconds elapsed, standing for ten minutes of ordinary pages.
+        assert_eq!(
+            accrue_equivalent(&mut meta, true, Some(secs(600))),
+            Some(secs(600))
+        );
+    });
+    with_pace_clock(Some(t0 + secs(50)), false, || {
+        // An interval shorter than the gap: the gap counts.
+        assert_eq!(
+            accrue_equivalent(&mut meta, true, Some(secs(1))),
+            Some(secs(30))
+        );
+    });
+    assert!(meta.pace.accelerate);
+    assert_eq!(meta.pace.equiv_secs, Some(secs(640)));
+    // The pause half a second later records the ordinary tail too.
+    let pause = t0 + secs(50) + std::time::Duration::from_millis(500);
+    assert!(table.record(&meta.pace, pause));
+    assert_eq!(offsets(&table, key), Some((641, 641)), "rounded up");
+    assert_eq!(
+        table.verdict(key, &same, t0 + secs(640)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(key, &same, t0 + secs(641)), START);
+    // A later record of the same attempt never lowers its offsets.
+    let mut earlier = meta.pace;
+    earlier.equiv_secs = Some(secs(5));
+    assert!(table.record(&earlier, pause));
+    assert_eq!(offsets(&table, key), Some((641, 641)));
+}
+
+/// §7 Guard: a changed revision (growth, ctime) waits `min(1 h, equivalent)`;
+/// the same revision of the same attempt still waits the whole equivalent.
+#[test]
+fn paced_new_bytes_waits_min_hour_or_equivalent() {
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    let (short, long) = (pace_key("ns", "s", "/short"), pace_key("ns", "s", "/long"));
+    paced(&mut table, short, &rev(1, 100), t0, secs(600), t0 + secs(5));
+    paced(
+        &mut table,
+        long,
+        &rev(2, 100),
+        t0,
+        secs(7_200),
+        t0 + secs(5),
+    );
+    assert_eq!(offsets(&table, short), Some((600, 600)));
+    assert_eq!(offsets(&table, long), Some((7_200, 3_600)));
+    let grown = rev(1, 200);
+    assert_eq!(
+        table.verdict(short, &grown, t0 + secs(599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(short, &grown, t0 + secs(600)), START);
+    let long_grown = rev(2, 200);
+    assert_eq!(
+        table.verdict(long, &long_grown, t0 + secs(3_599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(long, &long_grown, t0 + secs(3_600)), START);
+    let mut touched = rev(2, 100);
+    touched.changed = (2, 0);
+    assert_eq!(
+        table.verdict(long, &touched, t0 + secs(3_600)),
+        START,
+        "ctime"
+    );
+    assert_eq!(
+        table.verdict(long, &rev(2, 100), t0 + secs(3_600)),
+        PaceVerdict::Defer,
+        "no new bytes: the whole equivalent"
+    );
+    assert_eq!(table.verdict(long, &rev(2, 100), t0 + secs(7_200)), START);
+}
+
+/// §7 Guard: an attempt with no continuation page is never paced (its
+/// equivalent is its elapsed time, exactly), and an unaccelerated attempt has
+/// no ticket, so no continuation page: today's cadence either way.
+#[test]
+fn unaccelerated_attempt_is_never_paced() {
+    let temp = Temp::new("pace-ordinary", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let same = rev(1, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    for page in 1..=3 {
+        let at = t0 + std::time::Duration::from_millis(1_500 * page);
+        with_pace_clock(Some(at), false, || {
+            accrue_equivalent(&mut meta, false, None).expect("known");
+        });
+    }
+    assert!(table.record(&meta.pace, t0 + secs(7)));
+    assert_eq!(offsets(&table, key), Some((0, 0)), "no surplus, no pacing");
+    assert_eq!(table.verdict(key, &same, t0 + secs(7)), START);
+    // An unaccelerated start (coverage lost to an eviction) is today's start;
+    // its ordinary pages leave zero offsets too.
+    table.unknown_until = Some(t0 + secs(100));
+    let other = pace_key("ns", "s", "/b");
+    assert_eq!(
+        table.verdict(other, &rev(2, 1), t0 + secs(8)),
+        START_UNACCELERATED
+    );
+    assert!(table.begin(other, &rev(2, 1), t0 + secs(8)));
+    let pace = JobPace::new(other, t0 + secs(8), false);
+    assert!(table.record(&pace, t0 + secs(9)));
+    assert_eq!(offsets(&table, other), Some((0, 0)));
+    assert_ne!(
+        table.verdict(other, &rev(2, 1), t0 + secs(9)),
+        PaceVerdict::Defer
+    );
+}
+
+/// §7 Guard, through the scan: an accelerated attempt that took a
+/// continuation page standing for ten minutes, then was lost (its
+/// equivalent kept), is not restarted on the same revision before that
+/// equivalent. The paced deferral leaves the file pending (owed), and is not
+/// a waiter (it blocks no other file's turn), a completion, a fence or a
+/// loss. Once eligible, the restart is accelerated again.
+#[test]
+fn paced_defer_is_pending_not_waiter_not_fenced() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let waiter = rotation_key("cursor-fixture", &local_index_key(&path));
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (index, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        let (index, scan) = with_pace_clock(Some(t0 + secs(1)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_some(),
+            "a known equivalent keeps the attempt accelerated: {}",
+            counters(&cache)
+        );
+        // The stale job is evicted (lost); its equivalent stays recorded.
+        with_pace_clock(Some(t0 + secs(2)), false, || {
+            cache
+                .with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES)
+                .unwrap();
+            assert!(cache.cursor_resume(&Scope("other".into()), false).is_none());
+        });
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        cache
+            .with_cursor(|cursor| cursor.rotation.wait(&waiter))
+            .unwrap();
+        let (index, _) = with_pace_clock(Some(t0 + secs(3)), false, || {
+            page(&fixture, index, Some(Arc::clone(&cache)))
+        });
+        let now = cache.counters_for_test();
+        assert_eq!(now.deferred_paced, 1, "{now:?}");
+        assert_eq!(now.jobs_started, 1, "{now:?}");
+        assert_eq!(now.deferred_next_generation, 0, "not fenced: {now:?}");
+        assert_eq!(now.jobs_lost, 1, "not a loss: {now:?}");
+        assert_eq!(now.jobs_certified + now.jobs_uncertified, 0, "{now:?}");
+        assert!(pending_hint(&index, &path).is_some(), "owed: still pending");
+        cache
+            .with_cursor(|cursor| {
+                assert!(
+                    !cursor.rotation.waiting.contains_key(&waiter),
+                    "not a waiter"
+                );
+                assert!(cursor.rotation.turn("cursor-fixture\0/another"));
+                assert!(
+                    !cursor.rotation.attempted.contains_key(&waiter),
+                    "not fenced"
+                );
+                assert!(
+                    !cursor.rotation.served.contains_key(&waiter),
+                    "not completed"
+                );
+            })
+            .unwrap();
+        assert!(cache.cursor_slot_free());
+        // Eligible after the recorded equivalent (601 s from the start).
+        with_pace_clock(Some(t0 + secs(601)), false, || {
+            page(&fixture, index, Some(Arc::clone(&cache)))
+        });
+        let now = cache.counters_for_test();
+        assert_eq!(now.deferred_paced, 1, "{now:?}");
+        assert_eq!(now.jobs_started, 2, "{now:?}");
+        let accelerated = cache
+            .with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => job.cursor.as_ref().map(accelerated),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+            })
+            .flatten();
+        assert_eq!(accelerated, Some(true), "{now:?}");
+    });
+}
+
+/// §7 Guard, condition 4: a full table places in a free slot, else an
+/// expired one (lossless: `unknown_until` untouched), else evicts the slot
+/// expiring first and holds `unknown_until` at its deadline: until then a key
+/// with no slot (the evicted one included) starts unaccelerated, while keys
+/// with slots keep their coverage. Later evictions never lower the hold.
+#[test]
+fn pace_lossy_eviction_disables_acceleration_until_expiry() {
+    let t0 = std::time::Instant::now();
+    let keys = (0..ROTATION_KEYS)
+        .map(|i| pace_key("ns", "s", &format!("/{i}")))
+        .collect::<Vec<_>>();
+    let full = || {
+        let mut table = PaceTable::default();
+        for (i, key) in keys.iter().enumerate() {
+            paced(
+                &mut table,
+                *key,
+                &rev(i as u64 + 1, 10),
+                t0,
+                secs(1_000 + i as u64),
+                t0,
+            );
+        }
+        assert!(table.slots.iter().all(Option::is_some));
+        table
+    };
+    // Expired-slot reuse: keys 0..=2 have expired by t0 + 1002 s.
+    let mut table = full();
+    let fresh = pace_key("ns", "s", "/fresh");
+    assert!(table.begin(fresh, &rev(900, 1), t0 + secs(1_002)));
+    assert_eq!(table.unknown_until, None, "lossless");
+    assert!(table.position(keys[0]).is_none() && table.position(fresh).is_some());
+    // Overflow: nothing expired, the earliest deadline is evicted (lossy).
+    let mut table = full();
+    paced(
+        &mut table,
+        fresh,
+        &rev(900, 1),
+        t0 + secs(10),
+        secs(5_000),
+        t0 + secs(10),
+    );
+    assert!(table.position(keys[0]).is_none());
+    assert_eq!(table.unknown_until, Some(t0 + secs(1_000)));
+    let later = t0 + secs(11);
+    assert_eq!(
+        table.verdict(keys[0], &rev(1, 10), later),
+        START_UNACCELERATED
+    );
+    let stranger = pace_key("ns", "s", "/stranger");
+    assert_eq!(
+        table.verdict(stranger, &rev(901, 1), later),
+        START_UNACCELERATED
+    );
+    assert_eq!(
+        table.verdict(keys[1], &rev(2, 10), later),
+        PaceVerdict::Defer
+    );
+    assert_eq!(
+        table.verdict(stranger, &rev(901, 1), t0 + secs(1_000)),
+        START
+    );
+    // A later eviction raises the hold; none lowers it.
+    assert!(table.begin(stranger, &rev(901, 1), later));
+    assert_eq!(table.unknown_until, Some(t0 + secs(1_001)));
+    table.unknown_until = Some(t0 + secs(9_000));
+    assert!(table.begin(pace_key("ns", "s", "/third"), &rev(902, 1), later));
+    assert_eq!(table.unknown_until, Some(t0 + secs(9_000)), "preserved");
+}
+
+/// Condition 2: keys include the namespace, the receipt/replay scope and the
+/// path, length-prefixed. A slot of another object under a matching key (a
+/// replaced file, or a collision) never shortens a deferral and never lends
+/// its coverage: it defers its changed-revision offset, then starts
+/// unaccelerated, and the live slot is kept (not overwritten) until it
+/// expires.
+#[test]
+fn pace_keys_isolate_namespaces_scopes_and_objects() {
+    let key = pace_key("ns", "scope", "/a");
+    assert_ne!(key, pace_key("other", "scope", "/a"));
+    assert_ne!(key, pace_key("ns", "another", "/a"));
+    assert_ne!(key, pace_key("ns", "scope", "/b"));
+    assert_ne!(pace_key("ab", "c", "/a"), pace_key("a", "bc", "/a"));
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    paced(&mut table, key, &rev(1, 100), t0, secs(7_200), t0);
+    let foreign = pace_key("other", "scope", "/a");
+    assert_eq!(table.verdict(foreign, &rev(1, 100), t0 + secs(1)), START);
+    // Another object (dev/ino) under the same key.
+    let replaced = rev(2, 100);
+    assert_eq!(
+        table.verdict(key, &replaced, t0 + secs(3_599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(
+        table.verdict(key, &replaced, t0 + secs(3_600)),
+        START_UNACCELERATED
+    );
+    assert!(
+        !table.begin(key, &replaced, t0 + secs(3_600)),
+        "the live slot stays"
+    );
+    assert_eq!(offsets(&table, key), Some((7_200, 3_600)));
+    assert_eq!(
+        table.verdict(key, &rev(1, 100), t0 + secs(3_600)),
+        PaceVerdict::Defer
+    );
+    // Expired, the slot is free for the new object.
+    assert_eq!(table.verdict(key, &replaced, t0 + secs(7_200)), START);
+    assert!(table.begin(key, &replaced, t0 + secs(7_200)));
+    assert_eq!(offsets(&table, key), Some((0, 0)));
+}
+
+/// §7 Guard: a process restart is a fresh table (every key starts
+/// accelerated, nothing deferred), never another cache's slots.
+#[test]
+fn pace_restart_is_fresh() {
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let old = SharedCache::default();
+    old.with_cursor(|cursor| paced(&mut cursor.pace, key, &rev(1, 1), t0, secs(7_200), t0))
+        .unwrap();
+    assert_eq!(
+        old.with_cursor(|cursor| cursor.pace.verdict(key, &rev(1, 1), t0 + secs(1)))
+            .unwrap(),
+        PaceVerdict::Defer
+    );
+    let restarted = SharedCache::default();
+    restarted
+        .with_cursor(|cursor| {
+            assert!(cursor.pace.slots.iter().all(Option::is_none));
+            assert_eq!(cursor.pace.unknown_until, None);
+            assert_eq!(cursor.pace.verdict(key, &rev(1, 1), t0 + secs(1)), START);
+        })
+        .unwrap();
+}
+
+/// §7 Guard, condition 2: a clock failure, an unknown ordinary interval or an
+/// overflow is unknown coverage. The attempt loses its acceleration for good
+/// (no further ticket); its pause or end forgets its slot and holds
+/// `unknown_until` past its deadline and at least an hour ahead, so its next
+/// start is today's, unaccelerated. Narrowing never shortens a deadline.
+#[test]
+fn pace_clock_failure_is_unknown() {
+    let temp = Temp::new("pace-clock", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let same = rev(1, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    with_pace_clock(Some(t0 + secs(5)), true, || {
+        assert_eq!(accrue_equivalent(&mut meta, true, Some(secs(600))), None);
+    });
+    assert!(!meta.pace.accelerate);
+    assert_eq!(meta.pace.equiv_secs, None);
+    with_pace_clock(Some(t0 + secs(6)), false, || {
+        assert_eq!(accrue_equivalent(&mut meta, false, None), None, "sticky");
+    });
+    assert!(!meta.pace.accelerate);
+    assert!(!table.record(&meta.pace, t0 + secs(6)));
+    assert!(table.position(key).is_none());
+    assert_eq!(table.unknown_until, Some(t0 + secs(3_606)));
+    assert_eq!(table.verdict(key, &same, t0 + secs(7)), START_UNACCELERATED);
+    // A failing elapsed time at the record itself forgets the slot too.
+    let other = pace_key("ns", "s", "/b");
+    paced(&mut table, other, &rev(2, 1), t0, secs(9_000), t0);
+    let pace = JobPace::new(other, t0, true);
+    with_pace_clock(None, true, || assert!(!table.record(&pace, t0 + secs(8))));
+    assert!(table.position(other).is_none());
+    assert_eq!(
+        table.unknown_until,
+        Some(t0 + secs(9_000)),
+        "past its deadline"
+    );
+    // Production's continuation input today is unknown (`None`).
+    let mut continued = pace_meta(&temp, JobPace::new(other, t0, true));
+    with_pace_clock(Some(t0 + secs(9)), false, || {
+        assert_eq!(accrue_equivalent(&mut continued, true, None), None);
+    });
+    assert!(!continued.pace.accelerate);
+    // Narrowing rounds up and refuses what a u32 offset cannot hold.
+    assert_eq!(
+        pace_offset(std::time::Duration::from_millis(1_001)),
+        Some(2)
+    );
+    assert_eq!(pace_offset(secs(u64::from(u32::MAX))), Some(u32::MAX));
+    assert_eq!(pace_offset(secs(u64::from(u32::MAX) + 1)), None);
+    let huge = pace_key("ns", "s", "/huge");
+    assert!(table.begin(huge, &rev(3, 1), t0));
+    let mut overflow = JobPace::new(huge, t0, true);
+    overflow.equiv_secs = Some(secs(u64::from(u32::MAX) + 1));
+    overflow.last_page_mono = t0;
+    assert!(
+        !table.record(&overflow, t0),
+        "overflow: unknown, never a shorter deadline"
+    );
+    assert!(table.position(huge).is_none());
+}
+
+/// Condition 4 layout proof: the slot, the table and the job's pace facts
+/// have exactly the granted inline sizes and own no heap, so a full table
+/// walks to its `size_of` only.
+#[test]
+fn pace_table_layout_is_inline_and_bounded() {
+    use std::mem::size_of;
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(size_of::<std::time::Instant>(), 16);
+        assert_eq!(size_of::<OpenStamp>(), 56);
+        assert_eq!(size_of::<PaceSlot>(), 96);
+        assert_eq!(size_of::<Option<PaceSlot>>(), 96, "the Instant niche");
+        assert_eq!(size_of::<PaceTable>(), 6_160);
+        assert_eq!(size_of::<JobPace>(), 72);
+    }
+    assert!(size_of::<CursorState>() >= size_of::<PaceTable>());
+    assert!(size_of::<SharedCache>() >= size_of::<CursorState>());
+    assert!(size_of::<JobMeta>() >= size_of::<JobPace>());
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    let empty = crate::heap_layout_bound::bound(&table, usize::MAX);
+    for i in 0..ROTATION_KEYS {
+        paced(
+            &mut table,
+            pace_key("ns", "s", &i.to_string()),
+            &rev(i as u64, 1),
+            t0,
+            secs(9),
+            t0,
+        );
+    }
+    assert!(table.slots.iter().all(Option::is_some));
+    assert_eq!(empty, Some(size_of::<PaceTable>()));
+    assert_eq!(
+        crate::heap_layout_bound::bound(&table, usize::MAX),
+        Some(size_of::<PaceTable>())
+    );
+    assert_eq!(
+        crate::heap_layout_bound::bound(&JobPace::new([1; 2], t0, true), usize::MAX),
+        Some(size_of::<JobPace>())
+    );
+}
+
+/// Every live pace slot of `cache` (64 distinct keys), deadlines ahead.
+fn fill_pace(cache: &SharedCache) {
+    let t0 = std::time::Instant::now();
+    cache
+        .with_cursor(|cursor| {
+            for i in 0..ROTATION_KEYS {
+                let key = pace_key("fill", "s", &i.to_string());
+                paced(
+                    &mut cursor.pace,
+                    key,
+                    &rev(i as u64, 1),
+                    t0,
+                    secs(9_000),
+                    t0,
+                );
+            }
+        })
+        .unwrap();
+}
+
+/// Condition 4 accounting, each site exactly once:
+/// - cursor feasibility and reservation (`state_for_main`, `cursor_resident`)
+///   carry the table inside `size_of_val(CursorState)` and never walk it;
+/// - the whole-cache bound carries it inside `size_of::<SharedCache>()` (the
+///   `Arc` payload) and not in the locked parts;
+/// - `context_overhead`, which every release (copy refusal, Path A, and
+///   #665's X_out/peak `prove_release` through `release_room_for_main`) adds
+///   beside `state_for_main`, leaves it out;
+/// - a job's pace facts are inside its own walk (`paused_charge`), with no
+///   heap, and the table is not reachable from a job.
+#[test]
+fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
+    use crate::heap_layout_bound::bound;
+    use std::mem::{align_of, size_of};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let cache = Arc::new(SharedCache::default());
+    let walked = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                let mut c = Counter::new(usize::MAX);
+                cursor.heap_bound(&mut c).unwrap();
+                c.bytes
+            })
+            .unwrap()
+    };
+    let empty_heap = walked(&cache);
+    let main_state = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| state_for_main(cursor))
+            .flatten()
+            .unwrap()
+    };
+    let empty_state = main_state(&cache);
+    fill_pace(&cache);
+    let state = main_state(&cache);
+    assert_eq!(state, empty_state, "a full table adds no walked bytes");
+    assert_eq!(walked(&cache), empty_heap);
+    assert_eq!(
+        state,
+        size_of::<CursorState>() + empty_heap,
+        "once, via size_of_val"
+    );
+    assert_eq!(cache.cursor_resident(), state);
+    // Whole cache: once, in the `Arc` payload; the locked parts never carry it.
+    let mut whole = Counter::new(usize::MAX);
+    cache.heap_bound(&mut whole).unwrap();
+    let mut parts = Counter::new(usize::MAX);
+    cache.inner.heap_bound(&mut parts).unwrap();
+    cache.cursor.heap_bound(&mut parts).unwrap();
+    assert_eq!(
+        whole.bytes,
+        size_of::<SharedCache>()
+            + align_of::<SharedCache>()
+            + 2 * size_of::<usize>()
+            + parts.bytes
+            + side
+    );
+    // The release math: `context_overhead` without the table, beside
+    // `state_for_main` with it.
+    let fixture = ScanRoot::new(4);
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("ns".into()));
+    let context = scan.sampling.as_ref().unwrap();
+    let overhead = crate::snapshots::sampled_scan::context_overhead(context).unwrap();
+    assert_eq!(
+        overhead,
+        size_of::<crate::snapshots::sampled_scan::Context>() + size_of::<SharedCache>()
+            - size_of::<PaceTable>()
+            + align_of::<SharedCache>()
+            + 2 * size_of::<usize>()
+            + side
+            + bound(&context.namespace, STATE_BYTES).unwrap()
+            + bound(&context.admission, STATE_BYTES).unwrap()
+    );
+    assert!(crate::snapshots::sampled_scan::context_overhead_covers(
+        context
+    ));
+    let retained = cache.retained().unwrap();
+    let room = cache.release_room_for_main(&retained, overhead, |_| true);
+    assert_eq!(room, Some(STATE_BYTES - state - overhead));
+    drop(retained);
+    // A job: its pace facts walk to nothing beyond its own size.
+    let temp = Temp::new("pace-job", b"{}\n");
+    let meta = pace_meta(&temp, JobPace::new([1; 2], std::time::Instant::now(), true));
+    let mut c = Counter::new(usize::MAX);
+    meta.pace.heap_bound(&mut c).unwrap();
+    assert_eq!(c.bytes, 0);
+}
+
+/// Condition 4 boundaries with a full table: a mandatory claim fits exactly
+/// at `state + claim + SIDE_LEDGER_BYTES + retained floor` (the table counted
+/// once inside `state`) and not one byte past; counting the table twice
+/// would refuse that fit, so a budget one table short refuses. A hopeless
+/// claim evicts nothing and leaves the table as it was.
+#[test]
+fn pace_table_admission_boundary_beside_the_side_reservation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    fill_pace(&cache);
+    let floor = admission_floor(&cache);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    with_test_state_budget(state + claim + floor, || {
+        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
+        let credit = cache.cursor_reserve(claim).expect("exactly fits");
+        assert_eq!(cache.cursor_resident(), state + claim);
+        credit.refund();
+    });
+    with_test_state_budget(
+        state + claim + floor - std::mem::size_of::<PaceTable>(),
+        || {
+            assert!(cache.cursor_reserve(claim).is_none());
+        },
+    );
+    let table = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                (
+                    cursor
+                        .pace
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.is_some())
+                        .count(),
+                    cursor.pace.unknown_until,
+                )
+            })
+            .unwrap()
+    };
+    let before = table(&cache);
+    for budget in [floor - 1, state + floor] {
+        with_test_state_budget(budget, || assert!(cache.cursor_reserve(1).is_none()));
+    }
+    assert_eq!(table(&cache), before);
+    assert_eq!(before, (ROTATION_KEYS, None));
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// S1-b carry-forward: the pause site mints its ticket with no lock held
+/// (`cursor_held`, `retained_held` both false there), and its one
+/// `with_cursor` would trip `CursorHeld` on a relock instead of deadlocking.
+#[test]
+fn pause_site_mints_without_relock() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() || !cfg!(debug_assertions) {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        let (job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused");
+        let mut exhausted = PageBudget::default();
+        exhausted.charge(true, Limits::current().cursor);
+        assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+        assert!(cache.continuation_ticket(&job, &exhausted).is_some());
+        assert!(!cursor_held());
+        assert!(matches!(lease.pause(job), PauseEnd::Paused));
+        let (job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused");
+        let relock = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|_| cache.continuation_ticket(&job, &exhausted))
+        }));
+        assert!(relock.is_err(), "a relock is caught, never a deadlock");
+        assert!(!cursor_held());
+        drop(lease);
+    });
+}
+
+/// EOF seam (condition 3, c22 side): only a continuation page that commits
+/// its job (and whose native finish succeeds) is marked committed: the one
+/// scan StateMissing may hand to `EofCompletion::new`. Its pausing pages and
+/// an ordinary page's completion are not; a re-paused accelerated job mints
+/// a ticket again.
+#[test]
+fn continuation_committed_marks_only_the_eof_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        for _ in 0..64 {
+            let (next, scan) = continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            );
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(scan.continuation_committed(), "{}", counters(&cache));
+                assert!(scan.continuation_ticket().is_none());
+                assert!(!scan.snapshots.is_empty());
+                assert!(cache.cursor_slot_free());
+                // An ordinary page's completion is never a continuation EOF.
+                let fixture = ScanRoot::new(80);
+                let ordinary = Arc::new(SharedCache::default());
+                let mut index = ScanIndex::default();
+                for _ in 0..64 {
+                    let (next, scan) = page(&fixture, index, Some(Arc::clone(&ordinary)));
+                    index = next;
+                    assert!(!scan.continuation_committed());
+                    if counter(&ordinary, |c| c.jobs_certified) > 0 {
+                        return;
+                    }
+                }
+                panic!("{}", counters(&ordinary));
+            }
+            assert!(!scan.continuation_committed());
+            assert!(scan.continuation_ticket().is_some(), "{}", counters(&cache));
+        }
+        panic!("{}", counters(&cache));
     });
 }

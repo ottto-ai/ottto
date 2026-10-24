@@ -5332,8 +5332,11 @@ pub struct SourceScanResult {
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
     /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
     /// at this page's pause (`PauseEnd::Paused` only). None on every other
-    /// end, and always None until the accelerate guard lands (S1-b).
+    /// end, and on an unaccelerated attempt.
     continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
+    /// Stage 1 (EOF seam): this continuation page committed its cursor job
+    /// and the native finish succeeded (`PageBudget::continuation_committed`).
+    continuation_committed: bool,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
@@ -5353,6 +5356,12 @@ impl SourceScanResult {
         &self,
     ) -> Option<&sampled_scan::codex_cursor::CodexCursorTicket> {
         self.continuation_ticket.as_ref()
+    }
+    /// Stage 1 (EOF seam): whether this continuation page committed its job,
+    /// the only page StateMissing may build `EofCompletion::new` from.
+    #[cfg_attr(not(test), allow(dead_code))] // Read only by the inert port.
+    pub(crate) fn continuation_committed(&self) -> bool {
+        self.continuation_committed
     }
     pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
         if let Some(validation) = &self.codex_join_validation {
@@ -21294,7 +21303,9 @@ impl OwnedSourceScan {
     /// the bounded walk still has pending directories: no hints, audits,
     /// replay or census fill, and the walk does not advance. Its step only
     /// resumes the paused job; it never plans or starts an attempt, and
-    /// returns every other identified path to the queue untouched.
+    /// returns every other identified path to the queue untouched. The page
+    /// stands for `ordinary_equivalent` of the ordinary cadence (StateMissing's
+    /// input, §6); `None` is unknown and ends the attempt's acceleration.
     #[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_continuation(
@@ -21306,6 +21317,7 @@ impl OwnedSourceScan {
         artifacts_enabled: bool,
         context_curve_enabled: bool,
         members: &BTreeSet<String>,
+        ordinary_equivalent: Option<std::time::Duration>,
     ) -> Self {
         let mut scan = Self::new_selecting(
             SnapshotSource::Codex,
@@ -21323,7 +21335,7 @@ impl OwnedSourceScan {
             &[],
             Some(members),
         );
-        scan.codex_page.set_continuation();
+        scan.codex_page.set_continuation(ordinary_equivalent);
         scan
     }
 
@@ -22661,6 +22673,7 @@ impl OwnedSourceScan {
                             flags: &codex_selected_flags,
                             census_complete: state_census_complete && sidecar_census_complete,
                             continuation: codex_page.continuation(),
+                            ordinary_equivalent: codex_page.ordinary_equivalent(),
                         },
                         index,
                         &mut identified_candidates,
@@ -23690,6 +23703,10 @@ impl OwnedSourceScan {
                     context
                         .cache
                         .cursor_published(publication, parsed_file.is_ok());
+                    // Stage 1 (EOF seam): the attempt committed and finished.
+                    if parsed_file.is_ok() {
+                        codex_page.note_committed();
+                    }
                 }
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
@@ -25234,6 +25251,7 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines,
                     claude_request_census_shadow,
                     continuation_ticket,
+                    continuation_committed: codex_page.continuation_committed(),
                     codex_join_validation: codex_join_inventory
                         .filter(|_| !codex_join_completed.is_empty())
                         .map(|inventory| codex_file_join::Validation {
@@ -25894,7 +25912,7 @@ impl OwnedSourceScan {
                 {
                     pending!();
                 }
-                match context.cache.cursor_plan(
+                match context.cache.cursor_plan_paced(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
@@ -25903,6 +25921,13 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &key,
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    // Stage 1 guard (§6): a side read is never paced.
+                    side_plan
+                        .is_none()
+                        .then_some(sampled_scan::codex_cursor::PaceProbe {
+                            file: &opened_file,
+                            index,
+                        }),
                 ) {
                     // U1a-2a G4a: a side deferral writes nothing (uncharged).
                     sampled_scan::codex_cursor::StartPlan::Defer if side_plan.is_some() => {
@@ -26391,7 +26416,7 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                let defer = match context.cache.cursor_plan(
+                let defer = match context.cache.cursor_plan_paced(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
@@ -26400,6 +26425,10 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &local_index_key(&active.candidate.path),
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    Some(sampled_scan::codex_cursor::PaceProbe {
+                        file: active.parser.reader.reader.get_ref(),
+                        index,
+                    }),
                 ) {
                     sampled_scan::codex_cursor::StartPlan::Singleton => false,
                     sampled_scan::codex_cursor::StartPlan::Unpaged => {
