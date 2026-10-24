@@ -1227,6 +1227,7 @@ fn daemon_executable_names_match_exactly() {
 
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "ubuntu /proc not fully readable")]
 fn process_table_shows_another_daemon_executable() {
     assert!(
         other_daemon_running(&mut || false).is_ok(),

@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 835,
-  "content_sha256": "a5176bfbdd260b3da14f76f53751ddd48b360b8a43eb99a7980f44c63e476dd5",
+  "candidate_file_count": 836,
+  "content_sha256": "ccc9114fe4ca41cfd68b2da7c0f279839ac2b8c3e00e6fb84e491b39f9b10925",
   "files": [
     {
       "executable": false,
@@ -22,6 +22,13 @@
       "path": ".github/workflows/ci.yml",
       "sha256": "9005b94670e681b24fd6b8106b43f900d100bd9dd648e94d29fdc106f8137490",
       "size_bytes": 4011
+    },
+    {
+      "executable": false,
+      "mode": "0644",
+      "path": ".github/workflows/linux-tests.yml",
+      "sha256": "9b8eb74386d5da5bd213f2fc39f1353e80cbeffd8791a51b4ec00f7aa0514295",
+      "size_bytes": 2580
     },
     {
       "executable": false,
@@ -1231,8 +1238,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/lib.rs",
-      "sha256": "da81c3440d4a241f32e61584a5ae48043a99e51e053832a7ab074a8817ad3545",
-      "size_bytes": 372562
+      "sha256": "14ccc0d6ca647d20b507da6756a5f9fdcdb552dbdb8db875643d6acdafcc8db1",
+      "size_bytes": 372691
     },
     {
       "executable": false,
@@ -1280,8 +1287,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/local_state_sweep/tests.rs",
-      "sha256": "1b053be38a87544274d017e7e4ffb2f56f1dccf15f9dc665e60bc011577a8070",
-      "size_bytes": 57027
+      "sha256": "4c47373c71340b73c3b5c68b24859eab1f20a492497980f6aa649e573a5a297b",
+      "size_bytes": 57109
     },
     {
       "executable": false,
@@ -1469,8 +1476,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/authority_proof_correction_pipeline_tests.rs",
-      "sha256": "b430e67f1e13754214bcd9ae4540fe7844f9cc46beb92963df05ea60d1fa8ffe",
-      "size_bytes": 115657
+      "sha256": "599d75c01ce81d3831807549b7d3cca144a1f187ec23519c73d486141757dca1",
+      "size_bytes": 115731
     },
     {
       "executable": false,
@@ -1847,8 +1854,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money_tests.rs",
-      "sha256": "e3cb65943a6589e9d67fa5118ba28659f9a2776655a18e4354e117a732b9d1ca",
-      "size_bytes": 111900
+      "sha256": "2cf07418bfeb207c77700978f7a92e7dec0d11dff1ee4425b51943aa6b1f0878",
+      "size_bytes": 111980
     },
     {
       "executable": false,
@@ -1917,8 +1924,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_file_join/group_job_tests.rs",
-      "sha256": "d2aae7e3e1098cc5de8267c1ff8cd42a87325db37ca8fb7e26caec50ca126706",
-      "size_bytes": 99787
+      "sha256": "8e63bf54a3530f5f065f112be95533e794b6ddfefa4edb5e79701adf230c17fa",
+      "size_bytes": 100231
     },
     {
       "executable": false,
@@ -1938,8 +1945,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_proof_use_tests.rs",
-      "sha256": "e15124425bc94ad5fbd149ff645555cdd737e1be2af1485eeab3ebb1b57b1011",
-      "size_bytes": 108329
+      "sha256": "e6a4feb4d618cf9c335c29026cd1219575ce8f5ff9a8c334055cef075e05d42d",
+      "size_bytes": 109217
     },
     {
       "executable": false,
@@ -1952,8 +1959,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/codex_parent_side_read_tests.rs",
-      "sha256": "0048a51c4320d40e85d653ff67c99df47663c80e525c7a695f1d6263d789f4fc",
-      "size_bytes": 20538
+      "sha256": "510cd13b02df96528f15a52dfb86fdce236605a35f653275326dddc5d8b3a60a",
+      "size_bytes": 20908
     },
     {
       "executable": false,
@@ -2120,8 +2127,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/sampled_scan/codex_cursor_tests.rs",
-      "sha256": "8b3967304e8bfb451df5bf8d1bb364bbd6d94cb6157f8edb7c91bf6f99ca6126",
-      "size_bytes": 390874
+      "sha256": "ebe6e762c7c5c6f829e41fc9c2b9d508737de93f6d635b8b0e6e78fc180e897f",
+      "size_bytes": 393834
     },
     {
       "executable": false,
@@ -2134,8 +2141,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/session_start.rs",
-      "sha256": "beb672fb849ed486432a31d587f3e3cdcc9ba29404f10770b444c80b846bf7e4",
-      "size_bytes": 135070
+      "sha256": "903ded6fd5b877e092fc36bed85d30bea61e442132b1015fcce6507994b851da",
+      "size_bytes": 135148
     },
     {
       "executable": false,
@@ -2218,8 +2225,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/unix_socket.rs",
-      "sha256": "148691cee7065cbf911a8a5b3f17ab2e4694cf627fa7d1426aaea0baab5618f2",
-      "size_bytes": 47944
+      "sha256": "e9ea0341b5ba19a4c00a8639b86e3a3b3ea042610afc35659cc30d97d756982b",
+      "size_bytes": 48720
     },
     {
       "executable": false,
@@ -5354,8 +5361,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/path-map.tsv",
-      "sha256": "6bf77d380881c07f2da4f65286efa79e84caf7910d04e9660ec37ade5cb7e9fa",
-      "size_bytes": 2611
+      "sha256": "5c7a7960eeb6f9e6c85c60ea18d535312e3dea9ec40da6f2a666ebc0b0a732e6",
+      "size_bytes": 2719
     },
     {
       "executable": false,
@@ -5368,8 +5375,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/roots.txt",
-      "sha256": "87e758f22f0adc5da55a30cba94aa5779569e6e258910bfd54f01c19a657311f",
-      "size_bytes": 563
+      "sha256": "33ac59b0447c41f8a2259bdf0608e091c0ce45162a6e529ccd1d15f25590655f",
+      "size_bytes": 597
     },
     {
       "executable": false,
@@ -5848,13 +5855,14 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T07:53:41+00:00",
+  "generated_at": "2026-10-24T09:05:36+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 836,
+  "output_file_count": 837,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
     ".github/workflows/ci.yml",
+    ".github/workflows/linux-tests.yml",
     ".github/workflows/macos-stable-release.yml",
     "AGENTS.md",
     "CLAUDE.md",
@@ -5887,5 +5895,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "98bcfb5cebaa9ebee4c8b168b9666c666bd3d7b3"
+  "source_commit": "54786c16780a6d38e4c9c79cf25395d4b9797558"
 }
