@@ -710,6 +710,13 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
     Ok(true)
 }
 
+pub(crate) fn initialized(support: &Path) -> bool {
+    CATALOGS.lock().ok().is_some_and(|c| {
+        c.get(support)
+            .is_some_and(|c| c.loading.is_none() && !c.fault)
+    })
+}
+
 pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> bool {
     let Ok(catalogs) = CATALOGS.lock() else {
         return true;

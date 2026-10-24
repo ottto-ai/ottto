@@ -36490,8 +36490,10 @@ impl ScanIndex {
     /// A member-only line is closed over its indexed family root.
     pub fn load_claude_reemission_exclusions(&mut self, support_dir: &Path) {
         self.active_request_money_support_dir =
-            (self.active_effective_upload_body_witness_revision == 3)
-                .then(|| support_dir.to_path_buf());
+            (self.active_effective_upload_body_witness_revision == 3
+                || claude_request_money::request_owned_live(support_dir)
+                    && crate::snapshot_sync::unknown_recovery::initialized(support_dir))
+            .then(|| support_dir.to_path_buf());
         self.active_request_money_adoption_paused = self
             .active_request_money_support_dir
             .as_deref()

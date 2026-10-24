@@ -670,6 +670,23 @@ impl P2aControl {
                 .remove("claude_code"),
         }
     }
+    fn recovery_startup(&self, now: u64) {
+        let binding = unknown_recovery::binding(
+            &snapshot_upload_destination_namespace(&self.device, "device-secret"),
+            self.client.recovery_origin(),
+            "otm_test",
+            "",
+        );
+        for _ in 0..32 {
+            if unknown_recovery::startup(&self.support, &binding, now).unwrap() {
+                return;
+            }
+            crate::snapshots::claude_request_money::store::flush();
+        }
+        panic!(
+            "fixture requires initialized durable batch custody before direct preparation/replay"
+        );
+    }
     fn transcript(&self) -> PathBuf {
         self.fixture
             .home
@@ -1559,6 +1576,7 @@ fn p2a_bad_first_adoption_slice_over_good_history_restarts_and_recovers() {
     let _live = money::LiveForTest::new(&control.support);
     let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
     let clock = money::PageClockForTest::new(&control.support, now);
+    control.recovery_startup(now);
     // Saved historical acceptances deliberately dwarf the first real bad slice.
     // Use the real preparation's context key, rather than guessing its hash.
     control.cadence.next_due_cycle();
@@ -2050,8 +2068,10 @@ fn p2a_checkpoint_resume_revalidates_selected_state_protection_and_live_gate() {
     for reason in ["selected index", "protection list", "live custody"] {
         let control = P2aControl::new(FinishOutcome::Accept);
         let _live = money::LiveForTest::new(&control.support);
-        let result = control.cycle_changing(|attempt| {
-            if attempt == 1 {
+        let mut changed = false;
+        let result = control.cycle_changing(|_| {
+            if !changed && money_resume::pending_for_test(&control.support) {
+                changed = true;
                 match reason {
                     "selected index" => {
                         control.saved().save(&control.index_path).unwrap();
@@ -2480,8 +2500,8 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
         let control = P2aControl::new(FinishOutcome::Accept);
         let _live = money::LiveForTest::new(&control.support);
         let mut cancelled = false;
-        let result = control.cycle_changing(|attempt| {
-            if attempt != 1 {
+        let result = control.cycle_changing(|_| {
+            if cancelled || !money_resume::pending_for_test(&control.support) {
                 return;
             }
             assert!(money_resume::pending_for_test(&control.support));
@@ -2892,6 +2912,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle();
+        control.recovery_startup(now);
         let m = unknown_recovery::active_for_test(&control.support)
             .pop()
             .unwrap();
@@ -3134,6 +3155,7 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle();
+        control.recovery_startup(now);
         if stop {
             crate::snapshots::latch_claude_reemission_stop_for_test();
         } else {

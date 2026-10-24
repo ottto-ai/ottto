@@ -6116,7 +6116,7 @@ async fn finish_sync_source_resume(
         account_witness,
         scan_started_at,
         activity_hint,
-        money_policy: _,
+        money_policy,
         receipt_window_days,
         context_curve_enabled,
         cache_observations_enabled,
@@ -6136,6 +6136,7 @@ async fn finish_sync_source_resume(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let recovery_prepared = money_policy.is_some();
     if let Some(lease) = native_comparison_lease.as_mut() {
         lease.observe_policy_page(
             &scan_result.census_window_end,
@@ -6208,7 +6209,7 @@ async fn finish_sync_source_resume(
         }
         Ok(())
     };
-    if source_money_resume(source, support_dir) {
+    if source_money_resume(source, support_dir) && recovery_prepared {
         unknown_recovery::replay_due(
             support_dir,
             &mut index,
@@ -6644,14 +6645,15 @@ async fn finish_sync_source_resume(
     // through the existing CAS contract, omitting the additive cache patch.
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
     let mut recovery_send = unknown_recovery::SendState::default();
-    let recovery_binding = source_money_resume(source, support_dir).then(|| {
-        unknown_recovery::binding(
-            &upload_destination_namespace,
-            client.recovery_origin(),
-            machine_id,
-            "",
-        )
-    });
+    let recovery_binding =
+        (source_money_resume(source, support_dir) && recovery_prepared).then(|| {
+            unknown_recovery::binding(
+                &upload_destination_namespace,
+                client.recovery_origin(),
+                machine_id,
+                "",
+            )
+        });
     let probes = scan_result
         .snapshots
         .iter()
