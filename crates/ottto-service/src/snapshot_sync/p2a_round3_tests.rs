@@ -3246,3 +3246,82 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
         }
     }
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_cancel_after_counter_commit_consumes_slot_for_next_owner() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    let control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+    }
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    let mut cancelled = false;
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 300);
+        control
+            .cycle_changing(|_| {
+                if cancelled || !money_resume::pending_for_test(&control.support) {
+                    return;
+                }
+                let active = unknown_recovery::active_for_test(&control.support);
+                if active.first().is_some_and(|m| m.posts == 2) {
+                    money_resume::cancel_owner(&control.daemon);
+                    cancelled = true;
+                }
+            })
+            .unwrap();
+    }
+    assert!(
+        cancelled,
+        "cancel the real parked replay after its counter receipt, before POST"
+    );
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "a consumed slot cannot be rearmed from the old catalog"
+    );
+    let consumed = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!((consumed.posts, consumed.slot), (2, 1));
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 3600);
+        control.cycle();
+    }
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+    let recovered = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        (recovered.posts, recovered.slot),
+        (3, 2),
+        "one durable counter survives cancellation and transport ownership change"
+    );
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now + 3601);
+        control.cycle();
+    }
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|e| e.effective_upload_body_witness_revision == 3));
+    assert!(!money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+}
