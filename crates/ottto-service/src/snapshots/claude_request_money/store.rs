@@ -1761,6 +1761,20 @@ pub(super) fn recovery_debt_is_covered(
 }
 
 #[cfg(test)]
+pub(crate) fn recovery_debt_debug_for_test(support: &Path, key: &str) -> String {
+    let ledgers = LEDGERS.lock().unwrap();
+    let Some(Slot::Ready(ledger)) = ledgers.get(support) else {
+        return "ledger_not_ready".into();
+    };
+    let debts = ["dirty:", "due:"].map(|prefix| {
+        ledger
+            .get(&money_key(prefix, key))
+            .map(|r| (format!("{:02x?}", &r.money_revision()[..4]), r.window()))
+    });
+    format!("recovering={} debts={debts:?}", ledger.recovering())
+}
+
+#[cfg(test)]
 pub(super) fn checkpoint_pending(support_dir: &Path) -> bool {
     let Ok(ledgers) = LEDGERS.lock() else {
         return true;
