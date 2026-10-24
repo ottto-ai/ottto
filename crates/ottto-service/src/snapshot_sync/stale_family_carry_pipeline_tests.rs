@@ -815,9 +815,10 @@ fn c1b_retry_pending_family_is_never_carried() {
     assert!(retry.retry_pending && base_retry.retry_pending);
 }
 
-/// COST: authority debt beside another cause. An unsettled mark already left
-/// by another producer stays set; the retry carries nothing and re-reads the
-/// witnessed family as BASE does.
+/// COST: authority debt beside another cause on an ordinary red retry,
+/// outside Fix 2's full-rearm-window exception. An unsettled mark already
+/// left by another producer stays set; the retry carries nothing and re-reads
+/// the witnessed family as BASE does.
 #[test]
 #[serial(source_manifests)]
 fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
@@ -827,6 +828,26 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
     let _source_manifests = SourceManifestTestGuard::new();
     let mark = |fixture: &RearmFixture| {
         c1a_edit_index(fixture, |saved| {
+            assert!(
+                saved.get("traversal").is_some(),
+                "the red retry retains its walk"
+            );
+            assert!(
+                saved.get("claude_stale_family_carry").is_none(),
+                "no carry is retained yet"
+            );
+            // This test predates Fix 2: select the ordinary C1b retry, whose
+            // prior unsettled mark remains authoritative. The companion
+            // test below retains the window and checks Fix 2's exception.
+            let progress = saved
+                .get_mut("claude_full_rearm_progress")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("the preceding full re-arm recorded its progress");
+            assert!(
+                progress.remove("full_rearm_window").is_some(),
+                "explicitly leave Fix 2's window"
+            );
+            progress.remove("full_rearm_window_next");
             saved.insert(
                 "bounded_sweep_had_unsettled_upload".to_owned(),
                 serde_json::json!(true),
@@ -844,6 +865,84 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
     assert!(run
         .record_after_retry
         .is_some_and(|record| !record.terminal));
+}
+
+/// Fix 2's exception remains active beside #705 authority debt and another
+/// producer's unsettled mark: carry only the unchanged witnessed family,
+/// retain the held family's proof debt, and match BASE's liveness/acceptance.
+#[test]
+#[serial(source_manifests)]
+fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
+    if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mark = |fixture: &RearmFixture| {
+        c1a_edit_index(fixture, |saved| {
+            assert!(
+                saved
+                    .get("claude_full_rearm_progress")
+                    .and_then(|progress| progress.get("full_rearm_window"))
+                    .is_some(),
+                "retain Fix 2's full-rearm window"
+            );
+            saved.insert(
+                "bounded_sweep_had_unsettled_upload".to_owned(),
+                serde_json::json!(true),
+            );
+        });
+    };
+    let fix = c1b_held_retry_chain("c1b-held-mark-full-window", "fix", mark);
+    let base = {
+        let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
+        c1b_held_retry_chain("c1b-held-mark-full-window-base", "base", mark)
+    };
+    assert_eq!(
+        fix.retry.start.as_ref().unwrap().carried_pending_families,
+        Some(1)
+    );
+    assert_eq!(
+        base.retry.start.as_ref().unwrap().carried_pending_families,
+        Some(0)
+    );
+    assert_eq!(fix.retry.family_reads, 0, "the unchanged family is carried");
+    assert_eq!(base.retry.family_reads, rearm_family_sessions().len());
+    for (arm, run) in [("fix", &fix), ("base", &base)] {
+        assert!(
+            !run.marked_after_red,
+            "{arm}: authority debt itself never marks the sweep"
+        );
+        assert!(
+            run.retry.parsed.contains(REARM_TERMINAL),
+            "{arm}: the held family is read"
+        );
+        let before = run
+            .record_after_red
+            .as_ref()
+            .expect("authority debt before retry");
+        let after = run
+            .record_after_retry
+            .as_ref()
+            .expect("authority debt remains");
+        assert!(!after.terminal && after.bound_to_retained_witness, "{arm}");
+        assert_eq!(
+            after.failed_reconstruction_count,
+            before.failed_reconstruction_count
+        );
+        assert_eq!(
+            after.member_source_file_fingerprints,
+            before.member_source_file_fingerprints
+        );
+        assert_eq!(
+            run.head_after, run.head_before,
+            "{arm}: the held revision is never accepted"
+        );
+        assert!(
+            run.retry.red && !after.terminal,
+            "{arm}: the terminal family stays RetryPending"
+        );
+    }
+    assert_eq!(fix.retry.liveness(), base.retry.liveness());
 }
 
 /// SI P1: after a contract change, a full re-arm terminal with one
