@@ -5383,6 +5383,11 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    if source == SnapshotSource::ClaudeCode
+        && money_resume::resume(device, device_secret, home, support_dir, daemon)?
+    {
+        return Ok(None);
+    }
     if source_money_resume(source, support_dir) {
         let binding = unknown_recovery::binding(
             &snapshot_upload_destination_namespace(device, device_secret),
@@ -5396,11 +5401,6 @@ fn prepare_sync_source(
             )
             .into());
         }
-    }
-    if source == SnapshotSource::ClaudeCode
-        && money_resume::resume(device, device_secret, home, support_dir, daemon)?
-    {
-        return Ok(None);
     }
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now

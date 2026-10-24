@@ -3325,3 +3325,59 @@ fn p2a_unknown_cancel_after_counter_commit_consumes_slot_for_next_owner() {
         u64::MAX
     ));
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_parked_capture_cannot_post_after_original_deadline() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let mut clock = Some(money::PageClockForTest::new(&control.support, now));
+    let mut expired = false;
+    control
+        .cycle_changing(|_| {
+            if expired
+                || !money_resume::pending_for_test(&control.support)
+                || !control.server.raw_batches.lock().unwrap().is_empty()
+            {
+                return;
+            }
+            if !unknown_recovery::active_for_test(&control.support).is_empty() {
+                clock.take();
+                clock = Some(money::PageClockForTest::new(&control.support, now + 86400));
+                expired = true;
+            }
+        })
+        .unwrap();
+    assert!(
+        expired,
+        "advance the clock after durable custody, before the first POST"
+    );
+    assert!(
+        control.server.raw_batches.lock().unwrap().is_empty(),
+        "an old prepared body cannot use a new deadline"
+    );
+    let m = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(m.terminal, Some(unknown_recovery::Reason::Expired));
+    assert_eq!(m.deadline, now + 86400);
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|e| e.effective_upload_body_witness_revision != 3));
+}

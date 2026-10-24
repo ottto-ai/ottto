@@ -1116,6 +1116,21 @@ pub(super) fn initial_post(
     let SendState::Ready(m, body, _funds) = std::mem::take(state) else {
         return Err(fault());
     };
+    if now(support) >= m.deadline {
+        let ticket = outcome_ticket(support, m, Some(Reason::Expired), 0)?;
+        OUTCOMES
+            .lock()
+            .map_err(|_| fault())?
+            .entry(support.to_path_buf())
+            .or_default()
+            .push(ticket);
+        return Err(Deferred {
+            reason: None,
+            not_before: now(support),
+            route_unavailable: false,
+        }
+        .into());
+    }
     let roots = m
         .entities
         .iter()
@@ -1260,6 +1275,7 @@ pub(super) fn admitted(
 ) -> Result<bool> {
     if m.binding != binding
         || m.context != index.recovery_upload_context()
+        || now(support) >= m.deadline
         || !money::request_owned_live(support)
     {
         return Ok(false);
