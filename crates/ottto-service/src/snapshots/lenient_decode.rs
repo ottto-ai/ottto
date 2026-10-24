@@ -250,6 +250,10 @@ impl Serialize for ScanIndex {
             claude_duplicate_fence_next_full_rearm_unix_seconds,
             Option::is_none
         );
+        field!(
+            claude_full_rearm_progress,
+            ClaudeFullRearmProgress::is_empty
+        );
         field!(claude_request_identity_contract, Option::is_none);
         field!(claude_request_identity_contract_changed, std::ops::Not::not);
         field!(claude_desktop_store_cursor, Option::is_none);
@@ -335,6 +339,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_account_deferred_holds",
     "claude_duplicate_fence_rearm_attempt",
     "claude_duplicate_fence_next_full_rearm_unix_seconds",
+    "claude_full_rearm_progress",
     "claude_request_identity_contract",
     "claude_request_identity_contract_changed",
     "claude_desktop_store_cursor",
@@ -1485,6 +1490,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_duplicate_fence_next_full_rearm_unix_seconds" => {
                             index.claude_duplicate_fence_next_full_rearm_unix_seconds =
                                 self.typed(value)?
+                        }
+                        "claude_full_rearm_progress" => {
+                            // #720 scheduling-only memory: malformed progress
+                            // costs another re-arm, never opens the fence. Match
+                            // the native deserialize_lenient_default policy.
+                            index.claude_full_rearm_progress =
+                                self.history_scalar(value, ClaudeFullRearmProgress::default())?;
                         }
                         "claude_request_identity_contract" => {
                             index.claude_request_identity_contract = self.typed(value)?

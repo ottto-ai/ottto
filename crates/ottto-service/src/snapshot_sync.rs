@@ -6131,9 +6131,11 @@ fn finish_sync_source(
         };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
-                crate::snapshots::claude_api_cache_creation_rejection_count()
+                crate::snapshots::claude_api_cache_creation_rejection_count(),
+                stats.full_rearm_suppression.full_rearm_suppressed,
+                stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
@@ -7465,6 +7467,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// Fix 1's skipped full re-arms; absent from the line while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
+    pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -7936,6 +7941,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ..Default::default()
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
+    let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
         Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
@@ -7952,7 +7958,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             );
             api_read = evidence;
         }
-        Err(_) => stats.effort_evidence_load_failed = true,
+        Err(_) => {
+            stats.effort_evidence_load_failed = true;
+            full_rearm_evidence_complete = false;
+        }
     }
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
@@ -7976,11 +7985,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 )
                 .is_empty();
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired
-                && emission_permitted
-                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
-                identity_unhealthy_roots.insert(session_id.clone());
+                full_rearm_evidence_complete = false;
+                if emission_permitted {
+                    identity_unhealthy_roots.insert(session_id.clone());
+                }
             }
             paired
         })
@@ -8027,6 +8037,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
@@ -8054,6 +8065,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
+            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -8078,6 +8090,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
+    if !full_rearm_evidence_complete {
+        index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
+    }
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
@@ -8181,6 +8196,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {

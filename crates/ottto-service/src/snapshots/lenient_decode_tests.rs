@@ -2013,6 +2013,7 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact","b":"AAAAAAAAAAE="}})
             }
             "claude_request_census_shadow" => serde_json::json!({"o":true}),
+            "claude_full_rearm_progress" => serde_json::json!({"structural_rearm_owed":true}),
             "claude_duplicate_request_owners" => {
                 serde_json::json!({"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]})
             }
