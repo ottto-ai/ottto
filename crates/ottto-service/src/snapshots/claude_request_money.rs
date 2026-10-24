@@ -1312,6 +1312,8 @@ fn shadow_page_with_coverage(
     let deadline = started + remaining.saturating_sub(PAGE_CLOSE_RESERVE);
     let close_deadline = started + remaining.saturating_sub(Duration::from_millis(10));
     let snapshot = next_snapshot();
+    let day = utc_day(now);
+    let epoch = process_epoch();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us,
         capture_reserved_bytes: capture::capture_reserved() as u64,
@@ -1528,31 +1530,37 @@ fn shadow_page_with_coverage(
     if faulted(PageFault::BodyDeadline) {
         end.deadline = started;
     }
-    let mut order = order.into_iter();
-    while let Some((root, key, turn)) = order.next() {
+    for position in 0..order.len() {
+        let (root, key, turn) = order[position].clone();
         if scope.is_none() || preflight_check(end.deadline).is_err() {
             // Closing hashes only the admitted canonical failure template.
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
-            let deferred = order.len() as u64 + 1;
-            for (root, key, turn) in std::iter::once((root, key, turn)).chain(order) {
+            let deferred = (order.len() - position) as u64;
+            for (root, key, turn) in &order[position..] {
                 let state = coverage_view.family(root);
                 let digest = failure_digest.deferred(root, &state, ledger);
-                let unchanged = publication_unchanged(ledger, &key, digest, now);
-                counts.unchanged += u64::from(unchanged);
-                failed += u64::from(!unchanged);
+                let unchanged = publication_unchanged(ledger, key, digest, day, epoch);
+                if unchanged {
+                    counts.unchanged += 1;
+                    // Nothing was consumed or published. Re-acknowledging an
+                    // unchanged deferred memo only dirties the ledger and
+                    // makes the following page redo thousands of inserts.
+                    continue;
+                }
+                failed += 1;
                 memos.push(PendingMemo {
-                    key,
+                    key: key.clone(),
                     basis: None,
-                    observed_unix: turn,
+                    observed_unix: *turn,
                     published: ClaudeFamilyPublication {
-                        utc_day: utc_day(now),
+                        utc_day: day,
                         digest,
-                        epoch: process_epoch(),
+                        epoch,
                         attempted: now,
                     },
-                    row: !unchanged,
-                    deferred: (!unchanged).then(|| (root.to_owned(), state)),
+                    row: true,
+                    deferred: Some((root.to_string(), state)),
                 });
             }
             counts.families += deferred;
@@ -1692,7 +1700,7 @@ fn shadow_page_with_coverage(
         };
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);
-        let unchanged = publication_unchanged(ledger, &key, digest, now);
+        let unchanged = publication_unchanged(ledger, &key, digest, day, epoch);
         // Publication and capture scheduling are distinct. A reached
         // family denied capture keeps its old turn too, otherwise small
         // pages repeatedly pick the same first 64 despite reaching all roots.
@@ -1701,14 +1709,17 @@ fn shadow_page_with_coverage(
             basis: if unchanged { None } else { basis },
             observed_unix: if capture_consumed { now } else { turn },
             published: ClaudeFamilyPublication {
-                utc_day: utc_day(now),
+                utc_day: day,
                 digest,
-                epoch: process_epoch(),
+                epoch,
                 attempted: now,
             },
             row: !unchanged,
             deferred: None,
         });
+        if capture_consumed {
+            order[position].2 = now;
+        }
         if unchanged {
             counts.unchanged += 1;
         } else {
@@ -1738,12 +1749,10 @@ fn shadow_page_with_coverage(
     // This only selects optional captures; it grants no publication or
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
-    if memos.len() > capture::NEXT_PAGE_FAMILIES {
+    if order.len() > capture::NEXT_PAGE_FAMILIES {
         capture::plan_next_page(
             &scope_key,
-            memos
-                .iter()
-                .map(|memo| (memo.key.as_str(), memo.observed_unix)),
+            order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
             end.close_deadline
                 .min(Instant::now() + Duration::from_millis(10)),
         );
@@ -2345,16 +2354,20 @@ fn failure_rows(
     rows
 }
 
-fn publication_unchanged(ledger: &ClaudeLedger, key: &str, digest: u64, now: u64) -> bool {
+fn publication_unchanged(
+    ledger: &ClaudeLedger,
+    key: &str,
+    digest: u64,
+    day: u64,
+    epoch: u64,
+) -> bool {
     !ledger.in_flight(key)
         && ledger
             .get(key)
             .and_then(ClaudeRequestCensusRecord::family_memo)
             .and_then(|(_, memo)| memo.published)
             .is_some_and(|published| {
-                published.utc_day == utc_day(now)
-                    && published.epoch == process_epoch()
-                    && published.digest == digest
+                published.utc_day == day && published.epoch == epoch && published.digest == digest
             })
 }
 

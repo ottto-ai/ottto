@@ -1400,6 +1400,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let finalizers_started = std::time::Instant::now();
     let armed = scan(&mut armed_index);
     let armed_scan_elapsed = finalizers_started.elapsed();
+    println!("MONEY_P1B_NATIVE baseline_scan_us={} armed_scan_us={} total_wall_deadline_us=250000", baseline_scan_elapsed.as_micros(), armed_scan_elapsed.as_micros());
     assert!(armed.snapshots.len() >= 2048);
     assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
     assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
