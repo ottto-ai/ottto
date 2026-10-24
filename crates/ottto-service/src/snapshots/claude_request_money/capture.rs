@@ -218,14 +218,20 @@ fn complete_plan<'a>(
     if !within_deadline() {
         return Err(PlanFailure::Deadline);
     }
-    let mut oldest_funds = Funds::default();
-    if !oldest_funds
-        .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>()))
-    {
-        return Err(PlanFailure::Funds);
-    }
     plan.build += 1;
     let build = plan.build;
+    // Under ceiling pressure, room comes first from families this build has
+    // not listed (yet): earlier pages' families, which an interrupted build
+    // keeps, never outlast a page whose own families fit.
+    let oldest_bytes =
+        NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>());
+    let mut oldest_funds = Funds::default();
+    if !oldest_funds.spend(oldest_bytes) {
+        prune_unlisted(plan, build);
+        if !oldest_funds.spend(oldest_bytes) {
+            return Err(PlanFailure::Funds);
+        }
+    }
     // Oldest-64 selection with the producer's same (turn, family key)
     // total order, without an uninterruptible whole-page sort.
     let mut oldest = BTreeMap::new();
@@ -236,8 +242,14 @@ fn complete_plan<'a>(
         if let Some(entry) = plan.turns.get_mut(key) {
             *entry = (turn, build);
         } else {
+            // A page family still ahead in the walk that the pruning drops
+            // comes back with the page's own turn, which already includes
+            // the plan's (`scheduling_turn`).
             if !plan.turn_funds.spend(plan_key_bytes(key)) {
-                return Err(PlanFailure::Funds);
+                prune_unlisted(plan, build);
+                if !plan.turn_funds.spend(plan_key_bytes(key)) {
+                    return Err(PlanFailure::Funds);
+                }
             }
             plan.turns.insert(key.to_owned(), (turn, build));
         }
@@ -246,6 +258,14 @@ fn complete_plan<'a>(
             let _ = oldest.pop_last();
         }
     }
+    if !within_deadline() {
+        return Err(PlanFailure::Deadline);
+    }
+    // Families this page does not list leave the plan, with their funds,
+    // and so does the old eligible set (a failure below falls back).
+    prune_unlisted(plan, build);
+    plan.eligible = BTreeSet::new();
+    plan.eligible_funds = Funds::default();
     let mut eligible_funds = Funds::default();
     let mut eligible = BTreeSet::new();
     for key in oldest.values() {
@@ -260,7 +280,14 @@ fn complete_plan<'a>(
     if !within_deadline() {
         return Err(PlanFailure::Deadline);
     }
-    // Families this page does not list leave the plan, with their funds.
+    plan.eligible = eligible;
+    plan.eligible_funds = eligible_funds;
+    plan.unlisted_eligible = true;
+    Ok(())
+}
+
+/// Drop the families `build` has not listed, refunding their funds.
+fn prune_unlisted(plan: &mut Plan, build: u64) {
     let mut freed = 0;
     plan.turns.retain(|key, (_, seen)| {
         let keep = *seen == build;
@@ -270,10 +297,6 @@ fn complete_plan<'a>(
         keep
     });
     plan.turn_funds.refund(freed);
-    plan.eligible = eligible;
-    plan.eligible_funds = eligible_funds;
-    plan.unlisted_eligible = true;
-    Ok(())
 }
 
 /// Replace the eligible set with the fallback's (at most 64) and record
@@ -1586,43 +1609,80 @@ mod bounded_tests {
         println!("MONEY_P1B_PLAN_CLOSED first_page_eligible=1 closed_eligible=0 expired_checked={} expired_eligible=0 funds_refused=1", u8::from(expired.is_some()));
     }
 
-    /// Replacing a plan releases the old plan's funds before funding the new
-    /// one, so a family count whose two plans exceed the capture ceiling
-    /// still installs every page.
+    /// Each page updates the plan in place and reuses its funds, so a family
+    /// count whose two plans exceed the capture ceiling still installs every
+    /// page. Changing family sets near the ceiling, after an interrupted
+    /// build kept the union of two pages, still install: families the page
+    /// does not list make room first.
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn replacing_a_large_plan_reuses_the_old_plans_funds() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-large-plan");
         let support = scratch.join("support");
         let before = capture_reserved();
-        let keys = (0..30_000)
-            .map(|at| super::super::family_key(&format!("root-{at}")))
-            .collect::<Vec<_>>();
+        let set = |name: &str| {
+            (0..30_000)
+                .map(|at| super::super::family_key(&format!("{name}-{at}")))
+                .collect::<Vec<_>>()
+        };
+        let keys = set("root");
         let one_plan = keys.iter().map(|key| plan_key_bytes(key)).sum::<usize>();
         assert!(
             2 * one_plan > CAPTURE_CEILING_BYTES - before
                 && one_plan < CAPTURE_CEILING_BYTES - before,
             "two plans exceed the ceiling, one fits: {one_plan}"
         );
-        for page in 0..3_u64 {
+        let page = |keys: &[String], offset: u64, checks: usize| {
+            let walked = std::cell::Cell::new(0);
+            plan_next_page_while(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), (at as u64 + offset) % 30_000)),
+                keys[..NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| (key.as_str(), 0, true)),
+                || {
+                    walked.set(walked.get() + 1);
+                    walked.get() <= checks
+                },
+            )
+        };
+        for offset in 0..3_u64 {
             assert_eq!(
-                plan_next_page_while(
-                    &support,
-                    keys.iter()
-                        .enumerate()
-                        .map(|(at, key)| (key.as_str(), (at as u64 + page * 7) % 30_000)),
-                    std::iter::empty(),
-                    || true,
-                ),
+                page(&keys, offset * 7, usize::MAX),
                 PlanInstall::Complete,
-                "page {page}"
+                "page {offset}"
             );
             assert!(capture_reserved() - before < 2 * one_plan);
         }
         let held = capture_reserved() - before;
+        // Another native page's families: an interrupted build keeps the
+        // union (40,000 families) ...
+        let other = set("other");
+        assert_eq!(
+            page(&other, 0, 10_000),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
+        let union = capture_reserved() - before;
+        assert!(union > held, "{union} {held}");
+        // ... and a third page set, whose own 30,000 families fit but the
+        // 70,000-family union does not, still installs completely.
+        let third = set("third");
+        assert_eq!(page(&third, 0, usize::MAX), PlanInstall::Complete);
+        assert!(capture_reserved() - before < 2 * one_plan);
+        let eligible = planned_families_for_test(&support).unwrap();
+        assert_eq!(eligible.len(), NEXT_PAGE_FAMILIES);
+        assert!(eligible.iter().all(|key| third.contains(key)));
+        assert_eq!(
+            PLANS.lock().unwrap()[&support].turns.len(),
+            third.len(),
+            "only the page's own families stay"
+        );
+        assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
-        println!("MONEY_P1B_PLAN_FUNDS keys=30000 one_plan_bytes={one_plan} held_bytes={held} ceiling={CAPTURE_CEILING_BYTES} pages=3 installed=3");
+        println!("MONEY_P1B_PLAN_FUNDS keys=30000 one_plan_bytes={one_plan} held_bytes={held} interrupted_union_bytes={union} ceiling={CAPTURE_CEILING_BYTES} same_set_pages=3 changed_set_installed=1");
     }
 
     /// Admission inside a running money section charges its time already;
