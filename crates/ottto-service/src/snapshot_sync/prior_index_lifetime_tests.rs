@@ -605,6 +605,9 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     // Populate the money ledger with one armed cycle, save it and forget it;
     // then a new response, so the compared cycle has work.
     money::enable_shadow_for_test(&support);
+    // The writer supplies durable quota asynchronously; prime the fixture
+    // before requiring its first cycle to produce a persisted save.
+    money::store::prime_credit_for_test(&support, 0);
     let populated = cycle(
         crate::source_rotation::PARKED_BUDGET,
         false,
@@ -612,6 +615,7 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         false,
     );
     assert!(populated.ok, "{populated:?}");
+    money::store::flush();
     money::store::forget_for_test(&support);
     assert!(support.join(money::store::LEDGER_DIR).join("meta.json").is_file());
     let transcript = fixture

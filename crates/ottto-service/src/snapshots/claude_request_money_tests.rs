@@ -644,6 +644,7 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
                 removed_requests: 3,
                 removed_tokens: 900,
                 snapshot: 5,
+                published: None,
             },
         ),
     );
@@ -922,7 +923,7 @@ fn money_api_line(session: &str, request: &str, observed_at: &str) -> String {
 }
 
 fn money_work(bytes: u64) -> ClaudeLedgerWork {
-    ClaudeLedgerWork::new(bytes, 1024, Duration::from_secs(30))
+    ClaudeLedgerWork::new(bytes, 1024, Instant::now() + Duration::from_secs(30))
 }
 
 struct MoneyTail {
@@ -1056,7 +1057,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         expected.as_slice()
     );
 
-    // The shared byte budget (the anchor check plus one line) stops inside
+    // The shared byte budget (entry/final anchors plus one line) stops inside
     // the file; the next page resumes there and the sweep does not wrap.
     for number in 3..6 {
         tail.append(
@@ -1068,7 +1069,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         &mut ledger,
         &budget,
         1_800_000_000,
-        &mut money_work(64 + line.len() as u64),
+        &mut money_work(128 + line.len() as u64),
     );
     assert!(counts.budget_stopped);
     assert!(!counts.sweep_wrapped);
@@ -1248,7 +1249,7 @@ fn money_telemetry_retires_only_under_pressure() {
         );
     }
     assert_eq!(
-        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger),
+        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger, Instant::now() + Duration::from_secs(30)),
         0
     );
     ledger.insert(
@@ -1270,7 +1271,7 @@ fn money_telemetry_retires_only_under_pressure() {
         ClaudeRequestCensusInsert::Stored
     );
     assert_eq!(
-        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger),
+        crate::snapshots::claude_request_ledger::retire_telemetry_under_pressure(&mut ledger, Instant::now() + Duration::from_secs(30)),
         1
     );
     assert_eq!(
@@ -1360,12 +1361,8 @@ fn money_rows_converge_by_tailing_long_sidecars() {
     );
     assert_eq!(roots[session], ClaudeRootTelemetry::Current);
     assert_eq!(
-        (
-            counts.files_appended,
-            counts.files_rebuilt,
-            counts.bytes_read
-        ),
-        (1, 0, line.len() as u64),
+        (counts.files_appended, counts.files_rebuilt, counts.bytes_read),
+        (1, 0, line.len() as u64 + 3 * 64),
         "{counts:?}"
     );
     let rows = ClaudeRootRows::from_record(ledger.get(&key).unwrap()).expect("complete rows");
@@ -1882,6 +1879,7 @@ fn money_shadow_panics_are_contained_and_it_can_be_turned_off() {
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
             true,
+            &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage::default(),
         );
         store::flush();
         crate::snapshots::claude_request_money::take_shadow_lines_for_test().len()
@@ -2193,6 +2191,7 @@ impl MoneyLedger {
             trace: traces,
             telemetry_complete_through: 2_000_000_000,
             deadline,
+            holder_view: super::claude_request_money::coverage::ClaudeHolderView { request: true, message: true },
             unbuilt_older: std::cell::Cell::new(0),
         };
         ctx.classify_request(hash, 1_000, own_key, own_root)
@@ -2425,6 +2424,7 @@ fn money_message_only_copies_pick_one_owner() {
         trace: &empty_traces,
         telemetry_complete_through: 2_000_000_000,
         deadline,
+        holder_view: super::claude_request_money::coverage::ClaudeHolderView { request: true, message: true },
         unbuilt_older: std::cell::Cell::new(0),
     };
     let verdicts = keys.map(|key| ctx.classify_message(message, key));
@@ -3136,4 +3136,44 @@ fn money_two_owner_and_owned_after_retirement_match_frozen_main_records() {
         )
     }
     assert_eq!(arm(true), arm(false));
+}
+
+#[test]
+fn money_p1b_large_holder_record_checks_inner_deadline() {
+    let mut ledger = MoneyLedger::new(&[], &[], &[]);
+    let hashes = (0..1_000_000).collect::<Vec<u64>>();
+    ledger.ledger.insert_for_test("otel:large", money_record('a', hashes.clone()));
+    let started = Instant::now();
+    let deadline = started + Duration::from_millis(1);
+    let result = crate::snapshots::claude_request_ledger::scan_holders(
+        ledger.index.claude_request_census_for_test(), &ledger.ledger,
+        &hashes, &[], deadline, &mut |_| true);
+    assert!(result.is_none());
+    assert!(started.elapsed() < Duration::from_secs(1));
+    println!("MONEY_P1B_HOLDER hashes=1000000 wall_us={} check_interval=4096", started.elapsed().as_micros());
+}
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn money_p1b_raced_verification_respects_remaining_physical_read_budget() {
+    let tail = MoneyTail::new("money-verification-physical-budget");
+    let session = "money-verify-root";
+    let text = (0..64).map(|at| money_api_line(session, &format!("req_{at}"), "2026-08-02T09:00:00Z")).collect::<String>();
+    tail.append(session, &text);
+    let limit = text.len() as u64 + text.len() as u64 / 2;
+    let append = money_api_line(session, "req_late", "2026-08-02T09:00:00Z");
+    race_reads_for_test(Some(Box::new(move |path: &Path| {
+        std::fs::OpenOptions::new().append(true).open(path).unwrap().write_all(append.as_bytes()).unwrap();
+    })));
+    let mut ledger = ClaudeLedger::new_for_test();
+    let budget = ClaudeTelemetryTailBudget { max_files: 0, ..Default::default() };
+    let mut work = money_work(limit);
+    let (counts, roots) = tail.page(&mut ledger, &budget, 1_800_000_000, &mut work, &[session]);
+    race_reads_for_test(None);
+    assert_eq!(counts.files_reread_proven, 0, "{counts:?}");
+    assert!(counts.files_raced > 0 && counts.budget_stopped, "{counts:?}");
+    assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
+    assert!(ledger.get(&telemetry_key(session)).is_none(), "short verification never commits");
+    assert_eq!(counts.bytes_read, limit, "verification consumes the remaining physical bytes");
+    println!("MONEY_P1B_READ first_pass={} bytes_read={} physical_budget={limit} committed=0", text.len(), counts.bytes_read);
 }
