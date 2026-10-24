@@ -19,6 +19,7 @@ flate2.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
 libc.workspace = true
+log.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 ottto-core = { path = "../ottto-core" }
