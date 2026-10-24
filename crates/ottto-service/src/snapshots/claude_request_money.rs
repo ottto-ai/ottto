@@ -1308,7 +1308,7 @@ fn shadow_page_with_coverage(
     let deadline = started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE;
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
-        capture_us: capture::take_capture_us(),
+        capture_us: capture::take_capture_us(&shadow_scope(support_dir)),
         capture_reserved_bytes: capture::capture_reserved() as u64,
         ..Default::default()
     };

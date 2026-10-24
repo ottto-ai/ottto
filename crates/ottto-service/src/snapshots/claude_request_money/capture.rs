@@ -22,7 +22,7 @@ use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageT
 use super::ClaudeMoneyTokens;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -44,8 +44,6 @@ const MAX_MESSAGE_HASH_INPUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_MESSAGE_IDS: usize = 131_072;
 
 static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
-/// Time spent in capture work since the last page took it (microseconds).
-static CAPTURE_MICROS: AtomicU64 = AtomicU64::new(0);
 
 /// Cumulative work allowance, independent of resident refunds. Reset once,
 /// before the page's native finalizers. Time counts capture work, not parsing.
@@ -54,6 +52,7 @@ struct Work {
     input: usize,
     comparisons: usize,
     micros: u64,
+    reported_micros: u64,
     exhausted: bool,
 }
 const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -347,7 +346,6 @@ impl ClaudeResponseCapture {
             finished = true;
         });
         let elapsed = started.elapsed().as_micros() as u64;
-        CAPTURE_MICROS.fetch_add(elapsed, Ordering::Relaxed);
         if let Ok(mut work) = WORK.lock() {
             let work = work.entry(self.scope.clone()).or_default();
             work.micros = work.micros.saturating_add(elapsed);
@@ -747,9 +745,18 @@ pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
 }
 
-/// Capture work time since the last call (microseconds).
-pub(crate) fn take_capture_us() -> u64 {
-    CAPTURE_MICROS.swap(0, Ordering::Relaxed)
+/// This scope's capture work since its previous shadow call. Reporting
+/// never refunds the cumulative work budget; unrelated fixture scopes
+/// cannot donate elapsed work to another page's resource receipt.
+pub(crate) fn take_capture_us(scope: &Path) -> u64 {
+    WORK.lock().map_or(0, |mut pages| {
+        let Some(work) = pages.get_mut(scope) else {
+            return 0;
+        };
+        let elapsed = work.micros.saturating_sub(work.reported_micros);
+        work.reported_micros = work.micros;
+        elapsed
+    })
 }
 
 /// Accepted cumulative work, including work whose resident capture was dropped.
