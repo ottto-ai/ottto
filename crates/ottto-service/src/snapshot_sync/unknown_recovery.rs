@@ -1838,6 +1838,20 @@ mod tests {
             };
             m.terminal = Some(reason);
             if !known {
+                let mut released = false;
+                for _ in 0..32 {
+                    match money::recovery_release_receipt(&scratch, &m.lineage, m.deadline) {
+                        money::MoneyReceipt::Ready => {
+                            released = true;
+                            break;
+                        }
+                        money::MoneyReceipt::Pending => store::flush(),
+                        money::MoneyReceipt::Refused => {
+                            panic!("terminal latch must be durable before payload deletion")
+                        }
+                    }
+                }
+                assert!(released);
                 m.receipt_slot = Some(0);
                 let receipt = Receipt {
                     outcome: "unknown_outcome_unresolved".into(),
