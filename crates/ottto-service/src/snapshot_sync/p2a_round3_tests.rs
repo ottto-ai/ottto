@@ -3335,7 +3335,15 @@ fn p2a_unknown_live_off_retires_existing_payload_before_ordinary_networking() {
         assert_eq!(status["unknown_outcome_unresolved"], 1);
         posted.store(true, std::sync::atomic::Ordering::SeqCst);
     }));
-    std::fs::write(control.support.join("claude-money-live.off"), b"stop").unwrap();
+    std::fs::write(
+        control.support.join("claude-request-owned-live.off"),
+        b"stop",
+    )
+    .unwrap();
+    assert!(
+        !money::request_owned_live(&control.support),
+        "exercise the actual live kill switch"
+    );
     *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
     control.cycle();
     assert!(observed.load(std::sync::atomic::Ordering::SeqCst));

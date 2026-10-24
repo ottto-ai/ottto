@@ -2007,12 +2007,24 @@ mod refused_intent_tests {
         assert!(checkpoint_for_test(&support, &mut ledger));
         drop(ledger);
         forget_for_test(&support);
+        // A recovery result can be received just before its writer job drops
+        // its reservation. Drain that work before filling the shared ceiling;
+        // otherwise the completed job can free capacity underneath this cap.
+        assert!(
+            flush_acknowledged(),
+            "prior writer work must release its funds"
+        );
         let cap = ShadowReservation::admit(
             super::super::SHADOW_MEMORY_CEILING_BYTES - super::super::reserved_for_test(),
         )
         .unwrap();
         assert!(matches!(acquire(&support), ClaudeLedgerAcquire::Loading));
-        flush(); // Actual saved-shard load exhausts the existing admission attempts.
+        // Actual saved-shard loading must finish its unchanged admission
+        // attempts before this test interprets the terminal refusal receipt.
+        assert!(
+            flush_acknowledged(),
+            "load admission must return its writer receipt"
+        );
         assert!(matches!(
             acquire(&support),
             ClaudeLedgerAcquire::Unavailable
