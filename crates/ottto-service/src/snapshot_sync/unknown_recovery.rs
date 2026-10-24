@@ -43,6 +43,7 @@ pub(super) struct Manifest {
     pub id: String,
     pub binding: String,
     pub context: String,
+    pub policy: [u8; 32],
     pub created: u64,
     pub deadline: u64,
     /// Includes the original physical POST; 1 + at most three replays.
@@ -337,6 +338,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             id,
             binding: "00".repeat(32),
             context: String::new(),
+            policy: [0; 32],
             created: 0,
             deadline: DEADLINE,
             posts: 1,
@@ -649,6 +651,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                     id,
                     binding: "00".repeat(32),
                     context: String::new(),
+                    policy: [0; 32],
                     created: now,
                     deadline: now.saturating_add(DEADLINE),
                     posts: 1,
@@ -950,6 +953,7 @@ pub(super) fn manifest(
     request: &SnapshotBatchRequest,
     binding: String,
     head_cas: bool,
+    policy: [u8; 32],
 ) -> Result<Manifest> {
     let head_cas = head_cas
         || request
@@ -1005,6 +1009,7 @@ pub(super) fn manifest(
         id: format!("{:x}", lineage.finalize()),
         binding,
         context: index.recovery_upload_context().to_owned(),
+        policy,
         created: now,
         deadline: now.saturating_add(DEADLINE),
         posts: 1,
@@ -1062,10 +1067,18 @@ pub(super) fn initial_post(
     request: &SnapshotBatchRequest,
     binding: &str,
     head_cas: bool,
+    policy: [u8; 32],
     state: &mut SendState,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     if matches!(state, SendState::Empty) {
-        let m = manifest(support, index, request, binding.to_owned(), head_cas)?;
+        let m = manifest(
+            support,
+            index,
+            request,
+            binding.to_owned(),
+            head_cas,
+            policy,
+        )?;
         if CATALOGS
             .lock()
             .map_err(|_| fault())?
@@ -1400,12 +1413,16 @@ pub(super) async fn replay_due(
     secret: &str,
     machine: &str,
     namespace: &str,
+    policy: [u8; 32],
     authority: impl Fn() -> Result<()>,
 ) -> Result<()> {
     let binding = binding(namespace, client.recovery_origin(), machine, "");
     let (due, _scope_funds) = due(support, now(support))?;
     for m in due {
-        if m.binding != binding || m.context != index.recovery_upload_context() {
+        if m.binding != binding
+            || m.context != index.recovery_upload_context()
+            || m.policy != policy
+        {
             let updated = wait(outcome_ticket(support, m, Some(Reason::BindingLost), 0)?).await?;
             replace(support, updated)?;
             continue;
@@ -1555,6 +1572,7 @@ mod tests {
                 id: "ab".repeat(32),
                 binding: "cd".repeat(32),
                 context: "context".into(),
+                policy: [0; 32],
                 created,
                 deadline: created + DEADLINE,
                 posts: 1,

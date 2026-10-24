@@ -2957,6 +2957,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
             "device-secret",
             "otm_test",
             &namespace,
+            unknown_recovery::active_for_test(&control.support)[0].policy,
             || Ok(()),
         ))
         .unwrap();
@@ -2992,6 +2993,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
                 "device-secret",
                 "otm_test",
                 &namespace,
+                m.policy,
                 || Ok(()),
             ))
             .unwrap();
@@ -3188,6 +3190,7 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
             "device-secret",
             "otm_test",
             &namespace,
+            unknown_recovery::active_for_test(&control.support)[0].policy,
             || Ok(()),
         ))
         .unwrap();

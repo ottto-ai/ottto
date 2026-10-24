@@ -6220,6 +6220,7 @@ async fn finish_sync_source_resume(
             device_secret,
             machine_id,
             &upload_destination_namespace,
+            money_policy.expect("prepared recovery policy"),
             ensure_authority,
         )
         .await
@@ -6718,6 +6719,7 @@ async fn finish_sync_source_resume(
                             &request,
                             binding,
                             enforce_head_cas,
+                            money_policy.expect("prepared recovery policy"),
                             &mut recovery_send,
                         )
                     } else {
@@ -6860,6 +6862,7 @@ async fn finish_sync_source_resume(
                         &request,
                         binding,
                         reconcile_class,
+                        money_policy.expect("prepared recovery policy"),
                         &mut recovery_send,
                     )
                 } else {
