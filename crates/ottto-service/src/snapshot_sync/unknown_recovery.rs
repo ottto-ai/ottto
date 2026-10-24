@@ -666,6 +666,7 @@ pub(super) fn trace_for_test(
     if !tracing_for_test() {
         return;
     }
+    let live = money::request_owned_live(support);
     let Ok(catalogs) = CATALOGS.lock() else {
         return;
     };
@@ -688,7 +689,7 @@ pub(super) fn trace_for_test(
     }).collect::<Vec<_>>());
     eprintln!(
         "MONEY_UNKNOWN_TRACE {}",
-        serde_json::json!({"phase":phase,"attempts":attempts,
+        serde_json::json!({"phase":phase,"live":live,"attempts":attempts,
         "accepted":progress.accepted_fingerprints.len(),"bodies":progress.accepted_body_witnesses.len(),
         "quarantines":progress.quarantined_fingerprints.len(),"index_files":index.files.len()})
     );

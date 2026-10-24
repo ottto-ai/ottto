@@ -6555,6 +6555,13 @@ async fn finish_sync_source_resume(
     };
     let retained_bodies = retained_progress.as_ref().map(|(bodies, _funds)| bodies);
     #[cfg(test)]
+    if unknown_recovery::tracing_for_test() {
+        eprintln!(
+            "MONEY_UNKNOWN_TRACE scope_prepared={recovery_prepared} scope_count={:?}",
+            retained_bodies.map(BTreeMap::len)
+        );
+    }
+    #[cfg(test)]
     unknown_recovery::trace_for_test("retained_scope", support_dir, &index, &upload_progress);
     let mut current_fingerprints = index.current_snapshot_fingerprints();
     if let Some(bodies) = retained_bodies {
