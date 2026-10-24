@@ -3860,14 +3860,20 @@ fn p2a_unknown_last_replay_saved_ack_failed_selection_stays_known_at_expiry() {
     let status: serde_json::Value =
         serde_json::from_slice(&std::fs::read(root.join("status")).unwrap()).unwrap();
     assert_eq!(status["unknown_outcome_unresolved"], 0);
-    for file in std::fs::read_dir(root).unwrap() {
-        let path = file.unwrap().path();
-        if path.extension().and_then(|s| s.to_str()) == Some("receipt") {
-            let receipt: serde_json::Value =
-                serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-            assert_eq!(receipt["outcome"], "resolved");
-        }
-    }
+    assert_eq!(
+        std::fs::read_dir(root)
+            .unwrap()
+            .filter(|entry| entry
+                .as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .and_then(|s| s.to_str())
+                == Some("receipt"))
+            .count(),
+        0,
+        "known ACKs never exhaust the 35-day unresolved receipt quota"
+    );
     assert!(
         money::money_due(
             &control.support,

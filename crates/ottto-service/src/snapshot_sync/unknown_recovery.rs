@@ -476,28 +476,34 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
         attempts: m.posts.saturating_sub(1),
         hash8: m.id[..8].into(),
     };
-    if m.receipt_slot.is_none() {
-        let reserved = active
-            .iter()
-            .filter_map(|m| m.receipt_slot)
-            .collect::<BTreeSet<_>>();
-        let slot = (0..RECEIPT_MAX as u16)
-            .find(|slot| {
-                !reserved.contains(slot)
-                    && !root.join(format!("receipt-{slot:04}.receipt")).exists()
-            })
-            .ok_or_else(fault)?;
-        m.receipt_slot = Some(slot);
-        // Private slot reservation is durable before the count-only receipt.
-        // A crash cannot merge hash-8 collisions or count this lineage twice.
-        write_manifest(&root, &m)?;
+    // Known outcomes have durable ACK/selected evidence. They must not spend
+    // the 35-day unresolved-receipt quota on every ordinary successful POST.
+    // UNKNOWN retirement still requires its individual receipt before deletion.
+    if reason != Reason::Resolved {
+        if m.receipt_slot.is_none() {
+            let reserved = active
+                .iter()
+                .filter_map(|m| m.receipt_slot)
+                .collect::<BTreeSet<_>>();
+            let slot = (0..RECEIPT_MAX as u16)
+                .find(|slot| {
+                    !reserved.contains(slot)
+                        && !root.join(format!("receipt-{slot:04}.receipt")).exists()
+                })
+                .ok_or_else(fault)?;
+            m.receipt_slot = Some(slot);
+            // Private slot reservation is durable before the count-only receipt.
+            // A crash cannot merge hash-8 collisions or count this lineage twice.
+            write_manifest(&root, &m)?;
+        }
+        let receipt_path = root.join(format!("receipt-{:04}.receipt", m.receipt_slot.unwrap()));
+        if !receipt_path.exists() {
+            atomic(&root, &receipt_path, &serde_json::to_vec(&receipt)?)?;
+        }
     }
-    let receipt_path = root.join(format!("receipt-{:04}.receipt", m.receipt_slot.unwrap()));
-    if !receipt_path.exists() {
-        atomic(&root, &receipt_path, &serde_json::to_vec(&receipt)?)?;
-    }
-    // Receipt AND existing bounded money release latch precede deletion. A
-    // failed commit never evicts an unresolved body to make room for a send.
+    // UNKNOWN's receipt AND existing bounded release latch precede deletion.
+    // Known custody instead has its saved ACK and selected-save/expiry proof.
+    // A failed commit never evicts an unresolved body to admit another send.
     for extension in ["json", "body", "json.tmp", "body.tmp"] {
         match fs::remove_file(path(&root, &m.id, extension)?) {
             Ok(()) => (),
@@ -517,7 +523,9 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
     let status = serde_json::json!({"unknown_outcome_unresolved":unresolved,
         "active_batches":load(&root)?.len(), "time_day":now / 86400});
     atomic(&root, &root.join("status"), &serde_json::to_vec(&status)?)?;
-    crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
+    if reason != Reason::Resolved {
+        crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
+    }
     Ok(())
 }
 
