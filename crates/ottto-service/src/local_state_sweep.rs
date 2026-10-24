@@ -52,20 +52,24 @@
 //! support directory a daemon of this user can use (the environment's and
 //! the account database's home), so it only ever runs on copies.
 //!
-//! Nothing reads a quarantined copy again; it is kept only as evidence.
-//! Copies are pruned per group, one exact base in one destination
-//! directory, and only from a complete look at the whole group: the
-//! directory was listed in full, and every member is a safe regular file
-//! with no future timestamp. A copy's age counts from the newest of its
-//! name's timestamp, mtime, ctime and birthtime, since a rename keeps the
-//! old index's mtime. The group's newest copies (by that age, and by the
-//! name's timestamp; ties all count) are kept for 35 days, every other copy
-//! for 7. A group is pruned only while its canonical `<base>.json` exists as
-//! a non-empty regular file of this user, which shows the daemon rebuilt it;
-//! a copy is never opened or read. Each removal takes the same guards as a
-//! temp: the existing lock, a writer pid that no longer exists, no other
-//! daemon, and an unchanged identity, with the canonical file checked again
-//! under the lock.
+//! Nothing reads a quarantined copy's contents again; it is kept as
+//! evidence, and its name next to the Claude index is prior-history
+//! evidence (`claude_prior_history` in `snapshot_sync`), so every group
+//! keeps at least one copy for good. Copies are pruned per group, one exact
+//! base in one destination directory, and only from a complete look at the
+//! whole group: the directory was listed in full, and every member is a
+//! safe regular file with no future timestamp. A copy's age counts from the
+//! newest of its name's timestamp, mtime, ctime and birthtime, since a
+//! rename keeps the old index's mtime. The group's newest copies (by that
+//! age, and by the name's timestamp; ties all count) are never removed;
+//! every other copy is removed once 7 days old, and a plan that would leave
+//! the group empty removes nothing from it. A group is pruned only while its
+//! canonical `<base>.json` exists as a non-empty regular file of this user,
+//! which shows the daemon rebuilt it; a copy is never opened or read. Each
+//! removal takes the same guards as a temp: the existing lock, a writer pid
+//! that no longer exists, no other daemon, and an unchanged identity, with
+//! the canonical file and a kept copy of the group checked again under the
+//! lock.
 //!
 //! Only `<support>/snapshots/destinations/<64 lowercase hex>/` is visited,
 //! one level deep, through directory descriptors that never follow symlinks.
@@ -106,9 +110,8 @@ const MIN_AGE: Duration = Duration::from_secs(60 * 60);
 const MAX_DIR_ENTRIES: usize = 10_000;
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 const SCHEMA_VERSION: u32 = 1;
-/// A quarantine group's newest copies are kept at least this long.
-const QUARANTINE_NEWEST_MIN_AGE: Duration = Duration::from_secs(35 * 24 * 60 * 60);
-/// Every other quarantined copy is kept at least this long.
+/// A quarantined copy other than its group's newest is kept at least this
+/// long; the newest are never removed.
 const QUARANTINE_OTHER_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Canonical base suffixes whose loads quarantine an invalid file: the scan
 /// index (`quarantine_invalid_scan_index`) and its upload progress
@@ -267,6 +270,48 @@ fn parse_nanos(value: &str) -> Option<u64> {
         return None;
     }
     value.parse::<u64>().ok()
+}
+
+/// What happens to each copy of one fully looked-at group, given its
+/// `(age, name nanos)`: `None` removes it, `Some` keeps it for that reason.
+/// The newest copies, by age and by the name's timestamp (ties all count),
+/// are never removed; every other copy goes once 7 days old.
+fn quarantine_plan(copies: &[(i128, u64)]) -> Vec<Option<SkipReason>> {
+    let youngest = copies.iter().map(|&(age, _)| age).min();
+    let latest_name = copies.iter().map(|&(_, name_nanos)| name_nanos).max();
+    let mut plan: Vec<Option<SkipReason>> = copies
+        .iter()
+        .map(|&(age, name_nanos)| {
+            if Some(age) == youngest || Some(name_nanos) == latest_name {
+                Some(SkipReason::QuarantineKeptNewest)
+            } else if age < QUARANTINE_OTHER_MIN_AGE.as_nanos() as i128 {
+                Some(SkipReason::QuarantineRecent)
+            } else {
+                None
+            }
+        })
+        .collect();
+    keep_last_copies(&mut plan);
+    plan
+}
+
+/// A plan that would remove every copy of a group removes none: a
+/// quarantined copy next to the Claude index is prior-history evidence
+/// (`claude_prior_history`), so a group is never emptied. The newest rule
+/// already keeps one; this holds even if that rule changes.
+fn keep_last_copies(plan: &mut [Option<SkipReason>]) {
+    if plan.iter().all(Option::is_none) {
+        plan.fill(Some(SkipReason::QuarantineKeptNewest));
+    }
+}
+
+/// What a quarantined copy's removal checks again under its group's lock:
+/// the canonical file still shows a rebuild, and a copy the plan keeps is
+/// still there.
+#[derive(Clone, Copy)]
+struct KeptGroup<'a> {
+    canonical: &'a CStr,
+    kept: &'a CStr,
 }
 
 fn is_destination_name(name: &str) -> bool {
@@ -663,7 +708,8 @@ enum SkipReason {
     UnsafeEntry,
     TooManyEntries,
     OtherDaemon,
-    /// One of its group's newest quarantined copies, younger than 35 days.
+    /// One of its group's newest quarantined copies, which are never
+    /// removed.
     QuarantineKeptNewest,
     /// Another quarantined copy younger than 7 days, or one with a future
     /// timestamp.
@@ -1518,23 +1564,28 @@ impl Sweep<'_> {
                 return true;
             }
         };
-        let youngest = looks.iter().map(|look| look.age).min();
-        let latest_name = looks.iter().map(|look| look.copy.name_nanos).max();
-        for look in &looks {
+        let ages: Vec<(i128, u64)> = looks
+            .iter()
+            .map(|look| (look.age, look.copy.name_nanos))
+            .collect();
+        let plan = quarantine_plan(&ages);
+        // The plan keeps a copy of every group; it must still be there under
+        // each removal's lock.
+        let Some(kept) = plan.iter().position(Option::is_some) else {
+            return true;
+        };
+        let group = KeptGroup {
+            canonical: &canonical,
+            kept: &looks[kept].c_name,
+        };
+        for (look, keep) in looks.iter().zip(&plan) {
             if self.out_of_time() {
                 return false;
             }
-            let newest = Some(look.age) == youngest || Some(look.copy.name_nanos) == latest_name;
-            let (min_age, keep) = if newest {
-                (QUARANTINE_NEWEST_MIN_AGE, SkipReason::QuarantineKeptNewest)
-            } else {
-                (QUARANTINE_OTHER_MIN_AGE, SkipReason::QuarantineRecent)
-            };
             let bytes = look.identity.bytes();
-            let (verdict, bytes, lock) = if look.age < min_age.as_nanos() as i128 {
-                (Verdict::Skip(keep), bytes, LockState::NotChecked)
-            } else {
-                match self.lock_file(dir, base) {
+            let (verdict, bytes, lock) = match keep {
+                Some(reason) => (Verdict::Skip(*reason), bytes, LockState::NotChecked),
+                None => match self.lock_file(dir, base) {
                     Ok((lock_name, lock_identity)) => self.unlink_under_lock(
                         dir,
                         look.name,
@@ -1543,10 +1594,10 @@ impl Sweep<'_> {
                         &lock_name,
                         &lock_identity,
                         look.copy.pid,
-                        Some(canonical.as_c_str()),
+                        Some(group),
                     ),
                     Err(verdict) => (verdict, bytes, LockState::NotChecked),
-                }
+                },
             };
             self.record_artifact(path(look.name), kind, bytes, &verdict, lock);
         }
@@ -1569,7 +1620,8 @@ impl Sweep<'_> {
     /// copies: a writer pid that no longer exists, no other daemon, the
     /// flock on the already checked `lock_name`, then under it an unchanged
     /// identity, the pid again and, for a quarantined copy, a canonical
-    /// file that still shows a rebuild. Plan mode stops before the lock.
+    /// file that still shows a rebuild and a kept copy of its group that is
+    /// still there. Plan mode stops before the lock.
     #[allow(clippy::too_many_arguments)]
     fn unlink_under_lock(
         &mut self,
@@ -1580,7 +1632,7 @@ impl Sweep<'_> {
         lock_name: &CStr,
         lock_identity: &Identity,
         pid: i32,
-        canonical: Option<&CStr>,
+        group: Option<KeptGroup<'_>>,
     ) -> (Verdict, u64, LockState) {
         let bytes = first.bytes();
         let not_checked = |verdict| (verdict, bytes, LockState::NotChecked);
@@ -1619,8 +1671,17 @@ impl Sweep<'_> {
         if !self.writer_gone(pid) {
             return acquired(Verdict::Skip(SkipReason::LivePid));
         }
-        if canonical.is_some_and(|canonical| !self.rebuilt(dir, canonical)) {
-            return acquired(Verdict::Skip(SkipReason::QuarantineNoCanonical));
+        if let Some(group) = group {
+            if !self.rebuilt(dir, group.canonical) {
+                return acquired(Verdict::Skip(SkipReason::QuarantineNoCanonical));
+            }
+            match stat_at(dir, group.kept) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return acquired(Verdict::Skip(SkipReason::Changed))
+                }
+                Err(_) => return acquired(Verdict::Error),
+            }
         }
         if unsafe { libc::unlinkat(dir, c_name.as_ptr(), 0) } != 0 {
             let error = std::io::Error::last_os_error();

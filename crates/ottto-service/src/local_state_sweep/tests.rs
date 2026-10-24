@@ -1587,13 +1587,16 @@ fn real_scan_index_quarantine_is_recognized_and_aged_out() {
     // This test process wrote it; take it as exited, like a restarted daemon.
     let gone_writer = names_and_locks_only_after;
 
-    let report = apply(&f.support, &gone_writer(34 * DAY));
+    let report = apply(&f.support, &gone_writer(400 * DAY));
     assert_eq!(report.skipped.quarantine_kept_newest, 1);
     assert!(copy_path.exists());
 
-    let report = apply(&f.support, &gone_writer(36 * DAY));
+    // Once a later quarantine supersedes it, it ages out.
+    let newer = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let report = apply(&f.support, &gone_writer(8 * DAY));
     assert_eq!(report.removed_quarantine, 1);
     assert!(!copy_path.exists());
+    assert!(newer.exists());
     assert_eq!(
         ScanIndex::load(&path).expect("canonical intact").generation,
         1
@@ -1601,29 +1604,31 @@ fn real_scan_index_quarantine_is_recognized_and_aged_out() {
 }
 
 #[test]
-fn newest_copy_is_kept_until_35_days() {
+fn newest_copy_is_kept_at_any_age() {
     let f = fixture();
-    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now());
+    let copy = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
     let canonical = f.dest.join(format!("{INDEX}.json"));
     let lock = f.dest.join(format!("{INDEX}.lock"));
     let lock_inode = fs::metadata(&lock).unwrap().ino();
 
-    let report = apply(&f.support, &after(34 * DAY));
-
-    assert_eq!(report.removed_quarantine, 0);
-    assert_eq!(report.skipped.quarantine_kept_newest, 1);
-    assert_eq!(entry_for(&report, &copy).lock, LockState::NotChecked);
-    assert!(copy.exists());
-
-    let report = apply(&f.support, &after(36 * DAY));
+    let report = apply(&f.support, &after(400 * DAY));
 
     assert_eq!(
         (report.removed_quarantine, report.bytes_removed_quarantine),
         (1, 1000)
     );
     assert_eq!((report.removed, report.bytes_removed), (0, 0));
-    assert_eq!(report.skipped, SkipCounts::default());
+    assert_eq!(
+        report.skipped,
+        SkipCounts {
+            quarantine_kept_newest: 1,
+            ..SkipCounts::default()
+        }
+    );
     assert_eq!(report.errors, 0);
+    assert_eq!(entry_for(&report, &newest).lock, LockState::NotChecked);
+    assert!(newest.exists());
     let entry = entry_for(&report, &copy);
     assert_eq!(entry.artifact, Some(ArtifactKind::QuarantineCopy));
     assert_eq!(entry.outcome, EntryOutcome::Removed);
@@ -1632,6 +1637,106 @@ fn newest_copy_is_kept_until_35_days() {
     assert_eq!(fs::read(&canonical).unwrap(), b"{\"generation\":1}");
     assert_eq!(fs::metadata(&lock).unwrap().ino(), lock_inode);
     assert!(lock_is_free(&lock));
+
+    // Still kept, alone, however old.
+    for age in [8 * DAY, 36 * DAY, 400 * DAY, 4000 * DAY] {
+        let report = apply(&f.support, &after(age));
+        assert_eq!(report.removed_quarantine, 0);
+        assert_eq!(report.skipped.quarantine_kept_newest, 1);
+        assert!(newest.exists());
+    }
+}
+
+/// A group of one is its own newest copy: never removed, never locked,
+/// never changed, in plan or apply, at any age.
+#[test]
+fn group_of_one_is_never_touched() {
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() - 400 * DAY);
+    set_mtime(&copy, SystemTime::now() - 400 * DAY);
+    let before = listing(&f.dest);
+    for age in [Duration::ZERO, 7 * DAY, 36 * DAY, 400 * DAY, 4000 * DAY] {
+        for mode in [Mode::Plan, Mode::Apply] {
+            let policy = Policy {
+                before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+                ..names_and_locks_only_after(age)
+            };
+
+            let report = sweep(&f.support, mode, &policy, true);
+
+            assert_eq!(report.removed_quarantine, 0, "{mode:?} after {age:?}");
+            assert_eq!(report.candidates, 0, "{mode:?} after {age:?}");
+            let entry = entry_for(&report, &copy);
+            assert_eq!(entry.reason, Some(SkipReason::QuarantineKeptNewest));
+            assert_eq!(entry.lock, LockState::NotChecked);
+            assert_eq!(listing(&f.dest), before);
+        }
+    }
+}
+
+/// The plan for a group never removes all of it, nor a newest copy, for
+/// any mix of ages and name timestamps; a plan that would is cancelled.
+#[test]
+fn plan_never_removes_every_copy_of_a_group() {
+    let week = QUARANTINE_OTHER_MIN_AGE.as_nanos() as i128;
+    let ages = [0, week - 1, week, 8 * week, 400 * week];
+    let names = [0_u64, 1, 2, u64::MAX];
+    let choices: Vec<(i128, u64)> = ages
+        .iter()
+        .flat_map(|&age| names.iter().map(move |&name| (age, name)))
+        .collect();
+    let mut plans = 0;
+    for size in 1..=3_u32 {
+        for pick in 0..choices.len().pow(size) {
+            let copies: Vec<(i128, u64)> = (0..size)
+                .map(|slot| choices[pick / choices.len().pow(slot) % choices.len()])
+                .collect();
+            let plan = quarantine_plan(&copies);
+            assert_eq!(plan.len(), copies.len());
+            assert!(plan.iter().any(Option::is_some), "{copies:?} -> {plan:?}");
+            let youngest = copies.iter().map(|copy| copy.0).min();
+            let latest = copies.iter().map(|copy| copy.1).max();
+            for (copy, keep) in copies.iter().zip(&plan) {
+                if Some(copy.0) == youngest || Some(copy.1) == latest {
+                    assert_eq!(*keep, Some(SkipReason::QuarantineKeptNewest));
+                } else if copy.0 < week {
+                    assert_eq!(*keep, Some(SkipReason::QuarantineRecent));
+                } else {
+                    assert_eq!(*keep, None, "{copies:?}");
+                }
+            }
+            plans += 1;
+        }
+    }
+    assert!(plans > 8_000);
+    assert_eq!(quarantine_plan(&[]), Vec::new());
+
+    // The last-copy check alone cancels a plan that would empty a group.
+    let mut emptying = vec![None, None];
+    keep_last_copies(&mut emptying);
+    assert_eq!(emptying, vec![Some(SkipReason::QuarantineKeptNewest); 2]);
+    let mut partial = vec![None, Some(SkipReason::QuarantineRecent)];
+    keep_last_copies(&mut partial);
+    assert_eq!(partial, vec![None, Some(SkipReason::QuarantineRecent)]);
+
+    // A kept copy gone by the time the lock is held stops the removal.
+    let f = fixture();
+    let older = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let vanish = newest.clone();
+    let policy = Policy {
+        before_recheck: Some(Box::new(move |_name: &str| {
+            fs::remove_file(&vanish).unwrap();
+        })),
+        ..after(8 * DAY)
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.changed, 1);
+    assert_eq!(entry_for(&report, &older).lock, LockState::Acquired);
+    assert!(older.exists() && !newest.exists());
 }
 
 #[test]
@@ -1677,8 +1782,10 @@ fn every_tied_or_differently_newest_copy_is_kept() {
     assert_eq!(report.skipped.quarantine_kept_newest, 2);
     assert!(tied.iter().all(|copy| copy.exists()));
 
-    let report = apply(&f.support, &after(36 * DAY));
-    assert_eq!(report.removed_quarantine, 2);
+    let report = apply(&f.support, &after(400 * DAY));
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    assert!(tied.iter().all(|copy| copy.exists()));
 
     // Newest by name, but written first; the other is newest by its file
     // times. Both are kept as newest.
@@ -1822,7 +1929,8 @@ fn group_without_a_rebuilt_canonical_is_kept() {
 
     // Gone by the time the lock is held.
     let f = fixture();
-    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now());
+    let copy = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
     let canonical = f.dest.join(format!("{INDEX}.json"));
     let policy = Policy {
         before_recheck: Some(Box::new(move |_name: &str| {
@@ -1836,7 +1944,7 @@ fn group_without_a_rebuilt_canonical_is_kept() {
     assert_eq!(report.removed_quarantine, 0);
     assert_eq!(report.skipped.quarantine_no_canonical, 1);
     assert_eq!(entry_for(&report, &copy).lock, LockState::Acquired);
-    assert!(copy.exists());
+    assert!(copy.exists() && newest.exists());
 }
 
 #[test]
@@ -2096,9 +2204,13 @@ fn symlinked_or_hardlinked_copies_are_kept() {
 fn quarantined_copy_guards_match_the_temps() {
     let old = || SystemTime::now() - 400 * DAY;
 
+    // Each group also has a newer copy, which is never removed.
+    let newer = |dest: &Path| plant_copy(dest, INDEX, OTHER_DEAD_PID, SystemTime::now() + DAY);
+
     // Lock held by another descriptor.
     let f = fixture();
     let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
     let held = hold_lock(&f.dest.join(format!("{INDEX}.lock")));
     let report = apply(&f.support, &after(40 * DAY));
     assert_eq!(report.skipped.locked, 1);
@@ -2109,6 +2221,7 @@ fn quarantined_copy_guards_match_the_temps() {
     // No lock file: none is created.
     let f = fixture();
     let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
     let lock = f.dest.join(format!("{INDEX}.lock"));
     fs::remove_file(&lock).unwrap();
     let report = apply(&f.support, &after(40 * DAY));
@@ -2118,6 +2231,7 @@ fn quarantined_copy_guards_match_the_temps() {
     // Another daemon is running: no lock is taken.
     let f = fixture();
     let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
     let policy = Policy {
         other_daemon: daemon_probe(|| Ok(true)),
         before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
@@ -2164,6 +2278,7 @@ fn quarantined_copy_guards_match_the_temps() {
     // Replaced before the unlink.
     let f = fixture();
     let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
     let replace = copy.clone();
     let policy = Policy {
         before_recheck: Some(Box::new(move |_name: &str| {
@@ -2276,7 +2391,6 @@ fn quarantine_log_line_is_content_free() {
 
 #[test]
 fn quarantine_policy_is_the_owner_decision() {
-    assert_eq!(QUARANTINE_NEWEST_MIN_AGE, 35 * DAY);
     assert_eq!(QUARANTINE_OTHER_MIN_AGE, 7 * DAY);
     assert_eq!(
         QUARANTINE_BASES,
