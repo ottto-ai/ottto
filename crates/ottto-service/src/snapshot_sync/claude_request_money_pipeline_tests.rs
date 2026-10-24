@@ -1392,10 +1392,14 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index, "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
     let mut baseline_index = ScanIndex::default();
+    let native_started = std::time::Instant::now();
     let baseline = scan(&mut baseline_index);
+    let baseline_scan_elapsed = native_started.elapsed();
     money::enable_shadow_for_test(&fixture.support);
     let mut armed_index = ScanIndex::default();
+    let finalizers_started = std::time::Instant::now();
     let armed = scan(&mut armed_index);
+    let armed_scan_elapsed = finalizers_started.elapsed();
     assert!(armed.snapshots.len() >= 2048);
     assert_eq!(serde_json::to_vec(&baseline.snapshots).unwrap(), serde_json::to_vec(&armed.snapshots).unwrap());
     assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
@@ -1413,6 +1417,11 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         (counts, elapsed)
     };
     let (counts, elapsed) = run(&armed, &armed_index, now);
+    let shadow_lock_work = elapsed + std::time::Duration::from_micros(counts.capture_us);
+    assert!(shadow_lock_work <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE,
+        "capture callbacks plus shadow and closing: {shadow_lock_work:?}");
+    println!("MONEY_P1B_LOCK_CAPTURE baseline_native_scan_us={} armed_native_scan_us={} capture_plus_shadow_closing_us={} native_scan_plus_shadow_us={} deadline_us=250000 ci_tolerance_us=25000",
+        baseline_scan_elapsed.as_micros(), armed_scan_elapsed.as_micros(), shadow_lock_work.as_micros(), (armed_scan_elapsed + elapsed).as_micros());
     assert_eq!(counts.refused_deadline, 0, "whole-page refusal loses family accounting: {counts:?}");
     assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     let rows = money_jsonl_rows(&fixture.support);
@@ -1505,12 +1514,61 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
+/// A dense day with no new evidence should spend one family version, not
+/// one version per page. Force optional expiry to exercise only deferred
+/// publication, independently of CI scheduling and changing capture turns.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-deferred-day");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let dense = (0..2051).map(|at| {
+        let mut item = scan.snapshots[0].clone();
+        item.source_session_id = format!("deferred-{at:04}");
+        item.attribution_facts.retain(|fact| fact.field != "root_session_ref");
+        item
+    }).collect::<Vec<_>>();
+    // Add an expired memo not present in this dense page. Its removal is
+    // housekeeping and must not inherit the deliberately expired body clock.
+    money::seed_stale_memo_for_test(&fixture.support, now);
+    let mut suppressed = 0;
+    let mut max_elapsed = 0;
+    money::set_page_fault_for_test(money::PageFault::BodyDeadline);
+    for page in 0..32 {
+        let counts = money::shadow_page_at(&fixture.support, &dense, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now + page);
+        assert_eq!(counts.families_deadline_deferred, 2051, "{counts:?}");
+        assert_eq!(counts.ledger_save_late, 0, "closing owns a live save slice: {counts:?}");
+        if page == 0 {
+            assert_eq!(counts.family_memos_dropped, 1, "expired body work cannot skip retention");
+            assert!(counts.ledger_save_bytes > 0, "dense closing must actually save dirty state: {counts:?}");
+        } else {
+            assert_eq!(counts.unchanged, 2051, "identical deferred families must be suppressed: {counts:?}");
+            assert_eq!(counts.jsonl_queued, 1, "only the page row is new");
+            suppressed += counts.unchanged;
+        }
+        assert!(counts.elapsed_us <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros() as u64);
+        max_elapsed = max_elapsed.max(counts.elapsed_us);
+        money::store::flush();
+    }
+    money::set_page_fault_for_test(money::PageFault::None);
+    let rows = money_jsonl_rows(&fixture.support);
+    assert_eq!(rows.iter().filter(|row| row["row"] == "family").count(), 2051);
+    assert_eq!(rows.iter().filter(|row| row["row"] == "page").count(), 32);
+    assert!(!rows.iter().any(|row| row["truncated"] == true), "unchanged deferred rows must not seal the day");
+    let bytes = std::fs::metadata(fixture.support.join("diagnostics/claude-request-money-shadow-20260802.jsonl")).unwrap().len();
+    assert!(bytes < 8 * 1024 * 1024);
+    println!("MONEY_P1B_DEFERRED_DAY pages=32 families=2051 suppressed={suppressed} bytes={bytes} day_cap=8388608 sealed=0 retention_dropped=1 max_wall_us={max_elapsed}");
+    money::disable_shadow_for_test(&fixture.support);
+}
+
 /// Reaching an uncaptured family must not spend its capture turn. These
 /// small pages exercise the stable-sort tie that deadline-only tests miss.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
-    for family_count in [65_usize, 129] {
+    for (family_count, ack_mode) in [65_usize, 129].into_iter().flat_map(|n| ["ack", "lag", "sealed"].map(|mode| (n, mode))) {
         let fixture = PipelineFixture::new("money-p1b-small-full-rotation");
         for session in PIPELINE_SESSIONS {
             std::fs::remove_file(fixture.root.join(format!("{session}.jsonl"))).unwrap();
@@ -1529,6 +1587,12 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
         let baseline = scan(&mut baseline_index);
         money::enable_shadow_for_test(&fixture.support);
         money::store::prime_credit_for_test(&fixture.support, 0);
+        if ack_mode == "sealed" {
+            std::fs::create_dir_all(fixture.support.join("diagnostics")).unwrap();
+            std::fs::write(fixture.support.join("diagnostics/claude-request-money-shadow-20260802.jsonl"),
+                b"{\"row\":\"page\",\"truncated\":true}\n").unwrap();
+        }
+        money::set_page_fault_for_test(if ack_mode == "lag" { money::PageFault::LostAck } else { money::PageFault::None });
         let pages = family_count.div_ceil(money::capture::NEXT_PAGE_FAMILIES);
         let mut built = BTreeSet::new();
         let mut max_wall_us = 0;
@@ -1539,6 +1603,9 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             assert_eq!(full.scanned_file_count, family_count);
             assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), serde_json::to_vec(&baseline.snapshots).unwrap());
             assert_eq!(serde_json::to_vec(&index).unwrap(), serde_json::to_vec(&baseline_index).unwrap());
+            let captured_roots = money::capture::keys_for_test(&fixture.support).iter().take(money::capture::NEXT_PAGE_FAMILIES)
+                .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
+                .collect::<BTreeSet<_>>();
             let started = std::time::Instant::now();
             let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
                 &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
@@ -1549,6 +1616,11 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             max_wall_us = max_wall_us.max(elapsed.as_micros());
             assert_eq!(counts.refused_deadline, 0, "{counts:?}");
             assert_eq!(counts.families, family_count as u64);
+            // No-capture families cannot build; this equality proves every
+            // eligible captured root was also selected by the shadow, even
+            // when acknowledgement never arrives or publication is sealed.
+            assert_eq!(counts.families - counts.families_unbuilt, captured_roots.len() as u64, "{ack_mode}: {counts:?}");
+            built.extend(captured_roots);
             money::store::flush();
             for row in money_jsonl_rows(&fixture.support) {
                 if row["row"] == "family" && row["category"] != "unbuilt"
@@ -1558,8 +1630,9 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
                 }
             }
         }
+        money::set_page_fault_for_test(money::PageFault::None);
         assert_eq!(built, expected, "all {family_count} families must build within {pages} Full pages");
-        println!("MONEY_P1B_ROTATION families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", built.len());
+        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", built.len());
         money::disable_shadow_for_test(&fixture.support);
     }
 }

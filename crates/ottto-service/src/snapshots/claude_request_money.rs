@@ -544,6 +544,8 @@ pub(crate) enum PageFault {
     None,
     /// The deadline passes just before the families are handed over.
     LateAtHandOff,
+    /// Dense-page fixture: optional work is already out of time at entry.
+    BodyDeadline,
     /// The batch's admission is refused.
     BatchRefused,
     WriteFailure,
@@ -1239,6 +1241,30 @@ pub(crate) fn shadow_page_at(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn seed_stale_memo_for_test(support_dir: &Path, now: u64) {
+    store::prime_credit_for_test(support_dir, utc_day(now));
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        panic!("test ledger ready");
+    };
+    let memo = ClaudeFamilyMemo {
+        published: Some(ClaudeFamilyPublication {
+            utc_day: utc_day(now),
+            digest: 0,
+            epoch: process_epoch(),
+            attempted: now - FAMILY_MEMO_RETENTION_SECONDS - 1,
+        }),
+        ..Default::default()
+    };
+    assert_eq!(
+        ledger.insert(
+            family_key("stale-never-reappearing"),
+            ClaudeRequestCensusRecord::family_record([0; 32], 0, memo)
+        ),
+        ClaudeRequestCensusInsert::Stored
+    );
+}
+
 /// The actual synchronous page, without the fixture's writer-credit wait.
 #[cfg(test)]
 pub(crate) fn shadow_page_ready_for_test(
@@ -1278,7 +1304,11 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let deadline = started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE;
+    let deadline = if faulted(PageFault::BodyDeadline) {
+        started
+    } else {
+        started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE
+    };
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us: capture::take_capture_us(),
@@ -1499,7 +1529,7 @@ fn shadow_page_with_coverage(
             let deferred = order.len() as u64 + 1;
             for (root, key, turn) in std::iter::once((root, key, turn)).chain(order) {
                 let state = coverage_view.family(root);
-                let digest = failure_digest.deferred(root, &key, &state, ledger);
+                let digest = failure_digest.deferred(root, &state, ledger);
                 let unchanged = publication_unchanged(ledger, &key, digest, now);
                 counts.unchanged += u64::from(unchanged);
                 failed += u64::from(!unchanged);
@@ -2443,20 +2473,14 @@ struct DeadlineTemplate {
     suffix: usize,
 }
 impl DeadlineDigest {
-    fn deferred(
-        &mut self,
-        root: &str,
-        key: &str,
-        state: &FamilyCensus,
-        ledger: &ClaudeLedger,
-    ) -> u64 {
+    fn deferred(&mut self, root: &str, state: &FamilyCensus, ledger: &ClaudeLedger) -> u64 {
         let (census, reason, statuses) = state.wire();
         if self.template.as_ref().is_some_and(|template| {
             template.census == census && template.reason == reason && template.statuses == statuses
         }) {
-            // family_key and hashed_id use the same canonical root SHA256.
-            let family = &key[FAMILY_KEY_PREFIX.len()..FAMILY_KEY_PREFIX.len() + 16];
-            return self.identity(family);
+            // The wire identity has its own domain separator; it is not
+            // the scheduling key digest. Hash only the admitted root bytes.
+            return self.identity(&hashed_id(root));
         }
         let mut rows = failure_rows(
             root,
@@ -3779,6 +3803,11 @@ mod digest_deadline_tests {
                 );
                 let expected = semantic_digest(&mut rows);
                 assert_eq!(cached.digest(&mut rows), expected, "{state:?}: {root}");
+                assert_eq!(
+                    cached.deferred(root, &state, &ledger),
+                    expected,
+                    "producer deferred digest must equal the writer canonical digest"
+                );
                 assert_eq!(
                     (rows.row.observed_unix, rows.row.snapshot),
                     (at as u64 + 10, at as u64 + 100)
