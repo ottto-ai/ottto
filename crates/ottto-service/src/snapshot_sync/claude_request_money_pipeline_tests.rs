@@ -1763,6 +1763,86 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
+/// Starvation receipt: a page whose next capture plan cannot be installed
+/// says so on the shadow line. With the whole capture ceiling held the plan
+/// cannot be funded; once released, the next page installs it.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_plan_install_failure_is_counted() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-plan-install-failed");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let dense = (0..money::capture::NEXT_PAGE_FAMILIES + 6).map(|at| {
+        let mut item = scan.snapshots[0].clone();
+        item.source_session_id = format!("plan-{at:04}");
+        item.attribution_facts.retain(|fact| fact.field != "root_session_ref");
+        item
+    }).collect::<Vec<_>>();
+    let page = |now| {
+        let counts = money::shadow_page_at(&fixture.support, &dense, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+        money::store::flush();
+        counts
+    };
+    // Release the scan's captures first, so the page's own purge frees no funds.
+    money::capture::purge_scope_for_test(&fixture.support);
+    let _ = money::take_shadow_lines_for_test();
+    let held = money::capture::hold_capture_ceiling_for_test();
+    let refused = page(now);
+    drop(held);
+    assert_eq!(refused.refused_deadline + refused.refused_budget, 0, "{refused:?}");
+    assert_eq!(refused.plan_install_failed, 1, "{refused:?}");
+    assert_eq!(refused.full_page_zero_built, 0, "no fresh captures: {refused:?}");
+    let lines = money::take_shadow_lines_for_test();
+    assert_eq!(lines.last().unwrap()["counts"]["plan_install_failed"], 1, "{lines:?}");
+    assert!(money::capture::planned_families_for_test(&fixture.support).is_none());
+    let installed = page(now + 1);
+    assert_eq!(installed.plan_install_failed, 0, "{installed:?}");
+    assert_eq!(money::capture::planned_families_for_test(&fixture.support).map(|plan| plan.len()),
+        Some(money::capture::NEXT_PAGE_FAMILIES));
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Starvation receipt: a page with fresh captures that builds no family is
+/// counted on the shadow line; a page without captures and a page that
+/// builds are not.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_full_page_zero_built_is_counted() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-full-zero-built");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let page = |snapshots: &[crate::snapshots::SnapshotItem], index: &ScanIndex, now| {
+        let counts = money::shadow_page_at(&fixture.support, snapshots, index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+        money::store::flush();
+        counts
+    };
+    let _ = money::take_shadow_lines_for_test();
+    money::set_page_fault_for_test(money::PageFault::BodyDeadline);
+    let starved = page(&scan.snapshots, &index, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    assert!(starved.captures_taken > 0, "{starved:?}");
+    assert_eq!(starved.families_unbuilt, starved.families, "{starved:?}");
+    assert_eq!(starved.full_page_zero_built, 1, "{starved:?}");
+    let lines = money::take_shadow_lines_for_test();
+    assert_eq!(lines.last().unwrap()["counts"]["full_page_zero_built"], 1, "{lines:?}");
+    let skip = page(&scan.snapshots, &index, now + 1);
+    assert_eq!(skip.captures_taken + skip.captures_purged, 0, "{skip:?}");
+    assert_eq!(skip.full_page_zero_built, 0, "a page without captures is not a starved Full page: {skip:?}");
+    money::capture::begin_page(&fixture.support);
+    let mut full_index = ScanIndex::default();
+    let full = crate::snapshots::scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root), &mut full_index, "2026-08-02T08:00:00Z", 183, 16, true).unwrap();
+    let built = page(&full.snapshots, &full_index, now + 2);
+    assert!(built.captures_taken > 0, "{built:?}");
+    assert!(built.families_unbuilt < built.families, "{built:?}");
+    assert_eq!(built.full_page_zero_built, 0, "{built:?}");
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
 /// A dense day with no new evidence should spend one family version, not
 /// one version per page. Force optional expiry to exercise only deferred
 /// publication, independently of CI scheduling and changing capture turns.

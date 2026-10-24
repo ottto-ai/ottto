@@ -812,6 +812,12 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) batch_dropped: u64,
     pub(crate) captures_taken: u64,
     pub(crate) captures_purged: u64,
+    /// The next Full parse's capture plan was not installed (plan lock
+    /// busy, capture funds or the plan slice ran out): any earlier plan
+    /// still selects that parse's captures.
+    pub(crate) plan_install_failed: u64,
+    /// A page with fresh captures built no family: no coverage progress.
+    pub(crate) full_page_zero_built: u64,
     pub(crate) capture_reserved_bytes: u64,
     pub(crate) work_stopped: u64,
     pub(crate) telemetry_retired_pressure: u64,
@@ -1974,7 +1980,7 @@ fn shadow_page_body(
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
     if order.len() > capture::NEXT_PAGE_FAMILIES {
-        capture::plan_next_page(
+        let installed = capture::plan_next_page(
             &scope_key,
             order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
             end.close_deadline
@@ -1982,9 +1988,15 @@ fn shadow_page_body(
                 .expect("closing reserve")
                 .min(Instant::now() + Duration::from_millis(10)),
         );
+        counts.plan_install_failed = u64::from(!installed);
     } else {
         capture::forget_plan(&scope_key);
     }
+    counts.full_page_zero_built = u64::from(
+        counts.captures_taken + counts.captures_purged > 0
+            && counts.families > 0
+            && counts.families_unbuilt == counts.families,
+    );
     let page_complete = incomplete == 0 && telemetry_certified(ledger) && holder_view.complete();
     counts.coverage_complete = u64::from(page_complete);
     let page = CoverageRow {

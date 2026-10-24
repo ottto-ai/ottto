@@ -331,6 +331,17 @@ impl Funds {
     }
 }
 
+/// Holds the whole capture ceiling until dropped (no capture or plan funds).
+#[cfg(test)]
+pub(crate) struct CeilingHoldForTest(#[allow(dead_code)] Funds);
+
+#[cfg(test)]
+pub(crate) fn hold_capture_ceiling_for_test() -> CeilingHoldForTest {
+    let mut funds = Funds::default();
+    assert!(funds.spend(CAPTURE_CEILING_BYTES - capture_reserved()));
+    CeilingHoldForTest(funds)
+}
+
 impl Drop for Funds {
     fn drop(&mut self) {
         CAPTURE_RESERVED.fetch_sub(self.held, Ordering::AcqRel);
