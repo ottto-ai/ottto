@@ -85,36 +85,52 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   root with no indexed member, authority record, pending proof or tombstone
   (what a retirement leaves) raises the fence instead. A pre-bridge index in
   that state for another reason (a removed family whose witness no complete
-  census has pruned yet) fences too. An older writer whose complete census
-  already pruned the retired root's witness cannot be detected. A marked index whose set is missing, wrongly typed,
+  census has pruned yet) fences too. Round 15 (SOURCE) accepts that upgrade
+  false positive with no carve-out and counts every such raise as
+  `tombstone_fence_raised_on_upgrade`; the bounded drain below limits its
+  cost. An older writer whose complete census already pruned the retired
+  root's witness cannot be detected, so downgrading to a pre-#705 binary is
+  unsupported for this guarantee (as #712 excludes downgrade). A marked index whose set is missing, wrongly typed,
   damaged in an entry, or over its cap (trimmed at decode) raises a durable
   `claude_retired_family_tombstones_uncertain` fence. Decoding stays lenient
   (each drop counted, a non-boolean marker or fence read as set) and the rest
   of the index loads; nothing is quarantined or rebuilt. While the fence is
   up, every unindexed Claude member is read through the authority path,
   never as a new file, and every witness and authority record is kept as if
-  its root were tombstoned. A load that can tombstone every witnessed root
-  within the cap does so and lowers the fence: a tombstoned root keeps its
-  witness until its proof settles, so those roots are a superset of any lost
-  tombstone. Indexed presence never waives a slot (Round 14, H729-1): a
+  its root were tombstoned. A load never lowers the fence (Round 15, bounded
+  drain). Only a complete healthy (raw-complete) Claude terminal does, once
+  every witnessed root without a tombstone that the walk did not see present
+  is tombstoned within the cap; it runs before the census fold, so a
+  tombstoned root keeps its witness until its proof settles. A root is
+  present when the walk observed a member of it and every member it
+  observed is indexed. Indexed presence alone never waives a slot (Round 14,
+  H729-1): an indexed entry whose file the walk did not see is absent (a
   partial checkpoint restores a retired member's old entry beside the
-  retirement, and a returning member that parses empty is indexed while its
-  proof is unsettled. Otherwise the fence stays until settled proofs free
-  enough slots. The repair is bounded (Round 14, H729-2): it counts
-  untombstoned witnessed roots only until one more than it may tombstone (at
-  most cap + 1 witness visits), keeps nothing but the entries it inserts, and
-  prices those against the parked budget first; a refused price falls back
-  to at most 16 roots, and a larger loss keeps the fence. The cost is
-  liveness: re-tombstoned healthy roots hold their slots until a page reads
-  them again, and while more than the free slots stay witnessed the fence
-  stays up and witnesses are not pruned.
+  retirement), and a root seen only through an unindexed member also takes a
+  tombstone. Present roots are handled lazily: while present each is read as
+  an indexed file, never a new one, and if one later disappears the normal
+  reserve-before-retire tombstones it. So present roots, however many, never
+  block the drain. More absent roots than free slots keep the fence up,
+  published as `absent_family_tombstone_uncertain` with a local
+  `claude_absent_family_tombstone_uncertain` alarm at most hourly, until
+  settled proofs free enough slots. The drain is bounded (Round 14, H729-2):
+  its presence scratch holds one borrowed root and flag per witnessed root
+  the walk saw, priced with the new entries against the parked budget first;
+  it counts roots needing a tombstone only until one more than it may add,
+  and keeps nothing but the entries it inserts. A refused price falls back,
+  without the presence scratch, to at most 16 untombstoned witnessed roots
+  (present or not), and a larger set keeps the fence. The cost is liveness:
+  absent roots (including witnessed families that aged out of the backfill
+  window while fenced, which the walk does not observe) hold their slots
+  until a page reads them again, and while the fence is up witnesses are not
+  pruned.
 - Local content-free process counters appear on each Claude traversal's
   `retiring` transition row: `absent_retry_pending_retired`,
   `absent_family_tombstone_hits`, `retirements_refused`,
   `tombstone_decode_drops`, `absent_family_tombstones_cleared` (proof
-  settlement) and `absent_family_tombstone_capacity_refusals`, with the
-  index's fence state as `absent_family_tombstone_uncertain`. Other sources
-  omit them.
+  settlement), `absent_family_tombstone_capacity_refusals` and
+  `tombstone_fence_raised_on_upgrade` (Round 15), with the index's fence
+  state as `absent_family_tombstone_uncertain`. Other sources omit them.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -188,7 +204,12 @@ partial checkpoint restores the retired member's entry, the set is lost, the
 complete census keeps the witness and the return is held; unit tests for an
 indexed empty returning member, the bounded and refused fence repair, and a
 downgrade that drops the marker and set (including the intermediate
-binary's evicted entry and a healthy unmarked control).
+binary's evicted entry and a healthy unmarked control). Round 15 moves every
+fence-lowering assertion behind a complete terminal (the load now only
+raises the fence) and adds unit tests where more present roots than the cap
+never block the drain while more absent roots than free slots keep the
+fence (with one rate-limited alarm), and where an upgrade false positive is
+counted and drained to the absent root only.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and

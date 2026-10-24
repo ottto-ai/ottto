@@ -1544,6 +1544,15 @@ fn clean_terminal_traversal(observed: BTreeSet<String>) -> ScanTraversalCheckpoi
     }
 }
 
+/// SOURCE Round 15: the tombstone uncertainty fence comes down only at a
+/// complete healthy terminal. This one observed `observed` on disk.
+fn drain_fence_at_clean_terminal(
+    index: &mut ScanIndex,
+    observed: BTreeSet<String>,
+) -> ClaudeTombstoneFenceRepair {
+    index.drain_claude_retired_family_tombstone_fence(&clean_terminal_traversal(observed))
+}
+
 // SOURCE Round 11 guard (c): traversal counts carry no per-directory
 // attribution, so any read, permission or symlink error, entry cap, or
 // unfinished directory or candidate page anywhere in the traversal keeps
@@ -1768,7 +1777,7 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
         .unwrap()
         .remove("claude_retired_family_tombstones");
     fs::write(&path, serde_json::to_vec(&raw).unwrap()).unwrap();
-    let (repaired, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+    let (mut repaired, origin) = ScanIndex::load_for_snapshot_source_with_origin(
         &path,
         SnapshotSource::ClaudeCode,
         &support,
@@ -1777,6 +1786,11 @@ fn source_aware_loads_share_history_freshness_and_repair_tombstones() {
     assert_eq!(origin, ScanIndexLoadOrigin::Loaded);
     assert!(!origin.is_fresh(&repaired));
     assert!(!repaired.claude_history_unverified_in_process);
+    // Round 15: the source-aware load raises the fence; only a complete
+    // healthy terminal lowers it.
+    assert!(repaired.claude_retired_family_tombstones_uncertain);
+    assert!(!repaired.claude_family_tombstoned_for_test("gone-00"));
+    drain_fence_at_clean_terminal(&mut repaired, BTreeSet::new());
     assert!(repaired.claude_family_tombstoned_for_test("gone-00"));
     assert!(!repaired.claude_retired_family_tombstones_uncertain);
     assert!(repaired
@@ -1793,9 +1807,9 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     let dir = temp_dir("patha-malformed-tombstones");
     let path = dir.join("scan-index.json");
     let kept = claude_retired_family_digest("kept-root");
-    // Round 13: damage raises the uncertainty fence, and the load replaces it
-    // with a tombstone for every witnessed root (Round 14: indexed or not):
-    // here the held root.
+    // Round 13: damage raises the uncertainty fence, and the next complete
+    // terminal (Round 15; never the load) replaces it with a tombstone for
+    // every witnessed root it did not see on disk: here the held root.
     let held = claude_retired_family_digest("held-root");
     let mut index = ScanIndex::default();
     index.insert_retry_pending_claude_authority_for_test("held-root");
@@ -1829,8 +1843,10 @@ fn malformed_tombstones_never_fail_the_index_decode() {
         .collect(),
     ));
     let before = claude_absence_counters_for_test();
-    let loaded = ScanIndex::load(&path).expect("malformed entries still load");
+    let mut loaded = ScanIndex::load(&path).expect("malformed entries still load");
     assert_rest_kept(&loaded, "malformed entries");
+    assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+    drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     let tombstones = loaded.claude_retired_family_tombstones_for_test();
     assert_eq!(tombstones.get(&kept), Some(&1_700_000_000_u64));
     assert_eq!(
@@ -1852,8 +1868,13 @@ fn malformed_tombstones_never_fail_the_index_decode() {
     ] {
         write_tombstones(container);
         let before = claude_absence_counters_for_test();
-        let loaded = ScanIndex::load(&path).expect("a wrong container still loads");
+        let mut loaded = ScanIndex::load(&path).expect("a wrong container still loads");
         assert_rest_kept(&loaded, shape);
+        assert!(
+            loaded.claude_retired_family_tombstones_uncertain_for_test(),
+            "{shape}: the load raises the fence and never lowers it"
+        );
+        drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
         assert_eq!(
             loaded
                 .claude_retired_family_tombstones_for_test()
@@ -2009,8 +2030,8 @@ type IndexJsonEdit<'a> = dyn Fn(&mut serde_json::Map<String, serde_json::Value>)
 // SOURCE Round 13 F1: the persisted marker separates an index from before
 // the bridge (no marker: an empty set is safe, nothing ever retired) from a
 // marked index whose tombstone set was omitted, wrongly typed or damaged.
-// The latter raises the uncertainty fence; the load tombstones every
-// witnessed root, so the retired family's returning
+// The latter raises the uncertainty fence; the next complete terminal
+// (Round 15) tombstones every absent witnessed root, so the retired family's returning
 // member is still read through the authority path, never as a new file, and
 // that survives a save and reload. An unwitnessed new root stays new.
 #[test]
@@ -2078,12 +2099,16 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
     // The same omission after the retirement is what an older writer leaves
     // (SOURCE Round 14, downgrade): the retired root's witness has no record,
     // pending proof, indexed member or tombstone, so the load fails closed
-    // and the fence re-tombstones it.
+    // and the next complete terminal re-tombstones it.
     write(&|object| {
         object.remove("claude_retired_family_tombstones");
         object.remove("claude_retired_family_tombstones_initialized");
     });
-    let loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+    assert_eq!(decision(&loaded, &returning), authority);
+    assert_eq!(decision(&loaded, &unwitnessed), authority);
+    drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     assert!(loaded.claude_family_tombstoned_for_test("gone-00"));
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(decision(&loaded, &returning), authority);
@@ -2107,6 +2132,12 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
         write(edit);
         let mut loaded = ScanIndex::load(&path).expect("a lost set still loads");
         assert_eq!(loaded.generation, 3, "{shape}: never quarantined");
+        assert!(
+            loaded.claude_retired_family_tombstones_uncertain_for_test(),
+            "{shape}: the load raises the fence and never lowers it"
+        );
+        assert_eq!(decision(&loaded, &returning), authority, "{shape}");
+        drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
         assert!(
             loaded.claude_family_tombstoned_for_test("gone-00"),
             "{shape}: the fence tombstoned the witnessed root"
@@ -2139,7 +2170,9 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
         );
         object.remove("claude_retired_family_tombstones");
     });
-    let loaded = ScanIndex::load(&path).unwrap();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+    drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     assert!(loaded.claude_family_tombstoned_for_test("gone-00"));
     assert_eq!(decision(&loaded, &returning), authority);
     let _ = fs::remove_dir_all(&dir);
@@ -2149,8 +2182,9 @@ fn a_lost_tombstone_set_never_restores_new_file_eligibility() {
 // the cap (here an over-cap persisted set, trimmed at decode, dropped the
 // retired family's tombstone), the uncertainty fence stays up durably: every
 // unindexed Claude member, even an unwitnessed new root, is read through the
-// authority path, across saves and reloads. Once a settled proof frees
-// enough slots, the next load tombstones the witnessed roots and lowers it.
+// authority path, across saves, reloads and complete terminals. Once a
+// settled proof frees enough slots, the next complete terminal (Round 15)
+// tombstones the absent witnessed roots and lowers it.
 #[test]
 fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     restart_claude_reemission_stop_for_test();
@@ -2191,6 +2225,13 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
     assert!(!loaded.claude_family_tombstoned_for_test("gone-00"));
     for round in 0..2 {
         assert!(
+            matches!(
+                drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new()),
+                ClaudeTombstoneFenceRepair::Kept { .. }
+            ),
+            "round {round}: no free slot for the absent root"
+        );
+        assert!(
             loaded.claude_retired_family_tombstones_uncertain_for_test(),
             "round {round}: the fence stays up"
         );
@@ -2212,7 +2253,8 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
         json!(true),
         "the fence is durable"
     );
-    // A settled proof frees a slot; the next load lowers the fence.
+    // A settled proof frees a slot; the next complete terminal lowers the
+    // fence (the load alone never does).
     let freed = loaded
         .claude_retired_family_tombstones_for_test()
         .keys()
@@ -2224,7 +2266,9 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
         .remove(&freed)
         .is_some());
     loaded.save(&path).unwrap();
-    let lowered = ScanIndex::load(&path).unwrap();
+    let mut lowered = ScanIndex::load(&path).unwrap();
+    assert!(lowered.claude_retired_family_tombstones_uncertain_for_test());
+    drain_fence_at_clean_terminal(&mut lowered, BTreeSet::new());
     assert!(!lowered.claude_retired_family_tombstones_uncertain_for_test());
     assert!(lowered.claude_family_tombstoned_for_test("gone-00"));
     assert_eq!(decision(&lowered, &returning), authority);
@@ -2241,7 +2285,8 @@ fn an_unplaceable_tombstone_loss_keeps_a_durable_fence() {
 // SOURCE Round 14 H729-1 control: a member that returns and parses empty is
 // indexed (confirmed empty) while its family's proof is unsettled, so its
 // tombstone stays. If the set is then lost, that indexed member must not
-// waive the root's slot: the load re-tombstones the witnessed root, and once
+// waive the root's slot: the next complete terminal (Round 15), which does
+// not see its file, re-tombstones the witnessed root, and once
 // the member is gone again its return is still read through the authority
 // path.
 #[test]
@@ -2280,6 +2325,9 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
         loaded.files.contains_key(&key),
         "the member is still indexed"
     );
+    assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+    // The walk does not see the indexed member's file: it counts as absent.
+    drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     assert!(
         loaded.claude_family_tombstoned_for_test("gone-00"),
         "indexed presence never waives the root's slot"
@@ -2301,17 +2349,20 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
     let _ = fs::remove_dir_all(&dir);
 }
 
-// SOURCE Round 14 H729-2: the load's fence repair is bounded whatever the
-// witness count. It counts untombstoned witnessed roots only until one more
-// than it may tombstone, keeps nothing but the entries it inserts, and those
-// are priced first. Over capacity, or over the fixed-size fallback when the
-// scratch is refused, the fence stays up and nothing is inserted.
+// SOURCE Round 14 H729-2: the fence drain is bounded whatever the witness
+// count. It counts untombstoned witnessed roots only until one more than it
+// may tombstone, keeps nothing but the entries it inserts, and those are
+// priced first. Over capacity, or over the fixed-size fallback when the
+// scratch is refused, the fence stays up and nothing is inserted. Since
+// Round 15 the drain runs at a complete terminal, never at load; here every
+// witnessed root is absent (the walk observed nothing).
 #[test]
 fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
     let fallback = MAX_CLAUDE_TOMBSTONE_FENCE_FALLBACK_ROOTS;
     assert_eq!(fallback, 16);
     let admitted = crate::heap_layout_bound::layout_supported();
+    let nothing = BTreeSet::new();
     let witnessed = |count: usize| {
         let mut index = ScanIndex::default();
         for number in 0..count {
@@ -2324,7 +2375,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     // stops one past the free slots.
     let mut index = witnessed(3 * cap);
     assert_eq!(
-        index.lower_claude_retired_family_tombstone_fence(),
+        index.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
         ClaudeTombstoneFenceRepair::Kept {
             scratch_admitted: admitted,
             visited: if admitted { cap + 1 } else { fallback + 1 },
@@ -2335,7 +2386,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     // One free slot: two visits decide, whatever the witness count.
     index.fill_claude_retired_family_tombstones_for_test(cap - 1, 0);
     assert_eq!(
-        index.lower_claude_retired_family_tombstone_fence(),
+        index.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
         ClaudeTombstoneFenceRepair::Kept {
             scratch_admitted: admitted,
             visited: 2,
@@ -2350,7 +2401,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let mut index = witnessed(4);
     index.claude_retired_family_tombstones_uncertain = false;
     assert_eq!(
-        index.lower_claude_retired_family_tombstone_fence(),
+        index.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
         ClaudeTombstoneFenceRepair::NotFenced
     );
     assert!(index.claude_retired_family_tombstones_for_test().is_empty());
@@ -2360,7 +2411,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let refuse = RefuseClaudeTombstoneRepairScratchForTest::new();
     let mut small = witnessed(fallback);
     assert_eq!(
-        small.lower_claude_retired_family_tombstone_fence(),
+        small.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
         ClaudeTombstoneFenceRepair::Lowered {
             tombstoned: fallback,
             visited: 2 * fallback,
@@ -2375,7 +2426,7 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let path = dir.join("scan-index.json");
     let mut large = witnessed(fallback + 1);
     assert_eq!(
-        large.lower_claude_retired_family_tombstone_fence(),
+        large.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
         ClaudeTombstoneFenceRepair::Kept {
             scratch_admitted: false,
             visited: fallback + 1,
@@ -2389,6 +2440,14 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     );
     for round in 0..2 {
         let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new()),
+            ClaudeTombstoneFenceRepair::Kept {
+                scratch_admitted: false,
+                visited: fallback + 1,
+            },
+            "round {round}"
+        );
         assert!(
             loaded.claude_retired_family_tombstones_uncertain_for_test(),
             "round {round}: a refusal keeps the fence"
@@ -2407,7 +2466,9 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
         "the fence is durable"
     );
     drop(refuse);
-    let lowered = ScanIndex::load(&path).unwrap();
+    let mut lowered = ScanIndex::load(&path).unwrap();
+    assert!(lowered.claude_retired_family_tombstones_uncertain_for_test());
+    drain_fence_at_clean_terminal(&mut lowered, BTreeSet::new());
     if admitted {
         assert!(!lowered.claude_retired_family_tombstones_uncertain_for_test());
         assert_eq!(
@@ -2429,9 +2490,9 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
 
 // SOURCE Round 14 (d): an older writer drops the marker, the set and the
 // fence. A load that then finds a witnessed root with no record, pending
-// proof, indexed member or tombstone fails closed: the fence goes up and the
-// witnessed roots are re-tombstoned, or the fence stays durably when they
-// cannot all be. The intermediate binary that kept the set but not the
+// proof, indexed member or tombstone fails closed: the fence goes up, and
+// the next complete terminal (Round 15) re-tombstones the absent witnessed
+// roots, or the fence stays durably when they cannot all be. The intermediate binary that kept the set but not the
 // marker (and could evict at its cap) is caught the same way. A healthy
 // unmarked index (the witnessed root is indexed) still starts empty.
 #[test]
@@ -2482,6 +2543,16 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
             let mut loaded = ScanIndex::load(&path).expect("a downgraded index loads");
             assert_eq!(loaded.generation, 3 + round, "never quarantined");
             assert!(
+                matches!(
+                    drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new()),
+                    ClaudeTombstoneFenceRepair::Kept {
+                        scratch_admitted: false,
+                        ..
+                    }
+                ),
+                "round {round}: the fallback cannot place every root"
+            );
+            assert!(
                 loaded.claude_retired_family_tombstones_uncertain_for_test(),
                 "round {round}: fenced"
             );
@@ -2493,7 +2564,9 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
             loaded.save(&path).unwrap();
         }
     }
-    let lowered = ScanIndex::load(&path).unwrap();
+    let mut lowered = ScanIndex::load(&path).unwrap();
+    assert!(lowered.claude_retired_family_tombstones_uncertain_for_test());
+    drain_fence_at_clean_terminal(&mut lowered, BTreeSet::new());
     if admitted {
         assert!(!lowered.claude_retired_family_tombstones_uncertain_for_test());
         for number in 0..=fallback {
@@ -2507,7 +2580,14 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     // repair re-tombstones every witnessed root at once.
     if admitted {
         write(&downgrade);
-        let loaded = ScanIndex::load(&path).unwrap();
+        let before = claude_absence_counters_for_test();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            claude_absence_counters_for_test().tombstone_fence_raised_on_upgrade,
+            before.tombstone_fence_raised_on_upgrade + 1
+        );
+        assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+        drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
         assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
         assert!(loaded.claude_family_tombstoned_for_test("gone-00"));
         assert_eq!(decision(&loaded, &returning), authority);
@@ -2523,7 +2603,9 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
                 .unwrap()
                 .remove(&digest);
         });
-        let loaded = ScanIndex::load(&path).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+        drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
         assert!(loaded.claude_family_tombstoned_for_test("gone-00"));
         assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
         assert_eq!(decision(&loaded, &returning), authority);
@@ -2545,7 +2627,13 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
     let mut value = serde_json::to_value(&index).unwrap();
     downgrade(value.as_object_mut().unwrap());
     fs::write(&healthy, serde_json::to_vec(&value).unwrap()).unwrap();
+    let before = claude_absence_counters_for_test();
     let loaded = ScanIndex::load(&healthy).unwrap();
+    assert_eq!(
+        claude_absence_counters_for_test().tombstone_fence_raised_on_upgrade,
+        before.tombstone_fence_raised_on_upgrade,
+        "nothing was raised"
+    );
     assert!(loaded
         .claude_usage_family_witness_digest_for_test("live-00")
         .is_some());
@@ -2553,6 +2641,224 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
         .claude_retired_family_tombstones_for_test()
         .is_empty());
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
+    let _ = fs::remove_dir_all(&dir);
+}
+
+// SOURCE Round 15 bounded drain: the fence comes down at a complete healthy
+// terminal once every witnessed root the walk did not see present is
+// tombstoned under the cap. Present roots (observed, every observed member
+// indexed) take no slot, so more of them than the cap never block it; they
+// stay indexed files, never new ones. An indexed entry whose file the walk
+// did not see is absent (H729-1), and a root the walk saw only through an
+// unindexed member needs a tombstone too. More absent roots than free slots
+// keep the fence up, publish it and alarm at most hourly.
+#[test]
+fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
+    let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
+    if !crate::heap_layout_bound::layout_supported() {
+        // The refused-scratch fallback is covered by
+        // `tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence`.
+        return;
+    }
+    let key = |root: &str| format!("/synthetic/projects/drain/{root}.jsonl");
+    let present_roots = (0..cap + 8)
+        .map(|number| format!("present-{number:05}"))
+        .collect::<Vec<_>>();
+    // Witnessed roots with no record, as settled families leave them.
+    let witness_only = |index: &mut ScanIndex, root: &str| {
+        index.insert_retry_pending_claude_authority_for_test(root);
+        index.claude_usage_authority_quarantine.remove(root);
+    };
+    let fenced = |absent: usize| {
+        let mut index = ScanIndex::default();
+        let mut observed = BTreeSet::new();
+        for root in &present_roots {
+            witness_only(&mut index, root);
+            let mut entry = manifest_index_entry(None);
+            entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+            index.files.insert(key(root), entry);
+            observed.insert(key(root));
+        }
+        // H729-1: indexed, but the walk does not see its file.
+        witness_only(&mut index, "absent-stale");
+        let mut entry = manifest_index_entry(None);
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        index.files.insert(key("absent-stale"), entry);
+        // Seen by the walk, but never indexed.
+        witness_only(&mut index, "absent-unindexed");
+        observed.insert(key("absent-unindexed"));
+        for number in 0..absent {
+            witness_only(&mut index, &format!("absent-{number:02}"));
+        }
+        index.fill_claude_retired_family_tombstones_for_test(cap - 4, 0);
+        index.claude_retired_family_tombstones_uncertain = true;
+        (index, observed)
+    };
+
+    // Four free slots, four roots needing one, more than the cap present.
+    let (mut index, observed) = fenced(2);
+    assert!(index.claude_usage_family_witnesses.len() > cap + 4);
+    assert!(matches!(
+        drain_fence_at_clean_terminal(&mut index, observed.clone()),
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 4, .. }
+    ));
+    assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
+    assert_eq!(index.claude_retired_family_tombstones_for_test().len(), cap);
+    for root in ["absent-stale", "absent-unindexed", "absent-00", "absent-01"] {
+        assert!(index.claude_family_tombstoned_for_test(root), "{root}");
+    }
+    for root in &present_roots {
+        assert!(!index.claude_family_tombstoned_for_test(root), "{root}");
+        assert_ne!(
+            decision(&index, &test_candidate(PathBuf::from(key(root)))).1,
+            Some(CandidateParseReason::NewFile),
+            "{root}: a present root is read as an indexed file"
+        );
+    }
+    // Their unindexed returns are read through the authority path.
+    for root in ["absent-unindexed", "absent-00"] {
+        assert_eq!(
+            decision(&index, &test_candidate(PathBuf::from(key(root)))),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::AuthorityQuarantine)
+            ),
+            "{root}"
+        );
+    }
+    // Lowered: an unwitnessed root is new again.
+    assert_eq!(
+        decision(
+            &index,
+            &test_candidate(PathBuf::from("/synthetic/projects/new/new-00.jsonl"))
+        ),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::NewFile)
+        )
+    );
+
+    // One more absent root than free slots: the fence stays, nothing is
+    // inserted, the row publishes it and the alarm fires at most hourly.
+    let (mut index, observed) = fenced(3);
+    let (outcomes, alarms) = crate::local_resource_diagnostics::capture(|| {
+        [
+            drain_fence_at_clean_terminal(&mut index, observed.clone()),
+            drain_fence_at_clean_terminal(&mut index, observed.clone()),
+        ]
+    });
+    for outcome in outcomes {
+        assert!(matches!(
+            outcome,
+            ClaudeTombstoneFenceRepair::Kept {
+                scratch_admitted: true,
+                ..
+            }
+        ));
+    }
+    assert!(index.claude_retired_family_tombstones_uncertain_for_test());
+    assert_eq!(
+        index.claude_retired_family_tombstones_for_test().len(),
+        cap - 4
+    );
+    assert_eq!(alarms.len(), 1, "rate limited");
+    assert_eq!(
+        alarms[0]["stage"],
+        "claude_absent_family_tombstone_uncertain"
+    );
+    assert_eq!(
+        alarms[0]["counts"]["absent_family_tombstone_uncertain"],
+        json!(true)
+    );
+    assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], json!(4));
+    assert_eq!(
+        decision(
+            &index,
+            &test_candidate(PathBuf::from("/synthetic/projects/new/new-00.jsonl"))
+        ),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::AuthorityQuarantine)
+        ),
+        "still fenced"
+    );
+    // Present roots alone, however many, never block it.
+    for number in 0..3 {
+        let root = format!("absent-{number:02}");
+        index.claude_usage_family_witnesses.remove(&root);
+    }
+    assert!(matches!(
+        drain_fence_at_clean_terminal(&mut index, observed),
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 2, .. }
+    ));
+    assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
+}
+
+// SOURCE Round 15: the accepted upgrade false positive. A pre-bridge index
+// whose removed family's witness outlived its entry looks like a downgrade,
+// so the load raises the fence and counts it, with no carve-out. The next
+// complete terminal bounds the cost: only the absent witnessed root takes a
+// tombstone; the present one stays an indexed file.
+#[test]
+fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
+    restart_claude_reemission_stop_for_test();
+    let dir = temp_dir("patha-upgrade-false-positive");
+    let path = dir.join("scan-index.json");
+    let mut index = ScanIndex::default();
+    for root in ["removed-00", "live-00"] {
+        index.insert_retry_pending_claude_authority_for_test(root);
+        index.claude_usage_authority_quarantine.remove(root);
+    }
+    let live_key = "/synthetic/projects/live/live-00.jsonl".to_string();
+    let mut entry = manifest_index_entry(None);
+    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+    index.files.insert(live_key.clone(), entry);
+    index.generation = 4;
+    let mut value = serde_json::to_value(&index).unwrap();
+    for field in [
+        "claude_retired_family_tombstones",
+        "claude_retired_family_tombstones_initialized",
+        "claude_retired_family_tombstones_uncertain",
+    ] {
+        value.as_object_mut().unwrap().remove(field);
+    }
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let before = claude_absence_counters_for_test();
+    let mut loaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        claude_absence_counters_for_test().tombstone_fence_raised_on_upgrade,
+        before.tombstone_fence_raised_on_upgrade + 1
+    );
+    assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(loaded
+        .claude_retired_family_tombstones_for_test()
+        .is_empty());
+    if !crate::heap_layout_bound::layout_supported() {
+        // Without the presence scratch the fallback tombstones both roots.
+        let _ = fs::remove_dir_all(&dir);
+        return;
+    }
+    assert!(matches!(
+        drain_fence_at_clean_terminal(&mut loaded, BTreeSet::from([live_key.clone()])),
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 1, .. }
+    ));
+    assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(loaded.claude_family_tombstoned_for_test("removed-00"));
+    assert!(!loaded.claude_family_tombstoned_for_test("live-00"));
+    assert_ne!(
+        decision(&loaded, &test_candidate(PathBuf::from(&live_key))).1,
+        Some(CandidateParseReason::NewFile)
+    );
+    // Marked from now on: the next load is not an upgrade.
+    loaded.save(&path).unwrap();
+    let before = claude_absence_counters_for_test();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(
+        claude_absence_counters_for_test().tombstone_fence_raised_on_upgrade,
+        before.tombstone_fence_raised_on_upgrade
+    );
+    assert!(!reloaded.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(reloaded.claude_family_tombstoned_for_test("removed-00"));
     let _ = fs::remove_dir_all(&dir);
 }
 

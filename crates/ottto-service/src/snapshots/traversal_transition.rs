@@ -145,6 +145,8 @@ pub(super) fn retiring(
         absent_family_tombstone_capacity_refusals: Option<u64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         absent_family_tombstone_uncertain: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tombstone_fence_raised_on_upgrade: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -177,6 +179,8 @@ pub(super) fn retiring(
             absent_family_tombstone_capacity_refusals: absence
                 .map(|(counts, _)| counts.tombstone_capacity_refusals),
             absent_family_tombstone_uncertain: absence.map(|(_, uncertain)| uncertain),
+            tombstone_fence_raised_on_upgrade: absence
+                .map(|(counts, _)| counts.tombstone_fence_raised_on_upgrade),
         },
     );
 }
@@ -880,6 +884,7 @@ mod tests {
                             tombstone_decode_drops: u64::MAX,
                             tombstones_cleared: u64::MAX,
                             tombstone_capacity_refusals: u64::MAX,
+                            tombstone_fence_raised_on_upgrade: u64::MAX,
                         },
                         false,
                     )),
@@ -902,10 +907,11 @@ mod tests {
         }
     }
     // SOURCE Round 13 F3: the Claude retiring row names every absence total
-    // and the fence state with their values; other sources omit them all.
+    // and the fence state with their values (Round 15: and the upgrade fence
+    // count); other sources omit them all.
     #[test]
     fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
-        const NAMES: [&str; 7] = [
+        const NAMES: [&str; 8] = [
             "absent_retry_pending_retired",
             "absent_family_tombstone_hits",
             "retirements_refused",
@@ -913,6 +919,7 @@ mod tests {
             "absent_family_tombstones_cleared",
             "absent_family_tombstone_capacity_refusals",
             "absent_family_tombstone_uncertain",
+            "tombstone_fence_raised_on_upgrade",
         ];
         for source in [
             SnapshotSource::Codex,
@@ -937,6 +944,7 @@ mod tests {
                                 tombstone_decode_drops: 4,
                                 tombstones_cleared: 5,
                                 tombstone_capacity_refusals: 6,
+                                tombstone_fence_raised_on_upgrade: 8,
                             },
                             uncertain,
                         )),

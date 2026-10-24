@@ -3228,9 +3228,11 @@ fn assert_returning_member_held(pages: &[PipelinePage], session: &str, witness: 
 /// SOURCE Round 14 H729-1: a partial checkpoint (a shed upload of the
 /// retiring page) restores the retired member's old entry beside the
 /// retirement, so the retired root is indexed with no settled proof. Its set
-/// is then lost. Indexed presence never waives the root's slot: the load
-/// re-tombstones it, so the next complete census, which removes the stale
-/// entry, keeps its witness, and the returning member is held, never new.
+/// is then lost, which raises the uncertainty fence at load. Indexed presence
+/// never waives the root's slot: the next complete census (SOURCE Round 15,
+/// never the load) does not see the stale entry's file, so it re-tombstones
+/// the root as absent, removes the stale entry and keeps its witness, and
+/// the returning member is held, never new.
 #[test]
 #[serial(source_manifests)]
 fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
@@ -3295,14 +3297,15 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
         loaded.files.contains_key(&removed_key),
         "the stale member is still indexed"
     );
+    // Round 15: the load only raises the fence; the complete census drains it.
     assert!(
-        loaded.claude_family_tombstoned_for_test(session),
-        "indexed presence never waives the retired root's slot"
+        loaded.claude_retired_family_tombstones_uncertain_for_test(),
+        "the lost set raises the fence"
     );
-    assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(!loaded.claude_family_tombstoned_for_test(session));
 
-    // Still absent: the complete census removes the stale entry and keeps
-    // the witness and the tombstone.
+    // Still absent: the complete census removes the stale entry, keeps the
+    // witness and re-tombstones the root.
     let absent = walk_until_census_complete(&fixture, 12, 4);
     let last = absent
         .last()
@@ -3316,7 +3319,13 @@ fn restored_stale_member_after_a_lost_tombstone_set_is_held_not_new() {
         Some(witness.clone()),
         "the witness survives the complete census"
     );
-    assert!(last.index.claude_family_tombstoned_for_test(session));
+    assert!(
+        last.index.claude_family_tombstoned_for_test(session),
+        "indexed presence never waives the retired root's slot"
+    );
+    assert!(!last
+        .index
+        .claude_retired_family_tombstones_uncertain_for_test());
     for page in absent.iter().flatten() {
         assert!(
             page.scan
