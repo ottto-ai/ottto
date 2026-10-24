@@ -21,10 +21,10 @@
 use super::live_snapshot_retry::LiveRetryOwner;
 use super::{
     complete_continuation_eof, enabled_snapshot_sources, load_snapshot_device_credentials,
-    run_continuation_scan, snapshot_api_base_url, snapshot_upload_destination_namespace,
-    source_upload_backoff_remaining, with_source_cadence, ContinuationInputs, ContinuationScan,
-    ScanIndex, SnapshotSource, SourcePreparation, SourceScanResult, SNAPSHOT_SYNC_INTERVAL,
-    SNAPSHOT_SYNC_LOCK,
+    run_continuation_scan, safe_error, snapshot_api_base_url,
+    snapshot_upload_destination_namespace, source_upload_backoff_remaining, with_source_cadence,
+    ContinuationInputs, ContinuationScan, ScanIndex, SnapshotSource, SourcePreparation,
+    SourceScanResult, SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK,
 };
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
 use crate::snapshots::sampled_scan::SharedCache;
@@ -490,7 +490,14 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         Some(PageEnd::PausedContended) => (Outcome::PausedContended, None),
         Some(PageEnd::Deferred) => (Outcome::Deferred, None),
         Some(PageEnd::Cancelled) => (Outcome::Cancelled, None),
-        Some(PageEnd::Failed(_)) => (Outcome::Failed, None),
+        Some(PageEnd::Failed(error)) => {
+            // The sync phase only, never raw details (as an ordinary pass).
+            eprintln!(
+                "local snapshot continuation page failed: {}",
+                safe_error(&error)
+            );
+            (Outcome::Failed, None)
+        }
         Some(PageEnd::Eof(completion)) => (
             settle_eof(host, completion, destination, authority, (issued, expires)),
             None,
@@ -1132,6 +1139,8 @@ impl CursorContinuation for CodexContinuation<'_> {
         deadline: Instant,
         ordinary_equivalent: Option<Duration>,
     ) -> PageEnd {
+        // One variant outside tests: the fakes' synthetic ticket is the other.
+        #[allow(clippy::infallible_destructuring_match)]
         let page = match ticket.0 {
             CursorParts::Codex(page) => page,
             #[cfg(test)]

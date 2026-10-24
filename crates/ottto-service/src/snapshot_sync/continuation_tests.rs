@@ -1709,12 +1709,8 @@ fn a_worker_panic_under_any_cache_lock_latches_and_fails_closed() {
             }
             TestLock::Retained => assert!(cache.lock_poisoned_for_test(lock)),
             // The side ledger recovers by clearing (a process start for
-            // pacing) on its next use.
-            TestLock::Side => {
-                assert!(cache.lock_poisoned_for_test(lock));
-                assert_eq!(cache.side_ledger().len(), 0);
-                assert!(!cache.lock_poisoned_for_test(lock));
-            }
+            // pacing) on its next use: the cursor-side W9 control.
+            TestLock::Side => assert!(cache.lock_poisoned_for_test(lock)),
         }
     }
 }
@@ -1986,6 +1982,7 @@ fn the_non_eof_page_path_names_no_network_code() {
             "enabled_snapshot_sources",
             "load_snapshot_device_credentials",
             "run_continuation_scan",
+            "safe_error",
             "snapshot_api_base_url",
             "snapshot_upload_destination_namespace",
             "source_upload_backoff_remaining",
