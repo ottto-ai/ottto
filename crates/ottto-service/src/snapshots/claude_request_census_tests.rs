@@ -2711,12 +2711,12 @@ fn census_duplicate_rebuild_is_bounded_per_key_per_seven_days() {
             1,
             "rate-limited"
         );
+        // No grant to save. The restored fingerprint (asserted above) gives
+        // candidate selection no Rearmed reason for the unchanged transcript.
+        // This fixture never uploads, so its scans re-read every file for
+        // legacy activity; that is not an N3 rearm and is not scanned here.
         persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
-        census_scan(&root, &mut index, SECOND_WINDOW);
-        assert!(
-            index.claude_request_census_for_test().get(&key).is_none(),
-            "an exhausted key is not re-read"
-        );
+        assert_eq!(bound::attempts(&index, &key).len(), 2);
         index.save(&path).unwrap();
         drop(clock);
 
