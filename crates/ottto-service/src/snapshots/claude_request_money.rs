@@ -4191,7 +4191,7 @@ fn recovery_latch_receipt(support: &Path, lineage: &str, released: Option<u64>) 
     let now = released.map_or(0, |now| now.max(1));
     if ledger
         .get(&key)
-        .is_none_or(|old| released.is_some() && old.window() == 0)
+        .map_or(true, |old| released.is_some() && old.window() == 0)
         && !ledger.put_money(
             key,
             ClaudeRequestCensusRecord::money_debt(Sha256::digest(lineage.as_bytes()).into(), now),

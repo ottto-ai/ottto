@@ -119,15 +119,17 @@ fn fault() -> anyhow::Error {
 }
 
 pub(super) fn faulted(support: &Path, error: &anyhow::Error) {
-    if error.is::<CustodyFault>() {
-        if let Ok(mut catalogs) = CATALOGS.lock() {
-            if let Some(catalog) = catalogs.get_mut(support) {
-                catalog.fault = true;
-            }
-        }
-        eprintln!("claude_request_money recovery_custody_fault=1");
+    if !error.is::<CustodyFault>() {
+        return;
     }
+    if let Ok(mut catalogs) = CATALOGS.lock() {
+        if let Some(catalog) = catalogs.get_mut(support) {
+            catalog.fault = true;
+        }
+    }
+    eprintln!("claude_request_money recovery_custody_fault=1");
 }
+
 fn dir(support: &Path) -> PathBuf {
     support.join("claude-money-recovery")
 }
@@ -1367,6 +1369,27 @@ pub(super) async fn replay_due(
 }
 
 #[cfg(test)]
+pub(super) struct TestGuard(Option<LiteralPermit>);
+#[cfg(test)]
+pub(super) fn guard_for_test(permit: LiteralPermit) -> TestGuard {
+    TestGuard(TEST_LITERAL_GUARD.with(|value| value.replace(Some(permit))))
+}
+#[cfg(test)]
+impl Drop for TestGuard {
+    fn drop(&mut self) {
+        TEST_LITERAL_GUARD.with(|value| value.set(self.0));
+    }
+}
+#[cfg(test)]
+pub(super) fn active_for_test(support: &Path) -> Vec<Manifest> {
+    CATALOGS
+        .lock()
+        .unwrap()
+        .get(support)
+        .map_or_else(Vec::new, |c| c.entries.clone())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     fn specimen(created: u64) -> (Manifest, Vec<u8>) {
@@ -1534,25 +1557,4 @@ mod tests {
             );
         }
     }
-}
-
-#[cfg(test)]
-pub(super) struct TestGuard(Option<LiteralPermit>);
-#[cfg(test)]
-pub(super) fn guard_for_test(permit: LiteralPermit) -> TestGuard {
-    TestGuard(TEST_LITERAL_GUARD.with(|value| value.replace(Some(permit))))
-}
-#[cfg(test)]
-impl Drop for TestGuard {
-    fn drop(&mut self) {
-        TEST_LITERAL_GUARD.with(|value| value.set(self.0));
-    }
-}
-#[cfg(test)]
-pub(super) fn active_for_test(support: &Path) -> Vec<Manifest> {
-    CATALOGS
-        .lock()
-        .unwrap()
-        .get(support)
-        .map_or_else(Vec::new, |c| c.entries.clone())
 }

@@ -7196,16 +7196,16 @@ async fn finish_sync_source_resume(
         snapshot_upload_error_class(e) == Some(SnapshotUploadErrorClass::LocalState)
     });
     let settle_saved_money = |saved: &ScanIndex| {
-        if source_money_resume(source, support_dir) && recovery_ack_durable {
-            if unknown_recovery::resolve_saved(
+        if source_money_resume(source, support_dir)
+            && recovery_ack_durable
+            && unknown_recovery::resolve_saved(
                 support_dir,
                 &upload_progress,
                 unknown_recovery::now(support_dir),
             )
             .is_err()
-            {
-                eprintln!("claude_request_money recovery_custody_fault=1");
-            }
+        {
+            eprintln!("claude_request_money recovery_custody_fault=1");
         }
 
         if let Some((settled, bodies, _funds)) = &money_settlement {
