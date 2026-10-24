@@ -104,9 +104,6 @@ echo "public-surface-ci: scope=$SCOPE bash=$BASH_VERSION"
 
 require_command git
 require_command jq
-if [[ "$SCOPE" != macos ]]; then
-  require_command shellcheck
-fi
 require_command python3
 require_command cargo
 
@@ -185,9 +182,13 @@ for path in "${required_public_files[@]}"; do
 done
 
 # Checked only after staged-output preparation and root checks, so their
-# failures (exit 2 with their own message) stay the same on every OS.
+# failures (exit 2 with their own message) stay the same on every OS and on a
+# Mac without shellcheck (the macOS scope does not need it).
 if [[ "$SCOPE" != portable && "$(uname -s)" != Darwin ]]; then
   fail "scope $SCOPE needs macOS; use --scope portable"
+fi
+if [[ "$SCOPE" != macos ]]; then
+  require_command shellcheck
 fi
 
 # run_step <P|B|M> <label> <command...>: see --help for the step classes.

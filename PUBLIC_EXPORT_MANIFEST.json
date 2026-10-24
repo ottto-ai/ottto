@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "cf8d2c4b9c55dda0158b6da0f206b25724b638e475641957ea6e8dd780eb1d8d",
+  "content_sha256": "a130e6b321001c940b5c98979391bb075ca141d23000e54a0b422fa4f6e4fc87",
   "files": [
     {
       "executable": false,
@@ -5620,8 +5620,8 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "2bf8eeefcf00ca402cdad5e299249f18e0c87de9b2da66ba967e917b3de9dda0",
-      "size_bytes": 9967
+      "sha256": "f5159e19e371d0ca5b350c37f97683371dde599d5d876f24e7e1190bc30a6728",
+      "size_bytes": 10036
     },
     {
       "executable": false,
@@ -5841,7 +5841,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T08:13:08+00:00",
+  "generated_at": "2026-10-24T08:20:12+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 835,
   "public_roots": [
@@ -5880,5 +5880,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "3d7f1fff5f08fc644241ad5d2a61ec46b7b54f7f"
+  "source_commit": "600111bb629074a9a45ce04c4b359a595bcfd505"
 }
