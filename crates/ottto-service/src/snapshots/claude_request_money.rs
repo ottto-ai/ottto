@@ -1305,11 +1305,7 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let deadline = if faulted(PageFault::BodyDeadline) {
-        started
-    } else {
-        started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE
-    };
+    let deadline = started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE;
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us: capture::take_capture_us(),
@@ -1521,9 +1517,12 @@ fn shadow_page_with_coverage(
     let mut written = 0;
     let mut incomplete = 0;
     let mut failure_digest = DeadlineDigest::default();
+    if faulted(PageFault::BodyDeadline) {
+        end.deadline = started;
+    }
     let mut order = order.into_iter();
     while let Some((root, key, turn)) = order.next() {
-        if scope.is_none() || preflight_check(deadline).is_err() {
+        if scope.is_none() || preflight_check(end.deadline).is_err() {
             // Closing hashes only the admitted canonical failure template.
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
