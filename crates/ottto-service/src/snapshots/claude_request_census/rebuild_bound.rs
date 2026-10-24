@@ -840,9 +840,10 @@ mod tests {
             keys: ids
                 .clone()
                 .map(|id| {
+                    // Pending: only a pending key keeps a saved prior.
                     let key = TrackedKey {
                         attempts: vec![u64::MAX; MAX_ATTEMPTS_PER_WINDOW],
-                        flags: STARTED | EXHAUSTED,
+                        flags: PENDING | STARTED | EXHAUSTED | HELD,
                         legacy_prior: None,
                     };
                     (id, key)

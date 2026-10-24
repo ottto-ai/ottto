@@ -1389,25 +1389,53 @@ fn c1b_identity_rearm_wins_over_the_census_rebuild_bound() {
                     format!("1:{NOW}")
                 };
                 let mut value = serde_json::to_value(&index).unwrap();
+                // The same checkpoint without the bound: whatever its load
+                // itself re-arms (an owed proof correction does) is identity's.
+                let control_path = scratch.join("control.json");
+                std::fs::write(&control_path, value.to_string()).unwrap();
+                let control = ScanIndex::load(&control_path).unwrap();
                 value["claude_request_census_shadow"] = serde_json::json!({
                     "n": { "k": { (bound::key_id(grant_key)): tracked } }
                 });
                 std::fs::write(&path, value.to_string()).unwrap();
                 let mut index = ScanIndex::load(&path).unwrap();
-                assert_eq!(
-                    index.files[grant_key].source_file_fingerprint, grant_fp,
-                    "{case}: N3 never writes the fingerprint"
-                );
-                let decision = index.source_fingerprint_decision(
-                    grant_key,
-                    &index.files[grant_key],
-                    &grant_fp,
-                );
+                for (key, entry) in &index.files {
+                    assert_eq!(
+                        entry.source_file_fingerprint, control.files[key].source_file_fingerprint,
+                        "{case}: N3 never writes a fingerprint ({key})"
+                    );
+                }
                 if n3 == "exhausted" {
                     assert!(bound::exhausted(&index, grant_key), "{case}");
-                    assert_eq!(decision, (CandidateDecision::Skip, None), "{case}");
+                    assert_eq!(
+                        index.source_fingerprint_decision(
+                            grant_key,
+                            &index.files[grant_key],
+                            &grant_fp
+                        ),
+                        if index.files[grant_key].source_file_fingerprint.is_empty() {
+                            rearmed
+                        } else {
+                            (CandidateDecision::Skip, None)
+                        },
+                        "{case}: only identity's own re-arm reads it"
+                    );
                 } else {
-                    assert_eq!(decision, rearmed, "{case}: the grant is outstanding");
+                    assert_eq!(
+                        bound::attempts(&index, grant_key),
+                        vec![NOW, NOW],
+                        "{case}: the grant is outstanding"
+                    );
+                    assert!(!bound::exhausted(&index, grant_key), "{case}");
+                    assert_eq!(
+                        index.source_fingerprint_decision(
+                            grant_key,
+                            &index.files[grant_key],
+                            &grant_fp
+                        ),
+                        rearmed,
+                        "{case}: the grant reads"
+                    );
                 }
 
                 // The real identity re-arm, in the same process.

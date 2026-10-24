@@ -2588,7 +2588,20 @@ fn census_duplicate_rebuild_raw(
     guard: Option<serde_json::Value>,
 ) -> String {
     let mut value = serde_json::to_value(index).unwrap();
-    let rows = value["claude_request_census"]
+    let rows = census_duplicate_rows(&value, key);
+    value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
+    if let Some(guard) = guard {
+        value["claude_request_census_shadow"] = serde_json::json!({ "n": guard });
+    }
+    serde_json::to_string(&value)
+        .unwrap()
+        .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &rows)
+}
+
+/// The census map of the serialized `index` as raw JSON, `key`'s row twice.
+/// Raw text: a parsed `Value` would keep only one copy.
+fn census_duplicate_rows(index: &serde_json::Value, key: &str) -> String {
+    let rows = index["claude_request_census"]
         .as_object()
         .unwrap()
         .iter()
@@ -2606,13 +2619,7 @@ fn census_duplicate_rebuild_raw(
         })
         .collect::<Vec<_>>()
         .join(",");
-    value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
-    if let Some(guard) = guard {
-        value["claude_request_census_shadow"] = serde_json::json!({ "n": guard });
-    }
-    serde_json::to_string(&value)
-        .unwrap()
-        .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &format!("{{{rows}}}"))
+    format!("{{{rows}}}")
 }
 
 const N3_T0: u64 = 1_790_000_000;
@@ -2943,9 +2950,12 @@ fn census_rebuild_counters(index: &mut ScanIndex) -> (u64, u64) {
     counters
 }
 
-/// `raw` with its shadow state's guard lost or made ambiguous.
-fn census_rebuild_corrupt_guard(raw: &str, corruption: &str, id: &str) -> String {
-    let mut value: serde_json::Value = serde_json::from_str(raw).unwrap();
+/// `value` serialized with its shadow state's guard lost or made ambiguous.
+fn census_rebuild_corrupt_guard(
+    mut value: serde_json::Value,
+    corruption: &str,
+    id: &str,
+) -> String {
     let guard = value["claude_request_census_shadow"]["n"].clone();
     assert!(guard.is_object(), "{corruption}: the fixture holds a guard");
     let placeholder = |value: &mut serde_json::Value, at: &str| {
@@ -3023,11 +3033,15 @@ fn census_duplicate_rebuild_lost_or_ambiguous_guard_never_replenishes() {
             let completed = serde_json::json!({
                 "k": { (id.clone()): format!("0:{N3_T0},{}", N3_T0 + N3_DAY) }
             });
-            let raw = census_duplicate_rebuild_raw(&original, &key, Some(completed));
             let raw = if corruption == "intact" {
-                raw
+                census_duplicate_rebuild_raw(&original, &key, Some(completed))
             } else {
-                census_rebuild_corrupt_guard(&raw, corruption, &id)
+                let mut value = serde_json::to_value(&original).unwrap();
+                let rows = census_duplicate_rows(&value, &key);
+                value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
+                value["claude_request_census_shadow"] = serde_json::json!({ "n": completed });
+                census_rebuild_corrupt_guard(value, corruption, &id)
+                    .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &rows)
             };
             let path = scratch.join("index.json");
             std::fs::write(&path, raw).unwrap();
@@ -3089,11 +3103,14 @@ fn census_duplicate_rebuild_lost_or_ambiguous_guard_never_replenishes() {
                     .as_object_mut()
                     .expect("the guard is saved")
                     .remove("a");
-                let mut value: serde_json::Value =
-                    serde_json::from_str(&census_duplicate_rebuild_raw(&original, &key, None))
-                        .unwrap();
+                let mut value = serde_json::to_value(&original).unwrap();
+                let rows = census_duplicate_rows(&value, &key);
+                value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
                 value["claude_request_census_shadow"] = shadow;
-                std::fs::write(&path, serde_json::to_string(&value).unwrap()).unwrap();
+                let raw = serde_json::to_string(&value)
+                    .unwrap()
+                    .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &rows);
+                std::fs::write(&path, raw).unwrap();
             }
             // One window after the refusal: one new counted attempt.
             bound::restart();
@@ -3140,11 +3157,7 @@ fn census_duplicate_rebuild_legacy_orphan_is_re_offered_and_closes_admission() {
             saved["files"][&key]["source_file_fingerprint"] = serde_json::json!("");
             saved["claude_census_rebuild_priors"] =
                 serde_json::json!({ (id.clone()): fingerprint });
-            let raw = census_rebuild_corrupt_guard(
-                &serde_json::to_string(&saved).unwrap(),
-                corruption,
-                &id,
-            );
+            let raw = census_rebuild_corrupt_guard(saved, corruption, &id);
             let path = scratch.join("index.json");
             std::fs::write(&path, raw).unwrap();
 
@@ -3897,14 +3910,8 @@ fn census_rebuild_priors_refusal_keeps_bindings_acks_and_latch() {
         let fingerprint = original.files[&key].source_file_fingerprint.clone();
         let id = bound::key_id(&key);
         let mut value = serde_json::to_value(&original).unwrap();
-        let acks = value["file_snapshot_fingerprints"]
-            .as_object()
-            .unwrap()
-            .values()
-            .flat_map(|set| set.as_array().unwrap().clone())
-            .collect::<Vec<_>>();
-        assert!(!acks.is_empty());
-        value["accepted_snapshot_fingerprints"] = serde_json::Value::Array(acks);
+        let acks = serde_json::json!(["c".repeat(64), "d".repeat(64)]);
+        value["accepted_snapshot_fingerprints"] = acks.clone();
         let bindings = serde_json::json!({
             ("f".repeat(64)): { "account_identifier_hash": "a".repeat(64) }
         });
@@ -3923,7 +3930,7 @@ fn census_rebuild_priors_refusal_keeps_bindings_acks_and_latch() {
         assert_eq!(control[1], bindings, "the binding decodes");
         assert_eq!(control[4], contract, "the contract decodes");
         assert_eq!(control[5], serde_json::json!(true), "the latch decodes");
-        assert!(control[2].as_array().is_some_and(|acks| !acks.is_empty()));
+        assert_eq!(control[2], acks, "the ACKs decode");
         assert_eq!(
             kept(&decode_bounded_index(control_raw.as_bytes()).unwrap()),
             control
