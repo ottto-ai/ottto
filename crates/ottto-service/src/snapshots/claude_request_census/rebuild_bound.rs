@@ -95,7 +95,15 @@ impl Serialize for TrackedKey {
             .map(u64::to_string)
             .collect::<Vec<_>>()
             .join(",");
-        serializer.collect_str(&format_args!("{}:{attempts}", self.flags))
+        match &self.legacy_prior {
+            // Kept through the ON reader's normalization pass, which runs
+            // before `apply` migrates it; `apply` always takes it, so saves
+            // write the current form.
+            Some(prior) => {
+                serializer.collect_str(&format_args!("{}:{attempts}:{prior}", self.flags))
+            }
+            None => serializer.collect_str(&format_args!("{}:{attempts}", self.flags)),
+        }
     }
 }
 impl<'de> Deserialize<'de> for TrackedKey {
