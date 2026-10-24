@@ -266,6 +266,7 @@ pub(super) fn decide(
     let policy = revision_policy(inputs.active_revision)
         .filter(|_| inputs.active_revision <= MAX_GATED_CLAUDE_REVISION);
     let money_held = inputs.money_paused
+        && !inputs.unknown_outcome
         && !(inputs.money_probe_due && page.reserve_money_probe(index_key, size_bytes));
     let decision = if inputs.unknown_outcome {
         HistoryDecision::Held(HistoryHold::UnknownOutcome)
@@ -603,6 +604,35 @@ mod tests {
             history_cutoff_unix_seconds: None,
             no_list_policy: NoListPolicy::Pace,
         }
+    }
+
+    #[test]
+    fn unknown_scope_does_not_spend_the_unrelated_known_outcome_probe() {
+        let list = installed("");
+        let mut paused = inputs(&list, false, 3);
+        paused.money_paused = true;
+        paused.money_probe_due = true;
+        paused.unknown_outcome = true;
+        let mut page = HistoryPage::default();
+        assert_eq!(
+            decide(HistoryKind::Owed, &paused, &mut page, "unknown", 1),
+            HistoryDecision::Held(HistoryHold::UnknownOutcome)
+        );
+        assert_eq!(
+            page.files, 0,
+            "held UNKNOWN reuses its original reservation"
+        );
+        paused.unknown_outcome = false;
+        assert_eq!(
+            decide(HistoryKind::Fresh, &paused, &mut page, "unrelated", 1),
+            HistoryDecision::NotOwed
+        );
+        assert!(page.owns_money_probe("unrelated"));
+        assert_eq!(
+            decide(HistoryKind::Fresh, &paused, &mut page, "other", 1),
+            HistoryDecision::Held(HistoryHold::MoneyPaused)
+        );
+        assert_eq!(page.files, 1);
     }
 
     #[test]
