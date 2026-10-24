@@ -1,9 +1,11 @@
 use crate::adaptive_collector::{CadenceConfig, SourceCadence};
 use crate::agent_status::AgentStatusCollection;
+#[cfg(test)]
+use crate::backfill::save_backfill_state;
 use crate::backfill::{
     apply_backfill_cutoff, current_historical_replay, load_backfill_state,
     mark_backfill_complete_for_destination, pending_backfill_sources_for_destination,
-    save_backfill_state,
+    update_backfill_state,
 };
 use crate::codex_scan_diagnostics::{self, CodexScanDiagnostics, MAX_LOCAL_DIAGNOSTIC_BYTES};
 use crate::detected_uses::{
@@ -327,11 +329,200 @@ fn with_retained_refusal_conflicts(
 // written only when its upload settles, so an interrupted pass resumes. Claude
 // Code 2 re-reads its history once so the newer context numbers fill in. Bump a
 // source at most once per release; Codex and Pi stay unchanged.
-pub(crate) fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
+pub(crate) const fn effective_upload_body_witness_revision(source: SnapshotSource) -> u64 {
     match source {
         SnapshotSource::ClaudeCode => 2,
         SnapshotSource::Codex | SnapshotSource::Pi => 1,
     }
+}
+
+// SOURCE F2: a Claude revision the history gate is not complete for does not
+// build. Raise `MAX_GATED_CLAUDE_REVISION` only with its complete policy row.
+const _: () = assert!(
+    effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        <= crate::snapshots::MAX_GATED_CLAUDE_REVISION
+);
+
+/// Where this destination's Claude prior history comes from (SOURCE
+/// F1a/F1b, StateMissing H1/N1). A fresh install is only a positively empty
+/// support state.
+/// - `Unverified`: the backfill state is unreadable.
+/// - `Here`: this destination's completed bootstrap; a server-attested record
+///   in its upload ledger (an accepted, quarantined or refused body or
+///   accepted cache evidence; a generation or replay claim alone is saved
+///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
+///   sibling of this index; or the re-emission seen-marker.
+/// - `Moved`: only a Claude bootstrap completed for another destination or
+///   recorded by a legacy state, or a Claude index, ledger or quarantined
+///   copy another destination or a legacy layout left in the support
+///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   recorded a different-user cutoff, which keeps that history excluded by
+///   the cutoff, as before.
+///
+/// Read before scanning; none of it lives in the index, so it survives index
+/// loss (fail closed).
+fn claude_prior_history(
+    backfill_state: &crate::backfill::BackfillState,
+    destination_namespace: &str,
+    upload_progress: &SnapshotUploadProgress,
+    index_path: &Path,
+    support_dir: &Path,
+) -> crate::snapshots::PriorHistory {
+    use crate::snapshots::PriorHistory;
+    if backfill_state.prior_history_unverified {
+        return PriorHistory::Unverified;
+    }
+    let slug = SnapshotSource::ClaudeCode.api_slug();
+    let here = backfill_state
+        .completed_destination_namespaces
+        .get(slug)
+        .map(String::as_str)
+        == Some(destination_namespace);
+    // A quarantined copy of this index, of a legacy index or of this
+    // destination's ledger. An unreadable directory fails closed; a missing
+    // one is empty (SOURCE h695 N2).
+    let quarantined_sibling = || {
+        let own_stem = index_path.file_stem().and_then(|stem| stem.to_str());
+        let claude_prefix = format!("{slug}-scan-index");
+        let Some(parent) = index_path.parent() else {
+            return false;
+        };
+        match std::fs::read_dir(parent) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry.file_name().to_str().is_some_and(|name| {
+                    name.contains(".corrupt.")
+                        && (own_stem.is_some_and(|stem| name.starts_with(stem))
+                            || name.starts_with(&claude_prefix))
+                }),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
+    let other_destination = || {
+        let prefix = format!("{slug}-scan-index");
+        let own = index_path.parent();
+        // An unreadable directory fails closed; a missing one is empty.
+        let holds_claude_state = |directory: &Path| {
+            Some(directory) != own
+                && match std::fs::read_dir(directory) {
+                    Ok(mut entries) => entries.any(|entry| match entry {
+                        Ok(entry) => entry
+                            .file_name()
+                            .to_str()
+                            .is_some_and(|name| name.starts_with(&prefix)),
+                        Err(_) => true,
+                    }),
+                    Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+                }
+        };
+        let snapshots = support_dir.join("snapshots");
+        holds_claude_state(&snapshots)
+            || match std::fs::read_dir(snapshots.join("destinations")) {
+                Ok(mut destinations) => destinations.any(|destination| match destination {
+                    Ok(destination) => holds_claude_state(&destination.path()),
+                    Err(_) => true,
+                }),
+                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+            }
+    };
+    // Fails closed: only a positively missing marker is absent (h695 N2).
+    let seen_marker = || match std::fs::symlink_metadata(
+        crate::snapshots::claude_reemission_seen_marker_path(support_dir),
+    ) {
+        Ok(_) => true,
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    };
+    if here
+        || upload_progress.records_server_attested_upload()
+        || quarantined_sibling()
+        || seen_marker()
+    {
+        return PriorHistory::Here;
+    }
+    // A claim that recorded a different-user cutoff keeps the other
+    // destinations' history excluded by that cutoff, not by the gate, but
+    // only on that claim's own destination: a later same-user re-claim keeps
+    // the cutoff on a new destination (SOURCE h695 N1).
+    let other_user_cutoff = backfill_state.backfill_cutoff_at.is_some()
+        && backfill_state
+            .backfill_cutoff_destination_namespace
+            .as_deref()
+            == Some(destination_namespace);
+    // Claude's own entries only: `last_completed_at` is stamped by any
+    // source's bootstrap, so a Codex or Pi completion is not Claude history.
+    let earlier_bootstrap = backfill_state
+        .completed_destination_namespaces
+        .contains_key(slug)
+        || backfill_state.completed_parser_versions.contains_key(slug)
+        || backfill_state.completed_replay_revisions.contains_key(slug);
+    if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
+        PriorHistory::Moved
+    } else {
+        PriorHistory::None
+    }
+}
+
+/// Claude only, before scanning: with prior history, a fresh index (missing
+/// or quarantined), a replay that dropped entries or the first gated load of
+/// an index without one records the history cutoff; see
+/// `ScanIndex::note_claude_history_cutoff`.
+fn note_claude_history_cutoff_for_cycle(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    prior_history: crate::snapshots::PriorHistory,
+    backfill_state: &crate::backfill::BackfillState,
+    entries_lost: bool,
+) {
+    if source != SnapshotSource::ClaudeCode {
+        return;
+    }
+    index.note_claude_history_cutoff(
+        prior_history,
+        backfill_state.claim_backfill_policy_full,
+        entries_lost,
+    );
+}
+
+/// The historical replays one cycle arms (StateMissing H1, N2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayArming {
+    /// The source's bootstrap for this destination is pending.
+    backfill_pending: bool,
+    /// The index needs the current context-curve replay.
+    curve_replay_pending: bool,
+}
+
+impl ReplayArming {
+    /// One decision for production and the history pipeline tests. An
+    /// unreadable backfill state arms no Claude replay of either kind (its
+    /// history is unknown, and a replay would drop the index's entries);
+    /// Codex and Pi replays are not affected.
+    fn decide(
+        source: SnapshotSource,
+        backfill_state: &crate::backfill::BackfillState,
+        destination_namespace: &str,
+        curve_replay_needed: bool,
+    ) -> Self {
+        Self {
+            backfill_pending: pending_backfill_sources_for_destination(
+                backfill_state,
+                destination_namespace,
+            )
+            .contains(&source),
+            curve_replay_pending: curve_replay_needed
+                && !claude_replay_suppressed(source, backfill_state),
+        }
+    }
+}
+
+/// Claude only: the unreadable backfill state suppresses replays until a
+/// Claude census under the history gate clears it (N2).
+fn claude_replay_suppressed(
+    source: SnapshotSource,
+    backfill_state: &crate::backfill::BackfillState,
+) -> bool {
+    source == SnapshotSource::ClaudeCode && backfill_state.prior_history_unverified
 }
 
 fn exclude_held_effective_body_witness_revision(
@@ -609,7 +800,17 @@ fn settle_upload_corrections_after_selection(
     }
     index.settle_cutoff_claude_proof_corrections(cutoff_candidates);
     index.settle_empty_claude_proof_corrections(scan);
-    transport_fully_settled && !index.claude_authority_proof_correction_pending()
+    // Correction members the history gate holds wait for it; they are counted,
+    // not blocking (StateMissing M2).
+    let (blocking, deferred) = index.claude_authority_proof_correction_blocking();
+    if deferred > 0 {
+        eprintln!(
+            "local snapshot proof corrections deferred to the history gate for {}: members={deferred}",
+            scan.source.api_slug()
+        );
+        crate::local_resource_diagnostics::claude_history_proof_correction_deferred(deferred);
+    }
+    transport_fully_settled && !blocking
 }
 
 fn apply_backfill_cutoff_with_claude_corrections(
@@ -880,6 +1081,20 @@ struct SnapshotUploadProgress {
 }
 
 impl SnapshotUploadProgress {
+    /// A server-attested record of an earlier upload to this destination: an
+    /// accepted, quarantined or refused body, or accepted cache evidence
+    /// (SOURCE F1a prior history). A saved generation, a replay claim or a
+    /// pending cache head is this daemon's own claim, saved before any upload,
+    /// so it is not evidence (StateMissing N1).
+    fn records_server_attested_upload(&self) -> bool {
+        !self.accepted_fingerprints.is_empty()
+            || !self.accepted_body_witnesses.is_empty()
+            || !self.accepted_cache_states.is_empty()
+            || !self.accepted_cache_heads.is_empty()
+            || !self.quarantined_fingerprints.is_empty()
+            || !self.permanent_rejections.is_empty()
+    }
+
     fn new(
         destination_namespace_hash: String,
         active_quarantine_witness: SnapshotQuarantineWitness,
@@ -3896,6 +4111,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         claude_context_curve_request_index_complete: false,
         claude_context_curve_owned_start_proven: false,
         claude_file_birth: item.claude_file_birth,
+        claude_file_birth_verdict: item.claude_file_birth_verdict(),
         activity_summary: item.activity_summary.clone(),
         tool_usage: item.tool_usage.clone(),
         tool_usage_truncated: item.tool_usage_truncated,
@@ -5243,13 +5459,18 @@ fn prepare_sync_source(
         &upload_destination_namespace,
         snapshot_quarantine_witness(source),
     )?;
-    let mut index = ScanIndex::load_for_snapshot_source(&index_path, source, support_dir)?;
+    let (mut index, load_origin) =
+        ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
     let codex_side_pass = (source == SnapshotSource::Codex).then(|| {
         crate::snapshots::begin_codex_side_pass(&daemon.transcript_cache, &index_path, &mut index)
     });
+    // Absent, quarantined or undecodable: every file would come back new. The
+    // load origin decides it (StateMissing M3); an empty saved index counts too.
+    let claude_index_loaded_fresh = load_origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
+        || (index.generation == 0 && index.files.is_empty());
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -5274,9 +5495,17 @@ fn prepare_sync_source(
         index.mark_context_curve_capability_disabled();
     }
     let backfill_state = load_backfill_state(support_dir);
-    let backfill_pending =
-        pending_backfill_sources_for_destination(&backfill_state, &upload_destination_namespace)
-            .contains(&source);
+    // Read before this cycle's replay claims a generation in the upload
+    // ledger: only a generation an earlier cycle left there is evidence.
+    let prior_claude_history = (source == SnapshotSource::ClaudeCode).then(|| {
+        claude_prior_history(
+            &backfill_state,
+            &upload_destination_namespace,
+            &upload_progress,
+            &index_path,
+            support_dir,
+        )
+    });
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -5298,8 +5527,17 @@ fn prepare_sync_source(
             upload_destination_namespace
         )
     };
-    let curve_replay_pending =
-        context_curve_enabled && index.context_curve_replay_needed(&replay_generation);
+    // An unreadable backfill state arms no Claude replay of either kind, and
+    // no replay-wide scan window (StateMissing H1, N2).
+    let ReplayArming {
+        backfill_pending,
+        curve_replay_pending,
+    } = ReplayArming::decide(
+        source,
+        &backfill_state,
+        &upload_destination_namespace,
+        context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
+    );
     let historical_replay_pending = backfill_pending || curve_replay_pending;
     if !historical_replay_pending
         && index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE)
@@ -5358,7 +5596,7 @@ fn prepare_sync_source(
         .collect::<BTreeSet<_>>();
     // U1a-2a sync-6: under this pass's sync lock, after C14 and before the
     // scan is built.
-    crate::snapshots::prepare_historical_replay_with_side(
+    let replay_dropped_entries = crate::snapshots::prepare_historical_replay_with_side(
         &mut index,
         historical_replay_pending,
         replay_generation.clone(),
@@ -5366,6 +5604,15 @@ fn prepare_sync_source(
         &daemon.transcript_cache,
         &index_path,
     );
+    if let Some(prior_history) = prior_claude_history {
+        note_claude_history_cutoff_for_cycle(
+            &mut index,
+            source,
+            prior_history,
+            &backfill_state,
+            claude_index_loaded_fresh || replay_dropped_entries,
+        );
+    }
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
@@ -5767,6 +6014,9 @@ fn finish_sync_source(
             backfill_succeeded = false;
         }
     }
+    // The history-upgrade emission seam: after the local evidence fold, before
+    // every ordinary and correction upload path can see a held body.
+    index.veto_claude_history_emission(source, &mut scan_result.snapshots);
 
     // Recheck after the potentially long scan, not only when status was
     // acquired. A cached login must not claim sessions created after a switch.
@@ -5924,15 +6174,15 @@ fn finish_sync_source(
         &current_codex_bindings,
         cached_codex_login_changed,
     );
-    // Judge recency on the clock at reconciliation, not the scan start: a long
-    // scan reads transcripts that were still being written after it began, and
-    // anchoring to the start rejected that live activity as "future".
+    // Claude activity remains recent relative to the scan's observation
+    // horizon, while future timestamps are bounded by the reconciliation clock.
     if crate::active_sessions::reconcile_active_sessions(
         support_dir,
         source,
         &scan_result.snapshots,
         Some(&reconciliation_status),
         upload_policy,
+        (source == SnapshotSource::ClaudeCode).then_some(scan_started_at.as_str()),
         &current_rfc3339(),
     )
     .is_err()
@@ -6127,6 +6377,8 @@ fn finish_sync_source(
             );
         }
     }
+    // The same hook every resend path calls; nothing held is left by now.
+    index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
@@ -6653,12 +6905,19 @@ fn finish_sync_source(
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
     index.finish_legacy_settlement_reconciliation();
-    settle_context_curve_replay_state(
-        &mut index,
-        context_curve_enabled,
-        scan_result.census_complete && upload_fully_settled,
-        &replay_generation,
-    );
+    // A Claude curve replay an unreadable backfill state suppressed stays
+    // pending (StateMissing H1), so it runs once the marker clears.
+    let curve_replay_suppressed = context_curve_enabled
+        && claude_replay_suppressed(source, &backfill_state)
+        && index.context_curve_replay_needed(&replay_generation);
+    if !curve_replay_suppressed {
+        settle_context_curve_replay_state(
+            &mut index,
+            context_curve_enabled,
+            scan_result.census_complete && upload_fully_settled,
+            &replay_generation,
+        );
+    }
     ensure_authority()?;
     scan_result.validate_codex_checkpoint()?;
     let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -6750,18 +7009,35 @@ fn finish_sync_source(
         );
     }
 
+    // StateMissing N2: a Claude census completed and settled under the
+    // history gate clears the unverified marker. A fresh index recorded its
+    // cutoff this cycle and an intact one keeps its entries, so the rebuilt
+    // history stays gated; Claude's bootstrap and replays may then run.
+    if claude_replay_suppressed(source, &backfill_state)
+        && scan_result.census_complete
+        && upload_fully_settled
+    {
+        if let Err(error) = crate::backfill::clear_prior_history_unverified(support_dir) {
+            eprintln!(
+                "local snapshot backfill state save failed for {}: {}",
+                source.api_slug(),
+                safe_error(&error)
+            );
+            return Err(anyhow!("local snapshot backfill state save failed"));
+        }
+    }
+
     if backfill_succeeded {
-        // Reload before mutating: a claim completion can persist an
-        // account-switch backfill cutoff while this (potentially minutes-long)
-        // sync is running, and saving the stale pre-scan copy would clobber it.
-        let mut backfill_state = load_backfill_state(support_dir);
-        mark_backfill_complete_for_destination(
-            &mut backfill_state,
-            source,
-            &upload_destination_namespace,
-        );
-        backfill_state.last_completed_at = Some(scan_started_at.clone());
-        if let Err(error) = save_backfill_state(support_dir, &backfill_state) {
+        // Keep completion's reload, mutation and save atomic with claims,
+        // list intent and deliberate installation reset.
+        if let Err(error) = update_backfill_state(support_dir, |backfill_state| {
+            mark_backfill_complete_for_destination(
+                backfill_state,
+                source,
+                &upload_destination_namespace,
+            );
+            backfill_state.last_completed_at = Some(scan_started_at.clone());
+        }) {
             eprintln!(
                 "local snapshot backfill state save failed for {}: {}",
                 source.api_slug(),
@@ -20280,6 +20556,9 @@ mod tests {
     include!("retry_live_native_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
+    mod history_upgrade_pipeline_tests {
+        include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
+    }
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
