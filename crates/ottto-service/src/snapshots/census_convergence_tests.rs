@@ -2443,6 +2443,14 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     );
     assert_eq!(alarms[0]["counts"]["scratch_admitted"], json!(false));
     assert_eq!(
+        alarms[0]["counts"]["cause"],
+        if admitted {
+            "scratch_refused"
+        } else {
+            "unsupported_layout"
+        }
+    );
+    assert_eq!(
         alarms[0]["counts"]["absent_family_tombstone_uncertain"],
         json!(true)
     );
@@ -3055,4 +3063,34 @@ fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
 
 fn hex64_number(number: usize) -> String {
     format!("{number:064x}")
+}
+
+/// Unsupported layouts keep the fence permanently raised; the serialized
+/// alarm must distinguish that cause from an ordinary scratch refusal.
+#[test]
+fn kept_tombstone_fence_alarm_names_unsupported_layout() {
+    for (layout_supported, scratch_admitted, cause) in [
+        (false, false, "unsupported_layout"),
+        (true, false, "scratch_refused"),
+        (true, true, "tombstone_capacity"),
+    ] {
+        let (_, alarms) = crate::local_resource_diagnostics::capture(|| {
+            crate::local_resource_diagnostics::claude_absent_family_tombstone_uncertain(
+                &ClaudeTombstoneFenceKeptAlarm::new(17, scratch_admitted, 3, layout_supported),
+            );
+        });
+        assert_eq!(alarms.len(), 1);
+        assert_eq!(
+            alarms[0]["stage"],
+            "claude_absent_family_tombstone_uncertain"
+        );
+        assert_eq!(alarms[0]["counts"]["cause"], cause);
+        assert_eq!(
+            alarms[0]["counts"]["absent_family_tombstone_uncertain"],
+            true
+        );
+        assert_eq!(alarms[0]["counts"]["scratch_admitted"], scratch_admitted);
+        assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], 17);
+        assert_eq!(alarms[0]["counts"]["witness_visits"], 3);
+    }
 }

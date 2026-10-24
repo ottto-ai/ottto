@@ -9015,10 +9015,34 @@ fn take_claude_tombstone_fence_kept_alarm_slot(now: std::time::Instant) -> bool 
 /// Counts of one kept-fence alarm; counts only, never ids.
 #[derive(Serialize)]
 struct ClaudeTombstoneFenceKeptAlarm {
+    cause: &'static str,
     absent_family_tombstone_uncertain: bool,
     free_tombstone_slots: usize,
     scratch_admitted: bool,
     witness_visits: usize,
+}
+
+impl ClaudeTombstoneFenceKeptAlarm {
+    fn new(
+        free_tombstone_slots: usize,
+        scratch_admitted: bool,
+        witness_visits: usize,
+        layout_supported: bool,
+    ) -> Self {
+        Self {
+            cause: if !layout_supported {
+                "unsupported_layout"
+            } else if !scratch_admitted {
+                "scratch_refused"
+            } else {
+                "tombstone_capacity"
+            },
+            absent_family_tombstone_uncertain: true,
+            free_tombstone_slots,
+            scratch_admitted,
+            witness_visits,
+        }
+    }
 }
 
 /// Proven families of one complete closed-fence terminal whose earlier-page
@@ -38447,12 +38471,12 @@ impl ScanIndex {
                 );
                 if take_claude_tombstone_fence_kept_alarm_slot(std::time::Instant::now()) {
                     crate::local_resource_diagnostics::claude_absent_family_tombstone_uncertain(
-                        &ClaudeTombstoneFenceKeptAlarm {
-                            absent_family_tombstone_uncertain: true,
+                        &ClaudeTombstoneFenceKeptAlarm::new(
                             free_tombstone_slots,
                             scratch_admitted,
-                            witness_visits: visited,
-                        },
+                            visited,
+                            crate::heap_layout_bound::layout_supported(),
+                        ),
                     );
                 }
             }
