@@ -691,6 +691,10 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) capture_us: u64,
     pub(crate) writer_us: u64,
     pub(crate) result_apply_us: u64,
+    /// Time through shared family preparation, before optional body slices.
+    pub(crate) family_setup_us: u64,
+    /// Producer work accounting for the unreached family suffix.
+    pub(crate) deferred_close_us: u64,
     pub(crate) save_bytes_today: u64,
     pub(crate) units_immature: u64,
     pub(crate) units_matched: u64,
@@ -1536,12 +1540,14 @@ fn shadow_page_with_coverage(
     let mut written = 0;
     let mut incomplete = 0;
     let mut failure_digest = DeadlineDigest::default();
+    counts.family_setup_us = started.elapsed().as_micros() as u64;
     if faulted(PageFault::BodyDeadline) {
         end.deadline = started;
     }
     for position in 0..order.len() {
         let (root, key, turn) = order[position].clone();
         if scope.is_none() || preflight_check(end.deadline).is_err() {
+            let deferred_started = Instant::now();
             // Closing hashes only the admitted canonical failure template.
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
@@ -1581,6 +1587,7 @@ fn shadow_page_with_coverage(
             counts.families_deadline_deferred += deferred;
             counts.certificate_mismatch += deferred;
             counts.removed_change_unavailable += deferred;
+            counts.deferred_close_us = deferred_started.elapsed().as_micros() as u64;
             incomplete += deferred;
             break;
         }
