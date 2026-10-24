@@ -2326,11 +2326,17 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
         "the member is still indexed"
     );
     assert!(loaded.claude_retired_family_tombstones_uncertain_for_test());
-    // The walk does not see the indexed member's file: it counts as absent.
+    // The walk does not see the indexed member's file: it counts as absent,
+    // and as aged out (SOURCE h733-2).
+    let aged_out = claude_absence_counters_for_test().absent_family_tombstone_aged_out;
     drain_fence_at_clean_terminal(&mut loaded, BTreeSet::new());
     assert!(
         loaded.claude_family_tombstoned_for_test("gone-00"),
         "indexed presence never waives the root's slot"
+    );
+    assert_eq!(
+        claude_absence_counters_for_test().absent_family_tombstone_aged_out,
+        aged_out + 1
     );
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(
@@ -2352,10 +2358,14 @@ fn an_indexed_member_never_waives_a_lost_tombstone() {
 // SOURCE Round 14 H729-2: the fence drain is bounded whatever the witness
 // count. It counts untombstoned witnessed roots only until one more than it
 // may tombstone, keeps nothing but the entries it inserts, and those are
-// priced first. Over capacity, or over the fixed-size fallback when the
-// scratch is refused, the fence stays up and nothing is inserted. Since
-// Round 15 the drain runs at a complete terminal, never at load; here every
-// witnessed root is absent (the walk observed nothing).
+// priced first. Over capacity the fence stays up and nothing is inserted.
+// A refused scratch never lowers the fence (SOURCE h733-1), whatever it
+// counts: zero, one, exactly the fixed-size fallback, or every witness
+// already tombstoned. It inserts nothing, counts the skip and raises the
+// kept-fence alarm; after save and reload the next admitted complete
+// terminal lowers it. Since Round 15 the drain runs at a complete terminal,
+// never at load; here every witnessed root is absent (the walk observed
+// nothing).
 #[test]
 fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
@@ -2406,23 +2416,85 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
     );
     assert!(index.claude_retired_family_tombstones_for_test().is_empty());
 
-    // A refused scratch: the fixed-size fallback lowers a small loss and
-    // keeps the fence over a larger one, durably.
+    // A refused scratch never lowers (SOURCE h733-1; this replaces the
+    // Round 15 oracle that a refused pass lowered exactly `fallback` roots,
+    // which that ruling makes wrong). Exactly the fallback size: Kept,
+    // nothing inserted, the skip counted and the kept-fence alarm raised.
     let refuse = RefuseClaudeTombstoneRepairScratchForTest::new();
+    let dir = temp_dir("patha-refused-tombstone-repair");
+    let skipped = || claude_absence_counters_for_test().fence_lowering_skipped_scratch_fallback;
     let mut small = witnessed(fallback);
+    let before = skipped();
+    let (outcome, alarms) = crate::local_resource_diagnostics::capture(|| {
+        drain_fence_at_clean_terminal(&mut small, BTreeSet::new())
+    });
     assert_eq!(
-        small.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
-        ClaudeTombstoneFenceRepair::Lowered {
-            tombstoned: fallback,
-            visited: 2 * fallback,
+        outcome,
+        ClaudeTombstoneFenceRepair::Kept {
+            scratch_admitted: false,
+            visited: fallback,
         }
     );
-    assert!(!small.claude_retired_family_tombstones_uncertain_for_test());
+    assert_eq!(skipped(), before + 1);
+    assert_eq!(alarms.len(), 1);
     assert_eq!(
-        small.claude_retired_family_tombstones_for_test().len(),
-        fallback
+        alarms[0]["stage"],
+        "claude_absent_family_tombstone_uncertain"
     );
-    let dir = temp_dir("patha-refused-tombstone-repair");
+    assert_eq!(alarms[0]["counts"]["scratch_admitted"], json!(false));
+    assert_eq!(
+        alarms[0]["counts"]["absent_family_tombstone_uncertain"],
+        json!(true)
+    );
+    assert!(small.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(small.claude_retired_family_tombstones_for_test().is_empty());
+    // Zero and one root, and every witness already tombstoned: still Kept.
+    for (count, tombstoned) in [(0, 0), (1, 0), (fallback, fallback)] {
+        let mut index = witnessed(count);
+        for number in 0..tombstoned {
+            index
+                .claude_retired_family_tombstones
+                .entries
+                .insert(claude_retired_family_digest(&format!("w-{number:05}")), 0);
+        }
+        let before = skipped();
+        assert_eq!(
+            index.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
+            ClaudeTombstoneFenceRepair::Kept {
+                scratch_admitted: false,
+                visited: count,
+            },
+            "{count} witnessed, {tombstoned} tombstoned"
+        );
+        assert_eq!(skipped(), before + 1);
+        assert!(index.claude_retired_family_tombstones_uncertain_for_test());
+        assert_eq!(
+            index.claude_retired_family_tombstones_for_test().len(),
+            tombstoned
+        );
+    }
+    // An unfenced index does no work and counts no skip.
+    let mut index = witnessed(1);
+    index.claude_retired_family_tombstones_uncertain = false;
+    let before = skipped();
+    assert_eq!(
+        index.lower_claude_retired_family_tombstone_fence(&nothing, &nothing),
+        ClaudeTombstoneFenceRepair::NotFenced
+    );
+    assert_eq!(skipped(), before);
+    // The refusal is durable: saved and reloaded, it still keeps the fence.
+    let small_path = dir.join("small-index.json");
+    save_through_generation(&mut small, &small_path, 2);
+    let mut reloaded = ScanIndex::load(&small_path).unwrap();
+    assert!(matches!(
+        drain_fence_at_clean_terminal(&mut reloaded, BTreeSet::new()),
+        ClaudeTombstoneFenceRepair::Kept {
+            scratch_admitted: false,
+            ..
+        }
+    ));
+    assert!(reloaded.claude_retired_family_tombstones_uncertain_for_test());
+    reloaded.save(&small_path).unwrap();
     let path = dir.join("scan-index.json");
     let mut large = witnessed(fallback + 1);
     assert_eq!(
@@ -2466,9 +2538,45 @@ fn tombstone_fence_repair_is_bounded_and_a_refusal_keeps_the_fence() {
         "the fence is durable"
     );
     drop(refuse);
+    // The later admitted complete terminal lowers both: the small loss
+    // refused above, and the larger one.
+    let mut small = ScanIndex::load(&small_path).unwrap();
+    assert!(small.claude_retired_family_tombstones_uncertain_for_test());
+    let before = skipped();
+    let outcome = drain_fence_at_clean_terminal(&mut small, BTreeSet::new());
+    if admitted {
+        assert_eq!(
+            outcome,
+            ClaudeTombstoneFenceRepair::Lowered {
+                tombstoned: fallback,
+                visited: 2 * fallback,
+            }
+        );
+        assert_eq!(skipped(), before, "an admitted pass skips nothing");
+        assert!(!small.claude_retired_family_tombstones_uncertain_for_test());
+        assert_eq!(
+            small.claude_retired_family_tombstones_for_test().len(),
+            fallback
+        );
+        assert_eq!(
+            decision(&small, &unwitnessed),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::NewFile)
+            )
+        );
+    } else {
+        assert!(small.claude_retired_family_tombstones_uncertain_for_test());
+    }
     let mut lowered = ScanIndex::load(&path).unwrap();
     assert!(lowered.claude_retired_family_tombstones_uncertain_for_test());
+    let aged_out = claude_absence_counters_for_test().absent_family_tombstone_aged_out;
     drain_fence_at_clean_terminal(&mut lowered, BTreeSet::new());
+    // None of these roots has an indexed member: none aged out.
+    assert_eq!(
+        claude_absence_counters_for_test().absent_family_tombstone_aged_out,
+        aged_out
+    );
     if admitted {
         assert!(!lowered.claude_retired_family_tombstones_uncertain_for_test());
         assert_eq!(
@@ -2534,8 +2642,8 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
         Some(CandidateParseReason::NewFile),
     );
 
-    // Refused repair scratch: the check fails closed and the fallback cannot
-    // place all the roots, so the fence stays up across saves.
+    // Refused repair scratch: the check fails closed and a refused drain
+    // never lowers (SOURCE h733-1), so the fence stays up across saves.
     write(&downgrade);
     {
         let _refuse = RefuseClaudeTombstoneRepairScratchForTest::new();
@@ -2704,12 +2812,17 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     };
 
     // Five free slots, five roots needing one, more than the cap present.
+    // Of the five, only `absent-stale` is unobserved with an indexed member:
+    // it aged out of the walk (SOURCE h733-2) and is counted, still absent.
+    let aged_out = || claude_absence_counters_for_test().absent_family_tombstone_aged_out;
+    let before = aged_out();
     let (mut index, observed) = fenced(2);
     assert!(index.claude_usage_family_witnesses.len() > cap + 5);
     assert!(matches!(
         drain_fence_at_clean_terminal(&mut index, observed.clone()),
         ClaudeTombstoneFenceRepair::Lowered { tombstoned: 5, .. }
     ));
+    assert_eq!(aged_out(), before + 1);
     assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(index.claude_retired_family_tombstones_for_test().len(), cap);
     for root in [
@@ -2770,6 +2883,11 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
             }
         ));
     }
+    assert_eq!(
+        aged_out(),
+        before + 1,
+        "a kept fence inserts and counts nothing"
+    );
     assert!(index.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(
         index.claude_retired_family_tombstones_for_test().len(),
@@ -2806,6 +2924,8 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
         ClaudeTombstoneFenceRepair::Lowered { tombstoned: 3, .. }
     ));
     assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
+    assert!(index.claude_family_tombstoned_for_test("absent-stale"));
+    assert_eq!(aged_out(), before + 2);
 }
 
 // SOURCE Round 15, checkpoint selection: the drain exempts a present root by
@@ -2899,14 +3019,20 @@ fn an_upgrade_false_positive_is_counted_and_bounded_by_the_drain() {
         .claude_retired_family_tombstones_for_test()
         .is_empty());
     if !crate::heap_layout_bound::layout_supported() {
-        // Without the presence scratch the fallback tombstones both roots.
+        // Without the presence scratch the fallback keeps the fence.
         let _ = fs::remove_dir_all(&dir);
         return;
     }
+    let aged_out = claude_absence_counters_for_test().absent_family_tombstone_aged_out;
     assert!(matches!(
         drain_fence_at_clean_terminal(&mut loaded, BTreeSet::from([live_key.clone()])),
         ClaudeTombstoneFenceRepair::Lowered { tombstoned: 1, .. }
     ));
+    // `removed-00` has no indexed member: absent, not aged out.
+    assert_eq!(
+        claude_absence_counters_for_test().absent_family_tombstone_aged_out,
+        aged_out
+    );
     assert!(!loaded.claude_retired_family_tombstones_uncertain_for_test());
     assert!(loaded.claude_family_tombstoned_for_test("removed-00"));
     assert!(!loaded.claude_family_tombstoned_for_test("live-00"));

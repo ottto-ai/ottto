@@ -147,6 +147,10 @@ pub(super) fn retiring(
         absent_family_tombstone_uncertain: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         tombstone_fence_raised_on_upgrade: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_aged_out: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fence_lowering_skipped_scratch_fallback: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -181,6 +185,10 @@ pub(super) fn retiring(
             absent_family_tombstone_uncertain: absence.map(|(_, uncertain)| uncertain),
             tombstone_fence_raised_on_upgrade: absence
                 .map(|(counts, _)| counts.tombstone_fence_raised_on_upgrade),
+            absent_family_tombstone_aged_out: absence
+                .map(|(counts, _)| counts.absent_family_tombstone_aged_out),
+            fence_lowering_skipped_scratch_fallback: absence
+                .map(|(counts, _)| counts.fence_lowering_skipped_scratch_fallback),
         },
     );
 }
@@ -885,6 +893,8 @@ mod tests {
                             tombstones_cleared: u64::MAX,
                             tombstone_capacity_refusals: u64::MAX,
                             tombstone_fence_raised_on_upgrade: u64::MAX,
+                            absent_family_tombstone_aged_out: u64::MAX,
+                            fence_lowering_skipped_scratch_fallback: u64::MAX,
                         },
                         false,
                     )),
@@ -908,10 +918,11 @@ mod tests {
     }
     // SOURCE Round 13 F3: the Claude retiring row names every absence total
     // and the fence state with their values (Round 15: and the upgrade fence
-    // count); other sources omit them all.
+    // count; Round 16, SOURCE h733: the aged-out tombstone and refused-drain
+    // counts); other sources omit them all.
     #[test]
     fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
-        const NAMES: [&str; 8] = [
+        const NAMES: [&str; 10] = [
             "absent_retry_pending_retired",
             "absent_family_tombstone_hits",
             "retirements_refused",
@@ -920,6 +931,8 @@ mod tests {
             "absent_family_tombstone_capacity_refusals",
             "absent_family_tombstone_uncertain",
             "tombstone_fence_raised_on_upgrade",
+            "absent_family_tombstone_aged_out",
+            "fence_lowering_skipped_scratch_fallback",
         ];
         for source in [
             SnapshotSource::Codex,
@@ -945,6 +958,8 @@ mod tests {
                                 tombstones_cleared: 5,
                                 tombstone_capacity_refusals: 6,
                                 tombstone_fence_raised_on_upgrade: 8,
+                                absent_family_tombstone_aged_out: 9,
+                                fence_lowering_skipped_scratch_fallback: 10,
                             },
                             uncertain,
                         )),

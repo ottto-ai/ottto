@@ -122,20 +122,31 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   its presence scratch holds one borrowed root and flag per witnessed root
   the walk saw, priced with the new entries against the parked budget first;
   it counts roots needing a tombstone only until one more than it may add,
-  and keeps nothing but the entries it inserts. A refused price falls back,
-  without the presence scratch, to at most 16 untombstoned witnessed roots
-  (present or not), and a larger set keeps the fence. The cost is liveness:
-  absent roots (including witnessed families that aged out of the backfill
-  window while fenced, which the walk does not observe) hold their slots
-  until a page reads them again, and while the fence is up witnesses are not
-  pruned.
+  and keeps nothing but the entries it inserts. Only an admitted pass
+  lowers the fence (Round 16, SOURCE h733-1): a refused price has no
+  presence scratch, so it cannot tell present roots from absent ones; it
+  counts at most 17 untombstoned witnessed roots for the alarm, inserts
+  nothing, and keeps the fence up for any count (zero, one, exactly 16, or
+  every witness already tombstoned), counted as
+  `fence_lowering_skipped_scratch_fallback` and routed through the
+  kept-fence alarm. The next admitted complete terminal lowers it. The cost
+  is liveness: absent roots (including witnessed families that aged out of
+  the backfill window while fenced, which the walk does not observe) hold
+  their slots until a page reads them again, and while the fence is up
+  witnesses are not pruned. A tombstoned root that the walk did not observe
+  but that still has an indexed member is counted as
+  `absent_family_tombstone_aged_out` (Round 16, SOURCE h733-2); it still
+  counts as absent.
 - Local content-free process counters appear on each Claude traversal's
   `retiring` transition row: `absent_retry_pending_retired`,
   `absent_family_tombstone_hits`, `retirements_refused`,
   `tombstone_decode_drops`, `absent_family_tombstones_cleared` (proof
-  settlement), `absent_family_tombstone_capacity_refusals` and
-  `tombstone_fence_raised_on_upgrade` (Round 15), with the index's fence
-  state as `absent_family_tombstone_uncertain`. Other sources omit them.
+  settlement), `absent_family_tombstone_capacity_refusals`,
+  `tombstone_fence_raised_on_upgrade` (Round 15),
+  `absent_family_tombstone_aged_out` and
+  `fence_lowering_skipped_scratch_fallback` (Round 16), with the index's
+  fence state as `absent_family_tombstone_uncertain`. Other sources omit
+  them.
 - A fresh single-page traversal that starts with RetryPending debt no longer
   completes its ordinary census (before this change its start reset the mark,
   so it could). This bridge does not deliver census completion on a source
@@ -214,7 +225,18 @@ fence-lowering assertion behind a complete terminal (the load now only
 raises the fence) and adds unit tests where more present roots than the cap
 never block the drain while more absent roots than free slots keep the
 fence (with one rate-limited alarm), and where an upgrade false positive is
-counted and drained to the absent root only.
+counted and drained to the absent root only. Round 16 (SOURCE h733) replaces
+the refused-fallback oracle that lowered a 16-root loss with Kept: a refused
+drain keeps the fence for zero, one, exactly 16 or already-tombstoned
+witnesses, counts the skip and alarms, and the same index lowers at the next
+admitted terminal after save and reload. Unit tests count an unobserved
+indexed root as aged out (and an unindexed absent root as not), and the
+retiring-row tests cover both new counts, their omission for other sources
+and the maximum row bound. A prepare/finish pipeline test (COST) retires a
+proven root with its tombstone, returns it under unhealthy proof (held,
+record re-formed against the witness, nothing offered), then re-proves a
+changed revision and offers its body exactly once, never the old body, and
+keeps it indexed and accepted with the tombstone cleared.
 
 CI supplies execution receipts; no local cargo command, tests or
 installed-runtime reads were used. Landing stays gated on carry-line and
