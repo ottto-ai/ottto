@@ -1193,7 +1193,8 @@ impl<R: std::io::Read> CensusRead<R> {
             index.claude_money_files.clear();
         }
         if self.seen_selection {
-            for (key, entry) in &mut index.files {
+            let mut reowe = Vec::new();
+            for (key, entry) in &index.files {
                 // Empty physical files settle locally without an entity or
                 // ACK. Keep the same exception separate from selection loss.
                 let settled_empty = index.confirmed_empty_files.contains(key)
@@ -1211,9 +1212,12 @@ impl<R: std::io::Read> CensusRead<R> {
                         &index.snapshot_activity_at,
                     )
                 {
-                    entry.effective_upload_body_witness_revision = 2;
-                    index.claude_request_census.invalidate_keeping_birth(key);
+                    reowe.push(key.clone());
                 }
+            }
+            for key in reowe {
+                index.re_owe_effective_upload_body_witness_revision(&key, 2);
+                index.claude_request_census.invalidate_keeping_birth(&key);
             }
         }
 

@@ -1472,6 +1472,7 @@ fn p2a_literal_503_resends_byte_identical_after_progress_restart() {
         |batch| {
             first = serde_json::to_vec(&batch).unwrap();
             Err(anyhow::Error::new(UploadShed {
+ code: None,
                 request_owned_route_unavailable: true,
                 status: 503,
                 retry_after: Some(Duration::from_secs(60)),

@@ -1982,6 +1982,7 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
 
 fn short_shed() -> anyhow::Error {
     anyhow::Error::new(UploadShed {
+        request_owned_route_unavailable: false,
         status: 503,
         retry_after: Some(Duration::from_secs(1)),
         code: None,

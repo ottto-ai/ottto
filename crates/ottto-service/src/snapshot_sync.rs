@@ -25,9 +25,9 @@ use crate::snapshots::{
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotHoldKind, SnapshotHoldRetry, SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
-    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    SnapshotHoldKind, SnapshotHoldRetry, SnapshotItem, SnapshotQuarantineDisposition,
+    SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
+    SnapshotUploadPolicy, SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
     MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
     SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
@@ -48,8 +48,8 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use zeroize::Zeroize;
 
 mod continuation;
-mod reason_reoffer;
 pub(crate) mod money_resume;
+mod reason_reoffer;
 mod rejection_log;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
@@ -1341,22 +1341,9 @@ impl SnapshotUploadProgress {
                 ));
             }
         }
-        ordinary.sort();
         holds.sort();
-        let ordinary_count = ordinary
-            .len()
-            .min(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - holds.len().min(25));
-        let retry = ordinary
-            .into_iter()
-            .take(ordinary_count)
-            .map(|(_, _, fp)| fp)
-            .chain(
-                holds
-                    .into_iter()
-                    .take(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - ordinary_count)
-                    .map(|(_, fp)| fp),
-            )
-            .collect::<BTreeSet<_>>();
+        let held_slots = holds.len().min(25);
+        let mut candidates = ordinary;
         let mut reoffer_changed = false;
         let mut due_reoffers = BTreeMap::new();
         if let Some(scope) = reoffer {
@@ -1372,11 +1359,12 @@ impl SnapshotUploadProgress {
                     .map(|(fingerprint, (due, _))| (1u8, *due, fingerprint.clone())),
             );
         }
+        candidates.sort();
         let reoffer_now = reoffer.map_or(0, |scope| scope.now);
         let mut retry = BTreeSet::new();
         for (_, _, fingerprint) in candidates {
             if retry.len() + self.active_reason_reoffers.len()
-                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - held_slots
             {
                 break;
             }
@@ -1409,6 +1397,16 @@ impl SnapshotUploadProgress {
                 }
             }
         }
+        retry.extend(
+            holds
+                .into_iter()
+                .take(
+                    SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+                        - retry.len()
+                        - self.active_reason_reoffers.len(),
+                )
+                .map(|(_, fingerprint)| fingerprint),
+        );
         self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
         let active = self
             .active_quarantine_witness
@@ -7060,6 +7058,7 @@ async fn finish_sync_source_resume(
                         comparison_completion
                             .as_mut()
                             .map(NativeSelectedRestore::Paid),
+                        Some(UnsettledUploadCause::Unattributed),
                     ) {
                         eprintln!(
                             "local snapshot partial scan checkpoint failed for {}: {}",

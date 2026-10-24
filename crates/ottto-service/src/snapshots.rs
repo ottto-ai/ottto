@@ -1385,7 +1385,7 @@ fn serialize_snapshot_batch<S: Serializer>(
             })
         })
         .collect::<Result<Vec<_>, S::Error>>()?;
-    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 8)?;
+    let mut state = serializer.serialize_struct("SnapshotBatchRequest", 9)?;
     state.serialize_field("schema_version", &request.schema_version)?;
     state.serialize_field("source", &request.source)?;
     state.serialize_field("machine_id", &request.machine_id)?;
@@ -1394,6 +1394,10 @@ fn serialize_snapshot_batch<S: Serializer>(
     // forward-tolerant ingest model and ignore it; capable backends echo it
     // and may return a complete per-entity outcome partition.
     state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
+    state.serialize_field(
+        "usage_decrease_hold_ack_contract",
+        "usage_decrease_hold_ack:v1",
+    )?;
     if enforce_head_cas {
         state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
     }
@@ -6059,11 +6063,13 @@ pub fn finalize_scan_after_policy_with_body_witness(
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
         }
-        index.stamp_effective_upload_body_witness_revision(
-            &pending.index_key,
-            &pending.source_file_fingerprint,
-            pending.effective_upload_body_witness_revision,
-        );
+        if pending.effective_upload_body_witness_revision != 3 || locally_empty_money {
+            index.stamp_effective_upload_body_witness_revision(
+                &pending.index_key,
+                &pending.source_file_fingerprint,
+                pending.effective_upload_body_witness_revision,
+            );
+        }
         if let Some(diagnostic) = result.local_codex_diagnostics.as_mut() {
             let key_digest = codex_scan_diagnostics::digest(&pending.index_key);
             for sample in diagnostic.lineage.iter_mut().flatten() {
@@ -25623,6 +25629,28 @@ impl OwnedSourceScan {
             // index) still parses for its local work, but none of its bodies
             // is emitted and its upload tuple stays (`veto_claude_history_emission`).
             // Codex and Pi keep the adoption-only page budget.
+            if decision == CandidateDecision::Parse
+                && source == SnapshotSource::ClaudeCode
+                && index.request_money_live_revision()
+                && index.money_below_retention_floor(&candidate)
+            {
+                let key = local_index_key(&candidate.path);
+                if index
+                    .active_request_money_support_dir
+                    .as_deref()
+                    .is_some_and(|support| {
+                        claude_request_money::settle_below_retention_floor(support, index, &key)
+                    })
+                {
+                    index.stamp_effective_upload_body_witness_revision(
+                        &key,
+                        &candidate.source_file_fingerprint,
+                        3,
+                    );
+                    eprintln!("claude_request_money adoption_below_retention_floor=1");
+                }
+                decision = CandidateDecision::Skip;
+            }
             if decision == CandidateDecision::Parse {
                 let adoption_only = parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
                     && index.candidate_requires_only_body_witness_adoption(&candidate);
@@ -36397,6 +36425,20 @@ impl ScanIndex {
         self.claude_history_emission = HistoryEmission::default();
     }
 
+    /// Re-owe a lost selection without claiming a newly settled body.
+    pub(crate) fn re_owe_effective_upload_body_witness_revision(
+        &mut self,
+        key: &str,
+        revision: u64,
+    ) {
+        if let Some(entry) = self.files.get_mut(key) {
+            if revision < entry.effective_upload_body_witness_revision {
+                entry.effective_upload_body_witness_revision = revision;
+                crate::local_resource_diagnostics::body_witness_revision_reowed();
+            }
+        }
+    }
+
     /// Claude only (MONEY P2), after activating: re-read a file only when its
     /// stored revision is below the active one (a missing stored value is 0),
     /// so a newer stored revision is never re-read by an older build.
@@ -36458,10 +36500,14 @@ impl ScanIndex {
                 (source.to_owned(), acked)
             })
             .collect::<BTreeMap<_, _>>();
-        for entry in self.files.values_mut() {
-            if sources.get(entry.source_file_fingerprint.as_str()) == Some(&true) {
-                entry.effective_upload_body_witness_revision = 3;
-            }
+        let covered = self
+            .files
+            .iter()
+            .filter(|(_, entry)| sources.get(entry.source_file_fingerprint.as_str()) == Some(&true))
+            .map(|(key, entry)| (key.clone(), entry.source_file_fingerprint.clone()))
+            .collect::<Vec<_>>();
+        for (key, source) in covered {
+            self.stamp_effective_upload_body_witness_revision(&key, &source, 3);
         }
     }
 
@@ -36618,6 +36664,11 @@ impl ScanIndex {
                 listed: self.claude_reemission_excluded(candidate),
                 birth_unix_seconds,
                 latched: claude_reemission_stop_latched(),
+                money_paused: self.active_request_money_adoption_paused,
+                money_probe_due: self
+                    .active_request_money_support_dir
+                    .as_deref()
+                    .is_some_and(|support| claude_request_money::adoption_probe_due(support, self)),
                 active_revision: self.active_effective_upload_body_witness_revision,
                 history_cutoff_unix_seconds: self.claude_history_cutoff_unix_seconds,
                 no_list_policy: self.claude_no_list_policy,
@@ -42857,6 +42908,8 @@ mod tests {
             original_now - 1
         ));
         let far_future = SnapshotQuarantineRecord {
+            hold: None,
+            version_skew_attempts: 0,
             retry_after_unix_seconds: u64::MAX,
             ..record
         };
@@ -42898,6 +42951,8 @@ mod tests {
                     original_now - rollback - 1
                 ));
                 let corrupt = SnapshotQuarantineRecord {
+                    hold: None,
+                    version_skew_attempts: 0,
                     retry_after_unix_seconds: u64::MAX,
                     ..record
                 };
@@ -76687,6 +76742,8 @@ mod tests {
         index.quarantined_snapshot_fingerprints.insert(
             "old-entity".into(),
             SnapshotQuarantineRecord {
+                hold: None,
+                version_skew_attempts: 0,
                 witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
                 retry_after_unix_seconds: 0,
                 upload_body_witness: Some("old-body".into()),
@@ -77204,6 +77261,28 @@ mod tests {
         assert!(entries
             .iter()
             .all(|entry| entry["quantity"].as_u64() == Some(0)));
+    }
+
+    #[test]
+    fn every_batch_encoding_declares_the_hold_ack_capability() {
+        let request = valid_v6_batch_request();
+        for encoded in [
+            serde_json::to_vec(&request).unwrap(),
+            serde_json::to_vec(&request.wire_with_head_cas()).unwrap(),
+            crate::snapshot_retry::encode_json(&request, crate::snapshot_retry::REQUEST_BYTES)
+                .unwrap(),
+            crate::snapshot_retry::encode_json(
+                &request.wire_with_head_cas(),
+                crate::snapshot_retry::REQUEST_BYTES,
+            )
+            .unwrap(),
+        ] {
+            let value: Value = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(
+                value["usage_decrease_hold_ack_contract"],
+                "usage_decrease_hold_ack:v1"
+            );
+        }
     }
 
     #[test]
@@ -78504,3 +78583,5 @@ mod request_owned_grouping_settlement_tests {
         assert!(!disposition.request_groupings.contains_key("live"));
     }
 }
+
+crate::heap_layout_bound::fields!(SourceScanResult; source, backfill_window_days, backfill_file_limit, discovered_file_count, skipped_file_count_due_to_limit, scan_cap_hit, scanned_file_count, scanned_session_count, semantic_noop_count, census_complete, census_window_end, state_census_complete, sidecar_census_complete, symlink_rejected_count, directory_entry_cap_exceeded_count, unreadable_path_count, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_confirmed_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_ownership_incomplete_file_count, terminal_zero_snapshot_usage_evidence_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, terminal_over_line_cap_count, census_residue_index_key_count, census_residue_archived_rollout_count, census_residue_blocked_session_count, snapshots, pending_finalization, local_codex_diagnostics, codex_counting_v2, codex_join_validation, codex_legacy_join_baselines, claude_request_census_shadow);

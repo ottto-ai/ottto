@@ -800,3 +800,49 @@ fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
         "explicit full still releases"
     );
 }
+
+#[test]
+fn held_revision_three_file_reaches_neither_initial_nor_resend_emission() {
+    let (home, root, mut index) = families("history-gate-money-held", 1);
+    let support = support("history-gate-money-held-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&session(0))),
+    )
+    .unwrap();
+    index.load_claude_reemission_exclusions(&support);
+    let before = index.clone();
+    let mut result = scan(&root, &mut index, "different-upload-context", 3);
+    assert_eq!(
+        result.scanned_file_count, 2,
+        "another selection reason still parses locally"
+    );
+    assert_eq!(result.snapshots.len(), 2, "the real parser produced bodies");
+    for entry in index.files.values() {
+        assert!(index
+            .claude_history_emission_held(&entry.source_file_fingerprint)
+            .is_some());
+    }
+    let mut resend = result.snapshots.clone();
+    index.retain_claude_history_emission_permitted(&mut resend);
+    assert!(
+        resend.is_empty(),
+        "no due retry or re-offer can pass the resend seam"
+    );
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+    assert!(
+        result.snapshots.is_empty(),
+        "no initial offer passes finalization"
+    );
+    for (key, entry) in &index.files {
+        assert_eq!(
+            entry.effective_upload_body_witness_revision,
+            before.files[key].effective_upload_body_witness_revision
+        );
+        assert_eq!(
+            entry.last_upload_body_witness,
+            before.files[key].last_upload_body_witness
+        );
+    }
+    let _ = fs::remove_dir_all(home);
+}

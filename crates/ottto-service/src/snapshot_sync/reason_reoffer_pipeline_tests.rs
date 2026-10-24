@@ -1115,6 +1115,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
                 if posts == 1 {
                     clock.set(start + 600);
                     return Err(anyhow::Error::new(UploadShed {
+ request_owned_route_unavailable: false,
                         status: 503,
                         retry_after: Some(Duration::from_secs(1)),
                         code: None,

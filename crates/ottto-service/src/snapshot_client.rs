@@ -294,11 +294,17 @@ fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
         .read_to_end(&mut excerpt)
         .ok()
         .and_then(|_| shed_code(&excerpt));
+    let request_owned_route_unavailable = serde_json::from_slice::<Value>(&excerpt)
+        .ok()
+        .is_some_and(|body| {
+            body.pointer("/details/code").and_then(Value::as_str)
+                == Some("request_owned_usage_route_unavailable")
+        });
     UploadShed {
         status,
         retry_after,
         code,
-        request_owned_route_unavailable: false,
+        request_owned_route_unavailable,
     }
 }
 
@@ -2081,7 +2087,7 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let mut shed = shed_from_response(code, response.clone());
+                let shed = shed_from_response(code, response);
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
@@ -2090,20 +2096,6 @@ impl SnapshotApiClient {
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
-                // Inspect only the closed route code after recording header evidence.
-                shed.request_owned_route_unavailable =
-                    serde_json::from_reader::<_, serde_json::Value>(std::io::Read::take(
-                        response.into_reader(),
-                        16 * 1024,
-                    ))
-                    .ok()
-                    .and_then(|body| {
-                        body.pointer("/details/code")
-                            .and_then(|code| code.as_str())
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                        == Some("request_owned_usage_route_unavailable");
                 Err(anyhow::Error::new(shed))
             }
             // 401/403 means relay authorization failed, not schema drift.

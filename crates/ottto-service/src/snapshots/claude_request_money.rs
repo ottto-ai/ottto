@@ -4912,6 +4912,8 @@ pub(crate) fn append_synthetic_sessions(
 
 fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
     SnapshotItem {
+        first_own_request_at: None,
+        claude_file_birth_verdict: Default::default(),
         request_evidence: Vec::new(),
         request_identity_refusals: 0,
         claude_org_markers: None,

@@ -350,6 +350,22 @@ fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
             )
         })
         .collect();
+    let mut held_union = index.clone();
+    let held_key = held_union.files.keys().find(|key| {
+        key.as_str() != primary && key.ends_with(".jsonl")
+            && money::logical_family_member(&held_union, key)
+                .is_some_and(|(_, member)| member == "aaaaaaaa-bbbb-4ccc-8ddd-000000000000")
+    }).expect("secondary union copy").clone();
+    let held_source = held_union.files[&held_key].source_file_fingerprint.clone();
+    held_union.exclude_effective_upload_body_witness_revision_for_source_files(
+        &BTreeSet::from([held_source]),
+    );
+    let old_revision = held_union.files[&held_key].effective_upload_body_witness_revision;
+    assert!(old_revision < 3);
+    held_union.stamp_request_money_acks(&scan.snapshots, &accepted, &witnesses);
+    assert_eq!(held_union.files[&primary].effective_upload_body_witness_revision, 3);
+    assert_eq!(held_union.files[&held_key].effective_upload_body_witness_revision, old_revision,
+        "the primary's covering ACK cannot adopt a locally held physical copy");
     index.stamp_request_money_acks(&scan.snapshots, &accepted, &witnesses);
     assert!(index
         .files

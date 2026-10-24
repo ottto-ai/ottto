@@ -23,6 +23,8 @@ fn ledger() -> SnapshotUploadProgress {
 
 fn terminal_record(body: &str) -> SnapshotQuarantineRecord {
     SnapshotQuarantineRecord {
+ hold: None,
+ version_skew_attempts: 0,
         witness: snapshot_quarantine_witness(SnapshotSource::Codex),
         retry_after_unix_seconds: 0,
         upload_body_witness: Some(body.to_string()),
@@ -809,6 +811,7 @@ fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
                     posts += 1;
                     match failure {
                         "shed" => Err(anyhow::Error::new(UploadShed {
+ request_owned_route_unavailable: false,
                             status: 503,
                             retry_after: Some(Duration::from_secs(1)),
                             code: None,
