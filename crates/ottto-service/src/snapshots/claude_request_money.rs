@@ -1783,8 +1783,11 @@ fn shadow_page_body(
     prune_message_records(ledger, index, &mut counts);
     #[cfg(test)]
     if faulted(PageFault::SetupOverrun) || faulted(PageFault::SetupStall) {
-        // Common setup used everything up to its stop.
-        std::thread::sleep(setup_deadline.saturating_duration_since(Instant::now()));
+        // Common setup used everything up to its stop. It runs busy, as real
+        // setup does: a sleeping thread's wake-up can land past the stop.
+        while Instant::now() < setup_deadline {
+            std::hint::spin_loop();
+        }
     }
     // Only scheduled families can be reached. Their body inputs are gathered
     // when the schedule reaches them, in its order: a family the page never
