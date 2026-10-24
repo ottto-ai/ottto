@@ -1334,3 +1334,27 @@ fn p2a_index_hold_retry_obeys_cadence_allowance_and_code_changes() {
         );
     }
 }
+
+#[test]
+#[serial_test::serial(claude_request_money_shadow)]
+fn p2a_below_floor_adoption_does_not_skip_a_new_transcript_request() {
+    let (home, root, mut index) = claude_context_backfill_fixture("p2a-floor-new-request", 1);
+    let support = p2a_support(&home);
+    let _live = money::LiveForTest::new(&support);
+    for activity in index.snapshot_activity_at.values_mut() {
+        *activity = Some("2026-04-30T23:59:59Z".into());
+    }
+    let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
+    let path = root.join(format!("{session}.jsonl"));
+    use std::io::Write as _;
+    writeln!(fs::OpenOptions::new().append(true).open(path).unwrap(), "{}", json!({
+        "type":"assistant", "timestamp":"2026-08-23T18:30:00Z", "sessionId":session,
+        "requestId":"after-floor", "message":{"id":"after-floor-message", "model":"claude-haiku-4-5",
+        "usage":{"input_tokens":7,"output_tokens":1}}
+    })).unwrap();
+    let scan = p2a_scan(&root, &support, &mut index);
+    assert!(scan.scanned_file_count > 0, "a changed file cannot settle from stale activity");
+    assert!(scan.snapshots.iter().any(|item| item.source_session_id == session && item.request_count >= 2),
+        "the actual parser must include the new request");
+    let _ = fs::remove_dir_all(home);
+}

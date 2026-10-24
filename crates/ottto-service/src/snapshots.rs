@@ -25632,6 +25632,9 @@ impl OwnedSourceScan {
             if decision == CandidateDecision::Parse
                 && source == SnapshotSource::ClaudeCode
                 && index.request_money_live_revision()
+                && !index.claude_reemission_excluded(&candidate)
+                && parse_reason == Some(CandidateParseReason::BodyWitnessAdoption)
+                && index.candidate_requires_only_body_witness_adoption(&candidate)
                 && index.money_below_retention_floor(&candidate)
             {
                 let key = local_index_key(&candidate.path);
