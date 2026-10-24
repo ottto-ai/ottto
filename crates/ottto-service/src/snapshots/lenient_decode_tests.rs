@@ -3273,8 +3273,10 @@ fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
     let original = (0..CARRIED_ACK_ENTRIES_MAX - 1)
         .map(|n| format!("{n:064x}"))
         .collect::<BTreeSet<_>>();
-    let mut seed = ScanIndex::default();
-    seed.accepted_snapshot_fingerprints = original.clone();
+    let mut seed = ScanIndex {
+        accepted_snapshot_fingerprints: original.clone(),
+        ..ScanIndex::default()
+    };
     seed.file_snapshot_fingerprints
         .insert("original-held".into(), original.clone());
     let mut rebuilt = ScanIndex::default();
