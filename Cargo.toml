@@ -22,6 +22,12 @@ clap = { version = "4", features = ["derive"] }
 getrandom = "0.3"
 hmac = "0.12"
 libc = "0.2"
+# Compile debug/trace records out of every crate in any build that links
+# ottto-service. Pinned ureq logs each request prelude at debug level and
+# redacts only Authorization and Cookie, so a host logger would otherwise
+# receive custom credential headers verbatim. Both caps are needed: the
+# release_* features take precedence in release builds.
+log = { version = "0.4", features = ["max_level_info", "release_max_level_info"] }
 notify = "8"
 notify-debouncer-full = "0.6"
 plist = "1"
