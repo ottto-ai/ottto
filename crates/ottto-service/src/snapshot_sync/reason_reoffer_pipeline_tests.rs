@@ -319,6 +319,17 @@ impl ReofferPipeline {
 
     /// One real due cycle at local time `now`.
     fn cycle(&mut self, now: u64) -> CycleResult {
+        self.cycle_with_census(now, true)
+    }
+
+    /// One real due cycle that starts with RetryPending authority debt: its
+    /// scanner terminal withholds the ordinary census (path-(a) bridge), and
+    /// the debt settles in finish.
+    fn cycle_with_authority_debt(&mut self, now: u64) -> CycleResult {
+        self.cycle_with_census(now, false)
+    }
+
+    fn cycle_with_census(&mut self, now: u64, complete: bool) -> CycleResult {
         self.clock.set(now);
         assert_eq!(clock(), Some(now));
         self.cadence.next_due_cycle();
@@ -346,7 +357,10 @@ impl ReofferPipeline {
         .unwrap()
         .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete, "synthetic census is complete");
+        assert_eq!(
+            scan.census_complete, complete,
+            "synthetic census is complete unless authority debt withholds it"
+        );
         let cache_enabled = preparation.cache_observations_enabled;
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
         let index_path = preparation.index_path.clone();
@@ -1847,7 +1861,9 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
         .write_all(format!("{grown}\n").as_bytes())
         .unwrap();
     write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
-    let proved = pipeline.cycle(t0 + 1_800);
+    // It starts with the RetryPending record, which withholds this scan's
+    // census; the next cycle, with the debt settled, completes it again.
+    let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
     assert!(proved.result.is_ok(), "{:?}", proved.result);
     let later = pipeline.cycle(t0 + 2_400);
     assert!(later.result.is_ok(), "{:?}", later.result);
