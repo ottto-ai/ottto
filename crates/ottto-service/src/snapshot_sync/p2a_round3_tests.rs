@@ -24,6 +24,18 @@ pub(crate) fn p2a_before_ack_save_for_test(path: &Path) {
         }
     });
 }
+// These POST/ACK controls begin with an initialized durable store. A freshly
+// allocated store still owes its initial checkpoint and is correctly held by
+// the reason-independent history gate until that receipt is consumed.
+fn p2a_initialize_custody(support: &Path) {
+    use crate::snapshots::claude_request_money as money;
+    money::store::reload_for_test(support).unwrap();
+    money::store::with_ledger_for_test(support, |ledger| {
+        assert!(money::store::checkpoint_for_test(support, ledger));
+    })
+    .unwrap();
+}
+
 struct P2aConflictReset;
 impl Drop for P2aConflictReset {
     fn drop(&mut self) {
@@ -74,7 +86,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
         let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
         let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
         let _live = money::LiveForTest::new(&support);
-        money::store::reload_for_test(&support).unwrap();
+        p2a_initialize_custody(&support);
         let server = FinishServer::new(outcome);
         let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
         let device = LocalDeviceBinding {
@@ -507,7 +519,7 @@ impl P2aControl {
             &namespace,
         ));
         ScanIndex::default().save(&index_path).unwrap();
-        crate::snapshots::claude_request_money::store::reload_for_test(&support).unwrap();
+        p2a_initialize_custody(&support);
         Self {
             fixture,
             support,
@@ -734,95 +746,117 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    for cause in ["real_change", "alias", "rebuild"] {
-        let mut control = P2aControl::new(FinishOutcome::Accept);
-        control.cycle();
-        assert!(!control.offers().is_empty());
-        std::fs::write(
-            control
-                .support
-                .join("snapshots/claude_code-reemission-exclusions.txt"),
-            format!("{:x}\n", Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())),
-        )
-        .unwrap();
-        let _live = money::LiveForTest::new(&control.support);
-        let before = control.offers().len();
-        match cause {
-            "real_change" => {
-                let mut row: serde_json::Value = serde_json::from_str(
-                    std::fs::read_to_string(control.transcript())
-                        .unwrap()
-                        .lines()
-                        .last()
-                        .unwrap(),
-                )
-                .unwrap();
-                row["requestId"] = "req_changed".into();
-                row["message"]["id"] = "m-changed".into();
-                std::fs::OpenOptions::new()
-                    .append(true)
-                    .open(control.transcript())
-                    .unwrap()
-                    .write_all((row.to_string() + "\n").as_bytes())
+    for live in [false, true] {
+        for cause in ["real_change", "alias", "rebuild"] {
+            let mut control = P2aControl::new(FinishOutcome::Accept);
+            control.cycle();
+            assert!(!control.offers().is_empty());
+            std::fs::write(
+                control
+                    .support
+                    .join("snapshots/claude_code-reemission-exclusions.txt"),
+                format!("{:x}\n", Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())),
+            )
+            .unwrap();
+            let _live = live.then(|| money::LiveForTest::new(&control.support));
+            let before = control.offers().len();
+            match cause {
+                "real_change" => {
+                    let mut row: serde_json::Value = serde_json::from_str(
+                        std::fs::read_to_string(control.transcript())
+                            .unwrap()
+                            .lines()
+                            .last()
+                            .unwrap(),
+                    )
                     .unwrap();
+                    row["requestId"] = "req_changed".into();
+                    row["message"]["id"] = "m-changed".into();
+                    std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(control.transcript())
+                        .unwrap()
+                        .write_all((row.to_string() + "\n").as_bytes())
+                        .unwrap();
+                }
+                "alias" => {
+                    std::fs::copy(
+                        control.transcript(),
+                        control
+                            .transcript()
+                            .with_file_name("00000000-0000-4000-8000-000000000000.jsonl"),
+                    )
+                    .unwrap();
+                }
+                "rebuild" => {
+                    // An empty rebuilt index replaces the saved one through the
+                    // same generation compare-and-swap every writer uses.
+                    let mut rebuilt = ScanIndex::default();
+                    rebuilt.generation = control.saved().generation;
+                    rebuilt.save(&control.index_path).unwrap();
+                }
+                _ => unreachable!(),
             }
-            "alias" => {
-                std::fs::copy(
-                    control.transcript(),
-                    control
-                        .transcript()
-                        .with_file_name("00000000-0000-4000-8000-000000000000.jsonl"),
-                )
-                .unwrap();
+            // Fully paired API/trace evidence makes minting v1 possible on the
+            // ordinary fold, so its absence below is a discriminating protection.
+            write_native_bootstrap_sidecars(&control.fixture, &control.support);
+            control.restart();
+            let mut cause_count = 0_u64;
+            for _ in 0..3 {
+                let (_, diagnostics) =
+                    crate::local_resource_diagnostics::capture(|| control.cycle());
+                for event in diagnostics
+                    .iter()
+                    .filter(|event| event["stage"] == "claude_money_protected_offers")
+                {
+                    cause_count += event["counts"][cause].as_u64().unwrap();
+                    assert_eq!(event["counts"]["cause_unavailable"], 0, "{event}");
+                }
             }
-            "rebuild" => {
-                // An empty rebuilt index replaces the saved one through the
-                // same generation compare-and-swap every writer uses.
-                let mut rebuilt = ScanIndex::default();
-                rebuilt.generation = control.saved().generation;
-                rebuilt.save(&control.index_path).unwrap();
+            if live {
+                assert_eq!(
+                    cause_count, 0,
+                    "revision 3 holds every protected selection before POST"
+                );
+                assert_eq!(
+                    control.offers().len(),
+                    before,
+                    "protected {cause} cannot bypass the revision-3 gate"
+                );
+                assert!(control
+                    .saved()
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision != 3));
+                continue;
             }
-            _ => unreachable!(),
-        }
-        // Fully paired API/trace evidence makes minting v1 possible on the
-        // ordinary fold, so its absence below is a discriminating protection.
-        write_native_bootstrap_sidecars(&control.fixture, &control.support);
-        control.restart();
-        let mut cause_count = 0_u64;
-        for _ in 0..3 {
-            let (_, diagnostics) = crate::local_resource_diagnostics::capture(|| control.cycle());
-            for event in diagnostics
-                .iter()
-                .filter(|event| event["stage"] == "claude_money_protected_offers")
-            {
-                cause_count += event["counts"][cause].as_u64().unwrap();
-                assert_eq!(event["counts"]["cause_unavailable"], 0, "{event}");
-            }
-        }
-        assert!(
-            cause_count > 0,
-            "protected {cause} must be counted at its actual POST boundary"
-        );
-        let offers = control.offers();
-        assert!(
-            offers.len() > before,
-            "{cause} must actually reach the upload recorder"
-        );
-        for item in &offers[before..] {
-            assert!(
-                item["usage_accounting_contract"].is_null(),
-                "protected {cause} must mint neither literal nor v1: {item}"
+            // Revision 2 still syncs ordinary protected changes. Keep the original
+            // actual-POST conservation assertions on that permitted policy row.
+            assert_eq!(
+                cause_count, 0,
+                "live-only diagnostics stay inert under revision 2"
             );
-            assert!(item["removed_request_count"].is_null());
+            let offers = control.offers();
+            assert!(
+                offers.len() > before,
+                "{cause} must actually reach the upload recorder"
+            );
+            for item in &offers[before..] {
+                assert!(
+                    item["usage_accounting_contract"].is_null(),
+                    "protected {cause} must mint neither literal nor v1: {item}"
+                );
+                assert!(item["removed_request_count"].is_null());
+            }
+            assert!(
+                control
+                    .saved()
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision != 3),
+                "protected {cause} must never stamp 3"
+            );
         }
-        assert!(
-            control
-                .saved()
-                .files
-                .values()
-                .all(|entry| entry.effective_upload_body_witness_revision != 3),
-            "protected {cause} must never stamp 3"
-        );
     }
 }
 
