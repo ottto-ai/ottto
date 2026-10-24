@@ -6641,28 +6641,8 @@ async fn finish_sync_source_resume(
                 "",
             )
         });
-        #[cfg(test)]
-        if unknown_recovery::handoff_trace_for_test() {
-            eprintln!("MONEY_HANDOFF begin reoffers={} items={} retained={:?} prepared={} binding={} accepted={} bodies={}",
-                reoffers.len(),scan_result.snapshots.len(),retained_bodies.map(BTreeMap::len),recovery_prepared,recovery_binding.is_some(),upload_progress.accepted_fingerprints.len(),upload_progress.accepted_body_witnesses.len());
-        }
         if let Some(binding) = recovery_binding.as_deref() {
             for item in &scan_result.snapshots {
-                #[cfg(test)]
-                if unknown_recovery::handoff_trace_for_test() {
-                    eprintln!(
-                        "MONEY_HANDOFF candidate reoffer={} accepted={} body={} scratch={:?}",
-                        reoffers.contains(&item.snapshot_fingerprint),
-                        upload_progress
-                            .accepted_fingerprints
-                            .contains(&item.snapshot_fingerprint),
-                        upload_progress
-                            .accepted_body_witnesses
-                            .get(&item.snapshot_fingerprint)
-                            == Some(&snapshot_upload_body_witness(item)),
-                        crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)
-                    );
-                }
                 if !reoffers.contains(&item.snapshot_fingerprint)
                     || !upload_progress
                         .accepted_fingerprints
@@ -6685,10 +6665,6 @@ async fn finish_sync_source_resume(
                 let Some(_scratch) =
                     crate::snapshots::claude_request_money::ShadowReservation::admit(scratch)
                 else {
-                    #[cfg(test)]
-                    if unknown_recovery::handoff_trace_for_test() {
-                        eprintln!("MONEY_HANDOFF scratch_refused=true");
-                    }
                     continue;
                 };
                 // Compare the same final projection used by finalization and
@@ -6717,16 +6693,6 @@ async fn finish_sync_source_resume(
                     binding,
                     money_policy.expect("prepared recovery policy"),
                 )? {
-                    #[cfg(test)]
-                    if unknown_recovery::handoff_trace_for_test() {
-                        eprintln!(
-                            "MONEY_HANDOFF offers={} covered={}",
-                            offers.len(),
-                            crate::snapshots::claude_request_money::recovery_offer_covers_debt(
-                                &index, item, &offers
-                            )
-                        );
-                    }
                     if crate::snapshots::claude_request_money::recovery_offer_covers_debt(
                         &index, item, &offers,
                     ) {
@@ -6747,15 +6713,6 @@ async fn finish_sync_source_resume(
                 upload_progress.accepted_fingerprints.remove(fp);
                 upload_progress.accepted_body_witnesses.remove(fp);
             }
-        }
-        #[cfg(test)]
-        if unknown_recovery::handoff_trace_for_test() {
-            eprintln!(
-                "MONEY_HANDOFF end plans={} accepted={} bodies={}",
-                recovered_money_offers.len(),
-                upload_progress.accepted_fingerprints.len(),
-                upload_progress.accepted_body_witnesses.len()
-            );
         }
         if !reoffers.is_empty() {
             upload_progress.save(&upload_progress_path)?;
@@ -10051,18 +10008,6 @@ where
     let mut pending_by_fingerprint: BTreeMap<String, (usize, usize, String)> = BTreeMap::new();
     for (index, item) in items.iter().enumerate() {
         let witness = body_witness(item);
-        #[cfg(test)]
-        if unknown_recovery::handoff_trace_for_test() {
-            eprintln!(
-                "MONEY_HANDOFF driver accepted={} body={} retry={} contains={}",
-                progress.accepted_fingerprints.contains(fingerprint(item)),
-                progress.accepted_body_witnesses.get(fingerprint(item)) == Some(&witness),
-                progress
-                    .active_quarantine_retries
-                    .contains(fingerprint(item)),
-                progress.contains_body(fingerprint(item), &witness)
-            );
-        }
         if !progress.contains_body(fingerprint(item), &witness) {
             match pending_by_fingerprint.entry(fingerprint(item).to_string()) {
                 std::collections::btree_map::Entry::Vacant(entry) => {

@@ -2825,7 +2825,6 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
 fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
-    let _trace = unknown_recovery::HandoffTraceForTest::enable();
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2890,35 +2889,6 @@ fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
             1,
             "same-head convergence has one entity contribution"
         );
-        let before = format!(
-            "ack_saved={:?} original_offer={original_offer:?} selected_source_matches={:?} {}",
-            unknown_recovery::active_for_test(&control.support)
-                .iter()
-                .map(|m| (m.ack_saved, m.terminal))
-                .collect::<Vec<_>>(),
-            captured
-                .entities
-                .iter()
-                .flat_map(|e| e.files.iter().zip(&e.file_revisions))
-                .map(|(key, revision)| control
-                    .saved()
-                    .files
-                    .get(key)
-                    .is_some_and(|entry| &entry.source_file_fingerprint == revision))
-                .collect::<Vec<_>>(),
-            money::store::recovery_debt_debug_for_test(
-                &control.support,
-                &control.transcript().to_string_lossy()
-            )
-        );
-        let boundary = Arc::new(Mutex::new(String::new()));
-        let receipt = boundary.clone();
-        let support = control.support.clone();
-        let key = control.transcript();
-        *control.server.before_post.lock().unwrap() = Some(Box::new(move || {
-            *receipt.lock().unwrap() =
-                money::store::recovery_debt_debug_for_test(&support, &key.to_string_lossy());
-        }));
         control.cycle(); // consume durable selected-save release and ordinary debt settlement
         assert!(control
             .saved()
@@ -2934,9 +2904,8 @@ fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
         assert_eq!(
             control.server.raw_batches.lock().unwrap().len(),
             2,
-            "{} before={before} POST_boundary={}",
-            recovery_offer_difference(&offers),
-            boundary.lock().unwrap()
+            "{}",
+            recovery_offer_difference(&offers)
         );
     }
 }
