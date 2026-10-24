@@ -639,6 +639,28 @@ struct Catalog {
 }
 static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new());
 
+#[cfg(test)]
+thread_local! { static HANDOFF_TRACE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+#[cfg(test)]
+pub(super) struct HandoffTraceForTest;
+#[cfg(test)]
+impl HandoffTraceForTest {
+    pub fn enable() -> Self {
+        HANDOFF_TRACE.with(|v| v.set(true));
+        Self
+    }
+}
+#[cfg(test)]
+impl Drop for HandoffTraceForTest {
+    fn drop(&mut self) {
+        HANDOFF_TRACE.with(|v| v.set(false));
+    }
+}
+#[cfg(test)]
+pub(super) fn handoff_trace_for_test() -> bool {
+    HANDOFF_TRACE.with(std::cell::Cell::get)
+}
+
 /// Called before activity/token networking, including when the source's
 /// network backoff would otherwise skip its finish. Expiry does not need HTTP.
 pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
@@ -935,6 +957,15 @@ pub(super) fn saved_money_offers(
 > {
     let catalogs = CATALOGS.lock().map_err(|_| fault())?;
     let catalog = catalogs.get(support).ok_or_else(fault)?;
+    #[cfg(test)]
+    if handoff_trace_for_test() {
+        for m in &catalog.entries {
+            eprintln!("MONEY_HANDOFF manifest ack={} terminal={:?} binding={} context={} policy={} entities={:?}",
+                m.ack_saved,m.terminal,m.binding==binding,m.context==index.recovery_upload_context(),m.policy==policy,
+                m.entities.iter().map(|e|(e.session==item.source_session_id,e.fingerprint==item.snapshot_fingerprint,e.witness==witness,e.source_fingerprint==item.source_file_fingerprint,
+                    e.files.iter().zip(&e.file_revisions).zip(&e.file_selections).map(|((k,r),s)|(index.files.get(k).is_some_and(|f|&f.source_file_fingerprint==r),s.offer.is_some())).collect::<Vec<_>>())).collect::<Vec<_>>());
+        }
+    }
     let entities = || {
         catalog
             .entries
@@ -973,9 +1004,17 @@ pub(super) fn saved_money_offers(
         }
     }
     if charge == 0 {
+        #[cfg(test)]
+        if handoff_trace_for_test() {
+            eprintln!("MONEY_HANDOFF charge=0");
+        }
         return Ok(None);
     }
     let Some(funds) = money::ShadowReservation::admit(charge.saturating_add(4096)) else {
+        #[cfg(test)]
+        if handoff_trace_for_test() {
+            eprintln!("MONEY_HANDOFF offers_funds_refused={charge}");
+        }
         return Ok(None);
     };
     let mut offers = BTreeMap::<String, money::RecoveryOffer>::new();

@@ -2825,6 +2825,7 @@ fn p2a_transient_retry_keeps_server_hold_custody_across_restart() {
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
 fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
+    let _trace = unknown_recovery::HandoffTraceForTest::enable();
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
         return;
