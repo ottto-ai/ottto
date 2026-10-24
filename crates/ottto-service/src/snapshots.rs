@@ -6054,6 +6054,27 @@ pub fn finalize_scan_after_policy_with_body_witness(
         index.bounded_sweep_had_unsettled_upload = false;
         index.bounded_sweep_unsettled_causes = 0;
     }
+    let retained_carried = index
+        .accepted_rebuild_incidence
+        .values()
+        .map(BTreeSet::len)
+        .sum::<usize>();
+    let history_held_carried = index
+        .accepted_rebuild_incidence
+        .iter()
+        .filter(|(key, _)| {
+            index.files.get(*key).is_some_and(|entry| {
+                index
+                    .claude_history_emission_held(&entry.source_file_fingerprint)
+                    .is_some()
+            })
+        })
+        .map(|(_, members)| members.len())
+        .sum::<usize>();
+    emit_scan_index_containment_line(format!(
+        "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried}",
+        source.api_slug(), result.census_complete
+    ));
     let current_fingerprints = index
         .file_snapshot_fingerprints
         .values()
@@ -25178,6 +25199,19 @@ impl OwnedSourceScan {
                 index.preserve_decode_held_files(source, &snapshots, &mut pending_finalization);
                 snapshots.retain(|item| !index.decode_holds_snapshot(source, item));
                 let census_complete = census_complete && index.decode_holds.is_empty();
+                if census_complete {
+                    // SOURCE/SI: only a healthy EFFECTIVE terminal can prove a
+                    // carried file gone. A raw terminal, another file's census,
+                    // or an unknown original association cannot retire its ACKs.
+                    index.accepted_rebuild_incidence.retain(|key, _| {
+                        key.is_empty()
+                            || traversal_snapshot.observed_index_keys.contains(key)
+                            || traversal_snapshot.residue.index_keys.contains(key)
+                            || index.files.contains_key(key)
+                    });
+                    index.accepted_incidence_pending_census =
+                        !index.accepted_rebuild_incidence.is_empty();
+                }
                 if !index.decode_holds.is_empty() {
                     index.mark_bounded_sweep_unsettled();
                 }

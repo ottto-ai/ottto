@@ -451,6 +451,8 @@ pub(crate) enum ScanIndexRebuildOverride {
     Armed,
     /// An override already ran or is armed within 24 hours.
     Cooldown,
+    /// Strict identity recovery failed; another press cannot promise a rebuild.
+    IdentityUnrecoverable,
     /// The prior attempt refused without spending a successful-override cooldown.
     Refused(&'static str),
 }
@@ -467,6 +469,14 @@ pub(crate) fn arm_scan_index_rebuild_manual_override(
     }
     let now = unix_seconds_at(now);
     with_scan_index_rebuild_override(source, |state| {
+        // Re-report a failed attempt without arming or counting another attempt.
+        if let Some(code) = state.refusal {
+            return if code == SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE {
+                ScanIndexRebuildOverride::IdentityUnrecoverable
+            } else {
+                ScanIndexRebuildOverride::Refused(code)
+            };
+        }
         // A future stamp is a cooldown under clock rollback.
         let cooling = state
             .last_override_unix_seconds
@@ -474,10 +484,6 @@ pub(crate) fn arm_scan_index_rebuild_manual_override(
         if state.armed || cooling {
             count_scan_index_rebuild_override_refused(SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE);
             return ScanIndexRebuildOverride::Cooldown;
-        }
-        if let Some(code) = state.refusal {
-            count_scan_index_rebuild_override_refused(code);
-            return ScanIndexRebuildOverride::Refused(code);
         }
         state.armed = true;
         ScanIndexRebuildOverride::Armed
@@ -713,6 +719,11 @@ fn override_scan_index_rebuild_loop(
             ))
         }
     };
+    // This replacement deliberately bypasses save_internal's record normalizers
+    // and CAS: the locked damaged index cannot pass its ordinary CAS decoder.
+    // Safe today because the rebuild starts from Default, carries only strictly
+    // decoded identity fields, admits all ACK debt before writing, and derives
+    // every non-carried record on scan. New carried fields must preserve this.
     let mut stamp_attempted = false;
     let mut replaced = false;
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));

@@ -2849,15 +2849,14 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             !restarted.accepted_rebuild_incidence.is_empty(),
             "{context}"
         );
-        for key in seed.file_snapshot_fingerprints.keys() {
-            restarted.accepted_rebuild_incidence.remove(key);
-        }
-        assert!(restarted.accepted_rebuild_incidence.is_empty(), "{context}");
-        restarted.accepted_incidence_pending_census = false;
+        assert_eq!(
+            restarted.accepted_rebuild_incidence,
+            seed.file_snapshot_fingerprints
+        );
         restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
-        assert!(
-            restarted.accepted_snapshot_fingerprints.is_empty(),
-            "{context}"
+        assert_eq!(
+            restarted.accepted_snapshot_fingerprints,
+            seed.accepted_snapshot_fingerprints
         );
     }
 }
@@ -2956,19 +2955,29 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
         refused();
         assert_eq!(
             arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-            ScanIndexRebuildOverride::Refused(
-                SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE
-            )
+            ScanIndexRebuildOverride::IdentityUnrecoverable
         );
         assert_eq!(
             scan_index_rebuild_override_identity_unrecoverable_count(),
-            refusals + 2
+            refusals + 1
         );
         assert_eq!(
             with_scan_index_rebuild_override(source, |state| state.last_override_unix_seconds),
             None
         );
         assert_eq!(fs::read(&path).unwrap(), damage, "{case}");
+        assert!(!scan_index_override_stamp_path(&support, source).exists());
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
+        // A compatible replacement clears the refusal. Another recoverable
+        // incident can arm immediately, without waiting the 24-hour cooldown.
+        fs::write(&path, serde_json::to_vec(&fixture()).unwrap()).unwrap();
+        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Loaded);
+        fs::write(&path, struct_order_budget_damage(&fixture(), "")).unwrap();
+        assert!(load().is_err());
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Armed
+        );
     }
 }
 
@@ -3176,7 +3185,7 @@ fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
             scan_index_rebuild_override_refused_count(
                 SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
             ),
-            budget + 2
+            budget + 1
         );
         assert_eq!(
             with_scan_index_rebuild_override(source, |state| state.last_override_unix_seconds),
@@ -3229,7 +3238,7 @@ fn override_persistence_refusal_leaves_cooldown_unspent() {
     );
     assert_eq!(
         scan_index_rebuild_override_refused_count(SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE),
-        before + 2
+        before + 1
     );
     assert_eq!(
         scan_index_rebuild_override_identity_unrecoverable_count(),
@@ -3240,5 +3249,173 @@ fn override_persistence_refusal_leaves_cooldown_unspent() {
             SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
         ),
         budget
+    );
+}
+
+#[test]
+fn override_does_not_carry_unproven_or_preledger_acks() {
+    for version in [
+        SNAPSHOT_ACCEPTED_LEDGER_PRE_LEDGER_VERSION,
+        SNAPSHOT_ACCEPTED_LEDGER_UNPROVEN_VERSION,
+    ] {
+        let mut seed = fixture();
+        seed.accepted_snapshot_fingerprint_ledger_version = version;
+        let mut rebuilt = ScanIndex::default();
+        rebuilt.carry_identity_from(seed).unwrap();
+        assert!(rebuilt.accepted_snapshot_fingerprints.is_empty());
+        assert!(rebuilt.accepted_rebuild_incidence.is_empty());
+        assert!(!rebuilt.accepted_incidence_pending_census);
+    }
+}
+
+#[test]
+fn carried_ack_at_entry_cap_is_never_lost_or_reoffered() {
+    let original = (0..CARRIED_ACK_ENTRIES_MAX - 1)
+        .map(|n| format!("{n:064x}"))
+        .collect::<BTreeSet<_>>();
+    let mut seed = ScanIndex::default();
+    seed.accepted_snapshot_fingerprints = original.clone();
+    seed.file_snapshot_fingerprints
+        .insert("original-held".into(), original.clone());
+    let mut rebuilt = ScanIndex::default();
+    rebuilt.carry_identity_from(seed).unwrap();
+    assert_eq!(rebuilt.carried_ack_debt_size().0, CARRIED_ACK_ENTRIES_MAX);
+    let frozen = rebuilt.accepted_rebuild_incidence.clone();
+    for revision in 10000..10100 {
+        let fp = format!("{revision:064x}");
+        rebuilt
+            .file_snapshot_fingerprints
+            .insert("healthy-sibling".into(), BTreeSet::from([fp.clone()]));
+        rebuilt.record_accepted_snapshot_fingerprints(&BTreeSet::from([fp]));
+        rebuilt.retain_quarantined_fingerprints(&BTreeMap::new());
+        assert_eq!(rebuilt.accepted_rebuild_incidence, frozen);
+        assert!(original
+            .iter()
+            .all(|fp| rebuilt.accepted_snapshot_fingerprint_recorded(fp)));
+        assert_eq!(
+            original
+                .difference(&rebuilt.accepted_snapshot_fingerprints)
+                .count(),
+            0,
+            "no original ACK is offerable"
+        );
+        assert_eq!(
+            rebuilt.accepted_snapshot_fingerprints.len(),
+            original.len() + 1
+        );
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("carried-ack-at-cap");
+    let path = scratch.join("index.json");
+    rebuilt.save(&path).unwrap();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(reloaded.accepted_rebuild_incidence, frozen);
+    assert_eq!(
+        original
+            .difference(&reloaded.accepted_snapshot_fingerprints)
+            .count(),
+        0
+    );
+}
+
+/// SI O3: a real walk reaches its raw terminal without visiting a held family
+/// member. Neither that terminal nor save/reload may retire the original carry.
+#[test]
+#[serial_test::serial(source_manifests)]
+fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
+    let scratch = crate::test_scratch::ScratchDir::new("carried-unvisited-family-hold");
+    let root = scratch.join("projects");
+    let path = scratch.join("index.json");
+    let session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    fs::create_dir_all(&root).unwrap();
+    let transcript = root.join(format!("{session}.jsonl"));
+    fs::write(&transcript, format!("{{\"timestamp\":\"2026-10-21T10:01:00Z\",\"sessionId\":\"{session}\",\"message\":{{\"id\":\"message\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n")).unwrap();
+    let original_transcript = fs::read(&transcript).unwrap();
+    let source = SnapshotSource::ClaudeCode;
+    let scan = |index: &mut ScanIndex, at: &str| {
+        scan_source_roots(
+            source,
+            std::slice::from_ref(&root),
+            index,
+            at,
+            BACKFILL_WINDOW_DAYS,
+        )
+        .unwrap()
+    };
+    let mut seed = ScanIndex::default();
+    let first = scan(&mut seed, "2026-10-22T00:00:00Z");
+    assert_eq!(first.snapshots.len(), 1);
+    let mut accepted = first
+        .snapshots
+        .iter()
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>();
+    let actual_accepted = accepted.clone();
+    // Fund the carried set exactly to its combined entry cap, including a
+    // genuine emitted/ACKed body. Extra old revisions model retained history.
+    let key = local_index_key(&transcript);
+    accepted.extend((10000..10000 + CARRIED_ACK_ENTRIES_MAX - 2).map(|n| format!("{n:064x}")));
+    seed.file_snapshot_fingerprints
+        .insert(key.clone(), accepted.clone());
+    seed.record_accepted_snapshot_fingerprints(&accepted);
+    let mut rebuilt = ScanIndex::default();
+    rebuilt.carry_identity_from(seed).unwrap();
+    assert_eq!(rebuilt.carried_ack_debt_size().0, CARRIED_ACK_ENTRIES_MAX);
+    let original_carry = rebuilt.accepted_rebuild_incidence.clone();
+    rebuilt.save(&path).unwrap();
+    let mut value = serde_json::to_value(&rebuilt).unwrap();
+    value["claude_account_family_witnesses"] =
+        serde_json::json!({session: {"members": [false], "opaque": "future"}});
+    fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut held = ScanIndex::load(&path).unwrap();
+    assert!(held.decode_holds_file(&key));
+    let walk = scan(&mut held, "2026-10-22T00:01:00Z");
+    assert!(!walk.census_complete);
+    assert_eq!(
+        walk.scanned_file_count, 0,
+        "the held member was never visited"
+    );
+    assert!(walk.snapshots.is_empty());
+    assert!(held.traversal.is_none(), "the raw walk really finished");
+    held.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    held.save(&path).unwrap();
+    let restarted = ScanIndex::load(&path).unwrap();
+    assert!(restarted.accepted_incidence_pending_census);
+    assert_eq!(restarted.accepted_rebuild_incidence, original_carry);
+    assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
+    // Even an absent member cannot retire debt behind a family HOLD.
+    fs::remove_file(&transcript).unwrap();
+    let mut absent_held = restarted;
+    let missing = scan(&mut absent_held, "2026-10-22T00:01:30Z");
+    assert!(!missing.census_complete);
+    assert!(missing.snapshots.is_empty());
+    absent_held.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    absent_held.save(&path).unwrap();
+    let restarted = ScanIndex::load(&path).unwrap();
+    assert_eq!(restarted.accepted_rebuild_incidence, original_carry);
+    assert_eq!(restarted.accepted_snapshot_fingerprints, accepted);
+    assert!(restarted.accepted_incidence_pending_census);
+    fs::write(&transcript, original_transcript).unwrap();
+    // A compatible repair understands/removes the bad witness; the missing
+    // derived file entry now forces actual reconstruction on a healthy pass.
+    let mut repaired = serde_json::to_value(&restarted).unwrap();
+    repaired["claude_account_family_witnesses"] = serde_json::json!({});
+    fs::write(&path, serde_json::to_vec(&repaired).unwrap()).unwrap();
+    let mut healthy = ScanIndex::load(&path).unwrap();
+    let release = scan(&mut healthy, "2026-10-22T00:02:00Z");
+    assert!(release.census_complete);
+    assert_eq!(release.scanned_file_count, 1);
+    assert!(
+        release.snapshots.is_empty(),
+        "accepted body must not re-offer"
+    );
+    assert!(healthy.accepted_rebuild_incidence.is_empty());
+    assert!(!healthy.accepted_incidence_pending_census);
+    healthy.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+    healthy.save(&path).unwrap();
+    assert_eq!(
+        ScanIndex::load(&path)
+            .unwrap()
+            .accepted_snapshot_fingerprints,
+        actual_accepted
     );
 }

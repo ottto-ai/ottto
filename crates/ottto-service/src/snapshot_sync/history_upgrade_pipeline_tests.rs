@@ -877,6 +877,12 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
         let carried =
             serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
         assert_eq!(carried, state["file_snapshot_fingerprints"]);
+        assert!(
+            crate::snapshots::scan_index_containment_lines_for_test()
+                .iter()
+                .any(|line| line
+                    .contains("retained_carried_entries=3 history_held_carried_entries=3"))
+        );
         let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
         assert!(again.scan.census_complete);
         assert_eq!(
@@ -905,10 +911,122 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
         assert_eq!(released.corrections, 0);
         assert_acks(&released.index);
         assert_eq!(released.index.current_snapshot_fingerprints(), accepted);
+        assert!(
+            crate::snapshots::scan_index_containment_lines_for_test()
+                .iter()
+                .any(|line| line
+                    .contains("retained_carried_entries=0 history_held_carried_entries=0"))
+        );
         assert!(serde_json::to_value(&released.index)
             .unwrap()
             .get("accepted_rebuild_incidence")
             .is_none());
+    });
+}
+
+/// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
+#[test]
+fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-override-carried-ack-gone");
+    let baseline = fixture.baseline();
+    let state = serde_json::to_value(&baseline).unwrap();
+    let accepted = state["accepted_snapshot_fingerprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|fp| fp.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(accepted.len(), HISTORY_SESSIONS.len());
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    assert_eq!(
+        ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support
+        )
+        .unwrap()
+        .1,
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+    );
+    // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    fixture.exceed_decode_hold_budget();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(
+        crate::snapshots::arm_scan_index_rebuild_manual_override(
+            SnapshotSource::ClaudeCode,
+            std::time::SystemTime::now()
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+    let assert_acks = |index: &ScanIndex| {
+        assert!(accepted
+            .iter()
+            .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.scan.census_complete);
+        assert!(held.uploaded.is_empty());
+        assert_eq!(held.corrections, 0);
+        assert!(held.index.current_snapshot_fingerprints().is_empty());
+        assert_acks(&held.index);
+        let carried =
+            serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
+        assert_eq!(carried, state["file_snapshot_fingerprints"]);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert!(again.scan.census_complete);
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "held files never re-parse"
+        );
+        assert!(again.uploaded.is_empty());
+        assert_acks(&again.index);
+        assert_eq!(
+            serde_json::to_value(&again.index).unwrap()["accepted_rebuild_incidence"],
+            carried
+        );
+        // A vanished held file releases only at a healthy complete terminal;
+        // the other history-held files keep their original carried incidence.
+        let vanished_key = HistoryFixture::key(&again.index, HISTORY_SESSIONS[0]);
+        let vanished_acks = state["file_snapshot_fingerprints"][&vanished_key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fp| fp.as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        std::fs::remove_file(fixture.root.join(format!("{}.jsonl", HISTORY_SESSIONS[0]))).unwrap();
+        let gone = fixture.cycle("2026-08-02T10:30:00Z", HISTORY_REVISION_2);
+        assert!(gone.scan.census_complete);
+        assert!(gone.uploaded.is_empty());
+        assert!(!gone.index.files.contains_key(&vanished_key));
+        let gone_state = serde_json::to_value(&gone.index).unwrap();
+        let debt = gone_state["accepted_rebuild_incidence"]
+            .as_object()
+            .unwrap();
+        assert!(!debt.contains_key(&vanished_key));
+        assert_eq!(debt.len(), HISTORY_SESSIONS.len() - 1);
+        assert!(gone_state["accepted_incidence_pending_census"]
+            .as_bool()
+            .unwrap());
+        let remaining = accepted
+            .difference(&vanished_acks)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(remaining
+            .iter()
+            .all(|fp| gone.index.accepted_snapshot_fingerprint_recorded(fp)));
+        assert!(vanished_acks
+            .iter()
+            .all(|fp| !gone.index.accepted_snapshot_fingerprint_recorded(fp)));
     });
 }
 

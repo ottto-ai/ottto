@@ -4225,6 +4225,17 @@ fn scan_index_rebuild_override_repair(
             #[cfg(test)]
             let _ = daemon;
         }
+        crate::snapshots::ScanIndexRebuildOverride::IdentityUnrecoverable => {
+            plan.status = RepairPlanStatus::Blocked;
+            plan.authority.message = StableMessage {
+                code: crate::snapshots::SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE
+                    .to_string(),
+                text: format!(
+                    "{} local record is too damaged for Repair to rebuild safely.{retry}",
+                    source_display_name(source)
+                ),
+            };
+        }
         crate::snapshots::ScanIndexRebuildOverride::Refused(code) => {
             plan.status = RepairPlanStatus::Blocked;
             plan.authority.message = StableMessage {
@@ -31694,6 +31705,10 @@ X-API-Key = "otel_redacted"
             "scan_index_rebuild_override_identity_unrecoverable"
         );
         assert!(!plan.authority.message.text.contains("already used"));
+        assert!(!plan.authority.message.text.contains("will be rebuilt"));
+        assert!(!plan.authority.message.text.contains("Armed"));
+        assert!(plan.authority.message.text.contains("too damaged"));
+        assert!(plan.authority.message.text.contains("retries by itself at"));
         let _ = fs::remove_dir_all(&root);
     }
 

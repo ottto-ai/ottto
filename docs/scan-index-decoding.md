@@ -43,11 +43,13 @@ plus completed replay and curve generations) from the damaged bytes and
 durably replaces the index with a generation-0 gated rebuild that carries them
 (contract latch set; carried acknowledgements retained per file until that
 file is completely reconstructed through the emission policy, including
-history-held files that never re-parse during a full census), keeps the damaged bytes as `.corrupt.override.`, counts
+history-held files that never re-parse during a full census; a vanished file
+releases only when pruned at a healthy effective complete terminal), keeps the damaged bytes as `.corrupt.override.`, counts
 `scan_index_rebuild_manual_override` and logs one line. If any of those fields
 cannot be strictly recovered (syntax damage included), the override refuses:
 the source stays paused, the index is untouched, and the successful-override
-cooldown is not spent. A later press returns the same clear refusal.
+cooldown is not spent. A later press returns the same clear refusal without arming or incrementing the
+attempt counter. A compatible load clears that refusal.
 `scan_index_rebuild_override_identity_unrecoverable` is counted, alarmed and
 named in the health `clear_condition`. Syntax damage waits for the seven-day
 automatic retry: sessions arrive late, not lost.
@@ -61,7 +63,8 @@ bookkeeping before retention: at most 4,096 combined file/identity slots and
 separately from identity, persistence and cooldown refusals. Content-free
 `scan_index_rebuild_carried_ack_debt_entries` and
 `scan_index_rebuild_carried_ack_debt_bytes` disclose the admitted debt size.
-Unknown original incidence stays bounded and retained rather than guessing a
+Each census line reports `retained_carried_entries` and
+`history_held_carried_entries` after finalization. Unknown original incidence stays bounded and retained rather than guessing a
 file or granting new ACKs blanket retention. Releasing a file suppresses its
 already accepted entities and transfers its reconstructed membership to the
 ordinary ACK ledger; a partial commit retires debt only for committed files.
