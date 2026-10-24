@@ -3076,7 +3076,7 @@ fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
         }).unwrap();
         let support = control.support.clone();
         let pending_key = key.clone();
-        *control.server.post_hook.lock().unwrap() = Some(Box::new(move || {
+        *control.server.before_post.lock().unwrap() = Some(Box::new(move || {
             assert!(
                 money::money_due(&support, &pending_key, u64::MAX),
                 "the older ACK cannot retire the later obligation before its actual POST"
