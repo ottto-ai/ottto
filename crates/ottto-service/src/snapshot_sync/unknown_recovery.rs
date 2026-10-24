@@ -11,13 +11,16 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 const BODY_MAX: usize = 4 * 1024 * 1024;
 const MANIFEST_MAX: usize = 64 * 1024;
 const TOTAL_MAX: u64 = 16 * 1024 * 1024;
-const ACTIVE_MAX: usize = 64;
+// Matches the existing control carrier's hard slot cap. Together with the
+// metadata and wire caps this also bounds one writer load's decoded graph.
+const ACTIVE_MAX: usize = 16;
 const RECEIPT_MAX: usize = 1024;
 const RECEIPT_BYTES_MAX: u64 = 256 * 1024;
 const DEADLINE: u64 = 24 * 3600;
 const RECEIPT_TTL: u64 = 35 * 86400;
 const REPLAY_AT: [u64; 3] = [300, 3600, 21600];
 const IO_FUNDS: usize = 2 * BODY_MAX + 8 * MANIFEST_MAX;
+const BODY_FUNDS: usize = BODY_MAX + 4 * MANIFEST_MAX;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -498,12 +501,32 @@ impl<T> Ticket<T> {
         }
     }
 }
+struct CorruptBody(Manifest);
+impl std::fmt::Debug for CorruptBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("CorruptBody")
+    }
+}
+impl std::fmt::Display for CorruptBody {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money retained payload unavailable")
+    }
+}
+impl std::error::Error for CorruptBody {}
 fn job<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<Ticket<T>> {
     Ok(Ticket {
-        receiver: store::recovery_job(IO_FUNDS, move || operation().map_err(|_| fault()))
-            .ok_or_else(fault)?,
+        receiver: store::recovery_job(IO_FUNDS, move || {
+            operation().map_err(|error| {
+                if error.is::<CorruptBody>() {
+                    error
+                } else {
+                    fault()
+                }
+            })
+        })
+        .ok_or_else(fault)?,
     })
 }
 pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
@@ -710,24 +733,30 @@ pub(super) fn add(support: &Path, m: Manifest) -> Result<()> {
     }
     Ok(())
 }
-pub(super) fn due(support: &Path, now: u64) -> Result<Vec<Manifest>> {
+pub(super) fn due(support: &Path, now: u64) -> Result<(Vec<Manifest>, money::ShadowReservation)> {
     let catalogs = CATALOGS.lock().map_err(|_| fault())?;
     let catalog = catalogs.get(support).ok_or_else(fault)?;
-    Ok(catalog
-        .entries
-        .iter()
-        .filter(|m| {
-            m.terminal.is_none()
-                && !m.ack_saved
-                && m.posts < 4
-                && m.slot < 3
-                && now < m.deadline
-                && now >= m.not_before
-                && now >= m.created.saturating_add(REPLAY_AT[usize::from(m.slot)])
-        })
-        .cloned()
-        .collect())
+    let eligible = |m: &&Manifest| {
+        m.terminal.is_none()
+            && !m.ack_saved
+            && m.posts < 4
+            && m.slot < 3
+            && now < m.deadline
+            && now >= m.not_before
+            && now >= m.created.saturating_add(REPLAY_AT[usize::from(m.slot)])
+    };
+    let mut length = SnapshotPackingLength { bytes: 0 };
+    for m in catalog.entries.iter().filter(eligible) {
+        serde_json::to_writer(&mut length, m)?;
+    }
+    let funds =
+        money::ShadowReservation::admit(length.bytes.saturating_mul(4)).ok_or_else(fault)?;
+    Ok((
+        catalog.entries.iter().filter(eligible).cloned().collect(),
+        funds,
+    ))
 }
+
 pub(super) fn capture_ticket(
     support: &Path,
     m: Manifest,
@@ -744,16 +773,19 @@ pub(super) fn replay_ticket(support: &Path, mut m: Manifest, now: u64) -> Result
     let support = support.to_path_buf();
     job(move || {
         let root = dir(&support);
-        let funds = money::ShadowReservation::admit(BODY_MAX).ok_or_else(fault)?;
-        let bytes = read_capped(&path(&root, &m.id, "body")?, BODY_MAX)?;
-        if bytes.len() != m.length
-            || digest(&bytes) != m.sha256
-            || now >= m.deadline
-            || m.posts >= 4
-            || m.slot >= 3
-        {
+        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
+        if now >= m.deadline || m.posts >= 4 || m.slot >= 3 {
             return Err(fault());
         }
+        let body = read_capped(&path(&root, &m.id, "body")?, BODY_MAX);
+        let bytes = match body {
+            Ok(bytes) if bytes.len() == m.length && digest(&bytes) == m.sha256 => bytes,
+            _ => {
+                m.terminal = Some(Reason::CorruptCustody);
+                write_manifest(&root, &m)?;
+                return Err(CorruptBody(m).into());
+            }
+        };
         m.posts += 1;
         m.slot += 1;
         write_manifest(&root, &m)?;
@@ -1072,11 +1104,11 @@ pub(super) fn initial_post(
 
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
-            let _body_funds = money::ShadowReservation::admit(BODY_MAX).ok_or_else(fault)?;
+            let _body_funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
             let body = encode(request, m.head_cas)?;
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
-        let funds = money::ShadowReservation::admit(BODY_MAX).ok_or_else(fault)?;
+        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
         let body = encode(request, m.head_cas)?;
         *state = SendState::Reserving(m, body, funds);
         return Err(Pending.into());
@@ -1342,7 +1374,8 @@ pub(super) async fn replay_due(
     authority: impl Fn() -> Result<()>,
 ) -> Result<()> {
     let binding = binding(namespace, client.recovery_origin(), machine, "");
-    for m in due(support, now(support))? {
+    let (due, _scope_funds) = due(support, now(support))?;
+    for m in due {
         if m.binding != binding || m.context != index.recovery_upload_context() {
             let updated = wait(outcome_ticket(support, m, Some(Reason::BindingLost), 0)?).await?;
             replace(support, updated)?;
@@ -1372,7 +1405,18 @@ pub(super) async fn replay_due(
         let token = client.issue_relay_token(device, secret, SnapshotSource::ClaudeCode)?;
         // Counter save and payload read share the bounded money writer. A
         // crash at or after this save consumes the same slot on restart.
-        let (m, bytes, _body_funds) = wait(replay_ticket(support, m, now(support))?).await?;
+        let prepared = wait(replay_ticket(support, m, now(support))?).await;
+        let (m, bytes, _body_funds) = match prepared {
+            Ok(prepared) => prepared,
+            Err(error) if error.is::<CorruptBody>() => {
+                replace(
+                    support,
+                    error.downcast::<CorruptBody>().map_err(|_| fault())?.0,
+                )?;
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
         replace(support, m.clone())?;
         authority()?;
         let guard = current_literal_guard(index, &m);
