@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 835,
-  "content_sha256": "a5176bfbdd260b3da14f76f53751ddd48b360b8a43eb99a7980f44c63e476dd5",
+  "candidate_file_count": 837,
+  "content_sha256": "e71687dea910df39f65c67eca5bf4aa4e928a2b75d8c5db62043443f1da880b7",
   "files": [
     {
       "executable": false,
@@ -34,8 +34,8 @@
       "executable": false,
       "mode": "0644",
       "path": "AGENTS.md",
-      "sha256": "1cbe0eb2888b19cc0b47eec38c95027b56856a2302da14f59ef7071372b36338",
-      "size_bytes": 3088
+      "sha256": "bde8c11bdcdeb7ebf8cb93d1de62292d166826f53cf4b287d9aad65a6687ff6a",
+      "size_bytes": 4041
     },
     {
       "executable": false,
@@ -55,8 +55,8 @@
       "executable": false,
       "mode": "0644",
       "path": "CONTRIBUTING.md",
-      "sha256": "3f733e0e5174c5e87cc76e87093d24d7b83e76dda5e0d9dd9273d9eabb1279cf",
-      "size_bytes": 2938
+      "sha256": "cffc99ac53255aa99596d104cf82468025be40cfd9aa051c3121bea361b3fb9c",
+      "size_bytes": 3476
     },
     {
       "executable": false,
@@ -5570,6 +5570,13 @@
     {
       "executable": true,
       "mode": "0755",
+      "path": "scripts/pr_merge_when_mac_green.sh",
+      "sha256": "a4d834704b750a048efad1b530ace3b5877c50e87af9f6783ba9ac48ba02aee1",
+      "size_bytes": 7653
+    },
+    {
+      "executable": true,
+      "mode": "0755",
       "path": "scripts/public_repo_bootstrap_plan.sh",
       "sha256": "a8c87fff2af29aec23e6039f8a34ca976bc2398b1ff19934f38ff6899046d074",
       "size_bytes": 16439
@@ -5780,6 +5787,13 @@
     {
       "executable": true,
       "mode": "0755",
+      "path": "scripts/test_pr_merge_when_mac_green.sh",
+      "sha256": "19f68343d8e91ebef5bbe5d9c339809e0cb5bbc8b9db405435480aaad80b668a",
+      "size_bytes": 10465
+    },
+    {
+      "executable": true,
+      "mode": "0755",
       "path": "scripts/test_public_repo_bootstrap_plan.sh",
       "sha256": "2fc2f7eb2467fe767707c0bd1f887d97fa1a42bea4b17f31a756dde325fb064f",
       "size_bytes": 5493
@@ -5848,9 +5862,9 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T07:53:41+00:00",
+  "generated_at": "2026-10-24T09:06:15+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 836,
+  "output_file_count": 838,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",
@@ -5887,5 +5901,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "98bcfb5cebaa9ebee4c8b168b9666c666bd3d7b3"
+  "source_commit": "bad8135043897e6d331e04f70adfe2c5a995f67a"
 }

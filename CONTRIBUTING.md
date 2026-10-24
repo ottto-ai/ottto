@@ -38,6 +38,16 @@ and, after accepted fixes, one focused verification within 24 hours. Existing
 Cargo, native and public-surface checks remain required; review does not replace
 them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
 
+## Merging
+
+Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
+ready, waits until the macOS `Rust contracts` job of the pull-request run on the
+PR's head commit passed, and then squash-merges exactly that head
+(`--match-head-commit`). It refuses a PR with merge conflicts: rebase onto
+`main`, regenerate `PUBLIC_EXPORT_MANIFEST.json`, and push first. `gh pr checks`
+exit 0 and a Linux green are not Mac evidence, and a manually started
+(`workflow_dispatch`) run tests the branch head, not the merge with `main`.
+
 ## Credential Store Tests
 
 Service and CLI dev-dependencies enable core's `test-secret-store` feature.
