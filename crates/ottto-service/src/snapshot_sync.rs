@@ -7323,6 +7323,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// RetryPending families whose returning root retains a retirement
+    /// tombstone, separate from all other RetryPending causes. Local only.
+    pub returning_family_grown_held: usize,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -8041,6 +8044,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.duplicate_census = disposition.duplicate_census;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
         ..disposition.first_proof_hold

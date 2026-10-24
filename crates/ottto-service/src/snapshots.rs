@@ -38105,6 +38105,26 @@ impl ScanIndex {
             .count()
     }
 
+    /// Local census visibility for returning families still held for proof,
+    /// including grown returns: count RetryPending records whose root still
+    /// has its retirement tombstone. Absence retirement removes the record;
+    /// return re-forms it, and settled proof clears both record and tombstone.
+    /// This observation never changes proof, admission, or retry decisions.
+    pub(crate) fn claude_returning_family_grown_held_count(&self) -> usize {
+        if self.claude_retired_family_tombstones.is_empty() {
+            return 0;
+        }
+        self.claude_usage_authority_quarantine
+            .iter()
+            .filter(|(root, record)| {
+                record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                    && self
+                        .claude_retired_family_tombstones
+                        .contains_key(&claude_retired_family_digest(root))
+            })
+            .count()
+    }
+
     /// SOURCE Round 11 guards for the path-(a) absence retirement: absence
     /// retires a family only when it is positive. Refused (every family kept)
     /// while the #700 re-emission stop latch is set, while this index's

@@ -2004,6 +2004,15 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
         "the existing census counter exposes the held RetryPending family"
     );
 
+    assert_eq!(
+        returned
+            .evidence_stats
+            .as_ref()
+            .unwrap()
+            .returning_family_grown_held,
+        1
+    );
+
     // Growth needs a new witness. Keep exact reconstruction unchanged and
     // let the native terminal re-prove in a new wall-clock census window.
     let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
@@ -2021,13 +2030,44 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
         .unwrap()
         .write_all(format!("{grown}\n").as_bytes())
         .unwrap();
+    // Still-unhealthy evidence holds the genuinely grown returning family.
+    // The dedicated census-line value must expose it while other pending
+    // causes remain in the existing aggregate counter.
+    let grown_held = pipeline.cycle_with_authority_debt(t0 + 1_500);
+    assert!(grown_held.result.is_ok(), "{:?}", grown_held.result);
+    let held_stats = grown_held
+        .evidence_stats
+        .as_ref()
+        .expect("Claude evidence fold");
+    assert_eq!(held_stats.returning_family_grown_held, 1);
+    assert_eq!(
+        held_stats
+            .first_proof_hold
+            .census_withheld_retry_pending_family_count,
+        1
+    );
+    assert!(grown_held
+        .index
+        .claude_authority_record_for_test(root)
+        .is_some());
+    assert!(grown_held.index.claude_family_tombstoned_for_test(root));
+    assert!(root_offers(&pipeline.server.offered()[offered_before..]).is_empty());
     write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
     // It starts with the RetryPending record, which withholds this scan's
     // census; the next cycle, with the debt settled, completes it again.
-    wait_for_fresh_census_window(&returned.census_window_end);
+    wait_for_fresh_census_window(&grown_held.census_window_end);
     let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
     assert!(proved.result.is_ok(), "{:?}", proved.result);
     assert_ne!(proved.census_window_end, returned.census_window_end);
+    assert_ne!(proved.census_window_end, grown_held.census_window_end);
+    assert_eq!(
+        proved
+            .evidence_stats
+            .as_ref()
+            .unwrap()
+            .returning_family_grown_held,
+        0
+    );
     assert_eq!(
         proved
             .evidence_stats

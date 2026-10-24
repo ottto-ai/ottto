@@ -3094,3 +3094,35 @@ fn kept_tombstone_fence_alarm_names_unsupported_layout() {
         assert_eq!(alarms[0]["counts"]["witness_visits"], 3);
     }
 }
+
+/// Returning RetryPending roots must be visible separately from ordinary
+/// RetryPending causes, terminal records, and recordless retirement markers.
+#[test]
+fn returning_family_grown_held_counts_only_tombstoned_retry_pending_roots() {
+    let mut index = ScanIndex::default();
+    assert_eq!(index.claude_returning_family_grown_held_count(), 0);
+    for root in ["ordinary", "returning-a", "returning-b", "terminal"] {
+        index.insert_retry_pending_claude_authority_for_test(root);
+    }
+    assert_eq!(index.claude_returning_family_grown_held_count(), 0);
+    for root in ["returning-a", "returning-b", "terminal", "recordless"] {
+        index.tombstone_claude_family_for_test(root);
+    }
+    index
+        .claude_usage_authority_quarantine
+        .get_mut("terminal")
+        .unwrap()
+        .disposition = ClaudeUsageAuthorityQuarantineDisposition::UnprovenTerminal;
+    assert_eq!(index.claude_usage_authority_pending_count(), 3);
+    assert_eq!(index.claude_returning_family_grown_held_count(), 2);
+    index
+        .claude_usage_authority_quarantine
+        .remove("returning-a");
+    assert_eq!(index.claude_returning_family_grown_held_count(), 1);
+    index
+        .claude_retired_family_tombstones
+        .entries
+        .remove(&claude_retired_family_digest("returning-b"));
+    assert_eq!(index.claude_usage_authority_pending_count(), 2);
+    assert_eq!(index.claude_returning_family_grown_held_count(), 0);
+}
