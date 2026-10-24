@@ -1,7 +1,7 @@
 //! Bounded custody for an authorized batch whose outcome may be unknown.
 //! The payload is final identity-encoded wire JSON, never a recipe for a POST.
-//! All filesystem work runs on the existing money writer. No gate-OFF caller
-//! loads this directory or allocates a catalog.
+//! Payload/manifest work runs on the existing money writer. A fresh gate-OFF
+//! caller allocates no catalog; existing custody is retired before networking.
 use super::*;
 use crate::snapshots::claude_request_money::{self as money, store};
 use std::fs::{self, File, OpenOptions};
@@ -153,6 +153,30 @@ pub(super) fn faulted(support: &Path, error: &anyhow::Error) {
 
 fn dir(support: &Path) -> PathBuf {
     support.join("claude-money-recovery")
+}
+
+/// OFF cannot strand a previously authorized payload past its privacy bound.
+/// Probe only filenames in this bounded private directory; receipts/status
+/// alone never hydrate live custody or the money ledger on the OFF path.
+pub(super) fn unfinished_custody(support: &Path) -> Result<bool> {
+    let entries = match fs::read_dir(dir(support)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(fault()),
+    };
+    for (count, entry) in entries.enumerate() {
+        if count >= 4 * ACTIVE_MAX + RECEIPT_MAX + 4 {
+            return Err(fault());
+        }
+        let name = entry.map_err(|_| fault())?.file_name();
+        let name = name.to_str().ok_or_else(fault)?;
+        if name.split_once('.').is_some_and(|(_, extension)| {
+            matches!(extension, "json" | "body" | "json.tmp" | "body.tmp")
+        }) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
@@ -788,7 +812,10 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 // successful last replay as exhausted UNKNOWN. At the hard
                 // privacy deadline (or binding loss), retire known custody;
                 // selected-file debt still requires its ordinary saved proof.
-                return (m.binding != binding || now >= m.deadline).then_some(Reason::Resolved);
+                return (m.binding != binding
+                    || now >= m.deadline
+                    || !money::request_owned_live(support))
+                .then_some(Reason::Resolved);
             }
             if m.binding != binding {
                 Some(Reason::BindingLost)
@@ -798,6 +825,8 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 Some(Reason::Exhausted)
             } else if m.slot >= 3 {
                 Some(Reason::AdmissionDenied)
+            } else if !money::request_owned_live(support) {
+                Some(Reason::Disabled)
             } else if money::recovery_released(support, &m.lineage) {
                 Some(Reason::Released)
             } else {

@@ -3320,6 +3320,77 @@ fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_live_off_retires_existing_payload_before_ordinary_networking() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let _clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle_deferred();
+    let m = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    let body = control
+        .support
+        .join("claude-money-recovery")
+        .join(format!("{}.body", m.id));
+    assert!(body.exists());
+    let keys = ["dirty:", "due:"].map(|prefix| {
+        format!(
+            "{prefix}{:x}",
+            Sha256::digest(control.transcript().to_string_lossy().as_bytes())
+        )
+    });
+    let debt = money::store::with_ledger_for_test(&control.support, |ledger| {
+        keys.iter()
+            .map(|key| ledger.get(key).map(|r| (r.money_revision(), r.window())))
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    assert!(debt.iter().all(Option::is_some));
+    let status = control.support.join("claude-money-recovery/status");
+    let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let posted = observed.clone();
+    let payload = body.clone();
+    *control.server.before_post.lock().unwrap() = Some(Box::new(move || {
+        assert!(
+            !payload.exists(),
+            "disabled custody must retire before the next ordinary batch"
+        );
+        let status: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&status).unwrap()).unwrap();
+        assert_eq!(status["unknown_outcome_unresolved"], 1);
+        posted.store(true, std::sync::atomic::Ordering::SeqCst);
+    }));
+    std::fs::write(control.support.join("claude-money-live.off"), b"stop").unwrap();
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    control.cycle();
+    assert!(observed.load(std::sync::atomic::Ordering::SeqCst));
+    assert!(!body.exists());
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    let after = money::store::with_ledger_for_test(&control.support, |ledger| {
+        keys.iter()
+            .map(|key| ledger.get(key).map(|r| (r.money_revision(), r.window())))
+            .collect::<Vec<_>>()
+    })
+    .unwrap();
+    assert_eq!(
+        after, debt,
+        "only UNKNOWN is released; ordinary OFF delivery cannot retire the literal debt"
+    );
+    eprintln!("MONEY_UNKNOWN_OFF_CLEANUP prior_payload_deleted=true receipt_before_normal_post=true exact_debt_preserved=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
