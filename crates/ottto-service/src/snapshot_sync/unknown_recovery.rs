@@ -28,6 +28,7 @@ pub(super) struct Entity {
     pub witness: String,
     pub witness_version: Option<u64>,
     pub files: Vec<String>,
+    pub file_revisions: Vec<String>,
     pub source_fingerprint: Option<String>,
     pub literal: bool,
     pub cache_patch: Option<crate::snapshots::CacheObservations>,
@@ -48,6 +49,7 @@ pub(super) struct Manifest {
     pub sha256: String,
     pub head_cas: bool,
     pub ack_saved: bool,
+    pub receipt_slot: Option<u16>,
     pub entities: Vec<Entity>,
     pub terminal: Option<Reason>,
 }
@@ -270,10 +272,14 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         || m.length > BODY_MAX
         || m.length == 0
         || m.deadline != m.created.saturating_add(DEADLINE)
+        || m.receipt_slot
+            .is_some_and(|slot| usize::from(slot) >= RECEIPT_MAX)
         || m.entities.is_empty()
         || m.entities.len() > SNAPSHOT_BATCH_LIMIT
         || m.entities.iter().any(|e| {
             e.files.len() > 256
+                || e.files.len() != e.file_revisions.len()
+                || e.file_revisions.iter().any(|r| r.len() > 256)
                 || e.session.len() > 1024
                 || e.root.len() > 1024
                 || e.files.iter().any(|f| f.len() > 4096)
@@ -317,7 +323,9 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             if m.id != id || envelope.checksum != digest(&serde_json::to_vec(&m)?) {
                 return Err(fault());
             }
-            validate_manifest(&m)?;
+            if m.terminal != Some(Reason::CorruptCustody) {
+                validate_manifest(&m)?;
+            }
             Ok(m)
         })();
         let mut m = decoded.unwrap_or_else(|_| Manifest {
@@ -332,6 +340,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             sha256: "00".repeat(32),
             head_cas: false,
             ack_saved: false,
+            receipt_slot: None,
             entities: Vec::new(),
             terminal: Some(Reason::CorruptCustody),
         });
@@ -348,7 +357,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
     }
     Ok(entries)
 }
-fn prune_receipts(root: &Path, now: u64) -> Result<()> {
+fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
     let mut count = 0;
     let mut bytes = 0;
     for entry in fs::read_dir(root)? {
@@ -366,9 +375,7 @@ fn prune_receipts(root: &Path, now: u64) -> Result<()> {
         }
     }
     // Reserve a receipt for every admitted active batch, even at full custody.
-    if count + ACTIVE_MAX >= RECEIPT_MAX
-        || bytes + (ACTIVE_MAX as u64 + 1) * 1024 > RECEIPT_BYTES_MAX
-    {
+    if count + reserved > RECEIPT_MAX || bytes + reserved as u64 * 1024 > RECEIPT_BYTES_MAX {
         return Err(fault());
     }
     Ok(())
@@ -377,7 +384,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     let root = dir(&support);
     private_dir(&root)?;
     sync_dir(&support)?;
-    prune_receipts(&root, m.created)?;
+    prune_receipts(&root, m.created, load(&root)?.len() + 1)?;
     if load(&root)?.len() >= ACTIVE_MAX || body.len() > BODY_MAX {
         return Err(fault());
     }
@@ -399,9 +406,10 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     write_manifest(&root, &m)?;
     Ok(m)
 }
-fn terminal(support: PathBuf, m: Manifest, reason: Reason, now: u64) -> Result<()> {
+fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Result<()> {
     let root = dir(&support);
-    prune_receipts(&root, now)?;
+    let active = load(&root)?;
+    prune_receipts(&root, now, active.len())?;
     let receipt = Receipt {
         outcome: if reason == Reason::Resolved {
             "resolved"
@@ -416,7 +424,23 @@ fn terminal(support: PathBuf, m: Manifest, reason: Reason, now: u64) -> Result<(
         attempts: m.posts.saturating_sub(1),
         hash8: m.id[..8].into(),
     };
-    let receipt_path = root.join(format!("{}.receipt", &m.id[..8]));
+    if m.receipt_slot.is_none() {
+        let reserved = active
+            .iter()
+            .filter_map(|m| m.receipt_slot)
+            .collect::<BTreeSet<_>>();
+        let slot = (0..RECEIPT_MAX as u16)
+            .find(|slot| {
+                !reserved.contains(slot)
+                    && !root.join(format!("receipt-{slot:04}.receipt")).exists()
+            })
+            .ok_or_else(fault)?;
+        m.receipt_slot = Some(slot);
+        // Private slot reservation is durable before the count-only receipt.
+        // A crash cannot merge hash-8 collisions or count this lineage twice.
+        write_manifest(&root, &m)?;
+    }
+    let receipt_path = root.join(format!("receipt-{:04}.receipt", m.receipt_slot.unwrap()));
     if !receipt_path.exists() {
         atomic(&root, &receipt_path, &serde_json::to_vec(&receipt)?)?;
     }
@@ -592,6 +616,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                     sha256: "00".repeat(32),
                     head_cas: false,
                     ack_saved: false,
+                    receipt_slot: None,
                     entities: Vec::new(),
                     terminal: Some(Reason::CorruptCustody),
                 };
@@ -858,10 +883,13 @@ pub(super) fn manifest(
     let mut metadata_bytes = 0_usize;
     let mut lineage = Sha256::new();
     lineage.update(binding.as_bytes());
+    lineage.update((index.recovery_upload_context().len() as u64).to_be_bytes());
+    lineage.update(index.recovery_upload_context().as_bytes());
     lineage.update([u8::from(head_cas)]);
     for item in &request.snapshots {
         let root = money::family_root(item).to_string();
         let mut files = Vec::new();
+        let mut file_revisions = Vec::new();
         for key in index
             .files
             .keys()
@@ -872,6 +900,7 @@ pub(super) fn manifest(
                 return Err(fault());
             }
             files.push(key.clone());
+            file_revisions.push(index.files[key].source_file_fingerprint.clone());
         }
         lineage.update((item.source_session_id.len() as u64).to_be_bytes());
         lineage.update(item.source_session_id.as_bytes());
@@ -886,6 +915,7 @@ pub(super) fn manifest(
             witness: snapshot_upload_body_witness(item),
             witness_version: crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
             files,
+            file_revisions,
             source_fingerprint: item.source_file_fingerprint.clone(),
             cache_patch: item.cache_observations.clone(),
             literal: item.usage_accounting_contract.as_deref()
@@ -905,6 +935,7 @@ pub(super) fn manifest(
         sha256: String::new(),
         head_cas,
         ack_saved: false,
+        receipt_slot: None,
         entities,
         terminal: None,
     })
@@ -1278,6 +1309,11 @@ pub(super) async fn replay_due(
 ) -> Result<()> {
     let binding = binding(namespace, client.recovery_origin(), machine, "");
     for m in due(support, now(support))? {
+        if m.binding != binding || m.context != index.recovery_upload_context() {
+            let updated = wait(outcome_ticket(support, m, Some(Reason::BindingLost), 0)?).await?;
+            replace(support, updated)?;
+            continue;
+        }
         let guard = current_literal_guard(index, &m);
         if !admitted(index, support, &binding, &m, guard)? {
             if guard == LiteralPermit::DenyAll {
@@ -1415,6 +1451,7 @@ mod tests {
                 sha256: digest(&bytes),
                 head_cas: false,
                 ack_saved: false,
+                receipt_slot: None,
                 entities: vec![Entity {
                     root: "synthetic-root".into(),
                     session: "synthetic-session".into(),
@@ -1422,6 +1459,7 @@ mod tests {
                     witness: "12".repeat(32),
                     witness_version: Some(7),
                     files: vec!["/fixture/file.jsonl".into()],
+                    file_revisions: vec!["34".repeat(32)],
                     source_fingerprint: Some("34".repeat(32)),
                     literal: true,
                     cache_patch: None,
@@ -1431,6 +1469,70 @@ mod tests {
             bytes,
         )
     }
+    fn startup_ready(support: &Path, binding: &str, now: u64) {
+        for _ in 0..32 {
+            if startup(support, binding, now).unwrap() {
+                return;
+            }
+            store::flush();
+        }
+        panic!("bounded recovery startup did not finish its writer receipts");
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn cold_start_binding_loss_and_missing_legacy_body_are_visible_unresolved() {
+        for legacy in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-unknown-startup");
+            let _live = money::LiveForTest::new(&scratch);
+            store::reload_for_test(&scratch).unwrap();
+            store::with_ledger_for_test(&scratch, |ledger| {
+                if legacy {
+                    let mut rates = [0; 32]; rates[..8].copy_from_slice(&((1_u64 << 63) | 1).to_be_bytes());
+                    assert!(ledger.put_money(format!("adopt:entity:v2:{}:rates", "aa".repeat(32)),
+                        crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt(rates, 1000)));
+                }
+                assert!(store::checkpoint_for_test(&scratch, ledger));
+            }).unwrap();
+            let (m, body) = specimen(1000);
+            if !legacy {
+                capture(scratch.to_path_buf(), m.clone(), &body).unwrap();
+            }
+            startup_ready(&scratch, &"99".repeat(32), 1001);
+            assert!(load(&dir(&scratch)).unwrap().is_empty());
+            let receipts = fs::read_dir(dir(&scratch))
+                .unwrap()
+                .filter_map(|entry| {
+                    let path = entry.unwrap().path();
+                    (path.extension().and_then(|s| s.to_str()) == Some("receipt")).then(|| {
+                        serde_json::from_slice::<Receipt>(&fs::read(path).unwrap()).unwrap()
+                    })
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(receipts.len(), 1);
+            assert_eq!(receipts[0].outcome, "unknown_outcome_unresolved");
+            assert_eq!(
+                receipts[0].reason,
+                if legacy {
+                    Reason::CorruptCustody
+                } else {
+                    Reason::BindingLost
+                }
+            );
+            if !legacy {
+                assert!(money::recovery_released(&scratch, &m.id));
+            }
+            forget(&scratch);
+            startup_ready(&scratch, &m.binding, 1002);
+            assert!(
+                load(&dir(&scratch)).unwrap().is_empty(),
+                "switching back cannot reconstruct an old replay"
+            );
+            forget(&scratch);
+            store::forget_for_test(&scratch);
+        }
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn durable_exact_bytes_counter_restart_deadline_and_private_receipt() {
@@ -1469,7 +1571,7 @@ mod tests {
         terminal(scratch.to_path_buf(), exhausted, Reason::Exhausted, 23000).unwrap();
         assert!(!path(&root, &m.id, "body").unwrap().exists());
         let receipt: serde_json::Value =
-            serde_json::from_slice(&fs::read(root.join("abababab.receipt")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(root.join("receipt-0000.receipt")).unwrap()).unwrap();
         assert_eq!(receipt["outcome"], "unknown_outcome_unresolved");
         assert_eq!(receipt["attempts"], 3);
         assert_eq!(receipt.as_object().unwrap().len(), 7);

@@ -6722,6 +6722,9 @@ async fn finish_sync_source_resume(
                         client.upload_batch(&token, &request, enforce_head_cas)
                     }?;
                     response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+                    if recovery_binding.is_some() {
+                        ensure_authority()?;
+                    }
                     Ok(response)
                 },
                 |progress| {
@@ -6873,6 +6876,9 @@ async fn finish_sync_source_resume(
                     }
                 })?;
                 response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                if recovery_binding.is_some() {
+                    ensure_authority()?;
+                }
                 let request_fingerprints = request
                     .snapshots
                     .iter()

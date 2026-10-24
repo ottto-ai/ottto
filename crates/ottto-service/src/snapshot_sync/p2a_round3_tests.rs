@@ -857,6 +857,7 @@ impl P2aControl {
 impl Drop for P2aControl {
     fn drop(&mut self) {
         money_resume::forget_for_test(&self.support);
+        unknown_recovery::forget(&self.support);
         crate::snapshots::claude_request_money::store::forget_for_test(&self.support);
         let mut deadlines = source_upload_deadlines().lock().unwrap();
         deadlines.remove("claude_code");
@@ -2894,6 +2895,10 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
         let m = unknown_recovery::active_for_test(&control.support)
             .pop()
             .unwrap();
+        assert!(
+            m.entities.iter().any(|e| e.literal),
+            "revision contract control requires an actual rev-3 literal"
+        );
         let mut index = control.saved();
         index.activate_effective_upload_body_witness_revision(if downgrade { 2 } else { 3 });
         if !downgrade {
