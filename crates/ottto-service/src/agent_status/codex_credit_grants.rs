@@ -131,7 +131,18 @@ pub(super) fn routine_param_rejected(error: &Value) -> bool {
 /// Time the detailed read sent after the routine one may take: what is left of
 /// the session bound, but never less than [`DETAIL_READ_MIN_BUDGET`].
 pub(super) fn detail_read_budget(session_remaining: Duration) -> Duration {
-    session_remaining.clamp(DETAIL_READ_MIN_BUDGET, DETAIL_READ_MAX_BUDGET)
+    let (min, max) = detail_read_bounds();
+    session_remaining.clamp(min, max)
+}
+
+/// [`DETAIL_READ_MIN_BUDGET`] and [`DETAIL_READ_MAX_BUDGET`], or a test's
+/// scaled bounds.
+fn detail_read_bounds() -> (Duration, Duration) {
+    #[cfg(test)]
+    if let Some(timeouts) = super::codex_app_server_test_timeouts() {
+        return (timeouts.detail_min, timeouts.detail_max);
+    }
+    (DETAIL_READ_MIN_BUDGET, DETAIL_READ_MAX_BUDGET)
 }
 
 impl CodexRateLimitsRead {
@@ -1607,7 +1618,8 @@ mod tests {
     mod session {
         use super::*;
         use crate::agent_status::{
-            call_codex_app_server_rate_limits_for_home, CodexAppServerObservation,
+            call_codex_app_server_rate_limits_for_home, with_codex_app_server_test_timeouts,
+            CodexAppServerObservation, CODEX_APP_SERVER_TIMEOUT,
         };
         use crate::test_scratch::ScratchDir;
         use ottto_core::CodexHomeTrust;
@@ -1813,12 +1825,24 @@ for line in sys.stdin:
         #[test]
         #[serial]
         fn an_unanswered_escalated_detail_read_keeps_the_routine_reading() {
+            let detail_min = Duration::from_secs(3);
             let started = std::time::Instant::now();
-            let (observation, requests) = run("detail_silent", true);
+            let (observation, requests) = with_codex_app_server_test_timeouts(
+                Duration::from_secs(6),
+                detail_min,
+                Duration::from_secs(6),
+                || {
+                    assert_eq!(detail_read_budget(Duration::ZERO), detail_min);
+                    run("detail_silent", true)
+                },
+            );
             assert_eq!(requests, vec![routine_request(), detail_request()]);
             assert_routine_reading_kept(&observation.expect("reading"));
             // The detailed read had its own budget, then gave up.
-            assert!(started.elapsed() >= DETAIL_READ_MIN_BUDGET);
+            let elapsed = started.elapsed();
+            assert!(elapsed >= detail_min);
+            // The scaled bounds, not the production ones, ended the session.
+            assert!(elapsed < CODEX_APP_SERVER_TIMEOUT, "{elapsed:?}");
         }
 
         #[test]

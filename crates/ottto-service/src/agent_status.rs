@@ -16010,6 +16010,64 @@ struct CodexAppServerRun {
 /// rate-limits read.
 const CODEX_APP_SERVER_MIN_REQUESTS: u32 = 2;
 
+/// Bound on one `codex app-server` quota session: [`CODEX_APP_SERVER_TIMEOUT`],
+/// or a test's scaled bound.
+fn codex_app_server_timeout() -> Duration {
+    #[cfg(test)]
+    if let Some(timeouts) = codex_app_server_test_timeouts() {
+        return timeouts.session;
+    }
+    CODEX_APP_SERVER_TIMEOUT
+}
+
+/// Scaled app-server bounds for tests only; production constants are never
+/// changed.
+#[cfg(test)]
+#[derive(Clone, Copy)]
+struct CodexAppServerTestTimeouts {
+    session: Duration,
+    detail_min: Duration,
+    detail_max: Duration,
+}
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_APP_SERVER_TEST_TIMEOUTS: std::cell::Cell<Option<CodexAppServerTestTimeouts>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+fn codex_app_server_test_timeouts() -> Option<CodexAppServerTestTimeouts> {
+    CODEX_APP_SERVER_TEST_TIMEOUTS.with(std::cell::Cell::get)
+}
+
+/// Runs `run` with the session bound and the detailed read's budget bounds
+/// scaled down. The session runs on the calling thread, so the override
+/// reaches it and no other test.
+#[cfg(test)]
+fn with_codex_app_server_test_timeouts<T>(
+    session: Duration,
+    detail_min: Duration,
+    detail_max: Duration,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            CODEX_APP_SERVER_TEST_TIMEOUTS.with(|timeouts| timeouts.set(None));
+        }
+    }
+    CODEX_APP_SERVER_TEST_TIMEOUTS.with(|timeouts| {
+        timeouts.set(Some(CodexAppServerTestTimeouts {
+            session,
+            detail_min,
+            detail_max,
+        }))
+    });
+    let _reset = Reset;
+    run()
+}
+
 /// One `codex app-server` quota session for `codex_home`, logged as one
 /// provider-call line when the CLI started.
 fn call_codex_app_server_rate_limits_for_home(
@@ -16144,7 +16202,7 @@ fn run_codex_app_server_rate_limits_for_home(
     }
 
     let start = Instant::now();
-    let mut deadline = start + CODEX_APP_SERVER_TIMEOUT;
+    let mut deadline = start + codex_app_server_timeout();
     let mut initialize_error = None;
     let mut initialize_completed = false;
     let mut disconnected = false;
@@ -24335,12 +24393,29 @@ for line in sys.stdin:
     #[test]
     #[serial]
     fn codex_probe_deadline_is_a_timeout_with_its_phase_not_an_eof() {
+        let session = Duration::from_secs(6);
         let started = Instant::now();
-        let message = run_codex_probe_failure_fake("account_timeout")
-            .err()
-            .expect("deadline");
+        let message = with_codex_app_server_test_timeouts(
+            session,
+            Duration::from_secs(3),
+            Duration::from_secs(6),
+            || {
+                assert_eq!(codex_app_server_timeout(), session);
+                run_codex_probe_failure_fake("account_timeout")
+            },
+        )
+        .err()
+        .expect("deadline");
         assert_eq!(message, "Codex app-server account read timed out.");
-        assert!(started.elapsed() >= CODEX_APP_SERVER_TIMEOUT);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= session);
+        // The scaled bound, not the production one, ended the session.
+        assert!(elapsed < CODEX_APP_SERVER_TIMEOUT, "{elapsed:?}");
+    }
+
+    #[test]
+    fn codex_app_server_timeout_is_twenty_seconds_without_a_test_override() {
+        assert_eq!(codex_app_server_timeout(), Duration::from_secs(20));
     }
 
     #[cfg(unix)]
