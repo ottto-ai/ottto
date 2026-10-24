@@ -706,8 +706,11 @@ impl ScanIndex {
     /// stale-carry posture stay fail-closed. The contract token is kept and
     /// its latch set: nothing proves the rebuilt graph ran under it. Accepted
     /// acknowledgements carry only from a current ledger, so an unproven one
-    /// re-offers rather than suppresses. Files, traversal and the Codex
-    /// ownership ledgers (the collision-bearing fields) are rebuilt by scan.
+    /// re-offers rather than suppresses. The replay generations carry so the
+    /// replacement cycle replays only what the damaged index still owed; a
+    /// spurious replay would clear the carried acknowledgements and
+    /// owned-start census. Files, traversal and the Codex ownership ledgers
+    /// (the collision-bearing fields) are rebuilt by scan.
     fn carry_identity_from(&mut self, carry: ScanIndex) {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
@@ -723,6 +726,11 @@ impl ScanIndex {
         }
         // No file incidence yet: keep them until the replacement census.
         self.accepted_incidence_pending_census = !self.accepted_snapshot_fingerprints.is_empty();
+        self.historical_replay_generation = carry.historical_replay_generation;
+        self.context_curve_capability_enabled = carry.context_curve_capability_enabled;
+        self.context_curve_replay_epoch = carry.context_curve_replay_epoch;
+        self.completed_context_curve_replay_generation =
+            carry.completed_context_curve_replay_generation;
     }
 
     /// Apply the per-record checks one record at a time: drop a non-RFC3339

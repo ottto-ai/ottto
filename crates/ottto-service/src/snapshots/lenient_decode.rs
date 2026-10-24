@@ -419,9 +419,11 @@ fn header_field(name: &str) -> bool {
     )
 }
 /// SI-718-O1: the session-identity state a user Repair override rebuild
-/// carries from the damaged index (`ScanIndex::carry_identity_from`). Each
-/// uses the load's own strict decoder; the accepted ledger keeps the load's
-/// rule that a malformed fingerprint vouched for nothing.
+/// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
+/// replay generations without which the rebuild would arm a replay the
+/// damaged index had completed (that replay clears carried state). Each uses
+/// the load's own strict decoder; the accepted ledger keeps the load's rule
+/// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "session_account_bindings",
     "claude_account_deferred_holds",
@@ -432,6 +434,10 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "claude_duplicate_request_owners",
     "claude_duplicate_request_witness_overflowed",
     "accepted_snapshot_fingerprints",
+    "historical_replay_generation",
+    "context_curve_capability_enabled",
+    "context_curve_replay_epoch",
+    "completed_context_curve_replay_generation",
 ];
 #[derive(Default)]
 struct Counts {

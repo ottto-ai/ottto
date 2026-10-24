@@ -2631,6 +2631,11 @@ fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
     ))
     .unwrap();
     index.claude_duplicate_request_witness_overflowed = true;
+    // A replay and a curve replay this index had already completed.
+    index.historical_replay_generation = Some("replay-generation".into());
+    index.context_curve_capability_enabled = true;
+    index.context_curve_replay_epoch = 3;
+    index.completed_context_curve_replay_generation = Some("curve-generation".into());
     assert!(!index.accepted_snapshot_fingerprints.is_empty());
     index
 }
@@ -2676,6 +2681,32 @@ fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
     );
     assert_eq!(
         index.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+        "{context}"
+    );
+    assert_eq!(
+        index.historical_replay_generation, seed.historical_replay_generation,
+        "{context}"
+    );
+    assert!(index.context_curve_capability_enabled, "{context}");
+    assert_eq!(index.context_curve_replay_epoch, 3, "{context}");
+    // The completed replays stay complete: no spurious replay preparation
+    // clears the carried acknowledgements or owned-start census.
+    assert!(
+        !index.context_curve_replay_needed("curve-generation"),
+        "{context}"
+    );
+    let mut replayed = index.clone();
+    assert!(
+        !replayed.prepare_historical_replay("replay-generation".into()),
+        "{context}"
+    );
+    assert_eq!(
+        replayed.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+        "{context}"
+    );
+    assert_eq!(
+        as_json(&replayed.claude_owned_start_census),
+        as_json(&seed.claude_owned_start_census),
         "{context}"
     );
 }
