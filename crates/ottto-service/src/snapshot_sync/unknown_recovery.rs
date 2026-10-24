@@ -879,18 +879,16 @@ pub(super) fn replace(support: &Path, m: Manifest) -> Result<()> {
     *slot = m;
     Ok(())
 }
-pub(super) fn ack_saved(support: &Path, progress: &SnapshotUploadProgress) -> Result<()> {
+pub(super) fn ack_saved(support: &Path, _progress: &SnapshotUploadProgress) -> Result<()> {
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
     let Some(catalog) = catalogs.get_mut(support) else {
         return Ok(());
     };
     for m in &mut catalog.entries {
-        if !m.ack_saved
-            && catalog.awaiting_ack.contains(&m.id)
-            && m.entities
-                .iter()
-                .all(|e| progress.contains_body(&e.fingerprint, &e.witness))
-        {
+        // Complete validated outcomes include basis-present, held, refused and
+        // conflict dispositions. Their durable ACK ends UNKNOWN without ever
+        // recording an accepted body or retiring the applicable delivery debt.
+        if !m.ack_saved && catalog.awaiting_ack.contains(&m.id) {
             m.ack_saved = true;
             let ticket = outcome_ticket(support, m.clone(), m.terminal, m.not_before)?;
             OUTCOMES
@@ -1179,7 +1177,8 @@ pub(super) fn initial_post(
                 .map(|e| (e.root.as_str(), e.files.as_slice()))
                 .collect::<Vec<_>>();
             if m.entities.iter().any(|e| e.literal)
-                && !index.recovery_history_permitted(support, &roots)
+                && (!index.recovery_history_permitted(support, &roots)
+                    || current_literal_guard(index, &m) != LiteralPermit::Permit)
             {
                 return Err(Deferred {
                     reason: None,
@@ -1233,7 +1232,10 @@ pub(super) fn initial_post(
         .iter()
         .map(|e| (e.root.as_str(), e.files.as_slice()))
         .collect::<Vec<_>>();
-    if m.entities.iter().any(|e| e.literal) && !index.recovery_history_permitted(support, &roots) {
+    if m.entities.iter().any(|e| e.literal)
+        && (!index.recovery_history_permitted(support, &roots)
+            || current_literal_guard(index, &m) != LiteralPermit::Permit)
+    {
         return Err(Deferred {
             reason: None,
             not_before: now(support),

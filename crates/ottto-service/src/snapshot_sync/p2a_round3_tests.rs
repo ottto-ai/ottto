@@ -611,6 +611,9 @@ struct P2aControl {
     index_path: PathBuf,
     _env: Vec<EnvVarGuard>,
     previous_deadline: Option<Instant>,
+    // The real owner-B guard is a documented composition dependency. This
+    // fixture explicitly supplies its Permit contract, never production logic.
+    _literal_guard: unknown_recovery::TestGuard,
     resource_receipt: bool,
     settlement_receipt: bool,
     accepted_history: usize,
@@ -661,6 +664,9 @@ impl P2aControl {
             cadence: IdentityPipelineCadence::new(),
             index_path,
             _env: env,
+            _literal_guard: unknown_recovery::guard_for_test(
+                unknown_recovery::LiteralPermit::Permit,
+            ),
             resource_receipt: false,
             settlement_receipt: false,
             accepted_history: 0,
@@ -3463,4 +3469,95 @@ fn p2a_unknown_known_ack_pending_selected_save_does_not_collide_with_fresh_offer
     control.cycle();
     assert!(unknown_recovery::active_for_test(&control.support).is_empty());
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for outcome in [
+        FinishOutcome::MoneyHeld,
+        FinishOutcome::MoneyRefused,
+        FinishOutcome::Permanent,
+        FinishOutcome::Dominated {
+            reason: "original_pair_candidate_unproved",
+            admit_residue: false,
+        },
+        FinishOutcome::Retryable,
+        FinishOutcome::Basis("dominated_by_head"),
+        FinishOutcome::Basis("usage_identical"),
+        FinishOutcome::Basis("future_basis_is_not_proof"),
+    ] {
+        for lost_first in [false, true] {
+            let mut control = P2aControl::new(if lost_first {
+                FinishOutcome::LostUncommitted
+            } else {
+                outcome
+            });
+            let _live = money::LiveForTest::new(&control.support);
+            let now = current_unix_seconds();
+            {
+                let _clock = money::PageClockForTest::new(&control.support, now);
+                control.cycle();
+            }
+            let original = control.server.raw_batches.lock().unwrap()[0].clone();
+            if lost_first {
+                control.restart();
+                *control.server.outcome.lock().unwrap() = outcome;
+                let _clock = money::PageClockForTest::new(&control.support, now + 300);
+                control.cycle();
+                assert_eq!(control.server.raw_batches.lock().unwrap()[1], original);
+            }
+            let elapsed = if lost_first { 300 } else { 0 };
+            let _clock = money::PageClockForTest::new(&control.support, now + elapsed);
+            let attempts = unknown_recovery::active_for_test(&control.support);
+            assert!(attempts.iter().all(|m| m.ack_saved), "{outcome:?}");
+            assert_eq!(
+                control.server.raw_batches.lock().unwrap().len(),
+                if lost_first { 2 } else { 1 }
+            );
+            let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+            let progress = SnapshotUploadProgress::load(
+                &snapshot_upload_progress_path(&control.index_path),
+                &namespace,
+                snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            )
+            .unwrap();
+            let original: serde_json::Value = serde_json::from_str(&original).unwrap();
+            let fp = original["snapshots"][0]["snapshot_fingerprint"]
+                .as_str()
+                .unwrap();
+            assert!(
+                !progress.accepted_fingerprints.contains(fp)
+                    && !progress.accepted_body_witnesses.contains_key(fp),
+                "nonstored ACK is never body acceptance: {outcome:?}"
+            );
+            assert!(!progress.quarantined_fingerprints.is_empty());
+            assert!(!control.saved().accepted_snapshot_fingerprint_recorded(fp));
+            control.restart();
+            control.recovery_startup(now + elapsed);
+            assert!(
+                unknown_recovery::due(&control.support, now + 3600)
+                    .unwrap()
+                    .0
+                    .is_empty(),
+                "a validated disposition must never run another UNKNOWN replay: {outcome:?}"
+            );
+            assert!(
+                money::money_due(
+                    &control.support,
+                    &control.transcript().to_string_lossy(),
+                    u64::MAX
+                ),
+                "nonstored ACK preserves delivery debt: {outcome:?}"
+            );
+        }
+    }
 }

@@ -12,6 +12,8 @@ enum FinishOutcome {
         retry_after: u64,
     },
     MoneyHeld,
+    MoneyRefused,
+    Basis(&'static str),
     MoneyRouteUnavailable,
     Permanent,
     Retryable,
@@ -166,6 +168,7 @@ impl FinishServer {
                     let reason = match outcome {
                         FinishOutcome::Dominated { reason, .. } => reason,
                         FinishOutcome::MoneyHeld => "usage_decrease_held_for_review",
+                        FinishOutcome::MoneyRefused => "usage_decrease_refused_after_review",
                         _ => "invalid",
                     };
                     let rejected = items
@@ -175,12 +178,12 @@ impl FinishServer {
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
                                 "reason":reason,"detail":"synthetic finish refusal",
-                                "permanent":!matches!(outcome, FinishOutcome::MoneyHeld),"occurrence_count":1
+                                "permanent":!matches!(outcome, FinishOutcome::MoneyHeld | FinishOutcome::MoneyRefused),"occurrence_count":1
                             })
                         })
                         .collect::<Vec<_>>();
-                    if matches!(outcome, FinishOutcome::Accept) {
-                        let entities = items.iter().map(|item| {
+                    if matches!(outcome, FinishOutcome::Accept | FinishOutcome::Basis(_)) {
+                        let mut entities = items.iter().map(|item| {
                             assert!(item.get("cache_observations").is_none());
                             assert!(item.get("context_curve").is_none());
                             let mut payload = serde_json::Map::new();
@@ -197,10 +200,20 @@ impl FinishServer {
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
                                 "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
                         }).collect::<Vec<_>>();
+                        let basis = if let FinishOutcome::Basis(basis) = outcome {
+                            for entity in &mut entities {
+                                entity["unchanged_basis"] = basis.into();
+                            }
+                            true
+                        } else {
+                            false
+                        };
                         serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
                             "session_ids":[],"disabled":false,"disabled_reason":null,
-                            "entity_ack_contract":"snapshot_entity_ack:v1","accepted_entities":entities,
-                            "unchanged_entities":[],"rejected_entities":[],"conflict_entities":[]})
+                            "entity_ack_contract":"snapshot_entity_ack:v1",
+                            "accepted_entities":if basis { Vec::new() } else { entities.clone() },
+                            "unchanged_entities":if basis { entities } else { Vec::new() },
+                            "rejected_entities":[],"conflict_entities":[]})
                     } else {
                         serde_json::json!({"accepted":0,"sessions_reconciled":0,"session_ids":[],
                         "disabled":false,"disabled_reason":null,
