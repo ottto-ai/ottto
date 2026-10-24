@@ -1763,10 +1763,11 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
 /// while its local proof is unhealthy: it is read against the retained
 /// witness (a bounded RetryPending record re-forms), never as a new file,
 /// and nothing is offered. Once the evidence is healthy, its next changed
-/// revision re-proves and its current body is offered exactly once: the old
-/// body is never re-sent as new history, nothing is offered twice across
-/// later cycles, and the root is never dropped (indexed, accepted, tombstone
-/// cleared). #712's history hold over a returning member is
+/// revision (a note, so the request set still matches the witness)
+/// re-proves and its body is offered exactly once with the same usage: never
+/// added again as new history, nothing offered twice across later cycles,
+/// and the root is never dropped (indexed, accepted, tombstone cleared).
+/// #712's history hold over a returning member is
 /// `tombstoned_returning_history_obeys_the_move_hold` above.
 #[test]
 #[serial]
@@ -1843,22 +1844,21 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
     assert_eq!(record.failed_reconstruction_count, 1);
     assert!(returned.index.claude_family_tombstoned_for_test(root));
 
-    // Healthy evidence and a changed revision: it re-proves, and its current
-    // body is offered once.
+    // Healthy evidence and a changed revision that adds no request (a new
+    // request would no longer match the retained witness): it re-proves, and
+    // its body is offered once.
     let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
         .replace_nanosecond(0)
         .unwrap()
         .format(&Rfc3339)
         .unwrap();
-    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
-        "sessionId": root, "requestId": "req_3",
-        "message": {"id": "m3", "model": "claude-haiku-4-5",
-        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    let note = serde_json::json!({"timestamp": at, "type": "user", "sessionId": root,
+        "message": {"role": "user", "content": "synthetic note"}});
     std::fs::OpenOptions::new()
         .append(true)
         .open(&transcript)
         .unwrap()
-        .write_all(format!("{grown}\n").as_bytes())
+        .write_all(format!("{note}\n").as_bytes())
         .unwrap();
     write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
     // It starts with the RetryPending record, which withholds this scan's
@@ -1867,11 +1867,19 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
     assert!(proved.result.is_ok(), "{:?}", proved.result);
     let later = pipeline.cycle(t0 + 2_400);
     assert!(later.result.is_ok(), "{:?}", later.result);
-    let reoffered = root_offers(&pipeline.server.offered()[offered_before..]);
+    let offered = pipeline.server.offered();
+    let reoffered = root_offers(&offered[offered_before..]);
     assert_eq!(reoffered.len(), 1, "re-offered exactly once: {reoffered:?}");
-    assert_ne!(
-        reoffered[0], accepted[0],
-        "the old body is never re-sent as new history"
+    let body = |fingerprint: &str| {
+        offered
+            .iter()
+            .find(|offer| fingerprint_of(offer) == fingerprint)
+            .unwrap()
+    };
+    assert_eq!(
+        usage_of(body(&reoffered[0])),
+        usage_of(body(&accepted[0])),
+        "the same usage, never added again as new history"
     );
     assert!(later.index.files.contains_key(&key), "never dropped");
     assert!(later
