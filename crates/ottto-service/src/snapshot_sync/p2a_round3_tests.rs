@@ -236,7 +236,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 let (preparation, index, scan) =
                     collect_native_preparation_with_rotation(frame, false);
                 assert!(index.request_money_live_revision());
-                if ack_save_fault && cycle > 0 {
+                if ack_save_fault && (1..=2).contains(&cycle) {
                     assert!(
                         !index.request_money_adoption_paused(),
                         "UNKNOWN cannot veto the entire context"
@@ -250,8 +250,9 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                         "the uncertain batch retains its contributing file"
                     );
                     assert!(
-                        scan.snapshots.is_empty(),
-                        "held file cannot create a successor offer"
+                        scan.snapshots.iter().all(|item| item.source_file_fingerprint.as_deref()
+                            .is_some_and(|fp| index.claude_history_emission_held(fp).is_some())),
+                        "every locally retained body remains UNKNOWN-held before finish's emission veto"
                     );
                 }
 
@@ -364,8 +365,9 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     "paused retry completes its local work: {result:?}"
                 );
                 assert!(
-                    unknown_recovery::blocked_file(&support, &transcript.to_string_lossy(), None),
-                    "failed ACK save must retain the batch-scoped unknown-outcome pause"
+                    unknown_recovery::blocked_file(&support, &transcript.to_string_lossy(), None)
+                        == (cycle == 1),
+                    "only a durable covering replay ACK ends the batch-scoped UNKNOWN hold"
                 );
                 assert_eq!(
                     server.offered.lock().unwrap().len(),
@@ -758,6 +760,23 @@ impl P2aControl {
     }
     fn cycle(&self) -> (usize, Vec<SnapshotItem>) {
         self.cycle_result().unwrap()
+    }
+    // Negative transport fixtures require the production's exact deferred
+    // outcome; ordinary positive controls keep cycle().unwrap() unchanged.
+    fn cycle_deferred(&self) {
+        Self::assert_deferred(self.cycle_result());
+    }
+    fn assert_deferred(result: Result<(usize, Vec<SnapshotItem>)>) {
+        let error = result.expect_err("this boundary must report unsettled delivery");
+        let deferred = error
+            .downcast_ref::<SnapshotEntityDeferred>()
+            .expect("only the typed unsettled-entity result is expected");
+        assert!(deferred.count > 0);
+    }
+    fn with_recovery_evidence(outcome: FinishOutcome) -> Self {
+        let control = Self::new(outcome);
+        write_native_bootstrap_sidecars(&control.fixture, &control.support);
+        control
     }
     fn cycle_result(&self) -> Result<(usize, Vec<SnapshotItem>)> {
         self.cycle_changing(|_| {})
@@ -1994,6 +2013,7 @@ fn p2a_continuously_changing_evidence_finishes_frozen_epoch_then_next_epoch() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::new(FinishOutcome::Accept);
     let _live = money::LiveForTest::new(&control.support);
+    control.recovery_startup(current_unix_seconds());
     let mut sequence = 0;
     let mut counts = Vec::new();
     for epoch in 0..2 {
@@ -2791,11 +2811,11 @@ fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     for lost in [FinishOutcome::LostCommitted, FinishOutcome::LostUncommitted] {
-        let mut control = P2aControl::new(lost);
+        let mut control = P2aControl::with_recovery_evidence(lost);
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
         assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
         let original = control.server.raw_batches.lock().unwrap()[0].clone();
         let committed_before = control.server.committed.lock().unwrap().len();
@@ -2862,12 +2882,14 @@ fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
-    control.cycle();
+    control.cycle_deferred();
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    let unavailable =
+        unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Unavailable);
     assert_eq!(
         unknown_recovery::current_literal_guard(
             &control.saved(),
@@ -2876,6 +2898,7 @@ fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
         unknown_recovery::LiteralPermit::Unavailable,
         "missing dependency is closed"
     );
+    drop(unavailable);
     control.restart();
     drop(clock);
     let _expired = money::PageClockForTest::new(&control.support, now + 86400);
@@ -2913,11 +2936,11 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for downgrade in [false, true] {
-        let control = P2aControl::new(FinishOutcome::LostCommitted);
+        let control = P2aControl::with_recovery_evidence(FinishOutcome::LostCommitted);
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
         control.recovery_startup(now);
         let m = unknown_recovery::active_for_test(&control.support)
             .pop()
@@ -3030,7 +3053,7 @@ fn p2a_unknown_mixed_batch_new_list_sends_none_unrelated_work_continues() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
-    let control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
@@ -3047,7 +3070,7 @@ fn p2a_unknown_mixed_batch_new_list_sends_none_unrelated_work_continues() {
             .replace("req_2", "unknown-sibling-2"),
     )
     .unwrap();
-    control.cycle();
+    control.cycle_deferred();
     let pending = unknown_recovery::active_for_test(&control.support);
     assert_eq!(pending.len(), 1);
     assert_eq!(
@@ -3104,12 +3127,12 @@ fn p2a_unknown_physical_three_replays_exhaustion_and_normal_return() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
-    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
     }
     for (slot, elapsed) in [300, 3600, 21600].into_iter().enumerate() {
         control.restart();
@@ -3158,11 +3181,11 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     for stop in [true, false] {
         crate::snapshots::restart_claude_reemission_stop_for_test();
-        let control = P2aControl::new(FinishOutcome::LostCommitted);
+        let control = P2aControl::with_recovery_evidence(FinishOutcome::LostCommitted);
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
         control.recovery_startup(now);
         if stop {
             crate::snapshots::latch_claude_reemission_stop_for_test();
@@ -3222,14 +3245,14 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     for status in [429, 503, 409, 412, 413, 422] {
-        let mut control = P2aControl::new(FinishOutcome::HttpFailure {
+        let mut control = P2aControl::with_recovery_evidence(FinishOutcome::HttpFailure {
             status,
             retry_after: 7200,
         });
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
         let m = unknown_recovery::active_for_test(&control.support)
             .pop()
             .unwrap();
@@ -3290,12 +3313,12 @@ fn p2a_unknown_cancel_after_counter_commit_consumes_slot_for_next_owner() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
-    let control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
     }
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
     let mut cancelled = false;
@@ -3368,26 +3391,25 @@ fn p2a_unknown_parked_capture_cannot_post_after_original_deadline() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let control = P2aControl::new(FinishOutcome::Accept);
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     let mut clock = Some(money::PageClockForTest::new(&control.support, now));
     let mut expired = false;
-    control
-        .cycle_changing(|_| {
-            if expired
-                || !money_resume::pending_for_test(&control.support)
-                || !control.server.raw_batches.lock().unwrap().is_empty()
-            {
-                return;
-            }
-            if !unknown_recovery::active_for_test(&control.support).is_empty() {
-                clock.take();
-                clock = Some(money::PageClockForTest::new(&control.support, now + 86400));
-                expired = true;
-            }
-        })
-        .unwrap();
+    let result = control.cycle_changing(|_| {
+        if expired
+            || !money_resume::pending_for_test(&control.support)
+            || !control.server.raw_batches.lock().unwrap().is_empty()
+        {
+            return;
+        }
+        if !unknown_recovery::active_for_test(&control.support).is_empty() {
+            clock.take();
+            clock = Some(money::PageClockForTest::new(&control.support, now + 86400));
+            expired = true;
+        }
+    });
+    P2aControl::assert_deferred(result);
     assert!(
         expired,
         "advance the clock after durable custody, before the first POST"
@@ -3424,7 +3446,7 @@ fn p2a_unknown_known_ack_pending_selected_save_does_not_collide_with_fresh_offer
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let control = P2aControl::new(FinishOutcome::Accept);
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
     let _live = money::LiveForTest::new(&control.support);
     let _reset = P2aConflictReset;
     P2A_INDEX_CONFLICT.with(|state| *state.borrow_mut() = Some(control.index_path.clone()));
@@ -3496,7 +3518,7 @@ fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
         FinishOutcome::Basis("future_basis_is_not_proof"),
     ] {
         for lost_first in [false, true] {
-            let mut control = P2aControl::new(if lost_first {
+            let mut control = P2aControl::with_recovery_evidence(if lost_first {
                 FinishOutcome::LostUncommitted
             } else {
                 outcome
@@ -3505,7 +3527,11 @@ fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
             let now = current_unix_seconds();
             {
                 let _clock = money::PageClockForTest::new(&control.support, now);
-                control.cycle();
+                if lost_first || matches!(outcome, FinishOutcome::Retryable) {
+                    control.cycle_deferred();
+                } else {
+                    control.cycle();
+                }
             }
             let original = control.server.raw_batches.lock().unwrap()[0].clone();
             if lost_first {
@@ -3539,7 +3565,14 @@ fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
                     && !progress.accepted_body_witnesses.contains_key(fp),
                 "nonstored ACK is never body acceptance: {outcome:?}"
             );
-            assert!(!progress.quarantined_fingerprints.is_empty());
+            assert!(
+                progress.quarantined_fingerprints.contains_key(fp)
+                    || control
+                        .saved()
+                        .quarantined_snapshot_fingerprints
+                        .contains_key(fp),
+                "the exact nonstored body retains its durable disposition: {outcome:?}"
+            );
             assert!(!control.saved().accepted_snapshot_fingerprint_recorded(fp));
             control.restart();
             control.recovery_startup(now + elapsed);
@@ -3573,12 +3606,12 @@ fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
     }
     let attempt = unknown_recovery::active_for_test(&control.support)
         .pop()
@@ -3650,7 +3683,7 @@ fn p2a_unknown_partial_200_records_only_covering_siblings() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let now = current_unix_seconds();
     let sibling = "22222222-2222-4222-8222-222222222222";
@@ -3667,7 +3700,7 @@ fn p2a_unknown_partial_200_records_only_covering_siblings() {
     .unwrap();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle();
+        control.cycle_deferred();
     }
     let attempt = unknown_recovery::active_for_test(&control.support)
         .pop()
@@ -3736,13 +3769,17 @@ fn p2a_unknown_last_replay_saved_ack_failed_selection_stays_known_at_expiry() {
         return;
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
-    let mut control = P2aControl::new(FinishOutcome::LostUncommitted);
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     let _live = money::LiveForTest::new(&control.support);
     let _reset = P2aConflictReset;
     let now = current_unix_seconds();
     for elapsed in [0, 300, 3600] {
         let _clock = money::PageClockForTest::new(&control.support, now + elapsed);
-        control.cycle();
+        if elapsed == 0 {
+            control.cycle_deferred();
+        } else {
+            control.cycle();
+        }
         control.restart();
     }
     *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
