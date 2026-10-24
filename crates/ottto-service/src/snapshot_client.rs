@@ -290,10 +290,10 @@ fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
     let mut excerpt = Vec::new();
     let code = response
         .into_reader()
-        .take(SHED_BODY_EXCERPT_BYTES)
+        .take(16 * 1024)
         .read_to_end(&mut excerpt)
         .ok()
-        .and_then(|_| shed_code(&excerpt));
+        .and_then(|_| shed_code(&excerpt[..excerpt.len().min(SHED_BODY_EXCERPT_BYTES as usize)]));
     let request_owned_route_unavailable = serde_json::from_slice::<Value>(&excerpt)
         .ok()
         .is_some_and(|body| {
