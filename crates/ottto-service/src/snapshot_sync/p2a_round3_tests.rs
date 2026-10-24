@@ -413,7 +413,8 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     result.is_ok(),
                     "recovery selected-save convergence: {result:?}"
                 );
-                assert_eq!(server.offered.lock().unwrap().len(), 2);
+                let offered = server.offered.lock().unwrap();
+                assert_eq!(offered.len(), 2, "{}", recovery_offer_difference(&offered));
                 assert!(saved
                     .files
                     .values()
@@ -2887,8 +2888,34 @@ fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
             &control.transcript().to_string_lossy(),
             u64::MAX
         ));
-        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+        let offers = control.offers();
+        assert_eq!(
+            control.server.raw_batches.lock().unwrap().len(),
+            2,
+            "{}",
+            recovery_offer_difference(&offers)
+        );
     }
+}
+
+// Synthetic HTTP fixture diagnostics only. Keep the exact physical-POST bound
+// while exposing which entity fields an unexpected successor changed.
+fn recovery_offer_difference(offers: &[serde_json::Value]) -> String {
+    let Some(first) = offers.first().and_then(serde_json::Value::as_object) else {
+        return "no fixture offers".into();
+    };
+    let Some(last) = offers.last().and_then(serde_json::Value::as_object) else {
+        return "no final fixture offer".into();
+    };
+    first
+        .keys()
+        .chain(last.keys())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|key| first.get(*key) != last.get(*key))
+        .map(|key| format!("{key}: {:?} -> {:?}", first.get(key), last.get(key)))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 #[test]
