@@ -365,7 +365,13 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     "paused retry completes its local work: {result:?}"
                 );
                 assert!(
-                    unknown_recovery::blocked_file(&support, &transcript.to_string_lossy(), None)
+                    unknown_recovery::active_for_test(&support)
+                        .iter()
+                        .any(|attempt| !attempt.ack_saved
+                            && attempt.entities.iter().any(|entity| entity
+                                .files
+                                .iter()
+                                .any(|file| file == transcript.to_string_lossy().as_ref())))
                         == (cycle == 1),
                     "only a durable covering replay ACK ends the batch-scoped UNKNOWN hold"
                 );
