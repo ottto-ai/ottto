@@ -28283,6 +28283,8 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
         }
         if source == SnapshotSource::ClaudeCode {
+            #[cfg(test)]
+            claude_native_delay_for_test(path);
             // P1 money shadow: a side capture only where the shadow is armed.
             let mut capture = claude_request_money::ClaudeResponseCapture::begin(path);
             accumulator.finalize_claude_responses_captured(capture.as_mut());
@@ -31349,6 +31351,33 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
         ClaudeForkLineProvenance::Inherited
     } else {
         ClaudeForkLineProvenance::Invalid
+    }
+}
+
+/// Native scan time a test injects before each Claude finalizer under a
+/// root (a production-shaped slow native page: seconds of native I/O
+/// between money finalizers). Production scanning is unchanged.
+#[cfg(test)]
+static CLAUDE_NATIVE_DELAY_FOR_TEST: std::sync::Mutex<Option<(PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_claude_native_delay_for_test(delay: Option<(PathBuf, std::time::Duration)>) {
+    *CLAUDE_NATIVE_DELAY_FOR_TEST
+        .lock()
+        .expect("native delay control") = delay;
+}
+
+#[cfg(test)]
+fn claude_native_delay_for_test(path: &Path) {
+    let delay = CLAUDE_NATIVE_DELAY_FOR_TEST
+        .lock()
+        .expect("native delay control")
+        .as_ref()
+        .filter(|(root, _)| path.starts_with(root))
+        .map(|(_, delay)| *delay);
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
     }
 }
 

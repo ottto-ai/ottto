@@ -46,7 +46,9 @@ const MAX_MESSAGE_IDS: usize = 131_072;
 static CAPTURE_RESERVED: AtomicUsize = AtomicUsize::new(0);
 
 /// Cumulative work allowance, independent of resident refunds. Reset once,
-/// before the page's native finalizers. Time counts capture work, not parsing.
+/// before the page's native finalizers. Time counts capture work, not parsing:
+/// `micros` sums the money sections only, and `first` (the first money
+/// finalizer) dates the native time between them for the receipt alone.
 #[derive(Default)]
 struct Work {
     input: usize,
@@ -171,8 +173,10 @@ pub(crate) fn begin_page(scope: &Path) {
     }
 }
 
-/// One wall deadline begins with the first money finalizer, never at
-/// native page start. Native gaps consume it without adding money time.
+/// The page's money clock starts with its first money finalizer, never at
+/// native page start. It counts money sections only (`MoneyTimer`): native
+/// time between or after finalizers is never charged (MONEY decision,
+/// superseding the one absolute wall deadline).
 fn start_clock(scope: &Path, first: Instant) {
     if let Ok(mut pages) = WORK.lock() {
         let work = pages.entry(scope.to_path_buf()).or_default();
@@ -210,35 +214,37 @@ impl Drop for MoneyTimer {
 }
 
 pub(super) struct PageClock {
+    /// `shadow_started` plus what is left of the page's money budget after
+    /// capture: the shadow and closing are one contiguous wall interval.
     pub(super) deadline: Instant,
+    /// Accumulated capture (money) time, charged against the budget.
     pub(super) capture_us: u64,
+    /// Native wall time from the first money finalizer to shadow entry,
+    /// minus capture time. Receipt only: never charged.
+    pub(super) native_us: u64,
 }
 
+/// The page's money budget is money-added time only: accumulated capture
+/// time plus the shadow measured from its entry, at most
+/// `PAGE_MAX_ELAPSED` in total. Taking it ends the page's capture clock, so
+/// a page never gets a refreshed budget; a page without captures starts its
+/// money clock at shadow entry.
 pub(super) fn take_page_clock(scope: &Path, shadow_started: Instant) -> PageClock {
-    WORK.lock().map_or(
-        PageClock {
-            deadline: shadow_started + super::PAGE_MAX_ELAPSED,
-            capture_us: 0,
-        },
-        |mut pages| {
-            let work = pages.entry(scope.to_path_buf()).or_default();
-            let first = work.first.take();
-            PageClock {
-                deadline: first.unwrap_or(shadow_started) + super::PAGE_MAX_ELAPSED,
-                capture_us: if first.is_some() { work.micros } else { 0 },
+    let (capture_us, native_us) = WORK.lock().map_or((0, 0), |mut pages| {
+        let work = pages.entry(scope.to_path_buf()).or_default();
+        match work.first.take() {
+            Some(first) => {
+                let wall = shadow_started.saturating_duration_since(first).as_micros() as u64;
+                (work.micros, wall.saturating_sub(work.micros))
             }
-        },
-    )
-}
-
-/// Functional shadow fixtures exclude setup/writer waits explicitly. The
-/// native-gap and lock receipts use the real clock and never call this.
-#[cfg(test)]
-pub(super) fn shadow_clock_for_test(scope: &Path) {
-    if let Ok(mut pages) = WORK.lock() {
-        if let Some(work) = pages.get_mut(scope).filter(|work| work.first.is_some()) {
-            work.first = Some(Instant::now() - Duration::from_micros(work.micros));
+            None => (0, 0),
         }
+    });
+    PageClock {
+        deadline: shadow_started
+            + super::PAGE_MAX_ELAPSED.saturating_sub(Duration::from_micros(capture_us)),
+        capture_us,
+        native_us,
     }
 }
 
@@ -251,9 +257,6 @@ fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
             || input > PAGE_INPUT_BYTES
             || comparisons > PAGE_COMPARISONS
             || work.micros >= PAGE_CAPTURE_US
-            || work
-                .first
-                .is_some_and(|first| first.elapsed() >= Duration::from_micros(PAGE_CAPTURE_US))
         {
             work.exhausted = true;
             return false;
@@ -839,39 +842,92 @@ pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {
 mod bounded_tests {
     use super::*;
 
+    fn charge_money_for_test(scope: &Path, micros: u64) {
+        let mut pages = WORK.lock().unwrap();
+        let work = pages.get_mut(scope).expect("page clock started");
+        work.micros = work.micros.saturating_add(micros);
+    }
+
+    /// MONEY decision (supersedes the one absolute wall deadline): native
+    /// gaps between or after finalizers are never charged; capture stops at
+    /// 100 ms of accumulated capture time; the shadow gets only what capture
+    /// left of 250 ms; and a page never gets a refreshed budget.
     #[test]
-    fn native_gaps_never_refresh_the_absolute_money_deadline() {
+    fn native_gaps_are_never_charged_to_the_money_budget() {
+        let budget = super::super::PAGE_MAX_ELAPSED;
         let scope = PathBuf::from("money-clock-native-gap");
         begin_page(&scope);
         let first = Instant::now() - Duration::from_millis(110);
         start_clock(&scope, first);
         assert!(
+            spend_work(&scope, 1, 1),
+            "a 110 ms native gap is not capture time"
+        );
+        charge_money_for_test(&scope, PAGE_CAPTURE_US - 1);
+        assert!(spend_work(&scope, 1, 1), "below 100 ms of capture time");
+        charge_money_for_test(&scope, 1);
+        assert!(
             !spend_work(&scope, 1, 1),
-            "native gap alone exhausts capture's 100 ms slice"
+            "capture refuses at 100 ms of accumulated capture time"
         );
         start_clock(&scope, Instant::now());
-        let clock = take_page_clock(&scope, Instant::now());
-        assert_eq!(clock.deadline, first + super::super::PAGE_MAX_ELAPSED);
         assert_eq!(
-            clock.capture_us, 0,
-            "native time is not charged as added money work"
+            work_for_test(&scope).2,
+            PAGE_CAPTURE_US,
+            "a later finalizer never refreshes the page's money clock"
         );
+        assert!(
+            !spend_work(&scope, 1, 1),
+            "refusal stays latched for the page"
+        );
+        let shadow_started = Instant::now();
+        let clock = take_page_clock(&scope, shadow_started);
+        assert_eq!(clock.capture_us, PAGE_CAPTURE_US);
+        assert_eq!(
+            clock.deadline,
+            shadow_started + budget - Duration::from_micros(PAGE_CAPTURE_US),
+            "the shadow gets only what capture left: capture plus shadow is 250 ms"
+        );
+        assert!(
+            clock.native_us >= 10_000,
+            "native receipt: {}",
+            clock.native_us
+        );
+        let following = Instant::now();
+        assert_eq!(
+            take_page_clock(&scope, following).deadline,
+            following + budget,
+            "a following Skip with no capture has its own money clock from shadow entry"
+        );
+
         begin_page(&scope);
         let first = Instant::now() - Duration::from_millis(260);
         start_clock(&scope, first);
+        charge_money_for_test(&scope, 20);
         let shadow_started = Instant::now();
         let clock = take_page_clock(&scope, shadow_started);
-        assert_eq!(clock.deadline, first + super::super::PAGE_MAX_ELAPSED);
-        assert!(
-            clock.deadline < shadow_started,
-            "shadow cannot start a fresh allowance after native work"
-        );
+        assert_eq!(clock.capture_us, 20);
         assert_eq!(
-            take_page_clock(&scope, shadow_started).deadline,
-            shadow_started + super::super::PAGE_MAX_ELAPSED,
-            "a following Skip with no capture has its own money deadline"
+            clock.deadline,
+            shadow_started + budget - Duration::from_micros(20),
+            "a 260 ms native gap leaves the money budget intact"
         );
-        println!("MONEY_P1B_CLOCK native_gap_ms=260 capture_after_100ms=refused deadline_refreshed=0 native_charged_us=0");
+        assert!(clock.deadline > shadow_started);
+        assert!(
+            clock.native_us >= 259_000,
+            "native receipt: {}",
+            clock.native_us
+        );
+
+        begin_page(&scope);
+        start_clock(&scope, Instant::now());
+        charge_money_for_test(&scope, budget.as_micros() as u64 + 1);
+        let shadow_started = Instant::now();
+        assert!(
+            take_page_clock(&scope, shadow_started).deadline <= shadow_started,
+            "capture time alone exhausting 250 ms keeps the pre-admission refusal"
+        );
+        println!("MONEY_P1B_CLOCK native_gap_ms=110,260 native_charged_us=0 capture_refused_at_us={PAGE_CAPTURE_US} shadow_budget_after_capture_us={} total_money_us<=250000 deadline_refreshed=0 capture_exhausted_refusal=1", (budget - Duration::from_micros(PAGE_CAPTURE_US)).as_micros());
     }
 
     #[test]

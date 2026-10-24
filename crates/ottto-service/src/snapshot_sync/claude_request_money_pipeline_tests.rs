@@ -1395,7 +1395,12 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let native_started = std::time::Instant::now();
     let baseline = scan(&mut baseline_index);
     let baseline_scan_elapsed = native_started.elapsed();
-    money::enable_shadow_for_test(&fixture.support);
+    // The long native probe runs in its own shadow scope: it is admitted now,
+    // so its rows, memos and next-page plan must not reach the admitted
+    // replay probe below, which keeps its empty starting state.
+    let native_support = fixture.base.join("native-support");
+    std::fs::create_dir_all(&native_support).unwrap();
+    money::enable_shadow_for_test(&native_support);
     let mut armed_index = ScanIndex::default();
     let finalizers_started = std::time::Instant::now();
     let armed = scan(&mut armed_index);
@@ -1406,10 +1411,11 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(serde_json::to_vec(&baseline_index).unwrap(), serde_json::to_vec(&armed_index).unwrap());
     let now = census_pipeline_window("2026-08-02T08:00:00Z");
     // Credit waits and writer flushes are outside the production sync path.
+    money::store::prime_credit_for_test(&native_support, 0);
     money::store::prime_credit_for_test(&fixture.support, 0);
-    let run = |scan: &crate::snapshots::SourceScanResult, index: &ScanIndex, now| {
+    let run_in = |support: &std::path::Path, scan: &crate::snapshots::SourceScanResult, index: &ScanIndex, now| {
         let started = std::time::Instant::now();
-        let counts = money::shadow_page_ready_for_test(&fixture.support, &scan.snapshots, index,
+        let counts = money::shadow_page_ready_for_test(support, &scan.snapshots, index,
             &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
             &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
         let elapsed = started.elapsed(); // includes closing, emit and handoff
@@ -1421,16 +1427,33 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         money::store::flush();
         (counts, elapsed)
     };
-    let (native_counts, native_shadow_elapsed) = run(&armed, &armed_index, now - 1);
+    let run = |scan: &crate::snapshots::SourceScanResult, index: &ScanIndex, now| run_in(&fixture.support, scan, index, now);
+    let (native_counts, native_shadow_elapsed) = run_in(&native_support, &armed, &armed_index, now - 1);
     let native_money_us = native_shadow_elapsed.as_micros() + u128::from(native_counts.capture_us);
-    println!("MONEY_P1B_LOCK money_us={native_money_us} native_us={} native_baseline_us={} deadline_us=250000 ci_tolerance_us=25000 native_info_only=true", armed_scan_elapsed.as_micros().saturating_sub(u128::from(native_counts.capture_us)), baseline_scan_elapsed.as_micros());
-    assert_eq!(native_counts.refused_deadline, 1, "long native Full must not refresh the expired money deadline");
-    assert_eq!(native_counts.captures_taken, 0);
-    assert_eq!(native_counts.message_records_written, 0);
-    assert!(money_jsonl_rows(&fixture.support).iter().any(|row| row["row"] == "page" && row["observed_unix"] == now - 1 && row["refused"] == true && row["coverage_complete"] == false));
+    println!("MONEY_P1B_LOCK money_us={native_money_us} counted_money_us={} native_us={} armed_native_scan_us={} native_baseline_us={} refused_deadline={} families={} unbuilt={} deadline_us=250000 ci_tolerance_us=25000 native_charged_us=0", native_counts.money_us, native_counts.native_us, armed_scan_elapsed.as_micros(), baseline_scan_elapsed.as_micros(), native_counts.refused_deadline, native_counts.families, native_counts.families_unbuilt);
+    // MONEY decision (deliberate re-scope; supersedes the expectation "long
+    // native Full must not refresh the expired money deadline"): the 250 ms
+    // budget counts money-added time only, so native scan time between and
+    // after finalizers is never charged. A long native Full with small money
+    // work is admitted and accounts every family; the production-shaped
+    // regression `money_p1b_slow_native_scan_page_is_admitted_and_builds`
+    // proves the families are built and written.
+    assert_eq!(native_counts.refused_deadline, 0, "long native Full with small money work is admitted: {native_counts:?}");
+    assert!(native_counts.captures_taken > 0, "{native_counts:?}");
+    assert!(u128::from(native_counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{native_counts:?}");
+    let native_rows = money_jsonl_rows(&native_support);
+    let native_page = native_rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now - 1).unwrap();
+    assert_eq!(native_page["refused"], false, "{native_page}");
+    assert_eq!(native_rows.iter().filter(|row| row["row"] == "family").count() as u64, native_counts.families,
+        "the admitted native page accounts every family once");
+    assert_eq!(native_counts.families as usize, armed.snapshots.iter().map(|item|
+        item.attribution_facts.iter().find(|fact| fact.field == "root_session_ref")
+            .map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id)).collect::<BTreeSet<_>>().len());
+    money::disable_shadow_for_test(&native_support);
+    money::enable_shadow_for_test(&fixture.support);
     // Keep all admitted-page accounting/progress assertions below. Run the
-    // real finalizers on prepared synthetic input, so native I/O does not
-    // consume this separate probe's wall deadline before admission.
+    // real finalizers on prepared synthetic input, so this probe's capture
+    // work is deterministic (native I/O is no longer charged either way).
     let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &armed_index);
     money::capture::begin_page(&fixture.support);
     replay();
@@ -1535,6 +1558,65 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(money::reserved_for_test(), 0);
     println!("MONEY_P1B_FULL admitted_finalizer_probe=true reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
         armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, deadline_built, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Production regression (0.1.193): every money shadow page was refused
+/// with `refused_deadline=1` and 0 families built, although capture took
+/// 22-446 us and the shadow 8-36 us, because native collection pages took
+/// 7.5-8.6 s and the deadline ran in wall time from the first finalizer.
+/// MONEY decision: native time between finalizers is never charged. A real
+/// native scan with a ~300 ms injected native delay before each finalizer
+/// (far beyond 250 ms in total) and small money work is admitted, builds and
+/// writes families, and its money time stays within 250 ms.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_slow_native_scan_page_is_admitted_and_builds() {
+    const NATIVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+    let fixture = PipelineFixture::new("money-p1b-slow-native-scan");
+    money::enable_shadow_for_test(&fixture.support);
+    crate::snapshots::set_claude_native_delay_for_test(Some((fixture.root.clone(), NATIVE_DELAY)));
+    let mut index = ScanIndex::default();
+    let scan_started = std::time::Instant::now();
+    let scan = crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), &mut index, "2026-08-02T08:00:00Z", 183, 16, true);
+    let scan_elapsed = scan_started.elapsed();
+    crate::snapshots::set_claude_native_delay_for_test(None);
+    let scan = scan.expect("scan synthetic Claude root");
+    let files = scan.snapshots.len() as u32;
+    assert_eq!(files as usize, PIPELINE_SESSIONS.len());
+    assert!(scan_elapsed >= NATIVE_DELAY * files, "native delay injected before every finalizer: {scan_elapsed:?}");
+    let now = census_pipeline_window("2026-08-02T07:00:00Z") + 3600;
+    // Credit waits are outside the production sync path.
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    let started = std::time::Instant::now();
+    let counts = money::shadow_page_ready_for_test(&fixture.support, &scan.snapshots, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete, now);
+    let elapsed = started.elapsed(); // includes closing, emit and handoff
+    money::store::flush();
+    let combined = elapsed + std::time::Duration::from_micros(counts.capture_us);
+    println!("MONEY_P1B_SLOW_NATIVE files={files} native_delay_ms_per_file={} native_scan_us={} native_us={} capture_us={} shadow_closing_us={} combined_us={} counted_money_us={} refused_deadline={} families={} unbuilt={} captures_taken={} deadline_us=250000 ci_tolerance_us={}",
+        NATIVE_DELAY.as_millis(), scan_elapsed.as_micros(), counts.native_us, counts.capture_us, elapsed.as_micros(), combined.as_micros(), counts.money_us, counts.refused_deadline, counts.families, counts.families_unbuilt, counts.captures_taken, MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros());
+    assert_eq!(counts.refused_deadline, 0, "native time must not expire the money deadline: {counts:?}");
+    assert_eq!(counts.refused_budget, 0, "{counts:?}");
+    assert!(counts.captures_taken > 0, "{counts:?}");
+    assert_eq!(counts.families, u64::from(files), "{counts:?}");
+    assert!(counts.families_unbuilt < counts.families, "families are built: {counts:?}");
+    assert!(u128::from(counts.native_us) >= (NATIVE_DELAY * (files - 1)).as_micros(),
+        "native time between finalizers is received, not charged: {counts:?}");
+    assert!(combined <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE,
+        "capture plus shadow and closing stays within the money budget: {combined:?}: {counts:?}");
+    assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let page = rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now).unwrap();
+    assert_eq!(page["refused"], false, "{page}");
+    let families = rows.iter().filter(|row| row["row"] == "family").collect::<Vec<_>>();
+    assert_eq!(families.len() as u64, counts.families);
+    assert!(families.iter().any(|row| row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")),
+        "built families are written: {families:?}");
+    assert_eq!(money::reserved_for_test(), 0);
     money::disable_shadow_for_test(&fixture.support);
 }
 
