@@ -6,7 +6,7 @@
 /// A destination namespace hash: a snapshot fingerprint (64 lowercase hex),
 /// or the upload-progress load quarantines the file as invalid.
 const CONTINUATION_NAMESPACE: &str =
-    "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a";
+    "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3";
 /// The synthetic attribution key (a sentinel, not a real key).
 const CONTINUATION_SENTINEL_KEY: [u8; 32] = [0x5a; 32];
 
