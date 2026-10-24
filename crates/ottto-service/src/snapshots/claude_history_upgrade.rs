@@ -1389,7 +1389,7 @@ mod tests {
             assert_eq!(
                 decide(
                     HistoryKind::Owed,
-                    &inputs(&list, false, MAX_GATED_CLAUDE_REVISION + 1),
+                    &inputs(&list, false, 4),
                     &mut page,
                     "k",
                     1
@@ -1399,7 +1399,7 @@ mod tests {
             assert_eq!(
                 decide(
                     HistoryKind::Changed,
-                    &inputs(&list, true, MAX_GATED_CLAUDE_REVISION + 1),
+                    &inputs(&list, true, 4),
                     &mut page,
                     "k",
                     1

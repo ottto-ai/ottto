@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 833,
-  "content_sha256": "1f4c871d0295438da75c62c0242a1775c012accc17ad18f2672cf875c05458d7",
+  "content_sha256": "78bde913827601ac3f1d342fe875eb8e2b6f16fc37bc67b97d2fbc6b82ed9299",
   "files": [
     {
       "executable": false,
@@ -1700,8 +1700,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_history_upgrade.rs",
-      "sha256": "79321b4f627e4516d0adb07808bb285db4022927dae333926613a1c41a1bec5d",
-      "size_bytes": 66681
+      "sha256": "dd265904499c0a3e490b4ecf4f33efb8dc1f55d8f9208d858edfbf70eb3ef51f",
+      "size_bytes": 66625
     },
     {
       "executable": false,
