@@ -1882,44 +1882,45 @@ async fn build_page_at(
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     };
     let complete_through = telemetry_complete_through(ledger_view);
-    // One global representative map per page, not a full-index scan for each
-    // item/request. Ranks include aliases outside this page and aliases that
-    // do not themselves carry a particular request.
-    let mut primary_holders = BTreeMap::<(Option<&str>, String, String), &str>::new();
-    for key in index.files.keys() {
-        if Instant::now() >= deadline {
-            counts.refused_deadline = 1;
-            return refuse(&end, None, index, roots.len(), counts);
+    // Classification needs one global representative map, including aliases
+    // outside this page. An empty page never uses the context: do not allocate
+    // two full-index maps for the gate-OFF shadow housekeeping path.
+    if !by_root.is_empty() {
+        let mut primary_holders = BTreeMap::<(Option<&str>, String, String), &str>::new();
+        for key in index.files.keys() {
+            if Instant::now() >= deadline {
+                counts.refused_deadline = 1;
+                return refuse(&end, None, index, roots.len(), counts);
+            }
+            if let Some((root, member)) = logical_family_member(index, key) {
+                let primary = primary_holders
+                    .entry((
+                        claude_request_ledger::claude_project_group(key),
+                        root,
+                        member,
+                    ))
+                    .or_insert(key);
+                if selection::primary_order(index, key) < selection::primary_order(index, primary) {
+                    *primary = key;
+                }
+            }
         }
-        if let Some((root, member)) = logical_family_member(index, key) {
-            let primary = primary_holders
-                .entry((
+        for key in index.files.keys() {
+            if Instant::now() >= deadline {
+                counts.refused_deadline = 1;
+                return refuse(&end, None, index, roots.len(), counts);
+            }
+            if let Some((root, member)) = logical_family_member(index, key) {
+                if let Some(primary) = primary_holders.get(&(
                     claude_request_ledger::claude_project_group(key),
                     root,
                     member,
-                ))
-                .or_insert(key);
-            if selection::primary_order(index, key) < selection::primary_order(index, primary) {
-                *primary = key;
+                )) {
+                    sessions.insert(key.clone(), (*primary).to_owned());
+                }
             }
         }
     }
-    for key in index.files.keys() {
-        if Instant::now() >= deadline {
-            counts.refused_deadline = 1;
-            return refuse(&end, None, index, roots.len(), counts);
-        }
-        if let Some((root, member)) = logical_family_member(index, key) {
-            if let Some(primary) = primary_holders.get(&(
-                claude_request_ledger::claude_project_group(key),
-                root,
-                member,
-            )) {
-                sessions.insert(key.clone(), (*primary).to_owned());
-            }
-        }
-    }
-    drop(primary_holders);
     let ctx = ClaudeClassifyContext {
         index,
         ledger: ledger_view.census(),
