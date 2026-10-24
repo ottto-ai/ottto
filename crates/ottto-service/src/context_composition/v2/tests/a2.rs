@@ -239,7 +239,7 @@ fn audit_stays_within_budget_and_rotates_through_every_file() {
 
 #[test]
 fn audit_never_samples_files_counted_from_the_middle_or_changed() {
-    let env = Env::new("composition-a2-audit-eligible");
+    let env = Env::uninstalled("composition-a2-audit-eligible");
     let now = base_now();
     let cwd = env.cwd();
     // Old at install: counting starts at its end, so it is never sampled.
@@ -252,6 +252,7 @@ fn audit_never_samples_files_counted_from_the_middle_or_changed() {
         .unwrap()
         .set_modified(old_time)
         .unwrap();
+    env.run(Source::Claude, now - time::Duration::days(1), None);
     let live = whole_file(&env, "live", now);
     env.run(Source::Claude, now, None);
     append_records(&old, &claude_turn(&cwd, now.date(), 2));

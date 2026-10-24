@@ -3231,7 +3231,8 @@ fn failing_file_is_retried_once_then_quarantined() {
 
 #[test]
 fn resume_of_a_dormant_file_adds_residency_only_to_copied_days() {
-    let env = Env::new("composition-v2-dormant-resume");
+    // The first run is the install: the old file starts at its end.
+    let env = Env::uninstalled("composition-v2-dormant-resume");
     let now = base_now();
     let day = now.date();
     let old_day = day - time::Duration::days(20);
