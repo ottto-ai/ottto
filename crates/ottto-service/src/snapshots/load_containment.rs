@@ -706,6 +706,11 @@ fn override_scan_index_rebuild_loop(
             &format!("{cause} identity_decode={decode_kind}"),
         ));
     }
+    if !rebuilt.accepted_rebuild_incidence.is_empty() {
+        rebuilt
+            .accepted_rebuild_pending_since_unix_seconds
+            .get_or_insert(unix_seconds_at(now));
+    }
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
     let prior_stamp = match fs::read(&stamp_path) {
@@ -865,6 +870,12 @@ impl ScanIndex {
             self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
             self.admit_carried_ack_debt()?;
             self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
+            if !self.accepted_rebuild_incidence.is_empty() {
+                self.accepted_rebuild_pending_since_unix_seconds =
+                    carry.accepted_rebuild_pending_since_unix_seconds;
+                self.accepted_rebuild_last_alarm_unix_seconds =
+                    carry.accepted_rebuild_last_alarm_unix_seconds;
+            }
         }
         self.accepted_incidence_pending_census = !self.accepted_rebuild_incidence.is_empty();
         let (entries, bytes) = self.carried_ack_debt_size();
@@ -877,6 +888,74 @@ impl ScanIndex {
         self.completed_context_curve_replay_generation =
             carry.completed_context_curve_replay_generation;
         Ok(())
+    }
+
+    /// Keep the original pending clock when a partial settlement restores debt.
+    /// These two scalars are diagnostics, never a reason to retain/drop an ACK.
+    fn preserve_carried_ack_clock(&mut self, previous: &Self) {
+        self.accepted_rebuild_pending_since_unix_seconds = previous
+            .accepted_rebuild_pending_since_unix_seconds
+            .or(self.accepted_rebuild_pending_since_unix_seconds);
+        self.accepted_rebuild_last_alarm_unix_seconds = previous
+            .accepted_rebuild_last_alarm_unix_seconds
+            .max(self.accepted_rebuild_last_alarm_unix_seconds);
+    }
+
+    fn note_carried_ack_census(
+        &mut self,
+        source: SnapshotSource,
+        census_complete: bool,
+        now: SystemTime,
+    ) {
+        const STALLED_SECONDS: u64 = 7 * 24 * 60 * 60;
+        const ALARM_INTERVAL_SECONDS: u64 = 24 * 60 * 60;
+        let now = unix_seconds_at(now);
+        let age = if self.accepted_rebuild_incidence.is_empty() {
+            self.accepted_rebuild_pending_since_unix_seconds = None;
+            self.accepted_rebuild_last_alarm_unix_seconds = None;
+            0
+        } else {
+            let first = *self
+                .accepted_rebuild_pending_since_unix_seconds
+                .get_or_insert(now);
+            // Future stamps retain their original value; rollback cannot make
+            // age negative, restart the pending clock, or bypass the throttle.
+            now.saturating_sub(first)
+        };
+        if age > STALLED_SECONDS
+            && self
+                .accepted_rebuild_last_alarm_unix_seconds
+                .map_or(true, |last| {
+                    now.saturating_sub(last) >= ALARM_INTERVAL_SECONDS
+                })
+        {
+            self.accepted_rebuild_last_alarm_unix_seconds = Some(now);
+            emit_scan_index_containment_line(format!(
+                "local snapshot carried ACK debt: source={} carried_ack_pending_stalled=1 carried_ack_pending_age_seconds={age} alarm=1 retained=1 visibility_only=1",
+                source.api_slug()
+            ));
+        }
+        let retained_carried = self
+            .accepted_rebuild_incidence
+            .values()
+            .map(BTreeSet::len)
+            .sum::<usize>();
+        let history_held_carried = self
+            .accepted_rebuild_incidence
+            .iter()
+            .filter(|(key, _)| {
+                self.files.get(*key).is_some_and(|entry| {
+                    self.claude_history_emission_held(&entry.source_file_fingerprint)
+                        .is_some()
+                })
+            })
+            .map(|(_, members)| members.len())
+            .sum::<usize>()
+            .saturating_add(self.claude_history_emission.skipped_carried_entries);
+        emit_scan_index_containment_line(format!(
+            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} carried_ack_pending_age_seconds={age}",
+            source.api_slug(), census_complete
+        ));
     }
 
     fn carried_ack_fingerprints(&self) -> BTreeSet<String> {

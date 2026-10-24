@@ -2055,6 +2055,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "claude_desktop_store_retry_not_before_unix_seconds"
             | "bounded_sweep_unsettled_causes"
             | "context_curve_replay_epoch"
+            | "accepted_rebuild_pending_since_unix_seconds"
+            | "accepted_rebuild_last_alarm_unix_seconds"
             | "claude_history_cutoff_unix_seconds" => serde_json::json!(1),
             "legacy_settlement_reconcile_after_fingerprint" => serde_json::json!("0".repeat(64)),
             "upload_context_fingerprint"
@@ -3421,4 +3423,147 @@ fn carried_ack_for_unvisited_family_hold_survives_until_reconstruction() {
             .accepted_snapshot_fingerprints,
         actual_accepted
     );
+}
+
+#[test]
+fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() {
+    const START: u64 = 2_000_000_000;
+    const WEEK: u64 = 7 * 24 * 60 * 60;
+    let at = |seconds| UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+    for unknown in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("carried-ack-age");
+        let root = scratch.join("projects");
+        let path = scratch.join("index.json");
+        let session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join(format!("{session}.jsonl")), format!("{{\"timestamp\":\"2026-10-21T10:01:00Z\",\"sessionId\":\"{session}\",\"message\":{{\"id\":\"message\",\"model\":\"claude-opus-4-8\",\"usage\":{{\"input_tokens\":35,\"output_tokens\":8}}}}}}\n")).unwrap();
+        let source = SnapshotSource::ClaudeCode;
+        let scan = |index: &mut ScanIndex, now: &str| {
+            scan_source_roots(
+                source,
+                std::slice::from_ref(&root),
+                index,
+                now,
+                BACKFILL_WINDOW_DAYS,
+            )
+            .unwrap()
+        };
+        let mut seed = ScanIndex::default();
+        let first = scan(&mut seed, "2026-10-22T00:00:00Z");
+        assert_eq!(first.snapshots.len(), 1);
+        let accepted = first
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect::<BTreeSet<_>>();
+        seed.record_accepted_snapshot_fingerprints(&accepted);
+        if unknown {
+            seed.file_snapshot_fingerprints.clear();
+        }
+        let mut carried = ScanIndex::default();
+        carried.carry_identity_from(seed).unwrap();
+        let original = carried.accepted_rebuild_incidence.clone();
+        assert_eq!(original.contains_key(""), unknown);
+        carried.note_carried_ack_census(source, false, at(START));
+        carried.save(&path).unwrap();
+        let mut carried = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            carried.accepted_rebuild_pending_since_unix_seconds,
+            Some(START)
+        );
+        let before = scan_index_containment_lines_for_test().len();
+        carried.note_carried_ack_census(source, false, at(START + WEEK + 1));
+        carried.note_carried_ack_census(source, false, at(START + WEEK + 2));
+        carried.save(&path).unwrap();
+        let mut carried = ScanIndex::load(&path).unwrap();
+        carried.note_carried_ack_census(source, false, at(START + WEEK + 3));
+        let lines = scan_index_containment_lines_for_test();
+        assert_eq!(
+            lines[before..]
+                .iter()
+                .filter(|line| line.contains("carried_ack_pending_stalled=1"))
+                .count(),
+            1
+        );
+        assert!(lines[before..].iter().any(|line| line
+            .starts_with("local snapshot census: source=claude_code ")
+            && line.contains(&format!("carried_ack_pending_age_seconds={}", WEEK + 1))));
+        assert_eq!(carried.accepted_rebuild_incidence, original);
+        assert_eq!(carried.accepted_snapshot_fingerprints, accepted);
+        // A future first/alarm stamp is retained across clock rollback, not
+        // reset to a new pending period or allowed to underflow/re-alarm.
+        carried.note_carried_ack_census(source, false, at(START - 1));
+        assert_eq!(
+            carried.accepted_rebuild_pending_since_unix_seconds,
+            Some(START)
+        );
+        assert_eq!(
+            carried.accepted_rebuild_last_alarm_unix_seconds,
+            Some(START + WEEK + 1)
+        );
+        assert!(scan_index_containment_lines_for_test()
+            .last()
+            .unwrap()
+            .ends_with("carried_ack_pending_age_seconds=0"));
+        assert_eq!(
+            scan_index_containment_lines_for_test()[before..]
+                .iter()
+                .filter(|line| line.contains("carried_ack_pending_stalled=1"))
+                .count(),
+            1
+        );
+        let mut recarried = ScanIndex::default();
+        recarried.carry_identity_from(carried.clone()).unwrap();
+        assert_eq!(
+            recarried.accepted_rebuild_pending_since_unix_seconds,
+            Some(START)
+        );
+        assert_eq!(
+            recarried.accepted_rebuild_last_alarm_unix_seconds,
+            Some(START + WEEK + 1)
+        );
+        // A partial save that still owes the original files keeps their clock.
+        let partial =
+            carried.committable_subset(&carried.clone(), &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            partial.accepted_rebuild_pending_since_unix_seconds,
+            Some(START)
+        );
+        assert_eq!(
+            partial.accepted_rebuild_last_alarm_unix_seconds,
+            Some(START + WEEK + 1)
+        );
+        let release = scan(&mut carried, "2026-10-22T00:01:00Z");
+        assert!(release.census_complete);
+        assert_eq!(release.scanned_file_count, 1);
+        assert!(
+            release.snapshots.is_empty(),
+            "age diagnostics must never re-offer an ACK"
+        );
+        if unknown {
+            // Reconstructing a guessed file cannot retire unknown incidence.
+            assert_eq!(carried.accepted_rebuild_incidence, original);
+            assert_eq!(
+                carried.accepted_rebuild_pending_since_unix_seconds,
+                Some(START)
+            );
+            // Only an existing intentional replay release clears unknown debt.
+            assert!(carried.prepare_historical_replay("age-test-release".into()));
+        }
+        assert!(carried.accepted_rebuild_incidence.is_empty());
+        assert_eq!(carried.accepted_rebuild_pending_since_unix_seconds, None);
+        assert_eq!(carried.accepted_rebuild_last_alarm_unix_seconds, None);
+        carried.note_carried_ack_census(source, true, at(START + 2 * WEEK));
+        assert!(scan_index_containment_lines_for_test()
+            .last()
+            .unwrap()
+            .ends_with("carried_ack_pending_age_seconds=0"));
+        assert_eq!(
+            scan_index_containment_lines_for_test()[before..]
+                .iter()
+                .filter(|line| line.contains("carried_ack_pending_stalled=1"))
+                .count(),
+            1
+        );
+    }
 }

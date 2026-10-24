@@ -295,6 +295,8 @@ impl Serialize for ScanIndex {
         field!(claude_history_move_released, std::ops::Not::not);
         field!(accepted_incidence_pending_census, std::ops::Not::not);
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
+        field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
+        field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         map.end()
     }
 }
@@ -375,6 +377,8 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_history_move_released",
     "accepted_incidence_pending_census",
     "accepted_rebuild_incidence",
+    "accepted_rebuild_pending_since_unix_seconds",
+    "accepted_rebuild_last_alarm_unix_seconds",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -444,6 +448,8 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "file_snapshot_fingerprints",
     "accepted_incidence_pending_census",
     "accepted_rebuild_incidence",
+    "accepted_rebuild_pending_since_unix_seconds",
+    "accepted_rebuild_last_alarm_unix_seconds",
     "historical_replay_generation",
     "context_curve_capability_enabled",
     "context_curve_replay_epoch",
@@ -1626,6 +1632,14 @@ impl<R: BufRead + Seek> Decoder<R> {
                             // Damage keeps carried acknowledgements, never drops them.
                             index.accepted_incidence_pending_census =
                                 self.history_scalar(value, true)?;
+                        }
+                        "accepted_rebuild_pending_since_unix_seconds" => {
+                            index.accepted_rebuild_pending_since_unix_seconds =
+                                self.history_scalar(value, None)?;
+                        }
+                        "accepted_rebuild_last_alarm_unix_seconds" => {
+                            index.accepted_rebuild_last_alarm_unix_seconds =
+                                self.history_scalar(value, None)?;
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
