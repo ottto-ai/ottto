@@ -81,8 +81,11 @@ struct TrackedKey {
     /// Rearm stamps (unix seconds), at most the two most recent.
     attempts: Vec<u64>,
     flags: u8,
+    /// Read from the earlier `"<flags>:<stamps>:<prior>"` form; moved into
+    /// the saved priors at the next apply and never written back.
+    legacy_prior: Option<String>,
 }
-crate::heap_layout_bound::fields!(TrackedKey; attempts, flags);
+crate::heap_layout_bound::fields!(TrackedKey; attempts, flags, legacy_prior);
 
 impl Serialize for TrackedKey {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -99,9 +102,14 @@ impl<'de> Deserialize<'de> for TrackedKey {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let malformed = || <D::Error as serde::de::Error>::custom("rebuild guard key");
         let text = String::deserialize(deserializer)?;
-        let Some((flags, attempts)) = text.split_once(':') else {
+        let mut parts = text.splitn(3, ':');
+        let (Some(flags), Some(attempts)) = (parts.next(), parts.next()) else {
             return Err(malformed());
         };
+        let legacy_prior = parts
+            .next()
+            .filter(|prior| !prior.is_empty())
+            .map(str::to_owned);
         let attempts = if attempts.is_empty() {
             Vec::new()
         } else {
@@ -114,6 +122,7 @@ impl<'de> Deserialize<'de> for TrackedKey {
         Ok(Self {
             attempts,
             flags: flags.parse().map_err(|_| malformed())?,
+            legacy_prior,
         })
     }
 }
@@ -199,6 +208,8 @@ impl DuplicateRebuildGuard {
                         id.len() == 16
                             && lower_hex(id.as_bytes())
                             && key.attempts.len() <= MAX_ATTEMPTS_PER_WINDOW
+                            && key.legacy_prior.as_ref().map_or(0, String::len)
+                                <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
                             && key.flags & !(PENDING | STARTED | EXHAUSTED) == 0
                     })
             })
@@ -337,6 +348,14 @@ pub(super) fn apply(index: &mut ScanIndex) {
     }
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
+    // An earlier checkpoint kept each pending key's prior inside the guard.
+    for (id, key) in guard.keys.iter_mut() {
+        if let Some(prior) = key.legacy_prior.take() {
+            if key.has(PENDING) && valid_prior(&prior) {
+                priors.entry(id.clone()).or_insert(prior);
+            }
+        }
+    }
     let mut transient = Transient::default();
     let ambiguous = &index.claude_request_census.ambiguous;
     // Ids to resolve: fresh duplicates by name, pending keys and orphans by hash.
@@ -677,6 +696,7 @@ mod tests {
                     let key = TrackedKey {
                         attempts: vec![u64::MAX; MAX_ATTEMPTS_PER_WINDOW],
                         flags: STARTED | EXHAUSTED,
+                        legacy_prior: None,
                     };
                     (id, key)
                 })

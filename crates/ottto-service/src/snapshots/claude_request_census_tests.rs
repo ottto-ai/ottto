@@ -3200,3 +3200,68 @@ fn census_duplicate_rebuild_refuses_malformed_fingerprints_at_insert() {
         assert_eq!(census_exhausted_counter(&mut index), 1);
     }
 }
+
+/// A checkpoint from the earlier guard form (`"<flags>:<stamps>:<prior>"`,
+/// no root priors) keeps its outstanding grant bounded: the prior moves into
+/// the saved priors, the second rebuild is the last, and the third restores.
+#[test]
+fn census_duplicate_rebuild_migrates_a_guard_saved_in_the_earlier_form() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-legacy");
+        let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let fingerprint = original.files[&key].source_file_fingerprint.clone();
+        let path = scratch.join("index.json");
+        std::fs::write(&path, census_duplicate_rebuild_raw(&original, &key, None)).unwrap();
+        let clock = bound::set_now(N3_T0);
+        let mut index = ScanIndex::load(&path).unwrap();
+        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+        drop(clock);
+        // Rewrite the saved grant in the earlier form.
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let id = bound::key_id(&key);
+        saved
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_census_rebuild_priors")
+            .expect("grant saved its prior");
+        saved["claude_request_census_shadow"]["n"]["k"][&id] =
+            serde_json::json!(format!("1:{N3_T0}:{fingerprint}"));
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + N3_DAY);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(
+            bound::tracked_open(&index).is_some(),
+            "earlier form decodes"
+        );
+        assert!(index.files[&key].source_file_fingerprint.is_empty());
+        assert_eq!(bound::attempts(&index, &key), vec![N3_T0, N3_T0 + N3_DAY]);
+        assert_eq!(
+            bound::prior(&index, &key).as_deref(),
+            Some(fingerprint.as_str()),
+            "prior migrated"
+        );
+        persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["claude_request_census_shadow"]["n"]["k"][&id],
+            serde_json::json!(format!("1:{N3_T0},{}", N3_T0 + N3_DAY)),
+            "written back in the current form"
+        );
+        drop(clock);
+
+        bound::restart();
+        let _clock = bound::set_now(N3_T0 + 2 * N3_DAY);
+        let index = ScanIndex::load(&path).unwrap();
+        assert!(bound::exhausted(&index, &key));
+        assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+    }
+}
