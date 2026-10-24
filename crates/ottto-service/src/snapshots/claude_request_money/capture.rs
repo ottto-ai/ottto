@@ -830,6 +830,41 @@ mod bounded_tests {
     use super::*;
 
     #[test]
+    fn native_gaps_never_refresh_the_absolute_money_deadline() {
+        let scope = PathBuf::from("money-clock-native-gap");
+        begin_page(&scope);
+        let first = Instant::now() - Duration::from_millis(110);
+        start_clock(&scope, first);
+        assert!(
+            !spend_work(&scope, 1, 1),
+            "native gap alone exhausts capture's 100 ms slice"
+        );
+        start_clock(&scope, Instant::now());
+        let clock = take_page_clock(&scope, Instant::now());
+        assert_eq!(clock.deadline, first + super::super::PAGE_MAX_ELAPSED);
+        assert_eq!(
+            clock.capture_us, 0,
+            "native time is not charged as added money work"
+        );
+        begin_page(&scope);
+        let first = Instant::now() - Duration::from_millis(260);
+        start_clock(&scope, first);
+        let shadow_started = Instant::now();
+        let clock = take_page_clock(&scope, shadow_started);
+        assert_eq!(clock.deadline, first + super::super::PAGE_MAX_ELAPSED);
+        assert!(
+            clock.deadline < shadow_started,
+            "shadow cannot start a fresh allowance after native work"
+        );
+        assert_eq!(
+            take_page_clock(&scope, shadow_started).deadline,
+            shadow_started + super::super::PAGE_MAX_ELAPSED,
+            "a following Skip with no capture has its own money deadline"
+        );
+        println!("MONEY_P1B_CLOCK native_gap_ms=260 capture_after_100ms=refused deadline_refreshed=0 native_charged_us=0");
+    }
+
+    #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn planned_capture_rotates_known_roots_without_gating_a_different_native_page() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-turns");
