@@ -25,6 +25,7 @@ pub(super) fn measure(
         counts.census_duplicate_rebuild_exhausted,
         counts.census_duplicate_rebuild_orphaned,
         counts.census_rebuild_priors_decode_refused,
+        counts.census_duplicate_rebuild_identity_revoked,
     ) = rebuild_bound::terminal(index);
     // Main's census contains only these core records. Keep its byte and heap
     // meaning even when OFF encounters safety left by a previous ON run.

@@ -169,9 +169,10 @@ impl ScanIndex {
             .claude_usage_authority_quarantine
             .iter()
             .filter(|(root, record)| {
-                !witnesses.get(*root).is_some_and(|witness| {
-                    claude_usage_authority_preserves_pending(record, witness)
-                })
+                !self.decode_holds_family(root)
+                    && !witnesses.get(*root).is_some_and(|witness| {
+                        claude_usage_authority_preserves_pending(record, witness)
+                    })
             })
             .map(|(root, _)| root.clone())
             .collect::<BTreeSet<_>>();
@@ -184,13 +185,24 @@ impl ScanIndex {
         }
         let mut rearmed = 0_usize;
         for (index_key, entry) in &mut self.files {
+            // A repair of damaged authority state, not identity work: an
+            // earlier checkpoint's N3 hold stays (corruption arms nothing).
             if claude_index_path_member_ref(Path::new(index_key))
                 .is_some_and(|member| unbound.contains(member.root))
-                && !entry.source_file_fingerprint.is_empty()
+                && claude_request_census::rearm_source_fingerprint(
+                    &mut self.claude_request_census_shadow,
+                    index_key,
+                    entry,
+                    claude_request_census::SourceRearm::Other("unbound_authority_repair"),
+                )
             {
-                entry.source_file_fingerprint.clear();
                 rearmed += 1;
             }
+        }
+        // A pure CAS reread discards this normalized graph. Only the load or
+        // working save applies a rearm, so do not count that same action twice.
+        if stage == "cas" {
+            return;
         }
         CLAUDE_AUTHORITY_DROPS.fetch_add(unbound.len(), std::sync::atomic::Ordering::Relaxed);
         CLAUDE_AUTHORITY_DROP_REARMED_FILES

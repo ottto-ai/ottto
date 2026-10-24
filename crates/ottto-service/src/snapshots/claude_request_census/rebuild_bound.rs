@@ -11,7 +11,13 @@
 //!   rearms (contract-5, family correction, stale uncarry, committable
 //!   subsets) clear the same fingerprint independently: they stay visible to
 //!   their own consumers, are saved as they are and always read. This bound
-//!   never restores, overwrites or holds them.
+//!   never restores, overwrites or holds them. They all go through
+//!   `rearm_source_fingerprint`, which also revokes this bound's hold on an
+//!   earlier checkpoint's key once per arming (SI-724-B1b,
+//!   `revoke_for_identity`): the key leaves the guard, its token stays in `r`
+//!   for one window, and `census_duplicate_rebuild_identity_revoked` counts
+//!   it. Repairs of damaged state, recovery re-reads and re-parse debt a
+//!   committable subset carries revoke nothing.
 //! - Nothing a rearm needs is saved in an entry, so whatever erases the guard
 //!   (a downgrade, an older binary's save, corruption) erases only the rearm:
 //!   the entry keeps its real fingerprint and is not re-read (MONEY P1a).
@@ -34,7 +40,11 @@
 //!   shadow state, a saved prior whose key the guard no longer holds (an
 //!   orphan), or a missing `n` with evidence of earlier activity: the
 //!   shadow's window witness (`nw`, the guard's latest stamp, saved beside
-//!   `n`) still inside the window, or a priors field present. Orphans and
+//!   `n`) still inside the window, a priors field present, or the
+//!   "N3 initialized" marker (`claude_census_rebuild_initialized`, SI-724-B3b)
+//!   present. The marker is written with the guard's first state and retires
+//!   only with an empty guard; a malformed marker is itself a lost guard.
+//!   Orphans and
 //!   missing guards count in `census_duplicate_rebuild_orphaned`. Only a
 //!   checkpoint with no such evidence starts a fresh guard. Rebuilds already
 //!   spent cannot be replenished by losing the guard (MONEY 724f P1).
@@ -50,11 +60,14 @@
 //!   the ordinary path and is re-offered.
 //! - The priors field is decoded in isolation (MONEY P1b): by the index
 //!   reader, and by the field's own lenient decoder on a plain Serde path. A
-//!   malformed, duplicated, oversized, truncated or wrong-type field never
-//!   fails the index decode: every entry, binding, ACK and latch is kept, the
+//!   malformed, oversized, truncated or wrong-type value never fails the
+//!   index decode: every entry, binding, ACK and latch is kept, the
 //!   priors are dropped (marking never depends on them), admission closes for
 //!   one window, and `census_rebuild_priors_decode_refused` counts it.
-//!   Counters and alarms are count-only.
+//!   Counters and alarms are count-only. A duplicated priors or marker
+//!   field name is a root-level defect: like any duplicated index field it
+//!   refuses the index (kept on disk, the source paused), never quarantined
+//!   or defaulted. The marker value is isolated the same way.
 //!
 //! A key whose fingerprint was already empty when its duplicate was found is
 //! another mechanism's rearm; this bound does not track it.
@@ -71,8 +84,12 @@ const MAX_GUARD_RAW_BYTES: usize = 128 * 1024;
 /// A Claude index fingerprint: lowercase hex SHA-256.
 const PRIOR_BYTES: usize = 64;
 const MAX_ALARMS_PER_TERMINAL: usize = 8;
+/// Identity-arming evidence longer than this revokes nothing.
+const MAX_ARMING_BYTES: usize = 4096;
 /// `closed_at` value of a guard that must be stamped at its next apply.
 const UNSTAMPED: u64 = u64::MAX;
+/// The marker value of a present but malformed "N3 initialized" marker.
+const MARKER_REFUSED: u64 = u64::MAX;
 
 const PENDING: u8 = 1;
 const STARTED: u8 = 2;
@@ -115,8 +132,52 @@ pub(crate) struct DuplicateRebuildGuard {
     priors_refused_at: u64,
     #[serde(default, rename = "c", skip_serializing_if = "Option::is_none")]
     closed_at: Option<u64>,
+    /// SI-724-B1b: earlier-checkpoint keys identity work took out of this
+    /// bound's control, with the arming's token, for one window: one revoke
+    /// per key per arming (`revoke_for_identity`).
+    #[serde(
+        default,
+        rename = "r",
+        skip_serializing_if = "BTreeMap::is_empty",
+        deserialize_with = "deserialize_keys"
+    )]
+    revoked: BTreeMap<String, Revoked>,
+    /// Identity revokes, counted for one window.
+    #[serde(default, rename = "i", skip_serializing_if = "is_zero")]
+    identity_revoked: u64,
+    #[serde(default, rename = "ia", skip_serializing_if = "is_zero")]
+    identity_revoked_at: u64,
 }
-crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at);
+crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at, revoked, identity_revoked, identity_revoked_at);
+
+/// One identity revoke, `"<token>:<stamp>"`: the arming's token (16 hex
+/// digits of its evidence's SHA-256) and the unix second of the revoke.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Revoked {
+    token: String,
+    at: u64,
+}
+crate::heap_layout_bound::fields!(Revoked; token, at);
+
+impl Serialize for Revoked {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(&format_args!("{}:{}", self.token, self.at))
+    }
+}
+impl<'de> Deserialize<'de> for Revoked {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let malformed = || <D::Error as serde::de::Error>::custom("rebuild guard revoke");
+        let text = String::deserialize(deserializer)?;
+        let (token, at) = text.split_once(':').ok_or_else(malformed)?;
+        if token.len() != 16 || !lower_hex(token.as_bytes()) {
+            return Err(malformed());
+        }
+        Ok(Self {
+            token: token.to_owned(),
+            at: at.parse().map_err(|_| malformed())?,
+        })
+    }
+}
 
 /// One compact string per key, `"<flags>:<stamp>,<stamp>"`, so the
 /// pretty-printed index spends one line on it.
@@ -183,20 +244,21 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
-/// `"k"`: a repeated key id is ambiguous (which copy holds the stamps is
-/// unknown), so it fails the guard's decode and closes it (SI-724-B3).
-fn deserialize_keys<'de, D: Deserializer<'de>>(
+/// `"k"` and `"r"`: a repeated key id is ambiguous (which copy holds the
+/// stamps or the revoke is unknown), so it fails the guard's decode and
+/// closes it (SI-724-B3).
+fn deserialize_keys<'de, D: Deserializer<'de>, V: Deserialize<'de>>(
     deserializer: D,
-) -> Result<BTreeMap<String, TrackedKey>, D::Error> {
-    struct Keys;
-    impl<'de> Visitor<'de> for Keys {
-        type Value = BTreeMap<String, TrackedKey>;
+) -> Result<BTreeMap<String, V>, D::Error> {
+    struct Keys<V>(std::marker::PhantomData<V>);
+    impl<'de, V: Deserialize<'de>> Visitor<'de> for Keys<V> {
+        type Value = BTreeMap<String, V>;
         fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
             formatter.write_str("rebuild guard keys")
         }
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut keys = BTreeMap::new();
-            while let Some((id, key)) = map.next_entry::<String, TrackedKey>()? {
+            while let Some((id, key)) = map.next_entry::<String, V>()? {
                 if keys.len() >= MAX_TRACKED_KEYS || keys.insert(id, key).is_some() {
                     return Err(<A::Error as serde::de::Error>::custom("rebuild guard keys"));
                 }
@@ -204,7 +266,7 @@ fn deserialize_keys<'de, D: Deserializer<'de>>(
             Ok(keys)
         }
     }
-    deserializer.deserialize_map(Keys)
+    deserializer.deserialize_map(Keys(std::marker::PhantomData))
 }
 
 /// A real Claude index fingerprint: the only form tracked, and the only
@@ -261,11 +323,30 @@ pub(crate) fn deserialize_priors<'de, D: Deserializer<'de>>(
 /// The isolated decode of the priors field (MONEY P1b): `None` refuses it,
 /// and the index reader hands the index an empty map and a refusal instead
 /// of failing the whole decode.
-pub(super) fn decode_priors(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+pub(crate) fn decode_priors(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
     let priors = strict_priors(&mut decoder).ok()?;
     decoder.end().ok()?;
     Some(priors)
+}
+
+/// `ScanIndex::claude_census_rebuild_initialized` (SI-724-B3b): the unix
+/// second the bound first held state. Captured raw and decoded in isolation:
+/// a malformed value is present and refused (`u64::MAX`), never an index
+/// decode error. The lenient index reader applies the same `decode_marker`.
+pub(crate) fn deserialize_marker<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    Ok(decode_marker(raw.get().as_bytes()))
+}
+
+/// A nonzero u64 below `u64::MAX`; anything else reads as refused.
+pub(crate) fn decode_marker(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<u64>(bytes)
+        .ok()
+        .filter(|stamp| *stamp != 0 && *stamp != MARKER_REFUSED)
+        .unwrap_or(MARKER_REFUSED)
 }
 
 /// Clamp a future stamp to `now` (recent, fail closed); true while it is
@@ -311,6 +392,11 @@ impl DuplicateRebuildGuard {
                                 <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
                             && key.flags & !(PENDING | STARTED | EXHAUSTED | HELD | CURRENT) == 0
                     })
+                    && guard.keys.len() + guard.revoked.len() <= MAX_TRACKED_KEYS
+                    && guard
+                        .revoked
+                        .keys()
+                        .all(|id| id.len() == 16 && lower_hex(id.as_bytes()))
             })
             .unwrap_or_else(Self::closed)
     }
@@ -332,6 +418,12 @@ impl DuplicateRebuildGuard {
             self.priors_refused = 0;
             self.priors_refused_at = 0;
         }
+        if self.identity_revoked > 0 && !recent(&mut self.identity_revoked_at, now) {
+            self.identity_revoked = 0;
+            self.identity_revoked_at = 0;
+        }
+        self.revoked
+            .retain(|_, revoked| recent(&mut revoked.at, now));
         for key in self.keys.values_mut() {
             key.attempts.retain_mut(|stamp| recent(stamp, now));
             key.attempts.sort_unstable();
@@ -350,10 +442,12 @@ impl DuplicateRebuildGuard {
             (self.untracked_refused, self.untracked_refused_at),
             (self.orphaned, self.orphaned_at),
             (self.priors_refused, self.priors_refused_at),
+            (self.identity_revoked, self.identity_revoked_at),
         ];
         self.keys
             .values()
             .flat_map(|key| key.attempts.iter().copied())
+            .chain(self.revoked.values().map(|revoked| revoked.at))
             .chain(self.closed_at)
             .chain(
                 counters
@@ -461,9 +555,11 @@ fn emit_alarm(line: String) {
 /// a grant is recorded in the guard and the load's transient set only.
 pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bool) {
     let witness = index.claude_request_census_shadow.rebuild_witness;
+    let marker = index.claude_census_rebuild_initialized;
     if !priors_refused
         && !priors_seen
         && witness == 0
+        && marker == 0
         && index.claude_request_census.ambiguous.is_empty()
         && index.claude_request_census_shadow.rebuild_bound.is_none()
         && index.claude_census_rebuild_priors.is_empty()
@@ -472,16 +568,19 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     }
     let now = now_unix();
     // MONEY 724f P1: a missing guard is fresh only without evidence of
-    // earlier activity. With its window witness still recent, or a priors
-    // field present, it was lost (an external or older save dropped it): its
-    // spent attempts are unknown, so admission closes for one window. A
-    // refused priors field closes it below on its own.
+    // earlier activity. With its window witness still recent, a priors field
+    // present, or the "N3 initialized" marker present (SI-724-B3b: the root
+    // shadow or its `n` was dropped), it was lost (an external or older save
+    // dropped it): its spent attempts are unknown, so admission closes for
+    // one window. A refused priors field closes it below on its own.
+    let marker_refused = marker == MARKER_REFUSED;
     let mut lost = false;
     let mut guard = match index.claude_request_census_shadow.rebuild_bound.take() {
         Some(guard) => *guard,
         None => {
             let mut stamp = witness;
-            lost = !priors_refused && (priors_seen || (witness != 0 && recent(&mut stamp, now)));
+            lost = !priors_refused
+                && (priors_seen || marker != 0 || (witness != 0 && recent(&mut stamp, now)));
             if lost {
                 DuplicateRebuildGuard::closed()
             } else {
@@ -489,6 +588,12 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             }
         }
     };
+    if marker_refused && !priors_refused {
+        // SI-724-B3b: value-level damage to the marker is isolated, and the
+        // guard it vouches for is lost: closed for one window, never fresh.
+        lost = true;
+        guard.closed_at = Some(UNSTAMPED);
+    }
     if guard.closed_at == Some(UNSTAMPED) {
         guard.closed_at = Some(now);
     }
@@ -509,6 +614,9 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         guard.priors_refused_at = now;
         guard.closed_at = Some(now);
     }
+    // A revoked key is out of this bound's control (SI-724-B1b): its prior
+    // is dropped with it, never counted as an orphan.
+    priors.retain(|id, _| !guard.revoked.contains_key(id));
     // An earlier checkpoint kept each pending key's prior inside the guard.
     for (id, key) in guard.keys.iter_mut() {
         if let Some(prior) = key.legacy_prior.take() {
@@ -566,7 +674,8 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             } else {
                 "guard_state_closed"
             })
-        } else if guard.keys.len() >= MAX_TRACKED_KEYS {
+        } else if guard.keys.len() + guard.revoked.len() >= MAX_TRACKED_KEYS {
+            // A revoke moves its key's slot to `r` for one window.
             Some("tracked_key_cap")
         } else {
             None
@@ -677,9 +786,82 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         .keys
         .retain(|_, key| key.has(PENDING) || !key.attempts.is_empty());
     index.claude_census_rebuild_priors = priors;
+    // SI-724-B3b: the marker is written the first time the bound holds any
+    // state (a grant included) and kept while it does; a refused one is
+    // rewritten present. It retires only with an empty guard, which is
+    // exactly a fresh one, so the guard and its marker leave the checkpoint
+    // together and only a lost guard leaves the marker without it.
+    if guard.is_empty() {
+        index.claude_census_rebuild_initialized = 0;
+    } else if marker == 0 || marker_refused {
+        index.claude_census_rebuild_initialized = now.max(1);
+    }
     index.claude_request_census_shadow.rebuild_witness = guard.latest_stamp();
     index.claude_request_census_shadow.rebuild_bound = (!guard.is_empty()).then(|| Box::new(guard));
     index.claude_request_census.rebuild_transient = transient;
+}
+
+/// SI-724-B1b, MONEY: identity work armed on `key` (`arming` is its
+/// evidence, from which the one-shot token is derived) takes an earlier
+/// checkpoint's key out of this bound's control, so the identity path
+/// re-offers its empty fingerprint at once and this bound never delays it.
+/// Called only from `rearm_source_fingerprint`, the one identity-clear path.
+///
+/// - Only a key this bound holds in the earlier form (pending without
+///   `CURRENT`: its empty fingerprint is the bound's own) is revoked. Others
+///   are not held, so nothing is revoked or counted.
+/// - Once per key per arming: the token is recorded in the guard (`r`) for
+///   one window, in the same index mutation as the arming's own clear, so
+///   both are saved by the same commit before any later selection reads the
+///   key. A crash or discarded working index loses both (the arming is
+///   re-derived and revokes once); a failed or discarded scan after the save
+///   finds the key already out of control. The key's attempts and prior are
+///   dropped, never restored: from here on it is the identity path's.
+/// - Corruption cannot manufacture a revoke: missing or oversized evidence,
+///   or an absent or ambiguous guard (decoded closed, so holding nothing),
+///   revokes nothing and the key stays held. A guard
+///   closed for its own bookkeeping still yields to identity work.
+pub(crate) fn revoke_for_identity(
+    shadow: &mut ClaudeRequestCensusShadowState,
+    key: &str,
+    arming: &str,
+) {
+    if arming.is_empty() || arming.len() > MAX_ARMING_BYTES {
+        return;
+    }
+    let Some(guard) = shadow.rebuild_bound.as_deref_mut() else {
+        return;
+    };
+    if guard.keys.is_empty() {
+        return;
+    }
+    let id = key_id(key);
+    if !guard
+        .keys
+        .get(&id)
+        .is_some_and(|tracked| tracked.has(PENDING) && !tracked.has(CURRENT))
+    {
+        return;
+    }
+    let mut token = crate::snapshots::sha256_hex(&["census_rebuild_identity_revoke:v1", arming]);
+    token.truncate(16);
+    if guard
+        .revoked
+        .get(&id)
+        .is_some_and(|revoked| revoked.token == token)
+    {
+        // The same arming already revoked this key once (a re-entered
+        // earlier-form entry): never a second revoke for it.
+        return;
+    }
+    // The key's slot moves to `r`: tracked keys and revokes share the cap.
+    let now = now_unix();
+    guard.keys.remove(&id);
+    guard.revoked.insert(id.clone(), Revoked { token, at: now });
+    guard.identity_revoked = guard.identity_revoked.saturating_add(1);
+    guard.identity_revoked_at = now;
+    shadow.rebuild_witness = guard.latest_stamp();
+    with_persisted(|set| set.remove(&id));
 }
 
 /// Candidate selection (MONEY P1a, legacy): `key`'s empty fingerprint is an
@@ -756,11 +938,11 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
-/// Census-line counters (exhausted, orphaned, priors refused) and
-/// rate-limited alarms.
-pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64) {
+/// Census-line counters (exhausted, orphaned, priors refused, identity
+/// revoked) and rate-limited alarms.
+pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     let Some(guard) = index.claude_request_census_shadow.rebuild_bound.as_deref() else {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     };
     let mut emitted = 0;
     let tracked = guard
@@ -809,7 +991,12 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64) {
             ));
         }
     }
-    (guard.exhausted_keys(), guard.orphaned, guard.priors_refused)
+    (
+        guard.exhausted_keys(),
+        guard.orphaned,
+        guard.priors_refused,
+        guard.identity_revoked,
+    )
 }
 
 #[cfg(test)]
@@ -913,6 +1100,44 @@ pub(crate) mod test_support {
             .map(|tracked| tracked.attempts)
             .unwrap_or_default()
     }
+    /// SI-724-B1b: identity revokes counted in the window, and whether `key`
+    /// has a revoke recorded.
+    pub(crate) fn identity_revoked(index: &ScanIndex) -> u64 {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .map_or(0, |guard| guard.identity_revoked)
+    }
+    pub(crate) fn revoked(index: &ScanIndex, key: &str) -> bool {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .is_some_and(|guard| guard.revoked.contains_key(&key_id(key)))
+    }
+    /// A guard is present and closed (never a fresh default).
+    pub(crate) fn closed(index: &ScanIndex) -> bool {
+        index
+            .claude_request_census_shadow
+            .rebuild_bound
+            .as_ref()
+            .is_some_and(|guard| guard.closed_at.is_some())
+    }
+    /// SI-724-B3b: the "N3 initialized" marker as loaded.
+    pub(crate) fn marker(index: &ScanIndex) -> u64 {
+        index.claude_census_rebuild_initialized
+    }
+    /// `key` as an earlier checkpoint saved this bound's exhausted, held
+    /// rearm: pending without `CURRENT`, both attempts spent at `stamps`, its
+    /// entry empty. Applied to the serialized index (a decode, as a load
+    /// reads it, but without the load's apply).
+    pub(crate) fn hold_earlier_form(value: &mut serde_json::Value, key: &str, stamps: [u64; 2]) {
+        value["files"][key]["source_file_fingerprint"] = serde_json::json!("");
+        let tracked = format!("{}:{},{}", PENDING | EXHAUSTED | HELD, stamps[0], stamps[1]);
+        value["claude_request_census_shadow"]["n"]["k"][key_id(key)] = serde_json::json!(tracked);
+        value["claude_census_rebuild_initialized"] = serde_json::json!(stamps[0]);
+    }
 }
 
 #[cfg(test)]
@@ -950,6 +1175,9 @@ mod tests {
             priors_refused: u64::MAX,
             priors_refused_at: u64::MAX,
             closed_at: None,
+            revoked: BTreeMap::new(),
+            identity_revoked: u64::MAX,
+            identity_revoked_at: u64::MAX,
         };
         let priors: BTreeMap<String, String> =
             ids.map(|id| (id, "f".repeat(PRIOR_BYTES))).collect();
@@ -1083,6 +1311,111 @@ mod tests {
             assert!(decoded.claude_census_rebuild_priors.is_empty(), "{priors}");
             assert_eq!(decoded.files.len(), 1, "{priors}");
         }
+    }
+
+    /// SI-724-B3b: the "N3 initialized" marker is decoded in isolation. Only
+    /// a nonzero u64 below `u64::MAX` is present and intact; any other value
+    /// (zero, negative, a string, null, an array, an overflowing literal,
+    /// `u64::MAX` itself) is present and refused, on a plain Serde path too,
+    /// never an index decode error.
+    #[test]
+    fn markers_decode_in_isolation_and_refuse_every_malformed_value() {
+        let base = serde_json::to_value(ScanIndex::default()).unwrap();
+        for (raw, expected) in [
+            ("5", 5),
+            ("1790000000", 1_790_000_000),
+            ("0", MARKER_REFUSED),
+            ("-1", MARKER_REFUSED),
+            ("\"5\"", MARKER_REFUSED),
+            ("null", MARKER_REFUSED),
+            ("[5]", MARKER_REFUSED),
+            ("1e400", MARKER_REFUSED),
+            ("5.5", MARKER_REFUSED),
+            ("18446744073709551615", MARKER_REFUSED),
+            ("18446744073709551616", MARKER_REFUSED),
+        ] {
+            assert_eq!(decode_marker(raw.as_bytes()), expected, "{raw}");
+            let mut value = base.clone();
+            value["claude_census_rebuild_initialized"] = serde_json::json!("MARKER");
+            let index = value.to_string().replace("\"MARKER\"", raw);
+            let decoded: ScanIndex = serde_json::from_str(&index).unwrap();
+            assert_eq!(decoded.claude_census_rebuild_initialized, expected, "{raw}");
+        }
+    }
+
+    /// SI-724-B1b: identity revokes (`"r"`) decode strictly with the guard.
+    /// A repeated or malformed revoke, or tracked keys and revokes past
+    /// their shared cap, closes the guard; nothing is revoked or restored.
+    #[test]
+    fn revokes_decode_strictly_and_share_the_tracked_cap() {
+        let intact = r#"{"k":{"0123456789abcdef":"17:1,2"},"r":{"fedcba9876543210":"0123456789abcdef:3"},"i":1,"ia":3}"#;
+        let guard = DuplicateRebuildGuard::decode(intact);
+        assert_eq!(guard.closed_at, None);
+        assert_eq!(guard.revoked.len(), 1);
+        assert_eq!(guard.identity_revoked, 1);
+        assert_eq!(
+            serde_json::to_string(&guard).unwrap(),
+            intact,
+            "saved as decoded"
+        );
+        for broken in [
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef:3","fedcba9876543210":"0123456789abcdef:4"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789ABCDEF:3"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef:x"}}"#,
+            r#"{"r":{"fedcba987654321":"0123456789abcdef:3"}}"#,
+            r#"{"r":{"fedcba9876543210":7}}"#,
+            r#"{"r":[]}"#,
+        ] {
+            assert_eq!(
+                DuplicateRebuildGuard::decode(broken).closed_at,
+                Some(UNSTAMPED),
+                "{broken}"
+            );
+        }
+        let half = MAX_TRACKED_KEYS / 2;
+        let full = DuplicateRebuildGuard {
+            keys: (0..half)
+                .map(|slot| {
+                    (
+                        format!("{slot:016x}"),
+                        TrackedKey {
+                            attempts: vec![1],
+                            flags: PENDING | CURRENT,
+                            legacy_prior: None,
+                        },
+                    )
+                })
+                .collect(),
+            revoked: (half..MAX_TRACKED_KEYS)
+                .map(|slot| {
+                    (
+                        format!("{slot:016x}"),
+                        Revoked {
+                            token: "f".repeat(16),
+                            at: 1,
+                        },
+                    )
+                })
+                .collect(),
+            ..DuplicateRebuildGuard::default()
+        };
+        let raw = serde_json::to_string(&full).unwrap();
+        assert_eq!(DuplicateRebuildGuard::decode(&raw), full, "at the cap");
+        let mut over = full.clone();
+        over.revoked.insert(
+            format!("{MAX_TRACKED_KEYS:016x}"),
+            Revoked {
+                token: "f".repeat(16),
+                at: 1,
+            },
+        );
+        let raw = serde_json::to_string(&over).unwrap();
+        assert_eq!(
+            DuplicateRebuildGuard::decode(&raw).closed_at,
+            Some(UNSTAMPED),
+            "past the shared cap"
+        );
     }
 
     /// SI-724-B3: a repeated key id in `"k"` is ambiguous and closes the guard.

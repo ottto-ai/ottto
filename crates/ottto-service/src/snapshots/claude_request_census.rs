@@ -1985,25 +1985,91 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+/// The bounded CAS reader's normalizer pass: raw optional evidence bounded,
+/// census/shadow normalized, the priors isolated. Its decode state (the
+/// duplicate-key identities normalization drops, duplicated census/shadow
+/// fields, the priors refusal) travels with the bytes into the lenient
+/// reader's single `finish_decode`.
+pub(super) fn normalized_bounded_bytes(
+    bytes: &[u8],
+) -> anyhow::Result<(Vec<u8>, CensusDecodeState)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    let mut decoded = crate::snapshot_retry::decode_state::<ScanIndex>(&normalized);
-    if decoded.is_err() && !reader.normalize {
-        // The bounded shape parser visits numbers before record-local tolerant
-        // decoders. Normalize only this failed optional-state case, using the
-        // same in-memory bytes: no new file read, no changed shape/node cap.
-        reader = CensusRead::new(bytes);
-        reader.normalize = true;
-        normalized.clear();
-        reader.read_to_end(&mut normalized)?;
-        decoded = crate::snapshot_retry::decode_state::<ScanIndex>(&normalized);
+    Ok((normalized, reader.take_state()))
+}
+
+pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+    super::lenient_decode::read_bounded(bytes)
+}
+
+/// One census field decoded alone (the lenient reader's mini index). Its
+/// decode state is returned, not applied: phase-B recovery needs the whole
+/// index (`finish_decode`).
+pub(super) fn decode_census_field<R: std::io::Read>(
+    reader: R,
+) -> serde_json::Result<(ScanIndex, CensusDecodeState)> {
+    let mut reader = CensusRead::new(reader);
+    let index = serde_json::from_reader(std::io::BufReader::new(&mut reader))?;
+    Ok((index, reader.take_state()))
+}
+
+/// What a census reader learned that the decoded fields cannot carry.
+#[derive(Debug, Default)]
+pub(super) struct CensusDecodeState {
+    pub(super) ambiguous_census: bool,
+    pub(super) ambiguous_keys: BTreeSet<String>,
+    pub(super) duplicate_census: bool,
+    pub(super) duplicate_shadow: bool,
+    pub(super) seen_priors: bool,
+    pub(super) priors_refused: bool,
+}
+
+impl CensusDecodeState {
+    pub(super) fn merge(&mut self, other: Self) {
+        self.ambiguous_census |= other.ambiguous_census;
+        let remaining = MAX_DECODE_ENTRIES.saturating_sub(self.ambiguous_keys.len());
+        self.ambiguous_keys
+            .extend(other.ambiguous_keys.into_iter().take(remaining));
+        self.duplicate_census |= other.duplicate_census;
+        self.duplicate_shadow |= other.duplicate_shadow;
+        self.seen_priors |= other.seen_priors;
+        self.priors_refused |= other.priors_refused;
     }
-    let mut index = decoded?;
-    reader.invalidate_duplicates(&mut index);
-    reader.recover_ambiguous_keys(&mut index);
+}
+
+/// Phase-B recovery on an assembled index, once per read: duplicated
+/// census/shadow fields invalidated (a duplicated shadow closes the rebuild
+/// guard), duplicate-key identities restored and counted, the N3 rebuild
+/// bound applied, and the safety marker derived from the shadow.
+pub(super) fn finish_decode(index: &mut ScanIndex, mut state: CensusDecodeState) {
+    if state.duplicate_census {
+        index.claude_request_census = ClaudeRequestCensus::default();
+    }
+    if state.duplicate_shadow {
+        // Which copy holds the rebuild guard is unknown: close it.
+        index.claude_request_census_shadow = ClaudeRequestCensusShadowState {
+            rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
+            ..ClaudeRequestCensusShadowState::default()
+        };
+    }
+    // Normalization serializes only surviving rows. Carry duplicate-key
+    // identities across that boundary for both normal and bounded CAS reads.
+    index
+        .claude_request_census
+        .ambiguous
+        .append(&mut state.ambiguous_keys);
+    let count = index.claude_request_census.ambiguous.len() as u64;
+    if count > 0 {
+        let shadow = &mut index.claude_request_census_shadow;
+        shadow.decode_duplicate_keys_dropped =
+            shadow.decode_duplicate_keys_dropped.saturating_add(count);
+    }
+    // MONEY N3: the next authorized transcript pass re-reads the key
+    // (Parse(Rearmed), fingerprint untouched) to rebuild its record, at
+    // most twice per key per seven days.
+    rebuild_bound::apply(index, state.priors_refused, state.seen_priors);
     index.claude_request_census.safety_incomplete = index
         .claude_request_census_shadow
         .safety_incomplete
@@ -2015,9 +2081,9 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
                 SafetyIncomplete::default()
             }
         });
-    if reader.ambiguous_census
-        || reader.duplicate_census
-        || reader.duplicate_shadow
+    if state.ambiguous_census
+        || state.duplicate_census
+        || state.duplicate_shadow
         || index.claude_request_census.decode_lost
         || !index.claude_request_census.ambiguous.is_empty()
     {
@@ -2026,7 +2092,6 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
             .safety_incomplete
             .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
     }
-    Ok(index)
 }
 
 /// Derive positional slots from Serde's own field metadata rather than pinning
@@ -2059,6 +2124,11 @@ fn sequence_fields() -> (usize, usize, usize) {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
         let fields = fields.expect("derived ScanIndex field metadata");
+        assert_eq!(
+            fields,
+            super::lenient_decode::FIELDS,
+            "ScanIndex field registry drift"
+        );
         let slot = |name| {
             fields
                 .iter()
@@ -2071,6 +2141,15 @@ fn sequence_fields() -> (usize, usize, usize) {
             slot("claude_census_rebuild_priors"),
         )
     })
+}
+
+// Explicit resource depth gate for optional evidence, shared with the original
+// input lexical gate. Above it evidence is unknown/null, never corruption.
+pub(super) const MAX_EVIDENCE_DEPTH: usize = 256;
+pub(super) fn validate_gated_syntax<R: std::io::Read>(reader: R) -> serde_json::Result<()> {
+    let mut reader = CensusRead::new(reader);
+    reader.syntax_only = true;
+    serde_json::from_reader::<_, serde::de::IgnoredAny>(std::io::BufReader::new(reader)).map(|_| ())
 }
 
 struct CensusRead<R> {
@@ -2098,6 +2177,7 @@ struct CensusRead<R> {
     priors_refused: bool,
     normalize: bool,
     capture: bool,
+    syntax_only: bool,
     #[cfg(test)]
     read_calls: usize,
     #[cfg(test)]
@@ -2130,6 +2210,7 @@ impl<R: std::io::Read> CensusRead<R> {
             priors_refused: false,
             normalize: phase_b::enabled(),
             capture: false,
+            syntax_only: false,
             #[cfg(test)]
             read_calls: 0,
             #[cfg(test)]
@@ -2141,62 +2222,18 @@ impl<R: std::io::Read> CensusRead<R> {
         // Serde's io::Bytes uses BufReader's buffered read_byte specialization.
         // Buffering only the underlying file would still call our Read per byte.
         let mut index = serde_json::from_reader(std::io::BufReader::new(&mut *self))?;
-        self.invalidate_duplicates(&mut index);
-        self.recover_ambiguous_keys(&mut index);
-        index.claude_request_census.safety_incomplete = index
-            .claude_request_census_shadow
-            .safety_incomplete
-            .clone()
-            .unwrap_or_else(|| {
-                if index.claude_request_census.safety.is_some() {
-                    SafetyIncomplete::closed()
-                } else {
-                    SafetyIncomplete::default()
-                }
-            });
-        if self.ambiguous_census
-            || self.duplicate_census
-            || self.duplicate_shadow
-            || index.claude_request_census.decode_lost
-            || !index.claude_request_census.ambiguous.is_empty()
-        {
-            index
-                .claude_request_census
-                .safety_incomplete
-                .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
-        }
+        finish_decode(&mut index, self.take_state());
         Ok(index)
     }
 
-    fn recover_ambiguous_keys(&mut self, index: &mut ScanIndex) {
-        // Normalization serializes only surviving rows. Carry duplicate-key
-        // identities across that boundary for both normal and bounded CAS reads.
-        index
-            .claude_request_census
-            .ambiguous
-            .append(&mut self.ambiguous_keys);
-        let count = index.claude_request_census.ambiguous.len() as u64;
-        if count > 0 {
-            let state = &mut index.claude_request_census_shadow;
-            state.decode_duplicate_keys_dropped =
-                state.decode_duplicate_keys_dropped.saturating_add(count);
-        }
-        // MONEY N3: the next authorized transcript pass re-reads the key
-        // (Parse(Rearmed), fingerprint untouched) to rebuild its record, at
-        // most twice per key per seven days.
-        rebuild_bound::apply(index, self.priors_refused, self.seen_priors);
-    }
-
-    fn invalidate_duplicates(&self, index: &mut ScanIndex) {
-        if self.duplicate_census {
-            index.claude_request_census = ClaudeRequestCensus::default();
-        }
-        if self.duplicate_shadow {
-            // Which copy holds the rebuild guard is unknown: close it.
-            index.claude_request_census_shadow = ClaudeRequestCensusShadowState {
-                rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
-                ..ClaudeRequestCensusShadowState::default()
-            };
+    fn take_state(&mut self) -> CensusDecodeState {
+        CensusDecodeState {
+            ambiguous_census: self.ambiguous_census,
+            ambiguous_keys: std::mem::take(&mut self.ambiguous_keys),
+            duplicate_census: self.duplicate_census,
+            duplicate_shadow: self.duplicate_shadow,
+            seen_priors: self.seen_priors,
+            priors_refused: self.priors_refused,
         }
     }
 
@@ -2243,15 +2280,14 @@ impl<R: std::io::Read> CensusRead<R> {
                         duplicate
                     }
                     "claude_census_rebuild_priors" => {
-                        // A duplicate is ambiguous: which copy holds the
-                        // grants is unknown, so the field is refused.
+                        // A duplicate is not renamed: like every other root
+                        // field it refuses the index (SI-724-B3b). Only the
+                        // value is isolated.
                         self.shadow_key = true;
                         self.shadow_state = false;
                         self.priors_state = true;
-                        let duplicate = self.seen_priors;
                         self.seen_priors = true;
-                        self.priors_refused |= duplicate;
-                        duplicate
+                        false
                     }
                     _ => false,
                 };
@@ -2286,7 +2322,10 @@ impl<R: std::io::Read> CensusRead<R> {
         let mut depth = 0_usize;
         let mut quoted = false;
         let mut escaped = false;
-        let mut overflow = false;
+        // Original admitted evidence was grammar-checked by the lexical
+        // boundary. The syntax-only pass substitutes null without buffering
+        // or interpreting census records, even before header controls run.
+        let mut overflow = self.syntax_only;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -2311,7 +2350,13 @@ impl<R: std::io::Read> CensusRead<R> {
             } else {
                 match byte {
                     b'"' => quoted = true,
-                    b'{' | b'[' => depth = depth.saturating_add(1),
+                    b'{' | b'[' => {
+                        depth = depth.saturating_add(1);
+                        if depth > MAX_EVIDENCE_DEPTH && !overflow {
+                            bytes = Vec::new();
+                            overflow = true;
+                        }
+                    }
                     b'}' | b']' => depth = depth.saturating_sub(1),
                     _ => {}
                 }
@@ -3700,6 +3745,44 @@ pub(crate) fn persist_duplicate_rebuild_grants(
 }
 
 pub(crate) use rebuild_bound::deserialize_priors as deserialize_duplicate_rebuild_priors;
+
+/// Why an index entry's source fingerprint is cleared (its unchanged
+/// transcript re-read).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SourceRearm<'a> {
+    /// Identity work (a contract-5 or family proof re-arm, a family
+    /// correction, a stale-family uncarry or rewind, an owned-start reparse).
+    /// The value is the arming's evidence, decoded strictly from the index or
+    /// proved by this pass; it keys the one-shot N3 revoke.
+    Identity(&'a str),
+    /// Not identity work: a repair of damaged state, carried re-parse debt or
+    /// a recovery re-read. An earlier checkpoint's N3 hold stays.
+    Other(&'static str),
+}
+
+/// SI-724-B1b: the one path that clears a Claude index entry's source
+/// fingerprint (`tests::every_source_fingerprint_clear_uses_the_identity_path`
+/// enumerates the call sites). Identity work also revokes an earlier
+/// checkpoint's N3 hold on the key, durably and once per arming, so the
+/// rebuild bound never delays it. Returns whether a fingerprint was cleared.
+pub(crate) fn rearm_source_fingerprint(
+    shadow: &mut ClaudeRequestCensusShadowState,
+    key: &str,
+    entry: &mut ScanIndexEntry,
+    why: SourceRearm<'_>,
+) -> bool {
+    if let SourceRearm::Identity(arming) = why {
+        rebuild_bound::revoke_for_identity(shadow, key, arming);
+    }
+    let cleared = !entry.source_file_fingerprint.is_empty();
+    entry.source_file_fingerprint.clear();
+    cleared
+}
+pub(crate) use rebuild_bound::deserialize_marker as deserialize_duplicate_rebuild_marker;
+pub(super) use rebuild_bound::{
+    decode_marker as decode_duplicate_rebuild_marker,
+    decode_priors as decode_duplicate_rebuild_priors,
+};
 // MONEY N3: candidate selection re-reads a granted key's unchanged transcript
 // and skips an earlier checkpoint's held rearm.
 #[cfg(test)]
@@ -3733,7 +3816,8 @@ pub(super) fn serialize_shadow_counts<S: Serializer>(
                 && counts.decode_duplicate_keys_dropped == 0
                 && counts.census_duplicate_rebuild_exhausted == 0
                 && counts.census_duplicate_rebuild_orphaned == 0
-                && counts.census_rebuild_priors_decode_refused == 0 =>
+                && counts.census_rebuild_priors_decode_refused == 0
+                && counts.census_duplicate_rebuild_identity_revoked == 0 =>
         {
             serializer.serialize_some(&d1::CountsLine(counts))
         }
@@ -3889,6 +3973,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
         counts.census_duplicate_rebuild_exhausted,
         counts.census_duplicate_rebuild_orphaned,
         counts.census_rebuild_priors_decode_refused,
+        counts.census_duplicate_rebuild_identity_revoked,
     ) = rebuild_bound::terminal(index);
     counts.json_bytes = serialized_bytes(&index.claude_request_census);
     counts.census_evidence_bytes = counts.json_bytes.saturating_add(serialized_len(

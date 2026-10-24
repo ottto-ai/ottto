@@ -1284,3 +1284,102 @@ fn pipeline_new_auxiliary_bad_clock_keeps_the_due_rearm_enabled() {
     }
     let _ = fs::remove_dir_all(support);
 }
+
+/// SI-724-B1b, MONEY: a real terminal contract-5 re-arm of a member the
+/// MONEY N3 bound holds for an earlier checkpoint (exhausted, its entry saved
+/// empty) revokes that hold once, so the identity path re-offers the file on
+/// the next selection, never delayed by the rebuild budget. The revoke is
+/// saved with the re-arm and survives reload. Repeating the cycle (the
+/// re-read failing or discarded, restarts, the same contract re-armed again)
+/// revokes nothing more: the key stays out of the bound's control. OFF and
+/// ON.
+#[test]
+fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    const NOW: u64 = 1_790_000_000;
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let _clock = bound::set_now(NOW);
+        let rearm = Rearm::new();
+        let mut index = rearm.index();
+        rearm.establish(&mut index, &rearm.items);
+        let (key, source) = rearm
+            .sources
+            .iter()
+            .next()
+            .map(|(key, source)| (key.clone(), source.clone()))
+            .unwrap();
+        let mut value = serde_json::to_value(&index).unwrap();
+        bound::hold_earlier_form(&mut value, &key, [NOW - 60, NOW - 30]);
+        let mut index: ScanIndex = serde_json::from_value(value).unwrap();
+        assert!(bound::held(&index, &key), "shadow={enabled}: held before");
+        assert_eq!(
+            index.source_fingerprint_decision(&key, &index.files[&key], &source),
+            (CandidateDecision::Skip, None),
+            "shadow={enabled}: the hold skips it before identity work"
+        );
+
+        // The real terminal contract-5 re-arm.
+        index.claude_request_identity_contract_changed = true;
+        index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+        rearm.fold(
+            &mut index,
+            &rearm.items,
+            true,
+            MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+        );
+        assert!(!index.claude_request_identity_contract_changed);
+        for member in rearm.sources.keys() {
+            assert!(index.files[member].source_file_fingerprint.is_empty());
+        }
+        assert!(!bound::held(&index, &key), "shadow={enabled}: revoked");
+        assert!(bound::revoked(&index, &key));
+        assert!(!bound::pending(&index, &key), "out of the bound's control");
+        assert_eq!(bound::identity_revoked(&index), 1);
+        assert_eq!(
+            index.source_fingerprint_decision(&key, &index.files[&key], &source),
+            rearmed,
+            "shadow={enabled}: re-offered on the next selection"
+        );
+
+        let scratch = crate::test_scratch::ScratchDir::new("contract-rearm-revokes-n3-hold");
+        let path = scratch.join("index.json");
+        index.save(&path).unwrap();
+        for cycle in 0..4 {
+            let case = format!("shadow={enabled} cycle={cycle}");
+            bound::restart();
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(!bound::held(&index, &key), "{case}: still not held");
+            assert!(
+                bound::revoked(&index, &key),
+                "{case}: the revoke is durable"
+            );
+            assert_eq!(
+                index.source_fingerprint_decision(&key, &index.files[&key], &source),
+                rearmed,
+                "{case}: still re-offered"
+            );
+            assert_eq!(bound::identity_revoked(&index), 1, "{case}: one revoke");
+            // The re-read fails or is discarded, and the same contract
+            // re-arms again: no second revoke.
+            index.claude_request_identity_contract_changed = true;
+            index.claude_duplicate_fence_next_full_rearm_unix_seconds = Some(1);
+            rearm.fold(
+                &mut index,
+                &rearm.items,
+                true,
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES,
+            );
+            assert_eq!(bound::identity_revoked(&index), 1, "{case}: no second");
+            assert!(!bound::held(&index, &key), "{case}");
+            if cycle % 2 == 0 {
+                index.save(&path).unwrap();
+            }
+        }
+    }
+}

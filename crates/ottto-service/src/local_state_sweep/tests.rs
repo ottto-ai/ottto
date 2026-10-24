@@ -2,8 +2,7 @@ use super::*;
 use crate::snapshots::ScanIndex;
 use crate::test_scratch::ScratchDir;
 use std::fs;
-use std::io::Write;
-use std::os::unix::fs::{symlink, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
 
 /// Above every pid_max on macOS and Linux, so `kill(pid, 0)` reports ESRCH.
 const DEAD_PID: i32 = 2_000_000_000;
@@ -332,38 +331,24 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     let mut saver = ScanIndex::load(&seed).expect("seed load");
     assert_eq!(saver.generation, 1);
     write(&f.dest.join(format!("{INDEX}.lock")), b"");
-    // A FIFO canonical file parks the real save inside its compare-and-swap
-    // read, after it took the checkpoint lock and before it settles.
-    let fifo = CString::new(path.as_os_str().as_bytes()).unwrap();
-    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    // Pause the real save after flock acquisition on a seekable canonical
+    // file. The lenient boundary deliberately refuses non-seekable inputs.
+    write(&path, &seed_bytes);
     let in_flight = f.dest.join(pid_temp(INDEX, std::process::id() as i32));
     write(&in_flight, b"partial");
     let orphan = f.dest.join(pid_temp(INDEX, DEAD_PID));
     write(&orphan, b"orphan");
 
     let save_path = path.clone();
-    let save = std::thread::spawn(move || saver.save(&save_path).map(|()| saver.generation));
-    // A non-blocking writer open succeeds only once the saver is reading.
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let mut feed = loop {
-        match fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK)
-            .open(&path)
-        {
-            Ok(file) => break file,
-            Err(error)
-                if error.raw_os_error() == Some(libc::ENXIO) && Instant::now() < deadline =>
-            {
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => panic!("saver never read the canonical index: {error}"),
-        }
-    };
-    unsafe {
-        let flags = libc::fcntl(feed.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(feed.as_raw_fd(), libc::F_SETFL, flags & !libc::O_NONBLOCK);
-    }
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let save = std::thread::spawn(move || {
+        crate::snapshots::pause_next_scan_index_cas_for_test(entered_tx, resume_rx);
+        saver.save(&save_path).map(|()| saver.generation)
+    });
+    entered_rx
+        .recv_timeout(Duration::from_secs(30))
+        .expect("saver acquired checkpoint lock");
 
     let report = apply(&f.support, &names_and_locks_only());
 
@@ -372,8 +357,7 @@ fn scan_index_save_in_progress_is_never_disturbed() {
     assert!(in_flight.exists());
     assert!(orphan.exists());
 
-    feed.write_all(&seed_bytes).expect("feed current index");
-    drop(feed);
+    resume_tx.send(()).expect("release current index read");
     let generation = save.join().expect("saver thread").expect("save completes");
     assert_eq!(generation, 2);
     assert_eq!(ScanIndex::load(&path).expect("load").generation, 2);

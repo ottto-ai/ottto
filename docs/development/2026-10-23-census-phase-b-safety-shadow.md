@@ -59,16 +59,35 @@ for that key is outstanding or exhausted. Whatever erases the guard (a
 downgrade, an older binary's save, corruption) erases only the rearm: the entry
 keeps its real fingerprint and is not re-read (MONEY P1a).
 
+Identity work also revokes an earlier checkpoint's hold (SI-724-B1b). Every
+fingerprint clear goes through `rearm_source_fingerprint`; a unit test
+enumerates the call sites. An identity arming (contract-5 or family proof
+re-arm, family correction, legacy witness, owned start, stale-family uncarry,
+cancel, rewind or stale-pending re-arm) takes a held earlier-form key out of
+the bound: the key leaves `n`, and a 16-hex token of the arming's evidence
+stays in `n.r` for one window. The revoke happens once per key per arming, is
+saved by the same commit as the arming's clear, and is counted in
+`census_duplicate_rebuild_identity_revoked`. The key is then re-offered on the
+next selection and never held, restored or revoked again for that arming.
+Missing or oversized evidence, or an absent or closed-ambiguous guard, revokes
+nothing. Repairs of damaged state, recovery re-reads and carried re-parse debt
+never revoke.
+
 A lost or ambiguous guard never replenishes the allowance (SI-724-B3, MONEY
 724f P1): a malformed `n`, a repeated `n` or key id, a malformed or duplicated
 shadow state, a saved prior whose key the guard no longer holds (an orphan,
 `cause=orphaned_rearm`), or a missing `n` with evidence of earlier activity
 (the shadow's window witness `nw`, the guard's latest stamp saved beside it,
-still inside the window, or a priors field present; `cause=guard_lost`) closes
+still inside the window, a priors field present, or the "N3 initialized"
+marker present; `cause=guard_lost`) closes
 admission for one window (`cause=guard_state_closed`). Orphans and lost guards
 count in `census_duplicate_rebuild_orphaned`. Only a checkpoint with no such
 evidence starts a fresh guard; main's own save drops `n` and `nw` together,
-and main has no duplicate-key rearm.
+and main has no duplicate-key rearm. The marker is the root field
+`claude_census_rebuild_initialized` (SI-724-B3b), decoded in isolation. It is
+written when the guard first holds state, a grant included, and retires only
+with an empty guard, which equals a fresh one. A marker with a missing `n` or
+root shadow, or a malformed marker, is a lost guard.
 
 Earlier checkpoints of this branch saved a rearm as an empty fingerprint (its
 prior in the root field `claude_census_rebuild_priors` or inside the guard).
@@ -82,11 +101,15 @@ is never restored. An empty fingerprint of a current-form key, or of a key the
 guard does not hold, takes the ordinary path and is re-offered. The priors
 field is decoded in isolation, by the index reader and
 by the field's own lenient decoder on a plain Serde path. A malformed,
-duplicated, truncated or wrong-type field never fails the index decode: every
+truncated or wrong-type value never fails the index decode: every
 entry, binding, ACK and latch is kept, the priors are dropped (marking never
 depends on them), admission closes for one window, and `census_rebuild_priors_decode_refused` counts it
-(`cause=priors_decode_refused`). All of these counters and alarms are
-count-only.
+(`cause=priors_decode_refused`). A duplicated priors or marker field name is a
+root-level defect: like any duplicated index field it refuses the index (kept,
+source paused), never quarantined or defaulted. Both lenient and bounded CAS
+reads apply census recovery and the bound once, after the whole index is
+assembled, carrying the normalizer's decode state. All of these counters and
+alarms are count-only.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes

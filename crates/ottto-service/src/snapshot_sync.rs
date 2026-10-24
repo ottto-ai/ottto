@@ -1460,7 +1460,7 @@ impl SnapshotUploadProgress {
             return false;
         }
         let current = index
-            .current_snapshot_fingerprint_refs()
+            .eligible_snapshot_fingerprint_refs()
             .collect::<BTreeSet<_>>();
         let latest = reason_reoffer::latest_valid_deadline(scope.now);
         let counts = &mut self.reason_reoffer_counts;
@@ -2044,7 +2044,9 @@ impl SnapshotUploadProgress {
         let indexed = index
             .files
             .keys()
-            .map(|key| cache_head_index_key(key))
+            .map(String::as_str)
+            .chain(index.decode_held_file_keys())
+            .map(cache_head_index_key)
             .collect::<BTreeSet<_>>();
         let before = self.pending_cache_heads.len();
         self.pending_cache_heads
@@ -2215,10 +2217,20 @@ impl SnapshotUploadProgress {
                     .map(|file| ((file.clone(), item.snapshot_fingerprint.clone()), item))
             })
             .collect::<BTreeMap<_, _>>();
+        let opaque_files = index
+            .decode_held_file_keys()
+            .map(cache_head_index_key)
+            .collect::<BTreeSet<_>>();
         self.pending_cache_heads.retain(|file, pending| {
+            if opaque_files.contains(file) {
+                return true;
+            }
             let Some((index_key, entry)) = current_files.get(file) else {
                 return !census_complete;
             };
+            if index.decode_holds_file(index_key) {
+                return true;
+            }
             // Neither held absence nor a changed aggregate alone certifies
             // enrichment. Rebinding comes from the current admitted raw item.
             if entry.source_file_fingerprint != pending.source_file_fingerprint
@@ -2256,9 +2268,12 @@ impl SnapshotUploadProgress {
                 .get(*index_key)
                 .is_some_and(|entities| {
                     entities.iter().all(|entity| {
-                        pending.settled_entities.contains(entity)
-                            || (self.accepted_fingerprints.contains(entity)
-                                && !index.quarantined_snapshot_fingerprints.contains_key(entity))
+                        !index.decode_holds_entity(entity)
+                            && (pending.settled_entities.contains(entity)
+                                || (self.accepted_fingerprints.contains(entity)
+                                    && !index
+                                        .quarantined_snapshot_fingerprints
+                                        .contains_key(entity)))
                     })
                 });
             !(all_siblings_settled
@@ -2492,6 +2507,27 @@ fn save_index_and_publish_manifest(
         );
     }
     Ok(())
+}
+
+// Exercise the real durable-save/publication boundary from decoder rescans.
+#[cfg(test)]
+pub(crate) fn decode_hold_manifest_published_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    source: SnapshotSource,
+    complete: bool,
+) -> Result<bool> {
+    let namespace = "lenient-decode-rescan";
+    save_index_and_publish_manifest(
+        index,
+        path,
+        namespace,
+        source,
+        complete,
+        "2026-01-01T00:00:00Z",
+        "2026-10-22T00:00:00Z",
+    )?;
+    Ok(cached_source_manifest(namespace, source).is_some())
 }
 
 // Test-only empty-ACK/shed boundary; invokes the real locked partial save.
@@ -11329,6 +11365,49 @@ mod tests {
             "due retry also survives actual finalizer no-op selection"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn opaque_file_decode_hold_keeps_pending_cache_head_custody() {
+        let root = cache_effective_wire_fixture_root();
+        let mut index = ScanIndex::default();
+        let mut result = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let item = result.snapshots.remove(0);
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        let path = root.join("index.json");
+        index.save(&path).unwrap();
+        let key = index.files.keys().next().unwrap().clone();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"][&key]["size_bytes"] = serde_json::json!([]);
+        value["unknown_padding"] = serde_json::json!("p".repeat(8192));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.decode_held_file_keys().collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+        assert!(!progress.prune_pending_cache_head_orphans_from_loaded_index(&loaded));
+        assert_eq!(progress.pending_cache_heads.len(), 1);
+        progress.retire_pending_cache_heads(&loaded, &[], &BTreeSet::new(), true, &BTreeMap::new());
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "opaque absence cannot settle a cache-head obligation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

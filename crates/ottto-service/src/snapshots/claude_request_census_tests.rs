@@ -1737,6 +1737,7 @@ fn census_shadow_counts_encoding_is_bounded() {
         census_duplicate_rebuild_exhausted: u64::MAX,
         census_duplicate_rebuild_orphaned: u64::MAX,
         census_rebuild_priors_decode_refused: u64::MAX,
+        census_duplicate_rebuild_identity_revoked: u64::MAX,
         producer_refused_keys: usize::MAX,
         shadow_post_save_mismatch_keys: usize::MAX,
         legacy_compare_families: usize::MAX,
@@ -1841,7 +1842,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 6113;
+const CENSUS_SHADOW_WORST_BYTES: usize = 6178;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
@@ -2444,7 +2445,9 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
             .save(&scratch.join(format!("{field}.json")))
             .expect("CAS isolates optional duplicates");
     }
-    // Required index fields retain their previous duplicate-field behavior.
+    // Required duplicate fields are ambiguous. Refuse without replacing the
+    // original witness; optional census duplicates above still invalidate only
+    // their evidence.
     let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
     let path = scratch.join("duplicate-files.json");
     std::fs::write(
@@ -2452,12 +2455,23 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         format!("{},\"files\":{{}}}}", base.strip_suffix('}').unwrap()),
     )
     .unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
     assert!(
-        !path.exists(),
-        "ordinary index corruption is still quarantined"
+        ScanIndex::load(&path).is_err(),
+        "ambiguous files field refuses"
     );
-    assert!(loaded.files.is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "refusal preserves the original index"
+    );
+    assert!(
+        !std::fs::read_dir(&scratch)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "refusal never quarantines"
+    );
 }
 
 /// MONEY N3: corruption is counted durably and the next ordinary scan rebuilds
@@ -4188,17 +4202,20 @@ fn census_duplicate_rebuild_save_keeps_an_independent_rearm_after_the_rebuild() 
     }
 }
 
-/// MONEY P1b, SI B2: a malformed, duplicated or truncated priors field is
+/// MONEY P1b, SI B2: a malformed, truncated or overflowing priors field is
 /// decoded in isolation and refused. Every index entry and the key's attempt
 /// history are kept (no whole-index reset), no rebuild is admitted for one
 /// window, and the refusal is counted on the census line for that window.
-/// The refused field marks nothing, so nothing is held or restored.
+/// The refused field marks nothing, so nothing is held or restored. A
+/// duplicated field name is not a value defect: it refuses the whole read
+/// (SI-724-B3b item 3,
+/// `census_rebuild_duplicated_root_fields_refuse_and_keep_the_index`).
 #[test]
 fn census_rebuild_priors_decode_refusal_keeps_the_index() {
     use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
     for enabled in [false, true] {
         let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
-        for corruption in ["malformed", "duplicated", "truncated", "overflow"] {
+        for corruption in ["malformed", "truncated", "overflow"] {
             bound::restart();
             let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-priors-refused");
             let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
@@ -4322,14 +4339,6 @@ fn census_rebuild_corrupt_priors(
             saved["claude_census_rebuild_priors"][id] = serde_json::json!(7);
             serde_json::to_string(saved).unwrap()
         }
-        "duplicated" => {
-            let priors = serde_json::to_string(&saved["claude_census_rebuild_priors"]).unwrap();
-            saved["claude_census_rebuild_priors"] = serde_json::json!("DUPLICATE_PRIORS");
-            serde_json::to_string(saved).unwrap().replace(
-                "\"DUPLICATE_PRIORS\"",
-                &format!("{priors},\"claude_census_rebuild_priors\":{priors}"),
-            )
-        }
         "truncated" => {
             saved["claude_census_rebuild_priors"][id] =
                 serde_json::json!(&fingerprint[..fingerprint.len() - 1]);
@@ -4359,8 +4368,9 @@ fn census_rebuild_corrupt_priors(
 
 /// SI B2 conditions 1 and 3, MONEY 724f P2: a real load and the bounded
 /// decoder, with session-account bindings, ACKs and the contract-5 latch
-/// present, and a malformed, duplicated, truncated, wrong-type or literally
-/// overflowing (`1e400`) priors field. Every identity field is kept exactly
+/// present, and a malformed, truncated, wrong-type or literally overflowing
+/// (`1e400`) priors field. (A duplicated field name refuses the whole read:
+/// `census_rebuild_duplicated_root_fields_refuse_and_keep_the_index`.) Every identity field is kept exactly
 /// as without the field, through a bounded CAS save (`save_with_read_limit`,
 /// whose compare-and-swap read decodes the corrupt checkpoint) and a plain
 /// one, and their reloads; only the priors are refused, counted once.
@@ -4414,7 +4424,6 @@ fn census_rebuild_priors_refusal_keeps_bindings_acks_and_latch() {
 
         for corruption in [
             "malformed",
-            "duplicated",
             "truncated",
             "wrong_type",
             "overflow",
@@ -4462,4 +4471,642 @@ fn census_rebuild_priors_refusal_keeps_bindings_acks_and_latch() {
             );
         }
     }
+}
+
+/// The census line's identity-revoke counter (SI-724-B1b).
+fn census_rebuild_identity_revoked_line(index: &mut ScanIndex) -> u64 {
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        index,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        FIRST_WINDOW,
+    );
+    let line = serde_json::to_value(ClaudeDuplicateCensusCounts {
+        request_census: Some(counts),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        line["request_census"]["census_duplicate_rebuild_identity_revoked"]
+            .as_u64()
+            .unwrap_or(0),
+        counts.census_duplicate_rebuild_identity_revoked
+    );
+    counts.census_duplicate_rebuild_identity_revoked
+}
+
+/// `key`'s fingerprint cleared through the shared identity-clear path.
+fn census_identity_clear(
+    index: &mut ScanIndex,
+    key: &str,
+    why: crate::snapshots::claude_request_census::SourceRearm<'_>,
+) -> bool {
+    let entry = index.files.get_mut(key).unwrap();
+    crate::snapshots::claude_request_census::rearm_source_fingerprint(
+        &mut index.claude_request_census_shadow,
+        key,
+        entry,
+        why,
+    )
+}
+
+/// SI-724-B1b with MONEY's conditions, through the shared identity-clear path
+/// itself. An earlier checkpoint's held key is revoked once per arming: one
+/// revoke, one re-offer, recorded in the guard and saved with the clear.
+/// Repeated cycles (restarts, a failed scan's discarded working index, an
+/// unsaved cycle, the same arming re-derived) never revoke it again: the key
+/// is out of the bound's control. Corruption never revokes: no evidence,
+/// oversized evidence, or a repair instead of identity work keep it held, and
+/// a malformed or duplicated contract-5 latch refuses the whole read (no
+/// arming at all). An earlier form re-entering (an older binary's save) is
+/// not revoked again by the same arming, only by a new one. OFF and ON.
+#[test]
+fn census_duplicate_rebuild_identity_revoke_is_one_shot_per_arming() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started, SourceRearm,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let oversized = "x".repeat(8192);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-identity-revoke");
+        let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let fingerprint = original.files[&key].source_file_fingerprint.clone();
+        let path = scratch.join("index.json");
+        let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+        bound::hold_earlier_form(&mut saved, &key, [N3_T0, N3_T0 + 30]);
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+
+        // A malformed or duplicated latch cannot arm anything: the read refuses.
+        for latch in ["malformed", "duplicated"] {
+            let mut value = saved.clone();
+            value["claude_request_identity_contract_changed"] = serde_json::json!("LATCH");
+            let raw = serde_json::to_string(&value).unwrap().replace(
+                "\"LATCH\"",
+                if latch == "malformed" {
+                    "\"yes\""
+                } else {
+                    "true,\"claude_request_identity_contract_changed\":true"
+                },
+            );
+            let latch_path = scratch.join(format!("latch-{latch}.json"));
+            std::fs::write(&latch_path, &raw).unwrap();
+            assert!(ScanIndex::load(&latch_path).is_err(), "{latch}: refused");
+            assert_eq!(
+                std::fs::read_to_string(&latch_path).unwrap(),
+                raw,
+                "{latch}: kept"
+            );
+        }
+
+        bound::restart();
+        let clock = bound::set_now(N3_T0 + 60);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(bound::held(&index, &key), "shadow={enabled}: held");
+        assert_eq!(
+            census_rebuild_decision(&index, &key, &fingerprint),
+            (CandidateDecision::Skip, None)
+        );
+        for why in [
+            SourceRearm::Identity(""),
+            SourceRearm::Identity(&oversized),
+            SourceRearm::Other("unbound_authority_repair"),
+        ] {
+            census_identity_clear(&mut index, &key, why);
+            assert!(bound::held(&index, &key), "{why:?}: still held");
+            assert_eq!(bound::identity_revoked(&index), 0, "{why:?}");
+        }
+        // One arming: one revoke, one re-offer.
+        census_identity_clear(
+            &mut index,
+            &key,
+            SourceRearm::Identity("identity_contract:test-5"),
+        );
+        assert!(!bound::held(&index, &key));
+        assert!(bound::revoked(&index, &key));
+        assert!(!bound::pending(&index, &key), "out of the bound's control");
+        assert_eq!(census_rebuild_decision(&index, &key, &fingerprint), rearmed);
+        // The same arming again, and another one: the identity path's now.
+        census_identity_clear(
+            &mut index,
+            &key,
+            SourceRearm::Identity("identity_contract:test-5"),
+        );
+        census_identity_clear(
+            &mut index,
+            &key,
+            SourceRearm::Identity("family_correction:test"),
+        );
+        assert_eq!(bound::identity_revoked(&index), 1);
+        assert_eq!(census_rebuild_identity_revoked_line(&mut index), 1);
+        index.save(&path).unwrap();
+        drop(clock);
+
+        for cycle in 1..=3_u64 {
+            let case = format!("shadow={enabled} cycle={cycle}");
+            bound::restart();
+            let _clock = bound::set_now(N3_T0 + 60 + 60 * cycle);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(!bound::held(&index, &key), "{case}: never held again");
+            assert!(bound::revoked(&index, &key), "{case}: durable");
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}: re-offered"
+            );
+            census_identity_clear(
+                &mut index,
+                &key,
+                SourceRearm::Identity("identity_contract:test-5"),
+            );
+            assert_eq!(bound::identity_revoked(&index), 1, "{case}: no second");
+            // A failed scan: its read starts, its working index is discarded.
+            let mut working = ScanIndex::load(&path).unwrap();
+            note_duplicate_rebuild_started(&mut working, Path::new(&key));
+            drop(working);
+            if cycle != 2 {
+                index.save(&path).unwrap();
+            }
+        }
+
+        // The earlier form re-entering: the same arming keeps it held, a new
+        // arming revokes it once more.
+        let mut saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        bound::hold_earlier_form(&mut saved, &key, [N3_T0, N3_T0 + 30]);
+        std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+        bound::restart();
+        let _clock = bound::set_now(N3_T0 + 600);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(bound::held(&index, &key), "shadow={enabled}: re-entered");
+        census_identity_clear(
+            &mut index,
+            &key,
+            SourceRearm::Identity("identity_contract:test-5"),
+        );
+        assert!(bound::held(&index, &key), "shadow={enabled}: same arming");
+        assert_eq!(bound::identity_revoked(&index), 1);
+        census_identity_clear(
+            &mut index,
+            &key,
+            SourceRearm::Identity("identity_contract:test-6"),
+        );
+        assert!(!bound::held(&index, &key), "shadow={enabled}: a new arming");
+        assert_eq!(bound::identity_revoked(&index), 2);
+        assert_eq!(census_rebuild_decision(&index, &key, &fingerprint), rearmed);
+    }
+}
+
+/// SI-724-B3b: the "N3 initialized" marker, saved at the root beside the
+/// shadow state from the first grant on, outlives a dropped guard. With `n`
+/// and its witness, or the whole root shadow state, missing, or the marker
+/// itself malformed (an isolated value defect), the guard is lost, never
+/// fresh: recurring duplicates get no new grant, admission stays closed for
+/// the window, counted and alarmed, the index kept. With no marker and no
+/// other evidence the guard is fresh (control). After the window one counted
+/// attempt is allowed. OFF and ON.
+#[test]
+fn census_duplicate_rebuild_marker_without_its_guard_is_lost() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for loss in [
+            "n_dropped",
+            "root_shadow_dropped",
+            "marker_malformed",
+            "marker_overflow",
+            "no_marker_control",
+        ] {
+            let case = format!("shadow={enabled} {loss}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-marker");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            std::fs::write(&path, census_duplicate_rebuild_raw(&original, &key, None)).unwrap();
+            {
+                bound::restart();
+                let _clock = bound::set_now(N3_T0);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert!(census_rebuild_rearms(&index, &key, &fingerprint), "{case}");
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                assert_eq!(bound::marker(&index), N3_T0, "{case}: written by the grant");
+            }
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["claude_census_rebuild_initialized"],
+                serde_json::json!(N3_T0),
+                "{case}: saved"
+            );
+            // The recurring duplicate over a checkpoint with `shadow` (none:
+            // the root field missing) and the raw marker `marker`.
+            let renew = |shadow: Option<serde_json::Value>, marker: Option<&str>| {
+                let mut value = serde_json::to_value(&original).unwrap();
+                let rows = census_duplicate_rows(&value, &key);
+                value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
+                match shadow {
+                    Some(shadow) => value["claude_request_census_shadow"] = shadow,
+                    None => {
+                        value
+                            .as_object_mut()
+                            .unwrap()
+                            .remove("claude_request_census_shadow");
+                    }
+                }
+                if marker.is_some() {
+                    value["claude_census_rebuild_initialized"] = serde_json::json!("MARKER");
+                }
+                let raw = serde_json::to_string(&value)
+                    .unwrap()
+                    .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &rows)
+                    .replace("\"MARKER\"", marker.unwrap_or_default());
+                std::fs::write(&path, raw).unwrap();
+            };
+            let mut shadow = saved["claude_request_census_shadow"].clone();
+            shadow.as_object_mut().unwrap().remove("a");
+            let marker = N3_T0.to_string();
+            match loss {
+                "n_dropped" | "no_marker_control" => {
+                    let map = shadow.as_object_mut().unwrap();
+                    map.remove("n").expect("guard saved");
+                    map.remove("nw").expect("witness saved");
+                    renew(
+                        Some(shadow),
+                        (loss == "n_dropped").then_some(marker.as_str()),
+                    );
+                }
+                "root_shadow_dropped" => renew(None, Some(&marker)),
+                "marker_malformed" => renew(Some(shadow), Some("\"x\"")),
+                _ => renew(Some(shadow), Some("1e400")),
+            }
+
+            let refused_at = N3_T0 + 2 * N3_DAY;
+            if loss == "no_marker_control" {
+                bound::restart();
+                let _clock = bound::set_now(refused_at);
+                let index = ScanIndex::load(&path).unwrap();
+                assert!(
+                    census_rebuild_rearms(&index, &key, &fingerprint),
+                    "{case}: fresh"
+                );
+                assert_eq!(bound::attempts(&index, &key), vec![refused_at]);
+                continue;
+            }
+            let lost = !loss.starts_with("marker_");
+            for (cycle, at) in [refused_at, refused_at + N3_DAY, refused_at + 4 * N3_DAY]
+                .into_iter()
+                .enumerate()
+            {
+                bound::restart();
+                let _clock = bound::set_now(at);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert!(path.exists(), "{case}: never quarantined");
+                assert!(
+                    !census_rebuild_rearms(&index, &key, &fingerprint),
+                    "{case} cycle {cycle}: no new grant"
+                );
+                assert!(bound::closed(&index), "{case}: closed, never fresh");
+                assert_ne!(bound::marker(&index), u64::MAX, "{case}: rewritten present");
+                assert_ne!(bound::marker(&index), 0, "{case}");
+                if lost {
+                    assert!(bound::attempts(&index, &key).is_empty(), "{case}");
+                    assert_eq!(census_rebuild_alarms(&key, "guard_lost"), 1, "{case}");
+                    assert_eq!(
+                        census_rebuild_alarms(&key, "guard_state_closed"),
+                        cycle,
+                        "{case}"
+                    );
+                } else {
+                    // The guard itself is intact; its one attempt stays.
+                    assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+                    assert_eq!(
+                        census_rebuild_alarms(&key, "guard_state_closed"),
+                        cycle + 1,
+                        "{case}"
+                    );
+                }
+                assert_eq!(
+                    census_exhausted_counter(&mut index),
+                    // Each renewed duplicate of the untracked key is refused;
+                    // the tracked key is one exhausted key.
+                    if lost { cycle as u64 + 1 } else { 1 },
+                    "{case}"
+                );
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                index.save(&path).unwrap();
+                let saved: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                let mut shadow = saved["claude_request_census_shadow"].clone();
+                assert!(shadow["n"].is_object(), "{case}: the closure is saved");
+                shadow.as_object_mut().unwrap().remove("a");
+                let marker = saved["claude_census_rebuild_initialized"].to_string();
+                renew(Some(shadow), Some(&marker));
+            }
+            bound::restart();
+            let at = refused_at + 7 * N3_DAY + 1;
+            let _clock = bound::set_now(at);
+            let index = ScanIndex::load(&path).unwrap();
+            assert!(
+                census_rebuild_rearms(&index, &key, &fingerprint),
+                "{case}: one counted attempt after the window"
+            );
+            assert_eq!(bound::attempts(&index, &key), vec![at], "{case}");
+        }
+    }
+}
+
+/// SI-724-B3b, item 3: a duplicated root field name follows the index-wide
+/// policy (#718): every reader refuses, the index is kept byte for byte and
+/// its source pauses; never a quarantine, never a default. The rebuild priors
+/// and the "N3 initialized" marker, with bindings, ACKs and the contract-5
+/// latch present, through a load, the bounded reader, a bounded CAS save
+/// (`save_with_read_limit`) and a plain CAS save. Their value-level defects
+/// stay isolated (`census_rebuild_priors_refusal_keeps_bindings_acks_and_latch`,
+/// `census_duplicate_rebuild_marker_without_its_guard_is_lost`).
+#[test]
+fn census_rebuild_duplicated_root_fields_refuse_and_keep_the_index() {
+    use crate::snapshots::claude_request_census::{
+        decode_bounded_index, duplicate_rebuild_test_support as bound,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for field in [
+            "claude_census_rebuild_priors",
+            "claude_census_rebuild_initialized",
+        ] {
+            let case = format!("shadow={enabled} {field}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-duplicated-root");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let mut value = serde_json::to_value(&original).unwrap();
+            value["accepted_snapshot_fingerprints"] =
+                serde_json::json!(["c".repeat(64), "d".repeat(64)]);
+            value["session_account_bindings"] = serde_json::json!({
+                ("f".repeat(64)): { "account_identifier_hash": "a".repeat(64) }
+            });
+            value["claude_request_identity_contract"] =
+                serde_json::json!(crate::snapshots::claude_request_identity::COLLECTOR);
+            value["claude_request_identity_contract_changed"] = serde_json::json!(true);
+            let control_path = scratch.join("control.json");
+            std::fs::write(&control_path, serde_json::to_string(&value).unwrap()).unwrap();
+            let plain = ScanIndex::load(&control_path).unwrap();
+            assert_eq!(plain.session_account_bindings.len(), 1, "{case}");
+            assert!(plain.claude_request_identity_contract_changed, "{case}");
+            let copy = if field == "claude_census_rebuild_priors" {
+                serde_json::json!({ (bound::key_id(&key)): fingerprint }).to_string()
+            } else {
+                N3_T0.to_string()
+            };
+            value[field] = serde_json::json!("DUPLICATE_ROOT_FIELD");
+            let raw = serde_json::to_string(&value).unwrap().replace(
+                "\"DUPLICATE_ROOT_FIELD\"",
+                &format!("{copy},\"{field}\":{copy}"),
+            );
+            let path = scratch.join("index.json");
+            std::fs::write(&path, &raw).unwrap();
+            let entries = || std::fs::read_dir(scratch.as_ref()).unwrap().count();
+            let before = entries();
+            assert!(ScanIndex::load(&path).is_err(), "{case}: load refused");
+            assert!(
+                decode_bounded_index(raw.as_bytes()).is_err(),
+                "{case}: bounded reader refused"
+            );
+            assert!(
+                plain
+                    .clone()
+                    .save_with_read_limit(&path, 64 * 1024 * 1024)
+                    .is_err(),
+                "{case}: bounded CAS refused"
+            );
+            assert!(plain.clone().save(&path).is_err(), "{case}: CAS refused");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), raw, "{case}: kept");
+            assert_eq!(entries(), before, "{case}: never quarantined");
+        }
+    }
+}
+
+/// #718 composition: the N3 state (a current grant, or identity's revoke of an
+/// earlier checkpoint's hold; the witness and marker) reads the same through
+/// a load and the bounded CAS reader, and persists through a plain and a
+/// bounded CAS save; a duplicated shadow state closes the guard in both
+/// readers (never a fresh default) and stays closed through both saves. An
+/// independent rearm of another key stays visible throughout. OFF and ON.
+#[test]
+fn census_duplicate_rebuild_state_reads_alike_through_load_and_bounded_cas() {
+    use crate::snapshots::claude_request_census::{
+        decode_bounded_index, duplicate_rebuild_test_support as bound, SourceRearm,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for state in ["grant", "revoked", "duplicated_shadow"] {
+            for save in ["plain", "bounded"] {
+                let case = format!("shadow={enabled} {state} {save}");
+                bound::restart();
+                let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-cas-alike");
+                let (root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let healthy = census_key(&original, &root, "healthy.jsonl");
+                let healthy_fp = original.files[&healthy].source_file_fingerprint.clone();
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+                if state == "revoked" {
+                    bound::hold_earlier_form(&mut saved, &key, [N3_T0, N3_T0 + 30]);
+                }
+                let mut raw = serde_json::to_string(&saved).unwrap();
+                if state == "duplicated_shadow" {
+                    let shadow =
+                        serde_json::to_string(&saved["claude_request_census_shadow"]).unwrap();
+                    saved["claude_request_census_shadow"] = serde_json::json!("DUPLICATE_SHADOW");
+                    raw = serde_json::to_string(&saved).unwrap().replace(
+                        "\"DUPLICATE_SHADOW\"",
+                        &format!("{shadow},\"claude_request_census_shadow\":{shadow}"),
+                    );
+                }
+                std::fs::write(&path, &raw).unwrap();
+                bound::restart();
+                let _clock = bound::set_now(N3_T0 + 60);
+                let mut index = ScanIndex::load(&path).unwrap();
+                if state == "revoked" {
+                    assert!(bound::held(&index, &key), "{case}");
+                    census_identity_clear(
+                        &mut index,
+                        &key,
+                        SourceRearm::Identity("identity_contract:test"),
+                    );
+                }
+                // The independent control.
+                census_identity_clear(
+                    &mut index,
+                    &healthy,
+                    SourceRearm::Other("independent_rearm_control"),
+                );
+                let first = serde_json::to_value(&index.claude_request_census_shadow).unwrap();
+                let bounded_first = decode_bounded_index(raw.as_bytes()).unwrap();
+                if state != "revoked" {
+                    assert_eq!(
+                        serde_json::to_value(&bounded_first.claude_request_census_shadow).unwrap(),
+                        first,
+                        "{case}: one decode of the same bytes"
+                    );
+                }
+                match save {
+                    "plain" => index.save(&path).unwrap(),
+                    _ => index.save_with_read_limit(&path, 64 * 1024 * 1024).unwrap(),
+                }
+                let bytes = std::fs::read(&path).unwrap();
+                bound::restart();
+                let loaded = ScanIndex::load(&path).unwrap();
+                let bounded = decode_bounded_index(&bytes).unwrap();
+                for (reader, index) in [("load", &loaded), ("bounded", &bounded)] {
+                    let case = format!("{case} {reader}");
+                    assert_eq!(
+                        index.source_fingerprint_decision(
+                            &healthy,
+                            &index.files[&healthy],
+                            &healthy_fp
+                        ),
+                        rearmed,
+                        "{case}: the independent rearm stays"
+                    );
+                    match state {
+                        "grant" => {
+                            assert_eq!(
+                                bound::attempts(index, &key).first(),
+                                Some(&N3_T0),
+                                "{case}"
+                            );
+                            assert_eq!(bound::marker(index), N3_T0, "{case}");
+                            assert!(bound::witness(index) >= N3_T0, "{case}");
+                            assert!(!bound::closed(index), "{case}");
+                        }
+                        "revoked" => {
+                            assert!(!bound::held(index, &key), "{case}");
+                            assert!(bound::revoked(index, &key), "{case}");
+                            assert_eq!(bound::identity_revoked(index), 1, "{case}");
+                            assert_eq!(
+                                census_rebuild_decision(index, &key, &fingerprint),
+                                rearmed,
+                                "{case}"
+                            );
+                        }
+                        _ => {
+                            assert!(bound::closed(index), "{case}: closed, never default");
+                            assert!(bound::attempts(index, &key).is_empty(), "{case}");
+                            assert!(!census_rebuild_rearms(index, &key, &fingerprint), "{case}");
+                        }
+                    }
+                }
+                assert_eq!(
+                    serde_json::to_value(&loaded.claude_request_census_shadow).unwrap(),
+                    serde_json::to_value(&bounded.claude_request_census_shadow).unwrap(),
+                    "{case}: both readers agree"
+                );
+                assert_eq!(
+                    loaded.claude_census_rebuild_initialized,
+                    bounded.claude_census_rebuild_initialized,
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// SI-724-B1b: the shared identity-clear path is the only place that clears
+/// a source fingerprint outside tests. A new clear fails here until it routes
+/// through `rearm_source_fingerprint` and is classified below: identity work
+/// (revokes an earlier checkpoint's N3 hold, once per arming) or not.
+#[test]
+fn every_source_fingerprint_clear_uses_the_identity_path() {
+    fn sources(dir: &Path, out: &mut Vec<PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, out);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                out.push(path);
+            }
+        }
+    }
+    let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = Vec::new();
+    sources(&src, &mut files);
+    let mut clears = BTreeMap::new();
+    let mut identity = BTreeMap::new();
+    let mut other = BTreeMap::new();
+    for path in files {
+        let name = path
+            .strip_prefix(&src)
+            .unwrap()
+            .to_string_lossy()
+            .replace('\\', "/");
+        if name.ends_with("_tests.rs") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        // Inline unit tests follow the production code.
+        let production = text
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
+            .unwrap_or_default();
+        for (map, needle) in [
+            (&mut clears, ".source_file_fingerprint.clear()"),
+            (&mut identity, "SourceRearm::Identity("),
+            (&mut other, "SourceRearm::Other("),
+        ] {
+            let count = production.matches(needle).count();
+            if count > 0 {
+                map.insert(name.clone(), count);
+            }
+        }
+    }
+    assert_eq!(
+        clears,
+        BTreeMap::from([
+            // The shared path itself.
+            ("snapshots/claude_request_census.rs".to_string(), 1),
+            // A `#[cfg(test)]` experiment module, absent from builds.
+            ("snapshots/envelope_selection_experiment.rs".to_string(), 2),
+        ]),
+        "a source fingerprint clear outside rearm_source_fingerprint"
+    );
+    assert_eq!(
+        identity,
+        BTreeMap::from([
+            // Contract-5/family proof re-arm, family correction, legacy
+            // witness, owned start, stale-family uncarry, cancel, rewind
+            // (two) and stale-pending re-arm.
+            ("snapshots.rs".to_string(), 9),
+            // The shared path's own dispatch.
+            ("snapshots/claude_request_census.rs".to_string(), 1),
+        ]),
+        "classify the new identity-clear site"
+    );
+    assert_eq!(
+        other,
+        BTreeMap::from([
+            // Carried re-parse debt through local-hold reverts (two) and the
+            // settled-subset save.
+            ("snapshots.rs".to_string(), 3),
+            // A repair of damaged authority state.
+            ("snapshots/authority_proof_correction.rs".to_string(), 1),
+            // A native comparison recovery re-read.
+            (
+                "snapshots/claude_native_comparison/settlement.rs".to_string(),
+                1
+            ),
+        ]),
+        "classify the new non-identity clear site"
+    );
 }

@@ -1353,8 +1353,16 @@ impl SelectedFallback {
         priority.append(&mut traversal.pending_candidates);
         traversal.pending_candidates = priority;
         for target in &self.targets {
-            if let Some(entry) = index.files.get_mut(&local_index_key(&target.path)) {
-                entry.source_file_fingerprint.clear();
+            let key = local_index_key(&target.path);
+            if let Some(entry) = index.files.get_mut(&key) {
+                crate::snapshots::claude_request_census::rearm_source_fingerprint(
+                    &mut index.claude_request_census_shadow,
+                    &key,
+                    entry,
+                    crate::snapshots::claude_request_census::SourceRearm::Other(
+                        "native_comparison_recovery",
+                    ),
+                );
             }
         }
         index.mark_bounded_sweep_unsettled();
