@@ -44,6 +44,10 @@ struct HistoryCycle<'a> {
     upload: PipelineUpload,
     /// Another relay destination (its own index); `None` is the default one.
     destination: Option<&'a str>,
+    /// Stand in for MONEY's emitter (#699): after finalization, add one
+    /// request-owned literal copy of every item, ignoring #699's own
+    /// protected-root skip, so only the gate's hook can remove it.
+    mint_literal: bool,
 }
 
 const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
@@ -53,6 +57,7 @@ const HISTORY_BASELINE: HistoryCycle<'static> = HistoryCycle {
     bootstrapped: false,
     upload: PipelineUpload::Accept,
     destination: None,
+    mint_literal: false,
 };
 
 struct HistoryOutcome {
@@ -60,6 +65,8 @@ struct HistoryOutcome {
     index: ScanIndex,
     /// Sessions whose bodies reached the in-process upload.
     uploaded: BTreeSet<String>,
+    /// Sessions whose request-owned literal items reached it.
+    uploaded_literal: BTreeSet<String>,
     /// Captured cutoff and proof corrections; no gated body may feed one.
     corrections: usize,
 }
@@ -285,8 +292,24 @@ impl HistoryFixture {
             &mut scan,
             &disposition,
         );
+        if cycle.mint_literal {
+            let copies = scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    let mut copy = item.clone();
+                    copy.usage_accounting_contract =
+                        Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
+                    copy.snapshot_fingerprint =
+                        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &copy);
+                    copy
+                })
+                .collect::<Vec<_>>();
+            scan.snapshots.extend(copies);
+        }
         index.retain_claude_history_emission_permitted(&mut scan.snapshots);
         let mut uploaded = BTreeSet::new();
+        let mut uploaded_literal = BTreeSet::new();
         let mut accepted = 0;
         let result = upload_resumable_batches_with_body_witness(
             &scan.snapshots,
@@ -297,6 +320,15 @@ impl HistoryFixture {
             snapshot_upload_body_witness,
             |items| {
                 uploaded.extend(items.iter().map(|item| item.source_session_id.clone()));
+                uploaded_literal.extend(
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.usage_accounting_contract.as_deref()
+                                == Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT)
+                        })
+                        .map(|item| item.source_session_id.clone()),
+                );
                 Ok(accepted_batch(items.len()))
             },
             |_| Ok(()),
@@ -316,6 +348,7 @@ impl HistoryFixture {
             scan,
             index: ScanIndex::load(&index_path).expect("reload scan index"),
             uploaded,
+            uploaded_literal,
             corrections,
         }
     }
@@ -359,6 +392,7 @@ const HISTORY_REVISION_2: HistoryCycle<'static> = HistoryCycle {
     bootstrapped: true,
     upload: PipelineUpload::Accept,
     destination: None,
+    mint_literal: false,
 };
 
 /// Primary incident shape (addendum 2) on an unverified Mac: a bootstrapped
@@ -878,34 +912,74 @@ fn user_repair_override_carries_accepted_history_through_census_and_release() {
     });
 }
 
-/// Addendum 1 items 2 and 5 (P2), SOURCE F2: revision 3 is above
-/// `MAX_GATED_CLAUDE_REVISION`, so the gate holds every upgrade
-/// (`ungated_revision`) and a listed family's genuine change is denied; no
-/// file is stamped 3. A listed family's genuine change emits under revision
-/// 2, and a stored 3 is never downgraded by revision 2.
+/// SOURCE Amendment 14 (owner B ruling 1): under revision 3 a LISTED root's
+/// genuine transcript change emits its ORDINARY body; no request-owned
+/// literal item and no revision-3 stamp reaches that file, and
+/// `history_emission_denied{reason=listed_literal}` counts it. Unlisted
+/// history upgrades carry the literal. The next cycle the unchanged listed
+/// root is owed and held, never settled as revision-3 history.
 #[test]
-fn revision_three_policy_denies_listed_changes_and_never_downgrades() {
-    let fixture = HistoryFixture::new("history-upgrade-revision-three");
-    fixture.baseline();
-    fixture.install_list(&[HISTORY_SESSIONS[0]]);
-    fixture.append(HISTORY_SESSIONS[0], "req_0_2");
-    let revision_3 = HistoryCycle {
-        revision: 3,
-        upload_context: "history-context-2",
-        ..HISTORY_REVISION_2
-    };
-    let denied = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
-    assert!(
-        denied.uploaded.is_empty(),
-        "an ungated revision emits nothing: {:?}",
-        denied.uploaded
-    );
-    assert!(denied
-        .index
-        .files
-        .values()
-        .all(|entry| entry.effective_upload_body_witness_revision <= 2));
+fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        use crate::snapshots::{history_local_count, HistoryLocalCount};
+        let fixture = HistoryFixture::new("history-upgrade-revision-three");
+        fixture.baseline();
+        fixture.install_list(&[HISTORY_SESSIONS[0]]);
+        fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+        let revision_3 = HistoryCycle {
+            revision: 3,
+            upload_context: "history-context-2",
+            mint_literal: true,
+            ..HISTORY_REVISION_2
+        };
+        let denied = history_local_count(HistoryLocalCount::ListedLiteralDenied);
+        let changed = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
+        assert_eq!(
+            history_local_count(HistoryLocalCount::ListedLiteralDenied),
+            denied + 1,
+            "listed_literal counts the listed root's change"
+        );
+        assert!(
+            changed.uploaded.contains(HISTORY_SESSIONS[0]),
+            "the listed root's ordinary body emits on a genuine change"
+        );
+        assert_eq!(
+            changed.uploaded_literal,
+            HISTORY_SESSIONS[1..]
+                .iter()
+                .map(|session| session.to_string())
+                .collect::<BTreeSet<_>>(),
+            "no literal item of the listed root; unlisted history carries it"
+        );
+        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        assert_eq!(
+            changed.index.files[&listed].effective_upload_body_witness_revision, 1,
+            "no revision-3 stamp on the listed root"
+        );
+        for session in &HISTORY_SESSIONS[1..] {
+            let key = HistoryFixture::key(&changed.index, session);
+            assert_eq!(
+                changed.index.files[&key].effective_upload_body_witness_revision,
+                3
+            );
+        }
+        let quiet = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
+        assert!(
+            quiet.uploaded.is_empty(),
+            "owed and held: {:?}",
+            quiet.uploaded
+        );
+        assert_eq!(
+            quiet.index.files[&listed].effective_upload_body_witness_revision,
+            1
+        );
+    });
+}
 
+/// Addendum 1 item 5: revision 2 lets a listed family's genuine change sync,
+/// and a stored 3 is never downgraded by revision 2.
+#[test]
+fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
     let fixture = HistoryFixture::new("history-upgrade-revision-two-listed");
     fixture.baseline();
     fixture.install_list(&[HISTORY_SESSIONS[0]]);
@@ -934,6 +1008,51 @@ fn revision_three_policy_denies_listed_changes_and_never_downgrades() {
         .files
         .values()
         .all(|entry| entry.effective_upload_body_witness_revision == 3));
+}
+
+/// Owner B ruling 3 through the pipeline: MONEY's census re-owes a stored 3
+/// (as #699's selection-loss path will); the file is owed again, a listed
+/// one is held and keeps 2, an unlisted one upgrades back to 3.
+#[test]
+fn a_re_owed_file_goes_back_through_the_gate() {
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        use crate::snapshots::{history_local_count, HistoryLocalCount};
+        let fixture = HistoryFixture::new("history-upgrade-reowe");
+        fixture.baseline();
+        fixture.install_list(&[]);
+        let revision_3 = HistoryCycle {
+            revision: 3,
+            upload_context: "history-context-1",
+            ..HISTORY_REVISION_2
+        };
+        let upgraded = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
+        assert_eq!(upgraded.uploaded.len(), HISTORY_SESSIONS.len());
+        let mut index = upgraded.index;
+        index.activate_effective_upload_body_witness_revision(3);
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
+        for session in &HISTORY_SESSIONS[..2] {
+            let key = HistoryFixture::key(&index, session);
+            assert!(index.re_owe_effective_upload_body_witness_revision(&key, 2));
+        }
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
+        index
+            .save(&fixture.index_path)
+            .expect("save re-owed stamps");
+        fixture.install_list(&[HISTORY_SESSIONS[0]]);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
+        assert_eq!(
+            again.uploaded,
+            BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+            "the listed re-owed root is held; the unlisted one upgrades"
+        );
+        for (session, revision) in HISTORY_SESSIONS.iter().zip([2, 3, 3]) {
+            let key = HistoryFixture::key(&again.index, session);
+            assert_eq!(
+                again.index.files[&key].effective_upload_body_witness_revision, revision,
+                "{session}"
+            );
+        }
+    });
 }
 
 /// Addendum 2 item 14 (#700): with the seen-marker present, an empty load
@@ -1607,6 +1726,29 @@ fn another_destinations_claude_state_is_prior_history() {
         crate::snapshots::PriorHistory::None,
         "this destination's own files are not evidence"
     );
+    // I-r3-1: this destination's own v1/v2 leftovers are not a move.
+    for legacy in [
+        own.join("claude_code-scan-index.json"),
+        own.join("claude_code-scan-index-v2.json"),
+    ] {
+        std::fs::write(&legacy, b"{}").expect("legacy leftover");
+    }
+    assert_eq!(
+        prior(),
+        crate::snapshots::PriorHistory::None,
+        "a same-destination legacy leftover is not another destination"
+    );
+    // SOURCE h732 C3: an unscoped pre-scoping index names no destination, so
+    // it is not a move, but it is this Mac's history: Here, so a cutoff keeps
+    // it owed, list-gated and paced.
+    std::fs::write(
+        fixture
+            .support
+            .join("snapshots/claude_code-scan-index-no-titles.json"),
+        b"{}",
+    )
+    .expect("unscoped legacy index");
+    assert_eq!(prior(), crate::snapshots::PriorHistory::Here);
     let other = destinations.join("destination-a");
     std::fs::create_dir_all(&other).expect("create other destination");
     std::fs::write(
@@ -1808,4 +1950,116 @@ fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
         assert!(outcome.uploaded.is_empty());
         crate::snapshots::restart_claude_reemission_stop_for_test();
     }
+}
+fn history_subagent_line(session: &str, agent: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-08-02T07:00:10Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{session}_{agent}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+    )
+}
+
+/// The members the history gate held only through a listed family root
+/// whose root file is absent, as the local diagnostics recorded them.
+fn family_closure_root_absent_excluded(lines: &[serde_json::Value]) -> u64 {
+    lines
+        .iter()
+        .filter(|line| line["stage"] == "claude_reemission_family_closure_root_absent_excluded")
+        .map(|line| {
+            line["counts"]["claude_reemission_family_closure_root_absent_excluded"]
+                .as_u64()
+                .expect("count")
+        })
+        .sum()
+}
+
+/// StateMissing M1 (SOURCE d680b524): the first family gets subagent files
+/// `agents`, every file is sent at revision 1, then its root transcript is
+/// removed, `listed` is installed as the list and the index is quarantined.
+/// The rebuilt cycle runs the full prepare/finish path under the captured
+/// local diagnostics.
+fn rootless_family_rebuild(
+    name: &str,
+    agents: &[&str],
+    listed: &str,
+) -> (HistoryOutcome, Vec<serde_json::Value>) {
+    let fixture = HistoryFixture::new(name);
+    let family = HISTORY_SESSIONS[0];
+    let subagents = fixture.root.join(family).join("subagents");
+    std::fs::create_dir_all(&subagents).expect("create synthetic subagents");
+    for agent in agents {
+        std::fs::write(
+            subagents.join(format!("{agent}.jsonl")),
+            history_subagent_line(family, agent),
+        )
+        .expect("write synthetic subagent transcript");
+    }
+    let baseline = fixture.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
+    for agent in agents {
+        assert!(
+            baseline.uploaded.contains(&format!("{family}_{agent}")),
+            "the subagent is sent before the rebuild: {:?}",
+            baseline.uploaded
+        );
+    }
+    std::fs::remove_file(fixture.root.join(format!("{family}.jsonl")))
+        .expect("remove the root transcript");
+    fixture.install_list(&[listed]);
+    fixture.corrupt_index();
+    crate::local_resource_diagnostics::capture(|| {
+        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2)
+    })
+}
+
+/// Nothing of the first family reached the upload or the emitted snapshots;
+/// the unlisted families are paced through and sent.
+fn assert_rootless_family_held(outcome: &HistoryOutcome) {
+    let family = HISTORY_SESSIONS[0];
+    assert!(
+        outcome.uploaded.iter().all(|id| !id.starts_with(family)),
+        "{:?}",
+        outcome.uploaded
+    );
+    assert!(outcome
+        .scan
+        .snapshots
+        .iter()
+        .all(|item| !item.source_session_id.starts_with(family)));
+    for session in &HISTORY_SESSIONS[1..] {
+        assert!(
+            outcome.uploaded.contains(*session),
+            "{:?}",
+            outcome.uploaded
+        );
+    }
+}
+
+/// SOURCE d680b524 (a): the list names only `R_agent-a`, `R.jsonl` is gone,
+/// and the index is rebuilt. A sibling is not offered whether traversal
+/// decides it after agent-a (`agent-b`) or before it (`agent-0`), and each
+/// sibling counts once as held through the absent root. agent-a itself is
+/// listed by its own line and is not counted.
+#[test]
+fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file() {
+    for (sibling, name) in [
+        ("agent-b", "history-upgrade-rootless-after"),
+        ("agent-0", "history-upgrade-rootless-before"),
+    ] {
+        let listed = format!("{}_agent-a", HISTORY_SESSIONS[0]);
+        let (outcome, lines) = rootless_family_rebuild(name, &["agent-a", sibling], &listed);
+        assert_rootless_family_held(&outcome);
+        assert_eq!(family_closure_root_absent_excluded(&lines), 1, "{sibling}");
+    }
+}
+
+/// SOURCE d680b524 (b), the reverse: the list names the root `R`, `R.jsonl`
+/// is gone and only subagent files remain. None is offered, and each counts
+/// as held through the absent root.
+#[test]
+fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file() {
+    let (outcome, lines) = rootless_family_rebuild(
+        "history-upgrade-rootless-listed-root",
+        &["agent-a", "agent-b"],
+        HISTORY_SESSIONS[0],
+    );
+    assert_rootless_family_held(&outcome);
+    assert_eq!(family_closure_root_absent_excluded(&lines), 2);
 }

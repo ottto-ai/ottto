@@ -215,14 +215,62 @@ fn save_backfill_state_locked(state_dir: &Path, state: &BackfillState) -> Result
     temp.sync_all().context("sync backfill state")?;
     std::fs::rename(&temp_path, &path)
         .with_context(|| format!("rename backfill state into place {}", path.display()))?;
+    // The new file is visible but not yet durable until its directory syncs.
+    remember_synced_state_directory(None);
+    sync_state_directory(state_dir)
+}
+
+// Addendum 3 (AutoReview P2 on #712 c4e3f426): the state directory this
+// process last synced after the last rename it made. Accessed only under
+// BACKFILL_SAVE_LOCK. One directory: the daemon has one state directory.
+#[cfg(not(test))]
+static SYNCED_STATE_DIRECTORY: std::sync::Mutex<Option<PathBuf>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static SYNCED_STATE_DIRECTORY: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
+    static STATE_DIRECTORY_SYNCS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(not(test))]
+fn with_synced_state_directory<T>(access: impl FnOnce(&mut Option<PathBuf>) -> T) -> T {
+    access(
+        &mut SYNCED_STATE_DIRECTORY
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
+#[cfg(test)]
+fn with_synced_state_directory<T>(access: impl FnOnce(&mut Option<PathBuf>) -> T) -> T {
+    SYNCED_STATE_DIRECTORY.with(|synced| access(&mut synced.borrow_mut()))
+}
+
+fn remember_synced_state_directory(state_dir: Option<&Path>) {
+    with_synced_state_directory(|synced| *synced = state_dir.map(Path::to_path_buf));
+}
+
+fn sync_state_directory(state_dir: &Path) -> Result<()> {
     File::open(state_dir)
         .and_then(|directory| directory.sync_all())
         .context("sync backfill state directory")?;
+    #[cfg(test)]
+    STATE_DIRECTORY_SYNCS.with(|syncs| syncs.set(syncs.get() + 1));
+    remember_synced_state_directory(Some(state_dir));
     Ok(())
 }
 
+#[cfg(test)]
+fn state_directory_syncs() -> u64 {
+    STATE_DIRECTORY_SYNCS.with(std::cell::Cell::get)
+}
+
 /// Update the latest durable state while excluding saves, other updates and
-/// installation reset. An unchanged on-disk state needs no write or fsync.
+/// installation reset. An unchanged on-disk state needs no write. Before it
+/// reports success it syncs the state directory once per process, so a value
+/// an earlier save renamed into place but failed to sync (an already-Set
+/// list intent, say) is durable before anyone relies on it.
 pub(crate) fn update_backfill_state(
     state_dir: &Path,
     update: impl FnOnce(&mut BackfillState),
@@ -234,13 +282,18 @@ pub(crate) fn update_backfill_state(
     let before = state.clone();
     update(&mut state);
     if state == before {
+        let synced = with_synced_state_directory(|synced| synced.as_deref() == Some(state_dir));
+        if !synced && backfill_state_path(state_dir).exists() {
+            sync_state_directory(state_dir)?;
+        }
         return Ok(());
     }
     save_backfill_state_locked(state_dir, &state)
 }
 
 /// A good list read is the only automatic transition to Set. A Set value
-/// loaded from disk under the lock succeeds without rewriting the file.
+/// loaded from disk under the lock succeeds without rewriting the file, after
+/// syncing its directory once per process.
 pub(crate) fn record_claude_history_list_intent(state_dir: &Path) -> Result<()> {
     update_backfill_state(state_dir, |state| {
         state.claude_history_list_intent = ClaudeHistoryListIntent::Set;
@@ -1041,6 +1094,37 @@ mod tests {
             assert_eq!(after.ino(), before.ino(), "no atomic replacement");
         }
         assert_eq!(fs::read(&temp).unwrap(), b"untouched temp sentinel");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// Addendum 3 (AutoReview P2 on #712 c4e3f426): a save can rename the
+    /// state into place and then fail its directory fsync. A later unchanged
+    /// update, such as an already-Set intent read, syncs the directory once
+    /// per process before it reports success, and still rewrites nothing.
+    #[test]
+    fn an_unchanged_state_syncs_its_directory_once_before_success() {
+        let dir = temp_dir("backfill-noop-directory-sync");
+        record_claude_history_list_intent(&dir).unwrap();
+        let saved = state_directory_syncs();
+        record_claude_history_list_intent(&dir).unwrap();
+        assert_eq!(state_directory_syncs(), saved, "the save synced it");
+
+        // As after a rename whose directory fsync failed, or a new process.
+        remember_synced_state_directory(None);
+        let content = fs::read(backfill_state_path(&dir)).unwrap();
+        record_claude_history_list_intent(&dir).unwrap();
+        assert_eq!(state_directory_syncs(), saved + 1, "synced before success");
+        assert_eq!(fs::read(backfill_state_path(&dir)).unwrap(), content);
+        record_claude_history_list_intent(&dir).unwrap();
+        clear_prior_history_unverified(&dir).unwrap();
+        assert_eq!(state_directory_syncs(), saved + 1, "once per process");
+
+        // A positively missing state has nothing to make durable.
+        let empty = temp_dir("backfill-noop-directory-sync-empty");
+        clear_prior_history_unverified(&empty).unwrap();
+        assert_eq!(state_directory_syncs(), saved + 1);
+        assert!(!backfill_state_path(&empty).exists());
+        let _ = fs::remove_dir_all(empty);
         let _ = fs::remove_dir_all(dir);
     }
 
