@@ -100,6 +100,12 @@ const WORK_MAX_STATS: u64 = 1024;
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
 /// Leave bounded closing work inside the total, rather than after expiry.
 const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
+/// The first scheduled family, and the inputs only bodies use, may run this
+/// far into the closing reserve. Fixed setup scales with every page family
+/// and with the earlier page's acknowledgements; without this floor, a large
+/// or loaded page can spend the whole body window on it and defer every
+/// family, page after page. Closing slices stay bounded by the close deadline.
+const FIRST_FAMILY_CLOSE_RESERVE: Duration = Duration::from_millis(70);
 const TELEMETRY_MAX_ELAPSED: Duration = Duration::from_millis(20);
 /// A growing structure's admission step.
 const GROWTH_STEP_BYTES: usize = 256 * 1024;
@@ -547,6 +553,9 @@ pub(crate) enum PageFault {
     LateAtHandOff,
     /// Dense-page fixture: optional work is already out of time at entry.
     BodyDeadline,
+    /// Fixed setup used the whole body window; only the first scheduled
+    /// family's floor remains.
+    SetupOverrun,
     /// The batch's admission is refused.
     BatchRefused,
     WriteFailure,
@@ -558,6 +567,31 @@ pub(crate) enum PageFault {
 #[cfg(test)]
 thread_local! {
     static PAGE_FAULT: std::cell::Cell<PageFault> = const { std::cell::Cell::new(PageFault::None) };
+}
+
+// The last admitted page's family processing order, by root.
+#[cfg(test)]
+thread_local! {
+    static PAGE_SCHEDULE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn last_page_schedule_for_test() -> Vec<String> {
+    PAGE_SCHEDULE.with(|schedule| schedule.borrow().clone())
+}
+
+// One page's injected wall budget, in place of the first-finalizer clock.
+#[cfg(test)]
+thread_local! {
+    static PAGE_BUDGET: std::cell::Cell<Option<Duration>> = const { std::cell::Cell::new(None) };
+}
+
+/// Functional probes inject the next page's clock: they check scheduling
+/// and body progress, independently of CI CPU contention. Wall bounds are
+/// asserted on real-clock pages.
+#[cfg(test)]
+pub(crate) fn set_next_page_budget_for_test(budget: Duration) {
+    PAGE_BUDGET.with(|current| current.set(Some(budget)));
 }
 
 #[cfg(test)]
@@ -1217,7 +1251,8 @@ struct PageEnd<'a> {
     now: u64,
     census_complete: bool,
     started: Instant,
-    /// Optional body work stops before the closing reserve.
+    /// Optional body work stops before the closing reserve (the first
+    /// scheduled family's floor reaches into it).
     deadline: Instant,
     /// Housekeeping stops here, leaving time for handoff and return.
     close_deadline: Instant,
@@ -1247,6 +1282,15 @@ pub(crate) fn shadow_page_at(
         census_complete,
         now,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn set_deferred_compare_cursor_for_test(support_dir: &Path, now: u64, cursor: usize) {
+    store::prime_credit_for_test(support_dir, utc_day(now));
+    let ClaudeLedgerAcquire::Ready(mut ledger) = store::acquire(support_dir) else {
+        panic!("test ledger ready");
+    };
+    ledger.deferred_compare_cursor = cursor;
 }
 
 #[cfg(test)]
@@ -1312,10 +1356,18 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
+    #[cfg(test)]
+    PAGE_SCHEDULE.with(|schedule| schedule.borrow_mut().clear());
     let scope_key = shadow_scope(support_dir);
-    let clock = capture::take_page_clock(&scope_key, started);
+    #[cfg_attr(not(test), allow(unused_mut))]
+    let mut clock = capture::take_page_clock(&scope_key, started);
+    #[cfg(test)]
+    if let Some(budget) = PAGE_BUDGET.with(std::cell::Cell::take) {
+        clock.deadline = started + budget;
+    }
     let capture_us = clock.capture_us;
     let deadline = clock.deadline - PAGE_CLOSE_RESERVE;
+    let first_family_deadline = clock.deadline - FIRST_FAMILY_CLOSE_RESERVE;
     let close_deadline = clock.deadline - Duration::from_millis(10);
     let snapshot = next_snapshot();
     let day = utc_day(now);
@@ -1417,6 +1469,13 @@ fn shadow_page_with_coverage(
     // The capture plan uses this same total order. Stable input ordering
     // differs after a rotation and cannot break equal-turn ties safely.
     order.sort_by(|left, right| left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1)));
+    #[cfg(test)]
+    PAGE_SCHEDULE.with(|schedule| {
+        *schedule.borrow_mut() = order
+            .iter()
+            .map(|(root, _, _)| (*root).to_owned())
+            .collect();
+    });
     let capture_turns = order
         .iter()
         .take(capture::NEXT_PAGE_FAMILIES)
@@ -1452,17 +1511,21 @@ fn shadow_page_with_coverage(
         drop_certificate(ledger);
     }
     prune_message_records(ledger, index, &mut counts);
-    // Global optional work may run out of time too. Its absence closes
-    // every body, while the pre-admitted family failure rows still publish.
+    // Only scheduled families can be reached, so their body inputs are
+    // gathered for them alone. Body inputs may run out of time too. Their
+    // absence closes every body; the pre-admitted failure rows still publish.
     let (member_keys, indexed_members) =
-        family_members(index, &roots, deadline).unwrap_or_default();
+        family_members(index, &capture_turns, first_family_deadline).unwrap_or_default();
     let mut by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     let mut captures = BTreeMap::new();
     let mut groups_owned = BTreeSet::new();
     for item in snapshots {
         let root = claude_snapshot_family_root_ref(item);
+        if !capture_turns.contains(root) {
+            continue;
+        }
         by_root.entry(root).or_default().push(item);
-        if Instant::now() >= deadline || !capture_turns.contains(root) {
+        if Instant::now() >= first_family_deadline {
             continue;
         }
         if let Some(keys) = member_keys
@@ -1494,7 +1557,13 @@ fn shadow_page_with_coverage(
     }
     purge_captures(&scope_key, &mut counts);
     let page_groups = groups_owned.iter().map(String::as_str).collect();
-    let scope = ClaudeLedgerScope::build(index, ledger.census(), &page_groups, &roots, deadline);
+    let scope = ClaudeLedgerScope::build(
+        index,
+        ledger.census(),
+        &page_groups,
+        &roots,
+        first_family_deadline,
+    );
     if let Some(scope) = &scope {
         end.scope = scope.debt;
     }
@@ -1518,7 +1587,7 @@ fn shadow_page_with_coverage(
         sessions.insert(key.clone(), root.to_owned());
         if let Some(rows) = api_report.evidence.get(root) {
             for row in rows {
-                if Instant::now() >= deadline {
+                if Instant::now() >= first_family_deadline {
                     break;
                 }
                 page_claims
@@ -1541,10 +1610,20 @@ fn shadow_page_with_coverage(
     let mut incomplete = 0;
     let mut failure_digest = DeadlineDigest::default();
     counts.family_setup_us = started.elapsed().as_micros() as u64;
+    // The first scheduled family is always attempted, before the body
+    // deadline every later family keeps.
+    let mut later_families = end.deadline;
+    end.deadline = first_family_deadline;
     if faulted(PageFault::BodyDeadline) {
-        end.deadline = started;
+        (end.deadline, later_families) = (started, started);
+    } else if faulted(PageFault::SetupOverrun) {
+        later_families = started;
     }
     for position in 0..order.len() {
+        if position > 0 {
+            end.deadline = later_families;
+        }
+        let body_deadline = end.deadline;
         let (root, key, turn) = order[position].clone();
         if !capture_turns.contains(root)
             || scope.is_none()
@@ -1560,6 +1639,11 @@ fn shadow_page_with_coverage(
             let compare_until = end.close_deadline - Duration::from_millis(30);
             let suffix = &order[position..];
             let mut first_uncompared = None;
+            // Comparisons rotate from the cursor; rows still follow the
+            // schedule. Memos pushed before the rotation wraps move last.
+            let first_memo = memos.len();
+            let rotation = ledger.deferred_compare_cursor % suffix.len();
+            let mut before_wrap = 0;
             for at in deferred_comparison_order(suffix.len(), ledger.deferred_compare_cursor) {
                 let (root, key, turn) = &suffix[at];
                 let state = coverage_view.family(root);
@@ -1600,7 +1684,9 @@ fn shadow_page_with_coverage(
                     row: true,
                     deferred: Some((root.to_string(), state)),
                 });
+                before_wrap += usize::from(at >= rotation);
             }
+            memos[first_memo..].rotate_left(before_wrap);
             ledger.deferred_compare_cursor = first_uncompared.unwrap_or(0);
             counts.families += deferred;
             counts.families_unbuilt += deferred;
@@ -1614,7 +1700,7 @@ fn shadow_page_with_coverage(
         let items = &by_root[root];
         let mut family_captures = BTreeMap::new();
         for item in items {
-            if Instant::now() >= deadline {
+            if Instant::now() >= body_deadline {
                 break;
             }
             let key = (root.to_owned(), item.source_session_id.clone());
@@ -1630,7 +1716,7 @@ fn shadow_page_with_coverage(
             ledger,
             api_report,
             trace_report,
-            deadline,
+            body_deadline,
         );
         let state = coverage_view.family(root);
         let mut basis = None;
@@ -1704,7 +1790,7 @@ fn shadow_page_with_coverage(
         }
         if !rows.row.old_available && !rows.row.p1_reasons.contains(&"deadline") {
             if let Some(members) = indexed_members.get(root) {
-                if let Some(revision) = union_revision_by(members, deadline) {
+                if let Some(revision) = union_revision_by(members, body_deadline) {
                     rows.row.revision = hex_revision(&revision);
                 }
                 rows.row.members_total = members.len().max(items.len());
@@ -1719,7 +1805,7 @@ fn shadow_page_with_coverage(
             } else {
                 semantic_digest(&mut rows)
             }
-        } else if let Some(digest) = semantic_digest_by(&mut rows, Some(deadline)) {
+        } else if let Some(digest) = semantic_digest_by(&mut rows, Some(body_deadline)) {
             digest
         } else {
             // The body was built, but its full digest did not finish. Keep
