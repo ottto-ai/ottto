@@ -3880,3 +3880,257 @@ fn repair_identity_carry_keeps_retirement_evidence_with_its_own_decode_policy() 
         assert_eq!(corrupt_count(&scratch), 0);
     }
 }
+
+fn write_repair_collision(path: &Path, value: &mut Value) -> Vec<u8> {
+    let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+    value["codex_state_only_snapshot_fingerprints"] = serde_json::json!({
+        key: "lower", key.to_ascii_uppercase(): "upper"
+    });
+    let bytes = serde_json::to_vec(value).unwrap();
+    fs::write(path, &bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn user_repair_tombstone_loss_carries_identity_without_refusal_and_keeps_the_fence() {
+    let source = SnapshotSource::ClaudeCode;
+    for case in [
+        "intact",
+        "entries",
+        "container",
+        "missing_map",
+        "cap",
+        "uncertain",
+        "no_marker",
+        "false_marker",
+        "damaged_marker",
+        "pre_bridge",
+    ] {
+        reset_override_state_for_restart();
+        let scratch = crate::test_scratch::ScratchDir::new("repair-retirement-loss");
+        let path = scratch.join("index.json");
+        let support = scratch.join("support");
+        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+        fs::write(&path, b"{").unwrap();
+        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+        let seed = retired_family_decode_seed();
+        let mut value = serde_json::to_value(&seed).unwrap();
+        let mut kept = seed.claude_retired_family_tombstones.entries.clone();
+        match case {
+            "intact" => {}
+            "entries" => {
+                value["claude_retired_family_tombstones"]["bad-root"] = serde_json::json!(false);
+            }
+            "container" => {
+                value["claude_retired_family_tombstones"] = serde_json::json!([false]);
+                kept.clear();
+            }
+            "missing_map" => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("claude_retired_family_tombstones");
+                kept.clear();
+            }
+            "cap" => {
+                let all = (0..=MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES)
+                    .map(|n| (format!("{n:064x}"), n as u64))
+                    .collect::<BTreeMap<_, _>>();
+                value["claude_retired_family_tombstones"] = serde_json::to_value(&all).unwrap();
+                kept = all.into_iter().skip(1).collect();
+            }
+            "uncertain" => {
+                value["claude_retired_family_tombstones_uncertain"] = serde_json::json!(true);
+            }
+            "no_marker" => {
+                value
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("claude_retired_family_tombstones_initialized");
+            }
+            "false_marker" => {
+                value["claude_retired_family_tombstones_initialized"] = serde_json::json!(false);
+            }
+            "damaged_marker" => {
+                value["claude_retired_family_tombstones_initialized"] =
+                    serde_json::json!({"lost":true});
+            }
+            "pre_bridge" => {
+                for field in [
+                    "claude_retired_family_tombstones",
+                    "claude_retired_family_tombstones_initialized",
+                    "claude_retired_family_tombstones_uncertain",
+                ] {
+                    value.as_object_mut().unwrap().remove(field);
+                }
+                kept.clear();
+            }
+            _ => unreachable!(),
+        }
+        let bytes = write_repair_collision(&path, &mut value);
+        assert!(
+            load()
+                .unwrap_err()
+                .downcast_ref::<ScanIndexRebuildLoop>()
+                .is_some(),
+            "{case}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Armed
+        );
+        let count = scan_index_rebuild_manual_override_count();
+        let (mut rebuilt, origin) = load().unwrap();
+        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{case}");
+        assert_eq!(
+            scan_index_rebuild_manual_override_count(),
+            count + 1,
+            "Repair was not refused: {case}"
+        );
+        assert_retired_family_decode_identity(&rebuilt, &seed);
+        assert_identity_carried(&rebuilt, &seed, case);
+        assert_eq!(
+            rebuilt.claude_retired_family_tombstones.entries, kept,
+            "{case}"
+        );
+        assert_eq!(
+            rebuilt.claude_retired_family_tombstones_uncertain,
+            case != "intact",
+            "{case}"
+        );
+        assert!(rebuilt.claude_history_unverified_in_process, "{case}");
+        assert!(rebuilt.files.is_empty());
+        assert_eq!(rebuilt.generation, 0);
+        let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved["claude_retired_family_tombstones_initialized"], true);
+        assert!(saved.get("claude_history_unverified_in_process").is_none());
+        // A fence and an unrelated tombstone cannot alter identity tags or
+        // suppress an exact-owner correction. Conflicting creator B still
+        // defers; matching creator A still proceeds, with ACKs unchanged.
+        let mut item = tests::valid_v6_batch_request().snapshots.remove(0);
+        let session = item.source_session_id.clone();
+        let key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
+        rebuilt.session_account_bindings.insert(
+            key,
+            SessionAccountBinding {
+                account_identifier_hash: OVERRIDE_OWNER_A.into(),
+                workspace_identifier_hash: None,
+            },
+        );
+        let accepted = rebuilt.accepted_snapshot_fingerprints.clone();
+        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
+        assert!(rebuilt
+            .bind_session_accounts(source, "machine-a", &mut [item.clone()], &[])
+            .contains(&session));
+        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_A));
+        item.request_evidence.push(SnapshotRequestEvidence {
+            identity_basis: claude_request_identity::TELEMETRY.to_owned(),
+            provider_workspace_hash: Some("d".repeat(64)),
+        });
+        let tags = as_json(&item.request_evidence);
+        let mut items = [item];
+        assert!(rebuilt
+            .bind_session_accounts(source, "machine-a", &mut items, &[])
+            .is_empty());
+        assert_eq!(as_json(&items[0].request_evidence), tags);
+        assert_eq!(rebuilt.accepted_snapshot_fingerprints, accepted);
+        assert_eq!(rebuilt.session_account_bindings, {
+            let mut bindings = seed.session_account_bindings.clone();
+            bindings.insert(
+                sha256_hex(&["session_owner:v1", "machine-a", &session]),
+                SessionAccountBinding {
+                    account_identifier_hash: OVERRIDE_OWNER_A.into(),
+                    workspace_identifier_hash: None,
+                },
+            );
+            bindings
+        });
+    }
+}
+
+#[test]
+fn real_repair_override_marks_history_unverified_before_return_and_first_census() {
+    reset_override_state_for_restart();
+    restart_claude_reemission_stop_for_test();
+    let scratch = crate::test_scratch::ScratchDir::new("repair-first-census");
+    let path = scratch.join("index.json");
+    let support = scratch.join("support");
+    let source = SnapshotSource::ClaudeCode;
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(
+        ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support)
+            .unwrap()
+            .1,
+        ScanIndexLoadOrigin::Quarantined
+    );
+    let seed = retired_family_decode_seed();
+    let mut value = serde_json::to_value(&seed).unwrap();
+    write_repair_collision(&path, &mut value);
+    assert!(
+        ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support)
+            .unwrap_err()
+            .downcast_ref::<ScanIndexRebuildLoop>()
+            .is_some()
+    );
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    // Forget the priming load: the real override must establish its own memo.
+    forget_claude_unverified_history_indexes_for_test();
+    let mut rebuilt = override_scan_index_rebuild_loop(
+        &path,
+        "codex_identity_collision",
+        source,
+        &support,
+        SystemTime::now(),
+    )
+    .unwrap();
+    assert!(
+        rebuilt.claude_history_unverified_in_process,
+        "before the outer source loader can help"
+    );
+    assert_retired_family_decode_identity(&rebuilt, &seed);
+    assert_eq!(rebuilt.generation, 0);
+    assert!(rebuilt.files.is_empty());
+    rebuilt.insert_retry_pending_claude_authority_for_test("first-census-absent");
+    let traversal: ScanTraversalCheckpoint = serde_json::from_value(serde_json::json!({
+        "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
+        "scan_roots":[], "pending_directories":[], "pending_candidates":[],
+        "observed_index_keys":[], "reconciliation_upper_bound":null,
+        "reconciliation_after":null, "reconciliation_started":true, "counts":{}
+    }))
+    .unwrap();
+    let before = claude_absence_counters_for_test().absent_families_retired;
+    assert_eq!(
+        rebuilt.retire_positively_absent_claude_families(&traversal, ""),
+        Err(ClaudeAbsenceRetirementRefusal::UnverifiedHistory)
+    );
+    assert_eq!(
+        claude_absence_counters_for_test().absent_families_retired,
+        before
+    );
+    assert!(rebuilt
+        .claude_authority_record_for_test("first-census-absent")
+        .is_some());
+    let mut control = rebuilt.clone();
+    control.claude_history_unverified_in_process = false;
+    assert_eq!(
+        control.retire_positively_absent_claude_families(&traversal, ""),
+        Ok(1)
+    );
+    // Generation and membership now look historic. Only the override's fresh
+    // path memo can keep the subsequent ordinary load unverified.
+    rebuilt.files.insert(
+        "/synthetic/post-repair.jsonl".into(),
+        tests::manifest_index_entry(Some(&"c".repeat(64))),
+    );
+    rebuilt.save(&path).unwrap();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(loaded.generation > 0 && !loaded.files.is_empty());
+    assert!(loaded.claude_history_unverified_in_process);
+    assert!(loaded
+        .claude_authority_record_for_test("first-census-absent")
+        .is_some());
+}
