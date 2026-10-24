@@ -102,6 +102,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 pub(crate) use store::MoneyReceipt;
+/// Debt revision and original authorization time of an immutable attempt.
+pub(crate) type RecoveryOffer = ([u8; 32], u64);
 use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
 
 /// Activation is a separate reviewed change after backend enforcement and parity.
@@ -3576,6 +3578,16 @@ pub(crate) fn prepare_money_offers_receipt(
     index: &ScanIndex,
     snapshots: &[SnapshotItem],
     held: &BTreeSet<String>,
+) -> MoneyReceipt {
+    prepare_money_offers_receipt_with_recovery(support_dir, index, snapshots, held, &|_, _| None)
+}
+
+pub(crate) fn prepare_money_offers_receipt_with_recovery(
+    support_dir: &Path,
+    index: &ScanIndex,
+    snapshots: &[SnapshotItem],
+    held: &BTreeSet<String>,
+    _recovered: &dyn Fn(&str, &SnapshotItem) -> Option<RecoveryOffer>,
 ) -> MoneyReceipt {
     if !request_owned_live(support_dir) {
         return MoneyReceipt::Ready;
