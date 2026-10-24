@@ -18,6 +18,8 @@ fn waker() -> &'static Waker {
 type Finish = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
 struct PendingFinish {
     future: Finish,
+    started_unix: u64,
+    recovery_binding: String,
     support_dir: PathBuf,
     index_path: PathBuf,
     index_revision: Option<FileRevision>,
@@ -60,6 +62,40 @@ fn cancel_weak(owner: &std::sync::Weak<Mutex<crate::DaemonState>>) {
 
 pub(crate) fn cancel_owner(daemon: &LocalDaemon) {
     cancel_weak(&std::sync::Arc::downgrade(&daemon.inner));
+}
+
+/// An unexpired owner may finish before cycle housekeeping. Its start is no
+/// later than any captured body, including a writer result not consumed yet.
+pub(super) fn privacy_owner_is_current(
+    support: &Path,
+    daemon: &LocalDaemon,
+    now: u64,
+) -> Result<bool> {
+    let slot = PENDING.lock().map_err(|_| refusal())?;
+    let owner = std::sync::Arc::downgrade(&daemon.inner);
+    Ok(slot.as_ref().is_some_and(|pending| {
+        pending.support_dir == support
+            && pending.owner.ptr_eq(&owner)
+            && now < pending.started_unix.saturating_add(24 * 3600)
+    }))
+}
+
+pub(super) fn privacy_owner_matches(
+    support: &Path,
+    daemon: &LocalDaemon,
+    now: u64,
+    binding: &str,
+    account_witness: &[u8; 32],
+) -> Result<bool> {
+    let slot = PENDING.lock().map_err(|_| refusal())?;
+    let owner = std::sync::Arc::downgrade(&daemon.inner);
+    Ok(slot.as_ref().is_some_and(|pending| {
+        pending.support_dir == support
+            && pending.owner.ptr_eq(&owner)
+            && now < pending.started_unix.saturating_add(24 * 3600)
+            && pending.recovery_binding == binding
+            && &pending.account_witness == account_witness
+    }))
 }
 
 /// Early credential/machine/account errors and a disabled Claude source can
@@ -464,6 +500,8 @@ fn start_admitted(
     let hint = preparation.money_policy.ok_or_else(admission_refused)?;
     let client = preparation.receipt_client.clone();
     let resume_client = client.clone();
+    let recovery_binding =
+        super::unknown_recovery::binding(&destination, client.recovery_origin(), machine_id, "");
     let owned_device = device.clone();
     let owned_secret = zeroize::Zeroizing::new(device_secret.to_owned());
     let machine_id = machine_id.to_owned();
@@ -505,6 +543,8 @@ fn start_admitted(
     };
     poll(PendingFinish {
         future: Box::pin(future),
+        started_unix: super::unknown_recovery::now(support_dir),
+        recovery_binding,
         support_dir: support_dir.to_owned(),
         index_path: path,
         index_revision: revision,

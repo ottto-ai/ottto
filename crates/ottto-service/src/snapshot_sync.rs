@@ -4128,6 +4128,24 @@ fn sync_once_with_retry(
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
     let mut money_cycle = money_resume::CycleScope::new(daemon);
+    // Private expiry must precede health/status/token networking and even a
+    // credential failure or a source-disabled early return. Cancel an expired
+    // owner first so queued send intents reload from their durable state.
+    if unknown_recovery::existing_recovery_state(support_dir)? {
+        let now = unknown_recovery::now(support_dir);
+        let owner_current = money_resume::privacy_owner_is_current(support_dir, daemon, now)?
+            && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+            && !unknown_recovery::expired_payload(support_dir, now)?;
+        if !owner_current {
+            money_resume::cancel_owner(daemon);
+            if !unknown_recovery::offline_startup(support_dir, now)? {
+                return Err(crate::source_rotation::LocalRefusal(
+                    "request money privacy checkpoint pending",
+                )
+                .into());
+            }
+        }
+    }
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -4146,6 +4164,33 @@ fn sync_once_with_retry(
         enabled_sources.contains(&SnapshotSource::ClaudeCode)
             && crate::snapshots::claude_request_money::request_owned_live(support_dir),
     );
+
+    if unknown_recovery::existing_recovery_state(support_dir)? {
+        let now = unknown_recovery::now(support_dir);
+        let binding = unknown_recovery::binding(
+            &snapshot_upload_destination_namespace(&device, &device_secret),
+            client.recovery_origin(),
+            &machine_id,
+            "",
+        );
+        // Preserve normal heartbeat cadence for an unexpired, current owner.
+        // Binding/account loss cancels speculative work before reconciliation.
+        if !money_resume::privacy_owner_matches(
+            support_dir,
+            daemon,
+            now,
+            &binding,
+            &account_witness,
+        )? {
+            money_resume::cancel_owner(daemon);
+            if !unknown_recovery::startup(support_dir, &binding, now)? {
+                return Err(crate::source_rotation::LocalRefusal(
+                    "request money identity checkpoint pending",
+                )
+                .into());
+            }
+        }
+    }
 
     if let Some(source) = enabled_sources.first().copied() {
         if let Err(error) = upload_local_health_projection_reporting(

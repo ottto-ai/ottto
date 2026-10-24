@@ -706,13 +706,27 @@ static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new())
 /// Called before activity/token networking, including when the source's
 /// network backoff would otherwise skip its finish. Expiry does not need HTTP.
 pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
+    startup_checked(support, Some(binding), now)
+}
+/// Privacy/expiry does not require credentials, an enabled Claude source or
+/// networking. Binding loss is reconciled once current identity is available.
+pub(super) fn offline_startup(support: &Path, now: u64) -> Result<bool> {
+    startup_checked(support, None, now)
+}
+fn startup_checked(support: &Path, binding: Option<&str>, now: u64) -> Result<bool> {
     let result = startup_inner(support, binding, now);
     if let Err(error) = &result {
         faulted(support, error);
     }
     result
 }
-fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
+pub(super) fn expired_payload(support: &Path, now: u64) -> Result<bool> {
+    let catalogs = CATALOGS.lock().map_err(|_| fault())?;
+    Ok(catalogs
+        .get(support)
+        .is_some_and(|catalog| catalog.entries.iter().any(|m| now >= m.deadline)))
+}
+fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool> {
     if CATALOGS
         .lock()
         .map_err(|_| fault())?
@@ -838,9 +852,10 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 // successful last replay as exhausted UNKNOWN. At the hard
                 // privacy deadline (or binding loss), retire known custody;
                 // selected-file debt still requires its ordinary saved proof.
-                return (m.binding != binding || now >= m.deadline).then_some(Reason::Resolved);
+                return (binding.is_some_and(|current| m.binding != current) || now >= m.deadline)
+                    .then_some(Reason::Resolved);
             }
-            if m.binding != binding {
+            if binding.is_some_and(|current| m.binding != current) {
                 Some(Reason::BindingLost)
             } else if now >= m.deadline {
                 Some(Reason::Expired)

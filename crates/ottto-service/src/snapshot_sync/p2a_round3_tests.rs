@@ -3368,6 +3368,89 @@ fn p2a_unknown_live_off_retires_existing_payload_before_ordinary_networking() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_restart_expiry_precedes_cycle_network_with_disabled_source_or_missing_binding() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for missing_binding in [false, true] {
+        let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle_deferred();
+        let m = unknown_recovery::active_for_test(&control.support)
+            .pop()
+            .unwrap();
+        let payload = control
+            .support
+            .join("claude-money-recovery")
+            .join(format!("{}.body", m.id));
+        assert!(payload.exists());
+        control.restart();
+        if missing_binding {
+            assert!(FileDeviceStore::default().reset().unwrap().is_some());
+        } else {
+            let mut device = control.device.clone();
+            device.sources = vec!["codex".into()];
+            FileDeviceStore::default().save(&device).unwrap();
+            assert!(!enabled_snapshot_sources(&device).contains(&SnapshotSource::ClaudeCode));
+        }
+        let observed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let seen = observed.clone();
+        let body = payload.clone();
+        let status = control.support.join("claude-money-recovery/status");
+        *control.server.before_request.lock().unwrap() = Some(Box::new(move || {
+            assert!(
+                !body.exists(),
+                "privacy retirement precedes even the first health/status/token request"
+            );
+            let status: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(status).unwrap()).unwrap();
+            assert_eq!(status["unknown_outcome_unresolved"], 1);
+            seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+        *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+        drop(clock);
+        let _expired = money::PageClockForTest::new(&control.support, now + 24 * 3600);
+        let mut credential_exit = false;
+        for _ in 0..32 {
+            let result = sync_once(&control.fixture.home, &control.support, &control.daemon);
+            money::store::flush();
+            if missing_binding {
+                credential_exit = result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|e| e.to_string().contains("relay device binding is missing"));
+                if credential_exit {
+                    break;
+                }
+            } else if observed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
+        }
+        assert!(!payload.exists());
+        assert_eq!(
+            observed.load(std::sync::atomic::Ordering::SeqCst),
+            !missing_binding
+        );
+        assert_eq!(credential_exit, missing_binding);
+        assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+        assert!(money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+        eprintln!("MONEY_UNKNOWN_CYCLE_PRIVACY missing_binding={missing_binding} claude_disabled={} expired_before_network=true receipt_before_credentials=true debt_preserved=true", !missing_binding);
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {

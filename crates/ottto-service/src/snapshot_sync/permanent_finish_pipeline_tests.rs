@@ -53,6 +53,7 @@ struct FinishServer {
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
     outcome: Arc<Mutex<FinishOutcome>>,
     before_post: FinishPostHook,
+    before_request: FinishPostHook,
 }
 
 impl FinishServer {
@@ -75,6 +76,8 @@ impl FinishServer {
         let active_outcome = outcome.clone();
         let before_post: FinishPostHook = Arc::new(Mutex::new(None));
         let post_hook = before_post.clone();
+        let before_request: FinishPostHook = Arc::new(Mutex::new(None));
+        let request_hook = before_request.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -87,6 +90,9 @@ impl FinishServer {
                 };
                 stream.set_nonblocking(false).unwrap();
                 let request = read_complete_http_request(&mut stream);
+                if let Some(hook) = request_hook.lock().unwrap().take() {
+                    hook();
+                }
                 assert!(http_request_complete(request.as_bytes()));
                 let raw = request.split_once("\r\n\r\n").unwrap().1;
                 let value: serde_json::Value = if raw.is_empty() {
@@ -263,6 +269,7 @@ impl FinishServer {
             terminal,
             outcome,
             before_post,
+            before_request,
         }
     }
 }
