@@ -140,19 +140,35 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             // clean telemetry sweep finish. Bounded; it must then accept.
             6
         } else if ack_save_fault {
-            2
+            3 // Fault, immediate held retry, then the timed recovery probe.
         } else {
             1
         };
         let _reset = P2aConflictReset;
         // Only the ledger-fault case stops early, once recovery accepted.
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
         let mut recovered = false;
         for cycle in 0..cycles {
             if recovered {
                 break;
             }
+            // A failed local ACK save legitimately pauses new offers. Prove
+            // the immediate retry stays held before advancing to the real
+            // thirty-minute recovery-probe deadline; do not clear the pause.
+            let _clock = money::PageClockForTest::new(
+                &support,
+                now + if ack_save_fault && cycle == 1 {
+                    1
+                } else {
+                    cycle as u64 * 1801
+                },
+            );
             let recovering =
                 ledger_fault && cycle > 0 && money::store::recovering_for_test(&support);
+            let paused = money::adoption_paused(&support, &ScanIndex::load(&index_path).unwrap());
             if conflict && cycle == 1 {
                 let saved = ScanIndex::load(&index_path).unwrap();
                 assert!(saved
@@ -297,6 +313,25 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     progress_path.with_extension(format!("json.{}.tmp", std::process::id())),
                 )
                 .unwrap();
+            } else if ack_save_fault && cycle == 1 {
+                assert!(
+                    result.is_ok(),
+                    "paused retry completes its local work: {result:?}"
+                );
+                assert!(paused, "failed ACK save must retain the rate pause");
+                assert_eq!(
+                    server.offered.lock().unwrap().len(),
+                    1,
+                    "the immediate retry cannot re-offer before its recovery deadline"
+                );
+                assert!(saved
+                    .files
+                    .values()
+                    .all(|entry| entry.effective_upload_body_witness_revision != 3));
+                assert!(
+                    money::money_due(&support, &transcript.to_string_lossy(), u64::MAX),
+                    "a held retry cannot retire the uncertain ACK debt"
+                );
             } else if ledger_fault && cycle == 0 {
                 assert!(
                     server.offered.lock().unwrap().is_empty(),
@@ -330,6 +365,33 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     .files
                     .values()
                     .all(|entry| entry.effective_upload_body_witness_revision != 3));
+            } else if ledger_fault
+                && cycle > 0
+                && saved
+                    .files
+                    .values()
+                    .any(|entry| entry.effective_upload_body_witness_revision != 3)
+            {
+                assert!(
+                    result.is_ok(),
+                    "held recovery completes local work: {result:?}"
+                );
+                assert!(
+                    recovering || paused,
+                    "only a real custody/history hold may defer recovery"
+                );
+                assert!(
+                    cycle + 1 < cycles,
+                    "custody recovery must converge to an accepted offer"
+                );
+                assert!(
+                    server.offered.lock().unwrap().is_empty(),
+                    "held recovery forbids POST"
+                );
+                assert!(
+                    money::money_due(&support, &transcript.to_string_lossy(), u64::MAX),
+                    "held recovery keeps exact selection debt"
+                );
             } else if matches!(
                 outcome,
                 FinishOutcome::Accept | FinishOutcome::Dominated { .. }
@@ -852,10 +914,17 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                 "{cause} must actually reach the upload recorder"
             );
             for item in &offers[before..] {
-                assert!(
-                    item["usage_accounting_contract"].is_null(),
-                    "protected {cause} must mint neither literal nor v1: {item}"
-                );
+                if live {
+                    assert!(
+                        item["usage_accounting_contract"].is_null(),
+                        "protected {cause} must mint neither literal nor v1: {item}"
+                    );
+                } else {
+                    assert_eq!(
+                        item["usage_accounting_contract"], "session_exclusive_reported_usage:v1",
+                        "revision 2 preserves main's ordinary sidecar-proven contract"
+                    );
+                }
                 assert!(item["removed_request_count"].is_null());
             }
             assert!(
