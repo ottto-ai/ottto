@@ -30,6 +30,22 @@
 //! - Only well-formed fingerprints (64 lowercase hex, the only Claude index
 //!   form) are rearmed; anything else is refused at insert, so every saved
 //!   prior and the guard stay small and decodable.
+//! - A rearm is never saved (MONEY P1a): the index writes a granted key's
+//!   entry with its prior fingerprint, and a load re-empties it only while
+//!   the guard still holds the grant. Whatever erases the guard and the
+//!   priors (a downgrade, an older binary's save, corruption) erases the rearm
+//!   with them: the entry keeps its real fingerprint and is not re-read.
+//! - A pending key whose emptied fingerprint has no prior to restore it is
+//!   held: candidate selection skips it (no read, never Rearmed), it stays
+//!   counted as exhausted, and a `prior_missing` alarm fires. Only new
+//!   transcript content (an ordinary changed-file parse), a clean decode of its
+//!   record or the key leaving the index releases it.
+//! - The priors field is decoded in isolation by the index reader (MONEY
+//!   P1b). A malformed, duplicated, oversized or truncated field never fails
+//!   the index decode: the entries and the guard are kept, this load grants
+//!   no rebuild (pending keys held exhausted, new duplicates refused), the
+//!   priors are re-derived from the entries, and
+//!   `census_rebuild_priors_decode_refused` counts it for one window.
 //!
 //! A key whose fingerprint was already empty when its duplicate was found is
 //! another mechanism's rearm; this bound does not track it.
@@ -52,6 +68,8 @@ const UNSTAMPED: u64 = u64::MAX;
 const PENDING: u8 = 1;
 const STARTED: u8 = 2;
 const EXHAUSTED: u8 = 4;
+/// Exhausted with nothing to restore its emptied fingerprint: never read.
+const HELD: u8 = 8;
 
 /// The persisted guard (`"n"` in the shadow state).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,10 +87,15 @@ pub(crate) struct DuplicateRebuildGuard {
     orphaned: u64,
     #[serde(default, rename = "oa", skip_serializing_if = "is_zero")]
     orphaned_at: u64,
+    /// Loads whose priors field was refused, counted for one window.
+    #[serde(default, rename = "p", skip_serializing_if = "is_zero")]
+    priors_refused: u64,
+    #[serde(default, rename = "pa", skip_serializing_if = "is_zero")]
+    priors_refused_at: u64,
     #[serde(default, rename = "c", skip_serializing_if = "Option::is_none")]
     closed_at: Option<u64>,
 }
-crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, closed_at);
+crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at);
 
 /// One compact string per key, `"<flags>:<stamp>,<stamp>"`, so the
 /// pretty-printed index spends one line on it.
@@ -145,10 +168,9 @@ fn valid_prior(fingerprint: &str) -> bool {
 }
 
 /// `ScanIndex::claude_census_rebuild_priors`: key id -> the fingerprint its
-/// outstanding grant emptied. Strict like the index entries it protects: an
-/// oversized, duplicated or malformed map fails the index decode (quarantine,
-/// as for any malformed entry), so a prior is never dropped while its entry
-/// survives.
+/// outstanding grant emptied. Strict: an oversized, duplicated or malformed
+/// map is an error. The index reader runs it in isolation (`decode_priors`),
+/// so that error refuses the field, never the index.
 pub(crate) fn deserialize_priors<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
@@ -176,6 +198,16 @@ pub(crate) fn deserialize_priors<'de, D: Deserializer<'de>>(
         }
     }
     deserializer.deserialize_map(Priors)
+}
+
+/// The index reader's isolated decode of the priors field (MONEY P1b):
+/// `None` refuses it, and the reader hands the index an empty map instead of
+/// failing the whole decode.
+pub(super) fn decode_priors(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let priors = deserialize_priors(&mut decoder).ok()?;
+    decoder.end().ok()?;
+    Some(priors)
 }
 
 /// Clamp a future stamp to `now` (recent, fail closed); true while it is
@@ -218,7 +250,7 @@ impl DuplicateRebuildGuard {
                             && key.attempts.len() <= MAX_ATTEMPTS_PER_WINDOW
                             && key.legacy_prior.as_ref().map_or(0, String::len)
                                 <= MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
-                            && key.flags & !(PENDING | STARTED | EXHAUSTED) == 0
+                            && key.flags & !(PENDING | STARTED | EXHAUSTED | HELD) == 0
                     })
             })
             .unwrap_or_else(Self::closed)
@@ -236,6 +268,10 @@ impl DuplicateRebuildGuard {
         if self.orphaned > 0 && !recent(&mut self.orphaned_at, now) {
             self.orphaned = 0;
             self.orphaned_at = 0;
+        }
+        if self.priors_refused > 0 && !recent(&mut self.priors_refused_at, now) {
+            self.priors_refused = 0;
+            self.priors_refused_at = 0;
         }
         for key in self.keys.values_mut() {
             key.attempts.retain_mut(|stamp| recent(stamp, now));
@@ -337,9 +373,10 @@ fn emit_alarm(line: String) {
 
 /// Decode-time decision for every fresh ambiguous key, every pending key and
 /// every saved prior. Replaces the unconditional rearm; cheap no-op on a
-/// healthy index.
-pub(super) fn apply(index: &mut ScanIndex) {
-    if index.claude_request_census.ambiguous.is_empty()
+/// healthy index. `priors_refused`: the reader refused the priors field.
+pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
+    if !priors_refused
+        && index.claude_request_census.ambiguous.is_empty()
         && index.claude_request_census_shadow.rebuild_bound.is_none()
         && index.claude_census_rebuild_priors.is_empty()
     {
@@ -356,6 +393,14 @@ pub(super) fn apply(index: &mut ScanIndex) {
     }
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
+    if priors_refused {
+        // Which fingerprint each grant emptied is unknown this load: trust
+        // none (a duplicated field's first copy included). Grants saved by this
+        // module still carry their prior in the entry itself.
+        priors.clear();
+        guard.priors_refused = guard.priors_refused.saturating_add(1);
+        guard.priors_refused_at = now;
+    }
     // An earlier checkpoint kept each pending key's prior inside the guard.
     for (id, key) in guard.keys.iter_mut() {
         if let Some(prior) = key.legacy_prior.take() {
@@ -386,6 +431,8 @@ pub(super) fn apply(index: &mut ScanIndex) {
             Some("fingerprint_format")
         } else if guard.keys.contains_key(&id) {
             None
+        } else if priors_refused {
+            Some("priors_decode_refused")
         } else if guard.closed_at.is_some() {
             Some("guard_state_closed")
         } else if guard.keys.len() >= MAX_TRACKED_KEYS {
@@ -434,16 +481,23 @@ pub(super) fn apply(index: &mut ScanIndex) {
         let Some(prior) = priors.remove(&id) else {
             continue;
         };
-        let Some(entry) = resolved.get(&id).and_then(|key| index.files.get_mut(key)) else {
+        let Some(key) = resolved.get(&id) else {
             continue;
         };
-        if !entry.source_file_fingerprint.is_empty() {
+        let rebuilt = !ambiguous.contains(key) && index.claude_request_census.get(key).is_some();
+        let Some(entry) = index.files.get_mut(key) else {
+            continue;
+        };
+        if rebuilt
+            || !(entry.source_file_fingerprint.is_empty() || entry.source_file_fingerprint == prior)
+        {
             // Rebuilt or replaced since: nothing of this rearm is outstanding.
             continue;
         }
-        // Spent, not free: restore the fingerprint so the unchanged transcript
-        // has no Rearmed reason, and hold the key exhausted for one window
-        // (in a closed guard too: holding a key only refuses).
+        // Spent, not free: restore the fingerprint (a grant saved by this
+        // module already carries it) so the unchanged transcript has no
+        // Rearmed reason, and hold the key exhausted for one window (in a
+        // closed guard too: holding a key only refuses).
         entry.source_file_fingerprint.clone_from(&prior);
         guard.orphaned = guard.orphaned.saturating_add(1);
         guard.orphaned_at = now;
@@ -479,12 +533,37 @@ pub(super) fn apply(index: &mut ScanIndex) {
             priors.remove(id);
             continue;
         }
-        let rearmed = entry.source_file_fingerprint.is_empty();
+        if priors_refused {
+            // MONEY P1b: no grant and no read this load. Re-derive the prior
+            // from the entry, which a saved grant carries; an empty one has
+            // nothing to restore it and is held.
+            if valid_prior(&entry.source_file_fingerprint) {
+                priors.insert(id.clone(), entry.source_file_fingerprint.clone());
+            }
+            tracked.flags = PENDING | EXHAUSTED;
+            if entry.source_file_fingerprint.is_empty() {
+                tracked.flags |= HELD;
+            }
+            if transient.refusals.len() < MAX_ALARMS_PER_TERMINAL {
+                transient
+                    .refusals
+                    .push((id.clone(), "priors_decode_refused"));
+            }
+            continue;
+        }
+        // A grant is saved with its prior in the entry (`fill_saved`): an
+        // entry still at its prior is that rearm, outstanding.
+        let saved = !tracked.has(EXHAUSTED)
+            && !entry.source_file_fingerprint.is_empty()
+            && priors.get(id) == Some(&entry.source_file_fingerprint);
+        let rearmed = entry.source_file_fingerprint.is_empty() || saved;
         let attempt_due = tracked.has(EXHAUSTED)
             || !rearmed
             || tracked.has(STARTED)
             || !with_persisted(|set| set.contains(id));
         if !attempt_due {
+            // This process saved the grant and has not started its read.
+            entry.source_file_fingerprint.clear();
             continue;
         }
         if !rearmed && valid_prior(&entry.source_file_fingerprint) {
@@ -496,13 +575,21 @@ pub(super) fn apply(index: &mut ScanIndex) {
             tracked.flags = PENDING;
             entry.source_file_fingerprint.clear();
             transient.grants.push(id.clone());
-        } else {
+        } else if let Some(prior) = priors.get(id) {
             // The prior stays while the key is pending: a partial save may
             // still commit the emptied fingerprint, and the next load restores
             // it again.
             tracked.flags = PENDING | EXHAUSTED;
-            if let Some(prior) = priors.get(id).filter(|_| rearmed) {
+            if rearmed {
                 entry.source_file_fingerprint.clone_from(prior);
+            }
+        } else {
+            // MONEY P1a: an emptied fingerprint with no prior cannot be
+            // restored. Hold it (candidate selection skips it), counted and
+            // alarmed: refused, never a free rearm.
+            tracked.flags = PENDING | EXHAUSTED;
+            if entry.source_file_fingerprint.is_empty() {
+                tracked.flags |= HELD;
             }
         }
     }
@@ -512,6 +599,63 @@ pub(super) fn apply(index: &mut ScanIndex) {
     index.claude_census_rebuild_priors = priors;
     index.claude_request_census_shadow.rebuild_bound = (!guard.is_empty()).then(|| Box::new(guard));
     index.claude_request_census.rebuild_transient = transient;
+}
+
+/// Candidate selection (MONEY P1a): `key`'s empty fingerprint is a rearm this
+/// bound holds because nothing can restore it. It is skipped, never read.
+pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
+    index
+        .claude_request_census_shadow
+        .rebuild_bound
+        .as_deref()
+        .filter(|guard| guard.keys.values().any(|tracked| tracked.has(HELD)))
+        .is_some_and(|guard| {
+            guard
+                .keys
+                .get(&key_id(key))
+                .is_some_and(|tracked| tracked.has(HELD))
+        })
+}
+
+/// Save (MONEY P1a): an entry emptied by an outstanding grant is written with
+/// its prior. The rearm itself lives only in the guard, so a save by a binary
+/// without it, a lost guard or lost priors leave the real fingerprint, never
+/// a free rearm. Returns the keys `clear_saved` empties again after the write.
+pub(crate) fn fill_saved(index: &mut ScanIndex) -> Vec<String> {
+    let Some(guard) = index.claude_request_census_shadow.rebuild_bound.as_deref() else {
+        return Vec::new();
+    };
+    if index.claude_census_rebuild_priors.is_empty() {
+        return Vec::new();
+    }
+    let mut filled = Vec::new();
+    for (key, entry) in &mut index.files {
+        if !entry.source_file_fingerprint.is_empty() {
+            continue;
+        }
+        let id = key_id(key);
+        let granted = guard
+            .keys
+            .get(&id)
+            .is_some_and(|tracked| tracked.has(PENDING) && !tracked.has(EXHAUSTED));
+        if let Some(prior) = index
+            .claude_census_rebuild_priors
+            .get(&id)
+            .filter(|_| granted)
+        {
+            entry.source_file_fingerprint.clone_from(prior);
+            filled.push(key.clone());
+        }
+    }
+    filled
+}
+
+pub(crate) fn clear_saved(index: &mut ScanIndex, filled: Vec<String>) {
+    for key in filled {
+        if let Some(entry) = index.files.get_mut(&key) {
+            entry.source_file_fingerprint.clear();
+        }
+    }
 }
 
 /// A Claude parse is starting: the current rearm of this key is being spent.
@@ -556,10 +700,11 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
     Ok(())
 }
 
-/// Census-line counters (exhausted, orphaned) and rate-limited alarms.
-pub(super) fn terminal(index: &ScanIndex) -> (u64, u64) {
+/// Census-line counters (exhausted, orphaned, priors refused) and
+/// rate-limited alarms.
+pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64) {
     let Some(guard) = index.claude_request_census_shadow.rebuild_bound.as_deref() else {
-        return (0, 0);
+        return (0, 0, 0);
     };
     let mut emitted = 0;
     let tracked = guard
@@ -567,16 +712,18 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64) {
         .iter()
         .filter(|(_, key)| key.has(EXHAUSTED))
         .map(|(id, key)| {
-            let retry_after = key
-                .attempts
-                .first()
-                .map_or(0, |stamp| stamp.saturating_add(WINDOW_SECONDS + 1));
-            (
-                id.as_str(),
-                "rebuild_bound_7d",
-                key.attempts.len(),
-                retry_after,
-            )
+            // A held key is released only by new content, a clean decode or
+            // the key leaving the index, never by the window.
+            let (cause, retry_after) = if key.has(HELD) {
+                ("prior_missing", 0)
+            } else {
+                let retry_after = key
+                    .attempts
+                    .first()
+                    .map_or(0, |stamp| stamp.saturating_add(WINDOW_SECONDS + 1));
+                ("rebuild_bound_7d", retry_after)
+            };
+            (id.as_str(), cause, key.attempts.len(), retry_after)
         });
     let untracked = index
         .claude_request_census
@@ -587,6 +734,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64) {
             let retry_after = match *cause {
                 "guard_state_closed" => guard.closed_at.unwrap_or(guard.untracked_refused_at),
                 "orphaned_rearm" => guard.orphaned_at,
+                "priors_decode_refused" => guard.priors_refused_at,
                 _ => guard.untracked_refused_at,
             }
             .saturating_add(WINDOW_SECONDS + 1);
@@ -604,7 +752,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64) {
             ));
         }
     }
-    (guard.exhausted_keys(), guard.orphaned)
+    (guard.exhausted_keys(), guard.orphaned, guard.priors_refused)
 }
 
 #[cfg(test)]
@@ -673,6 +821,10 @@ pub(crate) mod test_support {
             .get(&key_id(key))
             .cloned()
     }
+    /// Held: an emptied fingerprint with nothing to restore it (never read).
+    pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
+        super::held(index, key)
+    }
     pub(crate) fn pending(index: &ScanIndex, key: &str) -> bool {
         index
             .claude_request_census_shadow
@@ -687,7 +839,7 @@ pub(crate) mod test_support {
 mod tests {
     use super::*;
 
-    fn decode_priors(raw: &str) -> serde_json::Result<BTreeMap<String, String>> {
+    fn strict_priors(raw: &str) -> serde_json::Result<BTreeMap<String, String>> {
         deserialize_priors(&mut serde_json::Deserializer::from_str(raw))
     }
 
@@ -713,6 +865,8 @@ mod tests {
             untracked_refused_at: u64::MAX,
             orphaned: u64::MAX,
             orphaned_at: u64::MAX,
+            priors_refused: u64::MAX,
+            priors_refused_at: u64::MAX,
             closed_at: None,
         };
         let priors: BTreeMap<String, String> =
@@ -733,7 +887,8 @@ mod tests {
         assert_eq!(DuplicateRebuildGuard::decode(&raw_guard), guard);
         let raw_priors =
             serde_json::to_string_pretty(&value["claude_census_rebuild_priors"]).unwrap();
-        assert_eq!(decode_priors(&raw_priors).unwrap(), priors);
+        assert_eq!(strict_priors(&raw_priors).unwrap(), priors);
+        assert_eq!(decode_priors(raw_priors.as_bytes()), Some(priors));
         // The whole saved index decodes with the guard open and every key kept.
         let decoded = super::super::decode_index(saved.as_slice()).unwrap();
         let decoded = decoded
@@ -745,7 +900,8 @@ mod tests {
     }
 
     /// Only real Claude index fingerprints are saved as priors; anything else
-    /// in the strict map fails its decode instead of being dropped.
+    /// in the strict map fails its decode instead of being dropped, and the
+    /// reader's isolated decode refuses the whole field (MONEY P1b).
     #[test]
     fn priors_accept_only_well_formed_fingerprints() {
         let hex = "a".repeat(PRIOR_BYTES);
@@ -760,7 +916,8 @@ mod tests {
             assert!(!valid_prior(&invalid), "{invalid:?}");
         }
         let id = "0123456789abcdef";
-        assert!(decode_priors(&format!(r#"{{"{id}":"{hex}"}}"#)).is_ok());
+        assert!(strict_priors(&format!(r#"{{"{id}":"{hex}"}}"#)).is_ok());
+        assert!(decode_priors(format!(r#" {{"{id}":"{hex}"}} "#).as_bytes()).is_some());
         for raw in [
             format!(r#"{{"{id}":"\u0001"}}"#),
             format!(r#"{{"{id}":"{}"}}"#, "A".repeat(PRIOR_BYTES)),
@@ -768,13 +925,20 @@ mod tests {
             format!(r#"{{"{id}":"{hex}","{id}":"{hex}"}}"#),
             format!(r#"{{"{id}":1}}"#),
             r#"["x"]"#.to_owned(),
+            // Truncated: a short prior, a short id, a value cut mid-map.
+            format!(r#"{{"{id}":"{}"}}"#, &hex[..PRIOR_BYTES - 1]),
+            format!(r#"{{"{}":"{hex}"}}"#, &id[..15]),
+            format!(r#"{{"{id}":"{hex}","#),
+            "null".to_owned(),
         ] {
-            assert!(decode_priors(&raw).is_err(), "{raw}");
+            assert!(strict_priors(&raw).is_err(), "{raw}");
+            assert_eq!(decode_priors(raw.as_bytes()), None, "{raw}");
         }
         let over_cap = (0..=MAX_TRACKED_KEYS)
             .map(|slot| format!(r#""{slot:016x}":"{hex}""#))
             .collect::<Vec<_>>()
             .join(",");
-        assert!(decode_priors(&format!("{{{over_cap}}}")).is_err());
+        assert!(strict_priors(&format!("{{{over_cap}}}")).is_err());
+        assert_eq!(decode_priors(format!("{{{over_cap}}}").as_bytes()), None);
     }
 }

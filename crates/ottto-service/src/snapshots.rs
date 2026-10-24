@@ -5185,6 +5185,10 @@ pub struct ClaudeRequestCensusShadowCounts {
     /// MONEY N3: saved rebuild grants found orphaned (their guard lost),
     /// restored and held exhausted instead of rearmed; counted for one window.
     pub census_duplicate_rebuild_orphaned: u64,
+    /// MONEY N3 (P1b): loads whose rebuild-priors field was malformed,
+    /// duplicated or truncated; the index was kept and no rebuild granted.
+    /// Counted for one window.
+    pub census_rebuild_priors_decode_refused: u64,
     pub producer_refused_keys: usize,
     pub shadow_post_save_mismatch_keys: usize,
     pub legacy_compare_families: usize,
@@ -37789,6 +37793,8 @@ impl ScanIndex {
         let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
         let mut file = File::create(&temp_path)
             .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
+        // MONEY N3: a rearm is never written; its entry keeps its prior.
+        let filled = claude_request_census::fill_saved_duplicate_rebuild_priors(self);
         let result = (|| -> Result<()> {
             {
                 let mut writer = BufWriter::new(&mut file);
@@ -37804,6 +37810,7 @@ impl ScanIndex {
                 .with_context(|| format!("replace scan index {}", path.display()))?;
             sync_checkpoint_parent(path)
         })();
+        claude_request_census::clear_saved_duplicate_rebuild_priors(self, filled);
         if result.is_err() {
             self.generation = previous_generation;
             let _ = fs::remove_file(&temp_path);
@@ -39425,16 +39432,34 @@ impl ScanIndex {
                 )
             };
         }
-        if entry.source_file_fingerprint != candidate.source_file_fingerprint {
-            let reason = if entry.source_file_fingerprint.is_empty() {
-                CandidateParseReason::Rearmed
-            } else {
-                CandidateParseReason::SourceChanged
-            };
-            (CandidateDecision::Parse, Some(reason))
-        } else {
-            (CandidateDecision::Skip, None)
+        self.source_fingerprint_decision(&key, entry, &candidate.source_file_fingerprint)
+    }
+
+    /// The last gate, for an unchanged transcript: its indexed fingerprint
+    /// against the current one. An empty indexed fingerprint is a rearm,
+    /// unless MONEY N3 holds it (nothing can restore it): then it is skipped.
+    fn source_fingerprint_decision(
+        &self,
+        key: &str,
+        entry: &ScanIndexEntry,
+        current: &str,
+    ) -> (CandidateDecision, Option<CandidateParseReason>) {
+        if entry.source_file_fingerprint == current {
+            return (CandidateDecision::Skip, None);
         }
+        if !entry.source_file_fingerprint.is_empty() {
+            return (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged),
+            );
+        }
+        if claude_request_census::duplicate_rebuild_held(self, key) {
+            return (CandidateDecision::Skip, None);
+        }
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::Rearmed),
+        )
     }
 
     /// StateMissing M2: this member is selected only because its family owes
@@ -78316,7 +78341,7 @@ crate::heap_layout_bound::fields!(ProvenClaudeUsageFamily; witness, rows_by_memb
 
 crate::heap_layout_bound::fields!(ClaudeNativeObservations; counts, census_window_end, index_generation);
 crate::heap_layout_bound::fields!(ClaudeDuplicateCensusCounts; census_complete, fence_before, fence_after, census_invalid, invalid_current_window_family_count, pending_occurrence_count, page_invalidated_identity_count, page_invalidated_occurrence_mismatch_count, page_invalidated_cap_count, page_invalidated_member_changed_count, coverage_complete, coverage_missing_member_count, full_rearm, rearm_attempt, full_rearm_deferred_until, request_census);
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; safety_compact_decode_recovered, safety_metadata_reclaimed_active, unread_due_to_growth, dirty_unparsed_keys_known, shadow_decision_taps_known, shadow_peak_measured, shadow_workspace_peak_measured, safety_resource_refused_keys, confirmed_empty_keys, missing_confirmed_empty_records, unindexed_required_keys, missing_unindexed_records, strong_comparison_complete, safety_incomplete, safety_incomplete_overflow, safety_incomplete_overflow_cause, unread_alarm_emitted_keys, safety_incomplete_alarm, d2_hash_budget_alarm, legacy_compare_ready, legacy_compare_generation_mismatch, legacy_compare_budget_refused, shadow_post_save_equality_checked, shadow_post_save_qualified, shadow_projected_dependent_known, shadow_refusal_rate_known, migration_estimate_known, d2_active, debt_scheduler_active, safety_reclaimed, safety_incomplete_since, unread_oldest_age_seconds, unread_last_progress_age_seconds, unread_max_complete_terminals, shadow_elapsed_us, shadow_work_units, shadow_healthy_terminals_attempted, shadow_healthy_terminals_memory_refused, shadow_healthy_terminal_refusal_rate_ppm, census_read_bytes, census_evidence_bytes, shadow_spec_version, safety_reclaimed_keys, shape_lossy_unread, shape_lossy_dropped, shape_multi_item, shape_lossy_classification_unknown, shape_all_read_residue, unread_age_alarm_keys, unread_terminal_alarm_keys, unread_liveness_unknown_keys, retired_records, active_hash_total, retired_hash_total, retired_safety_missing, alias_migrate_keys, content_owner_pairs, content_owner_overflow_keys, shares_hash_with_retired_owner_keys, strong_admissions_via_excusal, dirty_unparsed_keys, decode_ambiguous_keys, decode_duplicate_keys_dropped, census_duplicate_rebuild_exhausted, census_duplicate_rebuild_orphaned, producer_refused_keys, shadow_post_save_mismatch_keys, legacy_compare_families, legacy_compare_keys, legacy_uncomparable_families, legacy_dup_not_d2_shared, legacy_dup_not_d2_shared_families, d2_shared_not_legacy, d2_shared_not_legacy_families, shadow_diff_old_families, shadow_diff_inert_families, shadow_diff_retired_families, shadow_diff_alias_families, shadow_diff_unclassified_families, d2_settled_pending_invalid_families, d2_settled_pending_cap_families, d2_settled_pending_identity_families, d2_settled_pending_member_changed_families, d2_settled_pending_occurrence_mismatch_families, d2_settled_pending_other_families, shadow_unexplained_positive_admissions, shadow_protected_contract_violations, shadow_d2_protected_offers, shadow_cutover_history_offers, shadow_cutover_newfile_offers, shadow_projected_dependent_keys, shadow_projected_dependent_bytes, shadow_projected_dependent_protected, shadow_join_builds, shadow_keys_visited, shadow_hashes_visited, shadow_work_limited, shadow_compare_heap_bytes, shadow_peak_heap_bytes, shadow_workspace_peak_bytes, migration_keys_estimated, migration_input_bytes_estimated, would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowCounts; safety_compact_decode_recovered, safety_metadata_reclaimed_active, unread_due_to_growth, dirty_unparsed_keys_known, shadow_decision_taps_known, shadow_peak_measured, shadow_workspace_peak_measured, safety_resource_refused_keys, confirmed_empty_keys, missing_confirmed_empty_records, unindexed_required_keys, missing_unindexed_records, strong_comparison_complete, safety_incomplete, safety_incomplete_overflow, safety_incomplete_overflow_cause, unread_alarm_emitted_keys, safety_incomplete_alarm, d2_hash_budget_alarm, legacy_compare_ready, legacy_compare_generation_mismatch, legacy_compare_budget_refused, shadow_post_save_equality_checked, shadow_post_save_qualified, shadow_projected_dependent_known, shadow_refusal_rate_known, migration_estimate_known, d2_active, debt_scheduler_active, safety_reclaimed, safety_incomplete_since, unread_oldest_age_seconds, unread_last_progress_age_seconds, unread_max_complete_terminals, shadow_elapsed_us, shadow_work_units, shadow_healthy_terminals_attempted, shadow_healthy_terminals_memory_refused, shadow_healthy_terminal_refusal_rate_ppm, census_read_bytes, census_evidence_bytes, shadow_spec_version, safety_reclaimed_keys, shape_lossy_unread, shape_lossy_dropped, shape_multi_item, shape_lossy_classification_unknown, shape_all_read_residue, unread_age_alarm_keys, unread_terminal_alarm_keys, unread_liveness_unknown_keys, retired_records, active_hash_total, retired_hash_total, retired_safety_missing, alias_migrate_keys, content_owner_pairs, content_owner_overflow_keys, shares_hash_with_retired_owner_keys, strong_admissions_via_excusal, dirty_unparsed_keys, decode_ambiguous_keys, decode_duplicate_keys_dropped, census_duplicate_rebuild_exhausted, census_duplicate_rebuild_orphaned, census_rebuild_priors_decode_refused, producer_refused_keys, shadow_post_save_mismatch_keys, legacy_compare_families, legacy_compare_keys, legacy_uncomparable_families, legacy_dup_not_d2_shared, legacy_dup_not_d2_shared_families, d2_shared_not_legacy, d2_shared_not_legacy_families, shadow_diff_old_families, shadow_diff_inert_families, shadow_diff_retired_families, shadow_diff_alias_families, shadow_diff_unclassified_families, d2_settled_pending_invalid_families, d2_settled_pending_cap_families, d2_settled_pending_identity_families, d2_settled_pending_member_changed_families, d2_settled_pending_occurrence_mismatch_families, d2_settled_pending_other_families, shadow_unexplained_positive_admissions, shadow_protected_contract_violations, shadow_d2_protected_offers, shadow_cutover_history_offers, shadow_cutover_newfile_offers, shadow_projected_dependent_keys, shadow_projected_dependent_bytes, shadow_projected_dependent_protected, shadow_join_builds, shadow_keys_visited, shadow_hashes_visited, shadow_work_limited, shadow_compare_heap_bytes, shadow_peak_heap_bytes, shadow_workspace_peak_bytes, migration_keys_estimated, migration_input_bytes_estimated, would_open, would_open_flips, family_keys, covered_by_fingerprint, covered_by_window, missing_residue, missing_account_hold, missing_placeholder, missing_empty_fingerprint, missing_fingerprint_mismatch, missing_migrate, missing_over_budget, quarantine_without_record, shape_exact, shape_empty, shape_identity_incomplete, shape_lossy, unverified, twin, family_unknown_roots, records, hashes, hash_budget_usage_percent, hash_budget_warning, transient_limited, transient_peak_bytes, duplicate_hashes, duplicate_owner_entries, shared_keys, derivation_drift, json_bytes, heap_bytes);
 
 #[path = "snapshots/composition_compactions.rs"]
 mod composition_compactions;

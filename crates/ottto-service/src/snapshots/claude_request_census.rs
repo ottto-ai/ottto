@@ -2022,7 +2022,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
 /// Derive positional slots from Serde's own field metadata rather than pinning
 /// offsets to ScanIndex's declaration order. JSON struct sequences are accepted
 /// by the old reader too; they need the same evidence bounds as object fields.
-fn sequence_fields() -> (usize, usize) {
+fn sequence_fields() -> (usize, usize, usize) {
     struct Fields<'a>(&'a mut Option<&'static [&'static str]>);
     impl<'de> Deserializer<'de> for Fields<'_> {
         type Error = serde::de::value::Error;
@@ -2044,7 +2044,7 @@ fn sequence_fields() -> (usize, usize) {
             tuple_struct map enum identifier ignored_any
         }
     }
-    static SLOTS: std::sync::OnceLock<(usize, usize)> = std::sync::OnceLock::new();
+    static SLOTS: std::sync::OnceLock<(usize, usize, usize)> = std::sync::OnceLock::new();
     *SLOTS.get_or_init(|| {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
@@ -2058,6 +2058,7 @@ fn sequence_fields() -> (usize, usize) {
         (
             slot("claude_request_census"),
             slot("claude_request_census_shadow"),
+            slot("claude_census_rebuild_priors"),
         )
     })
 }
@@ -2069,7 +2070,7 @@ struct CensusRead<R> {
     depth: usize,
     root_array: bool,
     array_index: usize,
-    sequence_fields: (usize, usize),
+    sequence_fields: (usize, usize, usize),
     quoted: bool,
     escaped: bool,
     expect_key: bool,
@@ -2081,6 +2082,10 @@ struct CensusRead<R> {
     duplicate_shadow: bool,
     shadow_key: bool,
     shadow_state: bool,
+    /// MONEY P1b: the captured value is `claude_census_rebuild_priors`.
+    priors_state: bool,
+    seen_priors: bool,
+    priors_refused: bool,
     normalize: bool,
     capture: bool,
     #[cfg(test)]
@@ -2110,6 +2115,9 @@ impl<R: std::io::Read> CensusRead<R> {
             duplicate_shadow: false,
             shadow_key: false,
             shadow_state: false,
+            priors_state: false,
+            seen_priors: false,
+            priors_refused: false,
             normalize: phase_b::enabled(),
             capture: false,
             #[cfg(test)]
@@ -2167,7 +2175,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Parse(Rearmed). The debt persists through save/restart until the next
         // authorized transcript pass rebuilds its record, at most twice per
         // key per seven days.
-        rebuild_bound::apply(index);
+        rebuild_bound::apply(index, self.priors_refused);
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
@@ -2206,6 +2214,7 @@ impl<R: std::io::Read> CensusRead<R> {
                     "claude_request_census" => {
                         self.shadow_key = true;
                         self.shadow_state = false;
+                        self.priors_state = false;
                         let duplicate = self.seen_census;
                         self.seen_census = true;
                         self.duplicate_census |= duplicate;
@@ -2214,9 +2223,21 @@ impl<R: std::io::Read> CensusRead<R> {
                     "claude_request_census_shadow" => {
                         self.shadow_key = true;
                         self.shadow_state = true;
+                        self.priors_state = false;
                         let duplicate = self.seen_shadow;
                         self.seen_shadow = true;
                         self.duplicate_shadow |= duplicate;
+                        duplicate
+                    }
+                    "claude_census_rebuild_priors" => {
+                        // A duplicate is ambiguous: which copy holds the
+                        // grants is unknown, so the field is refused.
+                        self.shadow_key = true;
+                        self.shadow_state = false;
+                        self.priors_state = true;
+                        let duplicate = self.seen_priors;
+                        self.seen_priors = true;
+                        self.priors_refused |= duplicate;
                         duplicate
                     }
                     _ => false,
@@ -2283,6 +2304,19 @@ impl<R: std::io::Read> CensusRead<R> {
                 }
             }
         }
+        if self.priors_state {
+            // MONEY P1b: decoded in isolation in every mode. A malformed,
+            // oversized or truncated value is refused (an empty map here and
+            // a refusal for the rebuild bound), never a failed index decode.
+            let priors = (!overflow)
+                .then(|| rebuild_bound::decode_priors(&bytes))
+                .flatten();
+            drop(bytes);
+            self.priors_refused |= priors.is_none();
+            return Ok(
+                serde_json::to_vec(&priors.unwrap_or_default()).expect("priors serialization")
+            );
+        }
         if overflow {
             return Ok(b"null".to_vec());
         }
@@ -2345,9 +2379,11 @@ impl<R: std::io::Read> CensusRead<R> {
             && !byte.is_ascii_whitespace()
             && !matches!(byte, b',' | b']')
             && (self.array_index == self.sequence_fields.0
-                || self.array_index == self.sequence_fields.1)
+                || self.array_index == self.sequence_fields.1
+                || self.array_index == self.sequence_fields.2)
         {
             self.shadow_state = self.array_index == self.sequence_fields.1;
+            self.priors_state = self.array_index == self.sequence_fields.2;
             self.replay = Some(byte);
             self.output = std::io::Cursor::new(self.evidence()?);
             return self.next();
@@ -3637,8 +3673,16 @@ pub(crate) fn persist_duplicate_rebuild_grants(
 }
 
 pub(crate) use rebuild_bound::deserialize_priors as deserialize_duplicate_rebuild_priors;
+// MONEY N3: candidate selection skips a held rearm; a save writes each
+// outstanding grant's entry with its prior fingerprint, then empties it again
+// (`rebuild_bound::fill_saved`).
+pub(crate) use rebuild_bound::held as duplicate_rebuild_held;
 #[cfg(test)]
 pub(crate) use rebuild_bound::test_support as duplicate_rebuild_test_support;
+pub(crate) use rebuild_bound::{
+    clear_saved as clear_saved_duplicate_rebuild_priors,
+    fill_saved as fill_saved_duplicate_rebuild_priors,
+};
 
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
@@ -3664,7 +3708,8 @@ pub(super) fn serialize_shadow_counts<S: Serializer>(
                 && !counts.safety_incomplete_overflow
                 && counts.decode_duplicate_keys_dropped == 0
                 && counts.census_duplicate_rebuild_exhausted == 0
-                && counts.census_duplicate_rebuild_orphaned == 0 =>
+                && counts.census_duplicate_rebuild_orphaned == 0
+                && counts.census_rebuild_priors_decode_refused == 0 =>
         {
             serializer.serialize_some(&d1::CountsLine(counts))
         }
@@ -3819,6 +3864,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
     (
         counts.census_duplicate_rebuild_exhausted,
         counts.census_duplicate_rebuild_orphaned,
+        counts.census_rebuild_priors_decode_refused,
     ) = rebuild_bound::terminal(index);
     counts.json_bytes = serialized_bytes(&index.claude_request_census);
     counts.census_evidence_bytes = counts.json_bytes.saturating_add(serialized_len(

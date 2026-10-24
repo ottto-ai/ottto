@@ -1736,6 +1736,7 @@ fn census_shadow_counts_encoding_is_bounded() {
         decode_duplicate_keys_dropped: u64::MAX,
         census_duplicate_rebuild_exhausted: u64::MAX,
         census_duplicate_rebuild_orphaned: u64::MAX,
+        census_rebuild_priors_decode_refused: u64::MAX,
         producer_refused_keys: usize::MAX,
         shadow_post_save_mismatch_keys: usize::MAX,
         legacy_compare_families: usize::MAX,
@@ -1840,7 +1841,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 6053;
+const CENSUS_SHADOW_WORST_BYTES: usize = 6113;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
@@ -3232,6 +3233,8 @@ fn census_duplicate_rebuild_migrates_a_guard_saved_in_the_earlier_form() {
             .expect("grant saved its prior");
         saved["claude_request_census_shadow"]["n"]["k"][&id] =
             serde_json::json!(format!("1:{N3_T0}:{fingerprint}"));
+        // The earlier form saved the rearmed entry empty.
+        saved["files"][&key]["source_file_fingerprint"] = serde_json::json!("");
         std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
 
         bound::restart();
@@ -3263,5 +3266,371 @@ fn census_duplicate_rebuild_migrates_a_guard_saved_in_the_earlier_form() {
         let index = ScanIndex::load(&path).unwrap();
         assert!(bound::exhausted(&index, &key));
         assert_eq!(index.files[&key].source_file_fingerprint, fingerprint);
+    }
+}
+
+/// What candidate selection decides for `key`'s unchanged transcript at its
+/// original `fingerprint` (the last gate, after every non-N3 reason).
+fn census_rebuild_decision(
+    index: &ScanIndex,
+    key: &str,
+    fingerprint: &str,
+) -> (CandidateDecision, Option<CandidateParseReason>) {
+    index.source_fingerprint_decision(key, &index.files[key], fingerprint)
+}
+
+/// All three rebuild counters, as the census line reports them.
+fn census_rebuild_counters_all(index: &mut ScanIndex) -> (u64, u64, u64) {
+    let (exhausted, orphaned) = census_rebuild_counters(index);
+    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+        index,
+        &BTreeSet::new(),
+        &BTreeSet::new(),
+        FIRST_WINDOW,
+    );
+    let line = serde_json::to_value(ClaudeDuplicateCensusCounts {
+        request_census: Some(counts),
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        line["request_census"]["census_rebuild_priors_decode_refused"].as_u64(),
+        Some(counts.census_rebuild_priors_decode_refused)
+    );
+    (
+        exhausted,
+        orphaned,
+        counts.census_rebuild_priors_decode_refused,
+    )
+}
+
+/// One saved grant: the fixture's duplicate loaded at `N3_T0`, its grant
+/// persisted. Returns the saved checkpoint as JSON.
+fn census_rebuild_saved_grant(path: &Path, original: &ScanIndex, key: &str) -> serde_json::Value {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    std::fs::write(path, census_duplicate_rebuild_raw(original, key, None)).unwrap();
+    let _clock = bound::set_now(N3_T0);
+    let mut index = ScanIndex::load(path).unwrap();
+    assert!(index.files[key].source_file_fingerprint.is_empty());
+    assert_eq!(
+        census_rebuild_decision(&index, key, &original.files[key].source_file_fingerprint),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::Rearmed)
+        ),
+        "the grant rearms in memory"
+    );
+    persist_duplicate_rebuild_grants(&mut index, path).unwrap();
+    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap()
+}
+
+/// MONEY P1a: a rearm is never written. The saved grant's entry keeps its
+/// prior, so a downgrade or an external save that erases both witnesses (main
+/// ignores the guard and drops the unknown priors field; round 7 rejects the
+/// current guard form and closes it) leaves the real fingerprint: no rearm,
+/// and repeated failed or discarded scans never re-read the transcript.
+#[test]
+fn census_duplicate_rebuild_erased_witnesses_never_leave_a_free_rearm() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for erasure in ["main_save", "round7_closed_guard"] {
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-erased");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+            assert_eq!(
+                saved["files"][&key]["source_file_fingerprint"],
+                serde_json::json!(fingerprint),
+                "a grant is saved with its prior, never empty"
+            );
+            assert_eq!(
+                saved["claude_census_rebuild_priors"][bound::key_id(&key)],
+                serde_json::json!(fingerprint)
+            );
+            saved
+                .as_object_mut()
+                .unwrap()
+                .remove("claude_census_rebuild_priors")
+                .expect("priors saved");
+            if erasure == "main_save" {
+                saved["claude_request_census_shadow"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("n")
+                    .expect("guard saved");
+            } else {
+                saved["claude_request_census_shadow"]["n"] = serde_json::json!({ "c": N3_T0 });
+            }
+            std::fs::write(&path, serde_json::to_string(&saved).unwrap()).unwrap();
+
+            for cycle in 1..=4_u64 {
+                bound::restart();
+                let _clock = bound::set_now(N3_T0 + 60 * cycle);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    index.files[&key].source_file_fingerprint, fingerprint,
+                    "{erasure}: no rearm outlives its guard"
+                );
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    (CandidateDecision::Skip, None),
+                    "{erasure}: not re-read"
+                );
+                assert!(bound::attempts(&index, &key).is_empty());
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                let mut working = ScanIndex::load(&path).unwrap();
+                assert_eq!(working.files[&key].source_file_fingerprint, fingerprint);
+                note_duplicate_rebuild_started(&mut working, Path::new(&key));
+                drop(working);
+                index.save(&path).unwrap();
+            }
+        }
+    }
+}
+
+/// MONEY P1a: the priors field removed or emptied after a grant. A grant this
+/// module saved still carries its prior in the entry: the bound re-derives it,
+/// spends at most the remaining attempt, then restores and stops. An entry
+/// saved empty (a checkpoint written before this rule) has nothing to restore
+/// it: it is held. Candidate selection skips it, failed or discarded scans and
+/// the window passing never re-read it, it stays counted and alarmed, and only
+/// new transcript content releases it.
+#[test]
+fn census_duplicate_rebuild_missing_prior_never_re_reads() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for (priors, saved_empty) in [
+            ("removed", false),
+            ("emptied", false),
+            ("removed", true),
+            ("emptied", true),
+        ] {
+            let case = format!("{priors}, saved_empty={saved_empty}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild-no-prior");
+            let (root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            census_rebuild_saved_grant(&path, &original, &key);
+            let erase = |path: &Path| {
+                let mut saved: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+                if priors == "removed" {
+                    saved
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("claude_census_rebuild_priors");
+                } else {
+                    saved["claude_census_rebuild_priors"] = serde_json::json!({});
+                }
+                if saved_empty {
+                    saved["files"][&key]["source_file_fingerprint"] = serde_json::json!("");
+                }
+                std::fs::write(path, serde_json::to_string(&saved).unwrap()).unwrap();
+            };
+            erase(&path);
+
+            let mut grants = 1;
+            for cycle in 1..=4_u64 {
+                bound::restart();
+                let _clock = bound::set_now(N3_T0 + 60 * cycle);
+                let mut index = ScanIndex::load(&path).unwrap();
+                let rearmed = index.files[&key].source_file_fingerprint.is_empty();
+                if saved_empty {
+                    assert!(rearmed, "{case}: the saved emptiness stays");
+                    assert!(bound::held(&index, &key), "{case}: held");
+                    assert_eq!(
+                        census_rebuild_decision(&index, &key, &fingerprint),
+                        (CandidateDecision::Skip, None),
+                        "{case}: a held rearm is never read"
+                    );
+                    assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                    assert_eq!(
+                        census_rebuild_alarms(&key, "prior_missing"),
+                        cycle as usize,
+                        "{case}: one alarm per process"
+                    );
+                } else if rearmed {
+                    // The entry's own prior funds the bound's last attempt.
+                    grants += 1;
+                    assert_eq!(
+                        bound::prior(&index, &key).as_deref(),
+                        Some(fingerprint.as_str()),
+                        "{case}: re-derived from the entry"
+                    );
+                } else {
+                    assert!(bound::exhausted(&index, &key), "{case}");
+                    assert_eq!(
+                        census_rebuild_decision(&index, &key, &fingerprint),
+                        (CandidateDecision::Skip, None),
+                        "{case}: exhausted, not re-read"
+                    );
+                }
+                assert!(
+                    grants <= MAX_N3_REARMS_PER_WINDOW,
+                    "{case}: {grants} rearms within one window"
+                );
+                assert!(bound::attempts(&index, &key).len() <= MAX_N3_REARMS_PER_WINDOW);
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                let mut working = ScanIndex::load(&path).unwrap();
+                note_duplicate_rebuild_started(&mut working, Path::new(&key));
+                drop(working);
+                index.save(&path).unwrap();
+                erase(&path);
+            }
+            assert_eq!(grants, if saved_empty { 1 } else { 2 }, "{case}");
+
+            // The window passing does not release a held key.
+            bound::restart();
+            let clock = bound::set_now(N3_T0 + 8 * N3_DAY);
+            let mut index = ScanIndex::load(&path).unwrap();
+            if saved_empty {
+                assert!(bound::held(&index, &key), "{case}: never rearmed");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    (CandidateDecision::Skip, None)
+                );
+            }
+
+            // New transcript content is ordinary changed-file work; its clean
+            // record releases the key.
+            census_write(
+                &root,
+                "duplicate.jsonl",
+                &[
+                    census_response("duplicate", Some("req-duplicate"), "msg-duplicate", 1, 10),
+                    census_response(
+                        "duplicate",
+                        Some("req-duplicate-2"),
+                        "msg-duplicate-2",
+                        2,
+                        10,
+                    ),
+                ],
+            );
+            census_scan(&root, &mut index, SECOND_WINDOW);
+            assert!(index.claude_request_census_for_test().get(&key).is_some());
+            assert!(!index.files[&key].source_file_fingerprint.is_empty());
+            index.save(&path).unwrap();
+            bound::restart();
+            let index = ScanIndex::load(&path).unwrap();
+            assert!(!bound::pending(&index, &key), "{case}: released");
+            assert!(!bound::held(&index, &key), "{case}");
+            drop(clock);
+        }
+    }
+}
+
+const MAX_N3_REARMS_PER_WINDOW: usize = 2;
+
+/// MONEY P1b: a malformed, duplicated or truncated priors field is decoded in
+/// isolation and refused. Every index entry and the key's attempt history are
+/// kept (no whole-index reset), no rebuild is granted on that load, and the
+/// refusal is counted on the census line for one window. The next save
+/// writes the priors again from the entries.
+#[test]
+fn census_rebuild_priors_decode_refusal_keeps_the_index() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for corruption in ["malformed", "duplicated", "truncated"] {
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-priors-refused");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            let mut saved = census_rebuild_saved_grant(&path, &original, &key);
+            let id = bound::key_id(&key);
+            let entries = saved["files"].as_object().unwrap().len();
+            assert_eq!(entries, original.files.len());
+            let raw = match corruption {
+                "malformed" => {
+                    saved["claude_census_rebuild_priors"][&id] = serde_json::json!(7);
+                    serde_json::to_string(&saved).unwrap()
+                }
+                "duplicated" => {
+                    let priors =
+                        serde_json::to_string(&saved["claude_census_rebuild_priors"]).unwrap();
+                    saved["claude_census_rebuild_priors"] = serde_json::json!("DUPLICATE_PRIORS");
+                    serde_json::to_string(&saved).unwrap().replace(
+                        "\"DUPLICATE_PRIORS\"",
+                        &format!("{priors},\"claude_census_rebuild_priors\":{priors}"),
+                    )
+                }
+                _ => {
+                    saved["claude_census_rebuild_priors"][&id] =
+                        serde_json::json!(&fingerprint[..fingerprint.len() - 1]);
+                    serde_json::to_string(&saved).unwrap()
+                }
+            };
+            std::fs::write(&path, raw).unwrap();
+
+            bound::restart();
+            let clock = bound::set_now(N3_T0 + 60);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                index.files.len(),
+                entries,
+                "{corruption}: every index entry kept"
+            );
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![N3_T0],
+                "{corruption}: attempt history kept"
+            );
+            assert!(bound::exhausted(&index, &key), "{corruption}: no grant");
+            assert_eq!(
+                index.files[&key].source_file_fingerprint, fingerprint,
+                "{corruption}: not rearmed"
+            );
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                (CandidateDecision::Skip, None),
+                "{corruption}: not re-read"
+            );
+            assert_eq!(
+                census_rebuild_counters_all(&mut index),
+                (1, 0, 1),
+                "{corruption}"
+            );
+            assert_eq!(
+                census_rebuild_alarms(&key, "priors_decode_refused"),
+                1,
+                "{corruption}"
+            );
+            index.save(&path).unwrap();
+            drop(clock);
+            let saved: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert_eq!(
+                saved["claude_census_rebuild_priors"][&id],
+                serde_json::json!(fingerprint),
+                "{corruption}: re-derived from the entry"
+            );
+
+            // The bound resumes from the kept history: one more rebuild.
+            bound::restart();
+            let _clock = bound::set_now(N3_T0 + 120);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert!(index.files[&key].source_file_fingerprint.is_empty());
+            assert_eq!(bound::attempts(&index, &key), vec![N3_T0, N3_T0 + 120]);
+            assert_eq!(
+                census_rebuild_counters_all(&mut index).2,
+                1,
+                "{corruption}: counted for one window"
+            );
+        }
     }
 }

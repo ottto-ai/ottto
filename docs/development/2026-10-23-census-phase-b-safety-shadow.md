@@ -48,10 +48,24 @@ if the failed pass is never saved. At most 512 keys are tracked, one compact
 line each in the saved index; past that, or after a malformed guard, new keys
 are refused for one window. Only well-formed fingerprints (64 lowercase hex)
 are rearmed. The fingerprint a grant emptied is saved outside the shadow, in
-the strictly decoded root field `claude_census_rebuild_priors`, so a malformed,
-duplicated or closed shadow cannot make a rearm free: an orphaned grant gets
-its fingerprint back, stays exhausted for one window, and is counted in
+the root field `claude_census_rebuild_priors`, so a malformed, duplicated or
+closed shadow cannot make a rearm free: an orphaned grant gets its fingerprint
+back, stays exhausted for one window, and is counted in
 `census_duplicate_rebuild_orphaned` with a `cause=orphaned_rearm` alarm.
+
+A rearm is never saved. The index writes a granted entry with its prior
+fingerprint, and a load empties it again only while the guard still holds the
+grant. A downgrade, an older binary's save or corruption that erases both the
+guard and the priors therefore leaves the real fingerprint: no rearm and no
+re-read. A pending key whose emptied fingerprint has no prior (an entry saved
+empty before this rule) is held: candidate selection skips it, it stays counted
+as exhausted with a `cause=prior_missing` alarm, and only new transcript
+content, a clean decode or the key leaving the index releases it. The index
+reader decodes the priors field in isolation: a malformed, duplicated or
+truncated field keeps every entry and the attempt history, grants no rebuild on
+that load, is re-derived from the entries at the next save, and is counted in
+`census_rebuild_priors_decode_refused` for one window
+(`cause=priors_decode_refused`).
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes
