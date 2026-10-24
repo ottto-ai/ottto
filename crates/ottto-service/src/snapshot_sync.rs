@@ -6727,7 +6727,8 @@ async fn finish_sync_source_resume(
                 |progress| {
                     progress.save(&upload_progress_path)?;
                     if source_money_resume(source, support_dir) {
-                        unknown_recovery::ack_saved(support_dir, progress)?;
+                        unknown_recovery::ack_saved(support_dir, progress)
+                            .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
                     }
                     Ok(())
                 },
@@ -6742,6 +6743,7 @@ async fn finish_sync_source_resume(
                 continue;
             }
             if source_money_resume(source, support_dir) {
+                unknown_recovery::discard_unsaved_acks(support_dir);
                 unknown_recovery::outcomes(support_dir).await?;
             }
             break result.inspect_err(log_bootstrap_failure("probe"))?;
@@ -6905,7 +6907,8 @@ async fn finish_sync_source_resume(
                 );
                 progress.save(&upload_progress_path)?;
                 if source_money_resume(source, support_dir) {
-                    unknown_recovery::ack_saved(support_dir, progress)?;
+                    unknown_recovery::ack_saved(support_dir, progress)
+                        .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
                 }
                 Ok(())
             },
@@ -6946,6 +6949,7 @@ async fn finish_sync_source_resume(
         break result;
     };
     if source_money_resume(source, support_dir) {
+        unknown_recovery::discard_unsaved_acks(support_dir);
         unknown_recovery::outcomes(support_dir).await?;
     }
     // The logical offer ends here; normal bounded HTTP retries happened inside.

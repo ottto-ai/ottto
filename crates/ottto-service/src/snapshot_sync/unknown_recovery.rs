@@ -479,6 +479,7 @@ pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
 #[derive(Default)]
 struct Catalog {
     fault: bool,
+    awaiting_ack: BTreeSet<String>,
     funds: Vec<money::ShadowReservation>,
     entries: Vec<Manifest>,
     loading: Option<Ticket<Vec<Manifest>>>,
@@ -536,6 +537,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
             support.to_path_buf(),
             Catalog {
                 fault: false,
+                awaiting_ack: BTreeSet::new(),
                 funds: Vec::new(),
                 entries: Vec::new(),
                 loading: Some(ticket),
@@ -744,6 +746,7 @@ pub(super) fn ack_saved(support: &Path, progress: &SnapshotUploadProgress) -> Re
     };
     for m in &mut catalog.entries {
         if !m.ack_saved
+            && catalog.awaiting_ack.contains(&m.id)
             && m.entities
                 .iter()
                 .all(|e| progress.contains_body(&e.fingerprint, &e.witness))
@@ -761,9 +764,17 @@ pub(super) fn ack_saved(support: &Path, progress: &SnapshotUploadProgress) -> Re
     Ok(())
 }
 
+pub(super) fn discard_unsaved_acks(support: &Path) {
+    if let Ok(mut catalogs) = CATALOGS.lock() {
+        if let Some(catalog) = catalogs.get_mut(support) {
+            catalog.awaiting_ack.clear();
+        }
+    }
+}
+
 pub(super) fn resolve_saved(
     support: &Path,
-    progress: &SnapshotUploadProgress,
+    _progress: &SnapshotUploadProgress,
     now: u64,
 ) -> Result<()> {
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
@@ -771,19 +782,7 @@ pub(super) fn resolve_saved(
         return Ok(());
     };
     for m in &mut catalog.entries {
-        if m.ack_saved
-            || m.entities.iter().all(|e| {
-                progress.contains_body(&e.fingerprint, &e.witness)
-                    || progress
-                        .quarantined_fingerprints
-                        .get(&e.fingerprint)
-                        .is_some_and(|q| q.upload_body_witness.as_deref() == Some(&e.witness))
-                    || progress
-                        .permanent_rejections
-                        .get(&e.fingerprint)
-                        .is_some_and(|q| q.body_witness == e.witness)
-            })
-        {
+        if m.terminal.is_none() && m.ack_saved {
             // This in-memory mark is reached only AFTER ACK and selected saves.
             // Startup commits the release latch and count-only terminal receipt.
             m.terminal = Some(Reason::Resolved);
@@ -1056,6 +1055,15 @@ pub(super) fn initial_post(
         .is_some_and(|s| s.request_owned_route_unavailable)
     {
         money::note_route_pause(support, index, true);
+    }
+    if result.as_ref().is_ok_and(|response| !response.disabled) {
+        CATALOGS
+            .lock()
+            .map_err(|_| fault())?
+            .get_mut(support)
+            .ok_or_else(fault)?
+            .awaiting_ack
+            .insert(m.id.clone());
     }
     // Outcome writes are awaited by the async owner, including Retry-After.
     // Keep no second copy of the retained payload after the one physical POST.
