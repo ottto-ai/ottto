@@ -7,6 +7,7 @@ PUBLIC_ROOT="${PUBLIC_CONTRACT_REPO_ROOT:-$DEFAULT_PUBLIC_ROOT}"
 PRIVATE_REPO_ROOT="${PUBLIC_CONTRACT_PRIVATE_REPO_ROOT:-}"
 PRIVATE_RUNTIME_PIN="${PUBLIC_CONTRACT_PRIVATE_RUNTIME_PIN:-}"
 REQUIRE_PUBLIC_AUTHORITY="${PUBLIC_CONTRACT_REQUIRE_PUBLIC_AUTHORITY:-false}"
+STAGED_OUTPUT=0
 
 usage() {
   cat <<'USAGE'
@@ -21,6 +22,12 @@ public-runtime pin whose manifest digest matches the checked public root.
 Use --require-public-authority after public repo cutover: it requires the
 private pin to name a public repo commit and verifies that the checked public
 root is a clean git checkout at that commit.
+
+The pin is compared with public manifest facts. With --staged-output they come
+from the bundle's PUBLIC_EXPORT_MANIFEST.json. Otherwise the checked root is a
+git checkout and they are derived from its HEAD commit tree with
+scripts/public_repo_manifest.sh; a commit that still tracks the manifest file
+must match the derived manifest.
 
 Environment overrides:
   PUBLIC_CONTRACT_REPO_ROOT
@@ -38,6 +45,7 @@ while [[ "$#" -gt 0 ]]; do
         exit 2
       }
       PUBLIC_ROOT="$2"
+      STAGED_OUTPUT=1
       shift 2
       ;;
     --private-repo-root)
@@ -71,7 +79,8 @@ while [[ "$#" -gt 0 ]]; do
   esac
 done
 
-python3 - "$PUBLIC_ROOT" "$PRIVATE_REPO_ROOT" "$PRIVATE_RUNTIME_PIN" "$REQUIRE_PUBLIC_AUTHORITY" <<'PY'
+python3 - "$PUBLIC_ROOT" "$PRIVATE_REPO_ROOT" "$PRIVATE_RUNTIME_PIN" "$REQUIRE_PUBLIC_AUTHORITY" \
+  "$STAGED_OUTPUT" "$SCRIPT_DIR/public_repo_manifest.sh" <<'PY'
 from __future__ import annotations
 
 import json
@@ -87,6 +96,8 @@ PUBLIC_ROOT = Path(sys.argv[1]).resolve()
 PRIVATE_REPO_ROOT = Path(sys.argv[2]).resolve() if sys.argv[2] else None
 PRIVATE_RUNTIME_PIN_ARG = sys.argv[3]
 REQUIRE_PUBLIC_AUTHORITY = sys.argv[4].lower() in {"1", "true", "yes"}
+STAGED_OUTPUT = sys.argv[5] == "1"
+MANIFEST_SCRIPT = sys.argv[6]
 REQUIRED_CONNECTOR_REDACTION_CLASSES = {
     "prompt",
     "response",
@@ -223,6 +234,42 @@ def git_output(args: list[str]) -> str | None:
         fail(f"public authority git check failed for {' '.join(args)}: {error}")
         return None
     return result.stdout.strip()
+
+
+def public_manifest_facts() -> dict[str, Any]:
+    # Decide by mode, not by looking for .git: a staged bundle such as
+    # dist/public-export/ottto sits inside the outer git checkout.
+    if STAGED_OUTPUT:
+        manifest = require_dict(load_json("PUBLIC_EXPORT_MANIFEST.json"), "public export manifest")
+        files = manifest.get("files")
+        return {
+            "content_sha256": manifest.get("content_sha256"),
+            "output_file_count": manifest.get("output_file_count"),
+            "file_record_count": len(files) if isinstance(files, list) else None,
+        }
+    try:
+        result = subprocess.run(
+            ["bash", MANIFEST_SCRIPT, "--repo", str(PUBLIC_ROOT), "--facts"],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as error:
+        fail(f"public export manifest could not be derived: {error}")
+        return {}
+    if result.returncode != 0:
+        fail(
+            "public export manifest could not be derived from the public root HEAD: "
+            + (result.stderr.strip() or f"exit {result.returncode}")
+        )
+        return {}
+    facts = require_dict(json.loads(result.stdout), "derived public export manifest facts")
+    return {
+        "content_sha256": facts.get("content_sha256"),
+        "output_file_count": facts.get("output_file_count"),
+        "file_record_count": facts.get("file_record_count"),
+    }
 
 
 def require_dict(value: Any, context: str) -> dict[str, Any]:
@@ -2374,9 +2421,8 @@ def check_private_runtime_pin() -> int:
     pinned_manifest = require_dict(
         pin.get("public_export_manifest"), "private runtime pin public_export_manifest"
     )
-    public_manifest = require_dict(load_json("PUBLIC_EXPORT_MANIFEST.json"), "public export manifest")
-    public_files = public_manifest.get("files")
-    public_file_record_count = len(public_files) if isinstance(public_files, list) else None
+    public_manifest = public_manifest_facts()
+    public_file_record_count = public_manifest.get("file_record_count")
 
     content_sha256 = pinned_manifest.get("content_sha256")
     expect(

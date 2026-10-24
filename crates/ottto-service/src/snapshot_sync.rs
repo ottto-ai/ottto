@@ -297,10 +297,13 @@ fn with_bootstrap_deferred(
 /// Carry a newer refused-body conflict even when the frozen upload delta is
 /// empty. New conflicts were already counted by bootstrap/main upload; this
 /// adds only older, untransmitted debt from the current source universe.
+/// A later traversal's proven unchanged cooldown is counted and disclosed,
+/// but leaves settlement to the normal clean-traversal boundary.
 fn with_retained_refusal_conflicts(
     result: ResumableUploadResult,
     index: &ScanIndex,
     progress: &SnapshotUploadProgress,
+    reoffer_now: u64,
 ) -> ResumableUploadResult {
     let retained = index
         .current_snapshot_fingerprint_refs()
@@ -310,14 +313,25 @@ fn with_retained_refusal_conflicts(
                     .permanent_rejections
                     .get(*fingerprint)
                     .is_some_and(|refusal| {
-                        progress
-                            .quarantined_fingerprints
-                            .get(*fingerprint)
-                            .is_some_and(|record| {
-                                record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                    && record.upload_body_witness.as_deref()
-                                        == Some(refusal.body_witness.as_str())
-                            })
+                        // The I/O view also holds due records waiting for
+                        // budget. Only a still-future reservation grants the
+                        // settlement exception; at D that debt blocks again.
+                        !(index.reason_reoffer_conflict_is_deferred(
+                            fingerprint,
+                            &refusal.body_witness,
+                        ) && refusal
+                            .reoffer
+                            .and_then(reason_reoffer::RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline > reoffer_now))
+                            && progress
+                                .quarantined_fingerprints
+                                .get(*fingerprint)
+                                .is_some_and(|record| {
+                                    record.disposition
+                                        == SnapshotQuarantineDisposition::RetryPending
+                                        && record.upload_body_witness.as_deref()
+                                            == Some(refusal.body_witness.as_str())
+                                })
                     })
         })
         .collect::<BTreeSet<_>>();
@@ -351,11 +365,16 @@ const _: () = assert!(
 ///   in its upload ledger (an accepted, quarantined or refused body or
 ///   accepted cache evidence; a generation or replay claim alone is saved
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
-///   sibling of this index; or the re-emission seen-marker.
+///   sibling of this index; or the re-emission seen-marker. Also, when the
+///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
+///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   is not a move, but this Mac did index history, so a cutoff keeps that
+///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
-///   copy another destination or a legacy layout left in the support
-///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   copy another destination's directory holds (an interrupted bootstrap
+///   before a re-pair). A leftover is another destination only when it sits
+///   under a different namespace (I-r3-1); unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -399,6 +418,10 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
+    // Only a different namespace's directory is another destination. An
+    // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
+    // no destination; it is usually this Mac's own pre-scoping index, so it
+    // must not hold history as a move (I-r3-1). It is `Here` evidence below.
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
@@ -416,15 +439,13 @@ fn claude_prior_history(
                     Err(error) => error.kind() != std::io::ErrorKind::NotFound,
                 }
         };
-        let snapshots = support_dir.join("snapshots");
-        holds_claude_state(&snapshots)
-            || match std::fs::read_dir(snapshots.join("destinations")) {
-                Ok(mut destinations) => destinations.any(|destination| match destination {
-                    Ok(destination) => holds_claude_state(&destination.path()),
-                    Err(_) => true,
-                }),
-                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-            }
+        match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
+            Ok(mut destinations) => destinations.any(|destination| match destination {
+                Ok(destination) => holds_claude_state(&destination.path()),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     };
     // Fails closed: only a positively missing marker is absent (h695 N2).
     let seen_marker = || match std::fs::symlink_metadata(
@@ -456,8 +477,25 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
+    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
+    // directory fails closed; a missing one is empty.
+    let unscoped_legacy_index = || {
+        let prefix = format!("{slug}-scan-index");
+        match std::fs::read_dir(support_dir.join("snapshots")) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix)),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
+    } else if unscoped_legacy_index() {
+        PriorHistory::Here
     } else {
         PriorHistory::None
     }
@@ -1487,6 +1525,49 @@ impl SnapshotUploadProgress {
             );
         }
         changed
+    }
+
+    /// Runtime-only exact-body cooldown view (fingerprint -> refused body
+    /// witness) of this prepared cycle: a retained exact-body RetryPending
+    /// conflict whose refusal holds a validated daily re-offer reservation
+    /// and no lease this cycle. Without that lease the exact body cannot be
+    /// sent, so its ordinary retry timer alone must not re-read an unchanged
+    /// file. Due records waiting for budget stay in the view. Missing,
+    /// malformed or classified extensions grant nothing. Bounded by the
+    /// refusal ledger; the reservation remains the sole durable schedule.
+    fn reason_reoffer_cooldowns(&self, now: u64) -> BTreeMap<String, String> {
+        use reason_reoffer::RefusalReoffer;
+        let latest = reason_reoffer::latest_valid_deadline(now);
+        self.permanent_rejections
+            .iter()
+            .filter(|(fingerprint, refusal)| {
+                refusal.reason == crate::upload_receipts::RejectedUsageReason::Other
+                    && matches!(
+                        refusal.reoffer,
+                        Some(
+                            RefusalReoffer::OriginalPair { .. }
+                                | RefusalReoffer::LegacyOther { .. }
+                        )
+                    )
+                    && refusal
+                        .reoffer
+                        .and_then(RefusalReoffer::retry_after)
+                        .is_some_and(|retry_after| retry_after <= latest)
+                    && !self.active_reason_reoffers.contains_key(*fingerprint)
+                    && !self.active_quarantine_retries.contains(*fingerprint)
+                    && !self.accepted_fingerprints.contains(*fingerprint)
+                    && self
+                        .quarantined_fingerprints
+                        .get(*fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                && record.upload_body_witness.as_deref()
+                                    == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, refusal)| (fingerprint.clone(), refusal.body_witness.clone()))
+            .collect()
     }
 
     /// Reserve the next logical offer before any scan or upload can use it.
@@ -3012,6 +3093,7 @@ struct SyncCounts {
     ownership_incomplete_file_count: u64,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
+    cooldown_conflict_deferred: usize,
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
@@ -3134,6 +3216,7 @@ impl SyncCounts {
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
+            cooldown_conflict_deferred: 0,
             zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
@@ -3157,7 +3240,26 @@ impl SyncCounts {
         }
     }
 
+    fn terminal_census_line(&self, source: &str) -> String {
+        format!(
+            "snapshot terminal_census source={source} census_complete={} scanned_files={} \
+             uploaded={} unproven_terminal={} superseded_terminal={} \
+             ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
+             dropped_usage_records={} cooldown_conflict_deferred={}",
+            self.census_complete,
+            self.scanned_file_count,
+            self.uploaded_count,
+            self.snapshot_unproven_terminal_count,
+            self.snapshot_superseded_terminal_count,
+            self.ownership_incomplete_file_count,
+            self.zero_snapshot_usage_evidence_count,
+            self.dropped_usage_record_count,
+            self.cooldown_conflict_deferred,
+        )
+    }
+
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
+        self.cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
         // Mirror #389's disclosed-loss convention: terminal unproven entities
@@ -5506,6 +5608,11 @@ fn prepare_sync_source(
             support_dir,
         )
     });
+    if let Some(prior) = prior_claude_history {
+        crate::snapshots::note_prior_history_unverified(
+            prior == crate::snapshots::PriorHistory::Unverified,
+        );
+    }
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -5626,6 +5733,12 @@ fn prepare_sync_source(
     let committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
+    // A replay re-reads everything and neither re-offers nor defers.
+    index.activate_reason_reoffer_cooldowns(if historical_replay_pending {
+        BTreeMap::new()
+    } else {
+        upload_progress.reason_reoffer_cooldowns(reoffer_now)
+    });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -6289,6 +6402,9 @@ fn finish_sync_source(
         // obligation survives until both cache settlement and index save.
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress
+        .reason_reoffer_counts
+        .cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
     // One logical offer per leased refusal: its next deadline is at least
     // this first transmission + 24 h, and durable before it. A failed save
     // sends nothing.
@@ -6470,6 +6586,7 @@ fn finish_sync_source(
             with_bootstrap_deferred(result, bootstrap_deferred),
             &index,
             &upload_progress,
+            reason_reoffer::now_unix_seconds(),
         )
     });
     // The logical offer ends here; normal bounded HTTP retries happened inside.
@@ -8068,6 +8185,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &api_report,
         &trace_report,
         scan_result.census_complete,
+        &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage {
+            census_complete: scan_result.census_complete,
+            fence_invalid: disposition.duplicate_census.census_invalid,
+            authority_retry: index.claude_usage_authority_pending_count() > 0,
+        },
     );
     Ok((disposition, census_withheld, stats))
 }
@@ -9454,6 +9576,9 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
+    // Keep non-blocking cooldown debt beside the terminal census counters on
+    // every report, even when the re-offer work summary is unchanged/quiet.
+    eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
     let diagnostic = status.counts.local_codex_diagnostics;
     let request = collector_status_request(
         &destination_namespace,

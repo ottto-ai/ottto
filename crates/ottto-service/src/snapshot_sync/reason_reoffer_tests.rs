@@ -718,11 +718,11 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     )
     .unwrap();
     assert_eq!(
-        with_retained_refusal_conflicts(result, &index, &progress),
+        with_retained_refusal_conflicts(result, &index, &progress, NOW),
         ResumableUploadResult::Deferred { count: 1 }
     );
     assert_eq!(
-        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress),
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
         ResumableUploadResult::Deferred { count: 1 },
         "an empty frozen delta still owes retry debt"
     );
@@ -730,7 +730,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred { count: 2 },
             &index,
-            &progress
+            &progress,
+            NOW,
         ),
         ResumableUploadResult::Deferred { count: 3 },
         "ordinary and retained conflicts are distinct"
@@ -740,7 +741,8 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
         with_retained_refusal_conflicts(
             ResumableUploadResult::Deferred { count: 1 },
             &index,
-            &progress
+            &progress,
+            NOW,
         ),
         ResumableUploadResult::Deferred { count: 1 },
         "a fresh re-offer conflict was already counted once"
@@ -764,6 +766,107 @@ fn retained_refusal_preserves_newer_retry_debt_without_early_transmission() {
     assert_eq!(
         old_progress.quarantined_fingerprints[&fp(2)].disposition,
         SnapshotQuarantineDisposition::UnprovenTerminal
+    );
+}
+
+/// O1: the runtime cooldown view holds exactly the retained exact-body
+/// conflicts that no lease lets through this cycle, including a due record
+/// still waiting for budget (no unlimited ordinary reparse while it waits)
+/// and an F2-re-clamped deadline read from the prepared ledger. A lease, a
+/// done marker, another body or no conflict grants no deferral.
+#[test]
+fn cooldown_view_holds_only_unleased_retained_exact_body_conflicts() {
+    use reason_reoffer::RefusalReoffer;
+    let (mut progress, mut index) = refused(&[
+        (1, original_pair(NOW + DAY)),
+        (2, original_pair(NOW - 1)),
+        (3, Some(RefusalReoffer::Classified)),
+        (4, original_pair(NOW + 5 * DAY)),
+        (5, original_pair(NOW + DAY)),
+        (6, original_pair(NOW + DAY)),
+    ]);
+    for value in 1..=4 {
+        progress.quarantine_retryable_body(&fp(value), &body(value));
+    }
+    // A conflict on another body of the entity is ordinary new work.
+    progress.quarantine_retryable_body(&fp(5), &body(500));
+    progress
+        .quarantined_fingerprints
+        .get_mut(&fp(5))
+        .unwrap()
+        .retry_after_unix_seconds = u64::MAX;
+    // Value 6 keeps only its terminal refusal: nothing to retry.
+    // Older ordinary retries fill the shared budget before the due re-offer.
+    for value in 200..200 + SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE {
+        let mut record = terminal_record(&body(value));
+        record.disposition = SnapshotQuarantineDisposition::RetryPending;
+        record.failed_reconstruction_count = 1;
+        record.retry_after_unix_seconds = 1;
+        index
+            .quarantined_snapshot_fingerprints
+            .insert(fp(value), record);
+    }
+    assert!(select(&mut progress, &index, NOW));
+    let counts = progress.reason_reoffer_counts;
+    assert_eq!(
+        counts.deferred_budget, 1,
+        "the due re-offer waits for budget"
+    );
+    assert_eq!(counts.clock_bound_skipped, 1);
+    assert!(progress.active_reason_reoffers.is_empty());
+    assert_eq!(
+        progress.permanent_rejections[&fp(4)].reoffer,
+        original_pair(NOW + DAY),
+        "F2 re-clamped before the view reads it"
+    );
+    assert_eq!(
+        progress.reason_reoffer_cooldowns(NOW),
+        BTreeMap::from([(fp(1), body(1)), (fp(2), body(2)), (fp(4), body(4)),])
+    );
+    let mut mismatched = progress.clone();
+    mismatched
+        .quarantined_fingerprints
+        .get_mut(&fp(1))
+        .unwrap()
+        .witness
+        .parser_version
+        .push_str("-older");
+    assert!(
+        !mismatched
+            .reason_reoffer_cooldowns(NOW)
+            .contains_key(&fp(1)),
+        "a stale ledger witness grants no cooldown proof"
+    );
+    // The view is a read: every refusal, conflict and deadline is retained.
+    for value in [1, 2, 4] {
+        assert!(progress.contains_body(&fp(value), &body(value)));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp(value)].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+    }
+    assert_eq!(
+        progress.permanent_rejections[&fp(2)].reoffer,
+        original_pair(NOW - 1)
+    );
+
+    // Budget frees: the due record's own lease, not the view, selects it.
+    for value in 200..200 + SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE {
+        index.quarantined_snapshot_fingerprints.remove(&fp(value));
+        progress.quarantined_fingerprints.remove(&fp(value));
+    }
+    assert!(select(&mut progress, &index, NOW + 300));
+    assert_eq!(progress.active_reason_reoffers[&fp(2)], body(2));
+    assert_eq!(
+        progress.reason_reoffer_cooldowns(NOW + 300),
+        BTreeMap::from([(fp(1), body(1)), (fp(4), body(4))])
+    );
+    let mut counts = progress.reason_reoffer_counts;
+    counts.cooldown_conflict_deferred = 2;
+    let summary = counts.line("claude_code");
+    assert!(
+        summary.contains("cooldown_conflict_deferred=2"),
+        "{summary}"
     );
 }
 
@@ -853,5 +956,108 @@ fn cache_bootstrap_errors_finalize_attempted_entities_bytes_and_outcomes() {
             assert_eq!((counts.failed, counts.shed), (1, 0), "{failure}");
         }
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Terminal census disclosure shares one per-source line with the other loss
+/// counters, even when the re-offer work summary has no new work to log.
+#[test]
+fn cooldown_conflict_count_is_disclosed_beside_terminal_census_counts() {
+    let counts = SyncCounts {
+        census_complete: true,
+        snapshot_unproven_terminal_count: 2,
+        ownership_incomplete_file_count: 3,
+        cooldown_conflict_deferred: 1,
+        ..SyncCounts::default()
+    };
+    let line = counts.terminal_census_line("claude_code");
+    for field in [
+        "source=claude_code",
+        "census_complete=true",
+        "unproven_terminal=2",
+        "ownership_incomplete_files=3",
+        "cooldown_conflict_deferred=1",
+    ] {
+        assert!(line.contains(field), "missing {field}: {line}");
+    }
+    assert_eq!(line.lines().count(), 1);
+}
+
+/// A bounded page need not revisit every cooldown entity. Its provisional
+/// classification preserves prior traversal causes and all fresh outcomes;
+/// only the scanner's ordinary clean boundary can settle the full traversal.
+#[test]
+fn cooldown_debt_on_unvisited_pages_does_not_clear_causes_or_mask_new_conflicts() {
+    let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
+    progress.quarantine_retryable_body(&fp(1), &body(1));
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
+    index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
+    index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::DeferredConflict);
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert_eq!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
+        ResumableUploadResult::Completed
+    );
+    assert!(
+        index.bounded_sweep_had_unsettled_upload(),
+        "classification cannot clear prior causes"
+    );
+    assert_eq!(
+        with_retained_refusal_conflicts(
+            ResumableUploadResult::Deferred { count: 2 },
+            &index,
+            &progress,
+            NOW,
+        ),
+        ResumableUploadResult::Deferred { count: 2 },
+        "new unrelated conflicts stay blocking"
+    );
+    assert_eq!(
+        progress.quarantined_fingerprints[&fp(1)].disposition,
+        SnapshotQuarantineDisposition::RetryPending
+    );
+    assert!(progress.permanent_rejections.contains_key(&fp(1)));
+}
+
+/// The I/O skip also covers a due record waiting for the shared budget, but
+/// that is no longer future cooldown debt. Keep its original blocking result
+/// at the deadline without granting another ordinary re-read or a lease.
+#[test]
+fn due_unleased_conflict_still_blocks_after_the_cooldown_deadline() {
+    let (mut progress, mut index) = refused(&[(1, original_pair(NOW + DAY))]);
+    progress.quarantine_retryable_body(&fp(1), &body(1));
+    index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
+    index.activate_quarantine_witness_for_test(SnapshotSource::Codex);
+    index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(NOW));
+    assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+    assert_eq!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, &index, &progress, NOW),
+        ResumableUploadResult::Completed,
+        "future cooldown is non-blocking"
+    );
+    for now in [NOW + DAY, NOW + DAY + 1] {
+        index.activate_reason_reoffer_cooldowns(progress.reason_reoffer_cooldowns(now));
+        assert_eq!(
+            index.reason_reoffer_cooldown_deferred_count(),
+            1,
+            "a due record without budget still has its I/O deferral"
+        );
+        assert_eq!(
+            with_retained_refusal_conflicts(
+                ResumableUploadResult::Completed,
+                &index,
+                &progress,
+                now
+            ),
+            ResumableUploadResult::Deferred { count: 1 },
+            "due-time settlement is unchanged"
+        );
+        assert!(progress.active_reason_reoffers.is_empty());
+        assert!(progress.contains_body(&fp(1), &body(1)));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp(1)].disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
     }
 }
