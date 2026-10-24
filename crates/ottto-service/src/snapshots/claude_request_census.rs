@@ -6761,12 +6761,12 @@ mod phase_b_tests {
         assert_eq!(retained_bytes, 0);
         assert_eq!(metadata_bytes, 0);
         assert_eq!(checkpoint_delta, 0);
-        // Steady arms, interleaved ABAB: `main` runs the frozen main reference
-        // on the OFF arm's own record map (swapped in O(1) outside the clock),
-        // so both walk the same nodes, keys and hash buffers and only the code
-        // differs. `own_map` is the previous method (main on its separately
+        // Steady arms, interleaved ABAB (A/B order alternates per sample):
+        // `main` runs the frozen main reference on the OFF arm's own record
+        // map (swapped in O(1) outside the clock), so both walk the same
+        // nodes, keys and hash buffers and only the code differs. `own_map` is the previous method (main on its separately
         // cloned map), kept as a diagnostic of allocation-layout bias.
-        const STEADY_SAMPLES: usize = 9;
+        const STEADY_SAMPLES: usize = 15;
         let mut main_steady = Vec::new();
         let mut off_steady = Vec::new();
         let mut own_map_steady = Vec::new();
@@ -6830,6 +6830,15 @@ mod phase_b_tests {
             render(&off_steady),
             render(&own_map_steady),
         );
+        // Each ABAB pair ran back to back, so its ratio cancels slower runner
+        // drift that moves both arms together.
+        let mut paired = main_steady
+            .iter()
+            .zip(&off_steady)
+            .map(|(&main, &off)| (off as f64 - main as f64) * 100.0 / main.max(1) as f64)
+            .collect::<Vec<_>>();
+        paired.sort_unstable_by(f64::total_cmp);
+        let paired_median_pct = paired[paired.len() / 2];
         let stats = |samples: &mut Vec<u64>| {
             samples.sort_unstable();
             (samples[samples.len() / 2], samples[0])
@@ -6843,7 +6852,7 @@ mod phase_b_tests {
             * FILES;
         // Reported, never asserted: shared CI runners are too noisy for a
         // 0.5% gate. Median and min deltas are both printed.
-        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} first_terminal_memory=distinct steady_samples={STEADY_SAMPLES} steady_order=ABAB steady_memory=shared main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} steady_median_delta_pct={:.3} main_steady_min_cpu_us={main_min} off_steady_min_cpu_us={off_min} steady_min_delta_us={} steady_min_delta_pct={:.3} own_map_main_median_cpu_us={own_map_median} own_map_main_min_cpu_us={own_map_min} own_map_vs_shared_main_median_pct={:.3} main_samples_us={main_samples} off_samples_us={off_samples} own_map_samples_us={own_map_samples} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=main_reference_shared_map counting_writer=main_serialized_len excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, pct(off_steady, main_steady), off_min as i128 - main_min as i128, pct(off_min, main_min), pct(own_map_median, main_steady), checkpoint_actual.len());
+        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} first_terminal_memory=distinct steady_samples={STEADY_SAMPLES} steady_order=ABAB steady_memory=shared main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} steady_median_delta_pct={:.3} main_steady_min_cpu_us={main_min} off_steady_min_cpu_us={off_min} steady_min_delta_us={} steady_min_delta_pct={:.3} steady_paired_median_delta_pct={paired_median_pct:.3} own_map_main_median_cpu_us={own_map_median} own_map_main_min_cpu_us={own_map_min} own_map_vs_shared_main_median_pct={:.3} main_samples_us={main_samples} off_samples_us={off_samples} own_map_samples_us={own_map_samples} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=main_reference_shared_map counting_writer=main_serialized_len excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, pct(off_steady, main_steady), off_min as i128 - main_min as i128, pct(off_min, main_min), pct(own_map_median, main_steady), checkpoint_actual.len());
     }
 
     #[test]

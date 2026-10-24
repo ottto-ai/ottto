@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 837,
-  "content_sha256": "1a708c0729d8bba61acffcac49e459afb3f459c92ffcabf63da1ee99e1f58188",
+  "content_sha256": "7560df0e113d932093768dda0292d91c8b0676c02cff12e78e89605744406bc3",
   "files": [
     {
       "executable": false,
@@ -1763,8 +1763,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "4f19e53a2c9c6da01166f3898d7415f47f1eeddfbb7332d25b25d1286a747d6f",
-      "size_bytes": 296052
+      "sha256": "4ce9d42e38b3762e799de3aacc2065c38af4c8422ec68659e78e18f61e019a2f",
+      "size_bytes": 296586
     },
     {
       "executable": false,
@@ -2323,8 +2323,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "fe033533e174f1ae3bb78554de12526c70f9ad669cff956751e6dff3c8fd25eb",
-      "size_bytes": 10876
+      "sha256": "6daf87184365e407092daee88ddd0447a31613ee092ce45e7251bc0b68ea8255",
+      "size_bytes": 10916
     },
     {
       "executable": false,
