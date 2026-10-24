@@ -1483,6 +1483,8 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(capture_us <= 125_000, "capture callback overshoot: {capture_us}");
     assert!(input <= 8 * 1024 * 1024, "{input}");
     assert!(comparisons <= 1_048_576, "{comparisons}");
+    // The capture plan this admitted page left for the next Full parse.
+    let planned_after_first = money::capture::planned_families_for_test(&fixture.support);
     // Reproduce a native Full rearm. It uses fresh current captures, not the
     // old page's consumed capture or a cached completed money body.
     money::capture::begin_page(&fixture.support);
@@ -1507,7 +1509,18 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     }).collect::<BTreeSet<_>>();
     let captured_deferred = captured_roots.intersection(&pending_capture_families).count();
     let captured_deadline = captured_roots.intersection(&deadline_families).count();
-    assert!(captured_deferred > 0, "Full capture plan must include prior incomplete capture turns");
+    if captured_deferred == 0 {
+        let pending_keys = armed.snapshots.iter().map(|item| item.attribution_facts.iter()
+            .find(|fact| fact.field == "root_session_ref").map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id))
+            .filter(|root| pending_capture_families.contains(&money::hashed_id_for_test(root)))
+            .map(crate::snapshots::claude_request_census::family_key).collect::<BTreeSet<_>>();
+        let plan_shape = |plan: &Option<BTreeSet<String>>| plan.as_ref().map(|plan| (plan.len(), plan.intersection(&pending_keys).count()));
+        let captured_rows = first_families.iter().filter(|row| captured_roots.contains(row["family"].as_str().unwrap()))
+            .map(|row| format!("{}:{}:{}", row["family"], row["category"], row["p1_reasons"])).collect::<Vec<_>>();
+        panic!("Full capture plan must include prior incomplete capture turns: captures={} plan_after_first(eligible,pending)={:?} plan_now={:?} work={:?} captured_rows={captured_rows:?} first_counts={counts:?}",
+            following_captures.len(), plan_shape(&planned_after_first),
+            plan_shape(&money::capture::planned_families_for_test(&fixture.support)), money::capture::work_for_test(&fixture.support));
+    }
     assert_eq!(captured_deferred, following_captures.len(),
         "every following capture must target a prior incomplete family, rather than repeat an already built one");
     let (following, following_elapsed) = run(&reread, &following_index, now + 1);
