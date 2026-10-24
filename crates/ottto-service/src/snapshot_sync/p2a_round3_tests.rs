@@ -3406,3 +3406,61 @@ fn p2a_unknown_parked_capture_cannot_post_after_original_deadline() {
         .values()
         .all(|e| e.effective_upload_body_witness_revision != 3));
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_known_ack_pending_selected_save_does_not_collide_with_fresh_offer() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::new(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let _reset = P2aConflictReset;
+    P2A_INDEX_CONFLICT.with(|state| *state.borrow_mut() = Some(control.index_path.clone()));
+    assert!(
+        control.cycle_result().is_err(),
+        "fail the selected CAS after the real ACK save"
+    );
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    let first = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert!(first.ack_saved);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let progress_path = snapshot_upload_progress_path(&control.index_path);
+    let mut progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    // A normal delivery re-offer still needs its own custody while the old
+    // selection is pending. Remove its transport suppression through the real
+    // progress save, without changing the file, body or money debt.
+    progress.accepted_fingerprints.clear();
+    progress.accepted_body_witnesses.clear();
+    progress.save(&progress_path).unwrap();
+    control.cycle();
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+    let attempts = unknown_recovery::active_for_test(&control.support);
+    assert_eq!(attempts.len(), 2);
+    assert!(attempts.iter().all(|m| m.lineage == first.lineage));
+    assert_ne!(
+        attempts[0].id, attempts[1].id,
+        "custody/counters belong to separate authorized attempts"
+    );
+    assert_eq!(control.server.committed.lock().unwrap().len(), 1);
+    assert!(control
+        .saved()
+        .files
+        .values()
+        .all(|e| e.effective_upload_body_witness_revision == 3));
+    control.cycle();
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+}

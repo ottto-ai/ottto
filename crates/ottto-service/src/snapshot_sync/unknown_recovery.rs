@@ -41,6 +41,7 @@ pub(super) struct Entity {
 #[serde(deny_unknown_fields)]
 pub(super) struct Manifest {
     pub id: String,
+    pub lineage: String,
     pub binding: String,
     pub context: String,
     pub policy: [u8; 32],
@@ -159,8 +160,17 @@ pub(super) fn binding(namespace: &str, origin: &str, machine: &str, context: &st
     }
     format!("{:x}", hash.finalize())
 }
-fn valid_id(id: &str) -> bool {
+fn valid_digest(id: &str) -> bool {
     id.len() == 64 && id.bytes().all(|c| c.is_ascii_hexdigit())
+}
+fn valid_id(id: &str) -> bool {
+    valid_digest(id)
+        || id
+            .split_once('-')
+            .is_some_and(|(lineage, nonce)| valid_digest(lineage) && valid_digest(nonce))
+}
+fn id_lineage(id: &str) -> &str {
+    id.split_once('-').map_or(id, |(lineage, _)| lineage)
 }
 fn path(root: &Path, id: &str, extension: &str) -> Result<PathBuf> {
     if !valid_id(id) {
@@ -289,8 +299,10 @@ fn write_manifest(root: &Path, manifest: &Manifest) -> Result<()> {
 }
 fn validate_manifest(m: &Manifest) -> Result<()> {
     if !valid_id(&m.id)
-        || !valid_id(&m.sha256)
-        || !valid_id(&m.binding)
+        || !valid_digest(&m.lineage)
+        || id_lineage(&m.id) != m.lineage
+        || !valid_digest(&m.sha256)
+        || !valid_digest(&m.binding)
         || m.posts == 0
         || m.posts > 4
         || m.slot > 3
@@ -353,8 +365,10 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             }
             Ok(m)
         })();
+        let fallback_lineage = id_lineage(&id).to_owned();
         let mut m = decoded.unwrap_or_else(|_| Manifest {
             id,
+            lineage: fallback_lineage,
             binding: "00".repeat(32),
             context: String::new(),
             policy: [0; 32],
@@ -667,6 +681,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
             sync_dir(&support)?;
             for id in legacy {
                 let m = Manifest {
+                    lineage: id.clone(),
                     id,
                     binding: "00".repeat(32),
                     context: String::new(),
@@ -692,7 +707,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
     }
     let pending = catalog.entries.iter().find_map(|m| {
         let reason = m.terminal.or_else(|| {
-            if money::recovery_released(support, &m.id) {
+            if money::recovery_released(support, &m.lineage) {
                 Some(Reason::Released)
             } else if m.binding != binding {
                 Some(Reason::BindingLost)
@@ -710,7 +725,22 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
     });
     drop(catalogs);
     if let Some((m, reason)) = pending {
-        match money::recovery_finish_receipt(support, &m.id, now, reason == Reason::Resolved) {
+        let another_attempt = CATALOGS
+            .lock()
+            .map_err(|_| fault())?
+            .get(support)
+            .is_some_and(|catalog| {
+                catalog
+                    .entries
+                    .iter()
+                    .any(|other| other.id != m.id && other.lineage == m.lineage)
+            });
+        let finish = if reason == Reason::Resolved && another_attempt {
+            money::MoneyReceipt::Ready
+        } else {
+            money::recovery_finish_receipt(support, &m.lineage, now, reason == Reason::Resolved)
+        };
+        match finish {
             money::MoneyReceipt::Ready => (),
             money::MoneyReceipt::Pending => return Ok(false),
             money::MoneyReceipt::Refused => return Err(fault()),
@@ -984,6 +1014,7 @@ pub(super) fn manifest(
     let mut metadata_bytes = 0_usize;
     let mut lineage = Sha256::new();
     lineage.update(binding.as_bytes());
+    lineage.update(policy);
     lineage.update((index.recovery_upload_context().len() as u64).to_be_bytes());
     lineage.update(index.recovery_upload_context().as_bytes());
     lineage.update([u8::from(head_cas)]);
@@ -1006,6 +1037,8 @@ pub(super) fn manifest(
         lineage.update((item.source_session_id.len() as u64).to_be_bytes());
         lineage.update(item.source_session_id.as_bytes());
         lineage.update(item.snapshot_fingerprint.as_bytes());
+        let witness = snapshot_upload_body_witness(item);
+        lineage.update(witness.as_bytes());
         if let Some(fp) = &item.source_file_fingerprint {
             lineage.update(fp.as_bytes());
         }
@@ -1013,7 +1046,7 @@ pub(super) fn manifest(
             root,
             session: item.source_session_id.clone(),
             fingerprint: item.snapshot_fingerprint.clone(),
-            witness: snapshot_upload_body_witness(item),
+            witness,
             witness_version: crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
             files,
             file_revisions,
@@ -1024,8 +1057,25 @@ pub(super) fn manifest(
         });
     }
     let now = now(support);
+    let lineage = format!("{:x}", lineage.finalize());
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut nonce = Sha256::new();
+    nonce.update(std::process::id().to_be_bytes());
+    nonce.update(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos())
+            .to_be_bytes(),
+    );
+    nonce.update(
+        SEQUENCE
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .to_be_bytes(),
+    );
+    let id = format!("{lineage}-{:x}", nonce.finalize());
     Ok(Manifest {
-        id: format!("{:x}", lineage.finalize()),
+        id,
+        lineage,
         binding,
         context: index.recovery_upload_context().to_owned(),
         policy,
@@ -1055,11 +1105,13 @@ pub(super) enum SendState {
 pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()> {
     let ticket = match std::mem::take(state) {
         SendState::Reserving(m, body, funds) => {
-            std::future::poll_fn(|_| match money::recovery_reserve_receipt(support, &m.id) {
-                money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
-                money::MoneyReceipt::Pending => std::task::Poll::Pending,
-                money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
-            })
+            std::future::poll_fn(
+                |_| match money::recovery_reserve_receipt(support, &m.lineage) {
+                    money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
+                    money::MoneyReceipt::Pending => std::task::Poll::Pending,
+                    money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
+                },
+            )
             .await
             .inspect_err(|error| faulted(support, error))?;
             capture_ticket(support, m, body, funds)?
@@ -1120,7 +1172,7 @@ pub(super) fn initial_post(
             }
             .into());
         }
-        if money::recovery_released(support, &m.id) {
+        if money::recovery_released(support, &m.lineage) {
             let roots = m
                 .entities
                 .iter()
@@ -1589,6 +1641,7 @@ mod tests {
         (
             Manifest {
                 id: "ab".repeat(32),
+                lineage: "ab".repeat(32),
                 binding: "cd".repeat(32),
                 context: "context".into(),
                 policy: [0; 32],
@@ -1738,6 +1791,7 @@ mod tests {
         }
         let (mut expired, body) = specimen(1000);
         expired.id = "56".repeat(32);
+        expired.lineage = expired.id.clone();
         let expired = capture(scratch.to_path_buf(), expired, &body).unwrap();
         assert!(money_resume::drive_for_test(wait(
             replay_ticket(&scratch, expired, 1000 + DEADLINE).unwrap()
@@ -1751,6 +1805,7 @@ mod tests {
         let (first, body) = specimen(1000);
         let mut second = first.clone();
         second.id = format!("{}{}", &first.id[..8], "56".repeat(28));
+        second.lineage = second.id.clone();
         let first = capture(scratch.to_path_buf(), first, &body).unwrap();
         let second = capture(scratch.to_path_buf(), second, &body).unwrap();
         terminal(

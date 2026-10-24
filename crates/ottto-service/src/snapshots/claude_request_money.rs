@@ -4173,7 +4173,12 @@ pub(crate) fn recovery_finish_receipt(
         ClaudeLedgerAcquire::Loading => return MoneyReceipt::Pending,
         ClaudeLedgerAcquire::Unavailable => return MoneyReceipt::Refused,
     };
-    ledger.remove(&format!("adopt:entity:recovery-release:{lineage}"));
+    let key = format!("adopt:entity:recovery-release:{lineage}");
+    // An older known outcome must not erase a newer unresolved release of the
+    // same logical body. Reclamation removes it only after delivery debt ends.
+    if ledger.get(&key).is_some_and(|record| record.window() == 0) {
+        ledger.remove(&key);
+    }
     store::checkpoint_receipt(support, &mut ledger)
 }
 
