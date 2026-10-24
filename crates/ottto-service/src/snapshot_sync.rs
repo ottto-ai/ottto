@@ -5467,6 +5467,12 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    // MONEY N3: a duplicate-key rebuild stamp is durable before this cycle's
+    // scan can re-read the transcript, so a crash cannot erase the attempt.
+    crate::snapshots::claude_request_census::persist_duplicate_rebuild_grants(
+        &mut index,
+        &index_path,
+    )?;
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.

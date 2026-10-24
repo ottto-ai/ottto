@@ -36,6 +36,16 @@ and clear only those indexed source fingerprints, using the existing
 transcript scan rebuilds the record. A successful rebuild clears the key's
 ambiguity, while the corruption count and sticky safety marker retain history.
 
+That rearm is bounded per key: at most two rebuilds per rolling seven days
+(`claude_request_census/rebuild_bound.rs`, shadow `n`). The daemon saves each
+grant stamp before its scan can read, so restarts and crashes count; a future
+stamp counts as recent. Past the bound the key keeps its last indexed
+fingerprint (no re-read), its record stays absent, its duplicate stays counted,
+and `census_duplicate_rebuild_exhausted` plus a rate-limited
+`key_hash8`/`cause` alarm make it visible. It clears when the window passes or
+the key's record next decodes clean. At most 1,024 keys are tracked; past that,
+or after a malformed guard, new keys are refused for one window.
+
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes
 remain the legacy duplicate identity. A digest basis checks record and pending

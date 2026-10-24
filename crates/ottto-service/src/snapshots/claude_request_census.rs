@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 mod d1;
 mod phase_b;
+mod rebuild_bound;
 mod shadow_admission;
 use phase_b::{HashIter, SafetyBase64, SafetyHashes};
 #[cfg(test)]
@@ -855,6 +856,8 @@ pub(crate) struct ClaudeRequestCensus {
     compact_decode_recovered: bool,
     /// Any evidence mutation invalidates previously prepared joins. Never persisted.
     revision: u64,
+    /// This load's N3 rebuild grants and refusals. Never persisted.
+    rebuild_transient: rebuild_bound::Transient,
 }
 impl PartialEq for ClaudeRequestCensus {
     fn eq(&self, other: &Self) -> bool {
@@ -873,7 +876,7 @@ impl PartialEq for ClaudeRequestCensus {
     }
 }
 impl Eq for ClaudeRequestCensus {}
-crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, safety, hash_total, serialized_total, retired_order, extension_order, admission_serialized_total, active_hash_total, safety_incomplete, ambiguous, producer_refused, decode_lost, compact_decode_recovered, revision);
+crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, safety, hash_total, serialized_total, retired_order, extension_order, admission_serialized_total, active_hash_total, safety_incomplete, ambiguous, producer_refused, decode_lost, compact_decode_recovered, revision, rebuild_transient);
 
 const MAX_RECLAIMED_KEYS: usize = 4096;
 const MAX_UNREAD_ALARMS_PER_TERMINAL: usize = 8;
@@ -1677,8 +1680,10 @@ pub(crate) struct ClaudeRequestCensusShadowState {
     derivation_drift: u64,
     decode_duplicate_keys_dropped: u64,
     safety_incomplete: Option<SafetyIncomplete>,
+    /// MONEY N3: per-key duplicate-rebuild stamps (`rebuild_bound`).
+    rebuild_bound: Option<Box<rebuild_bound::DuplicateRebuildGuard>>,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete, rebuild_bound);
 
 impl ClaudeRequestCensusShadowState {
     fn closed() -> Self {
@@ -1900,6 +1905,9 @@ impl Serialize for ClaudeRequestCensusShadowState {
         if let Some(state) = &self.safety_incomplete {
             map.serialize_entry("s", state)?;
         }
+        if let Some(guard) = &self.rebuild_bound {
+            map.serialize_entry("n", guard)?;
+        }
         map.end()
     }
 }
@@ -2096,20 +2104,16 @@ impl<R: std::io::Read> CensusRead<R> {
             .ambiguous
             .append(&mut self.ambiguous_keys);
         let count = index.claude_request_census.ambiguous.len() as u64;
-        if count == 0 {
-            return;
+        if count > 0 {
+            let state = &mut index.claude_request_census_shadow;
+            state.decode_duplicate_keys_dropped =
+                state.decode_duplicate_keys_dropped.saturating_add(count);
         }
-        let state = &mut index.claude_request_census_shadow;
-        state.decode_duplicate_keys_dropped =
-            state.decode_duplicate_keys_dropped.saturating_add(count);
-        for key in &index.claude_request_census.ambiguous {
-            if let Some(entry) = index.files.get_mut(key) {
-                // Existing candidate selection treats an empty fingerprint as
-                // Parse(Rearmed). Persist this debt through save/restart until
-                // the next authorized transcript pass rebuilds its record.
-                entry.source_file_fingerprint.clear();
-            }
-        }
+        // Existing candidate selection treats an empty fingerprint as
+        // Parse(Rearmed). The debt persists through save/restart until the next
+        // authorized transcript pass rebuilds its record, at most twice per
+        // key per seven days.
+        rebuild_bound::apply(index);
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
@@ -2651,6 +2655,13 @@ impl<'de> Visitor<'de> for ShadowStateVisitor {
                         .unwrap_or_else(SafetyIncomplete::closed)
                 });
                 marker_seen = true;
+                continue;
+            }
+            if field == "n" {
+                let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
+                state.rebuild_bound = Some(Box::new(rebuild_bound::DuplicateRebuildGuard::decode(
+                    raw.get(),
+                )));
                 continue;
             }
             let value = map.next_value::<Loose>()?;
@@ -3529,6 +3540,22 @@ pub(crate) fn record_claude_request_census(
         .insert(parse.index_key.to_owned(), record);
 }
 
+/// MONEY N3: a Claude parse of `path` is starting (spends a pending rearm).
+pub(crate) fn note_duplicate_rebuild_started(index: &mut ScanIndex, path: &Path) {
+    rebuild_bound::note_started(index, path);
+}
+
+/// MONEY N3: save this load's duplicate-rebuild grants before the scan reads.
+pub(crate) fn persist_duplicate_rebuild_grants(
+    index: &mut ScanIndex,
+    path: &Path,
+) -> anyhow::Result<()> {
+    rebuild_bound::persist_grants(index, path)
+}
+
+#[cfg(test)]
+pub(crate) use rebuild_bound::test_support as duplicate_rebuild_test_support;
+
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
 /// one, never with an older revision's.
@@ -3551,7 +3578,8 @@ pub(super) fn serialize_shadow_counts<S: Serializer>(
             if counts.shadow_spec_version == 0
                 && !counts.safety_incomplete
                 && !counts.safety_incomplete_overflow
-                && counts.decode_duplicate_keys_dropped == 0 =>
+                && counts.decode_duplicate_keys_dropped == 0
+                && counts.census_duplicate_rebuild_exhausted == 0 =>
         {
             serializer.serialize_some(&d1::CountsLine(counts))
         }
@@ -3703,6 +3731,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
     state.would_open = Some(counts.would_open);
     counts.would_open_flips = state.would_open_flips;
     counts.derivation_drift = state.derivation_drift;
+    counts.census_duplicate_rebuild_exhausted = rebuild_bound::terminal(index);
     counts.json_bytes = serialized_bytes(&index.claude_request_census);
     counts.census_evidence_bytes = counts.json_bytes.saturating_add(serialized_len(
         &index.claude_request_census.safety_incomplete,
@@ -5597,6 +5626,7 @@ mod reader_regression_tests {
                 derivation_drift: 0,
                 decode_duplicate_keys_dropped: 0,
                 safety_incomplete: None,
+                rebuild_bound: None,
             },
             ..ScanIndex::default()
         };
