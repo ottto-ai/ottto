@@ -1047,3 +1047,63 @@ fn recovery_does_not_require_messages_from_protected_or_other_source_files() {
     );
     assert!(!custody.rebuild_complete(&index));
 }
+
+#[test]
+fn gate_off_custody_queries_allocate_only_selected_paths() {
+    let mut ledger = ClaudeLedger::new_for_test();
+    for number in 0..1024 {
+        let path = format!("/custody/projects/-cold/{number:08x}.jsonl");
+        stored(
+            &mut ledger,
+            message_key(&path),
+            ClaudeRequestCensusRecord::custody_message([1; 32], 7, None, true),
+        );
+    }
+    let (absent, absent_allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        ledger.census().records_with_prefix("watch:").count()
+    });
+    assert_eq!(absent, 0);
+    assert_eq!(
+        absent_allocations.allocations, 0,
+        "an absent live field must not expand P1 path spellings"
+    );
+    let (selected, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        ledger
+            .census()
+            .message_records_after("", 17)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(selected.len(), 17);
+    assert!(selected.windows(2).all(|pair| pair[0].0 < pair[1].0));
+    assert_eq!(selected[0].0, "mh:/custody/projects/-cold/00000000.jsonl");
+    assert_eq!(selected[16].0, "mh:/custody/projects/-cold/00000010.jsonl");
+    assert!(
+        allocation.allocations <= 32,
+        "pruning allocates for its page, not all 1024 retained paths: {allocation:?}"
+    );
+    for prefix in [
+        "",
+        "m",
+        "mh:",
+        "mh:/custody/projects/-cold/0000000",
+        "watch:",
+        "offer:",
+    ] {
+        let expected = ledger
+            .census()
+            .records()
+            .filter(|(key, _)| key.starts_with(prefix))
+            .map(|(key, _)| key)
+            .collect::<BTreeSet<_>>();
+        let actual = ledger
+            .census()
+            .records_with_prefix(prefix)
+            .map(|(key, _)| key)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "compact prefix filter must keep exact query semantics"
+        );
+    }
+    eprintln!("MONEY_OFF_COLD_QUERIES population=1024 absent_live_allocations={} prune_page=17 prune_allocations={}", absent_allocations.allocations, allocation.allocations);
+}

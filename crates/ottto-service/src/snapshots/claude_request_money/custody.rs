@@ -715,8 +715,30 @@ impl Custody {
         &'a self,
         prefix: &'a str,
     ) -> impl Iterator<Item = (String, RecordRef<'a>)> + 'a {
-        self.records()
-            .filter(move |(key, _)| key.starts_with(prefix))
+        // Filter compact field tags before constructing query spellings. P1
+        // telemetry sweeps must not allocate every transcript path (or any
+        // absent live delivery query) just to discard it at this boundary.
+        self.entries().flat_map(move |(key, carrier)| {
+            let path = match carrier {
+                Carrier::File(file) => file.path.as_deref(),
+                _ => None,
+            };
+            carrier
+                .slots()
+                .filter(move |slot| {
+                    let fixed = match &slot.key {
+                        QueryKey::Standard(code) => QueryKey::PREFIXES[*code as usize],
+                        QueryKey::Binding(_) => return true,
+                    };
+                    fixed.starts_with(prefix) || prefix.starts_with(fixed)
+                })
+                .filter_map(move |slot| {
+                    let expanded = slot.key.expand(key, path);
+                    expanded
+                        .starts_with(prefix)
+                        .then(|| (expanded, slot.value.view()))
+                })
+        })
     }
     pub(crate) fn records_after<'a>(
         &'a self,
@@ -746,29 +768,33 @@ impl Custody {
         cursor: &str,
         limit: usize,
     ) -> impl Iterator<Item = (String, RecordRef<'a>)> {
-        let mut nearest = std::collections::BinaryHeap::new();
-        for (carrier, file) in &self.files {
+        // Every current_m query is mh:<physical path>. Keep only borrowed
+        // paths in the bounded selection heap, then materialize the selected
+        // page. The gate-OFF P1 prune no longer touches one String allocation
+        // for every retained transcript on every page.
+        let mut nearest = std::collections::BinaryHeap::<BorrowedMessage<'_>>::new();
+        for file in self.files.values() {
             let Some(slot) = file.current_m.as_deref() else {
                 continue;
             };
-            let key = slot.key.expand(carrier, file.path.as_deref());
-            if key.as_str() <= cursor {
+            let path = file.path.as_deref().unwrap_or("");
+            let after = cursor
+                .strip_prefix("mh:")
+                .map_or_else(|| "mh:" > cursor, |cursor| path > cursor);
+            if !after {
                 continue;
             }
             if nearest.len() < limit {
-                nearest.push(KeyedRecord(key, slot.value.view()));
-            } else if nearest
-                .peek()
-                .is_some_and(|last: &KeyedRecord<'_>| key < last.0)
-            {
+                nearest.push(BorrowedMessage(path, slot.value.view()));
+            } else if nearest.peek().is_some_and(|last| path < last.0) {
                 nearest.pop();
-                nearest.push(KeyedRecord(key, slot.value.view()));
+                nearest.push(BorrowedMessage(path, slot.value.view()));
             }
         }
         nearest
             .into_sorted_vec()
             .into_iter()
-            .map(|item| (item.0, item.1))
+            .map(|item| (format!("mh:{}", item.0), item.1))
     }
     pub(super) fn offer_count_for(&self, owner: &str) -> usize {
         if let Some(root) = owner.strip_prefix("synthetic:") {
@@ -1188,6 +1214,24 @@ impl Custody {
                     Carrier::Ever(&self.ever),
                 ),
             ])
+    }
+}
+
+struct BorrowedMessage<'a>(&'a str, RecordRef<'a>);
+impl PartialEq for BorrowedMessage<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.0 == other.0
+    }
+}
+impl Eq for BorrowedMessage<'_> {}
+impl PartialOrd for BorrowedMessage<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for BorrowedMessage<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.cmp(other.0)
     }
 }
 
@@ -2059,18 +2103,21 @@ impl Custody {
                         path: wire.path,
                         rebuild_owed: wire.rebuild_owed?,
                         current_m,
-                        live: Some(Box::new(FileLive {
-                            logical: wire.logical,
-                            birth: wire.birth,
-                            indexed: wire.indexed?,
-                            seen_r: decode(wire.seen_r, None)?,
-                            seen_m,
-                            trace: decode(wire.trace, None)?,
-                            union: decode(wire.union, None)?,
-                            delivery,
-                            adoption: decode(wire.adoption, None)?,
-                            memo: decode(wire.memo, None)?,
-                        })),
+                        live: {
+                            let live = FileLive {
+                                logical: wire.logical,
+                                birth: wire.birth,
+                                indexed: wire.indexed?,
+                                seen_r: decode(wire.seen_r, None)?,
+                                seen_m,
+                                trace: decode(wire.trace, None)?,
+                                union: decode(wire.union, None)?,
+                                delivery,
+                                adoption: decode(wire.adoption, None)?,
+                                memo: decode(wire.memo, None)?,
+                            };
+                            (!live.is_empty()).then(|| Box::new(live))
+                        },
                     };
                     let mut file = file;
                     if file.live.as_deref().is_some_and(FileLive::is_empty) {
@@ -2090,12 +2137,15 @@ impl Custody {
                     let mut telemetry = TelemetryCustody {
                         current,
                         memo: decode(wire.memo, None)?,
-                        live: Some(Box::new(TelemetryLive {
-                            seen_r,
-                            trace: decode(wire.trace, None)?,
-                            delivery,
-                            adoption: decode(wire.adoption, None)?,
-                        })),
+                        live: {
+                            let live = TelemetryLive {
+                                seen_r,
+                                trace: decode(wire.trace, None)?,
+                                delivery,
+                                adoption: decode(wire.adoption, None)?,
+                            };
+                            (!live.is_empty()).then(|| Box::new(live))
+                        },
                     };
                     if telemetry
                         .live

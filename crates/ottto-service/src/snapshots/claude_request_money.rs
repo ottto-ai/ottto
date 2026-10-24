@@ -1263,7 +1263,7 @@ fn family_members(
 ) -> Option<FamilyMembers> {
     let mut member_keys = BTreeMap::<(String, String), Vec<String>>::new();
     let mut members = BTreeMap::<String, BTreeSet<String>>::new();
-    for key in index.files.keys() {
+    for key in index.files.keys().filter(|_| !roots.is_empty()) {
         if Instant::now() >= deadline {
             return None;
         }
@@ -1530,6 +1530,7 @@ async fn build_page_at(
     let by_fingerprint = index
         .files
         .iter()
+        .filter(|_| !snapshots.is_empty())
         .map(|(key, entry)| (entry.source_file_fingerprint.as_str(), key.as_str()))
         .collect::<BTreeMap<_, _>>();
     for item in snapshots {
@@ -2737,7 +2738,7 @@ fn prune_message_records(
             let current = index.claude_request_census.get(file).is_some_and(|file| {
                 file.money_revision() == record.money_revision() && file.retired().is_none()
             });
-            (key.clone(), current)
+            (key, current)
         })
         .collect::<Vec<_>>();
     let wrapped = due.len() < MESSAGE_PRUNE_PER_PAGE;
