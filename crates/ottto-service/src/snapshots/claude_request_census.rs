@@ -1115,14 +1115,16 @@ pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<Sc
     CensusRead::new(reader).decode()
 }
 
-pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+pub(super) fn normalized_bounded_bytes(bytes: &[u8]) -> anyhow::Result<(Vec<u8>, bool, bool)> {
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
     reader.read_to_end(&mut normalized)?;
-    let mut index = crate::snapshot_retry::decode_state(&normalized)?;
-    reader.invalidate_duplicates(&mut index);
-    Ok(index)
+    Ok((normalized, reader.duplicate_census, reader.duplicate_shadow))
+}
+
+pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
+    super::lenient_decode::read_bounded(bytes)
 }
 
 /// Derive positional slots from Serde's own field metadata rather than pinning
@@ -1155,6 +1157,11 @@ fn sequence_fields() -> (usize, usize) {
         let mut fields = None;
         let _ = ScanIndex::deserialize(Fields(&mut fields));
         let fields = fields.expect("derived ScanIndex field metadata");
+        assert_eq!(
+            fields,
+            super::lenient_decode::FIELDS,
+            "ScanIndex field registry drift"
+        );
         let slot = |name| {
             fields
                 .iter()
@@ -1166,6 +1173,15 @@ fn sequence_fields() -> (usize, usize) {
             slot("claude_request_census_shadow"),
         )
     })
+}
+
+// Explicit resource depth gate for optional evidence, shared with the original
+// input lexical gate. Above it evidence is unknown/null, never corruption.
+pub(super) const MAX_EVIDENCE_DEPTH: usize = 256;
+pub(super) fn validate_gated_syntax<R: std::io::Read>(reader: R) -> serde_json::Result<()> {
+    let mut reader = CensusRead::new(reader);
+    reader.syntax_only = true;
+    serde_json::from_reader::<_, serde::de::IgnoredAny>(std::io::BufReader::new(reader)).map(|_| ())
 }
 
 struct CensusRead<R> {
@@ -1186,6 +1202,7 @@ struct CensusRead<R> {
     shadow_key: bool,
     shadow_state: bool,
     capture: bool,
+    syntax_only: bool,
     #[cfg(test)]
     read_calls: usize,
     #[cfg(test)]
@@ -1212,6 +1229,7 @@ impl<R: std::io::Read> CensusRead<R> {
             shadow_key: false,
             shadow_state: false,
             capture: false,
+            syntax_only: false,
             #[cfg(test)]
             read_calls: 0,
             #[cfg(test)]
@@ -1309,7 +1327,10 @@ impl<R: std::io::Read> CensusRead<R> {
         let mut depth = 0_usize;
         let mut quoted = false;
         let mut escaped = false;
-        let mut overflow = false;
+        // Original admitted evidence was grammar-checked by the lexical
+        // boundary. The syntax-only pass substitutes null without buffering
+        // or interpreting census records, even before header controls run.
+        let mut overflow = self.syntax_only;
         while let Some(byte) = self.byte()? {
             if !quoted && depth == 0 && matches!(byte, b',' | b'}' | b']') {
                 self.replay = Some(byte);
@@ -1334,7 +1355,13 @@ impl<R: std::io::Read> CensusRead<R> {
             } else {
                 match byte {
                     b'"' => quoted = true,
-                    b'{' | b'[' => depth = depth.saturating_add(1),
+                    b'{' | b'[' => {
+                        depth = depth.saturating_add(1);
+                        if depth > MAX_EVIDENCE_DEPTH && !overflow {
+                            bytes = Vec::new();
+                            overflow = true;
+                        }
+                    }
                     b'}' | b']' => depth = depth.saturating_sub(1),
                     _ => {}
                 }
