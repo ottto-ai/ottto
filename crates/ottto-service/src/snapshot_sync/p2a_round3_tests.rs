@@ -178,11 +178,11 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 // No physical change or adoption remains: only this durable
                 // external-evidence obligation can select the file again.
                 money::store::with_ledger_for_test(&support, |ledger| {
-                    ledger.insert(dirty.clone(), crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt([9; 32], 0));
-                    let mut writer = money::store::WriterState::default();
-                    while ledger.dirty_shards() > 0 {
-                        money::store::save_page_for_test(&support, ledger, &mut writer).unwrap();
-                    }
+                    assert_eq!(ledger.insert(dirty.clone(), crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt([9; 32], 0)),
+                        crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored);
+                    // A due-only external-evidence obligation must cross the
+                    // real custody barrier before the re-offer/CAS experiment.
+                    assert!(money::store::checkpoint_for_test(&support, ledger));
                 }).unwrap();
             }
             let mut attempts = 0;
@@ -229,10 +229,25 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 let (preparation, index, scan) =
                     collect_native_preparation_with_rotation(frame, false);
                 assert!(index.request_money_live_revision());
-                assert!(
-                    !scan.snapshots.is_empty(),
-                    "actual selector must re-read the owed revision"
-                );
+                if ack_save_fault && cycle == 1 || ledger_fault && recovering {
+                    assert!(
+                        index.request_money_adoption_paused(),
+                        "uncertain ACK/custody recovery must retain the history pause"
+                    );
+                    assert!(
+                        scan.snapshots.iter().all(|item| {
+                            item.source_file_fingerprint
+                                .as_deref()
+                                .is_some_and(|fingerprint| {
+                                    index.claude_history_emission_held(fingerprint).is_some()
+                                })
+                        }),
+                        "local recovery parses must remain vetoed at emission"
+                    );
+                } else {
+                    assert!(!scan.snapshots.is_empty(),
+                        "admitted selector must re-read the owed revision: {outcome:?}, conflict={conflict}, ledger_fault={ledger_fault}, ack_save_fault={ack_save_fault}, cycle={cycle}");
+                }
                 let progress_path = preparation.upload_progress_path.clone();
                 retained_progress = Some(progress_path.clone());
                 if ack_save_fault && cycle == 0 {
