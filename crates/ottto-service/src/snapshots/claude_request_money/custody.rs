@@ -793,10 +793,12 @@ impl Custody {
                 nearest.push(BorrowedMessage(path, slot.value.view()));
             }
         }
-        nearest
-            .into_sorted_vec()
-            .into_iter()
-            .map(|item| (format!("mh:{}", item.0), item.1))
+        nearest.into_sorted_vec().into_iter().map(|item| {
+            let mut key = String::with_capacity(3 + item.0.len());
+            key.push_str("mh:");
+            key.push_str(item.0);
+            (key, item.1)
+        })
     }
     pub(super) fn offer_count_for(&self, owner: &str) -> usize {
         if let Some(root) = owner.strip_prefix("synthetic:") {
