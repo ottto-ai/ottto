@@ -3274,6 +3274,40 @@ pub(crate) fn has_offer(support: &Path, key: &str) -> bool {
     store::has_offer(support, key)
 }
 
+pub(crate) fn recovery_offer(support: &Path, key: &str, fp: &str) -> Option<RecoveryOffer> {
+    store::recovery_offer(support, key, fp)
+}
+
+pub(crate) fn recovery_offer_covers_debt(
+    index: &ScanIndex,
+    item: &SnapshotItem,
+    offers: &BTreeMap<String, RecoveryOffer>,
+) -> bool {
+    let Some(support) = index.active_request_money_support_dir.as_deref() else {
+        return false;
+    };
+    let mut found = false;
+    for (key, entry) in &index.files {
+        let contributes = item.source_file_fingerprint.as_deref()
+            == Some(entry.source_file_fingerprint.as_str())
+            || index.claude_money_files.get(key).is_some_and(|selection| {
+                selection.revision == entry.source_file_fingerprint
+                    && selection.root == family_root(item)
+                    && selection.member == item.source_session_id
+            });
+        if contributes {
+            found = true;
+            if !offers
+                .get(key)
+                .is_some_and(|offer| store::recovery_debt_is_covered(support, key, *offer))
+            {
+                return false;
+            }
+        }
+    }
+    found
+}
+
 /// Evidence rebuilding is independent of adoption. It schedules an opened
 /// read for older saved witness revisions while literal offers remain closed.
 pub(crate) fn money_rebuild_due(support_dir: &Path, index_key: &str) -> bool {
@@ -3582,12 +3616,14 @@ pub(crate) fn prepare_money_offers_receipt(
     prepare_money_offers_receipt_with_recovery(support_dir, index, snapshots, held, &|_, _| None)
 }
 
+/// `recovered` supplies only an immutable attempt's validated, durably saved
+/// exact-body ACK bounds. It must never reconstruct a newer offer as proof.
 pub(crate) fn prepare_money_offers_receipt_with_recovery(
     support_dir: &Path,
     index: &ScanIndex,
     snapshots: &[SnapshotItem],
     held: &BTreeSet<String>,
-    _recovered: &dyn Fn(&str, &SnapshotItem) -> Option<RecoveryOffer>,
+    recovered: &dyn Fn(&str, &SnapshotItem) -> Option<RecoveryOffer>,
 ) -> MoneyReceipt {
     if !request_owned_live(support_dir) {
         return MoneyReceipt::Ready;
@@ -3700,6 +3736,38 @@ pub(crate) fn prepare_money_offers_receipt_with_recovery(
                 return MoneyReceipt::Refused;
             }
         } else if item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT) {
+            if let Some(original) = recovered(key, item) {
+                // A saved replay ACK covers only its original debt/time. Never
+                // move this binding to the handoff tick or certify newer debt.
+                if !store::recovery_debt_is_covered_in(&ledger, key, original) {
+                    return MoneyReceipt::Refused;
+                }
+                let offer = format!(
+                    "{}:{}",
+                    store::money_key("offer:", key),
+                    item.snapshot_fingerprint
+                );
+                if ledger.get(&offer).is_some_and(|old| {
+                    old.money_revision() == original.0 && old.window() == original.1
+                }) {
+                    continue;
+                }
+                let new_offer = ledger.get(&offer).is_none();
+                if new_offer
+                    && (offer_count >= MAX_MONEY_OFFERS_PER_CONTEXT
+                        || ledger.census().offer_count_for(key) >= MAX_MONEY_OFFERS_PER_FILE)
+                {
+                    return MoneyReceipt::Refused;
+                }
+                if !ledger.put_money(
+                    offer,
+                    ClaudeRequestCensusRecord::money_debt(original.0, original.1),
+                ) {
+                    return MoneyReceipt::Refused;
+                }
+                offer_count += usize::from(new_offer);
+                continue;
+            }
             let dirty = store::money_key("dirty:", key);
             let revision = ledger
                 .get(&dirty)

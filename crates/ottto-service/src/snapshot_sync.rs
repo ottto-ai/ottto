@@ -6637,14 +6637,81 @@ async fn finish_sync_source_resume(
     // consumers above, then remove only authority-demoting revisions at the
     // network boundary. They are not backend poison and are not counted as
     // accepted/quarantined upload settlement.
+    let mut recovered_money_offers = Vec::new();
     if source == SnapshotSource::ClaudeCode {
         let reoffers = crate::snapshots::claude_request_money::scheduled_reoffers(
             &index,
             &scan_result.snapshots,
         );
+        // Due debt normally invalidates older upload proof. A durable replay
+        // ACK can finish only its original exact offer, revision and time;
+        // preserve that proof without rebinding it to a later obligation.
+        let recovery_binding = (source_money_resume(source, support_dir)
+            && recovery_prepared
+            && retained_bodies.is_some_and(|bodies| !bodies.is_empty()))
+        .then(|| {
+            unknown_recovery::binding(
+                &upload_destination_namespace,
+                client.recovery_origin(),
+                machine_id,
+                "",
+            )
+        });
+        if let Some(binding) = recovery_binding.as_deref() {
+            for item in &scan_result.snapshots {
+                if !reoffers.contains(&item.snapshot_fingerprint)
+                    || !upload_progress
+                        .accepted_fingerprints
+                        .contains(&item.snapshot_fingerprint)
+                {
+                    continue;
+                }
+                let Some(scratch) =
+                    crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)
+                else {
+                    continue;
+                };
+                let Some(_scratch) =
+                    crate::snapshots::claude_request_money::ShadowReservation::admit(scratch)
+                else {
+                    continue;
+                };
+                let witness = snapshot_upload_body_witness(item);
+                if upload_progress
+                    .accepted_body_witnesses
+                    .get(&item.snapshot_fingerprint)
+                    != Some(&witness)
+                {
+                    continue;
+                }
+                if let Some((offers, funds)) = unknown_recovery::saved_money_offers(
+                    support_dir,
+                    &index,
+                    item,
+                    &witness,
+                    binding,
+                    money_policy.expect("prepared recovery policy"),
+                )? {
+                    if crate::snapshots::claude_request_money::recovery_offer_covers_debt(
+                        &index, item, &offers,
+                    ) {
+                        recovered_money_offers.push((
+                            item.snapshot_fingerprint.clone(),
+                            offers,
+                            funds,
+                        ));
+                    }
+                }
+            }
+        }
         for fp in &reoffers {
-            upload_progress.accepted_fingerprints.remove(fp);
-            upload_progress.accepted_body_witnesses.remove(fp);
+            if !recovered_money_offers
+                .iter()
+                .any(|(recovered, _, _)| recovered == fp)
+            {
+                upload_progress.accepted_fingerprints.remove(fp);
+                upload_progress.accepted_body_witnesses.remove(fp);
+            }
         }
         if !reoffers.is_empty() {
             upload_progress.save(&upload_progress_path)?;
@@ -6663,12 +6730,29 @@ async fn finish_sync_source_resume(
     }
     if source_money_resume(source, support_dir) {
         money_resume::until(|| {
-            crate::snapshots::claude_request_money::prepare_money_offers_receipt(
-                support_dir,
-                &index,
-                &scan_result.snapshots,
-                &claude_authority_disposition.quarantined_source_session_ids_for_money(),
-            )
+            let held = claude_authority_disposition.quarantined_source_session_ids_for_money();
+            if recovered_money_offers.is_empty() {
+                crate::snapshots::claude_request_money::prepare_money_offers_receipt(
+                    support_dir,
+                    &index,
+                    &scan_result.snapshots,
+                    &held,
+                )
+            } else {
+                crate::snapshots::claude_request_money::prepare_money_offers_receipt_with_recovery(
+                    support_dir,
+                    &index,
+                    &scan_result.snapshots,
+                    &held,
+                    &|key, item| {
+                        recovered_money_offers
+                            .iter()
+                            .find(|(fp, _, _)| fp == &item.snapshot_fingerprint)
+                            .and_then(|(_, offers, _)| offers.get(key))
+                            .copied()
+                    },
+                )
+            }
         })
         .await?;
         money_resume::until(|| {

@@ -28,6 +28,8 @@ pub(super) struct FileSelection {
     group: Option<String>,
     body: Option<String>,
     revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) offer: Option<money::RecoveryOffer>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -330,6 +332,7 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
                 || e.files.len() != e.file_selections.len()
                 || e.file_selections.iter().any(|selection| {
                     !matches!(selection.revision, 2 | 3)
+                        || selection.offer.is_some_and(|(_, at)| at > m.created)
                         || selection.group.as_ref().is_some_and(|s| !valid_digest(s))
                         || selection.body.as_ref().is_some_and(|s| !valid_digest(s))
                 })
@@ -976,6 +979,95 @@ pub(super) fn retained_progress_bodies(
     Ok((bodies, funds))
 }
 
+/// A durable body ACK may finish its original money offer without another
+/// POST. Keep the immutable authorization bounds, even if ordinary selected
+/// rollback has pruned the disposable offer carrier.
+pub(super) fn saved_money_offers(
+    support: &Path,
+    index: &ScanIndex,
+    item: &SnapshotItem,
+    witness: &str,
+    binding: &str,
+    policy: [u8; 32],
+) -> Result<
+    Option<(
+        BTreeMap<String, money::RecoveryOffer>,
+        money::ShadowReservation,
+    )>,
+> {
+    let catalogs = CATALOGS.lock().map_err(|_| fault())?;
+    let catalog = catalogs.get(support).ok_or_else(fault)?;
+    let entities = || {
+        catalog
+            .entries
+            .iter()
+            .filter(|m| {
+                m.ack_saved
+                    && m.terminal.is_none()
+                    && m.binding == binding
+                    && m.context == index.recovery_upload_context()
+                    && m.policy == policy
+            })
+            .flat_map(|m| &m.entities)
+            .filter(|e| {
+                e.session == item.source_session_id
+                    && e.fingerprint == item.snapshot_fingerprint
+                    && e.witness == witness
+                    && e.source_fingerprint == item.source_file_fingerprint
+            })
+    };
+    let mut charge = 0_usize;
+    for entity in entities() {
+        for ((key, revision), selection) in entity
+            .files
+            .iter()
+            .zip(&entity.file_revisions)
+            .zip(&entity.file_selections)
+        {
+            if selection.offer.is_some()
+                && index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| &entry.source_file_fingerprint == revision)
+            {
+                charge = charge.saturating_add(key.len()).saturating_add(1024);
+            }
+        }
+    }
+    if charge == 0 {
+        return Ok(None);
+    }
+    let Some(funds) = money::ShadowReservation::admit(charge.saturating_add(4096)) else {
+        return Ok(None);
+    };
+    let mut offers = BTreeMap::<String, money::RecoveryOffer>::new();
+    for entity in entities() {
+        for ((key, revision), selection) in entity
+            .files
+            .iter()
+            .zip(&entity.file_revisions)
+            .zip(&entity.file_selections)
+        {
+            if let Some(offer) = selection.offer.filter(|_| {
+                index
+                    .files
+                    .get(key)
+                    .is_some_and(|entry| &entry.source_file_fingerprint == revision)
+            }) {
+                offers
+                    .entry(key.clone())
+                    .and_modify(|old| {
+                        if offer.1 > old.1 {
+                            *old = offer;
+                        }
+                    })
+                    .or_insert(offer);
+            }
+        }
+    }
+    Ok(Some((offers, funds)))
+}
+
 pub(super) fn capture_ticket(
     support: &Path,
     m: Manifest,
@@ -1239,6 +1331,7 @@ pub(super) fn manifest(
                 } else {
                     effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
                 },
+                offer: money::recovery_offer(support, key, &item.snapshot_fingerprint),
             });
         }
         lineage.update((item.source_session_id.len() as u64).to_be_bytes());
@@ -1881,6 +1974,7 @@ mod tests {
                         group: Some("56".repeat(32)),
                         body: Some("78".repeat(32)),
                         revision: 3,
+                        offer: None,
                     }],
                     source_fingerprint: Some("34".repeat(32)),
                     literal: true,

@@ -3025,6 +3025,91 @@ fn p2a_unknown_late_revision_deny_contract_releases_without_post_charge() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for newer_revision in [false, true] {
+        let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        {
+            let _clock = money::PageClockForTest::new(&control.support, now);
+            control.cycle_deferred();
+        }
+        let original = unknown_recovery::active_for_test(&control.support)
+            .pop()
+            .unwrap();
+        let (entity, key, offer) = original
+            .entities
+            .iter()
+            .find_map(|entity| {
+                entity
+                    .files
+                    .iter()
+                    .zip(&entity.file_selections)
+                    .find_map(|(key, selection)| {
+                        selection.offer.map(|offer| (entity, key.clone(), offer))
+                    })
+            })
+            .expect("the original transcript-backed literal must retain its durable offer binding");
+        assert_eq!(key, control.transcript().to_string_lossy().into_owned());
+        assert!(entity.literal);
+        *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+        {
+            let _clock = money::PageClockForTest::new(&control.support, now + 300);
+            control.cycle();
+        }
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+        let mut revision = offer.0;
+        if newer_revision {
+            revision[0] ^= 1;
+        }
+        money::store::with_ledger_for_test(&control.support, |ledger| {
+            for prefix in ["dirty:", "due:"] {
+                let debt = format!("{prefix}{:x}", Sha256::digest(key.as_bytes()));
+                assert_eq!(ledger.insert(debt,
+                    crate::snapshots::claude_request_census::ClaudeRequestCensusRecord::money_debt(revision, now + 301)),
+                    crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored);
+            }
+            assert!(money::store::checkpoint_for_test(&control.support, ledger));
+        }).unwrap();
+        let support = control.support.clone();
+        let pending_key = key.clone();
+        *control.server.post_hook.lock().unwrap() = Some(Box::new(move || {
+            assert!(
+                money::money_due(&support, &pending_key, u64::MAX),
+                "the older ACK cannot retire the later obligation before its actual POST"
+            );
+        }));
+        {
+            let _clock = money::PageClockForTest::new(&control.support, now + 301);
+            control.cycle();
+        }
+        let offers = control.offers();
+        assert_eq!(
+            offers.len(),
+            3,
+            "a later revision or scheduling window requires its own offer"
+        );
+        assert!(
+            offers
+                .iter()
+                .all(|item| item["snapshot_fingerprint"].as_str()
+                    == Some(entity.fingerprint.as_str()))
+        );
+        assert!(!money::money_due(&control.support, &key, u64::MAX));
+    }
+    eprintln!("MONEY_UNKNOWN_REOFFER_BOUND newer_revision_requires_post=true later_window_requires_post=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {

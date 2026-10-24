@@ -1717,6 +1717,49 @@ pub(super) fn has_offer(support: &Path, key: &str) -> bool {
     ledger.census.offer_count_for(key) > 0
 }
 
+pub(super) fn recovery_offer(
+    support: &Path,
+    key: &str,
+    fingerprint: &str,
+) -> Option<super::RecoveryOffer> {
+    let ledgers = LEDGERS.lock().ok()?;
+    let Slot::Ready(ledger) = ledgers.get(support)? else {
+        return None;
+    };
+    if ledger.recovering() {
+        return None;
+    }
+    let offer = ledger.get(&format!("{}:{fingerprint}", money_key("offer:", key)))?;
+    Some((offer.money_revision(), offer.window()))
+}
+
+pub(super) fn recovery_debt_is_covered_in(
+    ledger: &ClaudeLedger,
+    key: &str,
+    (revision, offered_at): super::RecoveryOffer,
+) -> bool {
+    !ledger.recovering()
+        && ["dirty:", "due:"].iter().all(|prefix| {
+            ledger.get(&money_key(prefix, key)).map_or(true, |debt| {
+                debt.money_revision() == revision && debt.window() <= offered_at
+            })
+        })
+}
+
+pub(super) fn recovery_debt_is_covered(
+    support: &Path,
+    key: &str,
+    offer: super::RecoveryOffer,
+) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support) else {
+        return false;
+    };
+    recovery_debt_is_covered_in(ledger, key, offer)
+}
+
 #[cfg(test)]
 pub(super) fn checkpoint_pending(support_dir: &Path) -> bool {
     let Ok(ledgers) = LEDGERS.lock() else {
