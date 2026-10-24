@@ -2545,7 +2545,8 @@ fn claude_backfill_index_load_preserves_other_sources_and_existing_indexes() {
     fs::create_dir_all(marker.parent().unwrap()).unwrap();
     fs::write(marker, "").unwrap();
     for source in [SnapshotSource::Codex, SnapshotSource::Pi] {
-        let path = home.join("other-index.json");
+        // Production sources own separate checkpoints and rebuild budgets.
+        let path = home.join(format!("other-{}-index.json", source.api_slug()));
         ScanIndex::load_for_snapshot_source(&path, source, &home).unwrap();
         assert!(!claude_reemission_stop_latched());
         fs::write(&path, "{truncated").unwrap();
