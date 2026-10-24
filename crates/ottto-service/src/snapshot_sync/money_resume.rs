@@ -28,6 +28,14 @@ struct PendingFinish {
     client: SnapshotApiClient,
     owner: std::sync::Weak<Mutex<crate::DaemonState>>,
 }
+impl Drop for PendingFinish {
+    fn drop(&mut self) {
+        // A queued writer may have committed a send intent/counter after the
+        // last poll. The next owner must reload it rather than reuse a stale
+        // catalog and rearm a consumed physical slot.
+        super::unknown_recovery::invalidate(&self.support_dir);
+    }
+}
 static PENDING: Mutex<Option<PendingFinish>> = Mutex::new(None);
 
 // Cancellation is scoped to the daemon that owns the parked graph. Other

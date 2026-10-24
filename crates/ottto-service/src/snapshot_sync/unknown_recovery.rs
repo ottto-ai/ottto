@@ -361,6 +361,16 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
     }
     Ok(entries)
 }
+fn unwritten_receipts(root: &Path, active: &[Manifest]) -> usize {
+    active
+        .iter()
+        .filter(|m| {
+            m.receipt_slot.map_or(true, |slot| {
+                !root.join(format!("receipt-{slot:04}.receipt")).exists()
+            })
+        })
+        .count()
+}
 fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
     let mut count = 0;
     let mut bytes = 0;
@@ -371,7 +381,7 @@ fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
         }
         let encoded = read_capped(&file, 1024)?;
         let receipt: Receipt = serde_json::from_slice(&encoded)?;
-        if now / 86400 > receipt.time_day.saturating_add(RECEIPT_TTL / 86400) {
+        if now / 86400 >= receipt.time_day.saturating_add(RECEIPT_TTL / 86400) {
             fs::remove_file(file)?;
         } else {
             count += 1;
@@ -388,7 +398,8 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     let root = dir(&support);
     private_dir(&root)?;
     sync_dir(&support)?;
-    prune_receipts(&root, m.created, load(&root)?.len() + 1)?;
+    let active = load(&root)?;
+    prune_receipts(&root, m.created, unwritten_receipts(&root, &active) + 1)?;
     if load(&root)?.len() >= ACTIVE_MAX || body.len() > BODY_MAX {
         return Err(fault());
     }
@@ -413,7 +424,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
 fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Result<()> {
     let root = dir(&support);
     let active = load(&root)?;
-    prune_receipts(&root, now, active.len())?;
+    prune_receipts(&root, now, unwritten_receipts(&root, &active))?;
     let receipt = Receipt {
         outcome: if reason == Reason::Resolved {
             "resolved"
@@ -857,6 +868,20 @@ pub(super) fn error_transition(error: &anyhow::Error, now: u64) -> (Option<Reaso
         // Auth failures, transport errors and invalid/incomplete ACKs carry no
         // evidence of the original POST's outcome. They spend the same slots.
         _ => (None, now),
+    }
+}
+
+pub(super) fn invalidate(support: &Path) {
+    if let Ok(mut catalogs) = CATALOGS.lock() {
+        // An actual custody fault stays closed; dropping its future is not a
+        // successful repair or permission to forget a lost Retry-After write.
+        if catalogs.get(support).is_some_and(|c| c.fault) {
+            return;
+        }
+        catalogs.remove(support);
+    }
+    if let Ok(mut outcomes) = OUTCOMES.lock() {
+        outcomes.remove(support);
     }
 }
 
@@ -1441,11 +1466,10 @@ impl Drop for TestGuard {
 }
 #[cfg(test)]
 pub(super) fn active_for_test(support: &Path) -> Vec<Manifest> {
-    CATALOGS
-        .lock()
-        .unwrap()
-        .get(support)
-        .map_or_else(Vec::new, |c| c.entries.clone())
+    // Inspect durable state, including queued writes whose owner completed or
+    // was cancelled. Never make a fixture's in-memory cache the proof.
+    store::flush();
+    load(&dir(support)).unwrap()
 }
 
 #[cfg(test)]
@@ -1610,6 +1634,44 @@ mod tests {
         .is_err());
         eprintln!("MONEY_UNKNOWN_CUSTODY exact_replay=true replays=3 restart_counter=true terminal_allowlist=true private_files=true");
     }
+    #[test]
+    fn colliding_diagnostic_hashes_keep_distinct_private_receipt_reservations() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-unknown-hash8-collision");
+        let (first, body) = specimen(1000);
+        let mut second = first.clone();
+        second.id = format!("{}{}", &first.id[..8], "56".repeat(28));
+        let first = capture(scratch.to_path_buf(), first, &body).unwrap();
+        let second = capture(scratch.to_path_buf(), second, &body).unwrap();
+        terminal(
+            scratch.to_path_buf(),
+            first,
+            Reason::Expired,
+            1000 + DEADLINE,
+        )
+        .unwrap();
+        terminal(
+            scratch.to_path_buf(),
+            second,
+            Reason::Expired,
+            1000 + DEADLINE,
+        )
+        .unwrap();
+        let root = dir(&scratch);
+        let receipts = [0, 1].map(|slot| {
+            serde_json::from_slice::<Receipt>(
+                &fs::read(root.join(format!("receipt-{slot:04}.receipt"))).unwrap(),
+            )
+            .unwrap()
+        });
+        assert_eq!(receipts[0].hash8, receipts[1].hash8);
+        assert_eq!(receipts[0].outcome, "unknown_outcome_unresolved");
+        assert_eq!(receipts[1].outcome, "unknown_outcome_unresolved");
+        assert!(load(&root).unwrap().is_empty());
+        prune_receipts(&root, (receipts[0].time_day + 35) * 86400, 0).unwrap();
+        assert!(!root.join("receipt-0000.receipt").exists());
+        assert!(!root.join("receipt-0001.receipt").exists());
+    }
+
     #[test]
     fn custody_caps_include_stale_temps_and_corruption_never_reconstructs() {
         let scratch = crate::test_scratch::ScratchDir::new("money-unknown-caps");
