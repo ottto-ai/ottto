@@ -478,6 +478,8 @@ pub(crate) fn seed_shadow_off(support_dir: &Path) {
 /// complete.
 fn shadow_off(support_dir: &Path, now: u64) -> bool {
     let scope = shadow_scope(support_dir);
+    #[cfg(test)]
+    sleep_for_test(&KILL_SWITCH_DELAY_FOR_TEST);
     let off = SHADOW_PANICKED.load(Ordering::Acquire) || support_dir.join(SHADOW_OFF_FILE).exists();
     let day = day_stamp(now).unwrap_or_default();
     let first_today = SHADOW_OFF.lock().is_ok_and(|mut scopes| {
@@ -809,8 +811,14 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) undecided_unbuilt_older: u64,
     /// Time under the sync lock, every phase included but this line's write.
     pub(crate) elapsed_us: u64,
-    /// The page's charged money time: `capture_us + elapsed_us`.
+    /// The page's charged money time: capture plus shadow entry to the end
+    /// of the page, including this line's serialization and write and the
+    /// drop of the page's locals and ledger guard. Known only after the line
+    /// is written, so it is not in it (see `previous_page_money_us`).
+    #[serde(skip)]
     pub(crate) money_us: u64,
+    /// `money_us` of this scope's previous complete page (0 for none).
+    pub(crate) previous_page_money_us: u64,
 }
 
 impl ClaudeRequestMoneyShadowCounts {
@@ -1086,6 +1094,30 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+// Slow money-only steps outside the shadow body (a kill-switch lookup on a
+// slow filesystem, a blocked log sink), on the test's own thread.
+#[cfg(test)]
+thread_local! {
+    static KILL_SWITCH_DELAY_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+    static LOG_WRITE_DELAY_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
+}
+
+#[cfg(test)]
+fn sleep_for_test(delay: &'static std::thread::LocalKey<std::cell::Cell<Duration>>) {
+    let delay = delay.with(std::cell::Cell::get);
+    if !delay.is_zero() {
+        std::thread::sleep(delay);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn set_money_step_delays_for_test(kill_switch: Duration, log_write: Duration) {
+    KILL_SWITCH_DELAY_FOR_TEST.with(|delay| delay.set(kill_switch));
+    LOG_WRITE_DELAY_FOR_TEST.with(|delay| delay.set(log_write));
+}
+
 #[cfg(test)]
 pub(crate) fn take_shadow_lines_for_test() -> Vec<serde_json::Value> {
     SHADOW_LINES.with(|lines| std::mem::take(&mut *lines.borrow_mut()))
@@ -1101,7 +1133,10 @@ fn emit_line(line: &ShadowLine<'_>) {
             lines.borrow_mut().push(value);
         }
     });
-    // A log sink failure must not change collection.
+    #[cfg(test)]
+    sleep_for_test(&LOG_WRITE_DELAY_FOR_TEST);
+    // A log sink failure must not change collection. A blocking sink is
+    // money time: the page's `money_us` is taken after this write.
     let _ = writeln!(
         std::io::stderr().lock(),
         "local snapshot sync: claude request money shadow {json}"
@@ -1140,8 +1175,15 @@ pub(crate) fn shadow_page(
     census_complete: bool,
     coverage: &dyn FamilyCoverage,
 ) {
+    // The page's money clock starts here: the kill-switch check and every
+    // later shadow step are money time, never a native gap.
+    let entered = Instant::now();
     let now = now_unix();
-    if !shadow_enabled(support_dir) || shadow_off(support_dir, now) {
+    if !shadow_enabled(support_dir) {
+        return;
+    }
+    if shadow_off(support_dir, now) {
+        capture::charge_since(&shadow_scope(support_dir), entered);
         return;
     }
     guarded(|| {
@@ -1154,6 +1196,7 @@ pub(crate) fn shadow_page(
             coverage,
             census_complete,
             now,
+            entered,
         );
     });
 }
@@ -1305,9 +1348,15 @@ pub(crate) fn shadow_page_ready_for_test(
         &coverage,
         census_complete,
         now,
+        Instant::now(),
     )
 }
 
+/// The page from shadow entry to its very end: `money_us` is taken after the
+/// body returned, so it includes the log line's serialization and write and
+/// the drop of every page local and the ledger guard. The line itself
+/// cannot carry that total; the scope's next line reports it as
+/// `previous_page_money_us`.
 #[allow(clippy::too_many_arguments)]
 fn shadow_page_with_coverage(
     support_dir: &Path,
@@ -1318,8 +1367,43 @@ fn shadow_page_with_coverage(
     coverage_view: &dyn FamilyCoverage,
     census_complete: bool,
     now: u64,
+    entered: Instant,
 ) -> ClaudeRequestMoneyShadowCounts {
-    let started = Instant::now();
+    let mut counts = shadow_page_body(
+        support_dir,
+        snapshots,
+        index,
+        api_report,
+        trace_report,
+        coverage_view,
+        census_complete,
+        now,
+        entered,
+    );
+    counts.money_us = counts
+        .capture_us
+        .saturating_add(entered.elapsed().as_micros() as u64);
+    if let Ok(mut pages) = PAGE_MONEY_US.lock() {
+        pages.insert(support_dir.to_path_buf(), counts.money_us);
+    }
+    counts
+}
+
+/// Each scope's last complete page money time, for its next line.
+static PAGE_MONEY_US: Mutex<BTreeMap<PathBuf, u64>> = Mutex::new(BTreeMap::new());
+
+#[allow(clippy::too_many_arguments)]
+fn shadow_page_body(
+    support_dir: &Path,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+    api_report: &ClaudeLocalOtelLoadReport,
+    trace_report: &ClaudeTraceOwnershipLoadReport,
+    coverage_view: &dyn FamilyCoverage,
+    census_complete: bool,
+    now: u64,
+    started: Instant,
+) -> ClaudeRequestMoneyShadowCounts {
     let scope_key = shadow_scope(support_dir);
     // `clock.deadline` is `started` plus the money budget capture left, so
     // these are the same offsets in money time: optional work stops at
@@ -2849,8 +2933,12 @@ fn emit(
             state
         }
     };
+    counts.previous_page_money_us = PAGE_MONEY_US
+        .lock()
+        .ok()
+        .and_then(|mut pages| pages.remove(end.support_dir))
+        .unwrap_or(0);
     counts.elapsed_us = end.started.elapsed().as_micros() as u64;
-    counts.money_us = counts.capture_us.saturating_add(counts.elapsed_us);
     emit_line(&ShadowLine {
         counting: CLAUDE_REQUEST_COUNTING,
         census_complete: end.census_complete,

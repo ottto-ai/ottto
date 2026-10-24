@@ -235,6 +235,13 @@ impl Drop for MoneyTimer {
     }
 }
 
+/// Charge money work that ran outside a capture section since `started`
+/// (an off page's kill-switch check, purge and false-row handoff) to the
+/// scope's money clock.
+pub(super) fn charge_since(scope: &Path, started: Instant) {
+    drop(MoneyTimer::new(scope, started));
+}
+
 pub(super) struct PageClock {
     /// `shadow_started` plus what is left of the page's money budget after
     /// capture: the shadow and closing are one contiguous wall interval.
@@ -754,12 +761,16 @@ impl ClaudeResponseCapture {
     /// Hand the finished capture to the store under the parse's index key
     /// and fingerprint (replacing any earlier one). After the panic latch
     /// the capture is dropped instead (its funds are refunded).
-    pub(crate) fn deposit(self, index_key: String, fingerprint: String) {
+    /// The store key and fingerprint are built here, inside the money timer:
+    /// they are money-only work.
+    pub(crate) fn deposit(self, path: &Path, fingerprint: &str) {
         let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if super::SHADOW_PANICKED.load(Ordering::Acquire) || !spend_work(&self.scope, 0, 0) {
             return;
         }
-        super::guarded(move || self.keep(index_key, fingerprint));
+        super::guarded(move || {
+            self.keep(super::super::local_index_key(path), fingerprint.to_owned())
+        });
     }
 
     fn keep(mut self, index_key: String, fingerprint: String) {

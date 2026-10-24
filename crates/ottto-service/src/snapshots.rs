@@ -28293,7 +28293,7 @@ impl OwnedJsonlParser {
             let mut capture = claude_request_money::ClaudeResponseCapture::begin(path);
             accumulator.finalize_claude_responses_captured(capture.as_mut());
             if let Some(capture) = capture {
-                capture.deposit(local_index_key(path), source_file_fingerprint.clone());
+                capture.deposit(path, &source_file_fingerprint);
             }
             if let Some(metadata) = claude_title_metadata {
                 accumulator.apply_claude_title_metadata(path, metadata);
@@ -31435,7 +31435,7 @@ pub(crate) fn prepare_money_finalizers_for_test(
             let mut capture = claude_request_money::ClaudeResponseCapture::begin(&path);
             accumulator.finalize_claude_responses_captured(capture.as_mut());
             if let Some(capture) = capture {
-                capture.deposit(local_index_key(&path), fingerprint);
+                capture.deposit(&path, &fingerprint);
             }
         }
     }

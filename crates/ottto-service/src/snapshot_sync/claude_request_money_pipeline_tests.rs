@@ -1620,6 +1620,66 @@ fn money_p1b_slow_native_scan_page_is_admitted_and_builds() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
+/// MONEY round 2: money-only steps outside the shadow body are charged. A
+/// slow kill-switch lookup (it ran before the page clock started) and a
+/// blocked log write (it ran after `money_us` was frozen) both land in the
+/// page's money time, and an off page charges its check to the scope clock.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
+    const KILL_SWITCH: std::time::Duration = std::time::Duration::from_millis(60);
+    const LOG_WRITE: std::time::Duration = std::time::Duration::from_millis(40);
+    let (fixture, index, scan) = money_armed_scan("money-p1b-steps-outside-body");
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    let _ = money::take_shadow_lines_for_test();
+    let page = || {
+        money::shadow_page(&fixture.support, &scan.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), scan.census_complete,
+            &money::coverage::InterimFamilyCoverage::default());
+    };
+    money::set_money_step_delays_for_test(KILL_SWITCH, LOG_WRITE);
+    let started = std::time::Instant::now();
+    page();
+    let first_wall = started.elapsed();
+    money::set_money_step_delays_for_test(std::time::Duration::ZERO, std::time::Duration::ZERO);
+    money::store::flush();
+    page();
+    money::store::flush();
+    let lines = money::take_shadow_lines_for_test();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    let (first, second) = (&lines[0]["counts"], &lines[1]["counts"]);
+    let first_capture = first["capture_us"].as_u64().unwrap();
+    let first_elapsed = first["elapsed_us"].as_u64().unwrap();
+    assert!(first_elapsed >= KILL_SWITCH.as_micros() as u64, "the kill-switch lookup is inside the page clock: {first}");
+    assert!(first.get("money_us").is_none(), "a line cannot carry its own write time: {first}");
+    let previous = second["previous_page_money_us"].as_u64().unwrap();
+    assert!(previous >= first_capture + first_elapsed + LOG_WRITE.as_micros() as u64,
+        "the blocked log write and the page's drops are charged: previous={previous} first={first}");
+    assert!(u128::from(previous) <= u128::from(first_capture) + first_wall.as_micros(), "previous={previous} wall={first_wall:?}");
+    println!("MONEY_P1B_OUTSIDE_BODY kill_switch_delay_us={} log_write_delay_us={} first_capture_us={first_capture} first_elapsed_us={first_elapsed} first_money_us={previous} first_wall_us={}",
+        KILL_SWITCH.as_micros(), LOG_WRITE.as_micros(), first_wall.as_micros());
+    // An off page has no line: its kill-switch check, purge and handoff are
+    // charged to the scope's money clock.
+    let off = fixture.support.join("claude-request-money-shadow.off");
+    std::fs::write(&off, b"").unwrap();
+    money::capture::begin_page(&fixture.support);
+    money::set_money_step_delays_for_test(KILL_SWITCH, std::time::Duration::ZERO);
+    page();
+    money::set_money_step_delays_for_test(std::time::Duration::ZERO, std::time::Duration::ZERO);
+    money::store::flush();
+    assert!(money::take_shadow_lines_for_test().is_empty());
+    let (_, _, off_us) = money::capture::work_for_test(&fixture.support);
+    assert!(off_us >= KILL_SWITCH.as_micros() as u64, "off page money time is charged: {off_us}");
+    std::fs::remove_file(&off).unwrap();
+    page();
+    money::store::flush();
+    let _ = money::take_shadow_lines_for_test();
+    money::capture::purge_scope_for_test(&fixture.support);
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
 /// A dense day with no new evidence should spend one family version, not
 /// one version per page. Force optional expiry to exercise only deferred
 /// publication, independently of CI scheduling and changing capture turns.
