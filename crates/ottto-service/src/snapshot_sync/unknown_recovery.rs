@@ -852,7 +852,10 @@ pub(super) fn retained_progress_bodies(
         .sum::<usize>();
     // Funds cover this bounded map, the driver's copies and the current-index
     // identity set. No historical ACK map is cloned or added to this scope.
-    let funds = money::ShadowReservation::admit(count.saturating_mul(1024)).ok_or_else(fault)?;
+    let charge = count
+        .saturating_mul(1024)
+        .saturating_add(if count == 0 { 0 } else { 4096 });
+    let funds = money::ShadowReservation::admit(charge).ok_or_else(fault)?;
     let mut bodies = BTreeMap::new();
     for e in catalog.entries.iter().flat_map(|m| &m.entities) {
         if progress.accepted_body_witnesses.get(&e.fingerprint) == Some(&e.witness)
