@@ -1760,6 +1760,27 @@ pub(super) fn recovery_debt_is_covered(
     recovery_debt_is_covered_in(ledger, key, offer)
 }
 
+/// Selected-file proof must not discard an immutable offer binding while its
+/// matching original debt still awaits the ordinary money settlement step.
+pub(super) fn recovery_offer_debt_retired(
+    support: &Path,
+    key: &str,
+    (revision, offered_at): super::RecoveryOffer,
+) -> bool {
+    let Ok(ledgers) = LEDGERS.lock() else {
+        return false;
+    };
+    let Some(Slot::Ready(ledger)) = ledgers.get(support) else {
+        return false;
+    };
+    !ledger.recovering()
+        && ["dirty:", "due:"].iter().all(|prefix| {
+            ledger.get(&money_key(prefix, key)).map_or(true, |debt| {
+                debt.money_revision() != revision || debt.window() > offered_at
+            })
+        })
+}
+
 #[cfg(test)]
 pub(crate) fn recovery_debt_debug_for_test(support: &Path, key: &str) -> String {
     let ledgers = LEDGERS.lock().unwrap();

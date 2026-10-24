@@ -3278,6 +3278,10 @@ pub(crate) fn recovery_offer(support: &Path, key: &str, fp: &str) -> Option<Reco
     store::recovery_offer(support, key, fp)
 }
 
+pub(crate) fn recovery_offer_debt_retired(support: &Path, key: &str, offer: RecoveryOffer) -> bool {
+    store::recovery_offer_debt_retired(support, key, offer)
+}
+
 pub(crate) fn recovery_offer_covers_debt(
     index: &ScanIndex,
     item: &SnapshotItem,

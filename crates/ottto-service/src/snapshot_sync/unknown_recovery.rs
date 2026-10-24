@@ -1122,7 +1122,9 @@ pub(super) fn resolve_saved(
                             selection.group.as_deref(),
                             selection.body.as_deref(),
                             selection.revision,
-                        )
+                        ) && selection.offer.map_or(true, |offer| {
+                            money::recovery_offer_debt_retired(support, key, offer)
+                        })
                     })
                 || progress
                     .quarantined_fingerprints
@@ -1136,8 +1138,8 @@ pub(super) fn resolve_saved(
                     })
         });
         if m.terminal.is_none() && m.ack_saved && selected_outcomes {
-            // This in-memory mark is reached only AFTER ACK and selected saves.
-            // Startup commits the release latch and count-only terminal receipt.
+            // This mark follows ACK/selected saves and the original matching
+            // money debt handoff. Known outcomes need no unresolved receipt.
             m.terminal = Some(Reason::Resolved);
             m.not_before = now;
             let ticket = outcome_ticket(support, m.clone(), Some(Reason::Resolved), now)?;

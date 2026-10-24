@@ -7383,19 +7383,9 @@ async fn finish_sync_source_resume(
         snapshot_upload_error_class(e) == Some(SnapshotUploadErrorClass::LocalState)
     });
     let settle_saved_money = |saved: &ScanIndex| {
-        if source_money_resume(source, support_dir)
-            && recovery_ack_durable
-            && unknown_recovery::resolve_saved(
-                support_dir,
-                saved,
-                &upload_progress,
-                unknown_recovery::now(support_dir),
-            )
-            .is_err()
-        {
-            eprintln!("claude_request_money recovery_custody_fault=1");
-        }
-
+        // Queue the money checkpoint before any recovery retirement marker
+        // on their shared writer. Held local work can have a saved file tuple
+        // while its original offer/debt handoff still needs the next scan.
         if let Some((settled, bodies, _funds)) = &money_settlement {
             crate::snapshots::claude_request_money::settle_money_acks(
                 support_dir,
@@ -7411,6 +7401,18 @@ async fn finish_sync_source_resume(
                 saved,
                 &scan_result.snapshots,
             );
+        }
+        if source_money_resume(source, support_dir)
+            && recovery_ack_durable
+            && unknown_recovery::resolve_saved(
+                support_dir,
+                saved,
+                &upload_progress,
+                unknown_recovery::now(support_dir),
+            )
+            .is_err()
+        {
+            eprintln!("claude_request_money recovery_custody_fault=1");
         }
     };
     index.log_claude_proof_correction_debt();
