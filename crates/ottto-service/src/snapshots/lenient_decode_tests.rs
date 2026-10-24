@@ -2039,7 +2039,8 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             | "context_curve_capability_enabled"
             | "claude_history_gate_loaded"
             | "claude_history_move_not_full"
-            | "claude_history_move_released" => serde_json::json!(true),
+            | "claude_history_move_released"
+            | "accepted_incidence_pending_census" => serde_json::json!(true),
             "generation"
             | "codex_parent_side_generation"
             | "codex_parent_proof_wrap_epoch"
@@ -2775,6 +2776,19 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             OVERRIDE_OWNER_A
         );
 
+        // A replacement page records acknowledgements and checkpoints a
+        // partial commit: the carried ones have no file incidence yet and
+        // are kept until a census re-derives it.
+        assert!(reloaded.accepted_incidence_pending_census, "{context}");
+        reloaded.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+        let partial =
+            reloaded.committable_subset(&reloaded.clone(), &BTreeSet::new(), &BTreeMap::new());
+        assert_eq!(
+            partial.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+            "{context}"
+        );
+        assert!(partial.accepted_incidence_pending_census, "{context}");
+
         // A settled upload saves; a stale writer's CAS then fails. A stays.
         let mut stale = reloaded.clone();
         reloaded.save(&path).unwrap();
@@ -2793,6 +2807,15 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
         assert_eq!(
             restarted.session_account_bindings[&owner_key].account_identifier_hash,
             OVERRIDE_OWNER_A
+        );
+        // Once a census re-derived incidence, settlement prunes carried
+        // acknowledgements no current file anchors.
+        assert!(restarted.accepted_incidence_pending_census, "{context}");
+        restarted.accepted_incidence_pending_census = false;
+        restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
+        assert!(
+            restarted.accepted_snapshot_fingerprints.is_empty(),
+            "{context}"
         );
     }
 }

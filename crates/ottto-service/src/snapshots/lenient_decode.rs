@@ -289,6 +289,7 @@ impl Serialize for ScanIndex {
         field!(claude_history_gate_loaded, std::ops::Not::not);
         field!(claude_history_move_not_full, std::ops::Not::not);
         field!(claude_history_move_released, std::ops::Not::not);
+        field!(accepted_incidence_pending_census, std::ops::Not::not);
         map.end()
     }
 }
@@ -366,6 +367,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_history_gate_loaded",
     "claude_history_move_not_full",
     "claude_history_move_released",
+    "accepted_incidence_pending_census",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1508,6 +1510,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_history_move_released" => {
                             index.claude_history_move_released =
                                 self.history_scalar(value, false)?;
+                        }
+                        "accepted_incidence_pending_census" => {
+                            // Damage keeps carried acknowledgements, never drops them.
+                            index.accepted_incidence_pending_census =
+                                self.history_scalar(value, true)?;
                         }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }

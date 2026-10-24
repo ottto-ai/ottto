@@ -36,10 +36,22 @@ A paused source reports `scan_index_rebuild_loop` with its automatic retry time
 (`auto_retry_at=`, the newest backup stamp plus seven days) in the health
 `clear_condition`. One interactive user Repair from the signed companion
 (token-less `repair`, not dry run) may pass the guard once: the next source load
-runs the same gated rebuild, renames the witness to `.corrupt.override.`, counts
-`scan_index_rebuild_manual_override` and logs one line. That witness re-arms the
-seven-day guard and is the durable 24-hour cooldown; a second press inside it
-returns `scan_index_rebuild_override_cooldown`. Verify, automatic retries,
+strictly decodes the session-identity fields (bindings, deferred holds,
+contract token, owned-start census, stale-family carry, duplicate owners and
+fence flag, current-ledger accepted fingerprints) from the damaged bytes and
+durably replaces the index with a generation-0 gated rebuild that carries them
+(contract latch set; carried acknowledgements kept until the replacement census
+completes), keeps the damaged bytes as `.corrupt.override.`, counts
+`scan_index_rebuild_manual_override` and logs one line. If any of those fields
+cannot be strictly recovered (syntax damage included), the override refuses:
+the source stays paused, the index is untouched, the press is spent, and
+`scan_index_rebuild_override_identity_unrecoverable` is counted, alarmed and
+named in the health `clear_condition`. The witness re-arms the seven-day guard;
+the 24-hour cooldown is durable per checkpoint and source-wide
+(`<support>/snapshots/<source>-scan-index-rebuild-override.json`, outside every
+destination namespace, so a re-pair does not reset it; future or malformed
+stamps cool). A second press inside it returns
+`scan_index_rebuild_override_cooldown`. Verify, automatic retries,
 unattributed loads and token (CLI or agent) Repairs never override. Transcripts
 stay on disk, so a paused source's sessions arrive late, not lost.
 Malformed schema, generation, ledger or monotone controls refuse with the source

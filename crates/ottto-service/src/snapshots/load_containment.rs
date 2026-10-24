@@ -721,6 +721,8 @@ impl ScanIndex {
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
             self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
         }
+        // No file incidence yet: keep them until the replacement census.
+        self.accepted_incidence_pending_census = !self.accepted_snapshot_fingerprints.is_empty();
     }
 
     /// Apply the per-record checks one record at a time: drop a non-RFC3339
