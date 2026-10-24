@@ -817,6 +817,19 @@ pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
 }
 
+#[cfg(test)]
+pub(crate) fn planned_families_for_test(
+    scope: &Path,
+) -> Option<std::collections::BTreeSet<String>> {
+    PLANS.lock().unwrap().get(scope).map(|plan| {
+        plan.keys
+            .iter()
+            .filter(|(_, (_, eligible))| *eligible)
+            .map(|(key, _)| key.clone())
+            .collect()
+    })
+}
+
 /// Accepted cumulative work, including work whose resident capture was dropped.
 #[cfg(test)]
 pub(crate) fn work_for_test(scope: &Path) -> (usize, usize, u64) {

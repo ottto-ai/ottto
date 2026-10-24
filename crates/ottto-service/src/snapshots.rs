@@ -30436,10 +30436,30 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
 /// returned closure runs the real finalizers/capture hooks, with no fixture
 /// file I/O between them. Production scanning is unchanged.
 #[cfg(test)]
-pub(crate) fn prepare_money_finalizers_for_test(index: &ScanIndex) -> impl FnOnce() {
+pub(crate) fn prepare_money_finalizers_for_test(
+    support: &Path,
+    index: &ScanIndex,
+) -> impl FnOnce() {
+    let selected = claude_request_money::capture::planned_families_for_test(support)
+        .unwrap_or_else(|| {
+            index
+                .files
+                .keys()
+                .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
+                .map(|member| claude_request_census::family_key(member.root))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(claude_request_money::capture::NEXT_PAGE_FAMILIES)
+                .collect()
+        });
     let prepared = index
         .files
         .iter()
+        .filter(|(key, _)| {
+            claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                selected.contains(&claude_request_census::family_key(member.root))
+            })
+        })
         .map(|(key, entry)| {
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
             for line in std::fs::read_to_string(key)

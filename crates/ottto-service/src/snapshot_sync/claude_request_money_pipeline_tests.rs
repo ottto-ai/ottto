@@ -1431,7 +1431,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // Keep all admitted-page accounting/progress assertions below. Run the
     // real finalizers on prepared synthetic input, so native I/O does not
     // consume this separate probe's wall deadline before admission.
-    let replay = crate::snapshots::prepare_money_finalizers_for_test(&armed_index);
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &armed_index);
     money::capture::begin_page(&fixture.support);
     replay();
     let (counts, elapsed) = run(&armed, &armed_index, now);
@@ -1489,7 +1489,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let mut following_index = ScanIndex::default();
     let reread = scan(&mut following_index);
     assert_eq!(reread.scanned_file_count, armed.scanned_file_count, "fresh index must Full-reparse every selected file");
-    let replay = crate::snapshots::prepare_money_finalizers_for_test(&following_index);
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &following_index);
     money::capture::purge_scope_for_test(&fixture.support);
     money::capture::begin_page(&fixture.support);
     replay();
@@ -1626,7 +1626,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             assert_eq!(full.scanned_file_count, family_count);
             assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), serde_json::to_vec(&baseline.snapshots).unwrap());
             assert_eq!(serde_json::to_vec(&index).unwrap(), serde_json::to_vec(&baseline_index).unwrap());
-            let replay = crate::snapshots::prepare_money_finalizers_for_test(&index);
+            let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
             money::capture::purge_scope_for_test(&fixture.support);
             money::capture::begin_page(&fixture.support);
             replay();
