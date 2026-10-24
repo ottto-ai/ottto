@@ -37027,7 +37027,9 @@ impl ScanIndex {
             }
         }
         if claude_reemission_stop_latched()
-            || (self.active_request_money_adoption_paused && !reserved_initial_probe)
+            || ((self.active_request_money_adoption_paused
+                || claude_request_money::adoption_paused(support, self))
+                && !reserved_initial_probe)
             || self.claude_reemission_exclusions.pauses_adoption()
         {
             return false;

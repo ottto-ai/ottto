@@ -3066,6 +3066,122 @@ fn p2a_unknown_late_revision_deny_contract_releases_without_post_charge() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_pause_installed_after_counter_commit_is_current_before_post() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    {
+        let _clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle_deferred();
+    }
+    let original = control.server.raw_batches.lock().unwrap()[0].clone();
+    control.recovery_startup(now);
+    let attempt = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    let mut index = control.saved();
+    index.activate_upload_context(attempt.context.clone());
+    index.activate_effective_upload_body_witness_revision(3);
+    assert!(!index.request_money_adoption_paused());
+    let pause_index = index.clone();
+    let calls = std::cell::Cell::new(0);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let progress_path = snapshot_upload_progress_path(&control.index_path);
+    let mut progress = SnapshotUploadProgress::load(
+        &progress_path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    {
+        let _due = money::PageClockForTest::new(&control.support, now + 300);
+        money_resume::drive_for_test(unknown_recovery::replay_due(
+            &control.support,
+            &mut index,
+            &mut progress,
+            &progress_path,
+            &control.client,
+            &control.device,
+            "device-secret",
+            "otm_test",
+            &namespace,
+            attempt.policy,
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 2 {
+                    assert_eq!(
+                        unknown_recovery::active_for_test(&control.support)[0].posts,
+                        2
+                    );
+                    money::note_route_pause(&control.support, &pause_index, true);
+                    money::store::flush();
+                    money::store::with_ledger_for_test(&control.support, |ledger| {
+                        assert!(money::store::checkpoint_for_test(&control.support, ledger));
+                    })
+                    .unwrap();
+                    assert!(money::adoption_paused(&control.support, &pause_index));
+                }
+                Ok(())
+            },
+        ))
+        .unwrap();
+    }
+    assert_eq!(calls.get(), 2);
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "the newly installed independent pause must veto the physical POST"
+    );
+    let denied = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    assert_eq!(
+        denied.posts, 1,
+        "a gate denial rolls back the unsent physical charge"
+    );
+    assert_eq!(denied.slot, 1);
+    assert!(denied.terminal.is_none());
+    assert!(progress.accepted_fingerprints.is_empty());
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    {
+        let _next = money::PageClockForTest::new(&control.support, now + 3600);
+        money_resume::drive_for_test(unknown_recovery::replay_due(
+            &control.support,
+            &mut index,
+            &mut progress,
+            &progress_path,
+            &control.client,
+            &control.device,
+            "device-secret",
+            "otm_test",
+            &namespace,
+            attempt.policy,
+            || Ok(()),
+        ))
+        .unwrap();
+    }
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert_eq!(posts.len(), 2);
+    assert_eq!(
+        posts[1], original,
+        "the later permitted slot retains the original bytes"
+    );
+    assert!(progress
+        .accepted_fingerprints
+        .contains(&attempt.entities[0].fingerprint));
+    eprintln!("MONEY_UNKNOWN_CURRENT_PAUSE late_pause_post=false unsent_charge_rolled_back=true next_slot_exact=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
