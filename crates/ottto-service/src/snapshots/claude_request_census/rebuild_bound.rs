@@ -574,8 +574,9 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool) {
         let attempt_due = tracked.has(EXHAUSTED)
             || tracked.has(STARTED)
             || !with_persisted(|set| set.contains(id));
-        if !attempt_due {
-            // This process saved the grant and has not started its read.
+        if !attempt_due && open {
+            // This process saved the grant and has not started its read. A
+            // closed guard refuses it below instead.
             if !empty {
                 transient.rearmed.insert(key.clone());
             }

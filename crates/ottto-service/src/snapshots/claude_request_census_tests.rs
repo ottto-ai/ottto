@@ -3760,6 +3760,18 @@ fn census_rebuild_priors_decode_refusal_keeps_the_index() {
             let raw = census_rebuild_corrupt_priors(&mut saved, corruption, &id, &fingerprint);
             std::fs::write(&path, raw).unwrap();
 
+            // The same process, its saved grant not yet started: refused too.
+            {
+                let _clock = bound::set_now(N3_T0 + 30);
+                let index = ScanIndex::load(&path).unwrap();
+                assert!(
+                    !census_rebuild_rearms(&index, &key, &fingerprint),
+                    "{corruption}: a closed guard refuses an unstarted grant"
+                );
+                assert!(bound::exhausted(&index, &key), "{corruption}");
+                assert_eq!(bound::attempts(&index, &key), vec![N3_T0]);
+            }
+
             bound::restart();
             let clock = bound::set_now(N3_T0 + 60);
             let mut index = ScanIndex::load(&path).unwrap();
