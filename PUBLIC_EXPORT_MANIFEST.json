@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 833,
-  "content_sha256": "3900cc6691b6762ac140ee1e1b6b1149516f823bb39ae59b6999259ed8924aef",
+  "content_sha256": "32eda9b0d3d4c16d5181d2ad576412b76d88a34a41c1ef60e8456bec136950dc",
   "files": [
     {
       "executable": false,
@@ -1588,8 +1588,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/reason_reoffer_pipeline_tests.rs",
-      "sha256": "209240e6723b6927f027c2181df74c7099492dc2792b1be7f146028930e1a248",
-      "size_bytes": 67581
+      "sha256": "11e90ece2be9c8a3225580b891c016b7ab53187bebfe315889056477fcd87601",
+      "size_bytes": 69401
     },
     {
       "executable": false,
@@ -5834,7 +5834,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-23T22:44:44+00:00",
+  "generated_at": "2026-10-24T00:12:20+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 834,
   "public_roots": [
@@ -5873,5 +5873,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "d047c787e1ebd1fbffdf90120488dc87ad9ceb48"
+  "source_commit": "5d11ac5a7a71d61f3f7351eb70b627ebed4a0fe4"
 }

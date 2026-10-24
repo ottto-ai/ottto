@@ -1685,13 +1685,50 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
     assert!(absent.index.claude_family_tombstoned_for_test(root));
     let mut saved: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
+    std::fs::write(&transcript, &bytes).unwrap();
     saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
     saved["claude_history_move_not_full"] = true.into();
     std::fs::write(&absent.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
     assert!(!reemission_list_path(&pipeline.support).exists());
     let offered_before = pipeline.server.offered().len();
+
+    // Healthy local proof may clear #705's tombstone, but cannot waive
+    // #712's history hold or stamp the body as uploaded.
+    let proved_return = pipeline.cycle(t0 + 1_200);
+    assert!(proved_return.result.is_ok(), "{:?}", proved_return.result);
+    assert_eq!(pipeline.server.offered().len(), offered_before);
+    assert!(!proved_return.index.claude_family_tombstoned_for_test(root));
+    assert_eq!(
+        proved_return.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+
+    // Retire it again, then return without healthy proof. This is the
+    // retained-tombstone case: the history hold and the authority debt both
+    // stay owed. Keep all the original retention and wire assertions below.
+    let mut index = ScanIndex::load(&proved_return.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&proved_return.index_path).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent_again = pipeline.cycle(t0 + 1_800);
+    assert!(absent_again.result.is_ok(), "{:?}", absent_again.result);
+    assert!(!absent_again.index.files.contains_key(&key));
+    assert!(absent_again.index.claude_family_tombstoned_for_test(root));
+    let api = pipeline
+        .support
+        .join("local-otel/claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    std::fs::write(api, b"{ malformed synthetic proof\n").unwrap();
     std::fs::write(&transcript, bytes).unwrap();
-    let returned = pipeline.cycle(t0 + 1_200);
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&absent_again.index_path).unwrap()).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    std::fs::write(
+        &absent_again.index_path,
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let returned = pipeline.cycle(t0 + 2_400);
     assert!(returned.result.is_ok(), "{:?}", returned.result);
     assert_eq!(
         pipeline.server.offered().len(),
