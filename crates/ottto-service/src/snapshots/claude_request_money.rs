@@ -1361,7 +1361,8 @@ fn shadow_page_with_coverage(
         .iter()
         .map(|root| {
             let key = family_key(root);
-            let turn = ledger.get(&key).map_or(0, |record| record.window());
+            let published_turn = ledger.get(&key).map_or(0, |record| record.window());
+            let turn = capture::scheduling_turn(&scope_key, &key, published_turn);
             (*root, key, turn)
         })
         .collect::<Vec<_>>();
@@ -1492,23 +1493,28 @@ fn shadow_page_with_coverage(
     let mut order = order.into_iter();
     while let Some((root, key, turn)) = order.next() {
         if scope.is_none() || preflight_check(deadline).is_err() {
-            // No body or digest work after expiry. The same funded batch
-            // carries every remaining identity to the writer, which emits
-            // exactly one deadline failure and a complete digest per root.
+            // Closing hashes only the admitted canonical failure template.
+            // Identity/day/epoch suppression is a producer decision, before
+            // the writer can consume the day cap on identical deadline rows.
             let deferred = order.len() as u64 + 1;
             for (root, key, turn) in std::iter::once((root, key, turn)).chain(order) {
+                let state = coverage_view.family(root);
+                let digest = failure_digest.deferred(root, &key, &state, ledger);
+                let unchanged = publication_unchanged(ledger, &key, digest, now);
+                counts.unchanged += u64::from(unchanged);
+                failed += u64::from(!unchanged);
                 memos.push(PendingMemo {
                     key,
                     basis: None,
                     observed_unix: turn,
                     published: ClaudeFamilyPublication {
                         utc_day: utc_day(now),
-                        digest: 0,
+                        digest,
                         epoch: process_epoch(),
                         attempted: now,
                     },
-                    row: true,
-                    deferred: Some((root.to_owned(), coverage_view.family(root))),
+                    row: !unchanged,
+                    deferred: (!unchanged).then(|| (root.to_owned(), state)),
                 });
             }
             counts.families += deferred;
@@ -1516,7 +1522,6 @@ fn shadow_page_with_coverage(
             counts.families_deadline_deferred += deferred;
             counts.certificate_mismatch += deferred;
             counts.removed_change_unavailable += deferred;
-            failed += deferred;
             incomplete += deferred;
             break;
         }
@@ -1649,16 +1654,7 @@ fn shadow_page_with_coverage(
         };
         let is_failed = !rows.row.p1_reasons.is_empty();
         incomplete += u64::from(!rows.row.coverage_complete);
-        let unchanged = !ledger.in_flight(&key)
-            && ledger
-                .get(&key)
-                .and_then(ClaudeRequestCensusRecord::family_memo)
-                .and_then(|(_, memo)| memo.published)
-                .is_some_and(|published| {
-                    published.utc_day == utc_day(now)
-                        && published.epoch == process_epoch()
-                        && published.digest == digest
-                });
+        let unchanged = publication_unchanged(ledger, &key, digest, now);
         // Publication and capture scheduling are distinct. A reached
         // family denied capture keeps its old turn too, otherwise small
         // pages repeatedly pick the same first 64 despite reaching all roots.
@@ -1693,7 +1689,14 @@ fn shadow_page_with_coverage(
         drop(reservations);
         return refuse(&end, Some(ledger), index, roots.len(), counts);
     }
-    counts.family_memos_dropped = drop_old_family_memos(ledger, now, deadline);
+    // Optional body work has ended. Housekeeping owns the closing slice;
+    // it must not inherit the already-expired body deadline.
+    end.deadline = started + PAGE_MAX_ELAPSED - Duration::from_millis(10);
+    counts.family_memos_dropped = drop_old_family_memos(
+        ledger,
+        now,
+        end.deadline.min(Instant::now() + Duration::from_millis(10)),
+    );
     // This only selects optional captures; it grants no publication or
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
@@ -1703,7 +1706,7 @@ fn shadow_page_with_coverage(
             memos
                 .iter()
                 .map(|memo| (memo.key.as_str(), memo.observed_unix)),
-            started + PAGE_MAX_ELAPSED,
+            end.deadline.min(Instant::now() + Duration::from_millis(10)),
         );
     } else {
         capture::forget_plan(&scope_key);
@@ -2303,6 +2306,19 @@ fn failure_rows(
     rows
 }
 
+fn publication_unchanged(ledger: &ClaudeLedger, key: &str, digest: u64, now: u64) -> bool {
+    !ledger.in_flight(key)
+        && ledger
+            .get(key)
+            .and_then(ClaudeRequestCensusRecord::family_memo)
+            .and_then(|(_, memo)| memo.published)
+            .is_some_and(|published| {
+                published.utc_day == utc_day(now)
+                    && published.epoch == process_epoch()
+                    && published.digest == digest
+            })
+}
+
 /// Streaming canonical digest, without a second copy of the row or grains.
 /// Snapshot, observation time and removal-basis deltas are not semantic content.
 fn semantic_digest(rows: &mut FamilyRows) -> u64 {
@@ -2427,6 +2443,41 @@ struct DeadlineTemplate {
     suffix: usize,
 }
 impl DeadlineDigest {
+    fn deferred(
+        &mut self,
+        root: &str,
+        key: &str,
+        state: &FamilyCensus,
+        ledger: &ClaudeLedger,
+    ) -> u64 {
+        let (census, reason, statuses) = state.wire();
+        if self.template.as_ref().is_some_and(|template| {
+            template.census == census && template.reason == reason && template.statuses == statuses
+        }) {
+            // family_key and hashed_id use the same canonical root SHA256.
+            let family = &key[FAMILY_KEY_PREFIX.len()..FAMILY_KEY_PREFIX.len() + 16];
+            return self.identity(family);
+        }
+        let mut rows = failure_rows(
+            root,
+            "deadline",
+            state.clone(),
+            0,
+            0,
+            ledger,
+            &mut Default::default(),
+        );
+        self.digest(&mut rows)
+    }
+
+    fn identity(&self, family: &str) -> u64 {
+        let template = self.template.as_ref().expect("canonical deadline template");
+        let mut hash = template.prefix.clone();
+        hash.update(family.as_bytes());
+        hash.update(&template.bytes[template.suffix..]);
+        u64::from_be_bytes(hash.finalize()[..8].try_into().expect("digest"))
+    }
+
     fn digest(&mut self, rows: &mut FamilyRows) -> u64 {
         if rows.row.family.len() != 16 {
             return semantic_digest(rows);
@@ -2465,11 +2516,7 @@ impl DeadlineDigest {
                 suffix,
             });
         }
-        let template = self.template.as_ref().expect("canonical deadline template");
-        let mut hash = template.prefix.clone();
-        hash.update(rows.row.family.as_bytes());
-        hash.update(&template.bytes[template.suffix..]);
-        u64::from_be_bytes(hash.finalize()[..8].try_into().expect("digest"))
+        self.identity(&rows.row.family)
     }
 }
 

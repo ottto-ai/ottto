@@ -58,7 +58,7 @@ struct Work {
 }
 const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
 const PAGE_COMPARISONS: usize = 1_048_576;
-const PAGE_CAPTURE_US: u64 = 250_000;
+const PAGE_CAPTURE_US: u64 = 100_000;
 static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 
 /// After a cold page, focus the next Full parse on the oldest 64 family
@@ -66,7 +66,7 @@ static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 /// All members of a chosen family remain eligible, within the original caps.
 pub(crate) const NEXT_PAGE_FAMILIES: usize = 64;
 struct Plan {
-    keys: BTreeMap<String, bool>,
+    keys: BTreeMap<String, (u64, bool)>,
     _funds: Funds,
     created: Instant,
 }
@@ -104,11 +104,16 @@ fn plan_next_page_while<'a>(
     let mut oldest = BTreeMap::new();
     for (at, (key, turn)) in keys.enumerate() {
         if !within_deadline()
-            || !funds.spend(key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>())
+            || !funds.spend(
+                key.len()
+                    + MAP_ENTRY_BYTES
+                    + std::mem::size_of::<String>()
+                    + std::mem::size_of::<u64>(),
+            )
         {
             return false;
         }
-        selected.insert(key.to_owned(), false);
+        selected.insert(key.to_owned(), (turn, false));
         oldest.insert((turn, at), key);
         if oldest.len() > NEXT_PAGE_FAMILIES {
             let _ = oldest.pop_last();
@@ -118,7 +123,7 @@ fn plan_next_page_while<'a>(
         if !within_deadline() {
             return false;
         }
-        *selected.get_mut(*key).expect("admitted plan key") = true;
+        selected.get_mut(*key).expect("admitted plan key").1 = true;
     }
     if !within_deadline() {
         return false;
@@ -137,6 +142,24 @@ fn plan_next_page_while<'a>(
     } else {
         false
     }
+}
+
+/// Selection and finalizers share this scheduling state, including turns
+/// consumed while publication is delayed or the JSONL day is sealed. These
+/// hints confer no coverage, publication acknowledgement or removal basis.
+pub(super) fn scheduling_turn(scope: &Path, key: &str, published: u64) -> u64 {
+    PLANS
+        .lock()
+        .ok()
+        .and_then(|plans| {
+            plans
+                .get(scope)
+                .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
+                .and_then(|plan| plan.keys.get(key))
+                .map(|(turn, _)| *turn)
+        })
+        .unwrap_or(0)
+        .max(published)
 }
 
 pub(super) fn forget_plan(scope: &Path) {
@@ -289,7 +312,7 @@ impl ClaudeResponseCapture {
                                 // previous page's plan. Only its known roots rotate.
                                 plan.keys
                                     .get(&super::family_key(member.root))
-                                    .copied()
+                                    .map(|(_, eligible)| *eligible)
                                     .unwrap_or(true)
                             })
                         })
@@ -836,10 +859,12 @@ mod bounded_tests {
         let plans = PLANS.lock().unwrap();
         let plan = &plans[&support];
         assert_eq!(
-            plan.keys.values().filter(|eligible| **eligible).count(),
+            plan.keys.values().filter(|(_, eligible)| *eligible).count(),
             NEXT_PAGE_FAMILIES
         );
-        assert!(keys[..NEXT_PAGE_FAMILIES].iter().all(|key| plan.keys[key]));
+        assert!(keys[..NEXT_PAGE_FAMILIES]
+            .iter()
+            .all(|key| plan.keys[key].1));
         drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
