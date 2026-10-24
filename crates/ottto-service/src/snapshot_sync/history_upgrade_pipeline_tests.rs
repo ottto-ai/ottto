@@ -1438,3 +1438,34 @@ fn seen_marker_without_the_list_pauses_all_history() {
         crate::snapshots::restart_claude_reemission_stop_for_test();
     }
 }
+
+/// The startup sweep (`local_state_sweep`) ages out old quarantined copies
+/// but keeps each group's newest one forever, so a swept destination still
+/// has the quarantined sibling that makes it prior history (StateMissing H1).
+/// Each group's kept copy alone is enough.
+#[cfg(unix)]
+#[test]
+fn a_swept_destination_keeps_its_quarantined_prior_history() {
+    use crate::snapshots::PriorHistory;
+    let swept = crate::local_state_sweep::tests::swept_claude_quarantine_groups();
+    let backfill = crate::backfill::BackfillState::default();
+    let progress = test_upload_progress();
+    let prior = || {
+        claude_prior_history(
+            &backfill,
+            HISTORY_DESTINATION,
+            &progress,
+            &swept.index_path,
+            &swept.support,
+        )
+    };
+    assert_eq!(prior(), PriorHistory::Here);
+    std::fs::remove_file(&swept.kept[0]).expect("remove the index's kept copy");
+    assert_eq!(prior(), PriorHistory::Here, "the progress group's copy");
+    std::fs::remove_file(&swept.kept[1]).expect("remove the last kept copy");
+    assert_eq!(
+        prior(),
+        PriorHistory::None,
+        "without a quarantined copy this support state looks fresh"
+    );
+}

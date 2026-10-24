@@ -1801,8 +1801,16 @@ fn every_tied_or_differently_newest_copy_is_kept() {
     let report = apply(&f.support, &after(8 * DAY));
 
     assert_eq!(report.removed_quarantine, 0);
-    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    // These two, and the tied index copies still kept.
+    assert_eq!(report.skipped.quarantine_kept_newest, 4);
+    for copy in [&by_name, &by_times] {
+        assert_eq!(
+            entry_for(&report, copy).reason,
+            Some(SkipReason::QuarantineKeptNewest)
+        );
+    }
     assert!(by_name.exists() && by_times.exists());
+    assert!(tied.iter().all(|copy| copy.exists()));
 }
 
 #[test]
@@ -2387,6 +2395,41 @@ fn quarantine_log_line_is_content_free() {
     let line = report.log_line("startup").expect("line when kept");
     assert!(line.contains("\"removed_quarantine\":0"), "{line}");
     assert!(line.contains("\"quarantine_kept_newest\":1"), "{line}");
+}
+
+/// A destination whose two Claude quarantine groups were swept: each had
+/// an old and a newer copy, and only the old ones went. For
+/// `claude_prior_history`'s own test in `snapshot_sync`.
+pub(crate) struct SweptClaudeGroups {
+    _fixture: Fixture,
+    pub(crate) support: PathBuf,
+    /// The destination's Claude index, `claude_code-scan-index-v3.json`.
+    pub(crate) index_path: PathBuf,
+    /// The copy each group kept: the index's, then its upload progress's.
+    pub(crate) kept: [PathBuf; 2],
+}
+
+pub(crate) fn swept_claude_quarantine_groups() -> SweptClaudeGroups {
+    let f = fixture();
+    let progress = "claude_code-scan-index-v3-upload-progress";
+    let mut kept = Vec::new();
+    for base in [INDEX, progress] {
+        let old = plant_copy(&f.dest, base, OTHER_DEAD_PID, SystemTime::now());
+        kept.push(plant_copy(&f.dest, base, DEAD_PID, SystemTime::now() + DAY));
+        let report = apply(&f.support, &after(400 * DAY));
+        assert_eq!(report.removed_quarantine, 1, "{base}");
+        assert!(!old.exists(), "{base}");
+    }
+    let report = apply(&f.support, &after(4000 * DAY));
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    assert!(kept.iter().all(|copy| copy.exists()));
+    SweptClaudeGroups {
+        support: f.support.clone(),
+        index_path: f.dest.join(format!("{INDEX}.json")),
+        kept: kept.try_into().expect("two groups"),
+        _fixture: f,
+    }
 }
 
 #[test]

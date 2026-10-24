@@ -102,7 +102,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Exact `SnapshotSource::api_slug` values.
 const SOURCES: [&str; 3] = ["claude_code", "codex", "pi"];
