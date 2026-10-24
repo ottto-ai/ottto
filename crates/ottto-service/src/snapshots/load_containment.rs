@@ -683,6 +683,7 @@ fn override_scan_index_rebuild_loop(
     let mut rebuilt = ScanIndex::default();
     let carried = carry.and_then(|carry| rebuilt.carry_identity_from(carry));
     if let Err(error) = carried {
+        let decode_kind = error.kind();
         let code = match error {
             lenient_decode::Error::Refused(CARRIED_ACK_BUDGET_REFUSAL) => {
                 SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
@@ -693,7 +694,11 @@ fn override_scan_index_rebuild_loop(
         if let Ok(stamps) = scan_index_rebuild_witness_stamps(path) {
             note_scan_index_rebuild_refusal(source, stamps, Some(support_dir));
         }
-        return Err(refuse_scan_index_override(source, code, cause));
+        return Err(refuse_scan_index_override(
+            source,
+            code,
+            &format!("{cause} identity_decode={decode_kind}"),
+        ));
     }
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);

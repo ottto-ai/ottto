@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 838,
-  "content_sha256": "3fa248250272a6c81c4f79ef577e4fd73bb57d3c3c7c6cd42e0b55fc733b4432",
+  "content_sha256": "65d9c7e720a4414b5a11b031b60602369de832c6b451295bf95d414eac5a3870",
   "files": [
     {
       "executable": false,
@@ -2050,8 +2050,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/load_containment.rs",
-      "sha256": "6425730d759d420f9ba6bfd5055563a838331621c0036f1b3c9899a9f742562d",
-      "size_bytes": 42971
+      "sha256": "dc425697b56b2ecbe32948936f00e1f6adbae099c1f3ca0118f8afdd1bf2de1e",
+      "size_bytes": 43102
     },
     {
       "executable": false,
@@ -5869,7 +5869,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T11:31:51+00:00",
+  "generated_at": "2026-10-24T11:39:28+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 839,
   "public_roots": [
@@ -5908,5 +5908,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "de2c4b7b1dded2330e9d6a04f2ccb7a9da990aed"
+  "source_commit": "d7eab75eb4ec50f37703c0d6fb383d5eaba79d3e"
 }
