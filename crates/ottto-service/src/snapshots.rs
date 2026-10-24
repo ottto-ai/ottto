@@ -3103,6 +3103,13 @@ pub struct ScanIndex {
     /// scheduling permission only, never acceptance evidence.
     #[serde(skip)]
     reason_reoffer_retries: BTreeMap<String, String>,
+    /// Runtime-only exact-body cooldowns (fingerprint -> refused body
+    /// witness) from the upload ledger: a retained conflict whose refused
+    /// body waits for its reserved daily re-offer. Its ordinary retry timer
+    /// alone never re-reads an unchanged file. Never persisted; never
+    /// acceptance evidence. Bounded by the refusal ledger.
+    #[serde(skip)]
+    reason_reoffer_cooldowns: BTreeMap<String, String>,
     /// Claude only: the last moment this destination is known to have
     /// received history, recorded when a Mac with prior history loads a fresh
     /// index, a replay drops its entries, or a pre-gate index is first loaded
@@ -3371,6 +3378,7 @@ impl Default for ScanIndex {
             effective_upload_body_witness_revision_excluded_source_files: BTreeSet::new(),
             claude_reemission_exclusions: ReemissionExclusions::default(),
             reason_reoffer_retries: BTreeMap::new(),
+            reason_reoffer_cooldowns: BTreeMap::new(),
             claude_history_cutoff_unix_seconds: None,
             claude_history_gate_loaded: false,
             claude_history_move_not_full: false,
@@ -25371,6 +25379,10 @@ impl OwnedSourceScan {
                     *count = count.saturating_add(1);
                 }
             }
+            index.note_reason_reoffer_cooldown_candidate(
+                &candidate,
+                decision == CandidateDecision::Skip && parse_reason.is_none(),
+            );
             // A parse of a carried family's member cancels that family's
             // carry, so the family is co-observed in this window as BASE's
             // re-arm would observe it. A re-armed member is no new change.
@@ -37302,6 +37314,11 @@ impl ScanIndex {
         self.active_quarantine_witness = Some(snapshot_quarantine_witness(source));
     }
 
+    #[cfg(test)]
+    pub(crate) fn activate_quarantine_witness_for_test(&mut self, source: SnapshotSource) {
+        self.activate_quarantine_witness(source);
+    }
+
     fn quarantine_requires_retry(&self, fingerprint: &str) -> bool {
         if self.reason_reoffer_retries.contains_key(fingerprint) {
             return true;
@@ -37350,6 +37367,95 @@ impl ScanIndex {
                 record.upload_body_witness.as_deref() != Some(body_witness)
                     || self.quarantine_requires_retry(fingerprint)
             })
+    }
+
+    /// Arm this cycle's exact-body cooldown view (fingerprint -> refused
+    /// body witness), read from the prepared upload ledger after its leases
+    /// and any clock re-clamp. Replaces the previous view and its counts.
+    pub(crate) fn activate_reason_reoffer_cooldowns(
+        &mut self,
+        cooldowns: BTreeMap<String, String>,
+    ) {
+        self.reason_reoffer_cooldowns = cooldowns;
+    }
+
+    /// True when this entity's ordinary retry is only the retained conflict
+    /// of its exact refused body, which no lease lets through this cycle:
+    /// re-reading the unchanged file cannot send it. A lease, an acceptance,
+    /// another body or a changed quarantine witness keeps the retry.
+    fn reason_reoffer_cooldown_defers(&self, fingerprint: &str) -> bool {
+        !self.reason_reoffer_retries.contains_key(fingerprint)
+            && !self.accepted_snapshot_fingerprint_recorded(fingerprint)
+            && self
+                .reason_reoffer_cooldowns
+                .get(fingerprint)
+                .zip(self.quarantined_snapshot_fingerprints.get(fingerprint))
+                .is_some_and(|(body_witness, record)| {
+                    record.disposition == SnapshotQuarantineDisposition::RetryPending
+                        && record.upload_body_witness.as_deref() == Some(body_witness.as_str())
+                        && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                })
+    }
+
+    /// The ordinary retry gate of candidate selection, without the retry an
+    /// exact-body cooldown defers.
+    fn quarantine_retry_selects_file(&self, fingerprint: &str) -> bool {
+        self.quarantine_requires_retry(fingerprint)
+            && !self.reason_reoffer_cooldown_defers(fingerprint)
+    }
+
+    /// Revoke this cycle's bound if any mapped candidate is selected or
+    /// changed. Not-yet-visited entities remain provisional cooldown debt:
+    /// only the ordinary complete, clean traversal can settle them. Requiring
+    /// a page-local seen set would make multi-page quiet walks block forever.
+    fn note_reason_reoffer_cooldown_candidate(&mut self, candidate: &CandidateFile, skipped: bool) {
+        if self.reason_reoffer_cooldowns.is_empty() {
+            return;
+        }
+        let key = local_index_key(&candidate.path);
+        let unchanged = skipped
+            && self.files.get(&key).is_some_and(|entry| {
+                entry.size_bytes == candidate.size_bytes
+                    && entry.modified_unix_seconds == candidate.modified_unix_seconds
+                    && entry.modified_unix_nanos == Some(candidate.modified_unix_nanos)
+                    && entry.source_file_fingerprint == candidate.source_file_fingerprint
+                    && entry.scan_identity_version.as_deref()
+                        == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+            });
+        if !unchanged {
+            if let Some(fingerprints) = self.file_snapshot_fingerprints.get(&key) {
+                for fingerprint in fingerprints {
+                    self.reason_reoffer_cooldowns.remove(fingerprint);
+                }
+            }
+        }
+    }
+
+    /// This exact runtime bound makes the retained conflict non-blocking for
+    /// this page. It never certifies a traversal or changes its prior causes;
+    /// every candidate still has to pass the normal clean census boundary.
+    pub(crate) fn reason_reoffer_conflict_is_deferred(
+        &self,
+        fingerprint: &str,
+        body: &str,
+    ) -> bool {
+        self.reason_reoffer_cooldowns
+            .get(fingerprint)
+            .is_some_and(|witness| witness == body)
+            && self.reason_reoffer_cooldown_defers(fingerprint)
+    }
+
+    /// Current, distinct cooldown entities, including debt not visited on
+    /// this bounded page or whose ordinary timer has not expired. The set is
+    /// bounded by the refusal view, never by the whole source corpus.
+    pub(crate) fn reason_reoffer_cooldown_deferred_count(&self) -> usize {
+        if self.reason_reoffer_cooldowns.is_empty() {
+            return 0;
+        }
+        self.current_snapshot_fingerprint_refs()
+            .filter(|fingerprint| self.reason_reoffer_cooldown_defers(fingerprint))
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
     /// `load_for_snapshot_source_with_origin` without the origin.
@@ -38600,6 +38706,7 @@ impl ScanIndex {
                 .clone(),
             claude_reemission_exclusions: self.claude_reemission_exclusions.clone(),
             reason_reoffer_retries: self.reason_reoffer_retries.clone(),
+            reason_reoffer_cooldowns: self.reason_reoffer_cooldowns.clone(),
             claude_history_cutoff_unix_seconds: self
                 .claude_history_cutoff_unix_seconds
                 .or(previous.claude_history_cutoff_unix_seconds),
@@ -39061,7 +39168,7 @@ impl ScanIndex {
                         .snapshot_activity_at
                         .get(fingerprint)
                         .is_some_and(valid_snapshot_activity)
-                        || self.quarantine_requires_retry(fingerprint)
+                        || self.quarantine_retry_selects_file(fingerprint)
                 })
             })
         {
@@ -76144,6 +76251,179 @@ mod tests {
             .is_empty());
     }
 
+    /// O1: an exact-body cooldown defers only the ordinary retry of its own
+    /// retained conflict on an unchanged file. A changed file, a lease, a
+    /// changed quarantine witness, another body or an unrelated due sibling
+    /// in the same file still selects it. The conflict debt is untouched,
+    /// the view is runtime only, and deferrals count distinct entities.
+    #[test]
+    fn reason_reoffer_cooldown_defers_only_the_retained_exact_body_retry() {
+        let key = "/opaque/cooldown.jsonl".to_string();
+        let mut index = ScanIndex::default();
+        index.activate_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut entry = manifest_index_entry(Some("refused-entity"));
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
+        index.files.insert(key.clone(), entry.clone());
+        index
+            .file_snapshot_fingerprints
+            .insert(key.clone(), BTreeSet::from(["refused-entity".to_string()]));
+        index
+            .snapshot_activity_at
+            .insert("refused-entity".into(), Some("2026-10-14T10:00:00Z".into()));
+        // The newer conflict on the exact refused body, its timer due.
+        let conflict = SnapshotQuarantineRecord {
+            witness: snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+            retry_after_unix_seconds: 0,
+            upload_body_witness: Some("refused-body".into()),
+            failed_reconstruction_count: 0,
+            disposition: SnapshotQuarantineDisposition::RetryPending,
+        };
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), conflict.clone());
+        let mut candidate = test_candidate(PathBuf::from(&key));
+        candidate.size_bytes = entry.size_bytes;
+        candidate.modified_unix_seconds = entry.modified_unix_seconds;
+        candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
+        candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+        let reread = (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::ActivityOrQuarantineRetry),
+        );
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            reread
+        );
+
+        let cooldown = BTreeMap::from([("refused-entity".to_string(), "refused-body".to_string())]);
+        index.activate_reason_reoffer_cooldowns(cooldown.clone());
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            (CandidateDecision::Skip, None)
+        );
+        assert!(
+            index.quarantine_requires_retry("refused-entity"),
+            "the conflict debt itself is unchanged"
+        );
+        index.note_reason_reoffer_cooldown_candidate(&candidate, true);
+        index.note_reason_reoffer_cooldown_candidate(&candidate, true);
+        assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+        assert!(index.reason_reoffer_conflict_is_deferred("refused-entity", "refused-body"));
+        assert!(!index.reason_reoffer_conflict_is_deferred("refused-entity", "another-body"));
+        // Non-blocking debt remains counted before the ordinary timer is due.
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut("refused-entity")
+            .unwrap()
+            .retry_after_unix_seconds = u64::MAX;
+        index.activate_reason_reoffer_cooldowns(cooldown.clone());
+        index.note_reason_reoffer_cooldown_candidate(&candidate, true);
+        assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 1);
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), conflict.clone());
+        let saved: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(saved.reason_reoffer_cooldowns.is_empty(), "never persisted");
+        assert_eq!(saved.reason_reoffer_cooldown_deferred_count(), 0);
+
+        // Any file change still re-reads. Once any incidence breaks the bound,
+        // another unchanged incidence cannot restore it during this traversal.
+        let mut grown = candidate.clone();
+        grown.size_bytes += 1;
+        index.note_reason_reoffer_cooldown_candidate(&grown, false);
+        index.note_reason_reoffer_cooldown_candidate(&candidate, true);
+        assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 0);
+        assert!(!index.reason_reoffer_conflict_is_deferred("refused-entity", "refused-body"));
+        index.activate_reason_reoffer_cooldowns(cooldown.clone());
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&grown, 0),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::TranscriptChanged)
+            )
+        );
+        let mut resourced = candidate.clone();
+        resourced.source_file_fingerprint = "changed-sidecars".into();
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&resourced, 0),
+            (
+                CandidateDecision::Parse,
+                Some(CandidateParseReason::SourceChanged)
+            )
+        );
+
+        // An unrelated due obligation in the same file still selects it.
+        index
+            .file_snapshot_fingerprints
+            .get_mut(&key)
+            .unwrap()
+            .insert("sibling-entity".into());
+        index
+            .snapshot_activity_at
+            .insert("sibling-entity".into(), Some("2026-10-14T10:00:00Z".into()));
+        index.quarantined_snapshot_fingerprints.insert(
+            "sibling-entity".into(),
+            SnapshotQuarantineRecord {
+                upload_body_witness: Some("sibling-body".into()),
+                ..conflict.clone()
+            },
+        );
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            reread
+        );
+        index
+            .file_snapshot_fingerprints
+            .get_mut(&key)
+            .unwrap()
+            .remove("sibling-entity");
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+
+        // A different body is new work, never the refused one.
+        index.activate_reason_reoffer_cooldowns(BTreeMap::from([(
+            "refused-entity".to_string(),
+            "other-body".to_string(),
+        )]));
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            reread
+        );
+
+        // A changed quarantine witness (a new parser or contract) re-reads.
+        index.activate_reason_reoffer_cooldowns(cooldown.clone());
+        let mut older = conflict.clone();
+        older.witness.parser_version.push_str("-older");
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), older);
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            reread
+        );
+        index
+            .quarantined_snapshot_fingerprints
+            .insert("refused-entity".into(), conflict.clone());
+        assert_eq!(
+            index.candidate_decision_at(&candidate, 0),
+            CandidateDecision::Skip
+        );
+
+        // The daily lease alone lets the exact body through.
+        let hinted = index.activate_reason_reoffer_retries(cooldown.clone());
+        assert_eq!(hinted, vec![PathBuf::from(&key)]);
+        assert_eq!(
+            index.candidate_decision_with_reason_at(&candidate, 0),
+            reread
+        );
+        index.activate_reason_reoffer_cooldowns(cooldown);
+        index.note_reason_reoffer_cooldown_candidate(&candidate, true);
+        assert_eq!(index.reason_reoffer_cooldown_deferred_count(), 0);
+    }
+
     #[test]
     fn partial_commit_reparses_unchanged_rearmed_file_after_held_sibling() {
         let key = "/opaque/rearmed.jsonl".to_string();
@@ -77504,7 +77784,7 @@ crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verifi
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
 crate::heap_layout_bound::fields!(ScanCensus; #[cfg(test)] discovered_file_count, directory_entry_cap_exceeded_count, symlink_rejected_count, unreadable_path_count, unreadable_causes, parent_unresolvable, oversized_file_count, disappeared_file_count, malformed_json_line_count, invalid_utf8_line_count, over_line_cap_count, recognized_usage_drop_count, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, terminal_over_line_cap_count, terminal_recognized_usage_drop_count, terminal_dropped_usage_record_count, observed_index_keys, removed_index_keys, claude_vanished_index_keys, claude_parse_reasons, codex_counting_v2, claude_compaction_unlinked_parent_count);
-crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, claude_no_list_policy, claude_history_emission, reason_reoffer_retries);
+crate::heap_layout_bound::fields!(ScanIndex; schema_version, generation, upload_context_fingerprint, files, session_account_bindings, terminal_jsonl_dispositions, known_configured_scan_roots, legacy_unresolved_root_file_witnesses, codex_state_only_snapshot_fingerprints, codex_state_only_blocked_session_ids, codex_state_only_blocked_by_file, codex_state_only_blocked_unattributed, codex_state_only_blocked_legacy, codex_state_only_blocked_attributed, codex_parent_ownership_refs, codex_parent_ownership_ledgers, codex_parent_side_requests, codex_parent_side, codex_parent_side_generation, codex_parent_proof_wrap_epoch, codex_parent_prefix_proofs, codex_parent_proof_cursor, codex_parent_side_cursor, codex_parent_proof_seq, codex_proof_index_incarnation, codex_proof_index_minted, codex_parent_proof_parents_live, claude_desktop_title_files, claude_account_family_witnesses, claude_account_family_pending, claude_usage_family_witnesses, claude_usage_family_pending, claude_request_census, claude_request_census_shadow, claude_usage_authority_quarantine, claude_duplicate_request_owners, claude_duplicate_request_witness_overflowed, claude_owned_start_census, claude_account_deferred_holds, claude_duplicate_fence_rearm_attempt, claude_duplicate_fence_next_full_rearm_unix_seconds, claude_request_identity_contract, claude_request_identity_contract_changed, claude_desktop_store_cursor, claude_desktop_store_upper_bound, claude_desktop_store_sweep_had_errors, claude_desktop_identity_census_complete, claude_desktop_lineage_census_complete, claude_desktop_census_witness, claude_desktop_store_retry_attempt, claude_desktop_store_retry_not_before_unix_seconds, resume_after_path, resume_upper_bound_path, resume_census_window_end, bounded_sweep_had_unsettled_upload, bounded_sweep_unsettled_causes, traversal, claude_stale_family_carry, scan_residue_witness, historical_replay_generation, context_curve_capability_enabled, context_curve_replay_epoch, completed_context_curve_replay_generation, confirmed_empty_files, file_snapshot_fingerprints, snapshot_activity_at, accepted_snapshot_fingerprints, accepted_snapshot_fingerprint_ledger_version, legacy_settlement_reconcile_after_fingerprint, quarantined_snapshot_fingerprints, active_quarantine_witness, active_upload_context_fingerprint, active_effective_upload_body_witness_revision, active_effective_upload_body_witness_revision_monotone, effective_upload_body_witness_revision_excluded_source_files, claude_reemission_exclusions, claude_history_cutoff_unix_seconds, claude_history_gate_loaded, claude_history_move_not_full, claude_history_move_released, claude_no_list_policy, claude_history_emission, reason_reoffer_retries, reason_reoffer_cooldowns);
 crate::heap_layout_bound::fields!(ScanIndexEntry; size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, last_snapshot_fingerprint, last_upload_body_witness, effective_upload_body_witness_revision, scan_identity_version, codex_joined_member_set, codex_captured_joined_member_set, codex_protected_owner, codex_applied_tier_receipt, codex_applied_tier_receipt_required, codex_captured_tier_receipt, codex_captured_tier_receipt_required, codex_captured_uncommitted, codex_counting_v2);
 crate::heap_layout_bound::fields!(ScanResidueWitness; census_window_end, ownership_incomplete_file_count, zero_snapshot_usage_evidence_count, dropped_usage_record_count, index_keys, codex_state_only_blocked_session_ids);
 crate::heap_layout_bound::fields!(ScanTraversalCheckpoint; context_fingerprint, census_window_end, scan_roots, pending_directories, pending_candidates, observed_index_keys, codex_rollout_paths, codex_join_directory_census, reconciliation_upper_bound, reconciliation_after, reconciliation_started, watcher_hint_seen, codex_parent_resolution_retry_required, unhealthy_retry_attempt, unhealthy_retry_not_before_unix_seconds, counts, residue);
