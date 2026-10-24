@@ -137,6 +137,24 @@ pub(in crate::snapshots) fn with_test_limits<T>(
     run()
 }
 
+/// Stage 1 K8, tests only: [`with_test_limits`] for `snapshot_sync` tests.
+#[cfg(test)]
+pub(crate) fn with_test_limits_for_test<T>(
+    cursor: u64,
+    singleton: u64,
+    skip_chunk: usize,
+    run: impl FnOnce() -> T,
+) -> T {
+    with_test_limits(cursor, singleton, skip_chunk, run)
+}
+
+/// Stage 1 K8, tests only: the cursor byte budget in force on this thread,
+/// so a test can tell which thread's test limits a page sees (W10).
+#[cfg(test)]
+pub(crate) fn cursor_limit_for_test() -> u64 {
+    Limits::current().cursor
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_STATE_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -202,10 +220,15 @@ pub(in crate::snapshots) struct PageBudget {
     /// Stage 1 (EOF seam): a cursor attempt committed on this scan object
     /// and its native finish succeeded (`cursor_published`).
     committed: bool,
+    /// Stage 1 (K6): a continuation page's cooperative deadline, on the pace
+    /// clock. Past it the pause arm pauses the job as at an exhausted budget,
+    /// but no ticket is minted (`continuation_ticket` still requires the
+    /// exhausted budget). Never set on an ordinary page.
+    deadline: Option<InlineInstant>,
 }
 crate::heap_layout_bound::fields!(PageBudget; cursor_decoded, singleton_decoded,
     disabled_disclosed, page_noted, resume_claimed, proof_claimed, window_start, continuation,
-    ordinary_equivalent, committed);
+    ordinary_equivalent, committed, deadline);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::snapshots) enum StartPlan {
@@ -258,6 +281,19 @@ impl PageBudget {
 
     pub(in crate::snapshots) fn cursor_exhausted(&self, limits: Limits) -> bool {
         self.cursor_decoded >= limits.cursor
+    }
+
+    /// Stage 1 (K6): the pause arm's condition: the exhausted budget, or a
+    /// continuation page past its deadline. An ordinary page has no
+    /// deadline, so this is `cursor_exhausted` there.
+    pub(in crate::snapshots) fn cursor_stop(&self, limits: Limits) -> bool {
+        self.cursor_exhausted(limits) || self.deadline_passed()
+    }
+
+    /// Stage 1 (K6): a continuation page whose deadline has passed.
+    pub(in crate::snapshots) fn deadline_passed(&self) -> bool {
+        self.deadline
+            .is_some_and(|InlineInstant(deadline)| pace_now() >= deadline)
     }
 
     /// Singleton-budget bytes this page may still read (group probes, R2-N2).
@@ -325,6 +361,14 @@ impl PageBudget {
     ) {
         self.continuation = true;
         self.ordinary_equivalent = ordinary_equivalent.map(InlineDuration);
+    }
+
+    /// Stage 1 (K6): a continuation page's cooperative deadline. Ignored on
+    /// an ordinary page, which never has one.
+    pub(in crate::snapshots) fn set_continuation_deadline(&mut self, deadline: std::time::Instant) {
+        if self.continuation {
+            self.deadline = Some(InlineInstant(deadline));
+        }
     }
 
     /// Stage 1 (§6): the ordinary interval this continuation page stands for.
@@ -728,6 +772,18 @@ impl HeapLayoutBound for JobPace {
 pub(in crate::snapshots) struct InlineDuration(std::time::Duration);
 
 impl HeapLayoutBound for InlineDuration {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
+/// An `Instant` held inline (no heap), for a continuation page's deadline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::snapshots) struct InlineInstant(std::time::Instant);
+
+impl HeapLayoutBound for InlineInstant {
     const INLINE_ONLY: bool = true;
     const STABLE_HEAP: bool = true;
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -2225,6 +2281,26 @@ impl HeapLayoutBound for CodexCursorTicket {
 }
 
 impl CodexCursorTicket {
+    /// Stage 1 K8, tests only: a well-formed ticket that no cursor state ever
+    /// paused (epoch `u64::MAX`), so it is never ready and names no members.
+    #[cfg(test)]
+    pub(crate) fn unready_for_test() -> Self {
+        Self {
+            epoch: u64::MAX,
+            namespace: [0; 32],
+            key: [0; 32],
+            fence: None,
+            stamp_open: OpenStamp {
+                dev: 0,
+                ino: 0,
+                extent: 0,
+                modified: (0, 0),
+                changed: (0, 0),
+            },
+            started: 0,
+        }
+    }
+
     fn of(epoch: u64, meta: &JobMeta) -> Self {
         Self {
             epoch,

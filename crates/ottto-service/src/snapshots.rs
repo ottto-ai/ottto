@@ -113,6 +113,8 @@ use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
 // Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
 // adapter in `snapshot_sync` (inert while continuation pages are disabled).
+#[cfg(test)]
+pub(crate) use sampled_scan::codex_cursor::{cursor_limit_for_test, with_test_limits_for_test};
 #[allow(unused_imports)]
 pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
@@ -21368,12 +21370,22 @@ impl OwnedSourceScan {
             &[],
             false,
             context_curve_enabled,
-            claude_request_identity::capture_by_default(),
+            // Codex: no permit (OtherSource). The ordinary Codex page never
+            // captures, so neither does its continuation, in tests too (K5).
+            false,
             &[],
             Some(members),
         );
         scan.codex_page.set_continuation(ordinary_equivalent);
         scan
+    }
+
+    /// Stage 1 (K6): the cooperative deadline of a continuation page, on the
+    /// pace clock; ignored on an ordinary page. Past it the page pauses its
+    /// job at the next `step()` return without minting a ticket.
+    pub(crate) fn with_continuation_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.codex_page.set_continuation_deadline(deadline);
+        self
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -22868,9 +22880,10 @@ impl OwnedSourceScan {
                 }
                 match stepped {
                     Ok(false) => {
+                        // Stage 1 (K6): or a continuation page past its
+                        // deadline, which pauses without a ticket.
                         if active.cursor.is_some()
-                            && codex_page
-                                .cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
+                            && codex_page.cursor_stop(sampled_scan::codex_cursor::Limits::current())
                         {
                             if let Some(lease) = codex_cursor_lease.take() {
                                 // Stage 1 hunk A: minted before the pause

@@ -80,6 +80,15 @@ impl Drop for BlockingResidentMeasure {
     }
 }
 
+/// Stage 1 K8, tests only: one of [`SharedCache`]'s three locks.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TestLock {
+    Cursor,
+    Retained,
+    Side,
+}
+
 pub(crate) struct SharedCache {
     inner: Mutex<RetainedCache>,
     /// The resumable Codex job slot and held-singleton memo. Charged once,
@@ -227,6 +236,33 @@ impl SharedCache {
     }
     pub(super) fn retained_sealed_offset(&self, key: &str) -> Option<u64> {
         self.retained().ok()?.sealed_offset(key)
+    }
+    /// Stage 1 K8 (iii), tests only: panic on this thread while holding
+    /// `lock`, as a continuation worker would (W9).
+    #[cfg(test)]
+    pub(crate) fn panic_under_lock_for_test(&self, lock: TestLock) {
+        match lock {
+            TestLock::Cursor => {
+                self.with_cursor(|_| panic!("W9: panic under the cursor lock (test)"));
+            }
+            TestLock::Retained => {
+                let _held = self.retained();
+                panic!("W9: panic under the retained lock (test)");
+            }
+            TestLock::Side => {
+                let _held = self.side_ledger();
+                panic!("W9: panic under the side-ledger lock (test)");
+            }
+        }
+    }
+    /// Stage 1 K8, tests only: whether `lock` is poisoned now.
+    #[cfg(test)]
+    pub(crate) fn lock_poisoned_for_test(&self, lock: TestLock) -> bool {
+        match lock {
+            TestLock::Cursor => self.cursor.is_poisoned(),
+            TestLock::Retained => self.inner.is_poisoned(),
+            TestLock::Side => self.side.is_poisoned(),
+        }
     }
     /// Poison the retained lock from another thread (tests only).
     #[cfg(test)]

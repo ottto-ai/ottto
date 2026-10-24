@@ -4304,6 +4304,8 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
     ) -> Result<Option<SourcePreparation>> {
         if continuation::ENABLED && source == SnapshotSource::Codex {
             self.codex_started = Some(Instant::now());
+            // K2: this prepare's policy replaces any older cached inputs.
+            continuation::invalidate_on_ordinary_prepare();
         }
         ensure_snapshot_scan_authority(
             self.device,
@@ -4380,11 +4382,18 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
                     })
                     .flatten();
                 continuation::ordinary_ticket(
-                    &continuation::NoCursorContinuation,
+                    &continuation::CodexContinuation::new(
+                        &self.daemon.transcript_cache,
+                        self.home,
+                        self.support_dir,
+                    ),
                     &completed.2,
                     &completed.0.upload_destination_namespace,
                     authority,
+                    continuation::ticket_lifetime(self.codex_started),
                 )
+                // K2: moved out only when a ticket was minted.
+                .map(|ticket| ticket.with_inputs(take_continuation_inputs(&mut completed.0)))
             });
         let finished = crate::local_resource_diagnostics::source_finish(source.api_slug(), || {
             self.finish_completed(completed)
@@ -4420,16 +4429,20 @@ impl crate::source_rotation::Owner for SnapshotCycleOwner<'_> {
         self.started.elapsed()
     }
     fn retained_bound(&self, limit: usize) -> Option<usize> {
-        if crate::snapshots::claude_native_comparison::enabled() {
-            self.daemon.native_comparison.retained_bound(limit)
+        let native = if crate::snapshots::claude_native_comparison::enabled() {
+            self.daemon.native_comparison.retained_bound(limit)?
         } else {
-            Some(0)
-        }
+            0
+        };
+        // Stage 1 (K2): a held continuation ticket's inputs; zero while inert.
+        let continuation = continuation::retained_bound(limit.checked_sub(native)?)?;
+        native.checked_add(continuation)
     }
     fn discard_retained(&mut self) {
         if crate::snapshots::claude_native_comparison::enabled() {
             self.daemon.native_comparison.discard_retained();
         }
+        continuation::discard_retained();
     }
     fn boundary(&mut self, busy: impl Iterator<Item = SnapshotSource>) {
         self.retry
@@ -5281,6 +5294,78 @@ fn cycle_request_identity_permit(
     .ok()
 }
 
+/// The upload-context fingerprint a cycle activates on its index (pure; the
+/// ordinary prepare and a Stage 1 continuation page share it).
+fn cycle_upload_context(
+    upload_policy: SnapshotUploadPolicy,
+    checkpoint_namespace: Option<&str>,
+    cache_observations_enabled: bool,
+) -> String {
+    let upload_context = snapshot_upload_context_fingerprint(upload_policy, checkpoint_namespace);
+    if cache_observations_enabled {
+        // Reuse the existing per-file upload context invalidation when a
+        // backend upgrade admits cache evidence from previously scanned files.
+        format!(
+            "{:x}",
+            Sha256::digest(format!("{upload_context}:session_cache_observations:v1"))
+        )
+    } else {
+        upload_context
+    }
+}
+
+/// The replay generation of a cycle over `index` (pure; shared as above).
+fn cycle_replay_generation(
+    source: SnapshotSource,
+    context_curve_enabled: bool,
+    index: &ScanIndex,
+    upload_destination_namespace: &str,
+) -> String {
+    let replay = current_historical_replay(source);
+    if context_curve_enabled {
+        let curve_derivation_revision = context_curve_derivation_revision(source)
+            .expect("curve capability is supported only for local Codex and Claude sources");
+        format!(
+            "{}:{}:{}:{}:{}:{}",
+            source.api_slug(),
+            replay.revision,
+            CONTEXT_CURVE_CONTRACT_VERSION,
+            curve_derivation_revision,
+            index.context_curve_replay_epoch(),
+            upload_destination_namespace
+        )
+    } else {
+        format!(
+            "{}:{}:{}",
+            source.api_slug(),
+            replay.revision,
+            upload_destination_namespace
+        )
+    }
+}
+
+/// The sampled-acquisition scope of a cycle: the cursor and retained
+/// namespace (pure; a continuation page must use the same bytes, K5).
+fn cycle_sampled_scope(
+    account_witness: &[u8; 32],
+    upload_destination_namespace: &str,
+    index_path: &Path,
+    context_curve_enabled: bool,
+    request_identity_capture: bool,
+) -> crate::transcript_acquisition::Scope {
+    let mut sampled_scope = format!(
+        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
+        index_path.display(),
+        context_curve_enabled
+    );
+    if request_identity_capture {
+        // A retained parser never crosses capture modes; the dark scope bytes
+        // are unchanged.
+        sampled_scope.push_str(":request_identity");
+    }
+    crate::transcript_acquisition::Scope(format!("{:x}", Sha256::digest(sampled_scope.as_bytes())))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_sync_source(
     client: &SnapshotApiClient,
@@ -5554,17 +5639,11 @@ fn prepare_sync_source(
     {
         upload_progress.save(&upload_progress_path)?;
     }
-    let mut upload_context =
-        snapshot_upload_context_fingerprint(upload_policy, checkpoint_namespace.as_deref());
-    if cache_observations_enabled {
-        // Reuse the existing per-file upload context invalidation when a
-        // backend upgrade admits cache evidence from previously scanned files.
-        upload_context = format!(
-            "{:x}",
-            Sha256::digest(format!("{upload_context}:session_cache_observations:v1"))
-        );
-    }
-    index.activate_upload_context(upload_context);
+    index.activate_upload_context(cycle_upload_context(
+        upload_policy,
+        checkpoint_namespace.as_deref(),
+        cache_observations_enabled,
+    ));
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -5584,27 +5663,12 @@ fn prepare_sync_source(
             support_dir,
         )
     });
-    let replay = current_historical_replay(source);
-    let replay_generation = if context_curve_enabled {
-        let curve_derivation_revision = context_curve_derivation_revision(source)
-            .expect("curve capability is supported only for local Codex and Claude sources");
-        format!(
-            "{}:{}:{}:{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            CONTEXT_CURVE_CONTRACT_VERSION,
-            curve_derivation_revision,
-            index.context_curve_replay_epoch(),
-            upload_destination_namespace
-        )
-    } else {
-        format!(
-            "{}:{}:{}",
-            source.api_slug(),
-            replay.revision,
-            upload_destination_namespace
-        )
-    };
+    let replay_generation = cycle_replay_generation(
+        source,
+        context_curve_enabled,
+        &index,
+        &upload_destination_namespace,
+    );
     // An unreadable backfill state arms no Claude replay of either kind, and
     // no replay-wide scan window (StateMissing H1, N2).
     let ReplayArming {
@@ -5738,16 +5802,6 @@ fn prepare_sync_source(
     } else {
         None
     };
-    let mut sampled_scope = format!(
-        "sampled_scan:v1:{account_witness:?}:{upload_destination_namespace}:{}:{}",
-        index_path.display(),
-        context_curve_enabled
-    );
-    if request_identity_capture {
-        // A retained parser never crosses capture modes; the dark scope bytes
-        // are unchanged.
-        sampled_scope.push_str(":request_identity");
-    }
     let mut scan = crate::snapshots::OwnedSourceScan::new_with_identity_capture(
         source,
         &roots,
@@ -5768,10 +5822,13 @@ fn prepare_sync_source(
     )
     .with_sampled_acquisition(
         daemon.transcript_cache.clone(),
-        crate::transcript_acquisition::Scope(format!(
-            "{:x}",
-            Sha256::digest(sampled_scope.as_bytes())
-        )),
+        cycle_sampled_scope(
+            &account_witness,
+            &upload_destination_namespace,
+            &index_path,
+            context_curve_enabled,
+            request_identity_capture,
+        ),
     )
     .with_codex_side_pass(codex_side_pass);
     if crate::snapshots::claude_native_comparison::enabled() {
@@ -5817,6 +5874,367 @@ fn prepare_sync_source(
         scan: Some(scan),
     }))
 }
+
+/// Stage 1 (K1 a″, K2/P-1): what a Codex continuation page needs from the
+/// ordinary prepare of the cycle that minted its ticket. The attribution
+/// context is that cycle's own, moved out of its preparation, never copied
+/// or re-decoded; the policy copies (hint, upload policy, receipt client)
+/// carry no raw key. A ticket holds these for at most its fixed lifetime
+/// (`continuation::ticket_lifetime`) and drops them, zeroizing the key, on
+/// every other end. Charged as process-retained memory
+/// (`continuation::retained_bound`).
+struct ContinuationInputs {
+    account_witness: [u8; 32],
+    activity_hint: crate::snapshot_client::ActivityHintResponse,
+    receipt_window_days: u64,
+    context_curve_enabled: bool,
+    cache_observations_enabled: bool,
+    scan_agent_status_collection: std::sync::Arc<AgentStatusCollection>,
+    attribution_context: Option<SessionAttributionContext>,
+    upload_policy: SnapshotUploadPolicy,
+    upload_destination_namespace: String,
+    receipt_client: SnapshotApiClient,
+    index_path: PathBuf,
+    upload_progress_path: PathBuf,
+}
+
+crate::heap_layout_bound::fields!(ContinuationInputs; account_witness, activity_hint,
+    receipt_window_days, context_curve_enabled, cache_observations_enabled,
+    scan_agent_status_collection, attribution_context, upload_policy,
+    upload_destination_namespace, receipt_client, index_path, upload_progress_path);
+
+impl ContinuationInputs {
+    /// Whether the moved attribution context is present (tests read this
+    /// instead of the context itself).
+    #[cfg(test)]
+    fn holds_attribution(&self) -> bool {
+        self.attribution_context.is_some()
+    }
+}
+
+/// Stage 1 (K2): the continuation inputs of a just-finished ordinary Codex
+/// page, taken before its finish. `finish_sync_source` never reads the
+/// attribution context, so moving it out changes nothing for the finish.
+/// Called only while continuation pages are enabled and a ticket was minted.
+fn take_continuation_inputs(preparation: &mut SourcePreparation) -> ContinuationInputs {
+    let mut activity_hint = preparation.activity_hint.clone();
+    // The prepare took the raw key out of its hint already; never keep one.
+    if let Some(mut key) = activity_hint.session_attribution_hmac_key.take() {
+        key.zeroize();
+    }
+    ContinuationInputs {
+        account_witness: preparation.account_witness,
+        activity_hint,
+        receipt_window_days: preparation.receipt_window_days,
+        context_curve_enabled: preparation.context_curve_enabled,
+        cache_observations_enabled: preparation.cache_observations_enabled,
+        scan_agent_status_collection: std::sync::Arc::clone(
+            &preparation.scan_agent_status_collection,
+        ),
+        attribution_context: preparation.attribution_context.take(),
+        upload_policy: preparation.upload_policy,
+        upload_destination_namespace: preparation.upload_destination_namespace.clone(),
+        receipt_client: preparation.receipt_client.clone(),
+        index_path: preparation.index_path.clone(),
+        upload_progress_path: preparation.upload_progress_path.clone(),
+    }
+}
+
+/// Stage 1 (K1.1): why a continuation page refused before reading any
+/// transcript. Each state changes only through an ordinary prepare, so the
+/// paused job waits in its slot for the ordinary pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContinuationRefusal {
+    HistoricalReplay,
+    AdmissionReoffer,
+    LegacySettlement,
+    UploadClaim,
+    ReasonReoffer,
+}
+
+impl ContinuationRefusal {
+    fn label(self) -> &'static str {
+        match self {
+            Self::HistoricalReplay => "historical_replay_pending",
+            Self::AdmissionReoffer => "admission_reoffer_pending",
+            Self::LegacySettlement => "legacy_settlement_pending",
+            Self::UploadClaim => "upload_progress_claim_needed",
+            Self::ReasonReoffer => "reason_reoffer_active",
+        }
+    }
+}
+
+/// Stage 1 (K1, ruled a″): whether this cycle's ordinary prepare would claim
+/// an upload-progress generation or lease a retry or re-offer (and save that
+/// claim). Pure: it runs the ordinary selection on a copy, so its answer is
+/// the mutating function's by construction, and nothing is persisted.
+fn continuation_upload_claim_needed(
+    upload_progress: &SnapshotUploadProgress,
+    index: &ScanIndex,
+    replay_generation: &str,
+    reoffer: &reason_reoffer::Scope<'_>,
+) -> bool {
+    let mut probe = upload_progress.clone();
+    prepare_upload_progress_for_cycle_with_reoffer(
+        &mut probe,
+        index,
+        replay_generation,
+        false,
+        Some(reoffer),
+    )
+}
+
+/// How a continuation page's scan ended, on the worker.
+enum ContinuationScan {
+    /// Refused before any transcript read: nothing was stepped or saved.
+    Refused(ContinuationRefusal),
+    /// The scan's own local admission refused a step.
+    StepRefused,
+    /// Completed without committing its job. `ticket` is the byte-budget
+    /// pause's new ticket; `snapshots` how many snapshots the page produced
+    /// (zero on every valid non-EOF end, K7.1). Nothing was saved.
+    Uncommitted {
+        ticket: Option<crate::snapshots::CodexCursorTicket>,
+        snapshots: usize,
+    },
+    /// The job committed (EOF): the preparation, index and scan for the
+    /// unchanged finish on the parent.
+    Committed(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
+}
+
+/// Stage 1 (K1 a″): one Codex continuation page on the worker: the
+/// continuation-local prepare, then the scan to its end. The working index
+/// and its committed copy (K3) are dropped here on every end but EOF (K7: no
+/// save). The attribution context moves into the preparation and, on every
+/// end but EOF, back into `inputs`.
+fn run_continuation_scan(
+    home: &Path,
+    support_dir: &Path,
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    inputs: &mut ContinuationInputs,
+    members: &BTreeSet<String>,
+    ordinary_equivalent: Option<Duration>,
+    deadline: Instant,
+) -> Result<ContinuationScan> {
+    let mut preparation = match prepare_continuation_source(
+        home,
+        support_dir,
+        cache,
+        inputs,
+        members,
+        ordinary_equivalent,
+        deadline,
+    )? {
+        Ok(preparation) => preparation,
+        Err(reason) => return Ok(ContinuationScan::Refused(reason)),
+    };
+    loop {
+        match preparation.step() {
+            SourcePreparationStep::Pending(next) => preparation = next,
+            SourcePreparationStep::Refused(mut refused, _) => {
+                inputs.attribution_context = refused.attribution_context.take();
+                return Ok(ContinuationScan::StepRefused);
+            }
+            SourcePreparationStep::Complete {
+                mut preparation,
+                index,
+                scan,
+            } => {
+                if scan.continuation_committed() {
+                    return Ok(ContinuationScan::Committed(Box::new((
+                        preparation,
+                        index,
+                        scan,
+                    ))));
+                }
+                inputs.attribution_context = preparation.attribution_context.take();
+                return Ok(ContinuationScan::Uncommitted {
+                    ticket: scan.continuation_ticket().cloned(),
+                    snapshots: scan.snapshots.len(),
+                });
+            }
+        }
+    }
+}
+
+/// Stage 1 (K1, ruled a″): the continuation-local prepare. It is not
+/// `prepare_sync_source`'s tail: it takes no watcher hint, spends no
+/// per-cycle budget, saves nothing and never resets the index. Every state
+/// that would need one of those refuses first, before C14 or any transcript
+/// read (K1.1). The rest follows the ordinary prepare's order on the freshly
+/// loaded index and upload progress, with the same-cycle cached inputs. On
+/// `Ok(Ok(..))` the attribution context has moved into the preparation; on a
+/// refusal it is still in `inputs`.
+#[allow(clippy::too_many_arguments)]
+fn prepare_continuation_source(
+    home: &Path,
+    support_dir: &Path,
+    cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+    inputs: &mut ContinuationInputs,
+    members: &BTreeSet<String>,
+    ordinary_equivalent: Option<Duration>,
+    deadline: Instant,
+) -> Result<std::result::Result<SourcePreparation, ContinuationRefusal>> {
+    let source = SnapshotSource::Codex;
+    let scan_started_at = current_rfc3339();
+    let mut upload_progress = SnapshotUploadProgress::load(
+        &inputs.upload_progress_path,
+        &inputs.upload_destination_namespace,
+        snapshot_quarantine_witness(source),
+    )?;
+    let (mut index, _) =
+        ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    let backfill_state = load_backfill_state(support_dir);
+    let replay_generation = cycle_replay_generation(
+        source,
+        inputs.context_curve_enabled,
+        &index,
+        &inputs.upload_destination_namespace,
+    );
+    let arming = ReplayArming::decide(
+        source,
+        &backfill_state,
+        &inputs.upload_destination_namespace,
+        inputs.context_curve_enabled && index.context_curve_replay_needed(&replay_generation),
+    );
+    if arming.backfill_pending || arming.curve_replay_pending {
+        return Ok(Err(ContinuationRefusal::HistoricalReplay));
+    }
+    if index.snapshot_admission_reoffer_pending() {
+        return Ok(Err(ContinuationRefusal::AdmissionReoffer));
+    }
+    if index.legacy_settlement_ledger_needs_migration()
+        || !index
+            .legacy_settlement_reconciliation_pending_fingerprints()
+            .is_empty()
+    {
+        return Ok(Err(ContinuationRefusal::LegacySettlement));
+    }
+    let reoffer_now = reason_reoffer::now_unix_seconds();
+    let claim_needed = continuation_upload_claim_needed(
+        &upload_progress,
+        &index,
+        &replay_generation,
+        &reason_reoffer::Scope {
+            index: &index,
+            now: reoffer_now,
+            window_start_unix_seconds: reoffer_now
+                .saturating_sub(inputs.receipt_window_days.saturating_mul(86_400)),
+        },
+    );
+    if claim_needed {
+        return Ok(Err(ContinuationRefusal::UploadClaim));
+    }
+    // C14, on the index exactly as loaded, as the ordinary prepare runs it.
+    let codex_side_pass =
+        crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
+    let checkpoint_namespace = inputs
+        .attribution_context
+        .as_ref()
+        .map(SessionAttributionContext::checkpoint_namespace);
+    index.activate_upload_context(cycle_upload_context(
+        inputs.upload_policy,
+        checkpoint_namespace.as_deref(),
+        inputs.cache_observations_enabled,
+    ));
+    if !inputs.context_curve_enabled {
+        index.mark_context_curve_capability_disabled();
+    }
+    // The ordinary selection's in-memory effects, on this page's own copy;
+    // the probe above found no claim, so there is nothing to save.
+    let claimed = prepare_upload_progress_for_cycle_with_reoffer(
+        &mut upload_progress,
+        &index,
+        &replay_generation,
+        false,
+        Some(&reason_reoffer::Scope {
+            index: &index,
+            now: reoffer_now,
+            window_start_unix_seconds: reoffer_now
+                .saturating_sub(inputs.receipt_window_days.saturating_mul(86_400)),
+        }),
+    );
+    if claimed {
+        return Ok(Err(ContinuationRefusal::UploadClaim));
+    }
+    if !upload_progress.active_reason_reoffers.is_empty() {
+        return Ok(Err(ContinuationRefusal::ReasonReoffer));
+    }
+    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
+        source,
+    ));
+    // K3: as the ordinary prepare, before the scan advances it. It is dropped
+    // here unless the page commits, and crosses to the parent only by move.
+    let committed_index = index.clone();
+    // No lease is active (refused above), so this only installs the empty
+    // set, as the ordinary prepare does; there are no hint paths to take.
+    let leased_paths =
+        index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
+    debug_assert!(leased_paths.is_empty());
+    index.activate_reason_reoffer_cooldowns(upload_progress.reason_reoffer_cooldowns(reoffer_now));
+    upload_progress.reselect_pending_cache_heads(&mut index, inputs.cache_observations_enabled);
+    let roots = crate::snapshot_roots::scan_roots(
+        source,
+        home,
+        &inputs.scan_agent_status_collection.codex_scan_homes,
+    )?;
+    let scan = crate::snapshots::OwnedSourceScan::new_continuation(
+        &roots,
+        index,
+        &scan_started_at,
+        scan_request_window_days(inputs.receipt_window_days, false, false),
+        MAX_BACKFILL_FILES_PER_SOURCE,
+        inputs.upload_policy.session_artifacts_enabled,
+        inputs.context_curve_enabled,
+        members,
+        ordinary_equivalent,
+    )
+    .with_continuation_deadline(deadline)
+    .with_sampled_acquisition(
+        std::sync::Arc::clone(cache),
+        // K5: the ordinary Codex page's scope; Codex never captures.
+        cycle_sampled_scope(
+            &inputs.account_witness,
+            &inputs.upload_destination_namespace,
+            &inputs.index_path,
+            inputs.context_curve_enabled,
+            false,
+        ),
+    )
+    .with_codex_side_pass(Some(codex_side_pass));
+    Ok(Ok(SourcePreparation {
+        native_comparison_reservation: None,
+        native_comparison_lease: None,
+        prepared_claude_evidence: None,
+        terminal_native_traversal: None,
+        native_comparison_controller: None,
+        retry_authority: None,
+        source,
+        claude_scan_roots: None,
+        account_witness: inputs.account_witness,
+        scan_started_at,
+        activity_hint: inputs.activity_hint.clone(),
+        receipt_window_days: inputs.receipt_window_days,
+        context_curve_enabled: inputs.context_curve_enabled,
+        cache_observations_enabled: inputs.cache_observations_enabled,
+        scan_agent_status_collection: std::sync::Arc::clone(&inputs.scan_agent_status_collection),
+        attribution_context: inputs.attribution_context.take(),
+        upload_policy: inputs.upload_policy,
+        upload_destination_namespace: inputs.upload_destination_namespace.clone(),
+        receipt_client: inputs.receipt_client.clone(),
+        index_path: inputs.index_path.clone(),
+        upload_progress_path: inputs.upload_progress_path.clone(),
+        upload_progress,
+        committed_index,
+        backfill_state,
+        backfill_pending: false,
+        replay_generation,
+        legacy_reconciliation_pending: BTreeSet::new(),
+        active_legacy_reconciliation: BTreeSet::new(),
+        scan: Some(scan),
+    }))
+}
+
 fn capture_codex_recovery_evidence(
     index: &mut ScanIndex,
     committed_index: &mut ScanIndex,
@@ -20645,6 +21063,7 @@ mod tests {
     include!("retry_owned_rotation.rs");
     include!("retry_bounded_native_tests.rs");
     include!("retry_live_native_tests.rs");
+    include!("snapshot_sync/continuation_prepare_tests.rs");
     include!("snapshot_sync/census_convergence_pipeline_tests.rs");
     include!("snapshot_sync/claude_request_census_pipeline_tests.rs");
     mod history_upgrade_pipeline_tests {

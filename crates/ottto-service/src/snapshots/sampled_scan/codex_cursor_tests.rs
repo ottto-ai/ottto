@@ -11318,3 +11318,302 @@ fn continuation_parent_reads_are_page_charged_and_exclusions_hold() {
         panic!("{}", counters(&cache));
     });
 }
+
+// Stage 1 integration (StateMissing, under c22's K5/K6/K7/W9 rulings): the
+// leased deadline and capture lines, the no-save continuation contract and a
+// worker panic's next ordinary page. New tests only.
+
+/// K6: the deadline is a continuation page's only: an ordinary budget
+/// ignores it, and a continuation budget stops at it without exhausting its
+/// bytes (so `continuation_ticket`, which still requires exhaustion, mints
+/// nothing).
+#[test]
+fn continuation_deadline_stops_only_continuation_budgets() {
+    let t0 = std::time::Instant::now();
+    let limits = Limits::current();
+    let mut ordinary = PageBudget::default();
+    ordinary.set_continuation_deadline(t0);
+    let mut continuation = PageBudget::default();
+    continuation.set_continuation(Some(secs(600)));
+    with_pace_clock(Some(t0 + secs(1)), false, || {
+        assert!(
+            !continuation.deadline_passed(),
+            "no deadline: today's budget"
+        );
+        assert!(!ordinary.deadline_passed(), "an ordinary page has none");
+        assert!(!ordinary.cursor_stop(limits));
+        assert_eq!(
+            ordinary.cursor_stop(limits),
+            ordinary.cursor_exhausted(limits)
+        );
+    });
+    continuation.set_continuation_deadline(t0 + secs(5));
+    with_pace_clock(Some(t0 + secs(4)), false, || {
+        assert!(!continuation.cursor_stop(limits), "before the deadline");
+    });
+    with_pace_clock(Some(t0 + secs(5)), false, || {
+        assert!(continuation.deadline_passed());
+        assert!(continuation.cursor_stop(limits));
+        assert!(!continuation.cursor_exhausted(limits), "bytes remain");
+    });
+}
+
+/// K6 through the scan: a continuation page past its deadline pauses the
+/// job at the next `step()` return, still paused and resumable, and mints no
+/// ticket (`PausedContended`); the same page without a deadline keeps the
+/// attempt accelerated.
+#[test]
+fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (index, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        let paused = counter(&cache, |c| c.jobs_paused);
+        let (_, scan) = with_pace_clock(Some(t0 + secs(10)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |scan| scan.codex_page.set_continuation_deadline(t0 + secs(5)),
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_none(),
+            "a deadline pause mints no ticket: {}",
+            counters(&cache)
+        );
+        assert!(!scan.continuation_committed());
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(counter(&cache, |c| c.jobs_paused), paused + 1);
+        assert_eq!(cache.paused_members_for_test(), Some(members.clone()));
+        let (_, scan) = with_pace_clock(Some(t0 + secs(11)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_some(),
+            "no deadline: the byte budget, as today: {}",
+            counters(&cache)
+        );
+    });
+}
+
+/// K5.2/K5.3: Codex holds no request-identity permit (`OtherSource`), so
+/// the ordinary Codex page never captures; neither does its continuation,
+/// in tests too, where capture would otherwise be the default.
+#[test]
+fn continuation_capture_mode_is_the_ordinary_codex_mode() {
+    use crate::snapshots::claude_request_identity::{
+        capture_by_default, permit_when, CohortDenial, COHORT_HINT_TOKEN,
+    };
+    for token in [None, Some(COHORT_HINT_TOKEN)] {
+        assert!(matches!(
+            permit_when(true, SnapshotSource::Codex, token),
+            Err(CohortDenial::OtherSource)
+        ));
+    }
+    let ordinary_capture =
+        permit_when(true, SnapshotSource::Codex, Some(COHORT_HINT_TOKEN)).is_ok();
+    assert!(
+        capture_by_default(),
+        "the default the continuation must not use"
+    );
+    let fixture = ScanRoot::new(4);
+    let scan = OwnedSourceScan::new_continuation(
+        std::slice::from_ref(&fixture.root),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        true,
+        &BTreeSet::new(),
+        None,
+    );
+    assert_eq!(scan.claude_request_identity_capture, ordinary_capture);
+}
+
+/// K7: continuation pages save nothing, so every page starts from the index
+/// the minting ordinary page saved. Pages from that same unsaved index still
+/// page the job to its one commit, which publishes the unpaged read's output;
+/// every page before it publishes nothing (K7.1) and re-pauses with a ticket.
+#[test]
+fn continuation_pages_from_the_unsaved_index_reach_the_commit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let unpaged = fingerprints(&unpaged);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (saved, members) = paused_singleton(&fixture, &cache);
+        for page in 0..64 {
+            let (_, scan) = continuation_page_in(
+                &fixture.root,
+                saved.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            );
+            if scan.continuation_committed() {
+                assert!(!unpaged.is_empty());
+                assert_eq!(fingerprints(&scan), unpaged, "page {page}");
+                assert!(cache.cursor_slot_free());
+                return;
+            }
+            assert!(scan.snapshots.is_empty(), "page {page}: K7.1");
+            assert!(
+                scan.continuation_ticket().is_some(),
+                "page {page}: {}",
+                counters(&cache)
+            );
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+/// K7.2 proof: a continuation page whose job's member changed under it is
+/// not saved. The ordinary pages that follow, from the index the minting
+/// page saved, re-derive the whole debt: they publish exactly the unpaged
+/// read of the changed file, nothing older and nothing lost. Pace clock: the
+/// changed revision waits the guard's equivalent first (deferred, not lost).
+#[test]
+fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (saved, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        // Rewrite one byte of the already-read prefix in place, and grow.
+        let bytes = fs::read(&path).unwrap();
+        let at = bytes
+            .windows(8)
+            .position(|window| window == b"10:00:00")
+            .unwrap()
+            + 7;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(b"1", at as u64)
+            .unwrap();
+        fixture.append(SESSION, &token_line(81));
+        let (_, dropped) = with_pace_clock(Some(t0 + secs(1)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                saved.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            dropped.snapshots.is_empty() || dropped.continuation_committed(),
+            "K7.1: no snapshots before EOF"
+        );
+        assert!(
+            !dropped.continuation_committed(),
+            "a changed member never commits"
+        );
+        drop(dropped);
+        let (_, current) = page(&fixture, ScanIndex::default(), None);
+        let expected = fingerprints(&current);
+        assert!(!expected.is_empty());
+        let mut index = saved;
+        let mut published = BTreeSet::new();
+        for page_number in 0..64u64 {
+            let (next, scan) = with_pace_clock(Some(t0 + secs(3_601 + page_number)), false, || {
+                page(&fixture, index, Some(Arc::clone(&cache)))
+            });
+            index = next;
+            published.extend(fingerprints(&scan));
+            if expected.iter().all(|f| published.contains(f)) {
+                assert!(
+                    published.iter().all(|f| expected.contains(f)),
+                    "nothing older than the changed file: {}",
+                    counters(&cache)
+                );
+                return;
+            }
+        }
+        panic!("the debt was lost: {}", counters(&cache));
+    });
+}
+
+/// W9: a continuation worker that panicked while holding the cursor, the
+/// retained or the side-ledger lock leaves the process running. The next
+/// ordinary pages neither panic nor deadlock, and fail closed: they publish
+/// nothing the unpaged read would not, and a poisoned cursor admits nothing.
+#[test]
+fn ordinary_pages_after_a_worker_panic_under_any_lock_fail_closed() {
+    use crate::snapshots::sampled_scan::TestLock;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let unpaged = fingerprints(&unpaged);
+    for lock in [TestLock::Cursor, TestLock::Retained, TestLock::Side] {
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let (mut index, _) = paused_singleton(&fixture, &cache);
+            let worker = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("ottto-codex-continuation".to_string())
+                    .spawn_scoped(scope, || cache.panic_under_lock_for_test(lock))
+                    .unwrap()
+                    .join()
+            });
+            assert!(worker.is_err(), "{lock:?}: the panic stays on the worker");
+            assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+            for _ in 0..8 {
+                let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+                index = next;
+                assert!(
+                    fingerprints(&scan).iter().all(|f| unpaged.contains(f)),
+                    "{lock:?}"
+                );
+                if lock == TestLock::Cursor {
+                    assert!(cache.cursor_reserve(1).is_none(), "admits nothing");
+                }
+            }
+        });
+    }
+}
