@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 843,
-  "content_sha256": "5b96ea7d214b46f88fcab4e4b0063b336808a266841b94631e08287ce3650a1d",
+  "content_sha256": "8066ac67de06e1f9333df450fdb4cd77cbed993ffd32d1ca6736bd8ad6f2a7bc",
   "files": [
     {
       "executable": false,
@@ -1462,8 +1462,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync.rs",
-      "sha256": "50c700ed71fc669d079fc5d1e93cb53d57da89013a504c9b9130c803bc737da0",
-      "size_bytes": 991257
+      "sha256": "eb1c374fd8d2a06b283f8bb83c713cebf87ce3200ece48214699bb82a09c0919",
+      "size_bytes": 993203
     },
     {
       "executable": false,
@@ -1539,8 +1539,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/money_resume.rs",
-      "sha256": "73593e1fced0cd8615831d10516042059de59d35d49ec18340644c81997baa9b",
-      "size_bytes": 23998
+      "sha256": "d9331f52995403b9b3ebe9b26778d53dc8d4703b58ad961880249169d9f53fc0",
+      "size_bytes": 25460
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p2a_round3_tests.rs",
-      "sha256": "16f3f2e15ab5a823a88352898e79ed0e78b8ef178c76077fe34a49b75a6b67da",
-      "size_bytes": 183437
+      "sha256": "1d063f268405c5d3ee43d0c2b1a6707a54286b50441da48c2750cc042a4410dd",
+      "size_bytes": 187109
     },
     {
       "executable": false,
@@ -1574,8 +1574,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/permanent_finish_pipeline_tests.rs",
-      "sha256": "4004f2f5056dc6301cff4a66e18bbc9ded4c5b2915ac522d019334b51627bf05",
-      "size_bytes": 32031
+      "sha256": "0965240c722363647bbb054222d9e5123ae66cdbc3b367bd5250503a37f56075",
+      "size_bytes": 32339
     },
     {
       "executable": false,
@@ -1637,8 +1637,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/unknown_recovery.rs",
-      "sha256": "bfa4d1b0b199687c58935f74653de6a7549379e76e20be4eabc3c7ea3e564452",
-      "size_bytes": 91639
+      "sha256": "7c086390c4b5e90a2c5ed392d893b1b18005662bc952854e40726de9be5f693a",
+      "size_bytes": 92394
     },
     {
       "executable": false,
@@ -5904,7 +5904,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T23:09:10+00:00",
+  "generated_at": "2026-10-24T23:21:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 844,
   "public_roots": [
@@ -5943,5 +5943,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b93e8d7aa9c14472c2d8c09e2977cb8b58ea072b"
+  "source_commit": "b935003742f4b3dcf1240d95f79a9f0b3744877f"
 }
