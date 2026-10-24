@@ -1065,6 +1065,11 @@ mod tests {
         }
         assert!(files.len() > 50, "source inventory looks truncated");
         let mut seen = vec![0; ALLOWED.len()];
+        let tokens: Vec<String> = BYPASSES
+            .iter()
+            .chain(OVERRIDES)
+            .map(|token| expand(token))
+            .collect();
         for path in files {
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
@@ -1086,11 +1091,7 @@ mod tests {
                 {
                     panic!("{file}:{}: import ureq items by path: {trimmed}", index + 1);
                 }
-                if !BYPASSES
-                    .iter()
-                    .chain(OVERRIDES)
-                    .any(|token| line.contains(&expand(token)))
-                {
+                if !tokens.iter().any(|token| line.contains(token.as_str())) {
                     continue;
                 }
                 let in_tests = tests_start.is_some_and(|tests| start > tests);
