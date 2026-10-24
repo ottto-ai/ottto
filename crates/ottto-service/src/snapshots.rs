@@ -30462,12 +30462,11 @@ pub(crate) fn prepare_money_finalizers_for_test(
         })
         .map(|(key, entry)| {
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-            for line in std::fs::read_to_string(key)
-                .expect("synthetic transcript")
-                .lines()
-            {
+            let input = BufReader::new(std::fs::File::open(key).expect("synthetic transcript"));
+            for line in input.lines() {
+                let line = line.expect("synthetic line");
                 apply_claude_code_line(
-                    &serde_json::from_str(line).expect("synthetic record"),
+                    &serde_json::from_str(&line).expect("synthetic record"),
                     &mut accumulator,
                 );
             }

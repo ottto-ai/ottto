@@ -1548,8 +1548,12 @@ fn shadow_page_with_coverage(
             let deferred = (order.len() - position) as u64;
             for (root, key, turn) in &order[position..] {
                 let state = coverage_view.family(root);
-                let digest = failure_digest.deferred(root, &state, ledger);
-                let unchanged = publication_unchanged(ledger, key, digest, day, epoch);
+                // Only a current acknowledged publication can be unchanged.
+                // The writer computes the canonical digest before returning
+                // its acknowledgement, so new/expired/in-flight rows need no
+                // synchronous SHA of the entire deferred wire template.
+                let unchanged = published_digest(ledger, key, day, epoch)
+                    .is_some_and(|digest| failure_digest.deferred(root, &state, ledger) == digest);
                 if unchanged {
                     counts.unchanged += 1;
                     // Nothing was consumed or published. Re-acknowledging an
@@ -1564,7 +1568,7 @@ fn shadow_page_with_coverage(
                     observed_unix: *turn,
                     published: ClaudeFamilyPublication {
                         utc_day: day,
-                        digest,
+                        digest: 0, // replaced by the writer's canonical digest
                         epoch,
                         attempted: now,
                     },
@@ -2370,14 +2374,19 @@ fn publication_unchanged(
     day: u64,
     epoch: u64,
 ) -> bool {
-    !ledger.in_flight(key)
-        && ledger
-            .get(key)
-            .and_then(ClaudeRequestCensusRecord::family_memo)
-            .and_then(|(_, memo)| memo.published)
-            .is_some_and(|published| {
-                published.utc_day == day && published.epoch == epoch && published.digest == digest
-            })
+    published_digest(ledger, key, day, epoch) == Some(digest)
+}
+
+fn published_digest(ledger: &ClaudeLedger, key: &str, day: u64, epoch: u64) -> Option<u64> {
+    if ledger.in_flight(key) {
+        return None;
+    }
+    ledger
+        .get(key)
+        .and_then(ClaudeRequestCensusRecord::family_memo)
+        .and_then(|(_, memo)| memo.published)
+        .filter(|published| published.utc_day == day && published.epoch == epoch)
+        .map(|published| published.digest)
 }
 
 /// Streaming canonical digest, without a second copy of the row or grains.
