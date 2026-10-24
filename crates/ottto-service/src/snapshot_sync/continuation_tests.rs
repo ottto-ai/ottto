@@ -1461,11 +1461,12 @@ fn no_lifetime_or_authority_mints_no_ticket() {
     }
     let scan = empty_scan();
     let now = Instant::now();
-    let lifetime = Some((now, now + LIFETIME));
+    let bounds = (now, now + LIFETIME);
+    let lifetime = Some(bounds);
     assert!(ordinary_ticket(&Mints, &scan, "ns", Some(AUTHORITY), None).is_none());
     assert!(ordinary_ticket(&Mints, &scan, "ns", None, lifetime).is_none());
     let minted = ordinary_ticket(&Mints, &scan, "ns", Some(AUTHORITY), lifetime).unwrap();
-    assert_eq!((minted.issued, minted.expires), lifetime.unwrap());
+    assert_eq!((minted.issued, minted.expires), bounds);
     assert_eq!(minted.destination, destination_digest("ns"));
     assert!(!minted.valid_at(now + LIFETIME));
     assert!(!minted.valid_at(now - Duration::from_secs(1)));
@@ -1581,13 +1582,9 @@ fn every_worker_end_maps_to_one_page_end() {
     let deadline = Instant::now();
     let before = deadline - Duration::from_secs(1);
     type Check = fn(&PageEnd) -> bool;
-    let rows: [(
-        &str,
-        std::result::Result<WorkerEnd, WorkerFailure>,
-        Instant,
-        Check,
-        bool,
-    ); 10] = [
+    type Ended = std::result::Result<WorkerEnd, WorkerFailure>;
+    type Row = (&'static str, Ended, Instant, Check, bool);
+    let rows: [Row; 10] = [
         (
             "spawn",
             Err(WorkerFailure::Spawn),
