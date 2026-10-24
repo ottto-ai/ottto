@@ -3678,7 +3678,15 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
         drop(clock);
         let _early = money::PageClockForTest::new(&control.support, now + 299);
-        control.cycle();
+        // Both the original and dependent family remain locally unsettled.
+        // Accepted unrelated work is checkpointed alongside that exact result.
+        let result = control.cycle_result();
+        let error = result.expect_err("both dependent families remain unsettled");
+        let deferred = error.downcast_ref::<SnapshotEntityDeferred>().unwrap();
+        assert_eq!(
+            deferred.count, 2,
+            "early dependency scope; message_only={message_only}"
+        );
         let posts = control.server.raw_batches.lock().unwrap().clone();
         assert_eq!(
             posts.len(),
@@ -3718,7 +3726,13 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         .unwrap();
         drop(_early);
         let _due = money::PageClockForTest::new(&control.support, now + 300);
-        control.cycle();
+        let result = control.cycle_result();
+        let error = result.expect_err("listing the dependency does not settle either family");
+        let deferred = error.downcast_ref::<SnapshotEntityDeferred>().unwrap();
+        assert_eq!(
+            deferred.count, 2,
+            "listed dependency scope; message_only={message_only}"
+        );
         assert_eq!(
             control.server.raw_batches.lock().unwrap().len(),
             2,
