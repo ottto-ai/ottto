@@ -36873,7 +36873,11 @@ impl ScanIndex {
         source: SnapshotSource,
         snapshots: &mut Vec<SnapshotItem>,
     ) -> usize {
-        if source != SnapshotSource::ClaudeCode || self.claude_history_emission.files.is_empty() {
+        if source != SnapshotSource::ClaudeCode {
+            return 0;
+        }
+        self.hold_parsed_unknown_claude_aliases(snapshots);
+        if self.claude_history_emission.files.is_empty() {
             return 0;
         }
         if claude_reemission_stop_latched() {
@@ -36894,6 +36898,62 @@ impl ScanIndex {
             false
         });
         before - snapshots.len()
+    }
+
+    /// An unseen filename can disclose a different logical family only when
+    /// parsed. Apply that family's existing UNKNOWN hold before finalization,
+    /// so a fresh physical alias cannot advance a tuple or escape as a new body.
+    fn hold_parsed_unknown_claude_aliases(&mut self, snapshots: &[SnapshotItem]) {
+        let Some(support) = self.active_request_money_support_dir.as_deref() else {
+            return;
+        };
+        if !claude_request_money::request_owned_live(support) {
+            return;
+        }
+        for snapshot in snapshots {
+            if !crate::snapshot_sync::unknown_recovery::blocked_file(
+                support,
+                "",
+                Some(claude_snapshot_family_root_ref(snapshot)),
+            ) {
+                continue;
+            }
+            let Some(source) = snapshot.source_file_fingerprint.as_ref() else {
+                continue;
+            };
+            if let Some(gated) = self.claude_history_emission.files.get_mut(source) {
+                if gated.held.is_none() {
+                    gated.held = Some(HistoryHold::UnknownOutcome);
+                }
+                continue;
+            }
+            let Some((key, entry)) = self
+                .files
+                .iter()
+                .find(|(_, entry)| &entry.source_file_fingerprint == source)
+            else {
+                continue;
+            };
+            let previous = (entry.last_snapshot_fingerprint.is_some()
+                || entry.last_upload_body_witness.is_some()
+                || self.confirmed_empty_files.contains(key))
+            .then(|| claude_history_upgrade::HeldUploadTuple {
+                last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
+                last_upload_body_witness: entry.last_upload_body_witness.clone(),
+                revision: entry.effective_upload_body_witness_revision,
+                file_snapshot_fingerprints: self.file_snapshot_fingerprints.get(key).cloned(),
+                confirmed_empty: self.confirmed_empty_files.contains(key),
+            });
+            self.claude_history_emission.files.insert(
+                source.clone(),
+                claude_history_upgrade::GatedHistory {
+                    index_key: key.clone(),
+                    held: Some(HistoryHold::UnknownOutcome),
+                    previous,
+                    local: BTreeSet::new(),
+                },
+            );
+        }
     }
 
     /// Hook for resend paths outside the page (StateMissing #706 re-offer

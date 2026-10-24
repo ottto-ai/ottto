@@ -3352,6 +3352,71 @@ fn p2a_unknown_mixed_batch_new_list_sends_none_unrelated_work_continues() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_new_filename_alias_cannot_escape_family_custody() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle_deferred();
+    let original = std::fs::read_to_string(control.transcript()).unwrap();
+    let alias = control
+        .transcript()
+        .with_file_name("00000000-0000-4000-8000-000000000000.jsonl");
+    std::fs::write(&alias, &original).unwrap();
+    let unrelated = "33333333-3333-4333-8333-333333333333";
+    std::fs::write(
+        control
+            .transcript()
+            .with_file_name(format!("{unrelated}.jsonl")),
+        original
+            .replace(IDENTITY_PIPELINE_ROOT, unrelated)
+            .replace("req_1", "alias-control-fresh-1")
+            .replace("req_2", "alias-control-fresh-2"),
+    )
+    .unwrap();
+    *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+    drop(clock);
+    let _early = money::PageClockForTest::new(&control.support, now + 299);
+    control.cycle();
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert_eq!(
+        posts.len(),
+        2,
+        "only unrelated fresh work may POST before the replay slot"
+    );
+    let last: serde_json::Value = serde_json::from_str(&posts[1]).unwrap();
+    let items = last["snapshots"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["source_session_id"], unrelated);
+    let saved = control.saved();
+    assert!(
+        saved
+            .files
+            .get(alias.to_string_lossy().as_ref())
+            .is_some_and(|entry| entry.effective_upload_body_witness_revision != 3),
+        "a newly parsed alias must not acquire an uncertain family's history stamp"
+    );
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    assert!(unknown_recovery::active_for_test(&control.support)
+        .iter()
+        .any(|m| !m.ack_saved && m.posts == 1));
+    eprintln!("MONEY_UNKNOWN_ALIAS parsed_family_hold=true alias_post=false unrelated_post=true stamp_withheld=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_physical_three_replays_exhaustion_and_normal_return() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
