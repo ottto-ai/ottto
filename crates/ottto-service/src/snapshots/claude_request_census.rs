@@ -1981,6 +1981,10 @@ impl Serialize for ClaudeRequestCensusShadowState {
 /// drained with constant space and replaced by null; interpretation stops at
 /// MAX_RAW_BYTES. Draining necessarily remains linear in the input bytes.
 /// The token scanner never converts a number or copies an unbounded string.
+/// Production reads go through the lenient reader, which decodes each census
+/// field alone (`decode_census_field`) and applies `finish_decode` once; this
+/// whole-index Serde decode is the reference the tests compare against.
+#[cfg(test)]
 pub(super) fn decode_index<R: std::io::Read>(reader: R) -> serde_json::Result<ScanIndex> {
     CensusRead::new(reader).decode()
 }
@@ -2218,6 +2222,7 @@ impl<R: std::io::Read> CensusRead<R> {
         }
     }
 
+    #[cfg(test)]
     fn decode(&mut self) -> serde_json::Result<ScanIndex> {
         // Serde's io::Bytes uses BufReader's buffered read_byte specialization.
         // Buffering only the underlying file would still call our Read per byte.
@@ -3756,8 +3761,9 @@ pub(crate) enum SourceRearm<'a> {
     /// proved by this pass; it keys the one-shot N3 revoke.
     Identity(&'a str),
     /// Not identity work: a repair of damaged state, carried re-parse debt or
-    /// a recovery re-read. An earlier checkpoint's N3 hold stays.
-    Other(&'static str),
+    /// a recovery re-read. An earlier checkpoint's N3 hold stays. The value
+    /// names the site's classification for review; nothing reads it.
+    Other(#[allow(dead_code)] &'static str),
 }
 
 /// SI-724-B1b: the one path that clears a Claude index entry's source
