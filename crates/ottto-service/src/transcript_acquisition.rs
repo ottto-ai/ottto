@@ -203,6 +203,15 @@ impl Checkpoint {
     pub(crate) fn sealed_offset(&self) -> u64 {
         self.samples.sealed_offset
     }
+    /// Whether the opened object `file` still carries exactly the stamp this
+    /// checkpoint committed: no append, truncation, in-place edit or
+    /// metadata/ctime change to it since. P1-RETAIN R0's gate before a release
+    /// for this copy. It reads the open handle, so a path replaced after
+    /// revalidation is not seen here; the next take's `Replaced` check catches
+    /// it (at most one wasted release).
+    pub(crate) fn stamp_matches(&self, file: &File) -> io::Result<bool> {
+        Ok(FileStamp::capture(file.metadata()?)? == self.stamp)
+    }
     pub(crate) fn audit_debt(&self) -> Option<AuditDebt> {
         self.audit_debt
     }
@@ -650,6 +659,20 @@ fn select_mode(
 }
 
 impl ReadPlan {
+    /// The admission hint of the checkpoint this plan commits: the commit
+    /// refuses any source stamp but this plan's, and carries it unchanged
+    /// (`Checkpoint::modified_hint`). P1-RETAIN R0 ranks the completed copy
+    /// from it before the commit.
+    pub(crate) fn modified_hint(&self) -> (i64, i64) {
+        #[cfg(unix)]
+        {
+            self.stamp.modified
+        }
+        #[cfg(not(unix))]
+        {
+            (0, 0)
+        }
+    }
     /// Full decisions reset only transient reduction. Durable output/ACK state is
     /// untouched. A full audit debt is cleared only after native completion below.
     pub(crate) fn prepare(
