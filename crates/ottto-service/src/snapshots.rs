@@ -34622,23 +34622,51 @@ pub(crate) fn load_claude_settings_defaults(
     ClaudeConfigDefaultsOutcome::Configured(defaults)
 }
 
-/// Read one Claude Code settings file into JSON.
-///
+/// Read one Claude Code settings file into JSON; `None` for any failure.
+fn load_claude_settings_document(path: &Path) -> Option<Value> {
+    match read_claude_settings_document(path) {
+        ClaudeSettingsDocument::Parsed(document) => Some(document),
+        ClaudeSettingsDocument::Missing | ClaudeSettingsDocument::Failed => None,
+    }
+}
+
+/// One Claude Code settings file: absent, present but not usable (unreadable,
+/// not a regular file, oversized or malformed), or parsed.
+#[derive(Debug)]
+pub(crate) enum ClaudeSettingsDocument {
+    Missing,
+    Failed,
+    Parsed(Value),
+}
+
 /// Read line-by-line to satisfy the streaming guard (no whole-file reads in this
 /// module); settings files are small, so the accumulated string is fine.
-fn load_claude_settings_document(path: &Path) -> Option<Value> {
-    let metadata = fs::metadata(path).ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_CLAUDE_SETTINGS_FILE_BYTES {
-        return None;
-    }
-    let file = File::open(path).ok()?;
+pub(crate) fn read_claude_settings_document(path: &Path) -> ClaudeSettingsDocument {
+    let opened = fs::metadata(path).and_then(|metadata| {
+        if !metadata.is_file() || metadata.len() > MAX_CLAUDE_SETTINGS_FILE_BYTES {
+            return Err(std::io::Error::other("not a bounded settings file"));
+        }
+        File::open(path)
+    });
+    let file = match opened {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return ClaudeSettingsDocument::Missing
+        }
+        Err(_) => return ClaudeSettingsDocument::Failed,
+    };
     let mut raw = String::new();
     for line in BufReader::new(file).lines() {
-        let line = line.ok()?;
+        let Ok(line) = line else {
+            return ClaudeSettingsDocument::Failed;
+        };
         raw.push_str(line.as_str());
         raw.push('\n');
     }
-    serde_json::from_str::<Value>(&raw).ok()
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(document) => ClaudeSettingsDocument::Parsed(document),
+        Err(_) => ClaudeSettingsDocument::Failed,
+    }
 }
 
 fn apply_claude_settings_scope(

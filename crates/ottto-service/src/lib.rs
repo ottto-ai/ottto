@@ -31,6 +31,7 @@ pub mod detected_uses;
 mod external_scheduler_attribution;
 #[cfg(unix)]
 pub(crate) mod fd_guard;
+mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
