@@ -1580,3 +1580,116 @@ fn seen_marker_without_the_list_pauses_all_history() {
         crate::snapshots::restart_claude_reemission_stop_for_test();
     }
 }
+
+fn history_subagent_line(session: &str, agent: &str) -> String {
+    format!(
+        "{{\"timestamp\":\"2026-08-02T07:00:10Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{session}_{agent}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+    )
+}
+
+/// The members the history gate held only through a listed family root
+/// whose root file is absent, as the local diagnostics recorded them.
+fn family_closure_root_absent_excluded(lines: &[serde_json::Value]) -> u64 {
+    lines
+        .iter()
+        .filter(|line| line["stage"] == "claude_reemission_family_closure_root_absent_excluded")
+        .map(|line| {
+            line["counts"]["claude_reemission_family_closure_root_absent_excluded"]
+                .as_u64()
+                .expect("count")
+        })
+        .sum()
+}
+
+/// StateMissing M1 (SOURCE d680b524): the first family gets subagent files
+/// `agents`, every file is sent at revision 1, then its root transcript is
+/// removed, `listed` is installed as the list and the index is quarantined.
+/// The rebuilt cycle runs the full prepare/finish path under the captured
+/// local diagnostics.
+fn rootless_family_rebuild(
+    name: &str,
+    agents: &[&str],
+    listed: &str,
+) -> (HistoryOutcome, Vec<serde_json::Value>) {
+    let fixture = HistoryFixture::new(name);
+    let family = HISTORY_SESSIONS[0];
+    let subagents = fixture.root.join(family).join("subagents");
+    std::fs::create_dir_all(&subagents).expect("create synthetic subagents");
+    for agent in agents {
+        std::fs::write(
+            subagents.join(format!("{agent}.jsonl")),
+            history_subagent_line(family, agent),
+        )
+        .expect("write synthetic subagent transcript");
+    }
+    let baseline = fixture.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
+    for agent in agents {
+        assert!(
+            baseline.uploaded.contains(&format!("{family}_{agent}")),
+            "the subagent is sent before the rebuild: {:?}",
+            baseline.uploaded
+        );
+    }
+    std::fs::remove_file(fixture.root.join(format!("{family}.jsonl")))
+        .expect("remove the root transcript");
+    fixture.install_list(&[listed]);
+    fixture.corrupt_index();
+    crate::local_resource_diagnostics::capture(|| {
+        fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2)
+    })
+}
+
+/// Nothing of the first family reached the upload or the emitted snapshots;
+/// the unlisted families are paced through and sent.
+fn assert_rootless_family_held(outcome: &HistoryOutcome) {
+    let family = HISTORY_SESSIONS[0];
+    assert!(
+        outcome.uploaded.iter().all(|id| !id.starts_with(family)),
+        "{:?}",
+        outcome.uploaded
+    );
+    assert!(outcome
+        .scan
+        .snapshots
+        .iter()
+        .all(|item| !item.source_session_id.starts_with(family)));
+    for session in &HISTORY_SESSIONS[1..] {
+        assert!(
+            outcome.uploaded.contains(*session),
+            "{:?}",
+            outcome.uploaded
+        );
+    }
+}
+
+/// SOURCE d680b524 (a): the list names only `R_agent-a`, `R.jsonl` is gone,
+/// and the index is rebuilt. A sibling is not offered whether traversal
+/// decides it after agent-a (`agent-b`) or before it (`agent-0`), and each
+/// sibling counts once as held through the absent root. agent-a itself is
+/// listed by its own line and is not counted.
+#[test]
+fn listed_member_holds_its_siblings_through_the_pipeline_without_the_root_file() {
+    for (sibling, name) in [
+        ("agent-b", "history-upgrade-rootless-after"),
+        ("agent-0", "history-upgrade-rootless-before"),
+    ] {
+        let listed = format!("{}_agent-a", HISTORY_SESSIONS[0]);
+        let (outcome, lines) = rootless_family_rebuild(name, &["agent-a", sibling], &listed);
+        assert_rootless_family_held(&outcome);
+        assert_eq!(family_closure_root_absent_excluded(&lines), 1, "{sibling}");
+    }
+}
+
+/// SOURCE d680b524 (b), the reverse: the list names the root `R`, `R.jsonl`
+/// is gone and only subagent files remain. None is offered, and each counts
+/// as held through the absent root.
+#[test]
+fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file() {
+    let (outcome, lines) = rootless_family_rebuild(
+        "history-upgrade-rootless-listed-root",
+        &["agent-a", "agent-b"],
+        HISTORY_SESSIONS[0],
+    );
+    assert_rootless_family_held(&outcome);
+    assert_eq!(family_closure_root_absent_excluded(&lines), 2);
+}

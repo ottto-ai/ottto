@@ -8,8 +8,9 @@
 //! line is the lowercase hex SHA-256 of one exact, full `source_session_id`.
 //! Families are listed by their ROOT digest. A member-only line still
 //! excludes its whole family: the caller closes the list over the indexed
-//! roots, so no sibling's adoption can cancel a carry or re-arm the listed
-//! member. Blank lines and `#` lines are ignored. No id, digest or path is logged; only counts.
+//! roots at load, and over the members on disk before each family
+//! candidate's decision, root file present or not, so no sibling's adoption
+//! can cancel a carry or re-arm the listed member. Blank lines and `#` lines are ignored. No id, digest or path is logged; only counts.
 //!
 //! The list fails closed:
 //! - Never installed (no file, no seen-marker): adoption-only files whose
@@ -35,9 +36,10 @@
 //! Only adoption is gated; changed and new files are never held here.
 
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 const FILE_NAME: &str = "claude_code-reemission-exclusions.txt";
 const SEEN_FILE_NAME: &str = "claude_code-reemission-exclusions.seen";
@@ -52,6 +54,13 @@ const MAX_CLOSED_DIGESTS: usize = 2 * MAX_LINES;
 /// revision 2 row's cutoff; each revision carries its own in the history
 /// policy table (F4b).
 pub(super) const NO_LIST_HOLD_BEFORE_UNIX_SECONDS: u64 = 1_792_540_800;
+/// Family roots one pass remembers as walked (StateMissing M1). Past it, a
+/// family is walked again for each of its candidates: slower, never skipped.
+const MAX_WALKED_ROOTS: usize = 4_096;
+
+/// A family's `<root>/subagents` directory as stat-ed before its walk:
+/// modification time and inode, or `None` when it did not exist.
+pub(crate) type MemberDirStamp = Option<(SystemTime, u64)>;
 
 /// Where the list stands this cycle. `as_str` is the plain local status reason.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -127,9 +136,13 @@ pub(crate) struct ReemissionExclusions {
     state: ListState,
     /// Read only while `state` is `MissingAfterInstall`.
     missing_cause: MissingCause,
+    /// Family roots whose member walk this pass found no listed member, by
+    /// the directory stamp taken before that walk. A load starts it empty and
+    /// `begin_pass` clears it.
+    walked_roots: BTreeMap<String, MemberDirStamp>,
 }
 
-crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state, missing_cause);
+crate::heap_layout_bound::fields!(ReemissionExclusions; digests, state, missing_cause, walked_roots);
 
 impl ReemissionExclusions {
     pub(crate) fn path(support_dir: &Path) -> PathBuf {
@@ -207,6 +220,7 @@ impl ReemissionExclusions {
             digests,
             state: ListState::Installed,
             missing_cause: MissingCause::default(),
+            walked_roots: BTreeMap::new(),
         }
     }
 
@@ -215,6 +229,7 @@ impl ReemissionExclusions {
             digests: BTreeSet::new(),
             state,
             missing_cause: MissingCause::default(),
+            walked_roots: BTreeMap::new(),
         }
     }
 
@@ -338,6 +353,32 @@ impl ReemissionExclusions {
             return;
         }
         self.digests.insert(root_digest.as_str().to_owned());
+    }
+
+    /// True when this member's own full id (`root_stem`) is listed, not only
+    /// its family root.
+    pub(crate) fn lists_member(&self, root_session_id: &str, subagent_stem: &str) -> bool {
+        !self.is_empty() && self.contains(&HexDigest::of(root_session_id, Some(subagent_stem)))
+    }
+
+    /// Forget the families walked so far: each scan pass walks afresh.
+    pub(crate) fn begin_pass(&mut self) {
+        self.walked_roots.clear();
+    }
+
+    /// This pass already walked `root`'s members, found none listed, and its
+    /// member directory still has the stamp seen before that walk.
+    pub(crate) fn members_walked(&self, root: &str, stamp: &MemberDirStamp) -> bool {
+        self.walked_roots.get(root) == Some(stamp)
+    }
+
+    /// Remember a walk that found no listed member, within `MAX_WALKED_ROOTS`.
+    pub(crate) fn note_members_walked(&mut self, root: &str, stamp: MemberDirStamp) {
+        if let Some(walked) = self.walked_roots.get_mut(root) {
+            *walked = stamp;
+        } else if self.walked_roots.len() < MAX_WALKED_ROOTS {
+            self.walked_roots.insert(root.to_owned(), stamp);
+        }
     }
 
     /// True when the exact full id of the family root or of this member
@@ -656,6 +697,33 @@ mod tests {
         closed.close_over_roots(roots.iter().map(|root| (root.as_str(), "agent")));
         assert_eq!(closed.state(), ListState::Installed);
         assert_eq!(closed.digests.len(), MAX_CLOSED_DIGESTS);
+    }
+
+    /// The walked-roots memo matches only the same stamp, stays within its
+    /// bound, and a new pass forgets it.
+    #[test]
+    fn walked_roots_memo_is_stamped_bounded_and_per_pass() {
+        let mut parsed =
+            ReemissionExclusions::parse(format!("{}\n", digest("root-b_agent-1")).as_bytes());
+        let stamp = Some((SystemTime::UNIX_EPOCH, 7));
+        assert!(!parsed.members_walked("root-a", &stamp));
+        parsed.note_members_walked("root-a", stamp);
+        assert!(parsed.members_walked("root-a", &stamp));
+        assert!(
+            !parsed.members_walked("root-a", &None),
+            "a changed stamp walks again"
+        );
+        assert!(!parsed.members_walked("root-a", &Some((SystemTime::UNIX_EPOCH, 8))));
+        parsed.begin_pass();
+        assert!(!parsed.members_walked("root-a", &stamp));
+        for slot in 0..=MAX_WALKED_ROOTS {
+            parsed.note_members_walked(&format!("root-{slot}"), None);
+        }
+        assert_eq!(parsed.walked_roots.len(), MAX_WALKED_ROOTS);
+        assert!(
+            !parsed.members_walked(&format!("root-{MAX_WALKED_ROOTS}"), &None),
+            "past the bound a family is walked again"
+        );
     }
 
     #[test]
