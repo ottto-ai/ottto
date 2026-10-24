@@ -94,9 +94,9 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 /// The shared per-page I/O budget of every shadow reader.
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
-/// Synchronous shadow-call allowance in every build, including closing
-/// and handoff. Native parsing/finalizers precede this call under the lock;
-/// capture work has its own 100 ms cumulative allowance.
+/// Total synchronous money work allowance, including capture callbacks,
+/// shadow closing and handoff. Already-spent capture work is debited on
+/// shadow entry; native parsing and unrelated sync work are outside it.
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
 /// Leave bounded closing work inside the total, rather than after expiry.
 const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
@@ -1213,8 +1213,10 @@ struct PageEnd<'a> {
     now: u64,
     census_complete: bool,
     started: Instant,
-    /// The page deadline: the ledger's save stops at it too.
+    /// Optional body work stops before the closing reserve.
     deadline: Instant,
+    /// Housekeeping stops here, leaving time for handoff and return.
+    close_deadline: Instant,
     tail: ClaudeTelemetryTailCounts,
     rows: ClaudeRowCounts,
     scope: claude_request_ledger::ClaudeScopeDebt,
@@ -1305,10 +1307,13 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let deadline = started + PAGE_MAX_ELAPSED - PAGE_CLOSE_RESERVE;
+    let capture_us = capture::take_capture_us(&shadow_scope(support_dir));
+    let remaining = PAGE_MAX_ELAPSED.saturating_sub(Duration::from_micros(capture_us));
+    let deadline = started + remaining.saturating_sub(PAGE_CLOSE_RESERVE);
+    let close_deadline = started + remaining.saturating_sub(Duration::from_millis(10));
     let snapshot = next_snapshot();
     let mut counts = ClaudeRequestMoneyShadowCounts {
-        capture_us: capture::take_capture_us(&shadow_scope(support_dir)),
+        capture_us,
         capture_reserved_bytes: capture::capture_reserved() as u64,
         ..Default::default()
     };
@@ -1318,6 +1323,7 @@ fn shadow_page_with_coverage(
         census_complete,
         started,
         deadline,
+        close_deadline,
         tail: Default::default(),
         rows: Default::default(),
         scope: Default::default(),
@@ -1723,11 +1729,11 @@ fn shadow_page_with_coverage(
     }
     // Optional body work has ended. Housekeeping owns the closing slice;
     // it must not inherit the already-expired body deadline.
-    end.deadline = started + PAGE_MAX_ELAPSED - Duration::from_millis(10);
     counts.family_memos_dropped = drop_old_family_memos(
         ledger,
         now,
-        end.deadline.min(Instant::now() + Duration::from_millis(10)),
+        end.close_deadline
+            .min(Instant::now() + Duration::from_millis(10)),
     );
     // This only selects optional captures; it grants no publication or
     // coverage evidence. Reached turns yield to deferred turns on a Full
@@ -1738,7 +1744,8 @@ fn shadow_page_with_coverage(
             memos
                 .iter()
                 .map(|memo| (memo.key.as_str(), memo.observed_unix)),
-            end.deadline.min(Instant::now() + Duration::from_millis(10)),
+            end.close_deadline
+                .min(Instant::now() + Duration::from_millis(10)),
         );
     } else {
         capture::forget_plan(&scope_key);
@@ -2674,7 +2681,7 @@ fn hand_off_reserved_buffer(
     if let Some(ledger) = ledger.as_deref_mut() {
         match ledger.take_save(store::SavePolicy {
             support_dir: end.support_dir,
-            deadline: end.deadline,
+            deadline: end.close_deadline,
             utc_day: utc_day(end.now),
             min_interval: store::SAVE_MIN_INTERVAL,
         }) {
@@ -2684,7 +2691,7 @@ fn hand_off_reserved_buffer(
                 reservations.push(reservation);
                 save = Some(taken);
             }
-            None if Instant::now() >= end.deadline => counts.ledger_save_late = 1,
+            None if Instant::now() >= end.close_deadline => counts.ledger_save_late = 1,
             None => counts.ledger_save_refused = u64::from(ledger.dirty_shards() > 0),
         }
         counts.admitted_peak_bytes = counts
@@ -2744,7 +2751,7 @@ fn emit(
     let fresh = cached.filter(|(at, _)| at.elapsed() < STATE_COUNTS_REFRESH);
     let walked = match fresh {
         Some(_) => None,
-        None => claude_request_ledger::ledger_state_counts(census, ledger, end.deadline),
+        None => claude_request_ledger::ledger_state_counts(census, ledger, end.close_deadline),
     };
     let state = match (walked, cached) {
         (Some(state), _) => {
