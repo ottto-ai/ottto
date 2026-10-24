@@ -274,6 +274,14 @@ impl ReemissionExclusions {
                     .is_some_and(|stem| self.contains(&HexDigest::of(root_session_id, Some(stem)))))
     }
 
+    /// Money's separate consumer predicate; adoption semantics stay unchanged.
+    pub(crate) fn protected_root(&self, root: &str) -> bool {
+        self.excludes(root, None)
+    }
+    pub(crate) fn pauses_emission(&self) -> bool {
+        self.pauses_adoption()
+    }
+
     fn contains(&self, digest: &HexDigest) -> bool {
         self.digests.contains(digest.as_str())
     }

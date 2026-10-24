@@ -5,6 +5,14 @@ use super::*;
 #[derive(Clone, Copy, Debug)]
 enum FinishOutcome {
     Accept,
+    LostCommitted,
+    LostUncommitted,
+    HttpFailure {
+        status: u16,
+        retry_after: u64,
+    },
+    MoneyHeld,
+    MoneyRouteUnavailable,
     Permanent,
     Retryable,
     PermanentStatusFailure,
@@ -29,12 +37,18 @@ impl FinishOutcome {
     }
 }
 
+type FinishPostHook = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
 struct FinishServer {
     url: String,
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     offered: Arc<Mutex<Vec<serde_json::Value>>>,
+    raw_batches: Arc<Mutex<Vec<String>>>,
+    committed: Arc<Mutex<BTreeMap<String, String>>>,
     terminal: Arc<Mutex<Vec<serde_json::Value>>>,
+    outcome: Arc<Mutex<FinishOutcome>>,
+    before_post: FinishPostHook,
 }
 
 impl FinishServer {
@@ -47,8 +61,16 @@ impl FinishServer {
         let done = stop.clone();
         let offered = Arc::new(Mutex::new(Vec::new()));
         let bodies = offered.clone();
+        let raw_batches = Arc::new(Mutex::new(Vec::new()));
+        let raw_posts = raw_batches.clone();
+        let committed = Arc::new(Mutex::new(BTreeMap::new()));
+        let stored = committed.clone();
         let terminal = Arc::new(Mutex::new(Vec::new()));
         let statuses = terminal.clone();
+        let outcome = Arc::new(Mutex::new(outcome));
+        let active_outcome = outcome.clone();
+        let before_post: FinishPostHook = Arc::new(Mutex::new(None));
+        let post_hook = before_post.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -68,6 +90,7 @@ impl FinishServer {
                 } else {
                     serde_json::from_str(raw).unwrap()
                 };
+                let outcome = *active_outcome.lock().unwrap();
                 let mut status = "200 OK";
                 let response = if request.contains("/relay-token") {
                     serde_json::json!({"token":"synthetic-finish-token","expires_at":"2099-01-01T00:00:00Z"})
@@ -92,6 +115,43 @@ impl FinishServer {
                 } else if let Some(items) = value.get("snapshots").and_then(|v| v.as_array()) {
                     assert!(!items.is_empty());
                     bodies.lock().unwrap().extend(items.iter().cloned());
+                    raw_posts.lock().unwrap().push(raw.to_owned());
+                    if matches!(
+                        outcome,
+                        FinishOutcome::Accept | FinishOutcome::LostCommitted
+                    ) {
+                        for item in items {
+                            stored.lock().unwrap().insert(
+                                item["source_session_id"].as_str().unwrap().to_owned(),
+                                item["snapshot_fingerprint"].as_str().unwrap().to_owned(),
+                            );
+                        }
+                    }
+                    if matches!(
+                        outcome,
+                        FinishOutcome::LostCommitted | FinishOutcome::LostUncommitted
+                    ) {
+                        continue; // close a real batch connection without a response
+                    }
+
+                    if let Some(hook) = post_hook.lock().unwrap().take() {
+                        hook();
+                    }
+                    if let FinishOutcome::HttpFailure {
+                        status,
+                        retry_after,
+                    } = outcome
+                    {
+                        let body = "{\"detail\":\"synthetic refusal\"}";
+                        write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        stream.flush().unwrap();
+                        continue;
+                    }
+                    if matches!(outcome, FinishOutcome::MoneyRouteUnavailable) {
+                        bounded_native_response(&mut stream, "503 Service Unavailable",
+                            &serde_json::json!({"details":{"code":"request_owned_usage_route_unavailable"}}).to_string());
+                        continue;
+                    }
                     let retryable = matches!(outcome, FinishOutcome::Retryable);
                     let references = items
                         .iter()
@@ -105,6 +165,7 @@ impl FinishServer {
                         .collect::<Vec<_>>();
                     let reason = match outcome {
                         FinishOutcome::Dominated { reason, .. } => reason,
+                        FinishOutcome::MoneyHeld => "usage_decrease_held_for_review",
                         _ => "invalid",
                     };
                     let rejected = items
@@ -114,7 +175,7 @@ impl FinishServer {
                                 "source_session_id":item["source_session_id"],
                                 "snapshot_fingerprint":item["snapshot_fingerprint"],
                                 "reason":reason,"detail":"synthetic finish refusal",
-                                "permanent":true,"occurrence_count":1
+                                "permanent":!matches!(outcome, FinishOutcome::MoneyHeld),"occurrence_count":1
                             })
                         })
                         .collect::<Vec<_>>();
@@ -165,7 +226,11 @@ impl FinishServer {
             stop,
             worker: Some(worker),
             offered,
+            raw_batches,
+            committed,
             terminal,
+            outcome,
+            before_post,
         }
     }
 }
@@ -626,3 +691,4 @@ pub(crate) mod prior_index_lifetime_tests {
 pub(crate) mod reason_reoffer_pipeline_tests {
     include!("reason_reoffer_pipeline_tests.rs");
 }
+include!("p2a_round3_tests.rs");

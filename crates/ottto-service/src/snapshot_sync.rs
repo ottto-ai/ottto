@@ -25,9 +25,9 @@ use crate::snapshots::{
     finalize_scan_after_policy_with_body_witness, prepare_codex_recovery_diagnostics,
     snapshot_quarantine_deadline_is_bounded, snapshot_quarantine_witness,
     snapshot_upload_body_witness, validate_snapshot_batch_request, ScanIndex, SnapshotBatchRequest,
-    SnapshotItem, SnapshotQuarantineDisposition, SnapshotQuarantineRecord,
-    SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest, SnapshotUploadPolicy,
-    SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
+    SnapshotHoldKind, SnapshotHoldRetry, SnapshotItem, SnapshotQuarantineDisposition,
+    SnapshotQuarantineRecord, SnapshotQuarantineWitness, SnapshotSource, SnapshotSourceManifest,
+    SnapshotUploadPolicy, SourceScanResult, UnsettledUploadCause, CONTEXT_CURVE_CONTRACT_VERSION,
     MAX_BACKFILL_FILES_PER_SOURCE, MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
     SNAPSHOT_QUARANTINE_RETRY_SECONDS, SNAPSHOT_SCHEMA_VERSION, SNAPSHOT_STATUS_SCHEMA_VERSION,
 };
@@ -48,8 +48,10 @@ use time::{format_description::well_known::Rfc3339, Duration as TimeDuration, Of
 use zeroize::Zeroize;
 
 mod continuation;
+pub(crate) mod money_resume;
 mod reason_reoffer;
 mod rejection_log;
+pub(crate) mod unknown_recovery;
 
 // Direct API host; the apex `ottto.net/backend` proxy is retired in the marketing cutover.
 const DEFAULT_API_BASE_URL: &str = "https://api.ottto.net";
@@ -626,7 +628,12 @@ impl LocalHoldSettlement {
             account_holds_recorded,
         );
         disposition.retain_uploadable(&mut scan_result.snapshots);
-        let retry_pending_family_count = index.claude_usage_authority_pending_count();
+        let retry_pending_family_count =
+            if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
+                index.request_money_v1_pending_count()
+            } else {
+                index.claude_usage_authority_pending_count()
+            };
         Self {
             held_entity_count,
             retry_pending_family_count,
@@ -1308,28 +1315,36 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .as_ref()
             .expect("upload progress always has an active quarantine witness");
-        let mut candidates = self
-            .quarantined_fingerprints
-            .iter()
-            .filter(|(fingerprint, record)| {
-                !self
+        let mut ordinary = Vec::new();
+        let mut holds = Vec::new();
+        for (fingerprint, record) in &self.quarantined_fingerprints {
+            if record.disposition != SnapshotQuarantineDisposition::RetryPending
+                || self
                     .permanent_rejections
-                    .get(*fingerprint)
+                    .get(fingerprint)
                     .is_some_and(|permanent| {
                         record.upload_body_witness.as_deref()
                             == Some(permanent.body_witness.as_str())
                     })
-                    && record.disposition == SnapshotQuarantineDisposition::RetryPending
-                    && (&record.witness != active || record.retry_after_unix_seconds <= now)
-            })
-            .map(|(fingerprint, record)| {
-                (
+            {
+                continue;
+            }
+            if let Some(hold) = &record.hold {
+                // Hold cadence and allowance precede every code-witness bypass.
+                if record.retry_after_unix_seconds <= now && hold.allowance(now) {
+                    holds.push((record.retry_after_unix_seconds, fingerprint.clone()));
+                }
+            } else if &record.witness != active || record.retry_after_unix_seconds <= now {
+                ordinary.push((
                     (&record.witness == active) as u8,
                     record.retry_after_unix_seconds,
                     fingerprint.clone(),
-                )
-            })
-            .collect::<BTreeSet<_>>();
+                ));
+            }
+        }
+        holds.sort();
+        let held_slots = holds.len().min(25);
+        let mut candidates = ordinary;
         let mut reoffer_changed = false;
         let mut due_reoffers = BTreeMap::new();
         if let Some(scope) = reoffer {
@@ -1345,11 +1360,12 @@ impl SnapshotUploadProgress {
                     .map(|(fingerprint, (due, _))| (1u8, *due, fingerprint.clone())),
             );
         }
+        candidates.sort();
         let reoffer_now = reoffer.map_or(0, |scope| scope.now);
         let mut retry = BTreeSet::new();
         for (_, _, fingerprint) in candidates {
             if retry.len() + self.active_reason_reoffers.len()
-                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+                >= SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE - held_slots
             {
                 break;
             }
@@ -1382,6 +1398,16 @@ impl SnapshotUploadProgress {
                 }
             }
         }
+        retry.extend(
+            holds
+                .into_iter()
+                .take(
+                    SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE
+                        - retry.len()
+                        - self.active_reason_reoffers.len(),
+                )
+                .map(|(_, fingerprint)| fingerprint),
+        );
         self.reason_reoffer_counts.deferred_budget = due_reoffers.len();
         let active = self
             .active_quarantine_witness
@@ -1390,19 +1416,16 @@ impl SnapshotUploadProgress {
         for fingerprint in &retry {
             let record = self
                 .quarantined_fingerprints
-                .get(fingerprint)
-                .expect("selected quarantine retry exists")
-                .clone();
-            self.quarantined_fingerprints.insert(
-                fingerprint.clone(),
-                SnapshotQuarantineRecord {
-                    witness: active.clone(),
-                    retry_after_unix_seconds: quarantine_retry_after(fingerprint),
-                    upload_body_witness: record.upload_body_witness,
-                    failed_reconstruction_count: record.failed_reconstruction_count,
-                    disposition: record.disposition,
-                },
-            );
+                .get_mut(fingerprint)
+                .expect("selected retry exists");
+            record.witness = active.clone();
+            record.retry_after_unix_seconds = match &mut record.hold {
+                Some(hold) => {
+                    hold.consume(now);
+                    hold.retry_after(fingerprint, now)
+                }
+                None => quarantine_retry_after(fingerprint),
+            };
         }
         self.active_quarantine_retries = retry;
         !self.active_quarantine_retries.is_empty() || reoffer_changed
@@ -1744,6 +1767,9 @@ impl SnapshotUploadProgress {
         self.quarantined_fingerprints.insert(
             fingerprint.to_string(),
             SnapshotQuarantineRecord {
+                hold: None,
+                version_skew_attempts: 0,
+
                 witness,
                 retry_after_unix_seconds: if disposition
                     == SnapshotQuarantineDisposition::UnprovenTerminal
@@ -1807,6 +1833,39 @@ impl SnapshotUploadProgress {
         self.active_reason_reoffers.remove(fingerprint);
     }
 
+    fn quarantine_held_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        kind: SnapshotHoldKind,
+    ) {
+        let now = current_unix_seconds();
+        let previous = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
+            .and_then(|record| record.hold.clone())
+            .filter(|hold| hold.kind == kind);
+        let mut hold = previous.clone().unwrap_or(SnapshotHoldRetry {
+            kind,
+            stage: 0,
+            first_held_unix: now,
+            day_start_unix: now,
+            retries_in_day: 0,
+        });
+        if previous.is_some() && kind == SnapshotHoldKind::Held {
+            hold.stage = hold.stage.saturating_add(1).min(2);
+        }
+        self.quarantine_retryable_body(fingerprint, body_witness);
+        self.permanent_rejections.remove(fingerprint);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("record inserted");
+        record.retry_after_unix_seconds = hold.retry_after(fingerprint, now);
+        record.hold = Some(hold);
+    }
+
     /// The server answered `unchanged` with an `unchanged_basis`: it did not
     /// store this body. Hold the exact body terminally, like a permanent
     /// refusal of the same body before that answer existed, but record no
@@ -1862,6 +1921,34 @@ impl SnapshotUploadProgress {
         record.failed_reconstruction_count = 1;
         record.disposition = SnapshotQuarantineDisposition::RetryPending;
         record.retry_after_unix_seconds = quarantine_retry_after(fingerprint);
+    }
+
+    fn quarantine_transient_body(
+        &mut self,
+        fingerprint: &str,
+        body_witness: &str,
+        not_before: u64,
+    ) {
+        let previous = self
+            .quarantined_fingerprints
+            .get(fingerprint)
+            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
+            .and_then(|record| {
+                record
+                    .hold
+                    .clone()
+                    .map(|hold| (hold, record.retry_after_unix_seconds))
+            });
+        self.quarantine_retryable_body(fingerprint, body_witness);
+        let record = self
+            .quarantined_fingerprints
+            .get_mut(fingerprint)
+            .expect("retry inserted");
+        record.retry_after_unix_seconds = not_before;
+        if let Some((hold, deadline)) = previous {
+            record.hold = Some(hold);
+            record.retry_after_unix_seconds = deadline.max(not_before);
+        }
     }
 
     fn retain_current_quarantines_with_diagnostics(
@@ -3044,6 +3131,51 @@ enum DisclosedLoss {
     Unsettled,
 }
 
+#[derive(Clone)]
+pub(crate) struct RequestMoneyMenuStatus {
+    pub(crate) held: u64,
+    pub(crate) refused: u64,
+    pub(crate) adoption: String,
+    pub(crate) protected: String,
+}
+static REQUEST_MONEY_MENU: Mutex<Option<RequestMoneyMenuStatus>> = Mutex::new(None);
+static REQUEST_MONEY_MENU_SCOPE: Mutex<Option<(PathBuf, String, [u8; 32])>> = Mutex::new(None);
+
+fn scope_request_money_menu(support_dir: &Path, destination: String, account: [u8; 32]) {
+    if let Ok(mut scope) = REQUEST_MONEY_MENU_SCOPE.lock() {
+        let next = (support_dir.to_path_buf(), destination, account);
+        if scope.as_ref() != Some(&next) {
+            if let Ok(mut status) = REQUEST_MONEY_MENU.lock() {
+                *status = None;
+            }
+            *scope = Some(next);
+        }
+    }
+}
+pub(crate) fn request_money_menu_status(account: [u8; 32]) -> Option<RequestMoneyMenuStatus> {
+    let scope = REQUEST_MONEY_MENU_SCOPE.lock().ok()?;
+    let mut status = REQUEST_MONEY_MENU.lock().ok()?;
+    let Some((support_dir, _, bound_account)) = scope.as_ref() else {
+        *status = None;
+        return None;
+    };
+    if *bound_account != account {
+        *status = None;
+        return None;
+    }
+    if !crate::snapshots::claude_request_money::request_owned_live(support_dir) {
+        if status
+            .as_ref()
+            .is_some_and(|status| status.held == 0 && status.refused == 0)
+        {
+            *status = None;
+        } else if let Some(status) = status.as_mut() {
+            status.adoption = "off".into();
+        }
+    }
+    status.clone()
+}
+
 impl SyncCounts {
     /// Loss a later traversal can still change. Mirrors
     /// `ScanTraversalCounts::has_retryable_problems` on the receipt's own
@@ -3158,6 +3290,25 @@ impl SyncCounts {
     }
 
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
+        if let Some((held, refused, live, protected)) = index.request_owned_menu_projection() {
+            if let Ok(mut status) = REQUEST_MONEY_MENU.lock() {
+                *status = (live || held > 0 || refused > 0).then(|| RequestMoneyMenuStatus {
+                    held,
+                    refused,
+                    adoption: if live {
+                        if index.request_money_adoption_paused() {
+                            "paused"
+                        } else {
+                            "running"
+                        }
+                    } else {
+                        "off"
+                    }
+                    .into(),
+                    protected: protected.into(),
+                });
+            }
+        }
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
         // Mirror #389's disclosed-loss convention: terminal unproven entities
@@ -3915,6 +4066,7 @@ fn sync_once_with_retry(
     crate::snapshots::claude_request_money::seed_shadow_off(support_dir);
     // Declared after the guard, so it settles before the lock is released.
     let mut continuation_cycle = continuation::CycleSettlement::default();
+    let mut money_cycle = money_resume::CycleScope::new(daemon);
     let (device, device_secret) = load_snapshot_device_credentials()?;
     let Some(machine_id) = snapshot_machine_id(&device)? else {
         return Err(anyhow!("machine identity is missing"));
@@ -3923,7 +4075,16 @@ fn sync_once_with_retry(
         .snapshot_scan_account_witness()
         .map_err(|_| anyhow!("snapshot account authority unavailable"))?;
     let client = snapshot_cycle_client(support_dir, daemon);
+    scope_request_money_menu(
+        support_dir,
+        snapshot_upload_destination_namespace(&device, &device_secret),
+        account_witness,
+    );
     let enabled_sources = enabled_snapshot_sources(&device);
+    money_cycle.keep_claude(
+        enabled_sources.contains(&SnapshotSource::ClaudeCode)
+            && crate::snapshots::claude_request_money::request_owned_live(support_dir),
+    );
 
     if let Some(source) = enabled_sources.first().copied() {
         if let Err(error) = upload_local_health_projection_reporting(
@@ -4081,6 +4242,9 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         reasoning_output_tokens: item.reasoning_output_tokens,
         unattributed_total_tokens: item.unattributed_total_tokens,
         request_count: item.request_count,
+        removed_request_count: item.removed_request_count,
+        removed_usage: item.removed_usage,
+        telemetry_owned_complete: item.telemetry_owned_complete,
         usage_accounting_contract: item.usage_accounting_contract.clone(),
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -4781,6 +4945,8 @@ struct SourcePreparation {
     account_witness: [u8; 32],
     scan_started_at: String,
     activity_hint: crate::snapshot_client::ActivityHintResponse,
+    // Captured before the hint's raw attribution key is consumed/zeroized.
+    money_policy: Option<[u8; 32]>,
     receipt_window_days: u64,
     context_curve_enabled: bool,
     cache_observations_enabled: bool,
@@ -5217,6 +5383,25 @@ fn prepare_sync_source(
     account_witness: [u8; 32],
     retry_enabled: bool,
 ) -> Result<Option<SourcePreparation>> {
+    if source == SnapshotSource::ClaudeCode
+        && money_resume::resume(device, device_secret, home, support_dir, daemon)?
+    {
+        return Ok(None);
+    }
+    if source_money_resume(source, support_dir) {
+        let binding = unknown_recovery::binding(
+            &snapshot_upload_destination_namespace(device, device_secret),
+            client.recovery_origin(),
+            machine_id,
+            "",
+        );
+        if !unknown_recovery::startup(support_dir, &binding, unknown_recovery::now(support_dir))? {
+            return Err(crate::source_rotation::LocalRefusal(
+                "request money scheduling checkpoint pending",
+            )
+            .into());
+        }
+    }
     if let Some(remaining) = source_upload_backoff_remaining(source) {
         // The server asked for room and we said yes. Re-running the cycle now
         // would scan, re-derive and re-POST the same pages it just shed, which is
@@ -5381,6 +5566,10 @@ fn prepare_sync_source(
         home,
         &scan_agent_status_collection.codex_scan_homes,
     )?;
+    let money_policy = (source_money_resume(source, support_dir)
+        || source == SnapshotSource::ClaudeCode
+            && crate::snapshots::claude_request_money::store::live_refused(support_dir))
+    .then(|| money_resume::policy(activity_hint.clone()));
     let mut encoded_attribution_key = activity_hint.session_attribution_hmac_key.take();
     let attribution_context = SessionAttributionContext::from_activity_hint(
         source,
@@ -5487,6 +5676,20 @@ fn prepare_sync_source(
         );
     }
     index.activate_upload_context(upload_context);
+    if source == SnapshotSource::ClaudeCode {
+        use crate::snapshots::claude_request_money::{self as money, MoneyReceipt};
+        match money::reclaim_metadata(support_dir, &index) {
+            MoneyReceipt::Pending => {
+                return Err(crate::source_rotation::LocalRefusal(
+                    "request money scheduling checkpoint pending",
+                )
+                .into())
+            }
+            MoneyReceipt::Refused => money::store::refuse_live(support_dir),
+            MoneyReceipt::Ready => (),
+        }
+        money::note_collection_fallback(support_dir);
+    }
     if !context_curve_enabled {
         // Stamp the off transition before taking the partial-commit baseline.
         // If an ordinary no-curve upload is partially accepted and then shed,
@@ -5616,9 +5819,15 @@ fn prepare_sync_source(
     // The committed state, before the scan advances it. A partial commit needs
     // both: which entries this scan produced, and which ones the server was
     // already known to hold.
-    index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
-        source,
-    ));
+    index.activate_effective_upload_body_witness_revision(
+        if source == SnapshotSource::ClaudeCode
+            && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+        {
+            3
+        } else {
+            effective_upload_body_witness_revision(source)
+        },
+    );
     if source == SnapshotSource::ClaudeCode {
         index.adopt_effective_upload_body_witness_revision_monotonically();
         index.load_claude_reemission_exclusions(support_dir);
@@ -5713,6 +5922,7 @@ fn prepare_sync_source(
         account_witness,
         scan_started_at,
         activity_hint,
+        money_policy,
         receipt_window_days,
         context_curve_enabled,
         cache_observations_enabled,
@@ -5814,6 +6024,72 @@ fn note_codex_side_saved(
 #[allow(clippy::too_many_arguments)]
 fn finish_sync_source(
     preparation: SourcePreparation,
+    index: ScanIndex,
+    scan_result: SourceScanResult,
+    _client: &SnapshotApiClient,
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    _source: SnapshotSource,
+    machine_id: &str,
+    _home: &Path,
+    support_dir: &Path,
+    daemon: &LocalDaemon,
+    _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
+    retry: &mut live_snapshot_retry::LiveRetryOwner,
+) -> Result<()> {
+    if source_money_resume(preparation.source, support_dir) {
+        return money_resume::start(
+            preparation,
+            index,
+            scan_result,
+            device,
+            device_secret,
+            machine_id,
+            _home,
+            support_dir,
+            daemon,
+        );
+    }
+    #[cfg(test)]
+    money_resume::before_immediate_for_test();
+    let fallback = preparation.source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::store::live_refused(support_dir);
+    let result = money_resume::immediate(finish_sync_source_resume(
+        preparation,
+        index,
+        scan_result,
+        _client,
+        device,
+        device_secret,
+        _source,
+        machine_id,
+        _home,
+        support_dir,
+        daemon,
+        _transport_cycle,
+        retry,
+        None,
+    ))
+    .unwrap_or(Err(crate::source_rotation::LocalRefusal(
+        "request money scheduling checkpoint pending",
+    )
+    .into()));
+    if fallback && result.is_ok() {
+        // One completed ordinary collection earns a fresh live admission
+        // attempt. No elapsed-time timeout, cap bypass, or custody deletion.
+        crate::snapshots::claude_request_money::store::allow_live(support_dir);
+    }
+    result
+}
+
+fn source_money_resume(source: SnapshotSource, support_dir: &Path) -> bool {
+    source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn finish_sync_source_resume(
+    preparation: SourcePreparation,
     mut index: ScanIndex,
     mut scan_result: SourceScanResult,
     _client: &SnapshotApiClient,
@@ -5826,6 +6102,7 @@ fn finish_sync_source(
     daemon: &LocalDaemon,
     _transport_cycle: &mut crate::net_resilience::TransportCycleOutcome,
     retry: &mut live_snapshot_retry::LiveRetryOwner,
+    mut money_memory: Option<&mut money_resume::Memory>,
 ) -> Result<()> {
     let SourcePreparation {
         mut native_comparison_reservation,
@@ -5839,6 +6116,7 @@ fn finish_sync_source(
         account_witness,
         scan_started_at,
         activity_hint,
+        money_policy,
         receipt_window_days,
         context_curve_enabled,
         cache_observations_enabled,
@@ -5858,6 +6136,7 @@ fn finish_sync_source(
         active_legacy_reconciliation,
         scan: _,
     } = preparation;
+    let recovery_prepared = money_policy.is_some();
     if let Some(lease) = native_comparison_lease.as_mut() {
         lease.observe_policy_page(
             &scan_result.census_window_end,
@@ -5930,6 +6209,23 @@ fn finish_sync_source(
         }
         Ok(())
     };
+    if source_money_resume(source, support_dir) && recovery_prepared {
+        unknown_recovery::replay_due(
+            support_dir,
+            &mut index,
+            &mut upload_progress,
+            &upload_progress_path,
+            client,
+            device,
+            device_secret,
+            machine_id,
+            &upload_destination_namespace,
+            money_policy.expect("prepared recovery policy"),
+            ensure_authority,
+        )
+        .await
+        .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
+    }
     codex_scan_diagnostics::after_existing_census_fence(
         source,
         support_dir,
@@ -5959,15 +6255,18 @@ fn finish_sync_source(
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
-        let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
+        let applied = try_apply_claude_local_evidence_to_scan_resume(
             support_dir,
             &mut scan_result,
             &mut index,
             cycle_request_identity_permit(source, &activity_hint),
             prepared_claude_evidence,
             comparison_completion.as_mut(),
-            native_comparison_lease.as_ref(),
-        );
+            native_comparison_lease.as_mut(),
+            money_memory.as_deref_mut(),
+            true,
+        )
+        .await;
         let (disposition, census_withheld, stats) = match applied {
             Ok(applied) => applied,
             Err(reason) => {
@@ -6233,6 +6532,52 @@ fn finish_sync_source(
     // consumers above, then remove only authority-demoting revisions at the
     // network boundary. They are not backend poison and are not counted as
     // accepted/quarantined upload settlement.
+    if source == SnapshotSource::ClaudeCode {
+        let reoffers = crate::snapshots::claude_request_money::scheduled_reoffers(
+            &index,
+            &scan_result.snapshots,
+        );
+        for fp in &reoffers {
+            upload_progress.accepted_fingerprints.remove(fp);
+            upload_progress.accepted_body_witnesses.remove(fp);
+        }
+        if !reoffers.is_empty() {
+            upload_progress.save(&upload_progress_path)?;
+        }
+    }
+    if source == SnapshotSource::ClaudeCode {
+        crate::snapshots::claude_request_money::reconcile_saved_money_offers(
+            support_dir,
+            &committed_index,
+            &index,
+            &scan_result.snapshots,
+        );
+    }
+    if let Some(memory) = money_memory.as_deref_mut() {
+        memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
+    }
+    if source_money_resume(source, support_dir) {
+        money_resume::until(|| {
+            crate::snapshots::claude_request_money::prepare_money_offers_receipt(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                &claude_authority_disposition.quarantined_source_session_ids_for_money(),
+            )
+        })
+        .await?;
+        money_resume::until(|| {
+            crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                |item| {
+                    u64::from(claude_authority_disposition.was_quarantined(&item.source_session_id))
+                },
+            )
+        })
+        .await?;
+    }
     let local_holds = LocalHoldSettlement::classify(
         source,
         &mut index,
@@ -6300,6 +6645,16 @@ fn finish_sync_source(
     // a producer-owned predecessor token. Probe the unchanged semantic body
     // through the existing CAS contract, omitting the additive cache patch.
     // Exact settled ACKs enter the same atomic progress ledger as normal pages.
+    let mut recovery_send = unknown_recovery::SendState::default();
+    let recovery_binding =
+        (source_money_resume(source, support_dir) && recovery_prepared).then(|| {
+            unknown_recovery::binding(
+                &upload_destination_namespace,
+                client.recovery_origin(),
+                machine_id,
+                "",
+            )
+        });
     let probes = scan_result
         .snapshots
         .iter()
@@ -6329,38 +6684,77 @@ fn finish_sync_source(
             && probes
                 .iter()
                 .all(|item| !legacy_reconciliation_pending.contains(&item.snapshot_fingerprint));
-        bootstrap_deferred = bootstrap_cache_heads_with_budget(
-            &probes,
-            source.api_slug(),
-            &mut upload_progress,
-            ordinary_bootstrap,
-            &mut inplace_retry,
-            |snapshots, enforce_head_cas| {
-                let request = SnapshotBatchRequest {
-                    schema_version: SNAPSHOT_SCHEMA_VERSION,
-                    source: source.api_slug().to_string(),
-                    machine_id: machine_id.to_string(),
-                    collector_version: Some(collector_version()),
-                    snapshots,
-                    upload_policy,
-                    client_report: crate::client_report::ClientReport::empty(),
-                };
-                if let Err(reason) = validate_snapshot_batch_request(&request) {
-                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                        reason,
-                    }));
-                }
+        bootstrap_deferred = loop {
+            let result = bootstrap_cache_heads_with_budget(
+                &probes,
+                source.api_slug(),
+                &mut upload_progress,
+                ordinary_bootstrap,
+                &mut inplace_retry,
+                |snapshots, enforce_head_cas| {
+                    let request = SnapshotBatchRequest {
+                        schema_version: SNAPSHOT_SCHEMA_VERSION,
+                        source: source.api_slug().to_string(),
+                        machine_id: machine_id.to_string(),
+                        collector_version: Some(collector_version()),
+                        snapshots,
+                        upload_policy,
+                        client_report: crate::client_report::ClientReport::empty(),
+                    };
+                    if let Err(reason) = validate_snapshot_batch_request(&request) {
+                        return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                            reason,
+                        }));
+                    }
+                    ensure_authority()?;
+                    let token = client.issue_relay_token(device, device_secret, source)?;
+                    ensure_authority()?;
+                    validate_joined(&request.snapshots)?;
+                    let response = if let Some(binding) = recovery_binding.as_deref() {
+                        unknown_recovery::initial_post(
+                            support_dir,
+                            &mut index,
+                            client,
+                            &token,
+                            &request,
+                            binding,
+                            enforce_head_cas,
+                            money_policy.expect("prepared recovery policy"),
+                            &mut recovery_send,
+                        )
+                    } else {
+                        client.upload_batch(&token, &request, enforce_head_cas)
+                    }?;
+                    response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
+                    if recovery_binding.is_some() {
+                        ensure_authority()?;
+                    }
+                    Ok(response)
+                },
+                |progress| {
+                    progress.save(&upload_progress_path)?;
+                    if source_money_resume(source, support_dir) {
+                        unknown_recovery::ack_saved(support_dir, progress)
+                            .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
+                    }
+                    Ok(())
+                },
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.is::<unknown_recovery::Pending>())
+            {
+                unknown_recovery::captured(support_dir, &mut recovery_send).await?;
                 ensure_authority()?;
-                let token = client.issue_relay_token(device, device_secret, source)?;
-                ensure_authority()?;
-                validate_joined(&request.snapshots)?;
-                let response = client.upload_batch(&token, &request, enforce_head_cas)?;
-                response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
-                Ok(response)
-            },
-            |progress| progress.save(&upload_progress_path),
-        )
-        .inspect_err(log_bootstrap_failure("probe"))?;
+                continue;
+            }
+            if source_money_resume(source, support_dir) {
+                unknown_recovery::discard_unsaved_acks(support_dir);
+                unknown_recovery::outcomes(support_dir).await?;
+            }
+            break result.inspect_err(log_bootstrap_failure("probe"))?;
+        };
         let held = apply_bootstrapped_cache_heads(&mut scan_result.snapshots, &upload_progress)
             .inspect_err(log_bootstrap_failure("apply"))
             .inspect_err(|_| {
@@ -6381,95 +6775,194 @@ fn finish_sync_source(
     index.retain_claude_history_emission_permitted(&mut scan_result.snapshots);
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
-    let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
-        &scan_result.snapshots,
-        source.api_slug(),
-        &mut upload_progress,
-        &mut accepted,
-        |snapshot| snapshot.snapshot_fingerprint.as_str(),
-        snapshot_upload_body_witness,
-        |snapshot| Some(snapshot.source_session_id.as_str()),
-        |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
-        &mut inplace_retry,
-        |snapshots| {
-            // A first Codex/Claude scan can spend several minutes parsing local
-            // history and retroactive backfill before the first upload. Relay
-            // tokens are intentionally short-lived, so mint them at the network
-            // boundary instead of reusing the pre-scan activity-hint token.
-            // Leased, not read: exactly one in-flight batch may claim the
-            // counters, and dropping the lease on any failure below leaves the
-            // losses owed instead of stranded.
-            let client_report = crate::client_report::lease();
-            let request = SnapshotBatchRequest {
-                schema_version: SNAPSHOT_SCHEMA_VERSION,
-                source: source.api_slug().to_string(),
-                machine_id: machine_id.to_string(),
-                collector_version: Some(collector_version()),
-                snapshots,
-                upload_policy,
-                client_report: client_report.report().clone(),
-            };
-            let reconcile_class = request.snapshots.iter().all(|snapshot| {
-                legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-            });
-            debug_assert!(
-                reconcile_class
-                    || request.snapshots.iter().all(|snapshot| {
-                        !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
-                    }),
-                "legacy reconciliation must stay isolated at a batch boundary"
-            );
-            if let Err(reason) = validate_snapshot_batch_request(&request) {
-                return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
-                    reason,
-                }));
-            }
-            ensure_authority()?;
-            let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
-            ensure_authority()?;
-            validate_joined(&request.snapshots)?;
-            let response = client.upload_batch(&upload_relay_token, &request, reconcile_class)?;
-            response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
-            let request_fingerprints = request
-                .snapshots
-                .iter()
-                .map(|snapshot| snapshot.snapshot_fingerprint.clone())
-                .collect::<BTreeSet<_>>();
-            require_normal_write_ack_for_legacy_reconciliation(
-                &response,
-                &request_fingerprints,
-                &legacy_reconciliation_pending,
-            )?;
-            // Clear only what this accepted request carried. A failed upload
-            // leaves the counters in place so the losses are reported on the
-            // next batch instead of vanishing with the request that died.
-            client_report.commit();
-            Ok(response)
-        },
-        |progress| progress.save(&upload_progress_path),
-    )
-    .and_then(|result| {
-        if matches!(
-            result,
-            ResumableUploadResult::Completed
-                | ResumableUploadResult::Deferred { .. }
-                | ResumableUploadResult::Rejected { .. }
-        ) {
-            // A setup/account switch can replace the relay binding while a
-            // long historical scan is uploading. Never commit destination A's
-            // delivery cursor after the machine has moved to destination B.
-            ensure_authority()?;
-        }
-        Ok(result)
-    })
-    .map(|result| {
-        with_retained_refusal_conflicts(
-            with_bootstrap_deferred(result, bootstrap_deferred),
-            &index,
-            &upload_progress,
+    let protected_offer_causes = (source == SnapshotSource::ClaudeCode
+        && index.request_money_live_revision())
+    .then(|| {
+        crate::snapshots::claude_request_money::protected_offer_causes(
+            &committed_index,
+            &scan_result,
         )
-    });
+    })
+    .flatten();
+    let mut accepted = 0;
+    let mut recovery_report = None::<crate::client_report::ClientReportLease>;
+    let upload_result = loop {
+        let result = upload_resumable_batches_with_body_witness_partitioned(
+            &scan_result.snapshots,
+            source.api_slug(),
+            &mut upload_progress,
+            &mut accepted,
+            |snapshot| snapshot.snapshot_fingerprint.as_str(),
+            snapshot_upload_body_witness,
+            |snapshot| Some(snapshot.source_session_id.as_str()),
+            |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+            &mut inplace_retry,
+            |snapshots| {
+                // A first Codex/Claude scan can spend several minutes parsing local
+                // history and retroactive backfill before the first upload. Relay
+                // tokens are intentionally short-lived, so mint them at the network
+                // boundary instead of reusing the pre-scan activity-hint token.
+                // Leased, not read: exactly one in-flight batch may claim the
+                // counters, and dropping the lease on any failure below leaves the
+                // losses owed instead of stranded.
+                let mut ordinary_report = None;
+                let client_report = if recovery_binding.is_some() {
+                    recovery_report.get_or_insert_with(crate::client_report::lease)
+                } else {
+                    ordinary_report.get_or_insert_with(crate::client_report::lease)
+                };
+                let request = SnapshotBatchRequest {
+                    schema_version: SNAPSHOT_SCHEMA_VERSION,
+                    source: source.api_slug().to_string(),
+                    machine_id: machine_id.to_string(),
+                    collector_version: Some(collector_version()),
+                    snapshots,
+                    upload_policy,
+                    client_report: client_report.report().clone(),
+                };
+                let reconcile_class = request.snapshots.iter().all(|snapshot| {
+                    legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                });
+                debug_assert!(
+                    reconcile_class
+                        || request.snapshots.iter().all(|snapshot| {
+                            !legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint)
+                        }),
+                    "legacy reconciliation must stay isolated at a batch boundary"
+                );
+                if let Err(reason) = validate_snapshot_batch_request(&request) {
+                    return Err(anyhow::Error::new(SnapshotBatchPreflightRejected {
+                        reason,
+                    }));
+                }
+                ensure_authority()?;
+                if request.snapshots.iter().any(|item| {
+                    item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                }) && !crate::snapshots::claude_request_money::request_owned_live(support_dir)
+                {
+                    return Err(anyhow!("request money live custody withdrawn"));
+                }
+                let upload_relay_token = client.issue_relay_token(device, device_secret, source)?;
+                ensure_authority()?;
+                validate_joined(&request.snapshots)?;
+                if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
+                    crate::snapshots::claude_request_money::note_protected_offers(
+                        &index,
+                        protected_offer_causes.as_ref().map(|(causes, _)| causes),
+                        &request.snapshots,
+                    );
+                }
+                let response = if let Some(binding) = recovery_binding.as_deref() {
+                    unknown_recovery::initial_post(
+                        support_dir,
+                        &mut index,
+                        client,
+                        &upload_relay_token,
+                        &request,
+                        binding,
+                        reconcile_class,
+                        money_policy.expect("prepared recovery policy"),
+                        &mut recovery_send,
+                    )
+                } else {
+                    client.upload_batch(&upload_relay_token, &request, reconcile_class)
+                }
+                .inspect_err(|error| {
+                    if error
+                        .downcast_ref::<crate::snapshot_client::UploadShed>()
+                        .is_some_and(|shed| shed.request_owned_route_unavailable)
+                    {
+                        crate::snapshots::claude_request_money::note_route_pause(
+                            support_dir,
+                            &index,
+                            true,
+                        );
+                    }
+                })?;
+                response.validate_entity_ack_with_head_cas(&request, reconcile_class)?;
+                if recovery_binding.is_some() {
+                    ensure_authority()?;
+                }
+                let request_fingerprints = request
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect::<BTreeSet<_>>();
+                require_normal_write_ack_for_legacy_reconciliation(
+                    &response,
+                    &request_fingerprints,
+                    &legacy_reconciliation_pending,
+                )?;
+                if recovery_binding.is_some() {
+                    recovery_report.take().expect("batch report lease").commit();
+                } else {
+                    ordinary_report.take().expect("batch report lease").commit();
+                }
+                if request.snapshots.iter().any(|item| {
+                    item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                }) {
+                    crate::snapshots::claude_request_money::note_route_pause(
+                        support_dir,
+                        &index,
+                        false,
+                    );
+                }
+                Ok(response)
+            },
+            |progress| {
+                #[cfg(test)]
+                tests::permanent_finish_pipeline_tests::p2a_before_ack_save_for_test(
+                    &upload_progress_path,
+                );
+                progress.save(&upload_progress_path)?;
+                if source_money_resume(source, support_dir) {
+                    unknown_recovery::ack_saved(support_dir, progress)
+                        .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
+                }
+                Ok(())
+            },
+        )
+        .and_then(|result| {
+            if matches!(
+                result,
+                ResumableUploadResult::Completed
+                    | ResumableUploadResult::Deferred { .. }
+                    | ResumableUploadResult::Rejected { .. }
+            ) {
+                // A setup/account switch can replace the relay binding while a
+                // long historical scan is uploading. Never commit destination A's
+                // delivery cursor after the machine has moved to destination B.
+                ensure_authority()?;
+            }
+            Ok(result)
+        })
+        .map(|result| {
+            with_retained_refusal_conflicts(
+                with_bootstrap_deferred(result, bootstrap_deferred),
+                &index,
+                &upload_progress,
+            )
+        });
+        if result
+            .as_ref()
+            .err()
+            .is_some_and(|e| e.is::<unknown_recovery::Pending>())
+        {
+            unknown_recovery::captured(support_dir, &mut recovery_send).await?;
+            ensure_authority()?;
+            continue;
+        }
+        if result.is_err() {
+            recovery_report.take();
+        }
+        break result;
+    };
+    if source_money_resume(source, support_dir) {
+        unknown_recovery::discard_unsaved_acks(support_dir);
+        unknown_recovery::outcomes(support_dir).await?;
+    }
     // The logical offer ends here; normal bounded HTTP retries happened inside.
     upload_progress.finish_reason_reoffers(
         &attempted_reason_reoffers,
@@ -6491,6 +6984,262 @@ fn finish_sync_source(
         );
     }
 
+    let money_settlement = if source == SnapshotSource::ClaudeCode
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir)
+        && scan_result.snapshots.iter().any(|item| {
+            item.usage_accounting_contract.as_deref()
+                == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+        })
+        && !upload_result.as_ref().err().is_some_and(|error| {
+            snapshot_upload_error_class(error) == Some(SnapshotUploadErrorClass::LocalState)
+        }) {
+        // Everything below runs after the POST. A refusal must not drop the
+        // exact server outcomes upload progress already holds: commit the
+        // same partial subset an upload error would, without settling money.
+        let settlement = async {
+            crate::snapshots::claude_request_money::pace_money_debt(
+                support_dir,
+                &index,
+                &scan_result.snapshots,
+                |item| {
+                    upload_progress
+                        .quarantined_fingerprints
+                        .get(&item.snapshot_fingerprint)
+                        .filter(|record| {
+                            (record.hold.is_some() || record.version_skew_attempts > 0)
+                                && record.upload_body_witness.as_deref()
+                                    == Some(snapshot_upload_body_witness(item).as_str())
+                        })
+                        .map(|record| record.retry_after_unix_seconds)
+                },
+            );
+            if let Some(memory) = money_memory {
+                memory.refresh(&index, &scan_result, Some(&upload_progress), 0)?;
+            }
+            money_resume::until(|| {
+                crate::snapshots::claude_request_money::note_adoption_outcomes_receipt(
+                    support_dir,
+                    &index,
+                    &scan_result.snapshots,
+                    |item| {
+                        let fp = &item.snapshot_fingerprint;
+                        if upload_progress.accepted_fingerprints.contains(fp) {
+                            4
+                        } else if let Some(rejection) = upload_progress.permanent_rejections.get(fp)
+                        {
+                            if rejection.reason.is_dominated() {
+                                6
+                            } else {
+                                3
+                            }
+                        } else if upload_progress
+                            .quarantined_fingerprints
+                            .get(fp)
+                            .is_some_and(|record| record.hold.is_some())
+                        {
+                            2
+                        } else {
+                            0
+                        }
+                    },
+                )
+            })
+            .await?;
+
+            let offered = scan_result.snapshots.iter().filter(|item| {
+                item.usage_accounting_contract.as_deref()
+                    == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+            });
+            let required = (|| -> Option<usize> {
+                let mut maps = 0_usize;
+                let mut witness = 0_usize;
+                let node = crate::heap_layout_bound::tree_node_bytes::<String, ()>()?
+                    .checked_add(crate::heap_layout_bound::tree_node_bytes::<String, String>()?)?;
+                // One full node per entry plus a root overcounts the supported
+                // B-tree layout and covers the first small page's root nodes.
+                for item in offered.clone() {
+                    maps = maps
+                        .checked_add(node)?
+                        .checked_add(item.snapshot_fingerprint.len().checked_mul(2)?)?
+                        .checked_add(64)?;
+                    witness = witness
+                        .max(crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)?);
+                }
+                let mut sources = 0_usize;
+                let mut source_bytes = 0_usize;
+                for item in &scan_result.snapshots {
+                    if let Some(source) = &item.source_file_fingerprint {
+                        sources = sources.checked_add(1)?;
+                        source_bytes = source_bytes.checked_add(source.len())?;
+                    }
+                }
+                for state in index.current_claude_money_files() {
+                    if scan_result.snapshots.iter().any(|item| {
+                        crate::snapshots::claude_request_money::family_root(item) == state.root
+                            && item.source_session_id == state.member
+                    }) {
+                        sources = sources.checked_add(1)?;
+                        source_bytes = source_bytes.checked_add(state.revision.len())?;
+                    }
+                }
+                let stamp_nodes = scan_result
+                    .snapshots
+                    .len()
+                    .checked_add(sources.checked_mul(2)?)?
+                    .checked_add(3)?;
+                let stamp = crate::heap_layout_bound::tree_node_bytes::<String, String>()?
+                    .checked_mul(stamp_nodes)?
+                    .checked_add(source_bytes)?;
+                maps.checked_add(node)?
+                    .checked_add(stamp)?
+                    .checked_add(witness)
+            })()
+            .ok_or_else(money_resume::admission_refused)?;
+            #[cfg(test)]
+            let offered_count = offered.count();
+            let build_settlement = || {
+                #[cfg(test)]
+                if crate::retry_allocation_probe::money_settlement_refused_for_test() {
+                    return Err(money_resume::admission_refused());
+                }
+                let Some(settlement_funds) =
+                    crate::snapshots::claude_request_money::ShadowReservation::admit(required)
+                else {
+                    return Err(money_resume::admission_refused());
+                };
+                #[cfg(test)]
+                crate::retry_allocation_probe::money_settlement_admitted(settlement_funds.bytes());
+                // A dominated/stale exact literal is settled-refused, never accepted.
+                // Use the same covering body check for adoption and debt retirement.
+                let mut settled = BTreeSet::new();
+                let mut settled_bodies = BTreeMap::new();
+                for item in &scan_result.snapshots {
+                    if item.usage_accounting_contract.as_deref()
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                    {
+                        if upload_progress
+                            .accepted_fingerprints
+                            .contains(&item.snapshot_fingerprint)
+                        {
+                            if let Some(body) = upload_progress
+                                .accepted_body_witnesses
+                                .get(&item.snapshot_fingerprint)
+                                .filter(|body| **body == snapshot_upload_body_witness(item))
+                            {
+                                settled.insert(item.snapshot_fingerprint.clone());
+                                settled_bodies
+                                    .insert(item.snapshot_fingerprint.clone(), body.clone());
+                            }
+                        }
+                        if let Some(refusal) = upload_progress
+                            .permanent_rejections
+                            .get(&item.snapshot_fingerprint)
+                            .filter(|refusal| {
+                                refusal.reason.is_dominated()
+                                    && refusal.body_witness == snapshot_upload_body_witness(item)
+                            })
+                        {
+                            settled.insert(item.snapshot_fingerprint.clone());
+                            settled_bodies.insert(
+                                item.snapshot_fingerprint.clone(),
+                                refusal.body_witness.clone(),
+                            );
+                        }
+                    }
+                }
+                index.stamp_request_money_acks(&scan_result.snapshots, &settled, &settled_bodies);
+                #[cfg(test)]
+                crate::retry_allocation_probe::money_settlement_pairs(settled.len());
+                Ok(Some((settled, settled_bodies, settlement_funds)))
+            };
+            #[cfg(test)]
+            let result = crate::retry_allocation_probe::observe_money_settlement(
+                required,
+                offered_count,
+                build_settlement,
+            );
+            #[cfg(not(test))]
+            let result = {
+                let mut build_settlement = build_settlement;
+                build_settlement()
+            };
+            result
+        }
+        .await;
+        match settlement {
+            Ok(settlement) => settlement,
+            Err(error) => {
+                if !matches!(upload_result, Ok(ResumableUploadResult::Disabled(_))) {
+                    if let Err(checkpoint_error) = checkpoint_partial_snapshot_index_with_comparison(
+                        &index,
+                        &committed_index,
+                        &upload_progress,
+                        &scan_result.snapshots,
+                        Some(&scan_result),
+                        locally_held_fingerprints,
+                        &index_path,
+                        &upload_progress_path,
+                        || {
+                            ensure_authority()?;
+                            scan_result.validate_codex_checkpoint()
+                        },
+                        None,
+                        comparison_completion
+                            .as_mut()
+                            .map(NativeSelectedRestore::Paid),
+                        Some(UnsettledUploadCause::Unattributed),
+                    ) {
+                        eprintln!(
+                            "local snapshot partial scan checkpoint failed for {}: {}",
+                            source.api_slug(),
+                            safe_error(&checkpoint_error)
+                        );
+                    }
+                }
+                return Err(error);
+            }
+        }
+    } else {
+        #[cfg(test)]
+        crate::retry_allocation_probe::money_settlement_skipped();
+        None
+    };
+    // A durable ACK does not prove the selected index committed. Retain the
+    // due/dirty selection obligation through every failed CAS or save, even
+    // for unchanged, already-adopted files. Each caller below has saved first.
+    let recovery_ack_durable = !upload_result.as_ref().err().is_some_and(|e| {
+        snapshot_upload_error_class(e) == Some(SnapshotUploadErrorClass::LocalState)
+    });
+    let settle_saved_money = |saved: &ScanIndex| {
+        if source_money_resume(source, support_dir)
+            && recovery_ack_durable
+            && unknown_recovery::resolve_saved(
+                support_dir,
+                &upload_progress,
+                unknown_recovery::now(support_dir),
+            )
+            .is_err()
+        {
+            eprintln!("claude_request_money recovery_custody_fault=1");
+        }
+
+        if let Some((settled, bodies, _funds)) = &money_settlement {
+            crate::snapshots::claude_request_money::settle_money_acks(
+                support_dir,
+                saved,
+                &scan_result.snapshots,
+                settled,
+                bodies,
+            );
+        } else if source == SnapshotSource::ClaudeCode {
+            crate::snapshots::claude_request_money::reconcile_saved_money_offers(
+                support_dir,
+                saved,
+                saved,
+                &scan_result.snapshots,
+            );
+        }
+    };
     index.log_claude_proof_correction_debt();
 
     // The server may have accepted new entities even when the final result is a
@@ -6587,6 +7336,9 @@ fn finish_sync_source(
                     committed_index.clone()
                 }
             };
+            if checkpoint_succeeded {
+                settle_saved_money(&committable);
+            }
             if retry.enabled()
                 && checkpoint_succeeded
                 && locally_held_fingerprints.is_empty()
@@ -6694,6 +7446,7 @@ fn finish_sync_source(
                     Some(UnsettledUploadCause::UploadError),
                 ) {
                     Ok(committable) => {
+                        settle_saved_money(&committable);
                         index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
                     }
@@ -6888,6 +7641,8 @@ fn finish_sync_source(
     tests::permanent_finish_pipeline_tests::prior_index_lifetime_tests::after_retirement(
         committed_index.is_some(),
     );
+    #[cfg(test)]
+    tests::permanent_finish_pipeline_tests::p2a_conflict_index_for_test(&index_path);
     backfill_succeeded &= upload_fully_settled;
     // A quiet/delta-only scan still discloses current permanent refusals even
     // though no body needed another upload. The committed census owns scope.
@@ -6904,6 +7659,27 @@ fn finish_sync_source(
     // The whole ledger, before the current-entity prune below: a refusal from
     // this page that is not current still keeps its reported reason.
     let permanent_refusals = PermanentRefusalCounts::of(&upload_progress);
+    let held_only = source == SnapshotSource::ClaudeCode
+        && !local_holds.progress_blocking
+        && permanent_refusals.total == 0
+        && upload_progress
+            .quarantined_fingerprints
+            .values()
+            .any(|record| record.hold.is_some())
+        && scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                !upload_progress
+                    .accepted_fingerprints
+                    .contains(&item.snapshot_fingerprint)
+            })
+            .all(|item| {
+                upload_progress
+                    .quarantined_fingerprints
+                    .get(&item.snapshot_fingerprint)
+                    .is_some_and(|record| record.hold.is_some())
+            });
     index.finish_legacy_settlement_reconciliation();
     // A Claude curve replay an unreadable backfill state suppressed stays
     // pending (StateMissing H1), so it runs once the marker clears.
@@ -6931,6 +7707,7 @@ fn finish_sync_source(
         &manifest_window_end,
     )?;
     note_codex_side_saved(daemon, &index_path, true, side_mark);
+    settle_saved_money(&index);
     if upload_fully_settled
         && native_comparison_lease
             .as_ref()
@@ -6993,7 +7770,7 @@ fn finish_sync_source(
             cadence,
             now,
             accepted,
-            deferred_entity_count.is_some() && !resolved_permanent_rejections,
+            deferred_entity_count.is_some() && !resolved_permanent_rejections && !held_only,
         );
     });
 
@@ -7066,11 +7843,15 @@ fn finish_sync_source(
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
-        let state = refused_entity_state(
-            resolved_permanent_rejections,
-            permanent_refusals,
-            upload_fully_settled,
-        );
+        let state = if held_only {
+            CollectorState::Success
+        } else {
+            refused_entity_state(
+                resolved_permanent_rejections,
+                permanent_refusals,
+                upload_fully_settled,
+            )
+        };
         if resolved_permanent_rejections {
             log_retained_permanent_refusals(
                 source,
@@ -7106,7 +7887,7 @@ fn finish_sync_source(
             },
             scan_result.codex_counting_v2.as_deref(),
         );
-        if !resolved_permanent_rejections {
+        if !resolved_permanent_rejections && !held_only {
             return Err(snapshot_entity_deferred(count));
         }
         // Permanent refusals still finish transport successfully and remain
@@ -7713,7 +8494,7 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
     prepared: Option<PreparedClaudeLocalEvidence>,
     comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> (
     crate::snapshots::ClaudeUsageAuthorityDisposition,
     bool,
@@ -7736,9 +8517,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     scan_result: &mut SourceScanResult,
     index: &mut ScanIndex,
     permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
-    mut prepared: Option<PreparedClaudeLocalEvidence>,
-    mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
-    lease: Option<&crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    prepared: Option<PreparedClaudeLocalEvidence>,
+    comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
 ) -> std::result::Result<
     (
         crate::snapshots::ClaudeUsageAuthorityDisposition,
@@ -7747,6 +8528,53 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     ),
     crate::source_rotation::LocalRefusal,
 > {
+    let future = try_apply_claude_local_evidence_to_scan_resume(
+        support_dir,
+        scan_result,
+        index,
+        permit,
+        prepared,
+        comparison,
+        lease,
+        None,
+        cfg!(test), // Production synchronous caller is snapshot-audit, not a collector.
+    );
+    #[cfg(test)]
+    {
+        money_resume::drive_for_test(future)
+    }
+    #[cfg(not(test))]
+    {
+        money_resume::immediate(future).unwrap_or(Err(crate::source_rotation::LocalRefusal(
+            "request money scheduling checkpoint pending",
+        )))
+    }
+}
+
+#[allow(clippy::too_many_arguments)] // Shared evidence, comparison and one moving custody admission.
+async fn try_apply_claude_local_evidence_to_scan_resume(
+    support_dir: &Path,
+    scan_result: &mut SourceScanResult,
+    index: &mut ScanIndex,
+    permit: Option<crate::snapshots::claude_request_identity::EmissionPermit>,
+    mut prepared: Option<PreparedClaudeLocalEvidence>,
+    mut comparison: Option<&mut crate::snapshots::claude_native_comparison::Completion>,
+    lease: Option<&mut crate::snapshots::claude_native_comparison::lifecycle::Lease>,
+    money_memory: Option<&mut money_resume::Memory>,
+    money_allowed: bool,
+) -> std::result::Result<
+    (
+        crate::snapshots::ClaudeUsageAuthorityDisposition,
+        bool,
+        ClaudeLocalEvidenceStats,
+    ),
+    crate::source_rotation::LocalRefusal,
+> {
+    let request_owned_live = money_allowed
+        && comparison
+            .as_ref()
+            .map_or(true, |completion| !completion.filters_emission())
+        && crate::snapshots::claude_request_money::request_owned_live(support_dir);
     // Actual native occurrences are recorded once BEFORE emission filtering.
     // The authoritative fold still sees the actual terminal census decision.
     let observations = match comparison.as_deref_mut() {
@@ -7759,6 +8587,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     {
         fallback.withhold(scan_result);
     }
+    let _synthetic_funds = if request_owned_live {
+        crate::snapshots::claude_request_money::append_synthetic_sessions(
+            support_dir,
+            scan_result,
+            index,
+        )
+    } else {
+        None
+    };
     let emission_permitted = permit.is_some();
     let census_complete = scan_result.census_complete;
     // Preserve this scan's original carrier independently from later request
@@ -7916,7 +8753,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
-    let identity_evidence = emission_permitted.then(|| {
+    let mut identity_evidence = emission_permitted.then(|| {
         crate::snapshots::claude_request_identity::ScanEvidence::new(
             &api_report,
             &trace_report,
@@ -7925,6 +8762,24 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
+    // A first duplicate-census fence closure re-arms every family file so the
+    // NEXT window re-reads it. This page's completed parses (captures and
+    // census) stay the live money authority for this finish; the re-arm is
+    // restored after the live page so the index saves exactly what it decided.
+    let page_revisions = if request_owned_live {
+        scan_result
+            .completed_parses()
+            .filter(|(key, revision)| {
+                index
+                    .files
+                    .get(*key)
+                    .is_some_and(|entry| entry.source_file_fingerprint == *revision)
+            })
+            .map(|(key, revision)| (key.to_owned(), revision.to_owned()))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
@@ -7934,12 +8789,23 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         observations,
         comparison
             .as_deref()
-            .map(|comparison| comparison.fold_view(lease))
+            .map(|comparison| comparison.fold_view(lease.as_deref()))
             .or_else(|| {
-                lease.map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
+                lease
+                    .as_deref()
+                    .map(crate::snapshots::claude_native_comparison::FoldView::observation_only)
             }),
         &veto_api_rows,
     );
+    if request_owned_live {
+        // Protected roots keep their ordinary body, without minting a newly
+        // joined accounting contract during the preceding reported fold.
+        for item in &mut scan_result.snapshots {
+            if crate::snapshots::claude_request_money::is_protected_item(index, item) {
+                item.usage_accounting_contract = None;
+            }
+        }
+    }
     drop(veto_api_rows);
     if let Some(fallback) = comparison
         .as_deref()
@@ -7950,6 +8816,89 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     }
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
+    }
+
+    if let Some(memory) = money_memory {
+        memory
+            .evidence(index, scan_result, &api_report, &trace_report)
+            .map_err(|_| {
+                crate::snapshots::claude_request_money::store::refuse_live(support_dir);
+                crate::source_rotation::LocalRefusal("request money evidence retention refused")
+            })?;
+    }
+    if request_owned_live {
+        let rearmed = page_revisions
+            .into_iter()
+            .filter_map(|(key, revision)| {
+                let entry = index.files.get_mut(&key)?;
+                entry.source_file_fingerprint.is_empty().then(|| {
+                    entry.source_file_fingerprint = revision;
+                    key
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut groupings = BTreeMap::new();
+        let holds = crate::snapshots::claude_request_money::live_page_resume(
+            support_dir,
+            &mut scan_result.snapshots,
+            index,
+            crate::snapshots::claude_request_money::LivePageEvidence {
+                api: &api_report,
+                trace: &trace_report,
+                census_complete,
+            },
+            identity_evidence.as_mut(),
+            &mut groupings,
+        )
+        .await;
+        let mut holds = holds;
+        if !crate::snapshots::claude_request_money::stage_selection_fingerprints(
+            support_dir,
+            index,
+            &scan_result.snapshots,
+        ) {
+            holds.extend(
+                scan_result
+                    .snapshots
+                    .iter()
+                    .map(|item| item.source_session_id.clone()),
+            );
+        }
+        for key in &rearmed {
+            if let Some(entry) = index.files.get_mut(key) {
+                entry.source_file_fingerprint.clear();
+            }
+        }
+        for item in &scan_result.snapshots {
+            if item.usage_accounting_contract.as_deref()
+                != Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                && disposition.was_quarantined(&item.source_session_id)
+            {
+                holds.insert(item.source_session_id.clone());
+            }
+        }
+        disposition.request_owned_members = scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                !index.claude_reemission_exclusions_for_money(
+                    crate::snapshots::claude_request_money::family_root(item),
+                )
+            })
+            .map(|item| item.source_session_id.clone())
+            .collect();
+        disposition.request_owned(holds);
+        disposition.request_groupings.extend(groupings);
+        let unoffered = scan_result
+            .snapshots
+            .iter()
+            .filter(|item| {
+                item.usage_accounting_contract.as_deref()
+                    != Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+            })
+            .filter_map(|item| item.source_file_fingerprint.clone())
+            .collect();
+        index.exclude_effective_upload_body_witness_revision_for_source_files(&unoffered);
     }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
@@ -8031,7 +8980,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
-        census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
+        census_withheld_retry_pending_family_count: if request_owned_live {
+            index.request_money_v1_pending_count()
+        } else {
+            index.claude_usage_authority_pending_count()
+        },
         ..disposition.first_proof_hold
     };
     if census_withheld {
@@ -8045,14 +8998,16 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
-    crate::snapshots::claude_request_money::shadow_page(
-        support_dir,
-        &scan_result.snapshots,
-        index,
-        &api_report,
-        &trace_report,
-        scan_result.census_complete,
-    );
+    if !request_owned_live && money_allowed {
+        crate::snapshots::claude_request_money::shadow_page(
+            support_dir,
+            &scan_result.snapshots,
+            index,
+            &api_report,
+            &trace_report,
+            scan_result.census_complete,
+        );
+    }
     Ok((disposition, census_withheld, stats))
 }
 
@@ -8202,6 +9157,26 @@ fn snapshot_upload_error_class(error: &anyhow::Error) -> Option<SnapshotUploadEr
     } else {
         None
     }
+}
+
+fn is_literal_version_skew(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<crate::snapshot_client::RequestOwnedVersionSkew>()
+        .is_some()
+    {
+        return true;
+    }
+    // Synthetic transport fixtures historically construct BatchRejected
+    // directly. Production only trusts the raw-response marker above.
+    #[cfg(test)]
+    if let Some(body) = error
+        .downcast_ref::<BatchRejected>()
+        .filter(|error| error.status == 422)
+        .and_then(|error| error.body_excerpt.as_deref())
+    {
+        return crate::snapshot_client::literal_version_skew_body(body.as_bytes());
+    }
+    false
 }
 
 fn is_item_specific_validation_failure(error: &anyhow::Error) -> bool {
@@ -8463,7 +9438,35 @@ where
                 .saturating_add(snapshot_packing_json_length(item)?);
         }
     }
-    let response = upload(batch)?;
+    let response = match upload(batch) {
+        Err(error) if error.is::<unknown_recovery::Deferred>() => {
+            let deferred = error.downcast_ref::<unknown_recovery::Deferred>().unwrap();
+            if deferred.reason.is_some() || deferred.route_unavailable {
+                for index in indices {
+                    let fp = fingerprint(&items[*index]);
+                    progress.quarantine_transient_body(
+                        fp,
+                        &body_witness(&items[*index]),
+                        deferred
+                            .not_before
+                            .max(current_unix_seconds().saturating_add(1800)),
+                    );
+                    if deferred.reason == Some(unknown_recovery::Reason::VersionSkew) {
+                        progress
+                            .quarantined_fingerprints
+                            .get_mut(fp)
+                            .unwrap()
+                            .version_skew_attempts = 1;
+                    }
+                }
+                persist(progress).map_err(|_| SnapshotLocalStateRejected {
+                    operation: "save recovery handoff",
+                })?;
+            }
+            return Err(error);
+        }
+        result => result?,
+    };
     if response.disabled {
         return Ok(SnapshotPageOutcome::Disabled(response.disabled_reason));
     }
@@ -8560,11 +9563,22 @@ where
             let item = &items[*index];
             let item_fingerprint = fingerprint(item);
             if let Some(rejection) = rejected.get(item_fingerprint) {
-                progress.quarantine_permanent_body(
-                    item_fingerprint,
-                    &body_witness(item),
-                    rejection.safe_reason(),
-                );
+                let hold_kind = match rejection.safe_reason() {
+                    "usage_decrease_held_for_review" => Some(SnapshotHoldKind::Held),
+                    "usage_decrease_refused_after_review" => Some(SnapshotHoldKind::Refused),
+                    _ => None,
+                };
+                if let Some(kind) = hold_kind {
+                    progress.quarantine_held_body(item_fingerprint, &body_witness(item), kind);
+                } else if rejection.permanent {
+                    progress.quarantine_permanent_body(
+                        item_fingerprint,
+                        &body_witness(item),
+                        rejection.safe_reason(),
+                    );
+                } else {
+                    progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
+                }
             } else if conflicted.contains(item_fingerprint) {
                 progress.quarantine_retryable_body(item_fingerprint, &body_witness(item));
             }
@@ -8583,7 +9597,13 @@ where
         // complete scan" that recovery waited on could never
         // happen. One conflicting entity deadlocked its whole
         // source permanently, across restarts.
-        conflicted_entities = response.conflict_entities.len();
+        conflicted_entities = response.conflict_entities.len().saturating_add(
+            response
+                .rejected_entities
+                .iter()
+                .filter(|entity| !entity.permanent)
+                .count(),
+        );
     } else {
         for index in indices {
             let item = &items[*index];
@@ -8600,7 +9620,9 @@ where
     })?;
     if entity_ack {
         for entity in &response.rejected_entities {
-            record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            if entity.permanent {
+                record_poison_loss_once(poison_scope, &entity.snapshot_fingerprint);
+            }
             eprintln!(
                 "local snapshot entity rejected for {poison_scope}: reason={} permanent={} session_hash={}; \
                  accepted siblings checkpointed, rejected body retained in bounded quarantine",
@@ -8697,6 +9719,23 @@ where
         .keys()
         .cloned()
         .collect::<BTreeSet<_>>();
+    let stale_holds = progress
+        .quarantined_fingerprints
+        .iter()
+        .filter(|(fp, record)| {
+            record.hold.is_some()
+                && current_body_witnesses
+                    .get(*fp)
+                    .is_some_and(|body| record.upload_body_witness.as_ref() != Some(body))
+        })
+        .map(|(fp, _)| fp.clone())
+        .collect::<Vec<_>>();
+    for fp in &stale_holds {
+        // Rebind as retryable debt for the new exact body. This prevents an
+        // old index copy from restoring the held status after a failed offer.
+        progress.quarantine_retryable_body(fp, &current_body_witnesses[fp]);
+        progress.active_quarantine_retries.insert(fp.clone());
+    }
     let progress_len_before_prune = progress.accepted_fingerprints.len();
     progress
         .accepted_body_witnesses
@@ -8741,6 +9780,7 @@ where
     }
     if progress.accepted_fingerprints.len() != progress_len_before_prune
         || !permanent_to_restore.is_empty()
+        || !stale_holds.is_empty()
     {
         persist(progress).map_err(|_| {
             anyhow::Error::new(SnapshotLocalStateRejected {
@@ -8802,6 +9842,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut literal_retry_after = None::<u64>;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
         // A duplicate fingerprint may occur in the live scan and historical
@@ -8841,11 +9882,79 @@ where
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
         match attempt {
+            Err(error) if error.is::<unknown_recovery::Deferred>() => {
+                return Ok(ResumableUploadResult::Deferred {
+                    count: indices.len(),
+                });
+            }
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
             Ok(SnapshotPageOutcome::Settled { conflicted }) => {
                 conflicted_entities = conflicted_entities.saturating_add(conflicted);
+            }
+            Err(error)
+                if is_literal_version_skew(&error)
+                    && indices.iter().any(|index| {
+                        serde_json::to_value(&items[*index])
+                            .ok()
+                            .and_then(|body| {
+                                body.get("usage_accounting_contract")
+                                    .and_then(serde_json::Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                            .as_deref()
+                            == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                    }) =>
+            {
+                let mut retry_after = 1_800;
+                let mut ordinary = Vec::new();
+                for index in &indices {
+                    let literal = serde_json::to_value(&items[*index])
+                        .ok()
+                        .is_some_and(|body| {
+                            body.get("usage_accounting_contract")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(
+                                    crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT,
+                                )
+                        });
+                    if !literal {
+                        ordinary.push(*index);
+                        continue;
+                    }
+                    let fp = fingerprint(&items[*index]);
+                    let attempts = progress
+                        .quarantined_fingerprints
+                        .get(fp)
+                        .map_or(1, |record| record.version_skew_attempts.saturating_add(1))
+                        .min(5);
+                    let delay = (1_800_u64 << (attempts - 1)).min(21_600);
+                    progress.quarantine_transient_body(
+                        fp,
+                        &body_witness(&items[*index]),
+                        current_unix_seconds().saturating_add(delay),
+                    );
+                    let record = progress
+                        .quarantined_fingerprints
+                        .get_mut(fp)
+                        .expect("retry inserted");
+                    record.version_skew_attempts = attempts;
+                    retry_after = retry_after.max(delay);
+                }
+                persist(progress).map_err(|_| {
+                    anyhow::Error::new(SnapshotLocalStateRejected {
+                        operation: "save request-owned version-skew retry",
+                    })
+                })?;
+                eprintln!(
+                    "local snapshot sync: literal_version_skew={}",
+                    indices.len()
+                );
+                literal_retry_after = Some(literal_retry_after.unwrap_or(0).max(retry_after));
+                if !ordinary.is_empty() {
+                    batches.push_front((ordinary, false));
+                }
             }
             Err(error) if is_item_specific_local_preflight_failure(&error) => {
                 // The daemon validator names the exact request-local item. It
@@ -8957,6 +10066,37 @@ where
                     crate::client_report::ClientReportReason::RatelimitBackoff,
                     1,
                 );
+                if shed.request_owned_route_unavailable {
+                    eprintln!("local snapshot sync: request_owned_usage_route_unavailable=1");
+                    // Keep the exact offered bodies retryable in the existing
+                    // destination-scoped progress ledger too. The money route
+                    // shard may fail its checkpoint after the server's 503;
+                    // restart must not reopen these POSTs merely because that
+                    // independent pause write was lost. This is local retry
+                    // custody, never a server hold or permanent rejection.
+                    let retry_after = current_unix_seconds().saturating_add(
+                        shed.retry_after
+                            .map_or(1800, |delay| delay.as_secs().max(1800)),
+                    );
+                    let mut recorded = false;
+                    for index in &indices {
+                        if serde_json::to_value(&items[*index]).ok().is_some_and(|item| {
+                            item.get("usage_accounting_contract").and_then(serde_json::Value::as_str)
+                                == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                        }) {
+                            let fp = fingerprint(&items[*index]);
+                            progress.quarantine_transient_body(fp, &body_witness(&items[*index]), retry_after);
+                            recorded = true;
+                        }
+                    }
+                    if recorded {
+                        persist(progress).map_err(|_| {
+                            anyhow::Error::new(SnapshotLocalStateRejected {
+                                operation: "save request-owned route retry",
+                            })
+                        })?;
+                    }
+                }
                 // Stop the pass here rather than hammering the remaining pages
                 // at a server that just asked for room. Everything accepted so
                 // far is already checkpointed, so the retry resumes instead of
@@ -8994,6 +10134,10 @@ where
         .count();
     if let Some(error) = deferred_validation_error {
         Err(error)
+    } else if let Some(delay) = literal_retry_after {
+        Ok(ResumableUploadResult::Shed {
+            retry_after: Some(Duration::from_secs(delay)),
+        })
     } else if conflicted_entities > 0 {
         Ok(ResumableUploadResult::Deferred {
             count: conflicted_entities,
@@ -10254,7 +11398,7 @@ mod tests {
                 None,
                 None,
                 completion.as_mut(),
-                Some(&lease),
+                Some(&mut lease),
             )
             .unwrap()
         });
@@ -11888,6 +13032,8 @@ mod tests {
             snapshot_upload_body_witness,
             |_| {
                 Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
                     code: None,
@@ -14820,6 +15966,8 @@ mod tests {
                     Ok(accepted_batch(batch.len()))
                 } else {
                     Err(anyhow::Error::new(UploadShed {
+                        request_owned_route_unavailable: false,
+
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                         code: None,
@@ -15793,6 +16941,9 @@ mod tests {
         corrupt.quarantined_fingerprints.insert(
             fingerprint,
             SnapshotQuarantineRecord {
+                hold: None,
+                version_skew_attempts: 0,
+
                 witness: test_quarantine_witness(),
                 retry_after_unix_seconds: u64::MAX,
                 upload_body_witness: None,
@@ -16448,6 +17599,9 @@ mod tests {
             progress.quarantined_fingerprints.insert(
                 format!("{value:064x}"),
                 SnapshotQuarantineRecord {
+                    hold: None,
+                    version_skew_attempts: 0,
+
                     witness: witness.clone(),
                     retry_after_unix_seconds: value as u64,
                     upload_body_witness: None,
@@ -21845,6 +22999,8 @@ mod tests {
             |items| {
                 assert_eq!(serde_json::to_vec(&items[0]).unwrap(), expected);
                 Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 503,
                     retry_after: Some(Duration::from_secs(60)),
                     code: None,
@@ -21997,7 +23153,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
+crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, money_policy, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
 crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
@@ -22011,3 +23167,164 @@ crate::heap_layout_bound::fields!(PermanentSnapshotRejection; body_witness, reas
 
 crate::heap_layout_bound::fields!(PreparedTraceRead; generation, report);
 crate::heap_layout_bound::fields!(PreparedClaudeLocalEvidence; sessions, api, api_failed, trace_rows, traces, healthy_roots);
+
+#[cfg(test)]
+mod request_owned_retry_tests {
+    use super::*;
+
+    fn progress() -> SnapshotUploadProgress {
+        SnapshotUploadProgress::new(
+            "request-owned-tests".into(),
+            snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+        )
+    }
+
+    #[test]
+    fn request_owned_hold_survives_restart_and_obeys_allowance_before_witness_change() {
+        let mut p = progress();
+        p.quarantine_held_body("held", "body", SnapshotHoldKind::Held);
+        assert!(p.permanent_rejections.is_empty());
+        let now = current_unix_seconds();
+        let record = p.quarantined_fingerprints.get_mut("held").unwrap();
+        assert_eq!(record.failed_reconstruction_count, 1);
+        assert!(snapshot_quarantine_deadline_is_bounded(record));
+        record.retry_after_unix_seconds = now - 1;
+        record.hold.as_mut().unwrap().retries_in_day = 6;
+        record.witness.collector_version = "previous".into();
+        let mut restored: SnapshotUploadProgress =
+            serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap();
+        restored.active_quarantine_witness = p.active_quarantine_witness.clone();
+        assert!(!restored.prepare_quarantine_retries(&BTreeMap::new()));
+        restored
+            .quarantined_fingerprints
+            .get_mut("held")
+            .unwrap()
+            .hold
+            .as_mut()
+            .unwrap()
+            .day_start_unix = now - 86_400;
+        assert!(restored.prepare_quarantine_retries(&BTreeMap::new()));
+        let hold = restored.quarantined_fingerprints["held"]
+            .hold
+            .as_ref()
+            .unwrap();
+        assert_eq!(hold.retries_in_day, 1);
+        assert_eq!(
+            hold.stage, 0,
+            "leasing does not advance the response cadence"
+        );
+        restored.record_body("held", "body");
+        assert!(restored.quarantined_fingerprints.is_empty());
+    }
+
+    #[test]
+    fn held_clock_rollback_load_preserves_destination_ack_and_permanent_custody() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-hold-clock-rollback");
+        let path = scratch.join("upload-progress.json");
+        let namespace = "a".repeat(64);
+        let accepted = "b".repeat(64);
+        let refused = "c".repeat(64);
+        let held = "d".repeat(64);
+        let body = "e".repeat(64);
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut p = SnapshotUploadProgress::new(namespace.clone(), witness.clone());
+        p.record_body(&accepted, &body);
+        p.quarantine_permanent_body(
+            &refused,
+            &body,
+            "claude_request_owned_usage_contract_mismatch",
+        );
+        p.quarantine_held_body(&held, &body, SnapshotHoldKind::Held);
+        // Simulate an hour of rollback by persisting the clock seen before it.
+        let future = current_unix_seconds() + 3600;
+        let record = p.quarantined_fingerprints.get_mut(&held).unwrap();
+        let hold = record.hold.as_mut().unwrap();
+        // A re-hold advances its retry anchor while the original/day clocks
+        // remain older than the corrected wall clock.
+        hold.first_held_unix = future - 7200;
+        hold.day_start_unix = future - 7200;
+        hold.stage = 1;
+        hold.retries_in_day = 6;
+        record.retry_after_unix_seconds = hold.retry_after(&held, future);
+        p.save(&path).unwrap();
+        let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+        assert_eq!(restored.accepted_fingerprints, p.accepted_fingerprints);
+        assert_eq!(restored.accepted_body_witnesses, p.accepted_body_witnesses);
+        assert_eq!(restored.permanent_rejections, p.permanent_rejections);
+        assert_eq!(
+            restored.quarantined_fingerprints,
+            p.quarantined_fingerprints
+        );
+        assert!(!restored.quarantined_fingerprints[&held]
+            .hold
+            .as_ref()
+            .unwrap()
+            .allowance(current_unix_seconds()));
+    }
+
+    #[test]
+    fn request_owned_hold_slots_preserve_ordinary_retries_and_return_unused_capacity() {
+        let mut p = progress();
+        for n in 0..60 {
+            p.quarantine_held_body(&format!("h-{n:02}"), "body", SnapshotHoldKind::Held);
+        }
+        for n in 0..30 {
+            p.quarantine_retryable_body(&format!("o-{n:02}"), "body");
+        }
+        for record in p.quarantined_fingerprints.values_mut() {
+            record.retry_after_unix_seconds = 0;
+        }
+        assert!(p.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(p.active_quarantine_retries.len(), 50);
+        assert_eq!(
+            p.active_quarantine_retries
+                .iter()
+                .filter(|fp| fp.starts_with("h-"))
+                .count(),
+            25
+        );
+        p.quarantined_fingerprints
+            .retain(|fp, _| fp.starts_with("h-"));
+        for record in p.quarantined_fingerprints.values_mut() {
+            record.retry_after_unix_seconds = 0;
+        }
+        assert!(p.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(p.active_quarantine_retries.len(), 50);
+    }
+
+    #[test]
+    fn request_owned_refusal_stays_retryable_at_seven_days() {
+        let mut p = progress();
+        p.quarantine_held_body("refused", "body", SnapshotHoldKind::Refused);
+        let now = current_unix_seconds();
+        let record = p.quarantined_fingerprints.get_mut("refused").unwrap();
+        let hold = record.hold.as_mut().unwrap();
+        hold.first_held_unix = now - 31 * 86_400;
+        record.retry_after_unix_seconds = hold.retry_after("refused", now);
+        assert!(snapshot_quarantine_deadline_is_bounded(record));
+        assert_eq!(
+            record.disposition,
+            SnapshotQuarantineDisposition::RetryPending
+        );
+        assert!(p.permanent_rejections.is_empty());
+    }
+
+    #[test]
+    fn request_owned_skew_is_classified_before_item_validation() {
+        let error = anyhow::Error::new(BatchRejected {
+            status: 422,
+            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"extra_forbidden"}]}"#.into()),
+        });
+        assert!(is_literal_version_skew(&error));
+        assert!(is_item_specific_validation_failure(&error));
+        let unrelated = anyhow::Error::new(BatchRejected {
+            status: 422,
+            body_excerpt: Some("invalid tool_usage".into()),
+        });
+        assert!(!is_literal_version_skew(&unrelated));
+        let invalid = anyhow::Error::new(BatchRejected { status: 422,
+            body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"greater_than_equal"}]}"#.into()) });
+        assert!(!is_literal_version_skew(&invalid));
+        assert!(is_item_specific_validation_failure(&invalid));
+    }
+}

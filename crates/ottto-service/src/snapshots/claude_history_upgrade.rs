@@ -35,13 +35,9 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is complete for (SOURCE F2). The
-/// revision-3 row exists but is incomplete until MONEY's revision-3 change
-/// lands (a paused-list literal, a per-revision no-list cutoff, mtime-only
-/// changes), so this stays 2 until then. Above it every owed upgrade and
-/// every listed change is held, no file is stamped, and the Claude revision
-/// constant fails to compile. The release check reads this line.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
+/// Highest Claude revision with the shared history gate composed through all
+/// settlement paths. The live money gate remains independently disabled.
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
 
 /// At most one owed-without-list alarm an hour.
 const OWED_WITHOUT_LIST_ALARM_INTERVAL: std::time::Duration =
@@ -183,6 +179,9 @@ pub(super) fn classify(
 pub(crate) enum HistoryHold {
     /// The active revision has no policy row.
     UngatedRevision,
+    /// Money custody is paused; every selection reason retains its old body.
+    MoneyPaused,
+    UnknownOutcome,
     /// The list is unreadable, missing after install, unrecorded, or its
     /// family closure overflowed.
     ListPaused,
@@ -207,6 +206,8 @@ impl HistoryHold {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::UngatedRevision => "ungated_revision",
+            Self::MoneyPaused => "money_paused",
+            Self::UnknownOutcome => "unknown_outcome",
             Self::ListPaused => "list_paused",
             Self::Listed => "listed",
             Self::NoListBirth => "no_list_birth",
@@ -243,6 +244,9 @@ pub(super) struct PolicyInputs<'a> {
     pub(super) listed: bool,
     pub(super) birth_unix_seconds: Option<u64>,
     pub(super) latched: bool,
+    pub(super) money_paused: bool,
+    pub(super) money_probe_due: bool,
+    pub(super) unknown_outcome: bool,
     pub(super) active_revision: u64,
     /// The index's history cutoff (rebuilt or prior-install history).
     pub(super) history_cutoff_unix_seconds: Option<u64>,
@@ -261,32 +265,42 @@ pub(super) fn decide(
 ) -> HistoryDecision {
     let policy = revision_policy(inputs.active_revision)
         .filter(|_| inputs.active_revision <= MAX_GATED_CLAUDE_REVISION);
-    let decision = match kind {
-        HistoryKind::Settled | HistoryKind::Fresh => HistoryDecision::NotOwed,
-        HistoryKind::Changed => {
-            if inputs.listed && !policy.is_some_and(|policy| policy.listed_changed_may_emit) {
-                HistoryDecision::Held(HistoryHold::ListedChanged)
-            } else {
-                HistoryDecision::NotOwed
+    let money_held = inputs.money_paused
+        && !(inputs.money_probe_due && page.reserve_money_probe(index_key, size_bytes));
+    let decision = if inputs.unknown_outcome {
+        HistoryDecision::Held(HistoryHold::UnknownOutcome)
+    } else if money_held {
+        HistoryDecision::Held(HistoryHold::MoneyPaused)
+    } else if inputs.active_revision == 3 && inputs.exclusions.pauses_adoption() {
+        HistoryDecision::Held(HistoryHold::ListPaused)
+    } else {
+        match kind {
+            HistoryKind::Settled | HistoryKind::Fresh => HistoryDecision::NotOwed,
+            HistoryKind::Changed => {
+                if inputs.listed && !policy.is_some_and(|policy| policy.listed_changed_may_emit) {
+                    HistoryDecision::Held(HistoryHold::ListedChanged)
+                } else {
+                    HistoryDecision::NotOwed
+                }
             }
-        }
-        HistoryKind::Owed => {
-            let hold = if policy.is_none() {
-                Some(HistoryHold::UngatedRevision)
-            } else if inputs.exclusions.pauses_adoption() {
-                Some(HistoryHold::ListPaused)
-            } else if inputs.listed {
-                Some(HistoryHold::Listed)
-            } else if let Some(hold) = no_list_hold(inputs) {
-                Some(hold)
-            } else if inputs.latched {
-                Some(HistoryHold::Latched)
-            } else if !page.reserve(index_key, size_bytes) {
-                Some(HistoryHold::Budget)
-            } else {
-                None
-            };
-            hold.map_or(HistoryDecision::Owed, HistoryDecision::Held)
+            HistoryKind::Owed => {
+                let hold = if policy.is_none() {
+                    Some(HistoryHold::UngatedRevision)
+                } else if inputs.exclusions.pauses_adoption() {
+                    Some(HistoryHold::ListPaused)
+                } else if inputs.listed {
+                    Some(HistoryHold::Listed)
+                } else if let Some(hold) = no_list_hold(inputs) {
+                    Some(hold)
+                } else if inputs.latched {
+                    Some(HistoryHold::Latched)
+                } else if !page.reserve(index_key, size_bytes) {
+                    Some(HistoryHold::Budget)
+                } else {
+                    None
+                };
+                hold.map_or(HistoryDecision::Owed, HistoryDecision::Held)
+            }
         }
     };
     page.note(kind, decision, inputs.exclusions.state());
@@ -297,7 +311,7 @@ pub(super) fn decide(
 /// policy holds, owed history is held up to the later of the fixed no-list
 /// cutoff and the saved history cutoff. Unknown birth is history. Under
 /// `Pace` nothing is held here; the budget paces it.
-fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
+pub(super) fn no_list_hold(inputs: &PolicyInputs<'_>) -> Option<HistoryHold> {
     let hold = match inputs.no_list_policy {
         NoListPolicy::Pace => return None,
         NoListPolicy::HoldUnverified => HistoryHold::NoListBirth,
@@ -326,6 +340,7 @@ pub(crate) struct HistoryPage {
     files: usize,
     bytes: u64,
     reserved: BTreeSet<String>,
+    money_probe: Option<String>,
     /// Candidates classified as owed upgrades.
     pub(super) owed: u64,
     /// Owed upgrades permitted on this page.
@@ -334,9 +349,24 @@ pub(crate) struct HistoryPage {
     pub(super) denied: BTreeMap<(&'static str, &'static str), u64>,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, money_probe, owed, permitted, denied);
 
 impl HistoryPage {
+    fn reserve_money_probe(&mut self, key: &str, bytes: u64) -> bool {
+        if self
+            .money_probe
+            .as_deref()
+            .is_some_and(|probe| probe != key)
+        {
+            return false;
+        }
+        if !self.reserve(key, bytes) {
+            return false;
+        }
+        self.money_probe = Some(key.to_owned());
+        true
+    }
+
     /// Reserve this page's budget for one file. A file reserved earlier on
     /// this page keeps its reservation and is not charged twice.
     pub(super) fn reserve(&mut self, index_key: &str, size_bytes: u64) -> bool {
@@ -562,10 +592,55 @@ mod tests {
             listed,
             birth_unix_seconds: Some(u64::MAX),
             latched: false,
+            money_paused: false,
+            unknown_outcome: false,
+            money_probe_due: false,
             active_revision: active,
             history_cutoff_unix_seconds: None,
             no_list_policy: NoListPolicy::Pace,
         }
+    }
+
+    #[test]
+    fn money_pause_holds_every_classification_and_allows_one_bounded_probe() {
+        let list = installed("");
+        let mut paused = inputs(&list, false, 3);
+        paused.money_paused = true;
+        for kind in [
+            HistoryKind::Settled,
+            HistoryKind::Fresh,
+            HistoryKind::Changed,
+            HistoryKind::Owed,
+        ] {
+            let mut page = HistoryPage::default();
+            assert_eq!(
+                decide(kind, &paused, &mut page, "a", 1),
+                HistoryDecision::Held(HistoryHold::MoneyPaused)
+            );
+            assert_eq!(page.files, 0);
+        }
+        paused.money_probe_due = true;
+        let mut page = HistoryPage::default();
+        assert_eq!(
+            decide(HistoryKind::Changed, &paused, &mut page, "a", 1),
+            HistoryDecision::NotOwed
+        );
+        assert_eq!(
+            decide(HistoryKind::Fresh, &paused, &mut page, "b", 1),
+            HistoryDecision::Held(HistoryHold::MoneyPaused)
+        );
+        assert_eq!(page.files, 1);
+        let mut page = HistoryPage::default();
+        assert_eq!(
+            decide(
+                HistoryKind::Fresh,
+                &paused,
+                &mut page,
+                "huge",
+                HISTORY_UPGRADE_BYTES_PER_PAGE + 1
+            ),
+            HistoryDecision::Held(HistoryHold::MoneyPaused)
+        );
     }
 
     #[test]
@@ -648,14 +723,14 @@ mod tests {
         assert!(revision_policy(2).unwrap().listed_changed_may_emit);
         assert!(!revision_policy(3).unwrap().listed_changed_may_emit);
         assert_eq!(revision_policy(4), None);
-        // SOURCE F2: the revision-3 row is incomplete, so the gate stops at 2
-        // and an owed revision-3 upgrade is held whatever the list says.
-        assert_eq!(MAX_GATED_CLAUDE_REVISION, 2);
+        // The composed money paths use the shared gate; an unknown revision
+        // still cannot adopt, independently of the live feature gate.
+        assert_eq!(MAX_GATED_CLAUDE_REVISION, 3);
         let list = installed("");
         assert_eq!(
             decide(
                 HistoryKind::Owed,
-                &inputs(&list, false, 3),
+                &inputs(&list, false, 4),
                 &mut HistoryPage::default(),
                 "k",
                 1

@@ -11,6 +11,10 @@ pub(crate) mod codex_side_lifecycle;
 
 const SCHEMA_VERSION: u8 = 2;
 
+pub(crate) fn claude_money_unknown_outcome(receipt: &impl Serialize) {
+    traversal_point("claude_money_unknown_outcome", "claude_code", receipt);
+}
+
 /// Cumulative shared-process totals, NOT events attributed to the finishing
 /// page/source. No CPU/RSS probe, lookup, new collection trigger or wire event.
 pub(crate) fn cache_lifecycle_totals() {
@@ -83,6 +87,11 @@ pub(crate) fn side_read_point(point: SideReadPoint) {
             traversal_point("side_read_end", "codex", &End { pseq, abandoned })
         }
     }
+}
+
+/// Actual protected-root upload offers, by local selection cause; no entity ids.
+pub(crate) fn claude_money_protected_offers(counts: &impl Serialize) {
+    traversal_point("claude_money_protected_offers", "claude_code", counts);
 }
 
 #[derive(Clone, Copy, Debug, Serialize)]
@@ -830,6 +839,15 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
             .map(|text| serde_json::from_str(text).unwrap())
             .collect(),
     )
+}
+
+/// Count-only explicit loss-of-selection recovery transition.
+pub(crate) fn body_witness_revision_reowed() {
+    traversal_point(
+        "body_witness_revision_reowed",
+        "claude_code",
+        &serde_json::json!({"files": 1}),
+    );
 }
 
 #[cfg(test)]

@@ -56,6 +56,8 @@ fn lc_fixture() -> ScanIndex {
             upload_body_witness: None,
             failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
             disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+            hold: None,
+            version_skew_attempts: 0,
         },
     );
     index
@@ -569,4 +571,39 @@ fn save_cas_rereads_raw_bad_semantic_records_and_replaces_them_with_repaired_sel
     let reloaded = ScanIndex::load(&path).expect("reload repaired checkpoint");
     assert_eq!(scan_index_load_drops_for_test(), before_reload);
     assert_eq!(serde_json::to_value(reloaded).unwrap(), expected);
+}
+
+#[test]
+fn repaired_money_holds_have_bounded_non_immediate_deadlines() {
+    let now = 10_000_000;
+    let fingerprint = lc_hex('a');
+    for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
+        for witnessed in [false, true] {
+            let mut record = snapshot_quarantine_record(SnapshotSource::ClaudeCode);
+            record.hold = Some(SnapshotHoldRetry {
+                kind, stage: u8::MAX, first_held_unix: u64::MAX,
+                day_start_unix: u64::MAX, retries_in_day: 6,
+            });
+            record.version_skew_attempts = u8::MAX;
+            record.failed_reconstruction_count = u8::MAX;
+            record.retry_after_unix_seconds = u64::MAX;
+            record.upload_body_witness = witnessed.then(|| lc_hex('b'));
+            assert!(!snapshot_quarantine_deadline_is_bounded_at(&record, now));
+            normalize_snapshot_quarantine_record(&fingerprint, &mut record, now);
+            assert!(snapshot_quarantine_deadline_is_bounded_at(&record, now));
+            assert_eq!(record.version_skew_attempts, 5);
+            if witnessed {
+                let hold = record.hold.as_ref().unwrap();
+                assert_eq!(hold.stage, 2);
+                assert_eq!(hold.first_held_unix, now);
+                assert_eq!(hold.day_start_unix, now);
+                assert_eq!(hold.retries_in_day, 6);
+                assert_eq!(record.failed_reconstruction_count, 1);
+                assert_eq!(record.retry_after_unix_seconds, hold.retry_after(&fingerprint, now));
+                assert!(record.retry_after_unix_seconds > now);
+            } else {
+                assert!(record.hold.is_none());
+            }
+        }
+    }
 }

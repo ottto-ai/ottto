@@ -371,7 +371,7 @@ fn lose_claims(ledger: &mut ClaudeLedger, counts: &mut ClaudeTelemetryTailCounts
 /// A sweep record's (cursor stem, sweep start, state). The cursor is the
 /// record's fingerprint bytes as hex (all zero: the start).
 fn sweep_state(ledger: &ClaudeLedger, key: &str) -> (String, u64, ClaudeLedgerSweep) {
-    match ledger.get(key).and_then(ClaudeRequestCensusRecord::sweep) {
+    match ledger.get(key).and_then(|record| record.sweep()) {
         Some((cursor, start, sweep)) => {
             let stem = if cursor.iter().all(|byte| *byte == 0) {
                 String::new()
@@ -402,14 +402,14 @@ pub(crate) fn save_sweep(
     }
     debug_assert!(key.starts_with(SWEEP_KEY_PREFIX));
     let record = ClaudeRequestCensusRecord::sweep_record(bytes, start, sweep);
-    let before = ledger.get(key).and_then(ClaudeRequestCensusRecord::sweep);
+    let before = ledger.get(key).and_then(|record| record.sweep());
     if before.is_some_and(|(_, _, before)| before.complete_through > 0)
         && sweep.complete_through == 0
     {
         // A certificate went to zero: that zero reaches the disk first.
         ledger.note_meta_debt();
     }
-    if ledger.get(key) != Some(&record) {
+    if !ledger.get(key).is_some_and(|old| old.matches(&record)) {
         let _ = ledger.insert(key.to_owned(), record);
     }
 }
@@ -435,15 +435,16 @@ fn select_after(
     work: &mut ClaudeLedgerWork,
     counts: &mut ClaudeTelemetryTailCounts,
 ) -> Vec<String> {
-    let entries = match fs::read_dir(dir) {
-        Ok(entries) => entries,
-        // No sidecar was ever written: nothing to read.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
-        Err(_) => {
-            counts.enumeration_failed = true;
-            return Vec::new();
-        }
-    };
+    let entries =
+        match crate::snapshots::claude_request_money::money_io!(ReadDir, fs::read_dir(dir)) {
+            Ok(entries) => entries,
+            // No sidecar was ever written: nothing to read.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+            Err(_) => {
+                counts.enumeration_failed = true;
+                return Vec::new();
+            }
+        };
     let mut after = BinaryHeap::new();
     let mut smallest = BinaryHeap::new();
     let keep = |heap: &mut BinaryHeap<String>, stem: &str| {
@@ -512,7 +513,7 @@ fn anchor_at(file: &mut File, offset: u64, work: &mut ClaudeLedgerWork) -> Optio
     let mut bytes = [0_u8; ANCHOR_BYTES as usize];
     let bytes = &mut bytes[..(offset - start) as usize];
     file.seek(SeekFrom::Start(start)).ok()?;
-    file.read_exact(bytes).ok()?;
+    crate::snapshots::claude_request_money::money_io!(Read, file.read_exact(bytes)).ok()?;
     work.debit(bytes.len() as u64);
     let mut digest = Sha256::new();
     digest.update(b"claude_telemetry_anchor:v1\0");
@@ -604,8 +605,11 @@ fn race_point(path: &Path) {
 /// holding `kept` bytes, not rewritten in place (Sol N4), with whether it
 /// was written during the read (Sol R3-5).
 fn read_held(file: &File, path: &Path, opened: &Stamp, kept: u64) -> Option<(fs::Metadata, bool)> {
-    let after = file.metadata().ok()?;
-    let at_path = fs::symlink_metadata(path).ok()?;
+    let after =
+        crate::snapshots::claude_request_money::money_io!(Metadata, file.metadata()).ok()?;
+    let at_path =
+        crate::snapshots::claude_request_money::money_io!(Metadata, fs::symlink_metadata(path))
+            .ok()?;
     let stamp = Stamp::of(&after);
     let written = opened.written_since(&stamp)?;
     (stamp.len >= kept && identity(&at_path) == opened.identity).then_some((after, written))
@@ -671,12 +675,13 @@ pub(crate) fn open_sidecar(path: &Path) -> Result<Option<(File, fs::Metadata)>, 
         // A stat/open race to a FIFO must refuse without blocking at open.
         options.custom_flags(libc::O_NONBLOCK);
     }
-    let file = match options.open(path) {
+    let file = match crate::snapshots::claude_request_money::money_io!(Open, options.open(path)) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => return Err(()),
     };
-    let metadata = file.metadata().map_err(|_| ())?;
+    let metadata = crate::snapshots::claude_request_money::money_io!(Metadata, file.metadata())
+        .map_err(|_| ())?;
     if metadata.is_file() {
         Ok(Some((file, metadata)))
     } else {
@@ -706,7 +711,8 @@ impl<R> CountingRead<R> {
 
 impl<R: Read> Read for CountingRead<R> {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let read = self.inner.read(buffer)?;
+        let read =
+            crate::snapshots::claude_request_money::money_io!(Read, self.inner.read(buffer))?;
         self.read += read as u64;
         Ok(read)
     }
@@ -1107,7 +1113,7 @@ fn read_file(
     let previous = ledger.take(&key);
     let first_seen = previous
         .as_ref()
-        .and_then(ClaudeRequestCensusRecord::birth)
+        .and_then(|record| record.birth())
         .filter(|birth| birth.device == device && birth.inode == inode)
         .map_or(now_unix, |birth| birth.unix_seconds);
     let kept = resume.and(previous.as_ref());
@@ -1120,7 +1126,7 @@ fn read_file(
         ),
         None => Some((collected, 0)),
     };
-    let retired = kept.and_then(ClaudeRequestCensusRecord::retired);
+    let retired = kept.and_then(|record| record.retired());
     let lost_claims = previous
         .as_ref()
         .is_some_and(|previous| !previous.request_hashes().is_empty())
@@ -1414,7 +1420,6 @@ fn retire_missing(
         .map(|(key, _)| key)
         .filter(|key| key.as_str() > cursor_key.as_str())
         .take(budget.max_missing_checks)
-        .cloned()
         .collect::<Vec<_>>();
     let mut wrapped = due.len() < budget.max_missing_checks;
     let mut last = cursor;
@@ -1424,7 +1429,10 @@ fn retire_missing(
             break;
         }
         let stem = &key[TELEMETRY_KEY_PREFIX.len()..];
-        match fs::symlink_metadata(dir.join(format!("{stem}.jsonl"))) {
+        match crate::snapshots::claude_request_money::money_io!(
+            Metadata,
+            fs::symlink_metadata(dir.join(format!("{stem}.jsonl")))
+        ) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let had_claims = ledger
                     .get(&key)

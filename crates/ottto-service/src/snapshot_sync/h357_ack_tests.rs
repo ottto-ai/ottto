@@ -1346,6 +1346,8 @@ fn h360_probe_conflict_defers_without_source_abort_and_merges_count() {
             true,
             |_, _| match case {
                 "shed" => Err(anyhow::Error::new(UploadShed {
+                    request_owned_route_unavailable: false,
+
                     status: 429,
                     retry_after: None,
                     code: None,
@@ -1980,6 +1982,7 @@ fn a_pending_newer_body_unbinds_its_dominated_refusal() {
 
 fn short_shed() -> anyhow::Error {
     anyhow::Error::new(UploadShed {
+        request_owned_route_unavailable: false,
         status: 503,
         retry_after: Some(Duration::from_secs(1)),
         code: None,

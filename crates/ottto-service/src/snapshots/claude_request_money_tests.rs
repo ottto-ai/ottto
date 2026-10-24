@@ -24,8 +24,7 @@ use crate::snapshots::claude_request_money::rows::ClaudeRootRows;
 use crate::snapshots::claude_request_money::store::{self, ClaudeLedger};
 use crate::snapshots::claude_request_money::{
     claude_cache_creation, claude_response_conflict_order, enable_shadow_for_test,
-    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation,
-    ClaudeMoneyTokens,
+    parse_usd_micros_for_test, reserved_for_test, shadow_page_at, CacheCreation, ClaudeMoneyTokens,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -278,9 +277,15 @@ fn money_birth_is_carried_only_for_the_same_object() {
     let totals = census.totals_for_test();
     census.invalidate_keeping_birth_for_test(key);
     assert!(census.get(key).is_none());
-    assert!(census.record_for_test(key).unwrap().is_birth_stub_for_test());
+    assert!(census
+        .record_for_test(key)
+        .unwrap()
+        .is_birth_stub_for_test());
     assert_eq!(census.len_for_test(), 0);
-    assert!(census.totals_for_test().0 < totals.0, "the hashes are freed");
+    assert!(
+        census.totals_for_test().0 < totals.0,
+        "the hashes are freed"
+    );
     assert_eq!(census.totals_for_test(), census.recounted_for_test());
     assert_eq!(
         census.carried_birth_for_test(key, Some(reread)),
@@ -322,7 +327,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
     let birth = parser
         .claude_opened_birth
         .expect("the test file system must report file birth");
-    assert!(parser.accumulator.claude_file_birth.is_root_with_birth_for_test());
+    assert!(parser
+        .accumulator
+        .claude_file_birth
+        .is_root_with_birth_for_test());
     let created = expected
         .created()
         .expect("created")
@@ -330,7 +338,10 @@ fn money_birth_is_the_open_time_read_shared_with_the_birth_rule() {
         .expect("after the epoch");
     assert_eq!(birth.unix_seconds, created.as_secs());
     #[cfg(unix)]
-    assert_eq!((birth.device, birth.inode), (expected.dev(), expected.ino()));
+    assert_eq!(
+        (birth.device, birth.inode),
+        (expected.dev(), expected.ino())
+    );
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -588,7 +599,12 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let otel = telemetry_key("root");
     ledger.insert_for_test(
         &otel,
-        ClaudeRequestCensusRecord::telemetry(vec![2, 3], money_facts("root", 2), tail, 1_700_000_000),
+        ClaudeRequestCensusRecord::telemetry(
+            vec![2, 3],
+            money_facts("root", 2),
+            tail,
+            1_700_000_000,
+        ),
     );
     ledger.insert_for_test(
         &message_key("/money/projects/c.jsonl"),
@@ -628,13 +644,21 @@ fn money_census_ledger_fields_round_trip_and_are_charged_exactly() {
     let telemetry = loaded.record_for_test(&otel).unwrap();
     assert_eq!(telemetry.tail().copied(), Some(tail));
     assert_eq!(telemetry.facts(), Some(&money_facts("root", 2)[..]));
-    let sweep = loaded.record_for_test("sweep:tail").unwrap().sweep().unwrap();
-    assert_eq!((*sweep.0, sweep.1, sweep.2.debt), ([9; 32], 1_700_000_300, 1));
-    let memo = loaded.record_for_test("fam:x").unwrap().family_memo().unwrap();
+    let sweep = loaded
+        .record_for_test("sweep:tail")
+        .unwrap()
+        .sweep()
+        .unwrap();
     assert_eq!(
-        (memo.1.removed_tokens, memo.1.snapshot),
-        (900, 5)
+        (*sweep.0, sweep.1, sweep.2.debt),
+        ([9; 32], 1_700_000_300, 1)
     );
+    let memo = loaded
+        .record_for_test("fam:x")
+        .unwrap()
+        .family_memo()
+        .unwrap();
+    assert_eq!((memo.1.removed_tokens, memo.1.snapshot), (900, 5));
     let messages = loaded
         .record_for_test(&message_key("/money/projects/c.jsonl"))
         .unwrap();
@@ -703,7 +727,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     );
     with("b-wrong-type", "b", serde_json::json!([1, 2]));
     // Facts belong to a telemetry record (with a tail).
-    with("f-without-tail", "f", serde_json::json!(encode(&money_facts("r", 2)[..])));
+    with(
+        "f-without-tail",
+        "f",
+        serde_json::json!(encode(&money_facts("r", 2)[..])),
+    );
     with("f-not-base64", "f", serde_json::json!("!!!!"));
     with("bi-negative", "bi", serde_json::json!(-1));
     with("bi-string", "bi", serde_json::json!("1"));
@@ -766,7 +794,11 @@ fn money_census_decoder_refuses_hostile_ledger_fields() {
     for (field, value) in [("xa", 11), ("xs", 0), ("xp", 0), ("xq", 0), ("xk", 0)] {
         tail[field] = serde_json::json!(value);
     }
-    assert_eq!(money_decode_one(tail.clone()), None, "audit target past offset");
+    assert_eq!(
+        money_decode_one(tail.clone()),
+        None,
+        "audit target past offset"
+    );
     tail["xa"] = serde_json::json!(10);
     assert!(money_decode_one(tail.clone()).is_some());
     // Facts must hold exactly one fact per hash.
@@ -934,7 +966,10 @@ impl MoneyTail {
         now: u64,
         work: &mut ClaudeLedgerWork,
         roots: &[&str],
-    ) -> (ClaudeTelemetryTailCounts, BTreeMap<String, ClaudeRootTelemetry>) {
+    ) -> (
+        ClaudeTelemetryTailCounts,
+        BTreeMap<String, ClaudeRootTelemetry>,
+    ) {
         let out = ClaudeTelemetryTail::advance(&self.support, ledger, now, budget, roots, work);
         // Moving hashes in and out never leaves the budget totals behind.
         let census = ledger.census();
@@ -976,7 +1011,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
     assert_eq!((counts.rows_valid, counts.rows_refused), (1, 1));
     assert!(counts.sweep_wrapped && !counts.sweep_debt);
     assert_eq!(telemetry_complete_through(&ledger), 1_800_000_000);
-    let record = ledger.get(&key).expect("telemetry record").clone();
+    let record = ledger.get(&key).expect("telemetry record");
     assert_eq!(record.request_hashes(), &[claude_request_hash("req_1")]);
     let len = std::fs::metadata(tail.path(session)).unwrap().len();
     assert_eq!(record.tail().unwrap().offset, len);
@@ -985,7 +1020,7 @@ fn money_telemetry_tail_reads_only_complete_appended_lines() {
         crate::snapshots::rfc3339_unix_seconds(t).unwrap()
     );
     // The foreign row is refused: the root's rows are never complete.
-    assert!(ClaudeRootRows::from_record(&record).is_none());
+    assert!(ClaudeRootRows::from_record(record).is_none());
 
     // A partial line is not consumed until its newline arrives.
     let line = money_api_line(session, "req_2", t);
@@ -1093,7 +1128,7 @@ fn money_telemetry_tail_skips_oversized_lines_and_resumes_audits() {
     let mut oversized = 0;
     while ledger
         .get(&key)
-        .is_none_or(|record| record.request_hashes().is_empty())
+        .map_or(true, |record| record.request_hashes().is_empty())
     {
         pages += 1;
         assert!(pages < 12, "the oversized line pinned the file");
@@ -1291,7 +1326,11 @@ fn money_rows_converge_by_tailing_long_sidecars() {
     );
     assert_eq!(roots[session], ClaudeRootTelemetry::Current);
     assert_eq!(
-        (counts.files_appended, counts.files_rebuilt, counts.bytes_read),
+        (
+            counts.files_appended,
+            counts.files_rebuilt,
+            counts.bytes_read
+        ),
         (1, 0, line.len() as u64),
         "{counts:?}"
     );
@@ -1337,7 +1376,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     tail.append(session, &money_api_line(session, "req_1", t));
     let mut ledger = ClaudeLedger::new_for_test();
     tail.advance(&mut ledger, &budget);
-    let before = ledger.get(&key).unwrap().clone();
+    let before = ledger.get(&key).unwrap().to_owned_record();
     tail.append(session, &money_api_line(session, "req_2", t));
     let run = |ledger: &mut ClaudeLedger| {
         let out = tail.page(
@@ -1362,18 +1401,27 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert!(counts.sweep_debt, "a raced read is debt");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key), Some(&before), "nothing committed");
+    assert_eq!(
+        ledger.get(&key).map(|record| record.to_owned_record()),
+        Some(before.clone()),
+        "nothing committed"
+    );
 
     // Rewritten in place: same object, same length, new times.
     race_reads_for_test(Some(Box::new(|path: &Path| {
         let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
         let modified = file.metadata().unwrap().modified().unwrap();
-        file.set_modified(modified + Duration::from_secs(1)).unwrap();
+        file.set_modified(modified + Duration::from_secs(1))
+            .unwrap();
     })));
     let (counts, roots) = run(&mut ledger);
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key), Some(&before), "nothing committed");
+    assert_eq!(
+        ledger.get(&key).map(|record| record.to_owned_record()),
+        Some(before.clone()),
+        "nothing committed"
+    );
 
     // Appended mid-read: committed through the frozen extent.
     let appended = money_api_line(session, "req_late", t);
@@ -1394,7 +1442,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     // Sol R3-5: rewritten in place AND appended mid-read (it grew, so the
     // length alone looks like an append): the second pass sees the bytes
     // read changed, nothing commits and the read is debt.
-    let committed = ledger.get(&key).cloned();
+    let committed = ledger.get(&key).map(|record|record.to_owned_record());
     let more = money_api_line(session, "req_more", t);
     race_reads_for_test(Some(Box::new(move |path: &Path| {
         let text = std::fs::read_to_string(path).unwrap();
@@ -1421,7 +1469,7 @@ fn money_telemetry_tail_commits_nothing_from_a_raced_read() {
     assert!(counts.files_raced >= 1, "{counts:?}");
     assert_eq!(counts.files_reread_proven, 0, "{counts:?}");
     assert_eq!(roots[session], ClaudeRootTelemetry::Behind);
-    assert_eq!(ledger.get(&key).cloned(), committed, "nothing committed");
+    assert_eq!(ledger.get(&key).map(|record|record.to_owned_record()), committed, "nothing committed");
 }
 
 /// Sol N2: the tail admits a record's growth against the ledger's budgets
@@ -1521,8 +1569,15 @@ fn money_lost_claims_are_durable_debt() {
         "the debt first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
-    assert_eq!(telemetry_complete_through(&loaded), 0, "no certificate covers it");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "no certificate covers it"
+    );
 
     // A sweep advance is not written while that shard's write has failed.
     save_sweep(
@@ -1539,7 +1594,10 @@ fn money_lost_claims_are_durable_debt() {
         store::save_page_for_test(&support, &mut ledger, &mut failed),
         Some((2, false, 1))
     );
-    assert_eq!(telemetry_complete_through(&store::load_for_test(&support)), 0);
+    assert_eq!(
+        telemetry_complete_through(&store::load_for_test(&support)),
+        0
+    );
 
     // Once the shard is written, the advance follows it.
     std::fs::remove_dir_all(&staged).unwrap();
@@ -1587,7 +1645,9 @@ fn money_failed_debt_meta_blocks_later_batches() {
     // A later change, queued before the first batch's result comes back.
     let other = (0..)
         .map(|number| telemetry_key(&format!("other-{number}")))
-        .find(|key| store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel))
+        .find(|key| {
+            store::shard_path_for_test(&support, key) == store::shard_path_for_test(&support, &otel)
+        })
         .unwrap();
     let _ = ledger.insert(other.clone(), record(1));
     let second = store::take_save_for_test(&mut ledger).expect("the later batch");
@@ -1642,7 +1702,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         complete_through,
         debt: 0,
     };
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_000, sweep(1_799_000_000));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_000,
+        sweep(1_799_000_000),
+    );
     money_save_all(&support, &mut ledger);
 
     ledger.remove(&otel);
@@ -1654,7 +1720,13 @@ fn money_zero_meta_is_retaken_after_an_advance() {
     let dropped = store::take_save_for_test(&mut ledger).expect("the zero batch");
     store::restore_for_test(&mut ledger, &[&dropped]);
     // A clean sweep advances the certificate before the retry.
-    save_sweep(&mut ledger, "sweep:tail", "", 1_800_000_600, sweep(1_800_000_500));
+    save_sweep(
+        &mut ledger,
+        "sweep:tail",
+        "",
+        1_800_000_600,
+        sweep(1_800_000_500),
+    );
     let staged = store::shard_path_for_test(&support, &otel).with_extension("json.tmp");
     std::fs::create_dir_all(staged.join("blocked")).unwrap();
     let mut failed = store::WriterState::default();
@@ -1664,7 +1736,10 @@ fn money_zero_meta_is_retaken_after_an_advance() {
         "the zero meta first, then the data shard (which fails)"
     );
     let loaded = store::load_for_test(&support);
-    assert!(loaded.get(&otel).is_some(), "the disk still holds the claim");
+    assert!(
+        loaded.get(&otel).is_some(),
+        "the disk still holds the claim"
+    );
     assert_eq!(
         telemetry_complete_through(&loaded),
         0,
@@ -1713,7 +1788,11 @@ fn money_dirty_sweep_wrap_keeps_the_certificate_zero() {
     }
     money_save_all(&tail.support, &mut ledger);
     let mut loaded = store::load_for_test(&tail.support);
-    assert_eq!(telemetry_complete_through(&loaded), 0, "a restart loads the zero");
+    assert_eq!(
+        telemetry_complete_through(&loaded),
+        0,
+        "a restart loads the zero"
+    );
 
     // The line completes: the next clean sweep certifies again.
     tail.append(partial, rest);
@@ -1948,7 +2027,10 @@ fn money_facts_round_trip_compactly() {
     assert!(!facts::valid(&blob, rows.len() - 1));
     assert_eq!(facts::header_of_for_test(&blob), Some(header.clone()));
     let per_row = facts::body_len(&blob) as f64 / rows.len() as f64;
-    eprintln!("MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}", rows.len());
+    eprintln!(
+        "MONEY_FACTS rows={} body_bytes_per_row={per_row:.1}",
+        rows.len()
+    );
     assert!(per_row <= 24.0, "{per_row}");
     let hashes = (1..=rows.len() as u64).collect::<Vec<_>>();
     let record = ClaudeRequestCensusRecord::telemetry(
@@ -1979,7 +2061,7 @@ fn money_facts_round_trip_compactly() {
 /// root B, every record current at its entry and its message-only ids known.
 struct MoneyLedger {
     index: ScanIndex,
-    ledger: ClaudeRequestCensus,
+    ledger: super::claude_request_money::custody::Custody,
     /// Session ids by telemetry key, as a page names its roots'.
     sessions: BTreeMap<String, String>,
     a: String,
@@ -1988,7 +2070,10 @@ struct MoneyLedger {
 }
 
 fn money_hashes(ids: &[&str]) -> Vec<u64> {
-    let mut hashes = ids.iter().map(|id| claude_request_hash(id)).collect::<Vec<_>>();
+    let mut hashes = ids
+        .iter()
+        .map(|id| claude_request_hash(id))
+        .collect::<Vec<_>>();
     hashes.sort_unstable();
     hashes
 }
@@ -1996,7 +2081,7 @@ fn money_hashes(ids: &[&str]) -> Vec<u64> {
 impl MoneyLedger {
     fn new(a: &[&str], ax: &[&str], b: &[&str]) -> Self {
         let mut index = ScanIndex::default();
-        let mut ledger = ClaudeRequestCensus::default();
+        let mut ledger = super::claude_request_money::custody::Custody::default();
         let keys = [
             ("/m/projects/-repo/A.jsonl", 'a', a),
             ("/m/projects/-repo/A/subagents/agent-x.jsonl", 'b', ax),
@@ -2224,15 +2309,18 @@ fn money_scope_debt_blocks_negative_membership_claims() {
     // A retained record of a member the index no longer lists (residue):
     // its ids are no holder, so it blocks too.
     let mut ledger = MoneyLedger::new(&[], &[], &["req_own"]);
-    ledger.index.claude_request_census_mut_for_test().insert_for_test(
-        "/m/projects/-repo/R.jsonl",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &money_fingerprint('d'),
-            7,
-            ClaudeRequestCensusShape::Lossy,
-            vec![1],
-        ),
-    );
+    ledger
+        .index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(
+            "/m/projects/-repo/R.jsonl",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &money_fingerprint('d'),
+                7,
+                ClaudeRequestCensusShape::Lossy,
+                vec![1],
+            ),
+        );
     assert_eq!(
         ledger.classify("req_own", &ledger.b, "B", &none),
         ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::Scope)
@@ -2258,7 +2346,7 @@ fn money_scope_debt_blocks_negative_membership_claims() {
 fn money_message_only_copies_pick_one_owner() {
     let message = crate::snapshots::claude_request_money::claude_message_hash("msg_shared");
     let mut index = ScanIndex::default();
-    let mut ledger = ClaudeRequestCensus::default();
+    let mut ledger = super::claude_request_money::custody::Custody::default();
     let keys = ["/m/projects/-repo/P.jsonl", "/m/projects/-repo/Q.jsonl"];
     for (key, seed) in keys.iter().zip(['1', '2']) {
         let mut entry = manifest_index_entry(Some("body"));
@@ -2500,7 +2588,8 @@ fn money_rows_follow_audited_rewrites() {
     (&file).write_all(rewritten.as_bytes()).unwrap();
     // A later rewrite: its mtime moves past the last read's second.
     let modified = file.metadata().unwrap().modified().unwrap();
-    file.set_modified(modified + Duration::from_secs(5)).unwrap();
+    file.set_modified(modified + Duration::from_secs(5))
+        .unwrap();
     drop(file);
     // The tail sees the touched file; the next day's audit catches it (an
     // idle untouched sidecar waits for the 30-day sample); the tail
@@ -2528,6 +2617,9 @@ fn money_rows_follow_audited_rewrites() {
 #[serial_test::serial(claude_request_money_shadow)]
 fn money_m4_sized_ledger_and_page_are_measured() {
     use crate::claude_local_otel::telemetry_tail::save_sweep;
+    // The synthetic half-million-row cold load is intentionally larger than
+    // an ordinary shutdown flush. Require its completion, not a timed guess.
+    let _flush = store::flush_timeout_for_test(Duration::from_secs(60));
     const FILES: usize = 11_500;
     const FILE_HASHES: u64 = 61;
     const SIDECARS: usize = 5_600;
@@ -2554,7 +2646,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         )
         .unwrap();
         std::fs::write(
-            store_dir.join(format!("{:x}.jsonl", sha2::Sha256::digest(session.as_bytes()))),
+            store_dir.join(format!(
+                "{:x}.jsonl",
+                sha2::Sha256::digest(session.as_bytes())
+            )),
             money_api_line(session, &request, "2026-08-02T07:00:00Z"),
         )
         .unwrap();
@@ -2670,16 +2765,41 @@ fn money_m4_sized_ledger_and_page_are_measured() {
             debt: 0,
         },
     );
+    fn fixture_rss() -> u64 {
+        let output = std::process::Command::new("/bin/ps").args(["-o", "rss=", "-p", &std::process::id().to_string()]).output().unwrap();
+        assert!(output.status.success());
+        std::str::from_utf8(&output.stdout).unwrap().trim().parse::<u64>().unwrap() * 1024
+    }
+    // Touch the test-only pointer inventory before either sample so its fixed
+    // pages do not masquerade as live daemon custody growth.
+    let _ = crate::retry_allocation_probe::measure_caller_thread(|| ());
+    let p1_resident_rss = std::env::var_os("OTTTO_MONEY_ISOLATED_RSS").is_some().then(|| {
+        let _ = fixture_rss();
+        let mut samples = [fixture_rss(), fixture_rss(), fixture_rss()];
+        samples.sort_unstable();
+        samples[1]
+    });
+    let (_, live_native) = crate::retry_allocation_probe::measure_caller_thread(||
+        super::claude_request_money::custody_tests::admit_m4(&mut ledger, &index, now));
+    if let Some(p1_resident_rss) = p1_resident_rss {
+        let mut samples = [fixture_rss(), fixture_rss(), fixture_rss()];
+        samples.sort_unstable();
+        let live_resident_rss = samples[1];
+        eprintln!("MONEY_RSS_LIVE_FIXTURE p1_resident_bytes={p1_resident_rss} live_resident_bytes={live_resident_rss} delta_bytes={} current_kernel_rss=true observer_inventory_warmed=true isolated_test_process=true live_custody_admission=true release_daemon_rss=false", i128::from(live_resident_rss) - i128::from(p1_resident_rss));
+    }
     let build_ms = started.elapsed().as_millis();
     let index_census = index.claude_request_census_for_test();
     let index_bytes = index_census.exact_serialized_len_for_test();
     let census = ledger.census();
     let ledger_bytes = census.exact_serialized_len_for_test();
+    let (fact_bytes, hash_bytes, query_key_bytes, carrier_and_field_bytes) = census.resident_components_for_test();
+    eprintln!("MONEY_M4_RESIDENT_COMPONENTS fact_bytes={fact_bytes} hash_bytes={hash_bytes} query_key_bytes={query_key_bytes} carrier_and_field_bytes={carrier_and_field_bytes} shared_payload_counted_once=true structural_estimate_not_RSS=true");
     let ledger_resident = census
         .resident_bytes(std::time::Instant::now() + std::time::Duration::from_secs(3600))
         .expect("no deadline");
     // The structural resident bound (records, overhead, payload) holds.
     assert!(ledger_resident <= store::LEDGER_RESIDENT_BOUND_BYTES);
+    assert!(ledger_resident <= 38 * 1024 * 1024, "M4 live custody must fit the design resident range: {ledger_resident}");
     let facts_rows = SIDECARS as u64 * SIDECAR_ROWS;
     let facts_bytes = census
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
@@ -2688,23 +2808,44 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     assert_eq!(census.serialized_total_for_test(), ledger_bytes - 1);
     let telemetry_serialized = census
         .records_with_prefix(TELEMETRY_KEY_PREFIX)
-        .map(|(key, record)| key.len() + 3 + serde_json::to_vec(record).unwrap().len())
+        .map(|(key, record)| key.len() + 3 + serde_json::to_vec(&record).unwrap().len())
         .sum::<usize>();
 
-    // The whole ledger saved, then loaded (a restart).
-    let started = Instant::now();
-    let mut failed = store::WriterState::default();
-    let mut save_pages = 0;
-    while let Some((_, _, unwritten)) =
-        store::save_page_for_test(&support, &mut ledger, &mut failed)
-    {
-        assert_eq!(unwritten, 0);
-        save_pages += 1;
-    }
-    let save_ms = started.elapsed().as_millis();
-    let started = Instant::now();
-    let loaded = store::load_for_test(&support);
-    let load_ms = started.elapsed().as_millis();
+    // Admit every live field into its physical carrier. Packed history and
+    // every optional scheduling field consume bytes, never hidden records.
+    let transcript_records = index_census.len_for_test();
+    let telemetry_records = census.records_with_prefix(TELEMETRY_KEY_PREFIX).count();
+    let actual_admitted = census.record_count();
+    assert_eq!(actual_admitted, index.files.len() + telemetry_records + 2);
+    assert!(actual_admitted * 100 < store::LEDGER_MAX_RECORDS * 35);
+    assert_eq!(census.records_with_prefix("watch:r:").count(), transcript_records + telemetry_records);
+    assert_eq!(census.records_with_prefix("watch:m:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("union:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("adopt:member:v1:").count(), index.files.len());
+    assert_eq!(census.records_with_prefix("offer:").count(),16);
+    assert_eq!(census.records_with_prefix("due:").count(),16);
+    assert_eq!(census.records_with_prefix("dirty:").count(),16);
+    assert_eq!(census.totals_for_test(),census.recounted_for_test());
+    eprintln!("MONEY_M4_CUSTODY_ESTIMATE actual_admitted={actual_admitted} physical={} telemetry={telemetry_records} detached=0 globals=2 cap={} live_admission_executed=true percent={:.3} serialized_bytes={ledger_bytes} resident_bytes={ledger_resident}",index.files.len(),store::LEDGER_MAX_RECORDS,actual_admitted as f64 *100.0 / store::LEDGER_MAX_RECORDS as f64);
+
+    // The whole ledger saved, then loaded (a restart). Native measurements
+    // are incremental caller allocations, not process RSS or writer-thread I/O.
+    let ((save_pages, dirty_shard_writes, save_ms),save_native) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let started=Instant::now();
+        let mut failed=store::WriterState::default();
+        let mut pages=0;
+        let mut writes=0;
+        while let Some((shards,_,unwritten))=store::save_page_for_test(&support,&mut ledger,&mut failed) {
+            assert_eq!(unwritten,0);
+            pages+=1;
+            writes+=shards;
+        }
+        (pages,writes,started.elapsed().as_millis())
+    });
+    let started=Instant::now();
+    let (loaded,load_native) = crate::retry_allocation_probe::measure_caller_thread(||store::load_for_test(&support));
+    let load_ms=started.elapsed().as_millis();
+    eprintln!("MONEY_M4_CUSTODY_RESOURCES live_requested_peak={} live_native_usable_peak={} save_requested_peak={} save_native_usable_peak={} load_requested_peak={} load_native_usable_peak={} dirty_shard_writes={dirty_shard_writes} save_pages={save_pages} save_ms={save_ms} load_ms={load_ms}",live_native.requested_peak,live_native.usable_peak,save_native.requested_peak,save_native.usable_peak,load_native.requested_peak,load_native.usable_peak);
     assert!(!loaded.load_damaged);
     assert_eq!(loaded.census(), ledger.census());
     drop(loaded);
@@ -2729,8 +2870,16 @@ fn money_m4_sized_ledger_and_page_are_measured() {
     store::flush();
     let counts = page(&index);
     store::flush();
-    assert_eq!(counts.ledger_loading + counts.ledger_unavailable, 0, "{counts:?}");
-    assert_eq!(counts.refused_budget + counts.refused_deadline, 0, "{counts:?}");
+    assert_eq!(
+        counts.ledger_loading + counts.ledger_unavailable,
+        0,
+        "{counts:?}"
+    );
+    assert_eq!(
+        counts.refused_budget + counts.refused_deadline,
+        0,
+        "{counts:?}"
+    );
     assert_eq!(counts.ledger_load_damaged, 0, "{counts:?}");
     assert_eq!(counts.families, sessions.len() as u64, "{counts:?}");
     eprintln!(
@@ -2753,7 +2902,10 @@ fn money_m4_sized_ledger_and_page_are_measured() {
         counts.admission_bytes,
         counts.admitted_peak_bytes,
         counts.elapsed_us,
-        counts.units_counted + counts.units_removed + counts.units_undecided + counts.units_immature,
+        counts.units_counted
+            + counts.units_removed
+            + counts.units_undecided
+            + counts.units_immature,
         counts.families,
     );
     assert_eq!(reserved_for_test(), 0);
@@ -2766,4 +2918,1180 @@ fn census_len(support: &Path) -> usize {
 fn census_hashes(support: &Path) -> usize {
     store::with_ledger_for_test(support, |ledger| ledger.census().hash_total_for_test())
         .unwrap_or(0)
+}
+
+// P2a conservation exercises the real parser/capture, classifier, full body
+// builder and contract-5 sink. This deliberately does not emulate scheduling
+// or manufacture ACKs for the builder; caller/save boundaries live alongside
+// the resumable uploader tests.
+mod p2a_conservation {
+    use super::*;
+    use crate::snapshots::claude_request_identity as identity;
+    use crate::snapshots::claude_request_money::{self as money, body, capture, rows};
+
+    const A: &str = "a1111111-1111-4111-8111-111111111111";
+    const B: &str = "b2222222-2222-4222-8222-222222222222";
+    const H7: &str = "2026-08-02T07:00:00Z";
+    const H8: &str = "2026-08-02T08:00:00Z";
+    const NOW: u64 = 1_785_662_400; // safely after both synthetic hours
+
+    struct Corpus {
+        scratch: crate::test_scratch::ScratchDir,
+        support: PathBuf,
+        index: ScanIndex,
+        ledger: ClaudeLedger,
+        items: BTreeMap<String, SnapshotItem>,
+        paths: BTreeMap<String, String>,
+        api: crate::claude_local_otel::ClaudeLocalOtelLoadReport,
+        trace: crate::claude_local_otel::ClaudeTraceOwnershipLoadReport,
+    }
+
+    fn line(session: &str, request: &str, message: &str, hour: &str, input: u64) -> String {
+        serde_json::json!({"timestamp": hour, "type":"assistant", "sessionId":session,
+            "requestId":request, "message":{"id":message,"model":"claude-haiku-4-5",
+            "usage":{"input_tokens":input,"output_tokens":2,"cache_read_input_tokens":3,
+            "cache_creation_input_tokens":12,"cache_creation":{"ephemeral_5m_input_tokens":5,
+                "ephemeral_1h_input_tokens":7}}}})
+        .to_string()
+            + "\n"
+    }
+
+    fn signed(
+        mut row: crate::claude_local_otel::ClaudeLocalOtelEvidence,
+    ) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        row.fingerprint.clear();
+        row.fingerprint = format!(
+            "sha256:{:x}",
+            sha2::Sha256::digest(serde_json::to_vec(&row).unwrap())
+        );
+        row
+    }
+
+    impl Corpus {
+        fn new(name: &str) -> Self {
+            let scratch = crate::test_scratch::ScratchDir::new(name);
+            let support = scratch.join("support");
+            std::fs::create_dir_all(&support).unwrap();
+            money::enable_shadow_for_test(&support);
+            Self {
+                scratch,
+                support,
+                index: ScanIndex::default(),
+                ledger: ClaudeLedger::new_for_test(),
+                items: BTreeMap::new(),
+                paths: BTreeMap::new(),
+                api: Default::default(),
+                trace: Default::default(),
+            }
+        }
+
+        fn transcript(&mut self, session: &str, text: &str, birth: u64) {
+            let path = self.scratch.join(format!("projects/-repo/{session}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, text).unwrap();
+            let fp = format!("{:x}", sha2::Sha256::digest(text.as_bytes()));
+            let item = parse_claude_code_jsonl_file(&path, "2026-08-03T10:00:00Z", fp.clone())
+                .unwrap()
+                .remove(0);
+            let key = local_index_key(&path);
+            let mut entry = manifest_index_entry(Some("previous-body"));
+            entry.source_file_fingerprint = fp.clone();
+            self.index.files.insert(key.clone(), entry);
+            let hashes = money_hashes(
+                &item
+                    .claude_usage_occurrences
+                    .keys()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>(),
+            );
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &fp,
+                7,
+                if hashes.is_empty() {
+                    ClaudeRequestCensusShape::Empty
+                } else {
+                    ClaudeRequestCensusShape::Exact
+                },
+                hashes,
+            )
+            .with_birth_for_test(Some(ClaudeRequestBirth {
+                unix_seconds: birth,
+                device: 1,
+                inode: birth,
+            }));
+            let captured =
+                capture::take_capture(&self.support, &key, &fp).expect("real parser capture");
+            self.ledger.insert(
+                message_key(&key),
+                ClaudeRequestCensusRecord::message_record(&record, captured.message_only_hashes()),
+            );
+            captured.deposit(key.clone(), fp);
+            self.index
+                .claude_request_census_mut_for_test()
+                .insert_for_test(&key, record);
+            self.paths.insert(session.into(), key);
+            self.items.insert(session.into(), item);
+        }
+
+        fn telemetry(
+            &mut self,
+            root: &str,
+            request: &str,
+            hour: &str,
+            input: u64,
+            login: char,
+            priced: bool,
+        ) {
+            let mut row = complete_api_row(root, request, 1, input, 2, 12);
+            row.observed_at = hour.into();
+            row.speed.clear();
+            row.effort.clear();
+            row.app_version = "2.1.300".into();
+            row.cache_read_tokens = 3;
+            row.cache_creation_5m_tokens = 5;
+            row.cache_creation_1h_tokens = 7;
+            row.account_identifier_hash = Some(login.to_string().repeat(64));
+            row.cost_usd_micros = priced.then_some(100);
+            self.api
+                .evidence
+                .entry(root.into())
+                .or_default()
+                .push(signed(row));
+            self.trace
+                .evidence
+                .entry(root.into())
+                .or_default()
+                .push(complete_trace_row(root, request, ""));
+            self.refresh_telemetry(root);
+        }
+
+        fn refresh_telemetry(&mut self, root: &str) {
+            let mut header = ClaudeFactsHeader {
+                session: root.into(),
+                ..Default::default()
+            };
+            let mut facts = self.api.evidence[root]
+                .iter()
+                .map(|row| rows::row_fact(row, root, &mut header).unwrap())
+                .collect::<Vec<_>>();
+            rows::resolve_conflicts(&header, &mut facts);
+            let hashes = facts.iter().map(|(hash, _)| *hash).collect();
+            let first = facts.iter().map(|(_, fact)| fact.clock).min().unwrap();
+            let facts = facts.into_iter().map(|(_, fact)| fact).collect::<Vec<_>>();
+            self.ledger.insert(
+                telemetry_key(root),
+                ClaudeRequestCensusRecord::telemetry(
+                    hashes,
+                    facts::encode(&header, &facts, 0).into_boxed_slice(),
+                    ClaudeTelemetryTailState {
+                        first_event_unix: first,
+                        last_append_unix: first,
+                        ..Default::default()
+                    },
+                    NOW,
+                ),
+            );
+        }
+
+        fn restart(&mut self) {
+            let path = self.scratch.join("index.json");
+            self.index.save(&path).unwrap();
+            self.index = ScanIndex::load(&path).unwrap();
+            money_save_all(&self.support, &mut self.ledger);
+            self.ledger = store::load_for_test(&self.support);
+        }
+
+        fn build(&self, session: &str, now: u64) -> body::ClaudeRequestBody {
+            let item = &self.items[session];
+            let key = &self.paths[session];
+            let fp = &self.index.files[key].source_file_fingerprint;
+            // Reparse at every build, as a real selected file does after a restart.
+            let _ =
+                parse_claude_code_jsonl_file(Path::new(key), "2026-08-03T10:00:00Z", fp.clone())
+                    .unwrap();
+            let captured = capture::take_capture(&self.support, key, fp).expect("fresh capture");
+            let all_hashes = self
+                .items
+                .values()
+                .flat_map(|item| {
+                    item.claude_usage_occurrences
+                        .keys()
+                        .map(|id| claude_request_hash(id))
+                })
+                .chain(
+                    self.api
+                        .evidence
+                        .values()
+                        .flatten()
+                        .map(|row| claude_request_hash(&row.request_id)),
+                )
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>();
+            let messages = captured.message_only_hashes();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let holders = crate::snapshots::claude_request_ledger::scan_holders(
+                self.index.claude_request_census_for_test(),
+                self.ledger.census(),
+                &all_hashes,
+                &messages,
+                deadline,
+                &mut |_| true,
+            )
+            .unwrap();
+            let roots = self
+                .items
+                .keys()
+                .map(String::as_str)
+                .collect::<BTreeSet<_>>();
+            let scope = ClaudeLedgerScope::build(
+                &self.index,
+                self.ledger.census(),
+                &BTreeSet::from(["-repo"]),
+                &roots,
+                deadline,
+            )
+            .unwrap();
+            let claims = BTreeMap::new();
+            let first_event = BTreeMap::new();
+            let sessions = BTreeMap::new();
+            let traces = self
+                .trace
+                .evidence
+                .iter()
+                .map(|(root, rows)| {
+                    (
+                        root.clone(),
+                        rows.iter()
+                            .map(|row| (claude_request_hash(&row.request_id), root.clone()))
+                            .collect(),
+                    )
+                })
+                .collect::<BTreeMap<_, BTreeMap<_, _>>>();
+            let ctx = ClaudeClassifyContext {
+                index: &self.index,
+                ledger: self.ledger.census(),
+                holders: &holders,
+                scope: &scope,
+                page_claims: &claims,
+                first_event: &first_event,
+                sessions: &sessions,
+                trace: &traces,
+                telemetry_complete_through: NOW,
+                deadline,
+                unbuilt_older: std::cell::Cell::new(0),
+            };
+            let rows = match self.ledger.get(&telemetry_key(session)) {
+                Some(record) => ClaudeRootRows::from_record(record),
+                None => Some(ClaudeRootRows::default()),
+            };
+            let indexed = BTreeSet::from([session.to_owned()]);
+            let input = body::ClaudeFamilyInput {
+                root: session,
+                items: vec![item],
+                member_keys: BTreeMap::from([(session, Some(key.clone()))]),
+                indexed_members: &indexed,
+                members_total: 1,
+                rows: rows.as_ref(),
+                trace: traces.get(session),
+                captures: BTreeMap::from([(session, captured)]),
+            };
+            body::build_claude_request_body(
+                &input,
+                &ctx,
+                &BTreeSet::new(),
+                now,
+                &mut Default::default(),
+            )
+        }
+    }
+    impl Drop for Corpus {
+        fn drop(&mut self) {
+            money::disable_shadow_for_test(&self.support);
+        }
+    }
+
+    fn sum_entity(entity: &body::ClaudeEntityBody) -> (ClaudeMoneyTokens, u64) {
+        entity.grains.values().fold(
+            (ClaudeMoneyTokens::default(), 0),
+            |(mut tokens, requests), grain| {
+                tokens.add(&grain.tokens);
+                (tokens, requests + grain.requests)
+            },
+        )
+    }
+
+    // Check each session and each hour independently, including all seven
+    // counters (reasoning is a subset but must still conserve independently).
+    fn assert_entity(
+        corpus: &Corpus,
+        session: &str,
+        body: &body::ClaudeRequestBody,
+        expected: &[(&str, u64, u64)],
+        removed_requests: u64,
+        removed: ClaudeMoneyTokens,
+        complete: bool,
+    ) {
+        assert!(!body.unbuilt, "{session}: {body:?}");
+        let entity = &body.entities[session];
+        assert!(entity.certificate_ok, "{session}: {entity:?}");
+        assert!(!entity.held, "{session}: {entity:?}");
+        assert_eq!(entity.removed_requests, removed_requests, "{session}");
+        assert_eq!(entity.removed, removed, "{session}");
+        assert_eq!(entity.telemetry_owned_complete, complete, "W1 {session}");
+        let mut actual = BTreeMap::<String, (u64, u64)>::new();
+        for ((key, _), grain) in &entity.grains {
+            let slot = actual.entry(key.0.clone()).or_default();
+            slot.0 += grain.requests;
+            slot.1 += grain.tokens.conserved();
+        }
+        let expected = expected
+            .iter()
+            .map(|(hour, requests, tokens)| ((*hour).to_string(), (*requests, *tokens)))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(actual, expected, "per hour {session}");
+        let (tokens, requests) = sum_entity(entity);
+        assert_eq!(
+            requests,
+            expected.values().map(|v| v.0).sum::<u64>(),
+            "per session {session}"
+        );
+        assert_eq!(
+            tokens.conserved(),
+            expected.values().map(|v| v.1).sum::<u64>(),
+            "per session {session}"
+        );
+        let mut counted = ClaudeMoneyTokens::default();
+        for unit in &entity.counted {
+            counted.add(&unit.tokens);
+        }
+        assert_eq!(
+            counted, tokens,
+            "contract-5 input contains precisely counted usage"
+        );
+        let evidence =
+            identity::ScanEvidence::new(&corpus.api, &corpus.trace, BTreeSet::new(), None);
+        let mut projected = projected_item(&corpus.items[session], entity);
+        let before = (
+            projected.input_tokens,
+            projected.output_tokens,
+            projected.request_count,
+        );
+        let grouping = identity::request_owned_grouping(&projected, &evidence, entity)
+            .expect("contract-5 owner root");
+        identity::apply_grouped(&mut projected, grouping)
+            .expect("contract-5 must reproduce all full-body rows");
+        assert_eq!(
+            (
+                projected.input_tokens,
+                projected.output_tokens,
+                projected.request_count
+            ),
+            before
+        );
+        if entity
+            .counted
+            .iter()
+            .all(|unit| unit.by != ClaudeCountedBy::TelemetryProven)
+        {
+            assert!(
+                projected.request_evidence.is_empty(),
+                "policy/two-owner/idless must never tag"
+            );
+        }
+        for (hour, (requests, total)) in &expected {
+            let mut per_hour = ClaudeMoneyTokens::default();
+            for ((key, _), grain) in &entity.grains {
+                if &key.0 == hour {
+                    per_hour.add(&grain.tokens);
+                }
+            }
+            assert_eq!(
+                per_hour,
+                ClaudeMoneyTokens {
+                    input: total - 17 * requests,
+                    output: 2 * requests,
+                    cache_read: 3 * requests,
+                    cache_5m: 5 * requests,
+                    cache_1h: 7 * requests,
+                    ..Default::default()
+                },
+                "all seven components, hour {hour}, session {session}"
+            );
+        }
+    }
+
+    fn unit(input: u64) -> ClaudeMoneyTokens {
+        ClaudeMoneyTokens {
+            input,
+            output: 2,
+            cache_read: 3,
+            cache_5m: 5,
+            cache_1h: 7,
+            ..Default::default()
+        }
+    }
+
+    fn assert_mac_distinct(bodies: &[&body::ClaudeRequestBody], expected: usize) {
+        let ids = bodies
+            .iter()
+            .flat_map(|body| body.entities.values())
+            .flat_map(|entity| &entity.counted)
+            .filter_map(|unit| unit.request)
+            .collect::<Vec<_>>();
+        assert_eq!(ids.len(), expected, "Mac-wide request total");
+        assert_eq!(
+            ids.iter().collect::<BTreeSet<_>>().len(),
+            expected,
+            "every distinct request counted once on the Mac"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_arrival_orders_and_copy_before_after_original_conserve_sessions_and_hours() {
+        for telemetry_first in [false, true] {
+            for copy_first in [false, true] {
+                let mut c = Corpus::new("p2a-arrivals");
+                if telemetry_first {
+                    c.telemetry(A, "r1", H7, 11, 'a', true);
+                }
+                for s in if copy_first { [B, A] } else { [A, B] } {
+                    c.transcript(
+                        s,
+                        &(line(s, "r1", "m1", H7, 11) + &line(s, "r2", "m2", H8, 13)),
+                        if s == A { 1_700_000_000 } else { 1_700_000_100 },
+                    );
+                    c.restart();
+                }
+                if !telemetry_first {
+                    c.telemetry(A, "r1", H7, 11, 'a', true);
+                }
+                c.restart();
+                let a = c.build(A, NOW);
+                let b = c.build(B, NOW);
+                assert_entity(
+                    &c,
+                    A,
+                    &a,
+                    &[(H7, 1, 28), (H8, 1, 30)],
+                    0,
+                    Default::default(),
+                    false,
+                );
+                let mut removed = unit(11);
+                removed.add(&unit(13));
+                assert_entity(&c, B, &b, &[], 2, removed, true);
+                assert_mac_distinct(&[&a, &b], 2);
+            }
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_same_request_under_two_messages_counts_conflict_winner_once() {
+        for reversed in [false, true] {
+            let mut c = Corpus::new("p2a-response-conflict");
+            let responses = [
+                line(A, "r1", "m-low", H7, 11),
+                line(A, "r1", "m-high", H8, 13),
+            ];
+            c.transcript(
+                A,
+                &if reversed {
+                    responses[1].clone() + &responses[0]
+                } else {
+                    responses.concat()
+                },
+                1_700_000_000,
+            );
+            c.restart();
+            let a = c.build(A, NOW);
+            assert_entity(&c, A, &a, &[(H8, 1, 30)], 1, unit(11), false);
+            assert_mac_distinct(&[&a], 1);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_telemetry_only_call_later_gains_transcript_without_duplicate_or_money_change() {
+        let mut c = Corpus::new("p2a-side-then-transcript");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "r2", H8, 13, 'b', true);
+        c.restart();
+        let before = c.build(A, NOW);
+        assert_entity(
+            &c,
+            A,
+            &before,
+            &[(H7, 1, 28), (H8, 1, 30)],
+            0,
+            Default::default(),
+            false,
+        );
+        let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+        let mut emitted = c.items[A].clone();
+        assert!(money::emit_for_test(&mut emitted, &before.entities[A]));
+        assert_eq!(emitted.telemetry_owned_complete, Some(false));
+        let grouping =
+            identity::request_owned_grouping(&emitted, &evidence, &before.entities[A]).unwrap();
+        identity::apply_grouped(&mut emitted, grouping).unwrap();
+        assert_eq!(
+            emitted.request_identity_refusals, 1,
+            "side call keeps BadClock"
+        );
+        assert_eq!(emitted.request_count, 2);
+        c.transcript(
+            A,
+            &(line(A, "r1", "m1", H7, 11) + &line(A, "r2", "m2", H8, 13)),
+            1_700_000_000,
+        );
+        c.restart();
+        let after = c.build(A, NOW);
+        assert_entity(
+            &c,
+            A,
+            &after,
+            &[(H7, 1, 28), (H8, 1, 30)],
+            0,
+            Default::default(),
+            true,
+        );
+        let mut emitted = c.items[A].clone();
+        assert!(money::emit_for_test(&mut emitted, &after.entities[A]));
+        assert_eq!(emitted.telemetry_owned_complete, Some(true));
+        assert_eq!(
+            sum_entity(&before.entities[A]),
+            sum_entity(&after.entities[A])
+        );
+        assert_mac_distinct(&[&before], 2);
+        assert_mac_distinct(&[&after], 2);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_bad_clock_side_calls_clear_w1_for_priced_and_unpriced_bodies() {
+        for priced in [true, false] {
+            let mut c = Corpus::new("p2a-side-call-w1");
+            c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+            c.telemetry(A, "r1", H7, 11, 'a', true);
+            c.restart();
+            let baseline = c.build(A, NOW);
+            assert!(baseline.entities[A].telemetry_owned_complete);
+            c.telemetry(A, "side", H8, 13, 'b', priced);
+            c.restart();
+            let body = c.build(A, NOW);
+            assert_entity(
+                &c,
+                A,
+                &body,
+                &[(H7, 1, 28), (H8, 1, 30)],
+                0,
+                Default::default(),
+                false,
+            );
+            let entity = &body.entities[A];
+            let mut item = c.items[A].clone();
+            assert!(money::emit_for_test(&mut item, entity));
+            assert_eq!(item.telemetry_owned_complete, Some(false));
+            let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+            let grouping = identity::request_owned_grouping(&item, &evidence, entity).unwrap();
+            identity::apply_grouped(&mut item, grouping).unwrap();
+            assert_eq!(item.request_count, 2);
+            assert_eq!(item.request_identity_refusals, 1);
+            let side = item
+                .usage_buckets
+                .iter()
+                .find(|bucket| bucket.bucket_start == H8)
+                .unwrap();
+            assert!(side.model_usage.iter().all(|row| row.evidence_ref.is_none()
+                && row.account_identifier_hash.is_none()
+                && row.identity_parts.is_none()));
+            assert_eq!(item.telemetry_owned_complete, Some(false));
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_original_deleted_telemetry_kept_never_credits_a_copy() {
+        let mut c = Corpus::new("p2a-original-deleted");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        let key = c.paths.remove(A).unwrap();
+        c.items.remove(A);
+        c.index.files.remove(&key);
+        c.index.claude_request_census_mut_for_test().remove(&key);
+        std::fs::remove_file(key).unwrap();
+        c.restart();
+        let b = c.build(B, NOW);
+        assert_entity(&c, B, &b, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&b], 0); // the retained telemetry owner holds custody
+        assert!(c.ledger.get(&telemetry_key(A)).is_some());
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_two_telemetry_owners_count_once_and_do_not_claim_w1() {
+        let mut c = Corpus::new("p2a-two-telemetry-owners");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(B, "r1", H8, 11, 'b', true);
+        c.restart();
+        let a = c.build(A, NOW);
+        let b = c.build(B, NOW);
+        assert_entity(&c, A, &a, &[(H7, 1, 28)], 0, Default::default(), false);
+        assert_entity(&c, B, &b, &[], 1, unit(11), true);
+        assert_eq!(a.entities[A].counted[0].by, ClaudeCountedBy::TwoOwnerWinner);
+        assert_mac_distinct(&[&a, &b], 1);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_lost_ledger_is_a_scoped_hold_never_authoritative_zero() {
+        let mut c = Corpus::new("p2a-lost-ledger");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.restart();
+        *c.index.claude_request_census_mut_for_test() = ClaudeRequestCensus::default();
+        c.ledger = ClaudeLedger::new_for_test();
+        c.restart();
+        let a = c.build(A, NOW);
+        let b = c.build(B, NOW);
+        for body in [&a, &b] {
+            for entity in body.entities.values() {
+                assert!(entity.held, "lost membership must hold: {entity:?}");
+                assert_eq!(sum_entity(entity), (Default::default(), 0));
+                assert_eq!(entity.removed_requests, 0);
+                assert_eq!(entity.removed, Default::default());
+                assert!(!entity.telemetry_owned_complete);
+            }
+        }
+        assert_mac_distinct(&[&a, &b], 0);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_cost_unattributed_unpriced_is_held_until_cost_support_is_live() {
+        let mut c = Corpus::new("p2a-unattributed-hold");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "side", H8, 13, 'a', false);
+        let row = &mut c.api.evidence.get_mut(A).unwrap()[0];
+        row.cache_creation_5m_tokens = 0;
+        row.cache_creation_1h_tokens = 0;
+        *row = signed(row.clone());
+        c.refresh_telemetry(A);
+        c.restart();
+        let body = c.build(A, NOW);
+        let entity = &body.entities[A];
+        assert!(entity.held, "COST deployment gate holds the entire member");
+        assert!(
+            !entity.telemetry_owned_complete,
+            "held unit cannot satisfy SI W1"
+        );
+        assert_eq!(entity.removed_requests, 0);
+        assert_eq!(entity.removed, Default::default());
+        assert!(entity
+            .grains
+            .keys()
+            .all(|(_, origin)| *origin != Some(body::ClaudeRequestUsageOrigin::TelemetryUnpriced)));
+        assert_eq!(sum_entity(entity), (unit(11), 1));
+        assert_mac_distinct(&[&body], 1);
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_zero_token_transcript_holds_previously_priced_side_call() {
+        let mut c = Corpus::new("p2a-zero-token-own-cost");
+        let original = line(A, "r1", "m1", H7, 11);
+        c.transcript(A, &original, 1_700_000_000);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "r2", H8, 13, 'a', true);
+        let before = c.build(A, NOW);
+        assert_eq!(before.new.cost_micros, 200);
+        let zero = serde_json::json!({"timestamp":H8,"type":"assistant","sessionId":A,"requestId":"r2","message":{"id":"m2","model":"claude-haiku-4-5","usage":{"input_tokens":0,"output_tokens":0}}}).to_string()+"\n";
+        c.transcript(A, &(original + &zero), 1_700_000_000);
+        let after = c.build(A, NOW);
+        assert!(after.entities[A].held);
+        assert!(!after.coverage_complete(true));
+        let mut retained = c.items[A].clone();
+        assert!(!money::emit_for_test(&mut retained, &after.entities[A]));
+        assert_eq!(
+            after.entities[A].removed_requests, 0,
+            "hold does not manufacture removal"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_shadow_uses_actual_mismatched_cost_grains_and_final_cost_hold() {
+        let mut c = Corpus::new("p2a-final-shadow-grains");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "r1", H7, 99, 'a', true);
+        let body = c.build(A, NOW);
+        let mut item = c.items[A].clone();
+        assert!(money::emit_for_test(&mut item, &body.entities[A]));
+        assert_eq!(body.new.cost_micros, 100);
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        assert_eq!(body.new.requests, item.request_count);
+        assert!(body.grains.values().any(|(_, new)| new.cost_micros == 100));
+    }
+
+    // A fixture projection of the already-built grains lets contract-5 verify
+    // exact row reproduction without opening the private production emitter.
+    // Emitter/wire behavior is covered separately by the live-page controls.
+    fn projected_item(item: &SnapshotItem, entity: &body::ClaudeEntityBody) -> SnapshotItem {
+        let mut projected = item.clone();
+        assert!(money::emit_for_test(&mut projected, entity));
+        projected
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_own_cost_uses_transcript_tokens_when_telemetry_usage_disagrees() {
+        let mut c = Corpus::new("p2a-own-cost-token-mismatch");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "r1", H7, 999, 'a', true);
+        c.restart();
+        let body = c.build(A, NOW);
+        assert_entity(&c, A, &body, &[(H7, 1, 28)], 0, Default::default(), true);
+        assert_eq!(
+            body.entities[A]
+                .grains
+                .values()
+                .map(|g| g.cost().unwrap())
+                .sum::<u64>(),
+            100
+        );
+        assert_mac_distinct(&[&body], 1);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_account_collision_conserves_money_but_never_borrows_either_login() {
+        let mut c = Corpus::new("p2a-account-collision");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "r1", H7, 11, 'b', true);
+        c.restart();
+        let body = c.build(A, NOW);
+        assert_entity(&c, A, &body, &[(H7, 1, 28)], 0, Default::default(), true);
+        let mut item = projected_item(&c.items[A], &body.entities[A]);
+        let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+        let grouping =
+            identity::request_owned_grouping(&item, &evidence, &body.entities[A]).unwrap();
+        identity::apply_grouped(&mut item, grouping).unwrap();
+        assert!(
+            item.request_evidence.is_empty(),
+            "conflicting checked accounts refuse identity"
+        );
+        assert!(item.request_identity_refusals > 0);
+        assert_mac_distinct(&[&body], 1);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_cache_21300_flat_split_and_redundant_split_are_counted_once() {
+        for (flat, five, one, unattributed) in [(0, 5, 7, 0), (12, 5, 7, 0), (12, 0, 0, 12)] {
+            let mut c = Corpus::new("p2a-cache-21300");
+            c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+            c.telemetry(A, "r1", H7, 11, 'a', true);
+            let row = &mut c.api.evidence.get_mut(A).unwrap()[0];
+            row.cache_creation_tokens = flat;
+            row.cache_creation_5m_tokens = five;
+            row.cache_creation_1h_tokens = one;
+            *row = signed(row.clone());
+            c.refresh_telemetry(A);
+            c.telemetry(A, "side", H8, 13, 'a', true);
+            let row = &mut c.api.evidence.get_mut(A).unwrap()[1];
+            row.cache_creation_tokens = flat;
+            row.cache_creation_5m_tokens = five;
+            row.cache_creation_1h_tokens = one;
+            *row = signed(row.clone());
+            c.refresh_telemetry(A);
+            c.restart();
+            let body = c.build(A, NOW);
+            let entity = &body.entities[A];
+            assert!(!entity.held);
+            assert!(entity.certificate_ok);
+            assert_eq!(entity.removed_requests, 0);
+            let (tokens, requests) = sum_entity(entity);
+            assert_eq!(requests, 2);
+            assert_eq!(tokens.cache_5m, 5 + five);
+            assert_eq!(tokens.cache_1h, 7 + one);
+            assert_eq!(tokens.unattributed, unattributed);
+            assert_eq!(
+                tokens.conserved(),
+                58,
+                "per session cache writes never double counted"
+            );
+            for hour in [H7, H8] {
+                let n = entity
+                    .grains
+                    .iter()
+                    .filter(|((key, _), _)| key.0 == hour)
+                    .map(|(_, g)| g.tokens.conserved())
+                    .sum::<u64>();
+                assert_eq!(n, if hour == H7 { 28 } else { 30 }, "per hour {hour}");
+            }
+            let mut item = projected_item(&c.items[A], entity);
+            let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+            let grouped = identity::request_owned_grouping(&item, &evidence, entity).unwrap();
+            identity::apply_grouped(&mut item, grouped).unwrap();
+            assert_mac_distinct(&[&body], 2);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_sidecar_truncation_and_atomic_replacement_rebuild_before_counting() {
+        for replaced in [false, true] {
+            let mut c = Corpus::new("p2a-sidecar-replacement");
+            c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+            c.telemetry(A, "r1", H7, 11, 'a', true);
+            c.telemetry(A, "side", H8, 13, 'b', true);
+            let dir = c.support.join("local-otel/claude-code-effort");
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join(format!("{:x}.jsonl", sha2::Sha256::digest(A.as_bytes())));
+            let text = c.api.evidence[A]
+                .iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>();
+            std::fs::write(&path, text).unwrap();
+            // Start with a real tail-built record and save its offsets.
+            c.ledger.remove(&telemetry_key(A));
+            let budget = ClaudeTelemetryTailBudget::default();
+            for _ in 0..3 {
+                ClaudeTelemetryTail::advance(
+                    &c.support,
+                    &mut c.ledger,
+                    NOW,
+                    &budget,
+                    &[A],
+                    &mut money_work(16 << 20),
+                );
+            }
+            c.restart();
+            let before = c.build(A, NOW);
+            assert_entity(
+                &c,
+                A,
+                &before,
+                &[(H7, 1, 28), (H8, 1, 30)],
+                0,
+                Default::default(),
+                false,
+            );
+            let keep = serde_json::to_string(&c.api.evidence[A][0]).unwrap() + "\n";
+            if replaced {
+                let replacement = dir.join("replacement.tmp");
+                std::fs::write(&replacement, keep).unwrap();
+                std::fs::rename(replacement, &path).unwrap();
+            } else {
+                std::fs::write(&path, keep).unwrap();
+            }
+            for _ in 0..3 {
+                ClaudeTelemetryTail::advance(
+                    &c.support,
+                    &mut c.ledger,
+                    NOW + 86_400,
+                    &budget,
+                    &[A],
+                    &mut money_work(16 << 20),
+                );
+            }
+            c.api.evidence.get_mut(A).unwrap().truncate(1);
+            c.restart();
+            let after = c.build(A, NOW + 86_400);
+            assert_entity(&c, A, &after, &[(H7, 1, 28)], 0, Default::default(), true);
+            assert_mac_distinct(&[&before], 2);
+            assert_mac_distinct(&[&after], 1);
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_protected_real_change_keeps_contractless_body_and_attribution_bytes() {
+        let mut c = Corpus::new("p2a-protected-real-change");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        let prior = c.items[A].snapshot_fingerprint.clone();
+        c.index.claude_reemission_exclusions =
+            crate::snapshots::claude_reemission_exclusions::ReemissionExclusions::parse(
+                format!("{:x}\n", sha2::Sha256::digest(A.as_bytes())).as_bytes(),
+            );
+        c.transcript(
+            A,
+            &(line(A, "r1", "m1", H7, 11) + &line(A, "r2", "m2", H8, 13)),
+            1_700_000_000,
+        );
+        let mut items = vec![c.items[A].clone()];
+        assert_ne!(
+            items[0].snapshot_fingerprint, prior,
+            "the file has real new usage"
+        );
+        assert_eq!(items[0].request_count, 2);
+        assert_eq!(items[0].usage_buckets.len(), 2);
+        let before = serde_json::to_vec(&items).unwrap();
+        let held = money::live_page(
+            &c.support,
+            &mut items,
+            &c.index,
+            &c.api,
+            &c.trace,
+            true,
+            None,
+            &mut BTreeMap::new(),
+        );
+        assert!(
+            held.is_empty(),
+            "protected real changes retain today's upload path"
+        );
+        assert_eq!(
+            serde_json::to_vec(&items).unwrap(),
+            before,
+            "all money, posture, attribution and fingerprint bytes preserved"
+        );
+        assert!(items[0].usage_accounting_contract.is_none());
+        assert!(items[0].removed_request_count.is_none());
+        assert_eq!(items[0].request_count, 2);
+        assert_eq!(
+            items[0]
+                .usage_buckets
+                .iter()
+                .map(|b| b.model_usage.iter().map(|r| r.request_count).sum::<u64>())
+                .sum::<u64>(),
+            2
+        );
+        money::store::flush();
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_idle_telemetry_keeps_deleted_owner_after_transcript_retention() {
+        let mut c = Corpus::new("p2a-retirement-limit");
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        let last = c
+            .ledger
+            .get(&telemetry_key(A))
+            .unwrap()
+            .tail()
+            .unwrap()
+            .last_append_unix;
+        let at_limit = last + 35 * 86_400;
+        assert_eq!(
+            crate::snapshots::claude_request_ledger::retire_idle_telemetry(
+                &mut c.ledger,
+                &c.index,
+                at_limit
+            ),
+            0
+        );
+        c.restart();
+        let before = c.build(B, at_limit);
+        assert_entity(&c, B, &before, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&before], 0);
+        assert_eq!(
+            crate::snapshots::claude_request_ledger::retire_idle_telemetry(
+                &mut c.ledger,
+                &c.index,
+                at_limit + 1
+            ),
+            0
+        );
+        c.restart();
+        let after = c.build(B, at_limit + 1);
+        assert_entity(&c, B, &after, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&after], 0);
+        // Transcript retention cannot withdraw telemetry ownership claims:
+        // B remains a removed copy, and A's durable telemetry still owns r1.
+        assert!(after.entities[B].counted.is_empty());
+        assert!(c.ledger.get(&telemetry_key(A)).unwrap().request_hashes()
+            .contains(&claude_request_hash("r1")));
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_si_copy_side_second_login_and_idless_keep_distinct_identity_parts() {
+        let mut c = Corpus::new("p2a-si-full-family");
+        let mut idless: serde_json::Value =
+            serde_json::from_str(&line(A, "unused", "unused", H7, 11)).unwrap();
+        idless.as_object_mut().unwrap().remove("requestId");
+        idless["message"].as_object_mut().unwrap().remove("id");
+        c.transcript(
+            A,
+            &(line(A, "r1", "m1", H7, 11) + &idless.to_string() + "\n"),
+            1_700_000_000,
+        );
+        c.transcript(B, &line(B, "r1", "m1", H7, 11), 1_700_000_100);
+        c.telemetry(A, "r1", H7, 11, 'a', true);
+        c.telemetry(A, "side", H8, 13, 'b', true);
+        c.restart();
+        let a = c.build(A, NOW);
+        let b = c.build(B, NOW);
+        assert_entity(
+            &c,
+            A,
+            &a,
+            &[(H7, 2, 56), (H8, 1, 30)],
+            0,
+            Default::default(),
+            false,
+        );
+        assert_entity(&c, B, &b, &[], 1, unit(11), true);
+        assert_mac_distinct(&[&a, &b], 2);
+        let evidence = identity::ScanEvidence::new(&c.api, &c.trace, BTreeSet::new(), None);
+        let mut item = projected_item(&c.items[A], &a.entities[A]);
+        let grouping = identity::request_owned_grouping(&item, &evidence, &a.entities[A]).unwrap();
+        identity::apply_grouped(&mut item, grouping).unwrap();
+        let mut tagged = BTreeMap::<String, u64>::new();
+        let mut untagged = 0;
+        for row in item
+            .usage_buckets
+            .iter()
+            .flat_map(|bucket| &bucket.model_usage)
+        {
+            if let Some(parts) = &row.identity_parts {
+                for part in parts {
+                    if part.evidence_ref.is_some() {
+                        *tagged
+                            .entry(part.account_identifier_hash.clone().unwrap())
+                            .or_default() += part.request_count;
+                    } else {
+                        untagged += part.request_count;
+                    }
+                }
+            } else if row.evidence_ref.is_some() {
+                *tagged
+                    .entry(row.account_identifier_hash.clone().unwrap())
+                    .or_default() += row.request_count;
+            } else {
+                untagged += row.request_count;
+            }
+        }
+        assert_eq!(tagged, BTreeMap::from([("a".repeat(64), 1)]));
+        assert_eq!(
+            untagged, 2,
+            "idless and the side call without an original clock stay untagged"
+        );
+        assert_eq!(item.request_count, 3);
+        // Deliberate differences from the two legacy paths: the copy drops
+        // r1; the unproven root gains its own side call. Existing requests
+        // retain their own checked login; idless and the side call without
+        // an original transcript clock stay untagged.
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn p2a_restart_before_maturity_keeps_due_time_and_counts_at_exact_deadline() {
+        let mut c = Corpus::new("p2a-maturity-restart");
+        c.transcript(A, &line(A, "r1", "m1", H7, 11), 1_700_000_000);
+        let clock = rfc3339_unix_seconds(H7).unwrap();
+        let young = c.build(A, clock + 59);
+        let entity = &young.entities[A];
+        assert!(!entity.held);
+        assert!(entity.certificate_ok);
+        assert_eq!(sum_entity(entity), (Default::default(), 0));
+        assert_eq!(entity.removed_requests, 0);
+        assert_eq!(entity.removed, Default::default());
+        assert_eq!(entity.due_unix, Some(clock + 60));
+        assert_mac_distinct(&[&young], 0);
+        c.restart();
+        let mature = c.build(A, clock + 60);
+        assert_entity(&c, A, &mature, &[(H7, 1, 28)], 0, Default::default(), false);
+        assert_mac_distinct(&[&mature], 1);
+    }
+}
+
+// Cross-language golden derived from the backend request_ownership_semantic_leaf
+// and _semantic_component_hash contracts. Canonical JSON is sorted, compact UTF-8;
+// followed by one NUL byte. Ownership is inside usage_accounting.
+#[test]
+fn p2a_backend_ownership_wire_golden_zero_and_every_counter() {
+    use crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT;
+    let mut item = sample_session_artifact_item();
+    item.input_tokens = 0;
+    item.output_tokens = 0;
+    item.request_count = 0;
+    let old_bytes = serde_json::to_vec(&item).unwrap();
+    let components =
+        |item: &SnapshotItem| snapshot_semantic_component_hashes(SnapshotSource::ClaudeCode, item);
+    let old = components(&item);
+    assert_eq!(
+        old["usage_accounting"],
+        "f67ee5bd26c9325ff49bccc08a549e5a0fcb0fef02672e9f0c899d9f67387233"
+    );
+    item.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+    item.removed_request_count = Some(0);
+    item.removed_usage = Some(ClaudeRemovedUsage::default());
+    item.telemetry_owned_complete = Some(false);
+    assert_eq!(
+        components(&item)["usage_accounting"],
+        "c9d1e2ccd1092d6570b90137e916ec273e2725ab360c5d7060f7fb43724d0c85"
+    );
+    let wire = serde_json::to_value(&item).unwrap();
+    assert_eq!(wire["removed_request_count"], 0);
+    assert_eq!(wire["telemetry_owned_complete"], false);
+    assert_eq!(wire["removed_usage"].as_object().unwrap().len(), 7);
+    item.removed_request_count = Some(9);
+    item.removed_usage = Some(ClaudeRemovedUsage {
+        cache_creation_1h_tokens: 1,
+        cache_creation_5m_tokens: 2,
+        cache_read_tokens: 3,
+        input_tokens: 4,
+        output_tokens: 5,
+        reasoning_output_tokens: 6,
+        unattributed_total_tokens: 7,
+    });
+    item.telemetry_owned_complete = Some(true);
+    let owned = components(&item);
+    assert_eq!(
+        owned["usage_accounting"],
+        "b687536300c6bff44e9d6ae83e63eb6531490758c1189704c7144f031a4c28cf"
+    );
+    assert_eq!(
+        old.iter()
+            .filter(|(key, value)| owned[*key] != **value)
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>(),
+        vec!["usage_accounting"]
+    );
+    // Every independently declared counter must participate in the hash.
+    for field in 0..9 {
+        let mut changed = item.clone();
+        match field {
+            0 => changed.removed_request_count = Some(10),
+            1 => changed.telemetry_owned_complete = Some(false),
+            _ => {
+                let r = changed.removed_usage.as_mut().unwrap();
+                match field {
+                    2 => r.input_tokens += 1,
+                    3 => r.output_tokens += 1,
+                    4 => r.cache_read_tokens += 1,
+                    5 => r.cache_creation_5m_tokens += 1,
+                    6 => r.cache_creation_1h_tokens += 1,
+                    7 => r.unattributed_total_tokens += 1,
+                    _ => r.reasoning_output_tokens += 1,
+                }
+            }
+        }
+        assert_ne!(
+            components(&changed)["usage_accounting"],
+            owned["usage_accounting"],
+            "field {field}"
+        );
+    }
+    item.usage_accounting_contract = None;
+    item.removed_request_count = None;
+    item.removed_usage = None;
+    item.telemetry_owned_complete = None;
+    assert_eq!(
+        serde_json::to_vec(&item).unwrap(),
+        old_bytes,
+        "legacy wire omits every new field"
+    );
+    assert_eq!(components(&item), old);
 }

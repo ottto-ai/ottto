@@ -197,6 +197,7 @@ impl crate::source_rotation::Owner for OwnedRotationProof {
             account_witness: [0; 32],
             scan_started_at: "2026-10-05T00:00:00Z".into(),
             activity_hint: hint,
+            money_policy: None,
             receipt_window_days: 30,
             context_curve_enabled: false,
             cache_observations_enabled: false,

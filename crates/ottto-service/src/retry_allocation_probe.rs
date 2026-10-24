@@ -39,6 +39,269 @@ unsafe fn usable(ptr: *const std::ffi::c_void, requested: usize) -> usize {
         requested
     }
 }
+// Test-only sampling at allocator events; this is the SHARED admission
+// counter, not an exact per-phase reservation high-water mark. Reservations
+// with no caller allocation between admission/drop are deliberately unobserved.
+thread_local! {
+    static MONEY_ADMISSION_SAMPLE: Cell<Option<usize>> = const { Cell::new(None) };
+}
+fn sample_money_admission() {
+    let _ = MONEY_ADMISSION_SAMPLE.try_with(|sample| {
+        if let Some(peak) = sample.get() {
+            sample.set(Some(
+                peak.max(crate::snapshots::claude_request_money::reserved_for_test()),
+            ));
+        }
+    });
+}
+
+pub(crate) fn measure_money_caller_thread<T>(f: impl FnOnce() -> T) -> (T, Stats, usize) {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_ADMISSION_SAMPLE.with(|sample| sample.set(None));
+        }
+    }
+    MONEY_ADMISSION_SAMPLE.with(|sample| {
+        assert!(sample.get().is_none());
+        sample.set(Some(
+            crate::snapshots::claude_request_money::reserved_for_test(),
+        ));
+    });
+    let reset = Reset;
+    let (value, stats) = measure_caller_thread(f);
+    let peak = MONEY_ADMISSION_SAMPLE.with(|sample| sample.get().unwrap());
+    drop(reset);
+    (value, stats, peak)
+}
+
+// Opt-in settlement-only receipts. The synchronous production region uses the
+// same born-pointer table as a whole-caller audit, so these are separate modes.
+// Fixed receipt storage and atomic reservation sampling allocate no heap.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct MoneySettlementReceipt {
+    pub required: usize,
+    pub offered: usize,
+    pub admitted: bool,
+    pub funds: usize,
+    pub pairs: usize,
+    pub skipped: bool,
+    pub allocation: Stats,
+    pub shared_admission_peak: usize,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct MoneySettlementReceipts {
+    entries: [Option<MoneySettlementReceipt>; 64],
+    len: usize,
+}
+impl MoneySettlementReceipts {
+    const EMPTY: Self = Self {
+        entries: [None; 64],
+        len: 0,
+    };
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &MoneySettlementReceipt> {
+        self.entries[..self.len]
+            .iter()
+            .map(|receipt| receipt.as_ref().unwrap())
+    }
+}
+thread_local! {
+    static MONEY_SETTLEMENT_RECEIPTS: Cell<Option<MoneySettlementReceipts>> = const { Cell::new(None) };
+    static MONEY_SETTLEMENT_CURRENT: Cell<MoneySettlementReceipt> = Cell::new(MoneySettlementReceipt::default());
+}
+static MONEY_ADMISSION_OBSERVING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+static MONEY_ADMISSION_HIGH_WATER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+// Linearize the test observer's start/stop with reservation mutations. Without
+// this guard a delayed callback could land after the receipt has been closed.
+static MONEY_ADMISSION_EVENTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+pub(crate) fn money_admission_event() -> std::sync::MutexGuard<'static, ()> {
+    MONEY_ADMISSION_EVENTS
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+}
+
+// Called at every successful admit, shrink and drop, including writer events.
+// The value comes from that atomic mutation, rather than a later racy load.
+pub(crate) fn money_admission_changed(total: usize) {
+    use std::sync::atomic::Ordering;
+    if MONEY_ADMISSION_OBSERVING.load(Ordering::Acquire) {
+        MONEY_ADMISSION_HIGH_WATER.fetch_max(total, Ordering::AcqRel);
+    }
+}
+fn push_money_settlement(receipt: MoneySettlementReceipt) {
+    MONEY_SETTLEMENT_RECEIPTS.with(|cell| {
+        if let Some(mut receipts) = cell.get() {
+            assert!(
+                receipts.len < receipts.entries.len(),
+                "settlement receipt overflow"
+            );
+            receipts.entries[receipts.len] = Some(receipt);
+            receipts.len += 1;
+            cell.set(Some(receipts));
+        }
+    });
+}
+pub(crate) fn money_settlement_skipped() {
+    push_money_settlement(MoneySettlementReceipt {
+        skipped: true,
+        ..Default::default()
+    });
+}
+pub(crate) fn money_settlement_admitted(funds: usize) {
+    MONEY_SETTLEMENT_CURRENT.with(|cell| {
+        let mut receipt = cell.get();
+        receipt.admitted = true;
+        receipt.funds = funds;
+        cell.set(receipt);
+    });
+}
+pub(crate) fn money_settlement_pairs(pairs: usize) {
+    MONEY_SETTLEMENT_CURRENT.with(|cell| {
+        let mut receipt = cell.get();
+        receipt.pairs = pairs;
+        cell.set(receipt);
+    });
+}
+pub(crate) fn observe_money_settlement<T>(
+    required: usize,
+    offered: usize,
+    f: impl FnOnce() -> T,
+) -> T {
+    use std::sync::atomic::Ordering;
+    if !MONEY_SETTLEMENT_RECEIPTS.with(|cell| cell.get().is_some()) {
+        return f();
+    }
+    MONEY_SETTLEMENT_CURRENT.with(|cell| {
+        cell.set(MoneySettlementReceipt {
+            required,
+            offered,
+            ..Default::default()
+        })
+    });
+    {
+        let _event = money_admission_event();
+        MONEY_ADMISSION_HIGH_WATER.store(
+            crate::snapshots::claude_request_money::reserved_for_test(),
+            Ordering::Release,
+        );
+        assert!(!MONEY_ADMISSION_OBSERVING.swap(true, Ordering::AcqRel));
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            let _event = money_admission_event();
+            MONEY_ADMISSION_OBSERVING.store(false, Ordering::Release);
+        }
+    }
+    let reset = Reset;
+    let (value, allocation) = measure_caller_thread(f);
+    drop(reset);
+    let mut receipt = MONEY_SETTLEMENT_CURRENT.with(Cell::get);
+    receipt.allocation = allocation;
+    receipt.shared_admission_peak = MONEY_ADMISSION_HIGH_WATER.load(Ordering::Acquire);
+    push_money_settlement(receipt);
+    value
+}
+pub(crate) fn measure_money_settlements<T>(f: impl FnOnce() -> T) -> (T, MoneySettlementReceipts) {
+    MONEY_SETTLEMENT_RECEIPTS.with(|cell| {
+        assert!(cell.get().is_none());
+        cell.set(Some(MoneySettlementReceipts::EMPTY));
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_SETTLEMENT_RECEIPTS.with(|cell| cell.set(None));
+        }
+    }
+    let reset = Reset;
+    let value = f();
+    let receipts = MONEY_SETTLEMENT_RECEIPTS.with(|cell| cell.get().unwrap());
+    drop(reset);
+    (value, receipts)
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum MoneyIoKind {
+    Open,
+    Metadata,
+    Read,
+    Write,
+    Sync,
+    Mutate,
+    ReadDir,
+    ReadFile,
+}
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MoneyIoReceipt {
+    pub open: usize,
+    pub metadata: usize,
+    pub read: usize,
+    pub write: usize,
+    pub sync: usize,
+    pub mutate: usize,
+    pub read_dir: usize,
+}
+static MONEY_IO: std::sync::Mutex<Option<MoneyIoReceipt>> = std::sync::Mutex::new(None);
+// Boundary attempts, including failed calls; not OS syscall or byte counts.
+// Writer and telemetry-sidecar operations share this observer.
+pub(crate) fn money_io_attempt(kind: MoneyIoKind) {
+    let mut observation = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = observation.as_mut() {
+        match kind {
+            MoneyIoKind::Open => receipt.open += 1,
+            MoneyIoKind::Metadata => receipt.metadata += 1,
+            MoneyIoKind::Read => receipt.read += 1,
+            MoneyIoKind::Write => receipt.write += 1,
+            MoneyIoKind::Sync => receipt.sync += 1,
+            MoneyIoKind::Mutate => receipt.mutate += 1,
+            MoneyIoKind::ReadDir => receipt.read_dir += 1,
+            MoneyIoKind::ReadFile => {
+                receipt.open += 1;
+                receipt.read += 1;
+            }
+        }
+    }
+}
+pub(crate) fn measure_money_io<T>(f: impl FnOnce() -> T) -> (T, MoneyIoReceipt) {
+    {
+        let mut observation = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner());
+        assert!(observation.is_none(), "money I/O receipt already active");
+        *observation = Some(MoneyIoReceipt::default());
+    }
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            *MONEY_IO.lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+    let reset = Reset;
+    let value = f();
+    let receipt = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner()).unwrap();
+    drop(reset);
+    (value, receipt)
+}
+
+thread_local! {static MONEY_SETTLEMENT_REFUSE:Cell<bool>=const{Cell::new(false)};}
+pub(crate) fn money_settlement_refused_for_test() -> bool {
+    MONEY_SETTLEMENT_REFUSE.with(Cell::get)
+}
+pub(crate) fn refuse_money_settlement_for_test<T>(f: impl FnOnce() -> T) -> T {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_SETTLEMENT_REFUSE.with(|cell| cell.set(self.0));
+        }
+    }
+    let reset = Reset(MONEY_SETTLEMENT_REFUSE.with(|cell| cell.replace(true)));
+    let value = f();
+    drop(reset);
+    value
+}
+
 struct Probe;
 #[global_allocator]
 static ALLOCATOR: Probe = Probe;
@@ -102,6 +365,7 @@ unsafe impl GlobalAlloc for Probe {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
         if !ptr.is_null() {
+            sample_money_admission();
             process::allocated(ptr, layout.size(), usable(ptr.cast(), layout.size()));
             record(
                 layout.size() as isize,
@@ -121,6 +385,7 @@ unsafe impl GlobalAlloc for Probe {
         System.dealloc(ptr, layout);
     }
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+        sample_money_admission();
         let old_usable = usable(ptr.cast(), layout.size());
         let result = process::reallocate(ptr, layout, size);
         if !result.is_null() {
@@ -171,7 +436,10 @@ mod process {
     use std::cell::Cell;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Mutex, MutexGuard};
-    const SLOTS: usize = 65_536;
+    // The cap receipt can serialize 65,536 ledger records in one caller.
+    // Each record owns several pointers; table overflow must not masquerade
+    // as a resource peak or force reducing the fixture's production cap.
+    const SLOTS: usize = 1_048_576;
     #[derive(Clone, Copy)]
     struct Entry {
         pointer: usize,
@@ -548,6 +816,69 @@ mod tests {
         assert_eq!((audit.allocations, audit.deallocations), (2, 1));
         assert!(audit.usable_peak_with_overlap >= audit.requested_peak_with_overlap);
         drop(grown);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn money_settlement_observer_tracks_short_reservations_and_keeps_returned_funds() {
+        use crate::snapshots::claude_request_money::{store, ShadowReservation};
+        store::flush();
+        let (retained, receipts) = measure_money_settlements(|| {
+            observe_money_settlement(4096, 1, || {
+                let reservation = ShadowReservation::admit(4096).unwrap();
+                money_settlement_admitted(reservation.bytes());
+                let temporary = ShadowReservation::admit(8192).unwrap();
+                drop(temporary); // No allocator event occurs during this reservation.
+                let bytes = std::hint::black_box(Box::new([0_u8; 1024]));
+                money_settlement_pairs(1);
+                (reservation, bytes)
+            })
+        });
+        let receipt = receipts.iter().next().unwrap();
+        assert_eq!(
+            (receipt.required, receipt.funds, receipt.pairs),
+            (4096, 4096, 1)
+        );
+        assert!(receipt.admitted);
+        assert!(!receipt.skipped);
+        assert!(receipt.shared_admission_peak >= 4096 + 8192);
+        assert_eq!(receipt.allocation.requested_peak_with_overlap, 1024);
+        assert_eq!(
+            retained.0.bytes(),
+            4096,
+            "the seam cannot retire save funds"
+        );
+        drop(retained);
+        let (_, skipped) = measure_money_settlements(money_settlement_skipped);
+        let receipt = skipped.iter().next().unwrap();
+        assert!(receipt.skipped);
+        assert_eq!(
+            (receipt.funds, receipt.pairs, receipt.allocation.allocations),
+            (0, 0, 0)
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn money_io_observer_counts_real_ledger_file_boundaries() {
+        use crate::snapshots::claude_request_money::store;
+        let scratch = crate::test_scratch::ScratchDir::new("money-io-observer");
+        let mut ledger = store::ClaudeLedger::new_for_test();
+        let mut writer = store::WriterState::default();
+        let (_, io) = measure_money_io(|| {
+            let (_, _, unwritten) =
+                store::save_page_for_test(scratch.as_ref(), &mut ledger, &mut writer).unwrap();
+            assert_eq!(unwritten, 0);
+        });
+        assert!(io.open >= 257 * 2, "create plus directory open: {io:?}");
+        assert!(io.write >= 257, "shard writes: {io:?}");
+        assert!(io.sync >= 257 * 2, "file plus directory sync: {io:?}");
+        assert!(io.mutate >= 257, "atomic rename: {io:?}");
+        let (_, io) = measure_money_io(|| store::reload_for_test(scratch.as_ref()).unwrap());
+        assert!(
+            io.open >= 257 && io.metadata >= 257 && io.read >= 257,
+            "loaded shard operations: {io:?}"
+        );
     }
 
     fn formatless(s: Stats) -> (isize, isize, usize, usize, usize, usize, usize, usize) {

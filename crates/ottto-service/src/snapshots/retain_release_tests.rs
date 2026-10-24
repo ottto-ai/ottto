@@ -1109,6 +1109,9 @@ fn x_out_coverage_witness_names_every_finished_field() {
             unattributed_total_tokens: _,                   // I
             request_count: _,                               // I
             usage_accounting_contract: _,                   // K (literal)
+            removed_request_count: _,                       // K (None before live fold)
+            removed_usage: _,                               // K (None before live fold)
+            telemetry_owned_complete: _,                    // K (None before live fold)
             claude_usage_request_ids: _,                    // R
             claude_usage_occurrences: _,                    // R
             cache_observations: _,                          // K (None on Claude)

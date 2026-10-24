@@ -191,6 +191,7 @@ pub struct UploadShed {
     pub retry_after: Option<Duration>,
     /// The backend's error code when it is one the daemon recognizes. Only
     /// this fixed name survives; the rest of the response body is discarded.
+    pub request_owned_route_unavailable: bool,
     pub code: Option<UploadShedCode>,
 }
 
@@ -289,14 +290,21 @@ fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
     let mut excerpt = Vec::new();
     let code = response
         .into_reader()
-        .take(SHED_BODY_EXCERPT_BYTES)
+        .take(16 * 1024)
         .read_to_end(&mut excerpt)
         .ok()
-        .and_then(|_| shed_code(&excerpt));
+        .and_then(|_| shed_code(&excerpt[..excerpt.len().min(SHED_BODY_EXCERPT_BYTES as usize)]));
+    let request_owned_route_unavailable = serde_json::from_slice::<Value>(&excerpt)
+        .ok()
+        .is_some_and(|body| {
+            body.pointer("/details/code").and_then(Value::as_str)
+                == Some("request_owned_usage_route_unavailable")
+        });
     UploadShed {
         status,
         retry_after,
         code,
+        request_owned_route_unavailable,
     }
 }
 
@@ -521,6 +529,11 @@ pub struct UploadFailureDiagnostics {
 }
 
 impl UploadFailureDiagnostics {
+    pub(crate) fn batch_http_status(&self) -> Option<u16> {
+        (self.endpoint == "snapshot_batch")
+            .then_some(self.http_status)
+            .flatten()
+    }
     fn http(
         operation: &'static str,
         endpoint: &'static str,
@@ -637,7 +650,7 @@ impl std::fmt::Display for UploadFailureDiagnostics {
 
 impl std::error::Error for UploadFailureDiagnostics {}
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, PartialEq, Eq, Hash)]
 pub struct ActivityHintResponse {
     pub source: String,
     pub server_time: String,
@@ -778,6 +791,11 @@ impl SnapshotEntityRejection {
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
             // Logged by name; persisted as the old enum value `other`.
             "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
+            "claude_request_owned_usage_contract_mismatch" => {
+                "claude_request_owned_usage_contract_mismatch"
+            }
+            "usage_decrease_held_for_review" => "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review" => "usage_decrease_refused_after_review",
             _ => "other",
         }
     }
@@ -845,6 +863,50 @@ pub(crate) fn snapshot_ack_body_witness_version(
 }
 
 impl SnapshotBatchResponse {
+    /// Retained recovery validates the exact private manifest captured at the
+    /// original serialization boundary, never today's reconstructed bodies.
+    pub(crate) fn validate_recovery_ack<'a>(
+        &self,
+        entities: impl IntoIterator<Item = (&'a str, &'a str, Option<u64>, &'a str)>,
+        head_cas: bool,
+    ) -> Result<()> {
+        let entities = entities.into_iter().collect::<Vec<_>>();
+        if self.disabled {
+            if self.accepted != 0
+                || !self.accepted_entities.is_empty()
+                || !self.unchanged_entities.is_empty()
+                || !self.rejected_entities.is_empty()
+                || !self.conflict_entities.is_empty()
+            {
+                return Err(anyhow!("disabled recovery ACK contains entity outcomes"));
+            }
+            return Ok(());
+        }
+        if self.entity_ack_contract.as_deref() != Some(SNAPSHOT_ENTITY_ACK_CONTRACT) {
+            return Err(anyhow!("recovery requires complete entity ACK"));
+        }
+        self.validate_entity_ack_identities(entities.iter().map(|(s, f, _, _)| (*s, *f)))?;
+        self.validate_head_cas_ack(head_cas)?;
+        for reference in self
+            .accepted_entities
+            .iter()
+            .chain(&self.unchanged_entities)
+        {
+            let (_, _, version, witness) = entities
+                .iter()
+                .find(|(s, f, _, _)| {
+                    *s == reference.source_session_id && *f == reference.snapshot_fingerprint
+                })
+                .ok_or_else(|| anyhow!("foreign recovery ACK"))?;
+            if version.is_some()
+                && (reference.body_witness_version != *version
+                    || reference.body_witness_digest.as_deref() != Some(*witness))
+            {
+                return Err(anyhow!("recovery ACK lacks exact body witness"));
+            }
+        }
+        Ok(())
+    }
     /// Reject malformed, short, duplicated, foreign, overlapping, or partial
     /// ACKs before any local checkpoint can advance.
     pub fn validate_entity_ack(&self, request: &SnapshotBatchRequest) -> Result<()> {
@@ -1048,7 +1110,12 @@ impl SnapshotBatchResponse {
                 unchanged_basis: None,
             };
             validate_snapshot_entity_ref(&reference)?;
-            if !rejection.permanent {
+            if !rejection.permanent
+                && !matches!(
+                    rejection.safe_reason(),
+                    "usage_decrease_held_for_review" | "usage_decrease_refused_after_review"
+                )
+            {
                 return Err(anyhow!("snapshot ACK contains invalid rejection"));
             }
             record_snapshot_ack_occurrences(
@@ -1911,7 +1978,28 @@ impl SnapshotApiClient {
         request: &SnapshotBatchRequest,
         enforce_head_cas: bool,
     ) -> Result<SnapshotBatchResponse> {
-        self.upload_batch_inner(relay_token, request, enforce_head_cas, None)
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, None, None)
+    }
+
+    pub(crate) fn recovery_origin(&self) -> &str {
+        &self.api_base_url
+    }
+
+    /// One identity POST, no auth, encoding, redirect or in-place resend.
+    /// The caller durably consumes its shared physical slot before this call.
+    pub(crate) fn upload_recovery_bytes(
+        &self,
+        relay_token: &str,
+        request: &SnapshotBatchRequest,
+        enforce_head_cas: bool,
+        bytes: &[u8],
+    ) -> Result<SnapshotBatchResponse> {
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(anyhow!("recovery wire body exceeds limit"));
+        }
+        #[cfg(not(test))]
+        self.require_bounded_snapshot_https()?;
+        self.upload_batch_inner(relay_token, request, enforce_head_cas, None, Some(bytes))
     }
 
     /// Optional retry transport: fresh authority at every physical POST, one
@@ -1932,6 +2020,7 @@ impl SnapshotApiClient {
             request,
             enforce_head_cas,
             Some((budget, validate)),
+            None,
         )
     }
 
@@ -1944,6 +2033,7 @@ impl SnapshotApiClient {
             &mut crate::snapshot_retry::RetryBudget,
             &mut dyn FnMut() -> Result<()>,
         )>,
+        retained: Option<&[u8]>,
     ) -> Result<SnapshotBatchResponse> {
         let mut resources = crate::local_resource_diagnostics::UploadCall::start(&request.source);
         let enforce_head_cas = enforce_head_cas
@@ -1951,25 +2041,35 @@ impl SnapshotApiClient {
                 .snapshots
                 .iter()
                 .any(|item| item.cache_observations.is_some());
-        let body = if retry.is_some() && enforce_head_cas {
-            crate::snapshot_retry::encode_json(
-                &request.wire_with_head_cas(),
-                crate::snapshot_retry::REQUEST_BYTES,
-            )
-        } else if retry.is_some() {
-            crate::snapshot_retry::encode_json(request, crate::snapshot_retry::REQUEST_BYTES)
-        } else if enforce_head_cas {
-            serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
+        let body = if let Some(bytes) = retained {
+            std::borrow::Cow::Borrowed(bytes)
         } else {
-            serde_json::to_vec(request).map_err(anyhow::Error::from)
-        }
-        .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?;
+            std::borrow::Cow::Owned(
+                if retry.is_some() && enforce_head_cas {
+                    crate::snapshot_retry::encode_json(
+                        &request.wire_with_head_cas(),
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                } else if retry.is_some() {
+                    crate::snapshot_retry::encode_json(
+                        request,
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                } else if enforce_head_cas {
+                    serde_json::to_vec(&request.wire_with_head_cas()).map_err(anyhow::Error::from)
+                } else {
+                    serde_json::to_vec(request).map_err(anyhow::Error::from)
+                }
+                .map_err(|error| anyhow!("serialize snapshot batch failed: {error}"))?,
+            )
+        };
         resources.serialized(body.len());
         let default_gzip = snapshot_upload_gzip_enabled();
-        let gzip_enabled = retry
-            .as_ref()
-            .map(|(budget, _)| budget.gzip_enabled(default_gzip))
-            .unwrap_or(default_gzip);
+        let gzip_enabled = retained.is_none()
+            && retry
+                .as_ref()
+                .map(|(budget, _)| budget.gzip_enabled(default_gzip))
+                .unwrap_or(default_gzip);
         let compressed = gzip_snapshot_batch(&body, gzip_enabled);
         let mut request_builder = || -> Result<ureq::Request> {
             let (agent, timeout) = if let Some((budget, validate)) = retry.as_mut() {
@@ -1978,7 +2078,20 @@ impl SnapshotApiClient {
                 let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
                 (agent, Some(timeout))
             } else {
-                (self.batch_agent.clone(), None)
+                (
+                    if retained.is_some() {
+                        crate::retry_tls::agent_builder()
+                            .resolver(crate::net_resilience::shared_fallback_resolver())
+                            .redirects(0)
+                            .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
+                            .timeout_read(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT)
+                            .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
+                            .build()
+                    } else {
+                        self.batch_agent.clone()
+                    },
+                    None,
+                )
             };
             let request = agent
                 .post(&self.api_url("/api/v1/agent-session-snapshots/batches"))
@@ -2025,7 +2138,7 @@ impl SnapshotApiClient {
             Ok(response) => {
                 let status = response.status();
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let decoded = if retry.is_some() {
+                let decoded = if retry.is_some() || retained.is_some() {
                     bounded_response_json(response, crate::snapshot_retry::RESPONSE_BYTES)
                 } else {
                     response
@@ -2109,10 +2222,7 @@ impl SnapshotApiClient {
                     None,
                     retry.is_some(),
                 );
-                Err(anyhow::Error::new(BatchRejected {
-                    status: code,
-                    body_excerpt: response_body_excerpt(response),
-                }))
+                Err(validation_rejection(code, response))
             }
             Err(ureq::Error::Status(code, response)) => {
                 self.record_batch_http_failure(
@@ -3152,11 +3262,127 @@ fn response_has_request_id(response: &ureq::Response) -> bool {
     .any(|header| response.header(header).is_some())
 }
 
-fn response_body_excerpt(response: ureq::Response) -> Option<String> {
-    response
-        .into_string()
-        .ok()
-        .and_then(|body| safe_response_body_excerpt(&body))
+/// Content-free marker derived before any diagnostic redaction/truncation.
+#[derive(Debug)]
+pub(crate) struct RequestOwnedVersionSkew;
+impl std::fmt::Display for RequestOwnedVersionSkew {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("backend request-owned schema version skew")
+    }
+}
+impl std::error::Error for RequestOwnedVersionSkew {}
+
+fn validation_rejection(status: u16, response: ureq::Response) -> anyhow::Error {
+    use std::io::Read;
+    let mut raw = Vec::new();
+    let read = response
+        .into_reader()
+        .take(64 * 1024)
+        .read_to_end(&mut raw)
+        .is_ok();
+    let skew = read && status == 422 && literal_version_skew_body(&raw);
+    let excerpt = if read {
+        let prefix = match std::str::from_utf8(&raw) {
+            Ok(text) => Some(text),
+            // The bounded read may end within the final UTF-8 character.
+            // Preserve its valid prefix, but keep rejecting invalid interior
+            // bytes as before; diagnostics still undergo normal redaction.
+            Err(error) if error.error_len().is_none() => {
+                std::str::from_utf8(&raw[..error.valid_up_to()]).ok()
+            }
+            Err(_) => None,
+        };
+        prefix.and_then(safe_response_body_excerpt)
+    } else {
+        None
+    };
+    let error = anyhow::Error::new(BatchRejected {
+        status,
+        body_excerpt: excerpt,
+    });
+    if skew {
+        error.context(RequestOwnedVersionSkew)
+    } else {
+        error
+    }
+}
+
+/// Inspect complete error entries inside a bounded raw prefix. Stop as soon
+/// as one exact type/location pair proves schema skew, even if the backend
+/// returns more errors than the prefix can hold. Never retain raw input.
+pub(crate) fn literal_version_skew_body(raw: &[u8]) -> bool {
+    use serde::de::{DeserializeSeed, IgnoredAny, MapAccess, SeqAccess, Visitor};
+    use std::cell::Cell;
+    fn matches_error(error: &serde_json::Value) -> bool {
+        let kind = error.get("type").and_then(serde_json::Value::as_str);
+        let Some(location) = error.get("loc").and_then(serde_json::Value::as_array) else {
+            return false;
+        };
+        let literal_field = location
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .any(|field| {
+                matches!(
+                    field,
+                    "usage_accounting_contract"
+                        | "removed_request_count"
+                        | "removed_usage"
+                        | "telemetry_owned_complete"
+                        | "request_usage_origin"
+                )
+            });
+        let enum_field = location
+            .last()
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|field| {
+                matches!(field, "usage_accounting_contract" | "request_usage_origin")
+            });
+        literal_field
+            && (kind == Some("extra_forbidden") || kind == Some("literal_error") && enum_field)
+    }
+    struct Errors<'a>(&'a Cell<bool>);
+    impl<'de> Visitor<'de> for Errors<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("validator errors")
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while let Some(error) = seq.next_element::<serde_json::Value>()? {
+                if matches_error(&error) {
+                    self.0.set(true);
+                    return Err(serde::de::Error::custom("schema marker found"));
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Errors<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_seq(self)
+        }
+    }
+    struct Body<'a>(&'a Cell<bool>);
+    impl<'de> Visitor<'de> for Body<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("validator response")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "detail" || key == "errors" {
+                    map.next_value_seed(Errors(self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    let found = Cell::new(false);
+    let mut decoder = serde_json::Deserializer::from_slice(raw);
+    let _ = serde::de::Deserializer::deserialize_map(&mut decoder, Body(&found));
+    found.get()
 }
 
 fn safe_response_body_excerpt(body: &str) -> Option<String> {
@@ -3658,6 +3884,71 @@ mod tests {
                 String::from_utf8_lossy(&body[..body.len().min(80)])
             );
         }
+    }
+
+    #[test]
+    fn literal_schema_marker_uses_bounded_raw_response_before_truncated_diagnostics() {
+        let errors=["removed_usage","removed_request_count","telemetry_owned_complete","usage_accounting_contract"].map(|field| {
+            serde_json::json!({"type":"extra_forbidden","loc":["body","snapshots",0,field],"msg":"Extra inputs are not permitted","input":"synthetic validator detail ".repeat(100),"url":"https://errors.example/extra_forbidden"})
+        });
+        let raw = serde_json::json!({"detail":errors,"padding":"x".repeat(128*1024)}).to_string();
+        assert!(raw.len() > 64 * 1024);
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(
+            error.downcast_ref::<RequestOwnedVersionSkew>().is_some(),
+            "complete first error classifies even when later errors exceed the bounded prefix"
+        );
+        let rejected = error.downcast_ref::<BatchRejected>().unwrap();
+        assert_eq!(rejected.status, 422);
+        let excerpt = rejected.body_excerpt.as_deref().unwrap();
+        assert!(excerpt.chars().count() <= 503);
+        assert!(
+            serde_json::from_str::<serde_json::Value>(excerpt).is_err(),
+            "the diagnostic is deliberately not classification input"
+        );
+    }
+
+    #[test]
+    fn long_genuine_literal_validation_still_uses_item_isolation() {
+        let raw=serde_json::json!({"detail":[{"type":"greater_than_equal","loc":["body","snapshots",0,"removed_request_count"],"msg":"Input should be greater than or equal to zero ".repeat(100),"input":-1}]}).to_string();
+        assert!(raw.len() > 500);
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(error.downcast_ref::<RequestOwnedVersionSkew>().is_none());
+        assert_eq!(error.downcast_ref::<BatchRejected>().unwrap().status, 422);
+    }
+
+    #[test]
+    fn validation_excerpt_survives_a_utf8_character_split_at_the_raw_limit() {
+        let start = r#"{"detail":[{"loc":["body","snapshots",0,"removed_request_count"],"type":"greater_than_equal","msg":""#;
+        let mut raw = format!(
+            "{start}{}€ trailing validator detail",
+            "x".repeat(64 * 1024 - 1 - start.len())
+        );
+        raw.push_str("\"}]}");
+        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_ok());
+        assert!(std::str::from_utf8(&raw.as_bytes()[..64 * 1024]).is_err());
+        let error = validation_rejection(
+            422,
+            ureq::Response::new(422, "Unprocessable Entity", &raw).unwrap(),
+        );
+        assert!(error.downcast_ref::<RequestOwnedVersionSkew>().is_none());
+        let excerpt = error
+            .downcast_ref::<BatchRejected>()
+            .unwrap()
+            .body_excerpt
+            .as_deref()
+            .unwrap();
+        assert!(
+            excerpt.contains(r#""loc":["body","snapshots""#),
+            "keep the existing per-item isolation evidence"
+        );
+        assert!(excerpt.chars().count() <= 503);
     }
 
     #[test]
@@ -4528,6 +4819,7 @@ mod tests {
                     &request,
                     false,
                     Some((&mut budget, &mut validate)),
+                    None,
                 )
             });
             assert_eq!(result.is_err(), refuse_send);
@@ -4566,6 +4858,7 @@ mod tests {
                 Some((&mut budget, &mut || {
                     Err(anyhow!("synthetic presend refusal"))
                 })),
+                None,
             )
         });
         assert!(result.is_err());
@@ -4998,4 +5291,31 @@ impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
 #[cfg(test)]
 pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
     gzip_snapshot_batch(body, true)
+}
+
+#[cfg(test)]
+mod request_owned_ack_tests {
+    use super::*;
+    #[test]
+    fn nonpermanent_ack_is_accepted_only_for_the_two_review_reasons() {
+        let fingerprint = "a".repeat(64);
+        for reason in [
+            "usage_decrease_held_for_review",
+            "usage_decrease_refused_after_review",
+            "claude_request_owned_usage_contract_mismatch",
+            "other",
+        ] {
+            let response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+                "accepted": 0, "sessions_reconciled": 0, "session_ids": [], "disabled": false, "disabled_reason": null,
+                "rejected_entities": [{"source_session_id":"session", "snapshot_fingerprint":fingerprint, "reason": reason, "detail":"", "permanent":false}]
+            })).unwrap();
+            let valid =
+                response.validate_entity_ack_identities([("session", fingerprint.as_str())]);
+            assert_eq!(
+                valid.is_ok(),
+                reason.starts_with("usage_decrease_"),
+                "{reason}: {valid:?}"
+            );
+        }
+    }
 }

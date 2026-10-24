@@ -119,7 +119,20 @@ fn is_snapshot_fingerprint(value: &str) -> bool {
 /// invariants. A RetryPending record keeps its obligation: a deadline beyond
 /// the bound (clock rollback or damage) becomes due now, and a count at or
 /// above the maximum leaves one more retry before it turns terminal.
-fn normalize_snapshot_quarantine_record(record: &mut SnapshotQuarantineRecord, now: u64) {
+fn normalize_snapshot_quarantine_record(fingerprint: &str, record: &mut SnapshotQuarantineRecord, now: u64) {
+    record.version_skew_attempts = record.version_skew_attempts.min(5);
+    if let Some(hold) = &mut record.hold {
+        hold.stage = hold.stage.min(2);
+        hold.first_held_unix = hold.first_held_unix.min(now);
+        hold.day_start_unix = hold.day_start_unix.min(now);
+        if record.upload_body_witness.is_some() {
+            record.failed_reconstruction_count = 1;
+            record.disposition = SnapshotQuarantineDisposition::RetryPending;
+            record.retry_after_unix_seconds = hold.retry_after(fingerprint, now);
+            return;
+        }
+        record.hold = None;
+    }
     match record.disposition {
         SnapshotQuarantineDisposition::RetryPending => {
             record.failed_reconstruction_count = record
@@ -197,9 +210,9 @@ impl ScanIndex {
             .duration_since(UNIX_EPOCH)
             .map(|duration| duration.as_secs())
             .unwrap_or_default();
-        for record in self.quarantined_snapshot_fingerprints.values_mut() {
+        for (fingerprint, record) in &mut self.quarantined_snapshot_fingerprints {
             if !snapshot_quarantine_deadline_is_bounded_at(record, now) {
-                normalize_snapshot_quarantine_record(record, now);
+                normalize_snapshot_quarantine_record(fingerprint, record, now);
                 drops.quarantine += 1;
             }
         }

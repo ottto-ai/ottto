@@ -11,7 +11,7 @@
 //! Both sources reduce a row to the same fact and resolve two rows for one
 //! request by the same conflict order over the fact's content digest.
 
-use super::super::claude_request_census::{claude_request_hash, ClaudeRequestCensusRecord};
+use super::super::claude_request_census::claude_request_hash;
 use super::super::validate_claude_api_row;
 use super::facts::{fact_digest, ClaudeFact, ClaudeFacts, ClaudeFactsHeader, UNREADABLE_STYLE};
 use super::{
@@ -196,7 +196,10 @@ impl ClaudeRootRows {
     /// The rows a telemetry record's facts hold, sharing its hash buffer.
     /// None unless the record is complete and every row readable (not
     /// retired, not over budget, no refused line).
-    pub(crate) fn from_record(record: &ClaudeRequestCensusRecord) -> Option<Self> {
+    pub(crate) fn from_record<'a>(
+        record: impl Into<super::custody::RecordRef<'a>>,
+    ) -> Option<Self> {
+        let record = record.into();
         if record.retired().is_some() || record.over_budget() {
             return None;
         }

@@ -369,7 +369,8 @@ impl NativeBootstrapServer {
                     serde_json::json!({"source":"claude_code", "server_time":current_rfc3339(),
                         "last_data_at":null,"record_count_15m":0,"record_count_24h":0,
                         "local_usage_reconciliation_enabled":true,"backfill_window_days":183,
-                        "recommended_scan_after":"2099-01-01T00:00:00Z"})
+                        "recommended_scan_after":"2099-01-01T00:00:00Z",
+                        "session_request_identity_contract": if std::env::var_os("OTTTO_MONEY_PARITY_ROOT").is_some() { Some("own_request_identity_rows:v1") } else { None }})
                 } else if request.contains("/agent-status/snapshots") {
                     serde_json::json!({"accepted":1,"machine_id":"otm_test","sources":["claude_code"]})
                 } else if let Some(items) =
@@ -782,4 +783,949 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
         eprintln!("native paid evidence subset: requested_roots=2 retained_healthy=1 pressure_root_base=true duplicate_root_loaded_once=true actual_requested_peak={} prepaid_peak={prepaid} ordinary_final_cohort_unchanged=true not_RSS=true", allocation.requested_peak_with_overlap);
     }
     writeln!(std::io::stderr().lock(), "native_comparison_source_bootstrap: actual_prepare_step_finish=true completed_saved_cycles={completed} actual_wire_ack=true next_real_preparation_allowed=true abandoned_preparation_revokes=true test_only_due_cadence_slot=true ordinary_post_finish_wait_verified=true backfill_to_normal_scope_revokes=true new_request_native_conjunction=true actual_positive_retained_layout_unproved=true").unwrap();
+}
+
+/// CI runs this exact test source at main and the candidate against the same
+/// saved input tree. No production endpoint or host account is involved.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn money_gate_off_saved_fixture_receipt() {
+    let (Ok(root), Ok(output)) = (
+        std::env::var("OTTTO_MONEY_PARITY_ROOT"),
+        std::env::var("OTTTO_MONEY_PARITY_OUTPUT"),
+    ) else {
+        return;
+    };
+    if let Ok(expected_pid) = std::env::var("OTTTO_MONEY_PARITY_EXPECTED_PID") {
+        assert_eq!(std::process::id().to_string(), expected_pid);
+    }
+    let base = PathBuf::from(root);
+    std::fs::create_dir_all(&base).unwrap();
+    let home = base.join("home");
+    if !home.exists() {
+        let seed = IdentityPipelineHome::new();
+        std::fs::rename(&seed.home, &home).unwrap();
+    }
+    let fixture = std::mem::ManuallyDrop::new(IdentityPipelineHome {
+        base: base.clone(),
+        home,
+    });
+    let support = base.join("support");
+    let secrets = base.join("secrets");
+    std::fs::create_dir_all(&support).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    if !support.join("local-otel").exists() {
+        // Keep the two checked logins in the SAME hour and row grain, so
+        // C1 requires real identity_parts rather than two single-login rows.
+        let transcript = fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{IDENTITY_PIPELINE_ROOT}.jsonl"));
+        let hour = (OffsetDateTime::now_utc() - TimeDuration::hours(3))
+            .replace_minute(0)
+            .unwrap()
+            .replace_second(0)
+            .unwrap()
+            .replace_nanosecond(0)
+            .unwrap();
+        let mut lines = std::fs::read_to_string(&transcript)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        for (n, line) in lines.iter_mut().enumerate() {
+            line["timestamp"] = (hour + TimeDuration::seconds(n as i64))
+                .format(&Rfc3339)
+                .unwrap()
+                .into();
+        }
+        std::fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(|line| line.to_string() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        write_native_bootstrap_sidecars(&fixture, &support);
+        let path = support.join("local-otel/claude-code-effort").join(format!(
+            "{:x}.jsonl",
+            Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+        ));
+        let text = std::fs::read_to_string(&path).unwrap();
+        let mut rows = text
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<crate::claude_local_otel::ClaudeLocalOtelEvidence>(line)
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for (n, row) in rows.iter_mut().enumerate() {
+            row.account_identifier_hash = Some(if n == 0 { "a" } else { "b" }.repeat(64));
+            row.account_identity_checked = true;
+            row.request_identity = Some(serde_json::from_value(serde_json::json!({
+                "identity_hash_scheme":"provider-sha256:v1", "disposition":"complete",
+                "account":{"origin":"resource","disposition":"complete","resource_hash":row.account_identifier_hash},
+                "organization":{"origin":"resource","disposition":"complete","resource_hash":"c".repeat(64)}
+            })).unwrap());
+        }
+        // Both a missing-trace row and an auxiliary observer-clock row are
+        // present in the saved evidence, alongside the split logins/marker.
+        let mut missing = rows[0].clone();
+        missing.request_id = "req_missing_trace".into();
+        missing.client_request_id = "client-missing".into();
+        missing.event_sequence = Some(3);
+        let mut side = rows[0].clone();
+        side.request_id = "req_side_call".into();
+        side.client_request_id = "client-side".into();
+        side.event_sequence = Some(4);
+        // A paired auxiliary row is counted, but its observer clock cannot
+        // qualify identity: this must reach BadClock, not missing-trace.
+        let trace_path = support
+            .join("local-otel/claude-code-trace-ownership")
+            .join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())
+            ));
+        let mut trace: crate::claude_local_otel::ClaudeTraceOwnershipEvidence =
+            serde_json::from_str(
+                std::fs::read_to_string(&trace_path)
+                    .unwrap()
+                    .lines()
+                    .next()
+                    .unwrap(),
+            )
+            .unwrap();
+        trace.request_id = side.request_id.clone();
+        trace.client_request_id = side.client_request_id.clone();
+        trace.fingerprint.clear();
+        trace.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&trace).unwrap())
+        );
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(trace_path)
+            .unwrap()
+            .write_all((serde_json::to_string(&trace).unwrap() + "\n").as_bytes())
+            .unwrap();
+        // A missing trace invalidates the reported rebuild for its whole
+        // root. Keep that adverse population separate so the paired side
+        // call really reaches the primary's reported body and BadClock.
+        const MISSING_ROOT: &str = "4c8d914c-e346-4b16-91ab-99840cb5c1ae";
+        missing.session_id = MISSING_ROOT.into();
+        rows.push(side);
+        let transcript = fixture
+            .home
+            .join(".claude/projects/-synthetic-repo")
+            .join(format!("{MISSING_ROOT}.jsonl"));
+        let marker = serde_json::json!({"timestamp":missing.observed_at,"type":"attachment","sessionId":MISSING_ROOT,
+            "attachment":{"type":"credential_org","organizationUuid":IDENTITY_PIPELINE_ORG}});
+        let extra = serde_json::json!({"timestamp":missing.observed_at,"type":"assistant","sessionId":MISSING_ROOT,"requestId":missing.request_id,"message":{"id":"missing-trace-message","model":missing.model,"usage":{"input_tokens":missing.input_tokens,"output_tokens":missing.output_tokens}}});
+        std::fs::write(
+            transcript,
+            marker.to_string() + "\n" + &extra.to_string() + "\n",
+        )
+        .unwrap();
+        missing.fingerprint.clear();
+        missing.fingerprint = format!(
+            "sha256:{:x}",
+            Sha256::digest(serde_json::to_vec(&missing).unwrap())
+        );
+        std::fs::write(
+            support.join("local-otel/claude-code-effort").join(format!(
+                "{:x}.jsonl",
+                Sha256::digest(MISSING_ROOT.as_bytes())
+            )),
+            serde_json::to_string(&missing).unwrap() + "\n",
+        )
+        .unwrap();
+        for row in &mut rows {
+            row.fingerprint.clear();
+            row.fingerprint = format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&row).unwrap())
+            );
+        }
+        std::fs::write(
+            path,
+            rows.iter()
+                .map(|row| serde_json::to_string(row).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+    }
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
+    let device = LocalDeviceBinding {
+        device_id: "money-baseline-device".into(),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    // Each independently compiled caller starts fresh. Keep the ordinary
+    // history=0 -> history=20,000 progression within each caller, but never
+    // inherit the preceding source build's completed historical replay.
+    let backfill = crate::backfill::backfill_state_path(&support);
+    if backfill.exists() {
+        std::fs::remove_file(&backfill).unwrap();
+    }
+    assert!(!backfill.exists());
+    let mut receipts = Vec::new();
+    for history in [0, 20_000] {
+        let _cadence = IdentityPipelineCadence::new();
+        // Both independently compiled callers start each case from the same
+        // saved inputs, including the empty-history case after a prior run.
+        for state in [
+            "snapshots",
+            "claude-request-ledger",
+            "claude-request-custody-v2",
+        ] {
+            let path = support.join(state);
+            if path.exists() {
+                std::fs::remove_dir_all(path).unwrap();
+            }
+        }
+        let server = NativeBootstrapServer::new();
+        let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+        let client = SnapshotApiClient::new(server.url.clone());
+        let daemon = test_daemon("otm_test");
+        let namespace = snapshot_upload_destination_namespace(&device, "device-secret");
+        let index_path = snapshot_v3_index_path(&snapshot_destination_scoped_index_path(
+            &snapshot_index_path(&support, SnapshotSource::ClaudeCode),
+            &namespace,
+        ));
+        let mut seed = if history == 0 {
+            serde_json::to_value(ScanIndex::default()).unwrap()
+        } else {
+            money_m4_saved_inputs(&base, &support)
+        };
+        let ledger_before = money_saved_ledger_files(&support);
+        assert_eq!(
+            ledger_before.len(),
+            if history == 0 { 0 } else { 257 },
+            "each independent case restores its own saved ledger input"
+        );
+        seed["accepted_snapshot_fingerprints"] = serde_json::json!((0..history)
+            .map(|n| format!("{n:064x}"))
+            .collect::<Vec<_>>());
+        std::fs::create_dir_all(index_path.parent().unwrap()).unwrap();
+        std::fs::write(&index_path, serde_json::to_vec(&seed).unwrap()).unwrap();
+        let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let collection = || {
+            let mut status = test_agent_status(SourceKind::ClaudeCode);
+            status.account = Some(test_agent_account(&"a".repeat(64), &"c".repeat(64)));
+            AgentStatusCollection {
+                snapshots: vec![status.clone()],
+                source_health_snapshot: status,
+                codex_scan_homes: Vec::new(),
+                codex_home_bindings: Vec::new(),
+            }
+        };
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        });
+        let mut decision = "refused";
+        let mut local_markers = Vec::new();
+        if let Ok(Some(mut frame)) = frame {
+            for n in 0..history {
+                frame
+                    .upload_progress
+                    .accepted_fingerprints
+                    .insert(format!("{n:064x}"));
+                frame
+                    .upload_progress
+                    .accepted_body_witnesses
+                    .insert(format!("{n:064x}"), "historical-body".into());
+            }
+            frame
+                .upload_progress
+                .save(&frame.upload_progress_path)
+                .unwrap();
+            let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+            for item in &scan.snapshots {
+                assert!(
+                    item.claude_org_markers.is_some(),
+                    "C1 marker must be captured locally"
+                );
+                local_markers.push(format!("{:?}", item.claude_org_markers));
+            }
+            let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+                finish_sync_source(
+                    preparation,
+                    index,
+                    scan,
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::ClaudeCode,
+                    "otm_test",
+                    &fixture.home,
+                    &support,
+                    &daemon,
+                    &mut transport,
+                    &mut retry,
+                )
+            });
+            decision = if result.is_ok() { "accepted" } else { "failed" };
+            assert!(result.is_ok(), "saved-fixture finish failed: {result:?}");
+        }
+        let mut offers = server.bodies.lock().unwrap().clone();
+        for item in &mut offers {
+            item.as_object_mut().unwrap().remove("collected_at");
+        }
+        // A successful finish transfers ACKs to the scan index and clears
+        // transient upload progress. Assert durable acceptance of actual POSTs.
+        let saved = ScanIndex::load(&index_path).unwrap();
+        let accepted = offers
+            .iter()
+            .filter(|item| {
+                saved.accepted_snapshot_fingerprint_recorded(
+                    item["snapshot_fingerprint"].as_str().unwrap(),
+                )
+            })
+            .count();
+        assert!(!offers.is_empty(), "baseline must exercise real upload");
+        assert_eq!(
+            accepted,
+            offers.len(),
+            "every actual offer must have a durable ACK"
+        );
+        if history == 0 {
+            assert!(accepted > 0);
+            let item = offers
+                .iter()
+                .find(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT)
+                .unwrap();
+            assert!(
+                item["session_account_evidence"].is_object(),
+                "C1 populated creator evidence: {item}"
+            );
+            assert!(
+                !item["request_evidence"].as_array().unwrap().is_empty(),
+                "C1 real C5 evidence"
+            );
+            assert_eq!(
+                item["request_identity_refusals"], 1,
+                "paired BadClock side call must reach the real counted body: {item}"
+            );
+            assert_eq!(
+                item["request_count"], 3,
+                "two transcripts plus the actual paired side call"
+            );
+            let missing = offers
+                .iter()
+                .find(|item| item["source_session_id"] == "4c8d914c-e346-4b16-91ab-99840cb5c1ae")
+                .unwrap();
+            assert_eq!(
+                missing["request_identity_refusals"], 1,
+                "missing trace must independently refuse"
+            );
+            assert_eq!(
+                offers
+                    .iter()
+                    .map(|item| item["request_identity_refusals"].as_u64().unwrap())
+                    .sum::<u64>(),
+                2,
+                "missing trace + paired BadClock side call must both reach the real upload"
+            );
+            for rows in [
+                item["model_usage"].as_array().unwrap().clone(),
+                item["usage_buckets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .flat_map(|bucket| bucket["model_usage"].as_array().unwrap().iter().cloned())
+                    .collect(),
+            ] {
+                assert!(
+                    rows.iter()
+                        .any(
+                            |row| row["identity_parts"].as_array().is_some_and(|parts| parts
+                                .iter()
+                                .filter(|part| part["account_identifier_hash"].is_string())
+                                .count()
+                                >= 2)
+                        ),
+                    "C1 requires a populated split at row AND bucket grain: {rows:?}"
+                );
+            }
+        }
+        let ledger_after = money_saved_ledger_files(&support);
+        assert_eq!(
+            ledger_before, ledger_after,
+            "OFF must not write the saved money ledger"
+        );
+        let saved_value = serde_json::to_value(&saved).unwrap();
+        if history == 0 {
+            let field_bytes = saved_value
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(key, value)| (key, serde_json::to_vec(value).unwrap().len()))
+                .collect::<BTreeMap<_, _>>();
+            eprintln!(
+                "MONEY_GATE_OFF_INDEX_FIELDS {}",
+                serde_json::to_string(&field_bytes).unwrap()
+            );
+        }
+        if let Ok(output) = std::env::var("OTTTO_MONEY_PARITY_OUTPUT") {
+            let path = format!("{output}.index-{history}.json");
+            std::fs::write(path, serde_json::to_vec_pretty(&saved_value).unwrap()).unwrap();
+        }
+        let selections = saved_value
+            .get("claude_money_files")
+            .and_then(serde_json::Value::as_object)
+            .map_or(0, |files| files.len());
+        assert_eq!(selections, 0, "OFF must not grow live selection custody");
+        eprintln!("MONEY_GATE_OFF_SAVED history={history} ledger_files={} ledger_bytes={} saved_index_bytes={} selection_records={selections} ledger_rewrites=0 allocation_and_read_io_receipt=false",
+            ledger_before.len(), ledger_before.iter().map(|(_, bytes, _, _)| bytes).sum::<u64>(),
+            std::fs::metadata(&index_path).unwrap().len());
+        // Keep the local-only marker comparison separate from the upload
+        // identity bytes. The workflow diffs both receipts against main.
+        receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,
+            "local_claude_org_markers":local_markers,"offers":offers,
+            "saved_fingerprints":saved.current_snapshot_fingerprints(),
+            "saved_index_bytes":std::fs::metadata(&index_path).unwrap().len(),
+            "live_selection_records":selections,
+            "money_ledger":ledger_before.iter().map(|(path,bytes,digest,_)|
+                serde_json::json!({"path":path,"bytes":bytes,"sha256":digest})).collect::<Vec<_>>()}));
+    }
+    std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
+    #[cfg(unix)]
+    if let Ok(next_binary) = std::env::var("OTTTO_MONEY_PARITY_NEXT_BINARY") {
+        use std::os::unix::process::CommandExt;
+        // Replacing the process clears every runtime/global while retaining
+        // the PID serialized by DesktopCensusWitness. Both source trees were
+        // compiled independently; neither saved bytes nor receipts are edited.
+        let next_output = std::env::var("OTTTO_MONEY_PARITY_NEXT_OUTPUT").unwrap();
+        eprintln!(
+            "MONEY_GATE_OFF_EXEC_HANDOFF base_assertions_passed=true pid={}",
+            std::process::id()
+        );
+        let error = std::process::Command::new(next_binary)
+            .args(["money_gate_off_saved_fixture_receipt", "--nocapture"])
+            .env("OTTTO_MONEY_PARITY_OUTPUT", next_output)
+            .env(
+                "OTTTO_MONEY_PARITY_EXPECTED_PID",
+                std::process::id().to_string(),
+            )
+            .env_remove("OTTTO_MONEY_PARITY_NEXT_BINARY")
+            .env_remove("OTTTO_MONEY_PARITY_NEXT_OUTPUT")
+            .exec();
+        panic!("independent head caller exec failed: {error}");
+    }
+}
+
+// Kept in this file because CI copies it unchanged into the pinned main tree.
+// The large saved state is generated ONCE and then copied byte for byte for
+// both actual callers. No provider account, host transcript, or live store.
+fn money_m4_saved_inputs(base: &Path, support: &Path) -> serde_json::Value {
+    use crate::snapshots::claude_request_census::{
+        message_key, telemetry_key, ClaudeRequestCensusInsert, ClaudeRequestCensusRecord,
+        ClaudeRequestCensusShape, ClaudeTelemetryTailState,
+    };
+    use crate::snapshots::claude_request_money::{facts, store, ClaudeMoneyTokens};
+    const FILES: usize = 11_500;
+    const SIDECARS: usize = 5_600;
+    let saved = base.join("m4-saved-inputs");
+    let index_path = saved.join("index.json");
+    if !index_path.exists() {
+        std::fs::create_dir_all(&saved).unwrap();
+        let mut index = ScanIndex::default();
+        let mut ledger = store::ClaudeLedger::new_for_test();
+        for n in 0..FILES {
+            let key = format!(
+                "/synthetic/m4/projects/-repo-{}/{n:08x}-0000-4000-8000-000000000000.jsonl",
+                n % 400
+            );
+            let fingerprint = format!("{:064x}", n + 1);
+            index.files.insert(
+                key.clone(),
+                serde_json::from_value(serde_json::json!({
+                    "size_bytes":1,"modified_unix_seconds":2,
+                    "source_file_fingerprint":fingerprint,"last_snapshot_fingerprint":null
+                }))
+                .unwrap(),
+            );
+            let mut hashes = (n as u64 * 61..(n as u64 + 1) * 61)
+                .map(|id| id.wrapping_mul(0x9e37_79b9_7f4a_7c15))
+                .collect::<Vec<_>>();
+            hashes.sort_unstable();
+            let record = ClaudeRequestCensusRecord::synthetic_for_test(
+                &fingerprint,
+                7,
+                ClaudeRequestCensusShape::Exact,
+                hashes,
+            );
+            assert_eq!(
+                ledger.insert(
+                    message_key(&key),
+                    ClaudeRequestCensusRecord::message_record(&record, Vec::new())
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+            assert_eq!(
+                index
+                    .claude_request_census_mut_for_test()
+                    .insert_for_test(&key, record),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        let now = 1_792_627_200;
+        for n in 0..SIDECARS {
+            let session = format!("{n:08x}-1111-4111-8111-111111111111");
+            let mut header = facts::ClaudeFactsHeader {
+                session: session.clone(),
+                base_clock: now - 86_400,
+                ..Default::default()
+            };
+            let opus = header.intern("claude-opus-4-6", "", "high").unwrap();
+            let haiku = header.intern("claude-haiku-4-5", "", "").unwrap();
+            let mut pairs = (0..99_u64)
+                .map(|row| {
+                    let id = n as u64 * 1_000 + row;
+                    (
+                        id.wrapping_mul(0xd6e8_feb8_6659_fd93),
+                        facts::ClaudeFact {
+                            tokens: ClaudeMoneyTokens {
+                                input: 3 + id % 7,
+                                output: 200 + id * 13 % 1_800,
+                                cache_read: 40_000 + id * 997 % 110_000,
+                                cache_5m: 1_000 + id * 31 % 4_000,
+                                ..Default::default()
+                            },
+                            cost_micros: Some(20_000 + id * 71 % 80_000),
+                            clock: now - 86_400 + row * 37,
+                            style: if row % 5 == 0 { haiku } else { opus },
+                        },
+                    )
+                })
+                .collect::<Vec<_>>();
+            pairs.sort_unstable_by_key(|(hash, _)| *hash);
+            let blob = facts::encode(&header, pairs.iter().map(|(_, fact)| fact), 0);
+            assert_eq!(
+                ledger.insert(
+                    telemetry_key(&session),
+                    ClaudeRequestCensusRecord::telemetry(
+                        pairs.iter().map(|(hash, _)| *hash).collect(),
+                        blob.into_boxed_slice(),
+                        ClaudeTelemetryTailState {
+                            device: 1,
+                            inode: n as u64 + 1,
+                            offset: 99 * 450,
+                            line_sum: 1,
+                            last_append_unix: now - 3_600,
+                            audited_offset: 99 * 450,
+                            audited_unix: now,
+                            first_event_unix: now - 86_400,
+                            ..Default::default()
+                        },
+                        now - 86_400
+                    )
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        assert_eq!(
+            index.claude_request_census_for_test().hash_total_for_test(),
+            701_500
+        );
+        assert_eq!(ledger.census().records().count(), 17_100);
+        assert_eq!(ledger.census().hash_total_for_test(), 554_400);
+        // Pin the shared OFF input to the legacy format, independently of the
+        // candidate's live custody codec. Both separately built callers read
+        // these exact bytes; the OFF caller never migrates this directory.
+        let dir = saved.join("claude-request-ledger");
+        std::fs::create_dir_all(&dir).unwrap();
+        for shard in 0..256 {
+            let records = ledger
+                .census()
+                .records()
+                .filter(|(key, _)| usize::from(Sha256::digest(key.as_bytes())[0]) == shard)
+                .collect::<BTreeMap<_, _>>();
+            std::fs::write(
+                dir.join(format!("shard-{shard:02x}.json")),
+                serde_json::to_vec(&records).unwrap(),
+            )
+            .unwrap();
+        }
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        index.save(&index_path).unwrap();
+    }
+    let source = saved.join("claude-request-ledger");
+    let destination = support.join("claude-request-ledger");
+    if destination.exists() {
+        std::fs::remove_dir_all(&destination).unwrap();
+    }
+    std::fs::create_dir_all(&destination).unwrap();
+    for entry in std::fs::read_dir(source).unwrap() {
+        let entry = entry.unwrap();
+        assert!(entry.file_type().unwrap().is_file());
+        std::fs::copy(entry.path(), destination.join(entry.file_name())).unwrap();
+    }
+    // Verify the saved large index rather than trusting the generation loop.
+    let index = ScanIndex::load(&index_path).unwrap();
+    assert_eq!(index.files.len(), FILES);
+    assert_eq!(index.claude_request_census_for_test().len_for_test(), FILES);
+    assert_eq!(
+        index.claude_request_census_for_test().hash_total_for_test(),
+        701_500
+    );
+    serde_json::to_value(index).unwrap()
+}
+
+// Digest and mtime catch both changed bytes and rewriting identical bytes.
+// This proves absence of ledger writes, not absence of filesystem reads.
+fn money_saved_ledger_files(support: &Path) -> Vec<(String, u64, String, std::time::SystemTime)> {
+    let dir = support.join("claude-request-ledger");
+    if !dir.exists() {
+        return Vec::new();
+    }
+    let mut files = std::fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let metadata = entry.metadata().unwrap();
+            (
+                entry.file_name().to_string_lossy().into_owned(),
+                metadata.len(),
+                format!("{:x}", Sha256::digest(std::fs::read(entry.path()).unwrap())),
+                metadata.modified().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    files.sort();
+    files
+}
+
+// Run in its own exact-filter process, after the shared saved-input generator.
+// No allocator audit is active: these are current kernel RSS samples, not
+// born-in-scope allocation peaks or the parallel suite's lifetime maximum.
+fn money_fixture_rss_bytes() -> u64 {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    std::str::from_utf8(&output.stdout)
+        .unwrap()
+        .trim()
+        .parse::<u64>()
+        .unwrap()
+        * 1024
+}
+
+// Diagnostic only: live heap versus allocated zones explains an RSS delta
+// (retained free pages are not live custody). Never feeds an assertion.
+#[cfg(target_os = "macos")]
+fn money_fixture_heap() -> (usize, usize) {
+    #[repr(C)]
+    #[derive(Default)]
+    struct Statistics {
+        blocks_in_use: u32,
+        size_in_use: usize,
+        max_size_in_use: usize,
+        size_allocated: usize,
+    }
+    extern "C" {
+        fn malloc_zone_statistics(zone: *mut std::ffi::c_void, stats: *mut Statistics);
+    }
+    let mut stats = Statistics::default();
+    // SAFETY: a null zone aggregates every registered zone into `stats`.
+    unsafe { malloc_zone_statistics(std::ptr::null_mut(), &mut stats) };
+    (stats.size_in_use, stats.size_allocated)
+}
+#[cfg(not(target_os = "macos"))]
+fn money_fixture_heap() -> (usize, usize) {
+    (0, 0)
+}
+// Diagnostic only: the kernel's own split of this task's memory. The malloc
+// zone totals above omit some zones, so they cannot attribute an RSS delta;
+// these can. Never feeds an assertion.
+#[cfg(target_os = "macos")]
+fn money_fixture_vm() -> serde_json::Value {
+    // task_vm_info through phys_footprint (rev1); every field is 8-byte
+    // aligned, so the C layout matches the header's pack(4) declaration.
+    #[repr(C)]
+    #[derive(Default)]
+    struct TaskVmInfo {
+        virtual_size: u64,
+        region_count: i32,
+        page_size: i32,
+        resident_size: u64,
+        resident_size_peak: u64,
+        device: u64,
+        device_peak: u64,
+        internal: u64,
+        internal_peak: u64,
+        external: u64,
+        external_peak: u64,
+        reusable: u64,
+        reusable_peak: u64,
+        purgeable_volatile_pmap: u64,
+        purgeable_volatile_resident: u64,
+        purgeable_volatile_virtual: u64,
+        compressed: u64,
+        compressed_peak: u64,
+        compressed_lifetime: u64,
+        phys_footprint: u64,
+    }
+    // vm_region_extended_info (VM_REGION_EXTENDED_INFO = 13).
+    #[repr(C)]
+    #[derive(Default)]
+    struct RegionInfo {
+        protection: i32,
+        user_tag: u32,
+        pages_resident: u32,
+        pages_shared_now_private: u32,
+        pages_swapped_out: u32,
+        pages_dirtied: u32,
+        ref_count: u32,
+        shadow_depth: u16,
+        external_pager: u8,
+        share_mode: u8,
+        pages_reusable: u32,
+    }
+    extern "C" {
+        static mach_task_self_: u32;
+        fn task_info(task: u32, flavor: u32, info: *mut i32, count: *mut u32) -> i32;
+        fn mach_vm_region(
+            task: u32,
+            address: *mut u64,
+            size: *mut u64,
+            flavor: i32,
+            info: *mut i32,
+            count: *mut u32,
+            object: *mut u32,
+        ) -> i32;
+    }
+    let mut vm = TaskVmInfo::default();
+    let mut count = (std::mem::size_of::<TaskVmInfo>() / 4) as u32;
+    // SAFETY: TASK_VM_INFO (22) fills at most `count` words of `vm`.
+    let status = unsafe {
+        task_info(
+            mach_task_self_,
+            22,
+            (&mut vm as *mut TaskVmInfo).cast(),
+            &mut count,
+        )
+    };
+    let page = u64::try_from(vm.page_size).unwrap_or(0);
+    // Resident/reusable bytes per region kind: the malloc tag (1-12),
+    // stack (30), file-backed ("file") or another tag.
+    let mut regions = BTreeMap::<String, (u64, u64)>::new();
+    let mut address = 0_u64;
+    loop {
+        let mut size = 0_u64;
+        let mut region = RegionInfo::default();
+        let mut region_count = (std::mem::size_of::<RegionInfo>() / 4) as u32;
+        let mut object = 0_u32;
+        // SAFETY: VM_REGION_EXTENDED_INFO fills at most `region_count` words.
+        let found = unsafe {
+            mach_vm_region(
+                mach_task_self_,
+                &mut address,
+                &mut size,
+                13,
+                (&mut region as *mut RegionInfo).cast(),
+                &mut region_count,
+                &mut object,
+            )
+        };
+        if found != 0 || size == 0 {
+            break;
+        }
+        let kind = if region.external_pager != 0 {
+            "file".to_string()
+        } else {
+            format!("tag{}", region.user_tag)
+        };
+        let entry = regions.entry(kind).or_default();
+        entry.0 += u64::from(region.pages_resident) * page;
+        entry.1 += u64::from(region.pages_reusable) * page;
+        address = address.saturating_add(size);
+    }
+    regions.retain(|_, (resident, _)| *resident >= 256 * 1024);
+    serde_json::json!({
+        "status": status,
+        "resident": vm.resident_size,
+        "internal": vm.internal,
+        "external": vm.external,
+        "reusable": vm.reusable,
+        "compressed": vm.compressed,
+        "phys_footprint": vm.phys_footprint,
+        "regions_resident_reusable": regions,
+    })
+}
+#[cfg(not(target_os = "macos"))]
+fn money_fixture_vm() -> serde_json::Value {
+    serde_json::Value::Null
+}
+fn money_fixture_phase(phase: &str, phases: &mut Vec<serde_json::Value>) {
+    let rss = money_fixture_rss_bytes();
+    let (in_use, allocated) = money_fixture_heap();
+    let vm = money_fixture_vm();
+    eprintln!(
+        "MONEY_RSS_PHASE phase={phase} rss={rss} heap_in_use={in_use} heap_allocated={allocated} vm={vm}"
+    );
+    phases.push(serde_json::json!({"phase": phase, "rss": rss, "heap_in_use": in_use, "heap_allocated": allocated, "vm": vm}));
+}
+
+#[test]
+#[serial]
+#[serial(claude_request_money_shadow)]
+fn money_gate_off_rss_fixture_receipt() {
+    let (Ok(base), Ok(output)) = (
+        std::env::var("OTTTO_MONEY_PARITY_ROOT"),
+        std::env::var("OTTTO_MONEY_RSS_OUTPUT"),
+    ) else {
+        return;
+    };
+    let base = PathBuf::from(base);
+    assert!(
+        base.join("m4-saved-inputs/index.json").exists(),
+        "prepare shared inputs in a separate process first"
+    );
+    let support = PathBuf::from(format!("{output}.state"));
+    if support.exists() {
+        std::fs::remove_dir_all(&support).unwrap();
+    }
+    std::fs::create_dir_all(&support).unwrap();
+    let index: ScanIndex = serde_json::from_value(money_m4_saved_inputs(&base, &support)).unwrap();
+    let mut phases = Vec::new();
+    money_fixture_phase("inputs", &mut phases);
+    use crate::snapshots::claude_request_money as money;
+    money::enable_shadow_for_test(&support);
+    drop(money::store::acquire(&support));
+    let deadline = Instant::now() + Duration::from_secs(180);
+    let (records, hashes) = loop {
+        if let Some(counts) = money::store::with_ledger_for_test(&support, |ledger| {
+            (
+                ledger.census().record_count(),
+                ledger.census().hash_total_for_test(),
+            )
+        }) {
+            break counts;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "P1 resident load did not complete"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(hashes, 554_400);
+    money_fixture_phase("ledger_ready", &mut phases);
+    money::shadow_page_at(
+        &support,
+        &[],
+        &index,
+        &Default::default(),
+        &Default::default(),
+        true,
+        1_785_653_000,
+    );
+    money_fixture_phase("page", &mut phases);
+    money::store::flush();
+    let _ = money_fixture_rss_bytes();
+    let mut samples = [0_u64; 3];
+    for sample in &mut samples {
+        *sample = money_fixture_rss_bytes();
+    }
+    samples.sort_unstable();
+    money_fixture_phase("flushed", &mut phases);
+    // The gated OFF memory metric: the kernel's physical footprint (dirty and
+    // compressed memory) at the RSS sample point. ps RSS also counts clean
+    // file-backed code pages and reclaimable pages, which differ between two
+    // separately built debug binaries; it stays an INFO value.
+    let phys_footprint = phases
+        .last()
+        .and_then(|phase| phase["vm"]["phys_footprint"].as_u64())
+        .unwrap_or(0);
+    #[cfg(target_os = "macos")]
+    {
+        extern "C" {
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
+        }
+        // SAFETY: a null zone asks every zone to return free pages.
+        let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+        eprintln!("MONEY_RSS_PHASE released_free_bytes={released}");
+        money_fixture_phase("after_relief", &mut phases);
+    }
+    // Both source builds use the identical saved M4 ledger and audit the
+    // real load/save routines, independently of fixture creation and RSS.
+    let (mut measured, load_peak) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        money::store::load_for_test(&support)
+    });
+    let ledger_resident = measured
+        .census()
+        .resident_bytes(Instant::now() + Duration::from_secs(60))
+        .unwrap();
+    let mut query_key_capacity = 0;
+    let keys = measured
+        .census()
+        .records()
+        .map(|(key, _)| {
+            query_key_capacity += key.capacity();
+            key.to_string()
+        })
+        .collect::<Vec<_>>();
+    let legacy_node_bytes = keys.len()
+        * (std::mem::size_of::<String>()
+            + std::mem::size_of::<
+                crate::snapshots::claude_request_census::ClaudeRequestCensusRecord,
+            >())
+        * 3
+        / 2;
+    let mut legacy_heap_bytes = 0;
+    for key in keys {
+        let bytes = serde_json::to_vec(&BTreeMap::from([(
+            key.as_str(),
+            measured.census().get(&key).unwrap(),
+        )]))
+        .unwrap();
+        let decoded = crate::snapshots::claude_request_census::decode_ledger_shard(&bytes).unwrap();
+        let record = decoded.get(&key).unwrap().clone();
+        use crate::heap_layout_bound::{Counter, HeapLayoutBound};
+        let mut counter = Counter::new(usize::MAX);
+        record.heap_bound(&mut counter).unwrap();
+        legacy_heap_bytes += counter.bytes;
+        assert_eq!(
+            measured.insert(key, record),
+            crate::snapshots::claude_request_census::ClaudeRequestCensusInsert::Stored
+        );
+    }
+    let ((), save_peak) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let mut writer = money::store::WriterState::default();
+        while measured.dirty_shards() > 0 {
+            let (_, _, unwritten) =
+                money::store::save_page_for_test(&support, &mut measured, &mut writer).unwrap();
+            assert_eq!(unwritten, 0);
+        }
+    });
+    let receipt = serde_json::json!({"ledger_resident_bytes":ledger_resident, "p1_map_node_bytes":legacy_node_bytes, "query_key_capacity":query_key_capacity, "p1_record_heap_bytes":legacy_heap_bytes, "load_requested_peak":load_peak.requested_peak_with_overlap, "load_native_peak":load_peak.usable_peak_with_overlap, "save_requested_peak":save_peak.requested_peak_with_overlap, "save_native_peak":save_peak.usable_peak_with_overlap, "rss_samples_bytes": samples, "rss_median_bytes":samples[1], "phys_footprint_bytes": phys_footprint, "rss_phases": phases, "index_records":index.files.len(), "ledger_records":records, "ledger_hashes":hashes, "p1_shadow_enabled":true, "live_gate":false, "current_kernel_rss":true, "allocator_audit_active":false, "matched_source_build_fixture":true, "release_daemon_rss":false});
+    std::fs::write(output, serde_json::to_vec_pretty(&receipt).unwrap()).unwrap();
+    eprintln!("MONEY_RSS_OFF_FIXTURE median_bytes={} phys_footprint_bytes={phys_footprint} samples={samples:?} p1_shadow_enabled=true live_gate=false hashes={hashes} matched_source_build_fixture=true release_daemon_rss=false", samples[1]);
 }

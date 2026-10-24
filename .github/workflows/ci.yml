@@ -6,6 +6,11 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      money_base_comparison:
+        description: Compare the saved gate-off fixtures with main
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -128,3 +133,111 @@ jobs:
       - name: Connector advisory audit
         run: cargo audit --deny warnings
         working-directory: crates
+
+  money-base-comparison:
+    name: Saved money gate-off comparison
+    if: github.event_name == 'workflow_dispatch' && inputs.money_base_comparison
+    timeout-minutes: 40
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      OTTTO_REQUIRE_LAYOUT: "1"
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Compare real callers against identical saved inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          export OTTTO_MONEY_PARITY_ROOT="$RUNNER_TEMP/money-saved-inputs"
+          # Separate targets force each source tree to compile independently.
+          # Shared targets can reuse the base binary after a worktree switch.
+          git worktree add --detach "$RUNNER_TEMP/money-base" 8b1c7309720f6963b2b871d7543aea91977daa10
+          cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
+          # Match the test-only observer's fixed storage in both binaries.
+          # Runtime source, measured allocations and overflow assertions stay intact.
+          python3 - "$RUNNER_TEMP/money-base" <<'PY'
+          import pathlib, sys
+          path = pathlib.Path(sys.argv[1]) / "crates/ottto-service/src/retry_allocation_probe.rs"
+          source = path.read_text()
+          old = "const SLOTS: usize = 65_536;"
+          assert source.count(old) == 1
+          path.write_text(source.replace(old, "const SLOTS: usize = 1_048_576;"))
+          PY
+
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" cargo test -p ottto-service --lib --locked --no-run --message-format=json > "$RUNNER_TEMP/money-head-build.jsonl"
+          money_head_binary="$(python3 -c 'import json,sys; rows=[json.loads(line) for line in open(sys.argv[1])]; bins=[row["executable"] for row in rows if row.get("reason")=="compiler-artifact" and row.get("executable")]; assert len(bins)==1, bins; print(bins[0])' "$RUNNER_TEMP/money-head-build.jsonl")"
+          # The base test execs the independently built head test after all
+          # assertions pass. A fresh image preserves only the PID, avoiding
+          # nondeterministic serialized census-witness digit counts.
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_PARITY_OUTPUT="$RUNNER_TEMP/money-base.json" OTTTO_MONEY_PARITY_NEXT_BINARY="$money_head_binary" OTTTO_MONEY_PARITY_NEXT_OUTPUT="$RUNNER_TEMP/money-head.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_saved_fixture_receipt -- --nocapture
+          # Isolated processes measure memory with the same pre-generated M4
+          # input and armed P1 resident; allocator audits stay inactive. Five
+          # alternating base/head runs; the gate reads each side's median.
+          for run in 0 1 2 3 4; do
+            CARGO_TARGET_DIR="$RUNNER_TEMP/money-base-target" OTTTO_MONEY_RSS_OUTPUT="$RUNNER_TEMP/money-base-rss-$run.json" cargo test --manifest-path "$RUNNER_TEMP/money-base/Cargo.toml" -p ottto-service --lib --locked money_gate_off_rss_fixture_receipt -- --nocapture
+            CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_RSS_OUTPUT="$RUNNER_TEMP/money-head-rss-$run.json" cargo test -p ottto-service --lib --locked money_gate_off_rss_fixture_receipt -- --nocapture
+          done
+          CARGO_TARGET_DIR="$RUNNER_TEMP/money-head-target" OTTTO_MONEY_ISOLATED_RSS=1 cargo test -p ottto-service --lib --locked money_m4_sized_ledger_and_page_are_measured -- --nocapture
+          # The exact saved main/head byte diff gates first, so its verdict is
+          # recorded even when a resource budget below fails.
+          diff -u "$RUNNER_TEMP/money-base.json" "$RUNNER_TEMP/money-head.json"
+          echo "MONEY_GATE_OFF_EXACT_DIFF identical=true"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, sys
+          root = pathlib.Path(sys.argv[1])
+          import statistics
+          runs = range(5)
+          base_runs = [json.loads((root / f"money-base-rss-{run}.json").read_text()) for run in runs]
+          head_runs = [json.loads((root / f"money-head-rss-{run}.json").read_text()) for run in runs]
+          # Structural fields are deterministic; the first run of each side carries them.
+          base, head = base_runs[0], head_runs[0]
+          for receipt in base_runs + head_runs:
+              assert receipt["ledger_hashes"] == 554400
+              assert receipt["phys_footprint_bytes"] > 0, "phys_footprint unavailable"
+          def median(receipts, field):
+              return int(statistics.median(receipt[field] for receipt in receipts))
+          base_footprint, head_footprint = median(base_runs, "phys_footprint_bytes"), median(head_runs, "phys_footprint_bytes")
+          base_rss, head_rss = median(base_runs, "rss_median_bytes"), median(head_runs, "rss_median_bytes")
+          result = {"baseline_ref": "saved-main", "baseline_source": "8b1c7309720f6963b2b871d7543aea91977daa10", "runs_per_side": len(runs), "base_phys_footprint_bytes": base_footprint, "head_phys_footprint_bytes": head_footprint, "footprint_delta_bytes": head_footprint - base_footprint, "base_footprint_runs": [r["phys_footprint_bytes"] for r in base_runs], "head_footprint_runs": [r["phys_footprint_bytes"] for r in head_runs], "base_rss_bytes": base_rss, "head_rss_bytes": head_rss, "rss_delta_bytes_info": head_rss - base_rss, "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
+          (root / "money-rss-comparison.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
+          delta = head["ledger_resident_bytes"] - base["ledger_resident_bytes"]
+          print(f'MONEY_M4_DELTA_VS_MAIN base_resident={base["ledger_resident_bytes"]} head_off_resident={head["ledger_resident_bytes"]} delta={delta} base_load_peak={base["load_native_peak"]} head_off_load_peak={head["load_native_peak"]} base_save_peak={base["save_native_peak"]} head_off_save_peak={head["save_native_peak"]} base_footprint={base_footprint} head_off_footprint={head_footprint} footprint_delta={result["footprint_delta_bytes"]} base_rss={base_rss} head_off_rss={head_rss} rss_delta_info={result["rss_delta_bytes_info"]} resident_is_structural=true peaks_are_native_usable=true matched_observer_slots=1048576')
+          # P1 evidence now has a physical carrier, a typed field slot and a
+          # separately boxed telemetry record. Live delivery/watch fields are
+          # absent while OFF (MONEY_OFF_LAYOUT prints the exact partition).
+          # Budget the shared representation, not live scaffold or an RSS
+          # subtraction. Ceilings are measured against the pinned main source build.
+          # Memory is gated on the kernel's physical footprint (dirty and
+          # compressed memory), median of five alternating runs per side. ps RSS
+          # also counts clean file-backed code pages and reclaimable pages; for
+          # two separately built debug binaries those were +5.9 MB code pages and
+          # +3.4..4.9 MB reusable with no data cause (Round 11 kernel split), so
+          # RSS and the split are printed for information only.
+          MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES = 2 * 1024 * 1024
+          MONEY_OFF_FOOTPRINT_BUDGET_BYTES = 2 * 1024 * 1024
+          base_split = {k: base[k] for k in ("p1_map_node_bytes", "query_key_capacity", "p1_record_heap_bytes")}
+          assert sum(base_split.values()) == base["ledger_resident_bytes"], base_split
+          print("MONEY_OFF_SHARED_REPRESENTATION " + json.dumps({"base_split": base_split, "shared_layout_delta": delta, "structural_budget_bytes": MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES, "footprint_delta": result["footprint_delta_bytes"], "footprint_budget_bytes": MONEY_OFF_FOOTPRINT_BUDGET_BYTES, "rss_delta_info": result["rss_delta_bytes_info"]}, sort_keys=True))
+          # INFO only: the kernel's split at the sample point (clean file-backed,
+          # reclaimable reusable, dirty internal, footprint), head minus base
+          # medians over the same runs.
+          def vm_at(receipt, phase):
+              return next((p.get("vm") or {} for p in receipt.get("rss_phases", []) if p["phase"] == phase), {})
+          def vm_median(receipts, key):
+              return statistics.median(vm_at(receipt, "flushed").get(key, 0) for receipt in receipts)
+          split = {k: int(vm_median(head_runs, k) - vm_median(base_runs, k)) for k in ("resident", "external", "reusable", "internal", "phys_footprint")}
+          print("MONEY_OFF_RSS_SPLIT " + json.dumps({"head_minus_base_median_at_flushed": split, "gated": False}, sort_keys=True))
+          assert delta <= MONEY_OFF_SHARED_LAYOUT_BUDGET_BYTES, "gate-OFF shared P1 layout exceeds its 2 MiB budget"
+          assert result["footprint_delta_bytes"] <= MONEY_OFF_FOOTPRINT_BUDGET_BYTES, "gate-OFF physical footprint exceeds its 2 MiB budget"
+
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: money-gate-off-receipts
+          path: ${{ runner.temp }}/money-*.json

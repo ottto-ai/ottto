@@ -7,6 +7,7 @@ type BatchResponse = crate::snapshot_client::SnapshotBatchResponse;
 
 fn shed(retry_after_seconds: Option<u64>) -> anyhow::Error {
     anyhow::Error::new(UploadShed {
+ request_owned_route_unavailable: false,
         status: 503,
         retry_after: retry_after_seconds.map(Duration::from_secs),
         code: None,
@@ -77,6 +78,7 @@ fn short_retry_after_shed_is_retried_in_place_and_settles() {
         let driven = drive(3, None, |attempt, batch| match attempt {
             0 => Err(anyhow::Error::new(UploadShed {
                 status,
+                request_owned_route_unavailable: false,
                 retry_after: Some(Duration::from_secs(retry_after)),
                 code: None,
             })),

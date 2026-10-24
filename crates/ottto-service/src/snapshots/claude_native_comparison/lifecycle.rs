@@ -535,7 +535,72 @@ fn native_comparison_local_refusal_latches_base_across_pages_and_cache_clear() {
 
 crate::heap_layout_bound::fields!(Lifecycle; state);
 crate::heap_layout_bound::fields!(State; generation, scope, valid, window, admission_refused, policy, published_policy, policy_in_flight);
-crate::heap_layout_bound::fields!(Lease; owner, generation, previous_scope, previous_valid, scope, allowed, selected_save, native_save, finished, window, policy, policy_hit, diagnostic);
+impl crate::heap_layout_bound::HeapLayoutBound for Lease {
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        let Self {
+            owner,
+            generation,
+            previous_scope,
+            previous_valid,
+            scope,
+            allowed,
+            selected_save,
+            native_save,
+            finished,
+            window,
+            policy,
+            policy_hit,
+            diagnostic,
+        } = self;
+        owner.heap_bound(c)?;
+        generation.heap_bound(c)?;
+        previous_scope.heap_bound(c)?;
+        previous_valid.heap_bound(c)?;
+        scope.heap_bound(c)?;
+        allowed.heap_bound(c)?;
+        selected_save.heap_bound(c)?;
+        native_save.heap_bound(c)?;
+        finished.heap_bound(c)?;
+        window.heap_bound(c)?;
+        policy.heap_bound(c)?;
+        policy_hit.heap_bound(c)?;
+        diagnostic.heap_bound(c)?;
+        Some(())
+    }
+    fn completed_heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        // The daemon owns the mutable Lifecycle independently of this lease.
+        // A parked finish retains only another Arc handle, not a copy of that
+        // process-wide graph. Charge all lease-owned fields exhaustively.
+        let Self {
+            owner: _,
+            generation,
+            previous_scope,
+            previous_valid,
+            scope,
+            allowed,
+            selected_save,
+            native_save,
+            finished,
+            window,
+            policy,
+            policy_hit,
+            diagnostic,
+        } = self;
+        generation.completed_heap_bound(c)?;
+        previous_scope.completed_heap_bound(c)?;
+        previous_valid.completed_heap_bound(c)?;
+        scope.completed_heap_bound(c)?;
+        allowed.completed_heap_bound(c)?;
+        selected_save.completed_heap_bound(c)?;
+        native_save.completed_heap_bound(c)?;
+        finished.completed_heap_bound(c)?;
+        window.completed_heap_bound(c)?;
+        policy.completed_heap_bound(c)?;
+        policy_hit.completed_heap_bound(c)?;
+        diagnostic.completed_heap_bound(c)?;
+        Some(())
+    }
+}
 
 /// The latch is process-local progress policy, never upload/ownership evidence.
 /// Retain the success counter after quiet clear so a proof refresh cannot renew

@@ -673,6 +673,8 @@ impl ApcFixture {
                         Ok(accepted_batch(items.len()))
                     }
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
+                        request_owned_route_unavailable: false,
+
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
                         code: None,
