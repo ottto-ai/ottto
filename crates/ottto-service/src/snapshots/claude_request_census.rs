@@ -2243,7 +2243,17 @@ impl<R: std::io::Read> CensusRead<R> {
             let mut census =
                 serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
             self.ambiguous_census |= census.decode_lost || !census.ambiguous.is_empty();
-            self.ambiguous_keys.append(&mut census.ambiguous);
+            if !self.duplicate_census {
+                // Only the first census field can contribute identities.
+                // Repeated root fields are discarded; their independent decode
+                // budgets must never accumulate into an unbounded reader set.
+                let remaining = MAX_DECODE_ENTRIES.saturating_sub(self.ambiguous_keys.len());
+                self.ambiguous_keys.extend(
+                    std::mem::take(&mut census.ambiguous)
+                        .into_iter()
+                        .take(remaining),
+                );
+            }
             drop(bytes);
             serde_json::to_vec(&census).expect("census serialization")
         })
@@ -5449,6 +5459,45 @@ mod reader_regression_tests {
     use std::io::Read;
 
     #[test]
+    fn repeated_discarded_census_fields_do_not_accumulate_ambiguous_identities() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+        value["claude_request_census"] = serde_json::json!("FIRST_CENSUS_FIXTURE");
+        let first = r#"{"first":false,"first":false}"#;
+        let base = serde_json::to_string(&value)
+            .unwrap()
+            .replace("\"FIRST_CENSUS_FIXTURE\"", first);
+        let mut raw = base.strip_suffix('}').unwrap().to_owned();
+        for field in 0..128 {
+            raw.push_str(&format!(",\"claude_request_census\":{{\"discarded-{field}\":false,\"discarded-{field}\":false}}"));
+        }
+        raw.push('}');
+        let mut reader = CensusRead::new(raw.as_bytes());
+        let mut normalized = Vec::new();
+        reader.read_to_end(&mut normalized).unwrap();
+        assert!(reader.duplicate_census);
+        assert_eq!(reader.ambiguous_keys, BTreeSet::from(["first".to_owned()]));
+        assert!(reader.ambiguous_keys.len() <= MAX_DECODE_ENTRIES);
+        for index in [
+            decode_index(raw.as_bytes()).unwrap(),
+            decode_bounded_index(raw.as_bytes()).unwrap(),
+        ] {
+            assert!(index.claude_request_census.records.is_empty());
+            assert_eq!(
+                index.claude_request_census.ambiguous,
+                BTreeSet::from(["first".to_owned()])
+            );
+            assert_eq!(
+                index
+                    .claude_request_census_shadow
+                    .decode_duplicate_keys_dropped,
+                1
+            );
+            assert!(index.claude_request_census.safety_incomplete.incomplete());
+        }
+    }
+
+    #[test]
     fn census_index_decode_uses_buffered_reads_and_structural_steps() {
         let mut index = ScanIndex::default();
         // Real persisted index data: 4 MiB of long strings, plus escaped quotes,
@@ -6505,7 +6554,11 @@ mod phase_b_tests {
             Some(shadow_admission::Refusal::Workspace)
         ));
         assert!(requested > limit);
-        eprintln!("FIX3_PHASE_B_SCALE files={FILES} hashes={} requested_peak_with_overlap={} workspace_peak={} attempted={} refused={} refusal_rate_ppm={} estimated_peak_bytes={} actual_allocator_peak_bytes={} measured_error_ppm={} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by={refused_by} limit={limit} requested={requested} calibration_estimate_bytes={} calibration_actual_bytes={} calibration_effective_bound_bytes={} includes_old_new_checkpoint_decode=true per_caller_thread=true runtime_corpus=false",
+        let observed_scale_error_ppm = shadow_admission::measured_error_ppm(
+            admission.additional_estimate,
+            allocation.requested_peak_with_overlap,
+        );
+        eprintln!("FIX3_PHASE_B_SCALE files={FILES} hashes={} requested_peak_with_overlap={} workspace_peak={} attempted={} refused={} refusal_rate_ppm={} estimated_peak_bytes={} actual_allocator_peak_bytes={} measured_error_ppm={} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by={refused_by} limit={limit} requested={requested} calibration_estimate_bytes={} calibration_actual_bytes={} calibration_effective_bound_bytes={} measured_error_basis=admitted_1024_reference observed_scale_error_ppm={observed_scale_error_ppm} includes_old_new_checkpoint_decode=true per_caller_thread=true runtime_corpus=false",
             next, allocation.requested_peak_with_overlap, workspace, counts.shadow_healthy_terminals_attempted, counts.shadow_healthy_terminals_memory_refused, counts.shadow_healthy_terminal_refusal_rate_ppm,
             admission.additional_estimate, allocation.requested_peak_with_overlap, calibration.error_ppm,
             shadow_admission::ERROR_ALLOWANCE_PPM, admission.effective_additional(), admission.workspace_estimate, admission.effective_workspace(),
@@ -7470,7 +7523,7 @@ mod phase_b_tests {
             error_ppm,
             effective: admission.effective_additional(),
         };
-        eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true estimated_peak_bytes={} actual_allocator_peak_bytes={actual_allocator_peak} measured_error_ppm={error_ppm} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by=none limit={} requested={} includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families, admission.additional_estimate, shadow_admission::ERROR_ALLOWANCE_PPM, admission.effective_additional(), admission.workspace_estimate, admission.effective_workspace(), shadow_admission::ADDITIONAL_PEAK_CAP, admission.effective_additional());
+        eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true estimated_peak_bytes={} actual_allocator_peak_bytes={actual_allocator_peak} measured_error_ppm={error_ppm} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by=none limit={} requested={} measured_error_basis=admitted_1024_reference includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families, admission.additional_estimate, shadow_admission::ERROR_ALLOWANCE_PPM, admission.effective_additional(), admission.workspace_estimate, admission.effective_workspace(), shadow_admission::ADDITIONAL_PEAK_CAP, admission.effective_additional());
         calibration
     }
     #[test]
