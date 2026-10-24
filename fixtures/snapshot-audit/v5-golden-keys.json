@@ -1,0 +1,17 @@
+{
+  "audit_key_source": "first_32_bytes_of_pi_session_fixture",
+  "machine_key": "36d6c7f5a8abe0d958ffba3676633996d07861f8092f4318669bc363fbcfaacf",
+  "session_key": "55babf9f84f0bab4ed50ceb0629178c9156903e4c2823ddc0b3fd2c9f068755a",
+  "semantic_key": "1201a3c9eae1a7df440169288dad7fd27cd4b6d05487111bd2659634cea3545e",
+  "revision_key_with_fixture_input_fingerprint": "61292b17faef001329ee9efcb865968f04d28d6a8c51beac1c66974bd79f105f",
+  "policy_neutral_component_keys": {
+    "latency": "fe628886c1cd7e20f56f7702d5c8a737dffd63e8ca6114b6f68cccf26bb41a95",
+    "lifecycle_activity": "44b9bb2f2b26ed02c274884e4c739f38d4cc39ad2f326daea8806e62480f9cb6",
+    "usage_accounting": "7895f7d2f652cd725e4fad8052bff75a6967f69e1da0bc02912ee2229d059048"
+  },
+  "policy_sensitive_component_keys": {
+    "artifacts": "26a2f062e6d8e85acf9cd01705dc7fa4642395ab5417f4d9ce45368eccd2dd61",
+    "attribution": "98a418ff9fab3c3479fcdc3e84bcd8419ac79326de16ff7ac60285e958db0147",
+    "display_identity": "8edb7976a76c2cb7c0d254fee059074a637954bc902ee3346e568136f8502f6b"
+  }
+}

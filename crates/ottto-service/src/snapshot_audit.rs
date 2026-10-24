@@ -25,7 +25,9 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
-const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v4";
+// v5 adds `oversized_file_count` and `census_complete`. The schema string is
+// the HMAC domain of every blinded key, so all v4 keys change (as at each bump).
+const AUDIT_SCHEMA_VERSION: &str = "local_snapshot_audit:v5";
 const AUDIT_STATE_SCHEMA_VERSION: &str = "local_snapshot_audit_state:v3";
 const AUDIT_STATE_MARKER_FILE: &str = "audit-state.json";
 const AUDIT_SCAN_INDEX_FILE: &str = "scan-index.json";
@@ -77,6 +79,12 @@ pub struct SnapshotAuditReport {
     pub discovered_file_count: usize,
     pub skipped_file_count_due_to_limit: usize,
     pub scan_cap_hit: bool,
+    /// Discovered files refused as too large to read on this scan. Nonzero
+    /// means the audit leg is incomplete.
+    pub oversized_file_count: usize,
+    /// The scan's transcript census was complete. False means the audit leg
+    /// is incomplete.
+    pub census_complete: bool,
     pub scanned_file_count: usize,
     pub scanned_session_count: usize,
     pub semantic_noop_count: usize,
@@ -436,6 +444,8 @@ pub fn run_snapshot_audit<W: Write>(
         discovered_file_count: scan.discovered_file_count,
         skipped_file_count_due_to_limit: scan.skipped_file_count_due_to_limit,
         scan_cap_hit: scan.scan_cap_hit,
+        oversized_file_count: scan.oversized_file_count,
+        census_complete: scan.census_complete,
         scanned_file_count: scan.scanned_file_count,
         scanned_session_count: scan.scanned_session_count,
         semantic_noop_count: scan.semantic_noop_count,
@@ -794,6 +804,48 @@ mod tests {
         path
     }
 
+    /// The v5 golden keys. On any mismatch the actual keys and their
+    /// unblinded fixture inputs are printed, so a new golden is recomputed
+    /// independently from the inputs (and the inputs checked against the
+    /// previous golden), never blessed from the print alone.
+    /// `UPDATE_SNAPSHOT_AUDIT_GOLDEN=1` merges the actual keys into the
+    /// fixture first; the assertions read it after the next rebuild.
+    fn golden_keys(
+        case: &str,
+        actual: serde_json::Value,
+        inputs: impl FnOnce() -> serde_json::Value,
+    ) -> serde_json::Value {
+        let actual = actual.as_object().expect("actual keys object").clone();
+        if std::env::var_os("UPDATE_SNAPSHOT_AUDIT_GOLDEN").is_some() {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../fixtures/snapshot-audit/v5-golden-keys.json");
+            let mut golden: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).expect("read golden keys"))
+                    .expect("parse golden keys");
+            for (name, value) in &actual {
+                golden[name] = value.clone();
+            }
+            let encoded = serde_json::to_string_pretty(&golden).expect("serialize golden keys");
+            fs::write(&path, format!("{encoded}\n")).expect("write golden keys");
+        }
+        let golden: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/snapshot-audit/v5-golden-keys.json"
+        ))
+        .expect("parse golden keys");
+        if actual
+            .iter()
+            .any(|(name, value)| golden.get(name) != Some(value))
+        {
+            let line = format!(
+                "\nsnapshot_audit_golden_mismatch case={case} actual={} inputs={}\n",
+                serde_json::Value::Object(actual),
+                inputs()
+            );
+            let _ = std::io::Write::write_all(&mut std::io::stdout().lock(), line.as_bytes());
+        }
+        golden
+    }
+
     #[test]
     fn context_curve_measurement_is_content_free_and_sizes_the_real_wire_shape() {
         let curve = crate::snapshots::SnapshotContextCurve {
@@ -893,7 +945,12 @@ mod tests {
             .as_str()
             .expect("raw source file fingerprint");
         assert_eq!(report.emitted_session_count, 1);
-        assert_eq!(report.schema_version, "local_snapshot_audit:v4");
+        assert_eq!(report.schema_version, "local_snapshot_audit:v5");
+        assert_eq!(report.oversized_file_count, 0);
+        assert!(report.census_complete);
+        let report_value = serde_json::to_value(&report).expect("report value");
+        assert_eq!(report_value["oversized_file_count"], 0);
+        assert_eq!(report_value["census_complete"], true);
         assert_eq!(report.context_curve_evidence_scope, "source_native");
         assert_eq!(report.component_contract_version, "snapshot_semantic:v1");
         assert_eq!(
@@ -933,10 +990,49 @@ mod tests {
                 .len()
                 <= MAX_LEGACY_POLICY_CANDIDATES
         );
-        let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
-        ))
-        .expect("parse golden keys");
+        let golden = golden_keys(
+            "report",
+            serde_json::json!({
+                "machine_key": report.machine_key,
+                "session_key": report.sessions[0].session_key,
+                "semantic_key": report.sessions[0].semantic_key,
+                "policy_neutral_component_keys":
+                    report.sessions[0].policy_neutral_component_keys,
+                "policy_sensitive_component_keys":
+                    report.sessions[0].policy_sensitive_component_keys,
+            }),
+            || {
+                let mut index = ScanIndex::default();
+                let scan = scan_source_roots_with_artifacts(
+                    SnapshotSource::Pi,
+                    &[home.join(".pi").join("agent").join("sessions")],
+                    &mut index,
+                    "2026-07-22T08:02:00Z",
+                    BACKFILL_WINDOW_DAYS,
+                    false,
+                )
+                .expect("scan");
+                let mut item = scan.snapshots.into_iter().next().expect("snapshot");
+                apply_upload_policy(
+                    SnapshotSource::Pi,
+                    std::slice::from_mut(&mut item),
+                    SnapshotUploadPolicy {
+                        session_titles_enabled: false,
+                        workspace_labels_enabled: false,
+                        session_artifacts_enabled: false,
+                        session_attribution_enabled: false,
+                        session_attribution_labels_enabled: false,
+                    },
+                );
+                serde_json::json!({
+                    "payload_snapshot_fingerprint": raw_fingerprint,
+                    "rescanned_snapshot_fingerprint": item.snapshot_fingerprint,
+                    "source_session_id": item.source_session_id,
+                    "component_hashes":
+                        snapshot_semantic_component_hashes(SnapshotSource::Pi, &item),
+                })
+            },
+        );
         assert_eq!(
             report.machine_key,
             golden["machine_key"].as_str().expect("golden machine key")
@@ -1220,10 +1316,22 @@ mod tests {
         assert_eq!(original_neutral, stripped_neutral);
         assert_ne!(original_sensitive, stripped_sensitive);
         let original_revision = snapshot_revision_key(key, SnapshotSource::Pi, &original);
-        let golden: serde_json::Value = serde_json::from_str(include_str!(
-            "../../../fixtures/snapshot-audit/v4-golden-keys.json"
-        ))
-        .expect("parse golden keys");
+        let golden = golden_keys(
+            "revision",
+            serde_json::json!({
+                "revision_key_with_fixture_input_fingerprint": original_revision,
+            }),
+            || {
+                serde_json::json!({
+                    "revision_hash": snapshot_semantic_envelope(
+                        SnapshotSource::Pi,
+                        &original,
+                        SnapshotUploadPolicy::default(),
+                    )
+                    .revision_hash,
+                })
+            },
+        );
         assert_eq!(
             original_revision,
             golden["revision_key_with_fixture_input_fingerprint"]

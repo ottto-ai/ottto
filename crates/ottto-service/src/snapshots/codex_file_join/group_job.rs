@@ -391,6 +391,8 @@ impl GroupBoot {
             }
         }
         let mut census = ScanCensus::default();
+        // Identify reads only the stamp and header: no size cap here. Body
+        // reads re-open each member under the job's admission.
         let Some((opened, file)) = open_and_identify_scan_candidate(
             SnapshotSource::Codex,
             candidate,
@@ -398,6 +400,7 @@ impl GroupBoot {
             None,
             0,
             &BTreeMap::new(),
+            ReadAdmission::Bounded,
         ) else {
             return Boot::Strict;
         };
@@ -535,6 +538,13 @@ impl GroupBoot {
     ) -> std::result::Result<Box<OwnedActiveFile>, GroupEnd> {
         let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
         let dependencies = self.dependencies(inputs.metadata);
+        // The job's one admission, from its page plan: every member body
+        // open below and in `open_member` uses it.
+        let admission = if inputs.paged {
+            ReadAdmission::Bounded
+        } else {
+            ReadAdmission::Unpaged
+        };
         let Self {
             group,
             key,
@@ -577,7 +587,7 @@ impl GroupBoot {
             return Err(GroupEnd::Strict);
         }
         let mut opened = first.clone();
-        let file = open_member_file(&mut opened)?;
+        let file = open_member_file(&mut opened, admission)?;
         if opened.opened_object_identity != first.opened_object_identity {
             return Err(GroupEnd::Changed);
         }
@@ -633,6 +643,7 @@ impl GroupBoot {
             hold_offset: None,
             // U1a-2a: a group job is never a side read.
             side_origin: None,
+            admission,
             group: Some(Box::new(GroupJob {
                 key,
                 owner: group.owner,
@@ -671,10 +682,18 @@ pub(in crate::snapshots) struct JobInputs<'a> {
     pub(in crate::snapshots) artifacts: bool,
     pub(in crate::snapshots) context_curve: bool,
     pub(in crate::snapshots) index: &'a ScanIndex,
+    /// The group's page plan is `Cursor`: members are read by the cursor.
+    pub(in crate::snapshots) paged: bool,
 }
 
-fn open_member_file(member: &mut CandidateFile) -> std::result::Result<File, GroupEnd> {
-    match open_candidate_file(SnapshotSource::Codex, member) {
+/// A member body open. An `Unpaged` job's member over the unpaged limit is
+/// refused here on its own descriptor (`Strict`), whatever its length was at
+/// identify: identify-time lengths are not the final authority.
+fn open_member_file(
+    member: &mut CandidateFile,
+    admission: ReadAdmission,
+) -> std::result::Result<File, GroupEnd> {
+    match open_candidate_file_admitted(SnapshotSource::Codex, member, admission) {
         Ok(file) => Ok(file),
         // The member vanished or was renamed: membership changed.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(GroupEnd::Changed),
@@ -945,7 +964,12 @@ fn member_eof(
     // A cursor job's live member is fenced by its certificate; every other
     // member keeps exact identity at EOF.
     if !(last && paged) {
-        match opened_object_identity(SnapshotSource::Codex, active.parser.reader.reader.get_mut()) {
+        // An identity compare at EOF: no size cap.
+        match opened_object_identity_admitted(
+            SnapshotSource::Codex,
+            active.parser.reader.reader.get_mut(),
+            ReadAdmission::Bounded,
+        ) {
             Ok(identity) if identity == member.opened_object_identity => {}
             Ok(_) => return Err(GroupEnd::Changed),
             Err(_) => return Err(GroupEnd::Strict),
@@ -1125,7 +1149,7 @@ fn open_member(
         .ok_or(GroupEnd::Strict)?;
     let last = position + 1 == group.members.len();
     let mut opened = member.clone();
-    let file = open_member_file(&mut opened)?;
+    let file = open_member_file(&mut opened, active.admission)?;
     if last && paged {
         // The live member may have grown since boot; its line 0 must not
         // have changed (TOCTOU), and its object is fenced below.

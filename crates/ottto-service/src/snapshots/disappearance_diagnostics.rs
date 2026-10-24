@@ -285,7 +285,8 @@ mod tests {
         advance_bounded_directory_traversal, candidate_from_traversal_path,
         ensure_bounded_traversal, local_index_key, open_and_identify_scan_candidate,
         scan_source_roots_with_limit_and_attribution, OwnedSourceScan, OwnedSourceScanStep,
-        ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult, BACKFILL_WINDOW_DAYS,
+        ReadAdmission, ScanCensus, ScanIndex, ScanTraversalPath, SourceScanResult,
+        BACKFILL_WINDOW_DAYS,
     };
     use super::*;
     use std::{
@@ -553,6 +554,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    ReadAdmission::Unpaged,
                 )
             });
             assert!(opened.is_none());
@@ -1186,6 +1188,7 @@ mod tests {
                 None,
                 BACKFILL_WINDOW_DAYS,
                 &BTreeMap::new(),
+                ReadAdmission::Unpaged,
             )
         });
         assert!(opened.is_none());
@@ -1274,6 +1277,7 @@ mod tests {
                     None,
                     BACKFILL_WINDOW_DAYS,
                     &BTreeMap::new(),
+                    ReadAdmission::Unpaged,
                 )
                 .is_none());
             }

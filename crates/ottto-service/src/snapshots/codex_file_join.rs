@@ -463,7 +463,12 @@ impl Validation {
             }
             for member in &group.members {
                 let mut opened = member.clone();
-                let file = open_candidate_file(SnapshotSource::Codex, &mut opened)?;
+                // An identity compare after replay: no size cap.
+                let file = open_candidate_file_admitted(
+                    SnapshotSource::Codex,
+                    &mut opened,
+                    ReadAdmission::Bounded,
+                )?;
                 let granted = group.live.as_ref().is_some_and(|(key, prefix)| {
                     *key == local_index_key(&member.path) && prefix.holds(&file)
                 });
@@ -1597,6 +1602,7 @@ pub(super) mod tests {
             artifacts: false,
             context_curve: false,
             index,
+            paged: false,
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
@@ -3645,6 +3651,7 @@ pub(super) mod tests {
                 None,
                 0,
                 &BTreeMap::new(),
+                ReadAdmission::Unpaged,
             )
             .unwrap();
             let parsed = parse_opened_jsonl_file(
@@ -3743,6 +3750,7 @@ pub(super) mod tests {
                 artifacts: false,
                 context_curve: false,
                 index: &previous,
+                paged: false,
             })
             .unwrap();
         let no_scope = |_: &CandidateFile| None;
