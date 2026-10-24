@@ -390,10 +390,24 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 );
                 let offered = server.offered.lock().unwrap();
                 let fp = offered[0]["snapshot_fingerprint"].as_str().unwrap();
-                assert!(
-                    !saved.accepted_snapshot_fingerprint_recorded(fp),
-                    "unknown local ACK must not become a selected acceptance"
-                );
+                if cycle == 1 {
+                    assert!(
+                        !saved.accepted_snapshot_fingerprint_recorded(fp),
+                        "an uncertain local ACK must not become a selected acceptance"
+                    );
+                } else {
+                    let progress = SnapshotUploadProgress::load(
+                        &progress_path,
+                        &namespace,
+                        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+                    )
+                    .unwrap();
+                    assert!(
+                        progress.accepted_fingerprints.contains(fp)
+                            || saved.accepted_snapshot_fingerprint_recorded(fp),
+                        "the saved covering replay proof must survive into a durable carrier"
+                    );
+                }
             } else if ack_save_fault && cycle == 3 {
                 assert!(
                     result.is_ok(),
@@ -3667,7 +3681,16 @@ fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
-    let hold = &progress.quarantined_fingerprints[&entity.fingerprint];
+    let saved = control.saved();
+    let hold = progress
+        .quarantined_fingerprints
+        .get(&entity.fingerprint)
+        .or_else(|| {
+            saved
+                .quarantined_snapshot_fingerprints
+                .get(&entity.fingerprint)
+        })
+        .expect("the independent skew hold survives in progress or selected custody");
     assert_eq!(hold.version_skew_attempts, 3);
     assert_eq!(hold.retry_after_unix_seconds, now + 300 + 7200);
     assert!(!progress.accepted_fingerprints.contains(&entity.fingerprint));
@@ -3715,7 +3738,12 @@ fn p2a_unknown_partial_200_records_only_covering_siblings() {
     control.restart();
     *control.server.outcome.lock().unwrap() = FinishOutcome::PartialConflict;
     let _clock = money::PageClockForTest::new(&control.support, now + 300);
-    control.cycle();
+    let _reset = P2aConflictReset;
+    P2A_INDEX_CONFLICT.with(|state| *state.borrow_mut() = Some(control.index_path.clone()));
+    assert!(
+        control.cycle_result().is_err(),
+        "partial proof is durable before the failed selected save"
+    );
     let posts = control.server.raw_batches.lock().unwrap();
     assert_eq!(posts.len(), 2);
     assert_eq!(

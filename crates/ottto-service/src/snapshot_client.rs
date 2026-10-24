@@ -255,12 +255,16 @@ pub const MAX_HONOURED_RETRY_AFTER: Duration = Duration::from_secs(30 * 60);
 /// or absent value returns `None`, which the caller turns into its own jittered
 /// backoff rather than retrying immediately.
 pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Duration> {
+    parse_retry_after_with_cap(value, now, MAX_HONOURED_RETRY_AFTER)
+}
+
+fn parse_retry_after_with_cap(value: &str, now: OffsetDateTime, cap: Duration) -> Option<Duration> {
     let value = value.trim();
     if value.is_empty() {
         return None;
     }
     if let Ok(seconds) = value.parse::<u64>() {
-        return Some(Duration::from_secs(seconds).min(MAX_HONOURED_RETRY_AFTER));
+        return Some(Duration::from_secs(seconds).min(cap));
     }
     // IMF-fixdate, the only date form HTTP requires a client to produce and the
     // one every proxy in this path emits. RFC 2822 parsing covers it; the
@@ -276,17 +280,17 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
     if delta.is_negative() {
         return Some(Duration::ZERO);
     }
-    Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
+    Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(cap))
 }
 
 /// Bytes of a shed body read to recognize its code. The backend's error
 /// envelope is a few hundred bytes; a longer body is not recognized.
 const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
 
-fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+fn shed_from_response(status: u16, response: ureq::Response, retry_cap: Duration) -> UploadShed {
     let retry_after = response
         .header("Retry-After")
-        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
+        .and_then(|value| parse_retry_after_with_cap(value, OffsetDateTime::now_utc(), retry_cap));
     let mut excerpt = Vec::new();
     let code = response
         .into_reader()
@@ -2182,7 +2186,15 @@ impl SnapshotApiClient {
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
                 let server_request_id = response.header("X-Request-ID").map(str::to_string);
-                let shed = shed_from_response(code, response);
+                let shed = shed_from_response(
+                    code,
+                    response,
+                    if retained.is_some() {
+                        Duration::from_secs(24 * 3600)
+                    } else {
+                        MAX_HONOURED_RETRY_AFTER
+                    },
+                );
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,

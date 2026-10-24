@@ -134,6 +134,7 @@ fn bootstrap_cache_heads(
         progress,
         ordinary_bootstrap,
         &mut InplaceRetryBudget::default(),
+        None,
         upload,
         persist,
     )
@@ -142,12 +143,14 @@ fn bootstrap_cache_heads(
 /// Bootstrap only through existing ordinary authority followed by an exact
 /// CAS repeat. Both settlements share the normal atomic ACK progress seam and
 /// the source page's in-place resend budget.
+#[allow(clippy::too_many_arguments)]
 fn bootstrap_cache_heads_with_budget(
     probes: &[SnapshotItem],
     poison_scope: &str,
     progress: &mut SnapshotUploadProgress,
     ordinary_bootstrap: bool,
     inplace_retry: &mut InplaceRetryBudget,
+    retained_bodies: Option<&BTreeMap<String, String>>,
     mut upload: impl FnMut(
         Vec<SnapshotItem>,
         bool,
@@ -187,6 +190,7 @@ fn bootstrap_cache_heads_with_budget(
                 |item| Some(item.source_session_id.as_str()),
                 |_| false,
                 inplace_retry,
+                retained_bodies,
                 |items| upload(items, enforce_head_cas),
                 |progress| persist(progress),
             )?;
@@ -6481,7 +6485,19 @@ async fn finish_sync_source_resume(
     // files continue changing. Drop quarantine revisions no longer represented
     // by the authoritative current index before any early upload error can
     // preserve them forever.
-    let current_fingerprints = index.current_snapshot_fingerprints();
+    let retained_progress = if source_money_resume(source, support_dir) && recovery_prepared {
+        Some(unknown_recovery::retained_progress_bodies(
+            support_dir,
+            &upload_progress,
+        )?)
+    } else {
+        None
+    };
+    let retained_bodies = retained_progress.as_ref().map(|(bodies, _funds)| bodies);
+    let mut current_fingerprints = index.current_snapshot_fingerprints();
+    if let Some(bodies) = retained_bodies {
+        current_fingerprints.extend(bodies.keys().cloned());
+    }
     if upload_progress.retain_current_quarantines_with_diagnostics(
         &current_fingerprints,
         scan_result.local_codex_diagnostics.as_mut(),
@@ -6711,6 +6727,7 @@ async fn finish_sync_source_resume(
                 &mut upload_progress,
                 ordinary_bootstrap,
                 &mut inplace_retry,
+                retained_bodies,
                 |snapshots, enforce_head_cas| {
                     let request = SnapshotBatchRequest {
                         schema_version: SNAPSHOT_SCHEMA_VERSION,
@@ -6817,6 +6834,7 @@ async fn finish_sync_source_resume(
             |snapshot| Some(snapshot.source_session_id.as_str()),
             |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
             &mut inplace_retry,
+            retained_bodies,
             |snapshots| {
                 // A first Codex/Claude scan can spend several minutes parsing local
                 // history and retroactive backfill before the first upload. Relay
@@ -9407,6 +9425,7 @@ where
         |_| None,
         |_| false,
         &mut InplaceRetryBudget::default(),
+        None,
         upload,
         persist,
     )
@@ -9712,6 +9731,7 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     session_id: SessionId,
     batch_class: BatchClass,
     inplace_retry: &mut InplaceRetryBudget,
+    retained_bodies: Option<&BTreeMap<String, String>>,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -9739,6 +9759,13 @@ where
             return Err(anyhow::Error::new(SnapshotLocalStateRejected {
                 operation: "resolve conflicting snapshot body witnesses",
             }));
+        }
+    }
+    if let Some(retained) = retained_bodies {
+        for (fp, witness) in retained {
+            current_body_witnesses
+                .entry(fp.clone())
+                .or_insert_with(|| witness.clone());
         }
     }
     let current_fingerprints = current_body_witnesses
@@ -17222,6 +17249,7 @@ mod tests {
             |_| None,
             |item| reconcile_class.contains(item),
             &mut InplaceRetryBudget::default(),
+            None,
             |batch| {
                 let is_reconcile = batch
                     .iter()

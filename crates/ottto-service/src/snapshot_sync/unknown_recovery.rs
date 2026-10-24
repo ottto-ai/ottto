@@ -829,6 +829,38 @@ pub(super) fn due(support: &Path, now: u64) -> Result<(Vec<Manifest>, money::Sha
     ))
 }
 
+/// Retained exact outcomes remain current until their selected-state handoff.
+/// This supplies identities only; proof/hold state must already exist durably.
+pub(super) fn retained_progress_bodies(
+    support: &Path,
+    progress: &SnapshotUploadProgress,
+) -> Result<(BTreeMap<String, String>, money::ShadowReservation)> {
+    let catalogs = CATALOGS.lock().map_err(|_| fault())?;
+    let catalog = catalogs.get(support).ok_or_else(fault)?;
+    let count = catalog
+        .entries
+        .iter()
+        .map(|m| m.entities.len())
+        .sum::<usize>();
+    // Funds cover this bounded map, the driver's copies and the current-index
+    // identity set. No historical ACK map is cloned or added to this scope.
+    let funds = money::ShadowReservation::admit(count.saturating_mul(1024)).ok_or_else(fault)?;
+    let mut bodies = BTreeMap::new();
+    for e in catalog.entries.iter().flat_map(|m| &m.entities) {
+        if progress.accepted_body_witnesses.get(&e.fingerprint) == Some(&e.witness)
+            || progress
+                .quarantined_fingerprints
+                .get(&e.fingerprint)
+                .is_some_and(|record| {
+                    record.upload_body_witness.as_deref() == Some(e.witness.as_str())
+                })
+        {
+            bodies.insert(e.fingerprint.clone(), e.witness.clone());
+        }
+    }
+    Ok((bodies, funds))
+}
+
 pub(super) fn capture_ticket(
     support: &Path,
     m: Manifest,
