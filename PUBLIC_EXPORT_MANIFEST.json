@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 840,
-  "content_sha256": "40777f166cf38d5ecbade0cd2a312faf53ce030a0e0a461ab3d4e4805f7b9161",
+  "content_sha256": "db3d4224c47150eb49b2b7b14b96b634fe6d9352cbd4a226d4899e0c2217e174",
   "files": [
     {
       "executable": false,
@@ -1791,8 +1791,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/rebuild_bound.rs",
-      "sha256": "f5d94977bd28390bb10acf917d8dca1e141d3322259b5859463165061a4e5015",
-      "size_bytes": 30240
+      "sha256": "847b07d0400f092e620d3760d398ff273f9e56c2c9f29bdb166a5e4840ec268c",
+      "size_bytes": 30623
     },
     {
       "executable": false,
@@ -5883,7 +5883,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T08:16:49+00:00",
+  "generated_at": "2026-10-24T10:21:44+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 841,
   "public_roots": [
@@ -5922,5 +5922,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "a4654f40932419a19281a9aec26bf3d4b073711c"
+  "source_commit": "1b2b411cfa06c23353ab6a5aeef153532d4ec076"
 }
