@@ -5451,7 +5451,7 @@ fn prepare_sync_source(
     }
     if source_money_resume(source, support_dir)
         || source == SnapshotSource::ClaudeCode
-            && unknown_recovery::unfinished_custody(support_dir)?
+            && unknown_recovery::existing_recovery_state(support_dir)?
     {
         let binding = unknown_recovery::binding(
             &snapshot_upload_destination_namespace(device, device_secret),

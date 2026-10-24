@@ -157,9 +157,9 @@ fn dir(support: &Path) -> PathBuf {
 }
 
 /// OFF cannot strand a previously authorized payload past its privacy bound.
-/// Probe only filenames in this bounded private directory; receipts/status
-/// alone never hydrate live custody or the money ledger on the OFF path.
-pub(super) fn unfinished_custody(support: &Path) -> Result<bool> {
+/// Probe only filenames in this bounded private directory. Status alone does
+/// not hydrate custody; count-only receipts still need their daily TTL pass.
+pub(super) fn existing_recovery_state(support: &Path) -> Result<bool> {
     let entries = match fs::read_dir(dir(support)) {
         Ok(entries) => entries,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(false),
@@ -172,7 +172,10 @@ pub(super) fn unfinished_custody(support: &Path) -> Result<bool> {
         let name = entry.map_err(|_| fault())?.file_name();
         let name = name.to_str().ok_or_else(fault)?;
         if name.split_once('.').is_some_and(|(_, extension)| {
-            matches!(extension, "json" | "body" | "json.tmp" | "body.tmp")
+            matches!(
+                extension,
+                "json" | "body" | "json.tmp" | "body.tmp" | "receipt"
+            )
         }) {
             return Ok(true);
         }
@@ -488,6 +491,14 @@ fn prune_receipts(root: &Path, now: u64, reserved: usize) -> Result<()> {
     }
     Ok(())
 }
+fn load_for_startup(root: &Path, now: u64) -> Result<Vec<Manifest>> {
+    let entries = load(root)?;
+    if root.exists() {
+        prune_receipts(root, now, unwritten_receipts(root, &entries))?;
+        publish_status(root, now, entries.len())?;
+    }
+    Ok(entries)
+}
 fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     let root = dir(&support);
     private_dir(&root)?;
@@ -582,14 +593,14 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
         Err(error) => return Err(error.into()),
     }
     sync_dir(&root)?;
-    publish_status(&root, now)?;
+    publish_status(&root, now, load(&root)?.len())?;
     if reason != Reason::Resolved {
         crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
     }
     Ok(())
 }
 
-fn publish_status(root: &Path, now: u64) -> Result<()> {
+fn publish_status(root: &Path, now: u64, active_batches: usize) -> Result<()> {
     let mut unresolved = 0_u64;
     for entry in fs::read_dir(root)? {
         let file = entry?.path();
@@ -599,7 +610,7 @@ fn publish_status(root: &Path, now: u64) -> Result<()> {
         }
     }
     let status = serde_json::json!({"unknown_outcome_unresolved":unresolved,
-        "active_batches":load(root)?.len(), "time_day":now / 86400});
+        "active_batches":active_batches, "time_day":now / 86400});
     atomic(root, &root.join("status"), &serde_json::to_vec(&status)?)?;
     Ok(())
 }
@@ -666,6 +677,7 @@ struct Catalog {
     funds: Vec<money::ShadowReservation>,
     entries: Vec<Manifest>,
     loading: Option<Ticket<Vec<Manifest>>>,
+    maintenance_day: Option<u64>,
 }
 static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new());
 
@@ -737,7 +749,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
     if !catalogs.contains_key(support) {
         let root = dir(support);
-        let ticket = job(move || load(&root))?;
+        let ticket = job(move || load_for_startup(&root, now))?;
         catalogs.insert(
             support.to_path_buf(),
             Catalog {
@@ -746,10 +758,17 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 funds: Vec::new(),
                 entries: Vec::new(),
                 loading: Some(ticket),
+                maintenance_day: Some(now / 86400),
             },
         );
     }
     let catalog = catalogs.get_mut(support).unwrap();
+    if catalog.loading.is_none() && catalog.maintenance_day != Some(now / 86400) {
+        let root = dir(support);
+        catalog.loading = Some(job(move || load_for_startup(&root, now))?);
+        catalog.maintenance_day = Some(now / 86400);
+        return Ok(false);
+    }
     if let Some(ticket) = &catalog.loading {
         let Some(entries) = ticket.take()? else {
             return Ok(false);
@@ -2245,6 +2264,38 @@ mod tests {
         prune_receipts(&root, (receipts[0].time_day + 35) * 86400, 0).unwrap();
         assert!(!root.join("receipt-0000.receipt").exists());
         assert!(!root.join("receipt-0001.receipt").exists());
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn receipt_ttl_runs_on_a_quiet_warm_startup_without_new_offers() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-unknown-quiet-ttl");
+        let (m, body) = specimen(1000);
+        let m = capture(scratch.to_path_buf(), m, &body).unwrap();
+        let receipt_at = m.deadline;
+        terminal(
+            scratch.to_path_buf(),
+            m.clone(),
+            Reason::Expired,
+            receipt_at,
+        )
+        .unwrap();
+        assert!(existing_recovery_state(&scratch).unwrap());
+        startup_ready(&scratch, &m.binding, receipt_at + 1);
+        let receipt = dir(&scratch).join("receipt-0000.receipt");
+        assert!(receipt.exists());
+        // Keep the same initialized catalog; changing day must start a paid
+        // writer pass even when there are no active payloads or new offers.
+        let expired = (receipt_at / 86400 + RECEIPT_TTL / 86400) * 86400;
+        startup_ready(&scratch, &m.binding, expired);
+        assert!(!receipt.exists());
+        let status: serde_json::Value =
+            serde_json::from_slice(&fs::read(dir(&scratch).join("status")).unwrap()).unwrap();
+        assert_eq!(status["unknown_outcome_unresolved"], 0);
+        assert_eq!(status["active_batches"], 0);
+        assert!(!existing_recovery_state(&scratch).unwrap());
+        forget(&scratch);
+        money::store::forget_for_test(&scratch);
     }
 
     #[test]
