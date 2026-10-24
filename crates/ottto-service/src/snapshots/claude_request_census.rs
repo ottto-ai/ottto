@@ -935,8 +935,10 @@ impl SafetyIncomplete {
         }
     }
     fn mark_overflow(&mut self, cause: SafetyIncompleteOverflowCause) {
+        // An older sticky marker already has the fallback malformed cause;
+        // a later decode loss must not replace that first cause on save.
+        self.overflow_cause = Some(self.overflow_cause().unwrap_or(cause));
         self.overflow = true;
-        self.overflow_cause.get_or_insert(cause);
     }
     fn overflow_cause(&self) -> Option<SafetyIncompleteOverflowCause> {
         self.overflow.then(|| {
@@ -5662,6 +5664,36 @@ mod phase_b_tests {
                     .claude_request_census
                     .safety_incomplete
                     .incomplete());
+            }
+            // Old-format sticky overflow has an implicit malformed-marker
+            // cause. A later bad record cannot relabel its first cause.
+            value["claude_request_census_shadow"] = serde_json::json!({"s": {
+                "derivation": CLAUDE_REQUEST_CENSUS_DERIVATION,
+                "keys": [], "since": 7, "overflow": true, "reclaimed": 0
+            }});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            for mut loaded in [
+                decode_index(bytes.as_slice()).unwrap(),
+                decode_bounded_index(&bytes).unwrap(),
+            ] {
+                assert!(loaded.claude_request_census.decode_lost);
+                assert_eq!(
+                    loaded
+                        .claude_request_census
+                        .safety_incomplete
+                        .overflow_cause(),
+                    Some(MalformedMarker)
+                );
+                prepare_safety_checkpoint(&mut loaded);
+                let bytes = serde_json::to_vec(&loaded).unwrap();
+                let restarted = decode_index(bytes.as_slice()).unwrap();
+                assert_eq!(
+                    restarted
+                        .claude_request_census
+                        .safety_incomplete
+                        .overflow_cause(),
+                    Some(MalformedMarker)
+                );
             }
             let mut marker = SafetyIncomplete::default();
             for key in 0..=MAX_RECLAIMED_KEYS {
