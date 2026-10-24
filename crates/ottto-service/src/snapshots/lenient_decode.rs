@@ -1775,13 +1775,6 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
                         }
-                        "accepted_rebuild_incidence" => {
-                            if value.len > CARRIED_ACK_BYTES_MAX as u64 {
-                                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
-                            }
-                            index.accepted_rebuild_incidence = self.typed(value)?;
-                            index.admit_carried_ack_debt()?;
-                        }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }
                     self.hold(field, key, key_span, value)?;
