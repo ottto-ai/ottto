@@ -454,6 +454,341 @@ fn unreadable_member_directory_holds_its_root() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// One synthetic usage line for subagent `agent` of family `family`.
+fn subagent_line(family: &str, agent: &str) -> String {
+    format!(
+        "{}\n",
+        json!({
+            "timestamp": "2026-08-23T18:20:00Z",
+            "type": "assistant",
+            "sessionId": family,
+            "agentId": agent,
+            "isSidechain": true,
+            "requestId": format!("request-{family}-{agent}"),
+            "message": {
+                "id": format!("message-{family}-{agent}"),
+                "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}
+            }
+        })
+    )
+}
+
+/// A family `<project>/<family>/subagents/<stem>.jsonl` for each stem, with
+/// no root file unless `with_root`. Returns the project dir and each file's
+/// candidate, by stem (the root's under `""`).
+fn family_on_disk(
+    project: &Path,
+    family: &str,
+    stems: &[&str],
+    with_root: bool,
+) -> BTreeMap<String, CandidateFile> {
+    let candidate = |path: PathBuf| CandidateFile {
+        scan_root: project.to_path_buf(),
+        source_file_fingerprint: path.display().to_string(),
+        path,
+        size_bytes: 1,
+        modified_unix_seconds: 0,
+        modified_unix_nanos: 0,
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    };
+    let subagents = project.join(family).join("subagents");
+    fs::create_dir_all(&subagents).unwrap();
+    let mut candidates = BTreeMap::new();
+    for stem in stems {
+        let path = subagents.join(format!("{stem}.jsonl"));
+        fs::write(&path, subagent_line(family, stem)).unwrap();
+        candidates.insert((*stem).to_owned(), candidate(path));
+    }
+    if with_root {
+        let path = project.join(format!("{family}.jsonl"));
+        fs::write(&path, subagent_line(family, "root")).unwrap();
+        candidates.insert(String::new(), candidate(path));
+    }
+    candidates
+}
+
+/// A fresh index with prior history on this Mac and `list` installed: every
+/// new file born before the cutoff is owed history.
+fn fresh_with_list(name: &str, list: &str) -> (crate::test_scratch::ScratchDir, ScanIndex) {
+    let support = support(name);
+    fs::write(ReemissionExclusions::path(&support), list).unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    fresh.activate_effective_upload_body_witness_revision(2);
+    fresh.adopt_effective_upload_body_witness_revision_monotonically();
+    fresh.load_claude_reemission_exclusions(&support);
+    assert_eq!(
+        fresh.claude_reemission_exclusions.state(),
+        ListState::Installed
+    );
+    (support, fresh)
+}
+
+fn decide(index: &mut ScanIndex, candidate: &CandidateFile) -> HistoryDecision {
+    index.claude_history_upgrade_decision(candidate, Some(0), &mut HistoryPage::default())
+}
+
+/// Move a directory's modification time an hour back, as a family whose
+/// members were all written before this pass.
+fn age_directory(directory: &Path) {
+    fs::File::open(directory)
+        .unwrap()
+        .set_modified(SystemTime::now() - std::time::Duration::from_secs(3_600))
+        .unwrap();
+}
+
+/// StateMissing M1, a family with no root file: the list names only
+/// `R_agent-a`, and the fresh index has not seen agent-a. Its sibling agent-b
+/// is held whichever member is decided first, the root is listed, and an
+/// unlisted rootless family is not held. Before the fix, agent-b was decided
+/// as unlisted (`Owed`) in both orders.
+#[test]
+fn listed_member_holds_its_sibling_when_the_root_file_is_absent() {
+    for order in [["agent-b", "agent-a"], ["agent-a", "agent-b"]] {
+        let home = crate::test_scratch::unique_path("ottto-history-gate-rootless");
+        let project = home.join("project");
+        let family = session(1);
+        let members = family_on_disk(&project, &family, &["agent-a", "agent-b"], false);
+        let other = family_on_disk(&project, &session(2), &["agent-c"], false);
+        let (_support, mut fresh) = fresh_with_list(
+            "history-gate-rootless-support",
+            &format!("{}\n", digest(&format!("{family}_agent-a"))),
+        );
+        for stem in order {
+            assert_eq!(
+                decide(&mut fresh, &members[stem]),
+                HistoryDecision::Held(HistoryHold::Listed),
+                "{stem} in order {order:?}"
+            );
+        }
+        assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
+        assert_ne!(
+            decide(&mut fresh, &other["agent-c"]),
+            HistoryDecision::Held(HistoryHold::Listed),
+            "an unlisted rootless family is not held"
+        );
+        assert!(!fresh
+            .claude_reemission_exclusions
+            .excludes(&session(2), None));
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
+/// The same family through the whole scan: no root file, the listed member
+/// between two siblings in traversal order. No body of the listed family is
+/// emitted; the unlisted rootless family still emits.
+#[test]
+fn rootless_listed_family_emits_no_sibling_through_the_scan() {
+    let (home, root, index) = families("history-gate-rootless-scan", 2);
+    let listed = listed_member(&index, &session(1));
+    for slot in 0..2 {
+        let family = session(slot);
+        fs::remove_file(root.join(format!("{family}.jsonl"))).unwrap();
+        for agent in ["agent-0", "agent-z"] {
+            fs::write(
+                root.join(&family)
+                    .join("subagents")
+                    .join(format!("{agent}.jsonl")),
+                subagent_line(&family, agent),
+            )
+            .unwrap();
+        }
+    }
+    let support = support("history-gate-rootless-scan-support");
+    fs::write(
+        ReemissionExclusions::path(&support),
+        format!("{}\n", digest(&listed)),
+    )
+    .unwrap();
+    let mut fresh = ScanIndex::default();
+    fresh.note_claude_history_cutoff(PriorHistory::Here, false, true);
+    fresh.load_claude_reemission_exclusions(&support);
+    let mut result = scan(&root, &mut fresh, "ctx-1", 2);
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut fresh);
+    let emitted = result
+        .snapshots
+        .iter()
+        .map(|item| item.source_session_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        emitted.iter().all(|id| !id.starts_with(&session(1))),
+        "{emitted:?}"
+    );
+    assert!(
+        emitted.iter().any(|id| id.starts_with(&session(0))),
+        "the unlisted family upgrades: {emitted:?}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// With the root file present and a member listed, the root and every
+/// member are held as before, and the family is walked once.
+#[test]
+fn listed_member_with_its_root_present_holds_the_whole_family() {
+    let home = crate::test_scratch::unique_path("ottto-history-gate-rooted");
+    let project = home.join("project");
+    let family = session(1);
+    let members = family_on_disk(&project, &family, &["agent-a", "agent-b"], true);
+    let (_support, mut fresh) = fresh_with_list(
+        "history-gate-rooted-support",
+        &format!("{}\n", digest(&format!("{family}_agent-a"))),
+    );
+    let walks = claude_reemission_member_walks_for_test();
+    for stem in ["", "agent-b", "agent-a"] {
+        assert_eq!(
+            decide(&mut fresh, &members[stem]),
+            HistoryDecision::Held(HistoryHold::Listed),
+            "{stem:?}"
+        );
+    }
+    assert_eq!(claude_reemission_member_walks_for_test() - walks, 1);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A rootless family whose member walk cannot finish holds its root: an
+/// unreadable nested directory (it may hold the listed member), or more
+/// entries than the walk's bound.
+#[test]
+fn rootless_family_walk_that_cannot_finish_holds_the_root() {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let home = crate::test_scratch::unique_path("ottto-history-gate-rootless-unreadable");
+        let project = home.join("project");
+        let family = session(1);
+        let members = family_on_disk(&project, &family, &["agent-b"], false);
+        let nested = project.join(&family).join("subagents").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(
+            nested.join("agent-a.jsonl"),
+            subagent_line(&family, "agent-a"),
+        )
+        .unwrap();
+        let (_support, mut fresh) = fresh_with_list(
+            "history-gate-rootless-unreadable-support",
+            &format!("{}\n", digest(&format!("{family}_agent-a"))),
+        );
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o000)).unwrap();
+        let decision = decide(&mut fresh, &members["agent-b"]);
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(decision, HistoryDecision::Held(HistoryHold::Listed));
+        assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
+        let _ = fs::remove_dir_all(home);
+    }
+
+    let home = crate::test_scratch::unique_path("ottto-history-gate-rootless-bound");
+    let project = home.join("project");
+    let family = session(1);
+    let members = family_on_disk(&project, &family, &["agent-b"], false);
+    let subagents = project.join(&family).join("subagents");
+    for slot in 0..4_096 {
+        fs::write(subagents.join(format!("pad-{slot}")), "").unwrap();
+    }
+    // Nothing on disk is listed: only the bound holds the root.
+    let (_support, mut fresh) = fresh_with_list(
+        "history-gate-rootless-bound-support",
+        &format!("{}\n", digest(&format!("{family}_agent-absent"))),
+    );
+    assert_eq!(
+        decide(&mut fresh, &members["agent-b"]),
+        HistoryDecision::Held(HistoryHold::Listed)
+    );
+    assert!(fresh.claude_reemission_exclusions.excludes(&family, None));
+    let _ = fs::remove_dir_all(home);
+}
+
+/// An installed list with no line (most Macs) walks no member directory.
+#[test]
+fn empty_list_walks_no_member_directory() {
+    let home = crate::test_scratch::unique_path("ottto-history-gate-empty-walk");
+    let project = home.join("project");
+    let members = family_on_disk(&project, &session(1), &["agent-a", "agent-b"], true);
+    let (_support, mut fresh) = fresh_with_list("history-gate-empty-walk-support", "# none\n");
+    let walks = claude_reemission_member_walks_for_test();
+    for candidate in members.values() {
+        assert_ne!(
+            decide(&mut fresh, candidate),
+            HistoryDecision::Held(HistoryHold::Listed)
+        );
+    }
+    assert_eq!(claude_reemission_member_walks_for_test(), walks);
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A big unlisted family is walked once per pass, not once per member. A
+/// member created after the walk changes the directory's stamp, so the next
+/// sibling walks again and is held when that member is listed; a new pass
+/// walks again.
+#[test]
+fn member_walk_is_remembered_per_pass_until_the_directory_changes() {
+    let home = crate::test_scratch::unique_path("ottto-history-gate-walk-memo");
+    let project = home.join("project");
+    let family = session(1);
+    let stems = (0..32)
+        .map(|slot| format!("agent-{slot:02}"))
+        .collect::<Vec<_>>();
+    let members = family_on_disk(
+        &project,
+        &family,
+        &stems.iter().map(String::as_str).collect::<Vec<_>>(),
+        false,
+    );
+    let subagents = project.join(&family).join("subagents");
+    age_directory(&subagents);
+    let (_support, mut fresh) = fresh_with_list(
+        "history-gate-walk-memo-support",
+        &format!("{}\n", digest(&format!("{family}_agent-late"))),
+    );
+    let walks = claude_reemission_member_walks_for_test();
+    for candidate in members.values() {
+        assert_ne!(
+            decide(&mut fresh, candidate),
+            HistoryDecision::Held(HistoryHold::Listed)
+        );
+    }
+    assert_eq!(
+        claude_reemission_member_walks_for_test() - walks,
+        1,
+        "one walk for the whole family this pass"
+    );
+
+    // The listed member appears mid-pass: the memo cannot hide it.
+    fs::write(
+        subagents.join("agent-late.jsonl"),
+        subagent_line(&family, "agent-late"),
+    )
+    .unwrap();
+    assert_eq!(
+        decide(&mut fresh, &members["agent-00"]),
+        HistoryDecision::Held(HistoryHold::Listed)
+    );
+    assert_eq!(claude_reemission_member_walks_for_test() - walks, 2);
+
+    // A new pass forgets the walks of the last one.
+    fs::remove_file(subagents.join("agent-late.jsonl")).unwrap();
+    age_directory(&subagents);
+    let (_support, mut next) = fresh_with_list(
+        "history-gate-walk-memo-next-support",
+        &format!("{}\n", digest(&format!("{family}_agent-late"))),
+    );
+    for _ in 0..2 {
+        next.activate_effective_upload_body_witness_revision(2);
+        next.adopt_effective_upload_body_witness_revision_monotonically();
+        for stem in ["agent-01", "agent-02"] {
+            decide(&mut next, &members[stem]);
+        }
+    }
+    assert_eq!(
+        claude_reemission_member_walks_for_test() - walks,
+        4,
+        "one walk in each of two passes"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 /// StateMissing M2: a listed (held) family member owed only a proof
 /// correction is not re-read every traversal: it is skipped like any held
 /// adoption, and its correction is deferred to the history gate (disclosed)
