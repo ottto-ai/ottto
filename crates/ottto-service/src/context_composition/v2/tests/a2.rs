@@ -1163,6 +1163,9 @@ fn run_health_token_caps_an_oversized_response_without_retry() {
         while Instant::now() < until {
             if let Ok((mut socket, _)) = listener.accept() {
                 seen += 1;
+                // Darwin inherits the listener's nonblocking mode. The cap
+                // fixture must wait for the request under its existing timeout.
+                socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(1)))
                     .unwrap();
