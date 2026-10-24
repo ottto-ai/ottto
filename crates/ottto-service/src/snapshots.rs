@@ -36910,12 +36910,13 @@ impl ScanIndex {
         if !claude_request_money::request_owned_live(support) {
             return;
         }
+        let held = crate::snapshot_sync::unknown_recovery::held_roots(support, self);
         for snapshot in snapshots {
-            if !crate::snapshot_sync::unknown_recovery::blocked_file(
-                support,
-                "",
-                Some(claude_snapshot_family_root_ref(snapshot)),
-            ) {
+            if held.as_ref().is_some_and(|roots| {
+                !roots
+                    .roots
+                    .contains(claude_snapshot_family_root_ref(snapshot))
+            }) {
                 continue;
             }
             let Some(source) = snapshot.source_file_fingerprint.as_ref() else {

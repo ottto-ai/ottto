@@ -58,6 +58,8 @@ pub(super) struct Manifest {
     pub binding: String,
     pub context: String,
     pub policy: [u8; 32],
+    #[serde(default)]
+    pub scope: money::recovery_scope::Scope,
     pub created: u64,
     pub deadline: u64,
     /// Includes the original physical POST; 1 + at most three replays.
@@ -352,6 +354,10 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         || m.deadline != m.created.saturating_add(DEADLINE)
         || m.receipt_slot
             .is_some_and(|slot| usize::from(slot) >= RECEIPT_MAX)
+        || !m.scope.valid()
+        || m.entities
+            .iter()
+            .any(|e| !m.scope.roots.contains_key(&e.root))
         || m.entities.is_empty()
         || m.entities.len() > SNAPSHOT_BATCH_LIMIT
         || m.entities.iter().any(|e| {
@@ -420,6 +426,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             binding: "00".repeat(32),
             context: String::new(),
             policy: [0; 32],
+            scope: money::recovery_scope::Scope::default(),
             created: 0,
             deadline: DEADLINE,
             posts: 1,
@@ -803,6 +810,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                     binding: "00".repeat(32),
                     context: String::new(),
                     policy: [0; 32],
+                    scope: money::recovery_scope::Scope::default(),
                     created: now,
                     deadline: now.saturating_add(DEADLINE),
                     posts: 1,
@@ -908,11 +916,40 @@ pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> boo
     catalog.loading.is_some()
         || catalog.entries.iter().any(|m| {
             !m.ack_saved
-                && m.entities
-                    .iter()
-                    .any(|e| e.files.iter().any(|f| f == key) || root == Some(e.root.as_str()))
+                && (root.is_some_and(|r| m.scope.roots.contains_key(r))
+                    || m.entities.iter().any(|e| e.files.iter().any(|f| f == key)))
         })
 }
+/// Close each unresolved component against current evidence once for the page.
+/// None is an honest bounded-admission failure, never a partial allowlist.
+pub(crate) struct HeldRoots {
+    pub roots: BTreeSet<String>,
+    _funds: money::ShadowReservation,
+}
+pub(crate) fn held_roots(support: &Path, index: &ScanIndex) -> Option<HeldRoots> {
+    let catalogs = CATALOGS.lock().ok()?;
+    let Some(catalog) = catalogs.get(support) else {
+        return Some(HeldRoots {
+            roots: BTreeSet::new(),
+            _funds: money::ShadowReservation::admit(0)?,
+        });
+    };
+    if catalog.loading.is_some() || catalog.fault {
+        return None;
+    }
+    let count = catalog.entries.iter().filter(|m| !m.ack_saved).count();
+    let funds = money::ShadowReservation::admit(4 * count * MANIFEST_MAX)?;
+    let mut roots = BTreeSet::new();
+    for m in catalog.entries.iter().filter(|m| !m.ack_saved) {
+        let scope = money::recovery_scope::close(support, index, &m.scope)?;
+        roots.extend(scope.roots.keys().cloned());
+    }
+    Some(HeldRoots {
+        roots,
+        _funds: funds,
+    })
+}
+
 pub(super) fn add(support: &Path, m: Manifest) -> Result<()> {
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
     let catalog = catalogs.get_mut(support).ok_or_else(fault)?;
@@ -1363,6 +1400,12 @@ pub(super) fn manifest(
                 == Some(money::REQUEST_OWNED_CONTRACT),
         });
     }
+    let scope = money::recovery_scope::close(
+        support,
+        index,
+        &money::recovery_scope::Scope::seed(entities.iter().map(|e| e.root.clone())),
+    )
+    .ok_or_else(fault)?;
     let now = now(support);
     let lineage = format!("{:x}", lineage.finalize());
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1386,6 +1429,7 @@ pub(super) fn manifest(
         binding,
         context: index.recovery_upload_context().to_owned(),
         policy,
+        scope: scope.scope,
         created: now,
         deadline: now.saturating_add(DEADLINE),
         posts: 1,
@@ -1464,11 +1508,12 @@ pub(super) fn initial_post(
             .is_some_and(|c| {
                 c.entries.iter().any(|old| {
                     !old.ack_saved
-                        && old.entities.iter().any(|e| {
-                            m.entities
-                                .iter()
-                                .any(|new| new.root == e.root || new.session == e.session)
-                        })
+                        && (old.scope.intersects(&m.scope)
+                            || old.entities.iter().any(|e| {
+                                m.entities
+                                    .iter()
+                                    .any(|new| new.root == e.root || new.session == e.session)
+                            }))
                 })
             })
         {
@@ -1481,9 +1526,10 @@ pub(super) fn initial_post(
         }
         if money::recovery_released(support, &m.lineage) {
             let roots = m
-                .entities
+                .scope
+                .roots
                 .iter()
-                .map(|e| (e.root.as_str(), e.files.as_slice()))
+                .map(|(root, files)| (root.as_str(), files.as_slice()))
                 .collect::<Vec<_>>();
             if m.entities.iter().any(|e| e.literal)
                 && (!index.initial_recovery_history_permitted(support, &roots)
@@ -1537,9 +1583,10 @@ pub(super) fn initial_post(
         .into());
     }
     let roots = m
-        .entities
+        .scope
+        .roots
         .iter()
-        .map(|e| (e.root.as_str(), e.files.as_slice()))
+        .map(|(root, files)| (root.as_str(), files.as_slice()))
         .collect::<Vec<_>>();
     if m.entities.iter().any(|e| e.literal)
         && (!index.initial_recovery_history_permitted(support, &roots)
@@ -1688,10 +1735,13 @@ pub(super) fn admitted(
     {
         return Ok(false);
     }
-    let roots = m
-        .entities
+    let Some(scope) = money::recovery_scope::close(support, index, &m.scope) else {
+        return Ok(false);
+    };
+    let roots = scope
+        .roots
         .iter()
-        .map(|e| (e.root.as_str(), e.files.as_slice()))
+        .map(|(root, files)| (root.as_str(), files.as_slice()))
         .collect::<Vec<_>>();
     if !index.recovery_history_permitted(support, &roots) {
         return Ok(false);
@@ -1958,6 +2008,15 @@ mod tests {
                 binding: "cd".repeat(32),
                 context: "context".into(),
                 policy: [0; 32],
+                scope: {
+                    let mut scope = money::recovery_scope::Scope::seed(["synthetic-root".into()]);
+                    scope
+                        .roots
+                        .get_mut("synthetic-root")
+                        .unwrap()
+                        .push("/fixture/file.jsonl".into());
+                    scope
+                },
                 created,
                 deadline: created + DEADLINE,
                 posts: 1,

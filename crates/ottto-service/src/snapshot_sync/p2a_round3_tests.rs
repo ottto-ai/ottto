@@ -3616,6 +3616,96 @@ fn p2a_unknown_new_filename_alias_cannot_escape_family_custody() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_restart() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for message_only in [false, true] {
+        let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        if message_only {
+            let original = std::fs::read_to_string(control.transcript()).unwrap();
+            let lines = original
+                .lines()
+                .map(|line| {
+                    let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                    row.as_object_mut().unwrap().remove("requestId");
+                    row.to_string() + "\n"
+                })
+                .collect::<String>();
+            std::fs::write(control.transcript(), lines).unwrap();
+        }
+        control.cycle_deferred();
+        assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+        let original = std::fs::read_to_string(control.transcript()).unwrap();
+        let dependent = "22222222-2222-4222-8222-222222222222";
+        let unrelated = "33333333-3333-4333-8333-333333333333";
+        let dependent_file = control
+            .transcript()
+            .with_file_name(format!("{dependent}.jsonl"));
+        std::fs::write(
+            &dependent_file,
+            original.replace(IDENTITY_PIPELINE_ROOT, dependent),
+        )
+        .unwrap();
+        std::fs::write(
+            control
+                .transcript()
+                .with_file_name(format!("{unrelated}.jsonl")),
+            original
+                .replace(IDENTITY_PIPELINE_ROOT, unrelated)
+                .replace("req_1", "independent-request-1")
+                .replace("req_2", "independent-request-2")
+                .replace("m1", "independent-message-1")
+                .replace("m2", "independent-message-2"),
+        )
+        .unwrap();
+        // The new family was absent from the original attempt. Restart must
+        // recover its R/M dependency from immutable private evidence.
+        control.restart();
+        *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+        drop(clock);
+        let _early = money::PageClockForTest::new(&control.support, now + 299);
+        control.cycle();
+        let posts = control.server.raw_batches.lock().unwrap().clone();
+        assert_eq!(
+            posts.len(),
+            2,
+            "only unrelated fresh work may POST; message_only={message_only}"
+        );
+        let batch: serde_json::Value = serde_json::from_str(&posts[1]).unwrap();
+        let items = batch["snapshots"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["source_session_id"], unrelated);
+        let saved = control.saved();
+        assert!(
+            saved
+                .files
+                .get(dependent_file.to_string_lossy().as_ref())
+                .is_some_and(|file| file.effective_upload_body_witness_revision != 3),
+            "a dependent family must retain its unstamped tuple"
+        );
+        assert!(unknown_recovery::active_for_test(&control.support)
+            .iter()
+            .any(|m| !m.ack_saved && m.posts == 1));
+        assert!(money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+        eprintln!("MONEY_UNKNOWN_DEPENDENCY message_only={message_only} restart=true dependent_post=false unrelated_post=true stamp_withheld=true");
+    }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_physical_three_replays_exhaustion_and_normal_return() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {

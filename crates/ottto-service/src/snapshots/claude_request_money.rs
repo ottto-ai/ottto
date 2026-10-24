@@ -66,6 +66,7 @@ pub(crate) mod custody;
 #[cfg(test)]
 pub(super) mod custody_tests;
 pub(crate) mod facts;
+pub(crate) mod recovery_scope;
 pub(crate) mod rows;
 pub(crate) mod store;
 

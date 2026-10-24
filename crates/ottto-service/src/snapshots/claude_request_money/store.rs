@@ -1717,6 +1717,18 @@ pub(super) fn has_offer(support: &Path, key: &str) -> bool {
     ledger.census.offer_count_for(key) > 0
 }
 
+// A bounded read of current evidence; never clone the historical custody map.
+pub(super) fn recovery_evidence<T>(
+    support: &Path,
+    read: impl FnOnce(&ClaudeLedger) -> T,
+) -> Option<T> {
+    let ledgers = LEDGERS.lock().ok()?;
+    let Slot::Ready(ledger) = ledgers.get(support)? else {
+        return None;
+    };
+    (!ledger.recovering()).then(|| read(ledger))
+}
+
 pub(super) fn recovery_offer(
     support: &Path,
     key: &str,
