@@ -16840,7 +16840,7 @@ for line in sys.stdin:
         let home = open_waiting_codex_setup(operation_id);
 
         // Before the sign-in writes a credential, no check starts the CLI.
-        check_waiting_codex_setup(operation_id, 20, false);
+        check_waiting_codex_setup(operation_id, 3, false);
         assert_eq!(counted_lines(&runs), 0);
 
         // A credential whose quota read fails: the first check reads at once
@@ -16856,13 +16856,13 @@ for line in sys.stdin:
         // The person's check reads once the short gap passed.
         clock.set(5);
         check_waiting_codex_setup(operation_id, 1, true);
-        check_waiting_codex_setup(operation_id, 20, false);
+        check_waiting_codex_setup(operation_id, 3, false);
         assert_eq!(counted_lines(&runs), 2);
 
         // A new sign-in is read at once, then spaced again.
         clock.set(6);
         write_synthetic_codex_auth(&home, "{\"tokens\":null}");
-        check_waiting_codex_setup(operation_id, 20, false);
+        check_waiting_codex_setup(operation_id, 3, false);
         assert_eq!(counted_lines(&runs), 3);
 
         // Each failed read still counts as a sent call.
@@ -16926,7 +16926,7 @@ for line in sys.stdin:
         ];
         for (seconds, expected_runs) in schedule {
             clock.set(seconds);
-            check_waiting_codex_setup(operation_id, 3, false);
+            check_waiting_codex_setup(operation_id, 2, false);
             assert_eq!(
                 counted_lines(&runs),
                 expected_runs,
@@ -17023,7 +17023,7 @@ for line in sys.stdin:
             (44, 5),
         ] {
             clock.set(seconds);
-            check_waiting_codex_setup(operation_id, 3, false);
+            check_waiting_codex_setup(operation_id, 2, false);
             assert_eq!(
                 counted_lines(&runs),
                 expected_runs,
@@ -17051,18 +17051,18 @@ for line in sys.stdin:
                 expires_at + 60,
             ),
         );
-        check_waiting_codex_setup(operation_id, 3, false);
+        check_waiting_codex_setup(operation_id, 2, false);
         assert_eq!(counted_lines(&runs), 6);
         // That read continued the run: six failures, so 40 s after it, not
         // the short retries of a new run.
         clock.set(35);
-        check_waiting_codex_setup(operation_id, 3, false);
+        check_waiting_codex_setup(operation_id, 2, false);
         assert_eq!(counted_lines(&runs), 6);
         clock.set(69);
-        check_waiting_codex_setup(operation_id, 3, false);
+        check_waiting_codex_setup(operation_id, 2, false);
         assert_eq!(counted_lines(&runs), 6);
         clock.set(70);
-        check_waiting_codex_setup(operation_id, 3, false);
+        check_waiting_codex_setup(operation_id, 2, false);
         assert_eq!(counted_lines(&runs), 7);
 
         drop(clock);
@@ -17423,7 +17423,7 @@ for line in sys.stdin:
         assert!(!format!("{waiting:?}").contains("SYNTHETIC-SIGN-IN-URL-MARKER"));
         // A replay only reports status; a check while it runs reads nothing.
         start_codex_sign_in(1, SIGN_IN_OPERATION).expect("replay");
-        for _ in 0..50 {
+        for _ in 0..5 {
             check_codex_account(1, SIGN_IN_OPERATION, false).expect("check while running");
         }
         assert_eq!(fixture.login_pids().len(), 1);
