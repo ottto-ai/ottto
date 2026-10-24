@@ -4777,21 +4777,11 @@ fn census_duplicate_rebuild_marker_without_its_guard_is_lost() {
                 assert_ne!(bound::marker(&index), 0, "{case}");
                 if lost {
                     assert!(bound::attempts(&index, &key).is_empty(), "{case}");
-                    assert_eq!(census_rebuild_alarms(&key, "guard_lost"), 1, "{case}");
-                    assert_eq!(
-                        census_rebuild_alarms(&key, "guard_state_closed"),
-                        cycle,
-                        "{case}"
-                    );
                 } else {
                     // The guard itself is intact; its one attempt stays.
                     assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
-                    assert_eq!(
-                        census_rebuild_alarms(&key, "guard_state_closed"),
-                        cycle + 1,
-                        "{case}"
-                    );
                 }
+                // The terminal emits the alarms the load queued.
                 assert_eq!(
                     census_exhausted_counter(&mut index),
                     // Each renewed duplicate of the untracked key is refused;
@@ -4799,6 +4789,20 @@ fn census_duplicate_rebuild_marker_without_its_guard_is_lost() {
                     if lost { cycle as u64 + 1 } else { 1 },
                     "{case}"
                 );
+                if lost {
+                    assert_eq!(census_rebuild_alarms(&key, "guard_lost"), 1, "{case}");
+                    assert_eq!(
+                        census_rebuild_alarms(&key, "guard_state_closed"),
+                        cycle,
+                        "{case}"
+                    );
+                } else {
+                    assert_eq!(
+                        census_rebuild_alarms(&key, "guard_state_closed"),
+                        cycle + 1,
+                        "{case}"
+                    );
+                }
                 persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
                 index.save(&path).unwrap();
                 let saved: serde_json::Value =
