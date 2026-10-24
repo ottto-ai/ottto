@@ -707,7 +707,7 @@ impl ClaudeResponseCapture {
     /// the capture is dropped instead (its funds are refunded).
     pub(crate) fn deposit(self, index_key: String, fingerprint: String) {
         let _timer = MoneyTimer::new(&self.scope, Instant::now());
-        if super::SHADOW_PANICKED.load(Ordering::Acquire) {
+        if super::SHADOW_PANICKED.load(Ordering::Acquire) || !spend_work(&self.scope, 0, 0) {
             return;
         }
         super::guarded(move || self.keep(index_key, fingerprint));

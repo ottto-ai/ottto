@@ -1531,7 +1531,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
+    println!("MONEY_P1B_FULL admitted_finalizer_probe=true reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
         armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, deadline_built, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
     money::disable_shadow_for_test(&fixture.support);
 }
@@ -1585,8 +1585,10 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
-/// Reaching an uncaptured family must not spend its capture turn. These
-/// small pages exercise the stable-sort tie that deadline-only tests miss.
+/// Reaching an uncaptured family must not spend its capture turn. Native
+/// Full byte parity is checked separately; real finalizers on prepared
+/// current input isolate turn fairness from native I/O consuming the wall
+/// window. Continue beyond initial coverage to expose equal-turn ties.
 #[test]
 #[serial(claude_request_money_shadow)]
 fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
@@ -1675,7 +1677,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             // captured roots alone cannot substitute for emitted bodies.
             assert_eq!(built, expected, "all {family_count} families must publish built bodies within {pages} Full pages");
         }
-        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
+        println!("MONEY_P1B_ROTATION admitted_finalizer_probe=true ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
         money::disable_shadow_for_test(&fixture.support);
     }
 }
