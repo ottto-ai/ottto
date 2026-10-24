@@ -1595,6 +1595,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
         money::set_page_fault_for_test(if ack_mode == "lag" { money::PageFault::LostAck } else { money::PageFault::None });
         let pages = family_count.div_ceil(money::capture::NEXT_PAGE_FAMILIES);
         let mut built = BTreeSet::new();
+        let mut constructed = BTreeSet::new();
         let mut max_wall_us = 0;
         for page in 0..pages {
             money::capture::begin_page(&fixture.support);
@@ -1620,7 +1621,7 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             // eligible captured root was also selected by the shadow, even
             // when acknowledgement never arrives or publication is sealed.
             assert_eq!(counts.families - counts.families_unbuilt, captured_roots.len() as u64, "{ack_mode}: {counts:?}");
-            built.extend(captured_roots);
+            constructed.extend(captured_roots);
             money::store::flush();
             for row in money_jsonl_rows(&fixture.support) {
                 if row["row"] == "family" && row["category"] != "unbuilt"
@@ -1631,8 +1632,14 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             }
         }
         money::set_page_fault_for_test(money::PageFault::None);
-        assert_eq!(built, expected, "all {family_count} families must build within {pages} Full pages");
-        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", built.len());
+        if ack_mode == "sealed" {
+            assert_eq!(constructed, expected, "sealed-day captures and body selection must converge within {pages} Full pages");
+        } else {
+            // Preserve the original identity-level publication assertion:
+            // captured roots alone cannot substitute for emitted bodies.
+            assert_eq!(built, expected, "all {family_count} families must publish built bodies within {pages} Full pages");
+        }
+        println!("MONEY_P1B_ROTATION ack_mode={ack_mode} families={family_count} full_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", if ack_mode == "sealed" { constructed.len() } else { built.len() });
         money::disable_shadow_for_test(&fixture.support);
     }
 }
