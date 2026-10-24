@@ -581,8 +581,16 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
         Err(error) => return Err(error.into()),
     }
     sync_dir(&root)?;
+    publish_status(&root, now)?;
+    if reason != Reason::Resolved {
+        crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
+    }
+    Ok(())
+}
+
+fn publish_status(root: &Path, now: u64) -> Result<()> {
     let mut unresolved = 0_u64;
-    for entry in fs::read_dir(&root)? {
+    for entry in fs::read_dir(root)? {
         let file = entry?.path();
         if file.extension().and_then(|s| s.to_str()) == Some("receipt") {
             let saved: Receipt = serde_json::from_slice(&read_capped(&file, 1024)?)?;
@@ -590,11 +598,8 @@ fn terminal(support: PathBuf, mut m: Manifest, reason: Reason, now: u64) -> Resu
         }
     }
     let status = serde_json::json!({"unknown_outcome_unresolved":unresolved,
-        "active_batches":load(&root)?.len(), "time_day":now / 86400});
-    atomic(&root, &root.join("status"), &serde_json::to_vec(&status)?)?;
-    if reason != Reason::Resolved {
-        crate::local_resource_diagnostics::claude_money_unknown_outcome(&receipt);
-    }
+        "active_batches":load(root)?.len(), "time_day":now / 86400});
+    atomic(root, &root.join("status"), &serde_json::to_vec(&status)?)?;
     Ok(())
 }
 
