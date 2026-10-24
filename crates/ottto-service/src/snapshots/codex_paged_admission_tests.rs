@@ -2320,7 +2320,7 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
 // exits before the G7 charge: no side read starts, no side ledger entry,
 // nothing is requeued, and `oversized_file_count` equals the control page's
 // (no request). The side state (requests, records, ledger) and the emitted
-// snapshots (full `Debug` and serde equality) come out exactly as main's twin
+// snapshots (complete field-by-field equality) come out exactly as main's twin
 // leaves them: the same request with P under the unpaged limit but over the
 // singleton, main's G4a exit for a side-planned file. Without
 // the scaled limits the same request starts its side read, so the request
@@ -2400,6 +2400,13 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             let (_, control) = side_page(settled.clone(), &cache);
             let before = counters(&cache);
             let ((after, treated), counts) = observe(|| side_page(requested.clone(), &cache));
+            let lens = format!(
+                "treated={} twin={} control={}",
+                treated.snapshots.len(),
+                twin.2.snapshots.len(),
+                control.snapshots.len()
+            );
+            eprintln!("FC1_C_S1 {lens}");
             assert_eq!(counts.side_reads_started, 0, "{counts:?}");
             assert_eq!(counts.side_reads_ended, 0, "{counts:?}");
             assert!(ledger_entry(cache.as_ref()).is_none(), "no G7 charge");
@@ -2417,25 +2424,617 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             assert!(!pending(&after, &path));
             assert_eq!(treated.oversized_file_count, control.oversized_file_count);
             assert_eq!(treated.oversized_file_count, 0);
-            let lens = format!(
-                "snapshots: treated {}, twin {}, control {}",
-                treated.snapshots.len(),
-                twin.2.snapshots.len(),
-                control.snapshots.len()
-            );
-            assert_eq!(
-                format!("{:?}", treated.snapshots),
-                format!("{:?}", twin.2.snapshots),
-                "snapshots (Debug) as main's twin; {lens}"
-            );
-            assert_eq!(
-                serde_json::to_value(&treated.snapshots).unwrap(),
-                serde_json::to_value(&twin.2.snapshots).unwrap(),
-                "snapshots (serde) as main's twin; {lens}"
+            assert_snapshots_identical(
+                &treated.snapshots,
+                &twin.2.snapshots,
+                &format!("treated vs main's twin; {lens}"),
             );
         })
     });
     // Control: the same request at production limits starts its side read.
     let (_, counts) = observe(|| side_page(requested, &cache));
     assert_eq!(counts.side_reads_started, 1, "{counts:?}");
+    eprintln!(
+        "FC1_C_S1_COMPLETE parity=pass positive_control=pass side_reads_started={}",
+        counts.side_reads_started
+    );
+}
+
+/// C-S1: complete, ordered equality of two emitted snapshot lists. The
+/// lengths must match, then each pair of entries is compared field by field,
+/// with no sorting, deduplication or normalization. `SnapshotItem` is
+/// destructured exhaustively (no `..`), so a new field fails to compile until
+/// it is compared here. Fields use their derived value equality (which also
+/// covers serde-skipped state); `Arc`/`Box` compare their pointee contents.
+/// The three fields whose types have no derived equality are compared
+/// recursively, each destructured exhaustively too.
+fn assert_snapshots_identical(left: &[SnapshotItem], right: &[SnapshotItem], context: &str) {
+    assert_eq!(left.len(), right.len(), "snapshot count differs; {context}");
+    for (at, (left, right)) in left.iter().zip(right).enumerate() {
+        assert_snapshot_identical(left, right, &format!("snapshot {at}; {context}"));
+    }
+}
+
+fn assert_snapshot_identical(left: &SnapshotItem, right: &SnapshotItem, context: &str) {
+    let SnapshotItem {
+        session_account_evidence,
+        source_session_id,
+        snapshot_fingerprint,
+        status,
+        input_tokens,
+        output_tokens,
+        cache_read_tokens,
+        cache_creation_5m_tokens,
+        cache_creation_1h_tokens,
+        reasoning_output_tokens,
+        unattributed_total_tokens,
+        request_count,
+        usage_accounting_contract,
+        claude_usage_request_ids,
+        claude_usage_occurrences,
+        cache_observations,
+        cache_observations_state,
+        cache_base_head_etag,
+        cache_requests,
+        cache_requests_complete,
+        avg_duration_ms,
+        avg_time_to_first_token_ms,
+        max_duration_ms,
+        max_time_to_first_token_ms,
+        peak_context_fill_tokens,
+        first_turn_context_tokens,
+        last_turn_context_tokens,
+        compaction_count,
+        compaction_timestamps,
+        compaction_events,
+        local_context_points,
+        compaction_total_pre_tokens,
+        compaction_total_post_tokens,
+        compaction_total_cumulative_dropped_tokens,
+        compaction_total_duration_ms,
+        context_curve,
+        claude_context_curve_boundaries,
+        claude_context_curve_identity_complete,
+        claude_context_curve_request_index_complete,
+        claude_context_curve_owned_start_proven,
+        claude_file_birth,
+        claude_file_birth_verdict,
+        first_own_request_at,
+        activity_summary,
+        tool_usage,
+        tool_usage_truncated,
+        session_start,
+        model_usage,
+        usage_buckets,
+        cost,
+        session_display_name,
+        session_display_name_source,
+        source_started_at,
+        source_ended_at,
+        source_last_activity_at,
+        collected_at,
+        workspace_hash,
+        workspace_display_label,
+        workspace_label_source,
+        repository_hash,
+        repository_label,
+        repository_label_source,
+        repository_identity_source,
+        workspace_kind,
+        source_file_fingerprint,
+        session_artifacts,
+        provenance,
+        origin,
+        originator,
+        attribution_facts,
+        request_evidence,
+        request_identity_refusals,
+        claude_org_markers,
+        claude_account_withheld_reason,
+    } = left;
+    let SnapshotItem {
+        session_account_evidence: r_session_account_evidence,
+        source_session_id: r_source_session_id,
+        snapshot_fingerprint: r_snapshot_fingerprint,
+        status: r_status,
+        input_tokens: r_input_tokens,
+        output_tokens: r_output_tokens,
+        cache_read_tokens: r_cache_read_tokens,
+        cache_creation_5m_tokens: r_cache_creation_5m_tokens,
+        cache_creation_1h_tokens: r_cache_creation_1h_tokens,
+        reasoning_output_tokens: r_reasoning_output_tokens,
+        unattributed_total_tokens: r_unattributed_total_tokens,
+        request_count: r_request_count,
+        usage_accounting_contract: r_usage_accounting_contract,
+        claude_usage_request_ids: r_claude_usage_request_ids,
+        claude_usage_occurrences: r_claude_usage_occurrences,
+        cache_observations: r_cache_observations,
+        cache_observations_state: r_cache_observations_state,
+        cache_base_head_etag: r_cache_base_head_etag,
+        cache_requests: r_cache_requests,
+        cache_requests_complete: r_cache_requests_complete,
+        avg_duration_ms: r_avg_duration_ms,
+        avg_time_to_first_token_ms: r_avg_time_to_first_token_ms,
+        max_duration_ms: r_max_duration_ms,
+        max_time_to_first_token_ms: r_max_time_to_first_token_ms,
+        peak_context_fill_tokens: r_peak_context_fill_tokens,
+        first_turn_context_tokens: r_first_turn_context_tokens,
+        last_turn_context_tokens: r_last_turn_context_tokens,
+        compaction_count: r_compaction_count,
+        compaction_timestamps: r_compaction_timestamps,
+        compaction_events: r_compaction_events,
+        local_context_points: r_local_context_points,
+        compaction_total_pre_tokens: r_compaction_total_pre_tokens,
+        compaction_total_post_tokens: r_compaction_total_post_tokens,
+        compaction_total_cumulative_dropped_tokens: r_compaction_total_cumulative_dropped_tokens,
+        compaction_total_duration_ms: r_compaction_total_duration_ms,
+        context_curve: r_context_curve,
+        claude_context_curve_boundaries: r_claude_context_curve_boundaries,
+        claude_context_curve_identity_complete: r_claude_context_curve_identity_complete,
+        claude_context_curve_request_index_complete: r_claude_context_curve_request_index_complete,
+        claude_context_curve_owned_start_proven: r_claude_context_curve_owned_start_proven,
+        claude_file_birth: r_claude_file_birth,
+        claude_file_birth_verdict: r_claude_file_birth_verdict,
+        first_own_request_at: r_first_own_request_at,
+        activity_summary: r_activity_summary,
+        tool_usage: r_tool_usage,
+        tool_usage_truncated: r_tool_usage_truncated,
+        session_start: r_session_start,
+        model_usage: r_model_usage,
+        usage_buckets: r_usage_buckets,
+        cost: r_cost,
+        session_display_name: r_session_display_name,
+        session_display_name_source: r_session_display_name_source,
+        source_started_at: r_source_started_at,
+        source_ended_at: r_source_ended_at,
+        source_last_activity_at: r_source_last_activity_at,
+        collected_at: r_collected_at,
+        workspace_hash: r_workspace_hash,
+        workspace_display_label: r_workspace_display_label,
+        workspace_label_source: r_workspace_label_source,
+        repository_hash: r_repository_hash,
+        repository_label: r_repository_label,
+        repository_label_source: r_repository_label_source,
+        repository_identity_source: r_repository_identity_source,
+        workspace_kind: r_workspace_kind,
+        source_file_fingerprint: r_source_file_fingerprint,
+        session_artifacts: r_session_artifacts,
+        provenance: r_provenance,
+        origin: r_origin,
+        originator: r_originator,
+        attribution_facts: r_attribution_facts,
+        request_evidence: r_request_evidence,
+        request_identity_refusals: r_request_identity_refusals,
+        claude_org_markers: r_claude_org_markers,
+        claude_account_withheld_reason: r_claude_account_withheld_reason,
+    } = right;
+    assert_eq!(
+        session_account_evidence, r_session_account_evidence,
+        "`session_account_evidence` differs; {context}"
+    );
+    assert_eq!(
+        source_session_id, r_source_session_id,
+        "`source_session_id` differs; {context}"
+    );
+    assert_eq!(
+        snapshot_fingerprint, r_snapshot_fingerprint,
+        "`snapshot_fingerprint` differs; {context}"
+    );
+    assert_eq!(status, r_status, "`status` differs; {context}");
+    assert_eq!(
+        input_tokens, r_input_tokens,
+        "`input_tokens` differs; {context}"
+    );
+    assert_eq!(
+        output_tokens, r_output_tokens,
+        "`output_tokens` differs; {context}"
+    );
+    assert_eq!(
+        cache_read_tokens, r_cache_read_tokens,
+        "`cache_read_tokens` differs; {context}"
+    );
+    assert_eq!(
+        cache_creation_5m_tokens, r_cache_creation_5m_tokens,
+        "`cache_creation_5m_tokens` differs; {context}"
+    );
+    assert_eq!(
+        cache_creation_1h_tokens, r_cache_creation_1h_tokens,
+        "`cache_creation_1h_tokens` differs; {context}"
+    );
+    assert_eq!(
+        reasoning_output_tokens, r_reasoning_output_tokens,
+        "`reasoning_output_tokens` differs; {context}"
+    );
+    assert_eq!(
+        unattributed_total_tokens, r_unattributed_total_tokens,
+        "`unattributed_total_tokens` differs; {context}"
+    );
+    assert_eq!(
+        request_count, r_request_count,
+        "`request_count` differs; {context}"
+    );
+    assert_eq!(
+        usage_accounting_contract, r_usage_accounting_contract,
+        "`usage_accounting_contract` differs; {context}"
+    );
+    assert_eq!(
+        claude_usage_request_ids, r_claude_usage_request_ids,
+        "`claude_usage_request_ids` differs; {context}"
+    );
+    assert_eq!(
+        cache_observations, r_cache_observations,
+        "`cache_observations` differs; {context}"
+    );
+    assert_eq!(
+        cache_observations_state, r_cache_observations_state,
+        "`cache_observations_state` differs; {context}"
+    );
+    assert_eq!(
+        cache_base_head_etag, r_cache_base_head_etag,
+        "`cache_base_head_etag` differs; {context}"
+    );
+    assert_eq!(
+        cache_requests, r_cache_requests,
+        "`cache_requests` differs; {context}"
+    );
+    assert_eq!(
+        cache_requests_complete, r_cache_requests_complete,
+        "`cache_requests_complete` differs; {context}"
+    );
+    assert_eq!(
+        avg_duration_ms, r_avg_duration_ms,
+        "`avg_duration_ms` differs; {context}"
+    );
+    assert_eq!(
+        avg_time_to_first_token_ms, r_avg_time_to_first_token_ms,
+        "`avg_time_to_first_token_ms` differs; {context}"
+    );
+    assert_eq!(
+        max_duration_ms, r_max_duration_ms,
+        "`max_duration_ms` differs; {context}"
+    );
+    assert_eq!(
+        max_time_to_first_token_ms, r_max_time_to_first_token_ms,
+        "`max_time_to_first_token_ms` differs; {context}"
+    );
+    assert_eq!(
+        peak_context_fill_tokens, r_peak_context_fill_tokens,
+        "`peak_context_fill_tokens` differs; {context}"
+    );
+    assert_eq!(
+        first_turn_context_tokens, r_first_turn_context_tokens,
+        "`first_turn_context_tokens` differs; {context}"
+    );
+    assert_eq!(
+        last_turn_context_tokens, r_last_turn_context_tokens,
+        "`last_turn_context_tokens` differs; {context}"
+    );
+    assert_eq!(
+        compaction_count, r_compaction_count,
+        "`compaction_count` differs; {context}"
+    );
+    assert_eq!(
+        compaction_timestamps, r_compaction_timestamps,
+        "`compaction_timestamps` differs; {context}"
+    );
+    assert_eq!(
+        compaction_events, r_compaction_events,
+        "`compaction_events` differs; {context}"
+    );
+    assert_eq!(
+        local_context_points, r_local_context_points,
+        "`local_context_points` differs; {context}"
+    );
+    assert_eq!(
+        compaction_total_pre_tokens, r_compaction_total_pre_tokens,
+        "`compaction_total_pre_tokens` differs; {context}"
+    );
+    assert_eq!(
+        compaction_total_post_tokens, r_compaction_total_post_tokens,
+        "`compaction_total_post_tokens` differs; {context}"
+    );
+    assert_eq!(
+        compaction_total_cumulative_dropped_tokens, r_compaction_total_cumulative_dropped_tokens,
+        "`compaction_total_cumulative_dropped_tokens` differs; {context}"
+    );
+    assert_eq!(
+        compaction_total_duration_ms, r_compaction_total_duration_ms,
+        "`compaction_total_duration_ms` differs; {context}"
+    );
+    assert_eq!(
+        context_curve, r_context_curve,
+        "`context_curve` differs; {context}"
+    );
+    assert_eq!(
+        claude_context_curve_identity_complete, r_claude_context_curve_identity_complete,
+        "`claude_context_curve_identity_complete` differs; {context}"
+    );
+    assert_eq!(
+        claude_context_curve_request_index_complete, r_claude_context_curve_request_index_complete,
+        "`claude_context_curve_request_index_complete` differs; {context}"
+    );
+    assert_eq!(
+        claude_context_curve_owned_start_proven, r_claude_context_curve_owned_start_proven,
+        "`claude_context_curve_owned_start_proven` differs; {context}"
+    );
+    assert_eq!(
+        claude_file_birth, r_claude_file_birth,
+        "`claude_file_birth` differs; {context}"
+    );
+    assert_eq!(
+        claude_file_birth_verdict, r_claude_file_birth_verdict,
+        "`claude_file_birth_verdict` differs; {context}"
+    );
+    assert_eq!(
+        first_own_request_at, r_first_own_request_at,
+        "`first_own_request_at` differs; {context}"
+    );
+    assert_eq!(
+        activity_summary, r_activity_summary,
+        "`activity_summary` differs; {context}"
+    );
+    assert_eq!(tool_usage, r_tool_usage, "`tool_usage` differs; {context}");
+    assert_eq!(
+        tool_usage_truncated, r_tool_usage_truncated,
+        "`tool_usage_truncated` differs; {context}"
+    );
+    assert_eq!(
+        model_usage, r_model_usage,
+        "`model_usage` differs; {context}"
+    );
+    assert_eq!(
+        usage_buckets, r_usage_buckets,
+        "`usage_buckets` differs; {context}"
+    );
+    assert_eq!(cost, r_cost, "`cost` differs; {context}");
+    assert_eq!(
+        session_display_name, r_session_display_name,
+        "`session_display_name` differs; {context}"
+    );
+    assert_eq!(
+        session_display_name_source, r_session_display_name_source,
+        "`session_display_name_source` differs; {context}"
+    );
+    assert_eq!(
+        source_started_at, r_source_started_at,
+        "`source_started_at` differs; {context}"
+    );
+    assert_eq!(
+        source_ended_at, r_source_ended_at,
+        "`source_ended_at` differs; {context}"
+    );
+    assert_eq!(
+        source_last_activity_at, r_source_last_activity_at,
+        "`source_last_activity_at` differs; {context}"
+    );
+    assert_eq!(
+        collected_at, r_collected_at,
+        "`collected_at` differs; {context}"
+    );
+    assert_eq!(
+        workspace_hash, r_workspace_hash,
+        "`workspace_hash` differs; {context}"
+    );
+    assert_eq!(
+        workspace_display_label, r_workspace_display_label,
+        "`workspace_display_label` differs; {context}"
+    );
+    assert_eq!(
+        workspace_label_source, r_workspace_label_source,
+        "`workspace_label_source` differs; {context}"
+    );
+    assert_eq!(
+        repository_hash, r_repository_hash,
+        "`repository_hash` differs; {context}"
+    );
+    assert_eq!(
+        repository_label, r_repository_label,
+        "`repository_label` differs; {context}"
+    );
+    assert_eq!(
+        repository_label_source, r_repository_label_source,
+        "`repository_label_source` differs; {context}"
+    );
+    assert_eq!(
+        repository_identity_source, r_repository_identity_source,
+        "`repository_identity_source` differs; {context}"
+    );
+    assert_eq!(
+        workspace_kind, r_workspace_kind,
+        "`workspace_kind` differs; {context}"
+    );
+    assert_eq!(
+        source_file_fingerprint, r_source_file_fingerprint,
+        "`source_file_fingerprint` differs; {context}"
+    );
+    assert_eq!(
+        session_artifacts, r_session_artifacts,
+        "`session_artifacts` differs; {context}"
+    );
+    assert_eq!(origin, r_origin, "`origin` differs; {context}");
+    assert_eq!(originator, r_originator, "`originator` differs; {context}");
+    assert_eq!(
+        attribution_facts, r_attribution_facts,
+        "`attribution_facts` differs; {context}"
+    );
+    assert_eq!(
+        request_evidence, r_request_evidence,
+        "`request_evidence` differs; {context}"
+    );
+    assert_eq!(
+        request_identity_refusals, r_request_identity_refusals,
+        "`request_identity_refusals` differs; {context}"
+    );
+    assert_eq!(
+        claude_account_withheld_reason, r_claude_account_withheld_reason,
+        "`claude_account_withheld_reason` differs; {context}"
+    );
+    assert_eq!(
+        claude_org_markers.as_deref(),
+        r_claude_org_markers.as_deref(),
+        "`claude_org_markers` differs; {context}"
+    );
+    assert_eq!(
+        session_start.as_deref(),
+        r_session_start.as_deref(),
+        "`session_start` differs; {context}"
+    );
+    assert_eq!(
+        claude_usage_occurrences.len(),
+        r_claude_usage_occurrences.len(),
+        "`claude_usage_occurrences` length differs; {context}"
+    );
+    for ((key, occurrence), (r_key, r_occurrence)) in claude_usage_occurrences
+        .iter()
+        .zip(r_claude_usage_occurrences)
+    {
+        let context = format!("`claude_usage_occurrences[{key}]`; {context}");
+        assert_eq!(key, r_key, "occurrence key differs; {context}");
+        let ClaudeTranscriptUsageOccurrence {
+            sequence,
+            usage,
+            model,
+            selector,
+            reasoning_effort,
+            timestamp,
+            event_clock_complete,
+            effective_input_context,
+        } = occurrence;
+        let ClaudeTranscriptUsageOccurrence {
+            sequence: r_sequence,
+            usage: r_usage,
+            model: r_model,
+            selector: r_selector,
+            reasoning_effort: r_reasoning_effort,
+            timestamp: r_timestamp,
+            event_clock_complete: r_event_clock_complete,
+            effective_input_context: r_effective_input_context,
+        } = r_occurrence;
+        assert_eq!(sequence, r_sequence, "`sequence` differs; {context}");
+        assert_eq!(usage, r_usage, "`usage` differs; {context}");
+        assert_eq!(model, r_model, "`model` differs; {context}");
+        assert_eq!(
+            reasoning_effort, r_reasoning_effort,
+            "`reasoning_effort` differs; {context}"
+        );
+        assert_eq!(timestamp, r_timestamp, "`timestamp` differs; {context}");
+        assert_eq!(
+            event_clock_complete, r_event_clock_complete,
+            "`event_clock_complete` differs; {context}"
+        );
+        assert_eq!(
+            effective_input_context, r_effective_input_context,
+            "`effective_input_context` differs; {context}"
+        );
+        assert_eq!(
+            <Arc<SelectorCapture> as AsRef<SelectorCapture>>::as_ref(selector),
+            <Arc<SelectorCapture> as AsRef<SelectorCapture>>::as_ref(r_selector),
+            "`selector` differs; {context}"
+        );
+    }
+    assert_eq!(
+        claude_context_curve_boundaries.len(),
+        r_claude_context_curve_boundaries.len(),
+        "`claude_context_curve_boundaries` length differs; {context}"
+    );
+    for (at, (boundary, r_boundary)) in claude_context_curve_boundaries
+        .iter()
+        .zip(r_claude_context_curve_boundaries)
+        .enumerate()
+    {
+        let context = format!("`claude_context_curve_boundaries[{at}]`; {context}");
+        let ClaudeCompactionObservation {
+            kind,
+            timestamp,
+            pre_tokens,
+            post_tokens,
+            cumulative_dropped_tokens,
+            duration_ms,
+            response_count_before,
+            pair_key,
+            has_parent_link,
+            trigger,
+            id_less_before,
+            id_less_after,
+        } = boundary;
+        let ClaudeCompactionObservation {
+            kind: r_kind,
+            timestamp: r_timestamp,
+            pre_tokens: r_pre_tokens,
+            post_tokens: r_post_tokens,
+            cumulative_dropped_tokens: r_cumulative_dropped_tokens,
+            duration_ms: r_duration_ms,
+            response_count_before: r_response_count_before,
+            pair_key: r_pair_key,
+            has_parent_link: r_has_parent_link,
+            trigger: r_trigger,
+            id_less_before: r_id_less_before,
+            id_less_after: r_id_less_after,
+        } = r_boundary;
+        assert_eq!(kind, r_kind, "`kind` differs; {context}");
+        assert_eq!(timestamp, r_timestamp, "`timestamp` differs; {context}");
+        assert_eq!(pre_tokens, r_pre_tokens, "`pre_tokens` differs; {context}");
+        assert_eq!(
+            post_tokens, r_post_tokens,
+            "`post_tokens` differs; {context}"
+        );
+        assert_eq!(
+            cumulative_dropped_tokens, r_cumulative_dropped_tokens,
+            "`cumulative_dropped_tokens` differs; {context}"
+        );
+        assert_eq!(
+            duration_ms, r_duration_ms,
+            "`duration_ms` differs; {context}"
+        );
+        assert_eq!(
+            response_count_before, r_response_count_before,
+            "`response_count_before` differs; {context}"
+        );
+        assert_eq!(pair_key, r_pair_key, "`pair_key` differs; {context}");
+        assert_eq!(
+            has_parent_link, r_has_parent_link,
+            "`has_parent_link` differs; {context}"
+        );
+        assert_eq!(trigger, r_trigger, "`trigger` differs; {context}");
+        assert_eq!(
+            id_less_before, r_id_less_before,
+            "`id_less_before` differs; {context}"
+        );
+        assert_eq!(
+            id_less_after, r_id_less_after,
+            "`id_less_after` differs; {context}"
+        );
+    }
+    let context = format!("`provenance`; {context}");
+    let SnapshotProvenance {
+        collector,
+        source_file_count,
+        input_token_scope,
+        state_total_tokens,
+        state_archived,
+    } = provenance;
+    let SnapshotProvenance {
+        collector: r_collector,
+        source_file_count: r_source_file_count,
+        input_token_scope: r_input_token_scope,
+        state_total_tokens: r_state_total_tokens,
+        state_archived: r_state_archived,
+    } = r_provenance;
+    assert_eq!(collector, r_collector, "`collector` differs; {context}");
+    assert_eq!(
+        source_file_count, r_source_file_count,
+        "`source_file_count` differs; {context}"
+    );
+    assert_eq!(
+        input_token_scope, r_input_token_scope,
+        "`input_token_scope` differs; {context}"
+    );
+    assert_eq!(
+        state_total_tokens, r_state_total_tokens,
+        "`state_total_tokens` differs; {context}"
+    );
+    assert_eq!(
+        state_archived, r_state_archived,
+        "`state_archived` differs; {context}"
+    );
 }
