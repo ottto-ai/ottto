@@ -15737,10 +15737,6 @@ impl SnapshotAccumulator {
                 }
             }
             if let Some(request_id) = response.request_id.take() {
-                let request_hash = capture
-                    .is_some()
-                    .then(|| claude_request_census::claude_request_hash(&request_id));
-                let request_id_was_new = self.claude_usage_request_ids.insert(request_id.clone());
                 let selector = match shared_selectors.get(&response.selector) {
                     Some(shared) => Arc::clone(shared),
                     None => {
@@ -15750,7 +15746,7 @@ impl SnapshotAccumulator {
                     }
                 };
                 let prior_occurrence = self.claude_usage_occurrences.insert(
-                    request_id,
+                    request_id.clone(),
                     ClaudeTranscriptUsageOccurrence {
                         sequence: response.sequence,
                         usage: response.usage.clone(),
@@ -15762,6 +15758,14 @@ impl SnapshotAccumulator {
                         effective_input_context,
                     },
                 );
+                // Shadow-only: just a response that displaces an earlier one
+                // under its request id needs the hash, as timed and admitted
+                // capture work.
+                let request_hash = match (capture.as_deref_mut(), &prior_occurrence) {
+                    (Some(capture), Some(_)) => capture.request_hash(&request_id),
+                    _ => None,
+                };
+                let request_id_was_new = self.claude_usage_request_ids.insert(request_id);
                 // Progressive rows for one response were merged by response
                 // key above. Reaching this point twice for one provider request
                 // id therefore means two distinct responses claim the same
@@ -28283,6 +28287,8 @@ impl OwnedJsonlParser {
             accumulator.apply_first_prompt_fallback();
         }
         if source == SnapshotSource::ClaudeCode {
+            #[cfg(test)]
+            claude_native_delay_for_test(path);
             // P1 money shadow: a side capture only where the shadow is armed.
             let mut capture = claude_request_money::ClaudeResponseCapture::begin(path);
             accumulator.finalize_claude_responses_captured(capture.as_mut());
@@ -31349,6 +31355,33 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
         ClaudeForkLineProvenance::Inherited
     } else {
         ClaudeForkLineProvenance::Invalid
+    }
+}
+
+/// Native scan time a test injects before each Claude finalizer under a
+/// root (a production-shaped slow native page: seconds of native I/O
+/// between money finalizers). Production scanning is unchanged.
+#[cfg(test)]
+static CLAUDE_NATIVE_DELAY_FOR_TEST: std::sync::Mutex<Option<(PathBuf, std::time::Duration)>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+pub(crate) fn set_claude_native_delay_for_test(delay: Option<(PathBuf, std::time::Duration)>) {
+    *CLAUDE_NATIVE_DELAY_FOR_TEST
+        .lock()
+        .expect("native delay control") = delay;
+}
+
+#[cfg(test)]
+fn claude_native_delay_for_test(path: &Path) {
+    let delay = CLAUDE_NATIVE_DELAY_FOR_TEST
+        .lock()
+        .expect("native delay control")
+        .as_ref()
+        .filter(|(root, _)| path.starts_with(root))
+        .map(|(_, delay)| *delay);
+    if let Some(delay) = delay {
+        std::thread::sleep(delay);
     }
 }
 

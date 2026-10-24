@@ -95,10 +95,13 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
 /// Money-added synchronous work under the lock, including capture and
-/// closing. One absolute wall deadline starts at the first money finalizer;
-/// native gaps consume the deadline but are excluded from added work.
+/// closing. It counts money time only (MONEY decision, superseding the one
+/// absolute wall deadline from the first finalizer): accumulated capture
+/// sections, then the shadow from its entry, which gets what capture left.
+/// Native time between or after finalizers is never charged.
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
-/// Leave bounded closing work inside the total, rather than after expiry.
+/// Leave bounded closing work inside the total, rather than after expiry:
+/// optional work stops at 150 ms of money time, closing by 240 ms.
 const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
 const TELEMETRY_MAX_ELAPSED: Duration = Duration::from_millis(20);
 /// A growing structure's admission step.
@@ -688,7 +691,11 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) undecided_births: u64,
     pub(crate) undecided_holder_view: u64,
     pub(crate) unchanged: u64,
+    /// Accumulated capture (money) time before the shadow, charged.
     pub(crate) capture_us: u64,
+    /// Native wall time between the first money finalizer and shadow entry,
+    /// excluding capture time. Receipt only: never charged.
+    pub(crate) native_us: u64,
     pub(crate) writer_us: u64,
     pub(crate) result_apply_us: u64,
     /// Time through shared family preparation, before optional body slices.
@@ -802,6 +809,8 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) undecided_unbuilt_older: u64,
     /// Time under the sync lock, every phase included but this line's write.
     pub(crate) elapsed_us: u64,
+    /// The page's charged money time: `capture_us + elapsed_us`.
+    pub(crate) money_us: u64,
 }
 
 impl ClaudeRequestMoneyShadowCounts {
@@ -1237,7 +1246,6 @@ pub(crate) fn shadow_page_at(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     store::prime_credit_for_test(support_dir, utc_day(now));
-    capture::shadow_clock_for_test(support_dir);
     shadow_page_ready_for_test(
         support_dir,
         snapshots,
@@ -1313,6 +1321,9 @@ fn shadow_page_with_coverage(
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
     let scope_key = shadow_scope(support_dir);
+    // `clock.deadline` is `started` plus the money budget capture left, so
+    // these are the same offsets in money time: optional work stops at
+    // 150 ms, closing at 240 ms, 10 ms for the handoff.
     let clock = capture::take_page_clock(&scope_key, started);
     let capture_us = clock.capture_us;
     let deadline = clock.deadline - PAGE_CLOSE_RESERVE;
@@ -1322,6 +1333,7 @@ fn shadow_page_with_coverage(
     let epoch = process_epoch();
     let mut counts = ClaudeRequestMoneyShadowCounts {
         capture_us,
+        native_us: clock.native_us,
         capture_reserved_bytes: capture::capture_reserved() as u64,
         ..Default::default()
     };
@@ -1337,9 +1349,9 @@ fn shadow_page_with_coverage(
         scope: Default::default(),
     };
     if Instant::now() >= clock.deadline {
-        // Native gaps can exhaust the wall deadline before any diagnostic
-        // page is admitted. Close with one false page, without starting a
-        // ledger load, identity walk, body or digest after expiry.
+        // Accumulated capture time alone can exhaust the money budget before
+        // any diagnostic page is admitted. Close with one false page, without
+        // starting a ledger load, identity walk, body or digest after expiry.
         counts.refused_deadline = 1;
         purge_captures(&scope_key, &mut counts);
         return refuse(&end, None, index, snapshots.len(), counts);
@@ -2838,6 +2850,7 @@ fn emit(
         }
     };
     counts.elapsed_us = end.started.elapsed().as_micros() as u64;
+    counts.money_us = counts.capture_us.saturating_add(counts.elapsed_us);
     emit_line(&ShadowLine {
         counting: CLAUDE_REQUEST_COUNTING,
         census_complete: end.census_complete,
