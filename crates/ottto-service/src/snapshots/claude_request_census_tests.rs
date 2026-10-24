@@ -2965,6 +2965,13 @@ fn census_rebuild_corrupt_guard(raw: &str, corruption: &str, id: &str) -> String
                 &format!("{shadow},\"claude_request_census_shadow\":{shadow}"),
             )
         }
+        // The legacy numeric shadow scalar still reads as absent diagnostics.
+        "nonfinite_shadow" => {
+            value["claude_request_census_shadow"] = serde_json::json!("NONFINITE");
+            serde_json::to_string(&value)
+                .unwrap()
+                .replace("\"NONFINITE\"", "1e400")
+        }
         "malformed_guard" => {
             value["claude_request_census_shadow"]["n"] = serde_json::json!("corrupt");
             serde_json::to_string(&value).unwrap()
@@ -2984,8 +2991,9 @@ fn census_rebuild_corrupt_guard(raw: &str, corruption: &str, id: &str) -> String
     }
 }
 
-const N3_GUARD_CORRUPTIONS: [&str; 5] = [
+const N3_GUARD_CORRUPTIONS: [&str; 6] = [
     "malformed_shadow",
+    "nonfinite_shadow",
     "duplicated_shadow",
     "malformed_guard",
     "duplicated_guard",

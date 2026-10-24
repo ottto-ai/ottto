@@ -2552,7 +2552,11 @@ impl<'de> Deserialize<'de> for ClaudeRequestCensusShadowState {
             .is_some_and(|byte| byte.is_ascii_digit() || *byte == b'-')
             && token.parse::<f64>().is_ok_and(|value| !value.is_finite())
         {
-            return Ok(Self::default());
+            // It holds no rebuild guard either: a lost one closes (SI-724-B3).
+            return Ok(Self {
+                rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
+                ..Self::default()
+            });
         }
         if raw.get().len() > 512 * 1024 + MAX_CLAUDE_REQUEST_CENSUS_SCALAR_BYTES
             || !raw.get().trim_start().starts_with('{')

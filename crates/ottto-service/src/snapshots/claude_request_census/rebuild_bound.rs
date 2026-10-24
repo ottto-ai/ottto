@@ -201,110 +201,57 @@ fn valid_prior(fingerprint: &str) -> bool {
     fingerprint.len() == PRIOR_BYTES && lower_hex(fingerprint.as_bytes())
 }
 
-/// One prior value: a string, or anything else drained as `None`.
-struct PriorValue(Option<String>);
-impl<'de> Deserialize<'de> for PriorValue {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer
-            .deserialize_any(PriorsVisitor)
-            .map(|value| match value {
-                PriorsValue::Prior(prior) => PriorValue(Some(prior)),
-                _ => PriorValue(None),
-            })
-    }
-}
-
-enum PriorsValue {
-    Map(Option<BTreeMap<String, String>>),
-    Prior(String),
-    Other,
-}
-
-/// All or nothing: a map of 16-hex key ids to well-formed priors decodes to
-/// `Map(Some)`. An oversized, duplicated or malformed map is drained to
-/// `Map(None)` and any other shape to `Other`, never an error.
-struct PriorsVisitor;
-impl<'de> Visitor<'de> for PriorsVisitor {
-    type Value = PriorsValue;
-    fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-        formatter.write_str("duplicate rebuild priors")
-    }
-    fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-        let mut priors = Some(BTreeMap::new());
-        while let Some(id) = map.next_key::<String>()? {
-            let prior = map.next_value::<PriorValue>()?.0;
-            let Some(kept) = priors.as_mut() else {
-                continue;
-            };
-            let accepted = prior.is_some_and(|prior| {
-                kept.len() < MAX_TRACKED_KEYS
-                    && id.len() == 16
-                    && lower_hex(id.as_bytes())
-                    && valid_prior(&prior)
-                    && kept.insert(id, prior).is_none()
-            });
-            if !accepted {
-                priors = None;
-            }
+/// Strict: an oversized, duplicated or malformed map is an error. Run only
+/// in isolation (`decode_priors`), so that error refuses the field.
+fn strict_priors<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error> {
+    struct Priors;
+    impl<'de> Visitor<'de> for Priors {
+        type Value = BTreeMap<String, String>;
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("duplicate rebuild priors")
         }
-        Ok(PriorsValue::Map(priors))
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let malformed = || <A::Error as serde::de::Error>::custom("rebuild priors");
+            let mut priors = BTreeMap::new();
+            while let Some(id) = map.next_key::<String>()? {
+                let prior = map.next_value::<String>()?;
+                if priors.len() >= MAX_TRACKED_KEYS
+                    || id.len() != 16
+                    || !lower_hex(id.as_bytes())
+                    || !valid_prior(&prior)
+                    || priors.insert(id, prior).is_some()
+                {
+                    return Err(malformed());
+                }
+            }
+            Ok(priors)
+        }
     }
-    fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
-        while seq.next_element::<IgnoredAny>()?.is_some() {}
-        Ok(PriorsValue::Other)
-    }
-    fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Prior(value.to_owned()))
-    }
-    fn visit_bool<E: serde::de::Error>(self, _: bool) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-    fn visit_i64<E: serde::de::Error>(self, _: i64) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-    fn visit_u64<E: serde::de::Error>(self, _: u64) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-    fn visit_f64<E: serde::de::Error>(self, _: f64) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
-        Ok(PriorsValue::Other)
-    }
-}
-
-fn accepted_priors(value: PriorsValue) -> Option<BTreeMap<String, String>> {
-    match value {
-        PriorsValue::Map(priors) => priors,
-        PriorsValue::Prior(_) | PriorsValue::Other => None,
-    }
+    deserializer.deserialize_map(Priors)
 }
 
 /// `ScanIndex::claude_census_rebuild_priors`: key id -> the fingerprint an
-/// earlier checkpoint's rearm emptied (the legacy N3 marker). Lenient on any
-/// plain Serde path (SI B2 condition 1): a refused value reads as no priors,
-/// never as an index decode error. The index reader decodes the field first
-/// in isolation (`decode_priors`) and counts the refusal.
+/// earlier checkpoint's rearm emptied (the legacy N3 marker). Captured raw,
+/// so no token inside it (an overflowing number included) is interpreted by
+/// the enclosing decode, then decoded in isolation: on any plain Serde path
+/// a refused value reads as no priors, never as an index decode error (SI B2
+/// condition 1). The index reader isolates the field before this runs and
+/// counts the refusal.
 pub(crate) fn deserialize_priors<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<BTreeMap<String, String>, D::Error> {
-    Ok(deserializer
-        .deserialize_any(PriorsVisitor)
-        .map(accepted_priors)?
-        .unwrap_or_default())
+    let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    Ok(decode_priors(raw.get().as_bytes()).unwrap_or_default())
 }
 
-/// The index reader's isolated decode of the priors field (MONEY P1b):
-/// `None` refuses it, and the reader hands the index an empty map and a
-/// refusal instead of failing the whole decode.
+/// The isolated decode of the priors field (MONEY P1b): `None` refuses it,
+/// and the index reader hands the index an empty map and a refusal instead
+/// of failing the whole decode.
 pub(super) fn decode_priors(bytes: &[u8]) -> Option<BTreeMap<String, String>> {
     let mut decoder = serde_json::Deserializer::from_slice(bytes);
-    let priors = serde::Deserializer::deserialize_any(&mut decoder, PriorsVisitor)
-        .ok()
-        .and_then(accepted_priors)?;
+    let priors = strict_priors(&mut decoder).ok()?;
     decoder.end().ok()?;
     Some(priors)
 }
@@ -981,6 +928,9 @@ mod tests {
             format!(r#"{{"{}":"{hex}"}}"#, &id[..15]),
             "null".to_owned(),
             format!("{{{over_cap}}}"),
+            // Overflowing numbers: never interpreted by the enclosing decode.
+            "1e400".to_owned(),
+            format!(r#"{{"{id}":1e400}}"#),
         ] {
             assert_eq!(decode_priors(raw.as_bytes()), None, "{raw}");
             assert_eq!(field_priors(&raw).unwrap(), BTreeMap::new(), "{raw}");
@@ -1027,6 +977,15 @@ mod tests {
                 decoded.files["/tmp/kept.jsonl"].source_file_fingerprint,
                 "b".repeat(PRIOR_BYTES)
             );
+        }
+        // Overflowing numbers exist only as text, never as a `Value`.
+        for priors in ["1e400", r#"{"0123456789abcdef":1e400}"#] {
+            let mut value = base.clone();
+            value["claude_census_rebuild_priors"] = serde_json::json!("OVERFLOW");
+            let raw = value.to_string().replace("\"OVERFLOW\"", priors);
+            let decoded: ScanIndex = serde_json::from_str(&raw).unwrap();
+            assert!(decoded.claude_census_rebuild_priors.is_empty(), "{priors}");
+            assert_eq!(decoded.files.len(), 1, "{priors}");
         }
     }
 
