@@ -1551,6 +1551,11 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert!(capture_us <= 125_000, "capture callback overshoot: {capture_us}");
     assert!(input <= 8 * 1024 * 1024, "{input}");
     assert!(comparisons <= 1_048_576, "{comparisons}");
+    // The product, not the probe, selects the following captures: the first
+    // admitted page installed a plan (complete, or the oldest-64 fallback
+    // when its close budget ran out), never none and never the old one.
+    assert_eq!(counts.plan_install_failed, counts.fallback_plan_installed, "{counts:?}");
+    assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(true), "{counts:?}");
     // Reproduce a native Full rearm. It uses fresh current captures, not the
     // old page's consumed capture or a cached completed money body.
     money::capture::begin_page(&fixture.support);
@@ -1601,8 +1606,8 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL admitted_finalizer_probe=true reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
-        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, deadline_built, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    println!("MONEY_P1B_FULL admitted_finalizer_probe=true plan_install_failed={} fallback_plan_installed={} first_captures={} reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
+        counts.plan_install_failed, counts.fallback_plan_installed, counts.captures_taken, armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, deadline_built, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
     money::disable_shadow_for_test(&fixture.support);
 }
 
@@ -1954,6 +1959,95 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
         println!("MONEY_P1B_ROTATION admitted_finalizer_probe=true ack_mode={ack_mode} families={family_count} full_pages={} initial_coverage_pages={pages} distinct_built={} max_wall_us={max_wall_us} deadline_us=250000", pages + 2, if ack_mode == "sealed" { constructed.len() } else { built.len() });
         money::disable_shadow_for_test(&fixture.support);
     }
+}
+
+/// MONEY decision (fail closed, never stale): a page whose complete plan
+/// runs out of budget installs the oldest-64 fallback, never the old plan,
+/// and the next Full parse captures and builds prior incomplete families
+/// only. Three pages of 200 roots: page 0 builds A, its plan selects B;
+/// page 1 builds B and its plan runs out; page 2 must capture C (the next
+/// 64 unbuilt), never B (the stale plan) or A.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_failed_plan_installs_fallback_and_captures_prior_incomplete_families() {
+    let family_count = 3 * money::capture::NEXT_PAGE_FAMILIES + 8;
+    let fixture = PipelineFixture::new("money-p1b-plan-fallback");
+    for session in PIPELINE_SESSIONS {
+        std::fs::remove_file(fixture.root.join(format!("{session}.jsonl"))).unwrap();
+    }
+    let sessions = (0..family_count).map(|at| format!("{at:08x}-1234-4567-890a-123456789abc")).collect::<Vec<_>>();
+    for (at, session) in sessions.iter().enumerate() {
+        std::fs::write(fixture.root.join(format!("{session}.jsonl")),
+            pipeline_transcript_line(session, &format!("req-{at}"), 7)).unwrap();
+    }
+    let family_of = sessions.iter()
+        .map(|session| (crate::snapshots::claude_request_census::family_key(session), money::hashed_id_for_test(session)))
+        .collect::<BTreeMap<_, _>>();
+    let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index,
+        "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+    money::enable_shadow_for_test(&fixture.support);
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let planned = || money::capture::planned_families_for_test(&fixture.support)
+        .expect("a page installs a plan").iter().map(|key| family_of[key].clone()).collect::<BTreeSet<_>>();
+    let mut built_by_page = Vec::new();
+    let mut captured_by_page = Vec::new();
+    let mut page_counts = Vec::new();
+    let mut planned_by_page = Vec::new();
+    for page in 0..3_u64 {
+        let mut index = ScanIndex::default(); // every page is genuinely Full
+        let full = scan(&mut index);
+        assert_eq!(full.scanned_file_count, family_count);
+        let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+        money::capture::purge_scope_for_test(&fixture.support);
+        money::capture::begin_page(&fixture.support);
+        replay();
+        captured_by_page.push(money::capture::keys_for_test(&fixture.support).iter()
+            .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
+            .collect::<BTreeSet<_>>());
+        // Page 1's complete plan runs out of its close budget.
+        money::capture::set_plan_deadline_for_test(page == 1);
+        let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete, now + page);
+        money::capture::set_plan_deadline_for_test(false);
+        assert_eq!(counts.refused_deadline, 0, "{counts:?}");
+        assert_eq!(counts.families, family_count as u64);
+        money::store::flush();
+        let rows = money_jsonl_rows(&fixture.support);
+        built_by_page.push(rows.iter().filter(|row| row["row"] == "family" && row["observed_unix"] == now + page
+            && row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0)
+            && !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"))
+            .map(|row| row["family"].as_str().unwrap().to_owned()).collect::<BTreeSet<_>>());
+        planned_by_page.push(planned());
+        page_counts.push(counts);
+    }
+    let [(a, b_plan), (b, c_plan), (c, _)] = [0, 1, 2].map(|page| (built_by_page[page].clone(), planned_by_page[page].clone()));
+    assert_eq!(page_counts[0].plan_install_failed, 0, "{:?}", page_counts[0]);
+    assert_eq!(a.len(), money::capture::NEXT_PAGE_FAMILIES, "the cold page builds its 64 capture turns");
+    assert_eq!(b_plan.len(), money::capture::NEXT_PAGE_FAMILIES);
+    assert!(b_plan.is_disjoint(&a));
+    assert_eq!(captured_by_page[1], b_plan, "the complete plan selects page 1's captures");
+    assert_eq!(b, b_plan, "page 1 builds its planned families");
+    let failed = page_counts[1];
+    assert_eq!((failed.plan_install_failed, failed.plan_install_failed_deadline, failed.fallback_plan_installed), (1, 1, 1), "{failed:?}");
+    assert_eq!((failed.plan_install_failed_funds, failed.plan_install_failed_lock), (0, 0), "{failed:?}");
+    assert_eq!(c_plan.len(), money::capture::NEXT_PAGE_FAMILIES, "the fallback lists the oldest 64 not built");
+    assert!(c_plan.is_disjoint(&b), "never the stale plan: page 1's plan selected what page 1 built");
+    assert!(c_plan.is_disjoint(&a));
+    let incomplete_after_1 = family_of.values().filter(|family| !a.contains(*family) && !b.contains(*family)).cloned().collect::<BTreeSet<_>>();
+    assert!(!captured_by_page[2].is_empty());
+    assert!(captured_by_page[2].is_subset(&incomplete_after_1),
+        "every following capture targets a prior incomplete family: {:?}", captured_by_page[2].difference(&incomplete_after_1).collect::<Vec<_>>());
+    assert_eq!(captured_by_page[2], c_plan, "the next Full parse captures exactly the fallback's families");
+    assert_eq!(c, c_plan, "and builds them");
+    assert_eq!(page_counts[2].plan_install_failed, 0, "{:?}", page_counts[2]);
+    assert_eq!(money::reserved_for_test(), 0);
+    println!("MONEY_P1B_PLAN_FALLBACK families={family_count} page0_built={} page1_built={} page1_plan_install_failed={} page1_fallback_installed={} page2_captured={} page2_captured_prior_incomplete={} page2_built={} stale_plan_captures={}",
+        a.len(), b.len(), failed.plan_install_failed, failed.fallback_plan_installed, captured_by_page[2].len(),
+        captured_by_page[2].intersection(&incomplete_after_1).count(), c.len(), captured_by_page[2].intersection(&b).count());
+    money::disable_shadow_for_test(&fixture.support);
 }
 
 #[test]
