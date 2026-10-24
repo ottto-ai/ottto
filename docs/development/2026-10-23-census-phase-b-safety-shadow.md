@@ -190,8 +190,10 @@ remains OFF; no runtime corpus, seven-day shadow or release evidence is claimed.
 
 
 Resource admission now assesses the join/view workspace and an additional-peak
-estimate before allocating the D2 join. The peak model reserves six serialized
-inventory equivalents plus the independently computed workspace layout bound.
+estimate before allocating the D2 join. The peak model reserves three serialized
+inventory equivalents (checkpoint, normalized decode and decoded evidence) plus
+the independently computed workspace layout bound. Old/working copies share
+immutable hash buffers; those are not separately encoded inventory copies.
 Both estimates are multiplied by `1 + error allowance`, with checked integer
 ceil rounding; unavailable/overflowed estimates refuse. The caps stay 128 MiB
 additional peak and 64 MiB workspace.

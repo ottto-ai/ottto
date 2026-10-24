@@ -34,13 +34,14 @@ pub(super) struct Admission {
 }
 impl Admission {
     pub(super) fn estimate(index: &ScanIndex, workspace: Option<usize>) -> Self {
-        // Six serialized inventory equivalents reserve concurrent checkpoint
-        // buffers, decoded evidence and retained shadow state. The independent
+        // Three serialized inventory equivalents reserve the checkpoint buffer,
+        // normalized decode buffer and decoded evidence. Old/working copies
+        // share immutable hash buffers; they are not extra encoded copies. The independent
         // layout estimate additionally reserves join/view workspace. Calibration
         // checks this model against the complete allocator scope, not just join.
         let additional = workspace.and_then(|workspace| {
             checked_serialized_len(index)?
-                .checked_mul(6)?
+                .checked_mul(3)?
                 .checked_add(workspace)
         });
         Self::from_estimates(workspace, additional)
