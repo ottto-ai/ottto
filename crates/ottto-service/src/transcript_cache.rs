@@ -46,6 +46,9 @@ struct Entry<S> {
     // take transfers it out. Reinsertion always measures the mutated graph.
     heap_bytes: usize,
     modified_hint: (i64, i64),
+    /// The finalization copy's charge reserved beside this entry at its
+    /// admission (P1-RETAIN R0, Q-PR13(iii) β). Inline; it charges no heap.
+    finalization_charge: usize,
 }
 impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
     fn heap_bound(&self, c: &mut Counter) -> Option<()> {
@@ -54,6 +57,7 @@ impl<S: HeapLayoutBound> HeapLayoutBound for Entry<S> {
             used: _,
             heap_bytes,
             modified_hint: _,
+            finalization_charge: _,
         } = self;
         c.add(*heap_bytes)
     }
@@ -67,9 +71,58 @@ pub(crate) enum Release {
     CursorReservation,
     /// A copy refusal fitting the residents beside the active file (M1).
     CopyRefusal,
-    /// Room for a zero-budget tail's own copy, from entries ranked strictly
-    /// older than the tailed file only (M1 Path A).
+    /// Room for a tail's own copy, from entries ranked strictly older than
+    /// the tailed file only: a non-F tail's zero-budget step start (M1 Path
+    /// A), and a shape-F completion's exact prefix ranked below its copy's
+    /// re-admission rank after every non-budget gate (P1-RETAIN R0, through
+    /// the same `release_older_until`).
     CopyAdmission,
+}
+
+/// A retained copy moved out of the cache, with the admission facts the
+/// caller's completion needs (P1-RETAIN R0).
+pub(crate) struct Taken<S> {
+    pub(crate) retained: Retained<S>,
+    /// The entry's victim-order hint as admitted: the source mtime, clipped
+    /// to admission time.
+    pub(crate) modified_hint: (i64, i64),
+    /// The finalization charge reserved beside the entry at its admission.
+    pub(crate) finalization_charge: usize,
+}
+
+/// The victim-order hint an entry modified at `modified` is admitted at,
+/// at `now`: future source timestamps are clipped to admission time, so they
+/// cannot rank an entry ahead of later live work. Every admission ranks
+/// through this; P1-RETAIN R0 ranks a completed copy once with it and carries
+/// that value to its release and its insert.
+pub(crate) fn admission_rank(modified: (i64, i64), now: std::time::Duration) -> (i64, i64) {
+    modified.min((
+        i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
+        i64::from(now.subsec_nanos()),
+    ))
+}
+
+/// The wall clock an admission ranks against (`admission_rank`).
+pub(crate) fn admission_now() -> std::time::Duration {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+}
+
+/// Exactly what one entry under a key of `key_capacity` adds to the cache's
+/// bound beyond its own `heap_bytes`, and exactly what removing it frees
+/// beyond them: one B-tree node (`tree_nodes` charges `(len + 1)` nodes,
+/// linear in `len`) plus the key's heap. `Entry` (inline in the node) stays
+/// private.
+pub(crate) fn entry_slot_bytes<S>(key_capacity: usize) -> Option<usize> {
+    heap_layout_bound::tree_node_bytes::<String, Entry<S>>()?.checked_add(key_capacity)
+}
+
+/// The inline bytes `Entry` adds around a retained state and its checkpoint.
+/// The insert's entry bound charges them; a caller's own admission does not.
+pub(crate) fn entry_overhead<S>() -> usize {
+    std::mem::size_of::<Entry<S>>()
+        .saturating_sub(std::mem::size_of::<S>() + std::mem::size_of::<Checkpoint>())
 }
 
 /// One common admission/eviction mechanism for compatible native states. Uses
@@ -119,14 +172,18 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// Moves state into the existing active frame: there is no cached duplicate
     /// while the provider mutates it. The active frame must count this allocation
     /// through its own existing HeapLayoutBound admission.
-    pub(crate) fn take(&mut self, key: &str) -> Option<Retained<S>> {
-        let retained = self.entries.remove(key).map(|entry| entry.retained);
-        record(if retained.is_some() {
+    pub(crate) fn take(&mut self, key: &str) -> Option<Taken<S>> {
+        let taken = self.entries.remove(key).map(|entry| Taken {
+            retained: entry.retained,
+            modified_hint: entry.modified_hint,
+            finalization_charge: entry.finalization_charge,
+        });
+        record(if taken.is_some() {
             Event::TakeHit
         } else {
             Event::TakeAbsent
         });
-        retained
+        taken
     }
     pub(crate) fn clear(&mut self) {
         add(Event::ClearEntriesReleased, self.entries.len() as u64);
@@ -167,6 +224,45 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         heap_layout_bound::bound(self, usize::MAX)
             .is_some_and(|resident| resident.saturating_sub(older) <= limit)
     }
+    /// M-a's churn bound: `release_older_until`, refusing (evicting nothing)
+    /// unless at most `max_victims` entries ranked strictly below `rank` fit
+    /// `limit` by their stored `heap_bytes` (`older_prefix_len`). The exact
+    /// eviction stops at the first fit, so it never evicts more than that.
+    pub(crate) fn release_older_until_at_most(
+        &mut self,
+        limit: usize,
+        rank: (i64, i64),
+        max_victims: usize,
+    ) -> bool {
+        self.older_prefix_len(limit, rank)
+            .is_some_and(|victims| victims <= max_victims)
+            && self.evict_until(limit, Release::CopyAdmission, Some(rank))
+    }
+    /// How many entries ranked strictly below `rank`, taken in victim order,
+    /// fit `limit` by their stored `heap_bytes` alone: `Some(0)` when the
+    /// cache fits already, `None` when all of them do not. Allocation-free
+    /// (one ordered pass per victim, as `evict_until` selects them).
+    pub(crate) fn older_prefix_len(&self, limit: usize, rank: (i64, i64)) -> Option<usize> {
+        if heap_layout_bound::bound(self, limit).is_some() {
+            return Some(0);
+        }
+        let mut resident = heap_layout_bound::bound(self, usize::MAX)?;
+        let mut last = None;
+        let mut victims = 0usize;
+        while resident > limit {
+            let (order, entry) = self
+                .entries
+                .values()
+                .filter(|entry| entry.modified_hint < rank)
+                .map(|entry| ((entry.modified_hint, entry.used), entry))
+                .filter(|(order, _)| last.map_or(true, |last| *order > last))
+                .min_by_key(|(order, _)| *order)?;
+            resident = resident.saturating_sub(entry.heap_bytes);
+            last = Some(order);
+            victims = victims.checked_add(1)?;
+        }
+        Some(victims)
+    }
     /// Evict in victim order, only entries ranked strictly below `below`
     /// when given, until the resident state fits `limit`.
     fn evict_until(&mut self, limit: usize, cause: Release, below: Option<(i64, i64)>) -> bool {
@@ -199,6 +295,11 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             }
         }
     }
+    /// Resident entries (tests only).
+    #[cfg(test)]
+    pub(crate) fn entry_count(&self) -> usize {
+        self.entries.len()
+    }
     /// Sealed offset of a retained entry without taking it, so a page budget
     /// can plan a tail read before the frame consumes retained state.
     pub(crate) fn sealed_offset(&self, key: &str) -> Option<u64> {
@@ -211,6 +312,24 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         self.entries
             .get(key)
             .map(|entry| entry.retained.checkpoint.clone())
+    }
+    /// Resident keys in victim order, with each admitted hint and the exact
+    /// bytes its removal frees.
+    #[cfg(test)]
+    pub(crate) fn victims(&self) -> Vec<(String, (i64, i64), usize)> {
+        let mut order = self
+            .entries
+            .iter()
+            .map(|(key, entry)| {
+                let freed = entry_slot_bytes::<S>(key.capacity()).unwrap() + entry.heap_bytes;
+                ((entry.modified_hint, entry.used), key.clone(), freed)
+            })
+            .collect::<Vec<_>>();
+        order.sort_unstable_by_key(|(rank, _, _)| *rank);
+        order
+            .into_iter()
+            .map(|((hint, _), key, freed)| (key, hint, freed))
+            .collect()
     }
     #[cfg(test)]
     pub(crate) fn remove(&mut self, key: &str) {
@@ -233,21 +352,48 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
     /// cannot mutate the authoritative file index or settle upload progress.
     #[cfg(test)]
     pub(crate) fn insert(&mut self, key: String, retained: Retained<S>) -> bool {
-        self.insert_reserving(key, retained, 0)
+        self.insert_reserving(key, retained, 0, 0)
     }
     /// `live_bytes` is an actual checked native-layout charge, not file size.
     /// Native output/active copies keep this room while entries are admitted.
+    /// `finalization_charge` (within `live_bytes`) is this entry's own
+    /// finalization copy, carried to its next take (P1-RETAIN β). Production
+    /// admits through `insert_reserving_at_rank`.
+    #[cfg(test)]
     pub(crate) fn insert_reserving(
         &mut self,
         key: String,
         retained: Retained<S>,
         live_bytes: usize,
+        finalization_charge: usize,
     ) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default();
-        self.insert_at(key, retained, live_bytes, now)
+        self.insert_reserving_at_rank(key, retained, live_bytes, finalization_charge, None)
     }
+    /// `insert_reserving`, admitting the entry at `rank` when one was computed
+    /// before (P1-RETAIN R0: the rank its completion's release ran against,
+    /// `admission_rank` of this checkpoint's mtime), so the entry's hint is
+    /// exactly the one its release ranked residents against and no later clock
+    /// read moves it. `None` ranks it now, as every other admission does.
+    pub(crate) fn insert_reserving_at_rank(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        finalization_charge: usize,
+        rank: Option<(i64, i64)>,
+    ) -> bool {
+        match rank {
+            Some(rank) => self.admit_at_rank(key, retained, live_bytes, finalization_charge, rank),
+            None => self.admit(
+                key,
+                retained,
+                live_bytes,
+                finalization_charge,
+                admission_now(),
+            ),
+        }
+    }
+    #[cfg(test)]
     fn insert_at(
         &mut self,
         key: String,
@@ -255,18 +401,48 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
         live_bytes: usize,
         now: std::time::Duration,
     ) -> bool {
+        self.admit(key, retained, live_bytes, 0, now)
+    }
+    /// `live_bytes` is the whole reservation kept beside the entries;
+    /// `finalization_charge` is the part of it owned by this entry's own
+    /// finalization copy, kept on the entry for its next take (β).
+    fn admit(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        finalization_charge: usize,
+        now: std::time::Duration,
+    ) -> bool {
+        let rank = admission_rank(retained.checkpoint.modified_hint(), now);
+        self.admit_at_rank(key, retained, live_bytes, finalization_charge, rank)
+    }
+    /// `admit` with the entry's victim-order hint already ranked
+    /// (`admission_rank`).
+    fn admit_at_rank(
+        &mut self,
+        key: String,
+        retained: Retained<S>,
+        live_bytes: usize,
+        finalization_charge: usize,
+        rank: (i64, i64),
+    ) -> bool {
         self.entries.remove(&key);
         let Some(resident_limit) = self.byte_limit.checked_sub(live_bytes) else {
             record(Event::InsertLiveReservationRefused);
             return false;
         };
         let Some(next) = self.clock.checked_add(1) else {
-            // A safe local reset; no durable debt is owned here.
+            // A safe local reset; no durable debt is owned here. Unreachable
+            // in practice (`u64` admissions), but it does clear the cache.
             self.entries.clear();
             self.clock = 0;
             record(Event::InsertClockReset);
             return false;
         };
+        // A zero count limit, or a toolchain whose layouts are not validated.
+        // Neither evicts; a P1-RETAIN R0 release needs a supported layout, so
+        // it never precedes this refusal.
         if self.count_limit == 0 || !heap_layout_bound::layout_supported() {
             record(Event::InsertDisabledOrLayoutRefused);
             return false;
@@ -281,20 +457,16 @@ impl<S: FrozenCacheState> TranscriptCache<S> {
             record(Event::InsertFrozenChargeRefused);
             return false;
         }
-        let clock_hint = (
-            i64::try_from(now.as_secs()).unwrap_or(i64::MAX),
-            i64::from(now.subsec_nanos()),
-        );
-        // Future source timestamps are clipped to admission time, so they
-        // cannot rank an entry ahead of later live work. Only the count/byte
-        // caps and the victim order below decide residency, never idle age:
-        // under pressure, older-modified work loses to newer resident state.
-        // Neither decision suppresses a native full read or audit.
+        // Only the count/byte caps and the victim order below decide
+        // residency, never idle age: under pressure, older-modified work loses
+        // to newer resident state. Neither decision suppresses a native full
+        // read or audit.
         let entry = Entry {
-            modified_hint: retained.checkpoint.modified_hint().min(clock_hint),
+            modified_hint: rank,
             retained,
             used: next,
             heap_bytes,
+            finalization_charge,
         };
         let Some(state_bytes) = heap_layout_bound::bound(&entry, self.entry_limit) else {
             record(Event::InsertEntryBoundRefused);
@@ -362,7 +534,7 @@ mod tests {
                     at
                 ));
             }
-            let moved = cache.take("a").unwrap();
+            let moved = cache.take("a").unwrap().retained;
             assert_eq!(moved.state, "a");
             assert!(cache.insert_at("a".into(), moved, 0, at));
             assert!(!cache.insert_at("older".into(), retained_at("old".into(), Some(1)), 0, at));
@@ -372,7 +544,8 @@ mod tests {
             assert!(!cache.insert_reserving(
                 "no-room".into(),
                 retained("x".into()),
-                2 * 1024 * 1024
+                2 * 1024 * 1024,
+                0
             ));
             // Cursor reservation still uses the same victim order. Leave room
             // for the empty map; no policy or byte limit is changed.
@@ -515,7 +688,8 @@ mod tests {
             assert!(cache.insert_reserving(
                 n.to_string(),
                 retained("x".repeat(4 * 1024 * 1024)),
-                live_bytes
+                live_bytes,
+                0
             ));
             assert!(cache.resident_bound().unwrap() + live_bytes + overlap <= CACHE_BYTES);
         }
@@ -523,7 +697,12 @@ mod tests {
             cache.entries.len() < 8,
             "admission evicts instead of consuming live/overlap reservation"
         );
-        assert!(!cache.insert_reserving("no-room".into(), retained("x".into()), 33 * 1024 * 1024));
+        assert!(!cache.insert_reserving(
+            "no-room".into(),
+            retained("x".into()),
+            33 * 1024 * 1024,
+            0
+        ));
     }
     #[test]
     fn sampled_cache_frozen_charges_survive_aggregate_walk_pressure_and_remeasure_mutation() {
@@ -539,7 +718,7 @@ mod tests {
             assert!(cache.resident_bound().unwrap() >= expected * (n + 1));
         }
         assert_eq!(cache.entries.len(), 24);
-        let mut moved = cache.take("0").unwrap();
+        let mut moved = cache.take("0").unwrap().retained;
         assert_eq!(cache.entries.len(), 23);
         moved.state[0].reserve(1024 * 1024);
         assert!(!cache.insert("0".into(), moved));
@@ -669,5 +848,140 @@ mod tests {
         ));
         value.lock().unwrap().reserve(1024 * 1024);
         assert!(cache.take("shared").is_none());
+    }
+
+    /// P1-RETAIN R0: `entry_slot_bytes` is exactly what one entry adds to the
+    /// cache's bound beyond its `heap_bytes`, and what removing it frees.
+    #[test]
+    fn entry_slot_bytes_equals_the_measured_bound_delta_of_one_insert_and_one_remove() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.insert_at("resident".into(), retained_at("r".into(), Some(10)), 0, at));
+        for key in ["k", "a-much-longer-key-with-more-heap"] {
+            let before = cache.resident_bound().unwrap();
+            let key = String::from(key);
+            let capacity = key.capacity();
+            assert!(cache.insert_at(key.clone(), retained_at("x".repeat(300), Some(20)), 0, at));
+            let heap_bytes = cache.entries[&key].heap_bytes;
+            let slot = entry_slot_bytes::<String>(capacity).unwrap();
+            let after = cache.resident_bound().unwrap();
+            assert_eq!(after - before, slot + heap_bytes, "insert {key}");
+            cache.remove(&key);
+            assert_eq!(cache.resident_bound().unwrap(), before, "remove {key}");
+        }
+        assert!(entry_overhead::<String>() > 0);
+        assert_eq!(
+            entry_overhead::<String>(),
+            std::mem::size_of::<Entry<String>>()
+                - std::mem::size_of::<String>()
+                - std::mem::size_of::<Checkpoint>()
+        );
+    }
+
+    /// P1-RETAIN R0 releases through M1's `release_older_until` (c22 integ1
+    /// ruling 6): only entries ranked strictly below the rank leave, in victim
+    /// order, the shortest prefix that fits; an unreachable fit evicts
+    /// nothing; equal and newer hints never leave.
+    #[test]
+    fn release_older_until_is_fit_or_nothing_and_strictly_older() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        for (key, modified) in [("old", 10), ("mid", 20), ("same", 30), ("new", 40)] {
+            assert!(cache.insert_at(
+                key.into(),
+                retained_at(key.repeat(5_000), Some(modified)),
+                0,
+                at
+            ));
+        }
+        let freed = |key: &str| {
+            entry_slot_bytes::<String>(key.len()).unwrap() + cache.entries[key].heap_bytes
+        };
+        let (old, mid) = (freed("old"), freed("mid"));
+        let hint = cache.entries["same"].modified_hint;
+        assert_eq!(hint, (30, 0));
+        let resident = cache.resident_bound().unwrap();
+        // Already fitting evicts nothing.
+        assert!(cache.older_release_fits(resident, hint));
+        // `same` and `new` are never candidates: an unreachable fit evicts
+        // nothing.
+        let unreachable = resident - old - mid - 1;
+        assert!(!cache.older_release_fits(unreachable, hint));
+        assert!(!cache.release_older_until(unreachable, hint));
+        assert_eq!(cache.resident_bound().unwrap(), resident);
+        assert_eq!(cache.entry_count(), 4);
+        // The release frees exactly the shortest prefix, under `CopyAdmission`.
+        let (_, counts) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+            assert!(cache.release_older_until(resident - old - 1, hint));
+        });
+        assert_eq!(counts.copy_refusal_admission_evicted, 2);
+        assert!(counts.copy_refusal_bytes_released > 0);
+        assert_eq!(counts.insert_entries_evicted, 0);
+        assert_eq!(counts.cursor_reservation_entries_evicted, 0);
+        assert_eq!(cache.resident_bound().unwrap(), resident - old - mid);
+        assert!(cache.entries.contains_key("same") && cache.entries.contains_key("new"));
+    }
+
+    /// Every admission ranks through `admission_rank` (a future mtime clips to
+    /// the admission clock); a rank computed before (P1-RETAIN R0, the rank
+    /// its release ran against) is admitted exactly, never re-ranked by a
+    /// later clock read.
+    #[test]
+    fn admission_rank_clips_once_and_a_carried_rank_is_admitted_exactly() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        assert_eq!(admission_rank((500, 7), at), (100, 0));
+        assert_eq!(admission_rank((50, 7), at), (50, 7));
+        assert_eq!(admission_rank((100, 0), at), (100, 0));
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.insert_reserving_at_rank(
+            "carried".into(),
+            retained_at("c".into(), Some(500)),
+            0,
+            0,
+            Some((90, 0))
+        ));
+        assert_eq!(cache.entries["carried"].modified_hint, (90, 0));
+        assert!(cache.insert_reserving_at_rank(
+            "ranked".into(),
+            retained_at("r".into(), Some(50)),
+            0,
+            0,
+            None
+        ));
+        assert_eq!(cache.entries["ranked"].modified_hint, (50, 0));
+    }
+
+    /// `Taken` carries the clipped admitted hint and the reserved finalization
+    /// charge (β).
+    #[test]
+    fn take_carries_the_clipped_admission_hint_and_finalization_charge() {
+        if !heap_layout_bound::layout_supported() {
+            return;
+        }
+        let at = std::time::Duration::from_secs(100);
+        let mut cache = TranscriptCache::new(1024 * 1024, 128 * 1024, 8);
+        assert!(cache.admit(
+            "future".into(),
+            retained_at("f".into(), Some(500)),
+            4096,
+            4096,
+            at
+        ));
+        assert!(cache.insert_at("past".into(), retained_at("p".into(), Some(50)), 0, at));
+        let future = cache.take("future").unwrap();
+        assert_eq!(future.modified_hint, (100, 0), "clipped to admission time");
+        assert_eq!(future.finalization_charge, 4096);
+        let past = cache.take("past").unwrap();
+        assert_eq!(past.modified_hint, (50, 0));
+        assert_eq!(past.finalization_charge, 0);
     }
 }

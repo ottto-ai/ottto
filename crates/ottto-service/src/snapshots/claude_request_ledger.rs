@@ -23,8 +23,10 @@
 //! scoped holder group (the project directory, across config roots) has no
 //! lost, over-budget, stale or unverified record, the telemetry sweep has
 //! read past the unit's clock, and the root's trace is known when two
-//! in-family members hold the id. Unknown debt is `Undecided`, never a
-//! guess, and keeps the family's coverage incomplete.
+//! in-family members hold the id. On top of those, "no telemetry owner"
+//! needs the census's holder view (`claude_request_money::coverage`), which
+//! is incomplete until Fix 3. Unknown debt is `Undecided`, never a guess,
+//! and keeps the family's coverage incomplete.
 //!
 //! Nothing here feeds a live decision: verdicts only shape the shadow body.
 
@@ -99,6 +101,9 @@ pub(crate) enum ClaudeUndecidedBy {
     StaleHolder,
     /// First-seen births are partly unknown.
     Births,
+    /// No telemetry claims it and the census's holder view is not complete
+    /// (`coverage::FamilyCoverage`): another holder may be unobserved.
+    HolderView,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,12 +130,18 @@ pub(crate) struct ClaudeRequestHolders<'a> {
 /// map entry's node share and its vector's growth.
 const HOLD_BYTES: usize = 128;
 
+/// Comparisons between two deadline checks inside one record.
+const INTERSECT_CHECK_EVERY: u64 = 4096;
+
 /// The hashes present in both sorted lists, probing the shorter list into
-/// the longer one.
+/// the longer one. False when `found` refuses or the deadline passes (it is
+/// checked every `INTERSECT_CHECK_EVERY` comparisons, so a large record
+/// cannot run past it).
 fn intersect(
     left: &[u64],
     right: &[u64],
     compared: &mut u64,
+    deadline: Instant,
     mut found: impl FnMut(u64) -> bool,
 ) -> bool {
     let (short, long) = if left.len() <= right.len() {
@@ -140,6 +151,9 @@ fn intersect(
     };
     for hash in short {
         *compared += 1;
+        if *compared % INTERSECT_CHECK_EVERY == 0 && Instant::now() >= deadline {
+            return false;
+        }
         if long.binary_search(hash).is_ok() && !found(*hash) {
             return false;
         }
@@ -191,9 +205,13 @@ pub(crate) fn scan_holders<'a>(
             ..
         } = &mut holders;
         if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
-                hold(transcript, overflow, &mut *charge, hash, key)
-            })
+            || !intersect(
+                record.request_hashes(),
+                page_hashes,
+                compared,
+                deadline,
+                |hash| hold(transcript, overflow, &mut *charge, hash, key),
+            )
         {
             return None;
         }
@@ -206,9 +224,13 @@ pub(crate) fn scan_holders<'a>(
             ..
         } = &mut holders;
         if late()
-            || !intersect(record.request_hashes(), page_hashes, compared, |hash| {
-                hold(telemetry, overflow, &mut *charge, hash, key)
-            })
+            || !intersect(
+                record.request_hashes(),
+                page_hashes,
+                compared,
+                deadline,
+                |hash| hold(telemetry, overflow, &mut *charge, hash, key),
+            )
         {
             return None;
         }
@@ -235,6 +257,7 @@ pub(crate) fn scan_holders<'a>(
                 record.request_hashes(),
                 page_message_hashes,
                 compared,
+                deadline,
                 |hash| hold(message, overflow, &mut *charge, hash, file_key),
             ) {
                 return None;
@@ -541,8 +564,11 @@ pub(crate) struct ClaudeClassifyContext<'a, 'b> {
     /// The telemetry certificate: the sweep read everything written before
     /// this time (0 while any telemetry debt is open).
     pub(crate) telemetry_complete_through: u64,
-    /// The page deadline: body building stops past it (the page is refused).
+    /// The page deadline: body building stops past it (the family fails).
     pub(crate) deadline: std::time::Instant,
+    /// Whether the census sees every holder (else a unit no telemetry
+    /// claims is held).
+    pub(crate) holder_view: super::claude_request_money::coverage::ClaudeHolderView,
     /// T-empty units SOURCE's held-unbuilt-older rule would hold (counted,
     /// no verdict changes).
     pub(crate) unbuilt_older: Cell<u64>,
@@ -670,6 +696,9 @@ impl ClaudeClassifyContext<'_, '_> {
             if let Some(reason) = self.scope.group_blocks(own_key, false) {
                 return ClaudeRequestVerdict::Undecided(reason);
             }
+            if !self.holder_view.request {
+                return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::HolderView);
+            }
             return self.t_empty_verdict(&holders, own_key);
         };
         if claimant != own_telemetry {
@@ -740,6 +769,9 @@ impl ClaudeClassifyContext<'_, '_> {
         }
         if let Some(reason) = self.scope.group_blocks(own_key, true) {
             return ClaudeRequestVerdict::Undecided(reason);
+        }
+        if !self.holder_view.message {
+            return ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::HolderView);
         }
         let holders = holders_with(self.holders.message_holders(hash), own_key);
         self.t_empty_verdict(&holders, own_key)
@@ -955,25 +987,26 @@ fn pressure(ledger: &ClaudeLedger, percent: usize) -> bool {
 /// copy of one falls back to policy. Records are retired in place (taken and
 /// reinserted without copying a hash). Returns how many; the caller drops
 /// the telemetry certificate when any had claims.
-pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 {
-    if !pressure(ledger, PRESSURE_START_PERCENT) {
+pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger, deadline: Instant) -> u64 {
+    if Instant::now() >= deadline || !pressure(ledger, PRESSURE_START_PERCENT) {
         return 0;
     }
-    let mut candidates = ledger
-        .census()
-        .records_with_prefix(TELEMETRY_KEY_PREFIX)
-        .filter(|(_, record)| !record.request_hashes().is_empty())
-        .map(|(key, record)| {
-            (
+    let mut candidates = Vec::new();
+    for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
+        if Instant::now() >= deadline {
+            return 0;
+        }
+        if !record.request_hashes().is_empty() {
+            candidates.push((
                 record.tail().map_or(0, |tail| tail.last_append_unix),
                 key.clone(),
-            )
-        })
-        .collect::<Vec<_>>();
+            ));
+        }
+    }
     candidates.sort_unstable();
     let mut retired = 0;
     for (_, key) in candidates {
-        if !pressure(ledger, PRESSURE_TARGET_PERCENT) {
+        if Instant::now() >= deadline || !pressure(ledger, PRESSURE_TARGET_PERCENT) {
             break;
         }
         if let Some(mut record) = ledger.take(&key) {
@@ -983,4 +1016,38 @@ pub(crate) fn retire_telemetry_under_pressure(ledger: &mut ClaudeLedger) -> u64 
         }
     }
     retired
+}
+
+#[cfg(test)]
+mod inner_deadline_tests {
+    use super::*;
+    #[test]
+    fn money_p1b_intersection_expires_after_entering_large_record() {
+        let hashes = (0..1_000_000).collect::<Vec<u64>>();
+        let started = Instant::now();
+        let deadline = started + std::time::Duration::from_millis(20);
+        let mut compared = 0;
+        let mut found = 0;
+        assert!(!intersect(
+            &hashes,
+            &hashes,
+            &mut compared,
+            deadline,
+            |_| {
+                found += 1;
+                if found == 1 {
+                    // Expire only after the first comparison and callback prove
+                    // the large record's inner loop was entered.
+                    while Instant::now() < deadline {
+                        std::hint::spin_loop();
+                    }
+                }
+                true
+            }
+        ));
+        assert!(found > 0);
+        assert_eq!(compared, INTERSECT_CHECK_EVERY);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        println!("MONEY_P1B_INNER compared={compared} found={found} wall_us={} check_interval={INTERSECT_CHECK_EVERY}", started.elapsed().as_micros());
+    }
 }

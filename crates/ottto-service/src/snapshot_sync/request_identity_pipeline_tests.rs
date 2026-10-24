@@ -258,12 +258,9 @@ fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
     assert_eq!(item.provenance.collector, identity::COLLECTOR);
     assert!(item.claude_org_markers.is_some(), "markers are captured");
     assert!(identity::desktop_census(&permitted.scanned_index).is_some());
-    // Without telemetry the only basis is the marker org, and only when the
-    // pass settled; nothing is refused and usage is unchanged.
-    assert!(item
-        .request_evidence
-        .iter()
-        .all(|evidence| evidence.identity_basis == identity::TRANSCRIPT_ORG));
+    // Even a settled pass withdraws marker-only tags. Nothing is refused
+    // and usage is unchanged.
+    assert!(item.request_evidence.is_empty());
     assert_eq!(item.request_identity_refusals, 0);
     assert_eq!(
         (item.request_count, item.input_tokens, item.output_tokens),
