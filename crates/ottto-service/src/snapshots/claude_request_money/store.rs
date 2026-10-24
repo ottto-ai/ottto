@@ -588,7 +588,7 @@ enum Job {
         release: Receiver<()>,
     },
     Checkpoint(Box<CheckpointPayload>, ShadowReservation),
-    Recovery(Box<dyn FnOnce() + Send>, Arc<ShadowReservation>),
+    Recovery(Box<dyn FnOnce() + Send>, Arc<Mutex<ShadowReservation>>),
 }
 
 enum Slot {
@@ -641,7 +641,7 @@ impl Job {
         match self {
             Self::Write(job) => job.queued_bytes(),
             Self::Checkpoint(payload, allocation) => payload.2.bytes() + allocation.bytes(),
-            Self::Recovery(_, allocation) => allocation.bytes(),
+            Self::Recovery(_, allocation) => allocation.lock().unwrap().bytes(),
             _ => 0,
         }
     }
@@ -820,8 +820,9 @@ fn run_writer(receiver: Receiver<Job>) {
     while let Ok(job) = receiver.recv() {
         match job {
             Job::Recovery(operation, allocation) => {
+                let queued = allocation.lock().unwrap().bytes();
                 operation();
-                QUEUED_BYTES.fetch_sub(allocation.bytes(), Ordering::AcqRel);
+                QUEUED_BYTES.fetch_sub(queued, Ordering::AcqRel);
             }
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
@@ -880,7 +881,7 @@ fn run_writer(receiver: Receiver<Job>) {
 /// drops an unconsumed payload before releasing its allocation on cancellation.
 pub(crate) struct RecoveryJob<T> {
     result: Receiver<T>,
-    _allocation: Arc<ShadowReservation>,
+    _allocation: Arc<Mutex<ShadowReservation>>,
 }
 impl<T> RecoveryJob<T> {
     pub(crate) fn try_recv(&self) -> Result<T, TryRecvError> {
@@ -893,14 +894,23 @@ impl<T> RecoveryJob<T> {
 /// completed result until the caller has consumed or dropped its ticket.
 pub(crate) fn recovery_job<T: Send + 'static>(
     bytes: usize,
+    retained_bytes: usize,
     operation: impl FnOnce() -> T + Send + 'static,
 ) -> Option<RecoveryJob<T>> {
-    let funds = Arc::new(ShadowReservation::admit(bytes)?);
+    if retained_bytes > bytes {
+        return None;
+    }
+    let funds = Arc::new(Mutex::new(ShadowReservation::admit(bytes)?));
     let retained = funds.clone();
+    let completed = funds.clone();
     let (done, result) = sync_channel(1);
     submit(Job::Recovery(
         Box::new(move || {
-            let _ = done.send(operation());
+            let value = operation();
+            // Scratch is gone; keep only the proved result bound paid. Shrink
+            // the same reservation before publishing, with no uncharged gap.
+            assert!(completed.lock().unwrap().resize(retained_bytes));
+            let _ = done.send(value);
         }),
         funds,
     ))
@@ -2013,7 +2023,7 @@ mod refused_intent_tests {
         use std::sync::atomic::{AtomicBool, Ordering};
         struct Payload {
             bytes: Vec<u8>,
-            funding: Arc<Mutex<Option<std::sync::Weak<ShadowReservation>>>>,
+            funding: Arc<Mutex<Option<std::sync::Weak<Mutex<ShadowReservation>>>>>,
             paid_on_drop: Arc<AtomicBool>,
         }
         impl Drop for Payload {
@@ -2034,7 +2044,7 @@ mod refused_intent_tests {
         let paid = Arc::new(AtomicBool::new(false));
         let saved_funding = funding.clone();
         let saved_paid = paid.clone();
-        let receipt = recovery_job(8192, move || Payload {
+        let receipt = recovery_job(16384, 8192, move || Payload {
             bytes: vec![0; 4096],
             funding: saved_funding,
             paid_on_drop: saved_paid,
@@ -2044,7 +2054,7 @@ mod refused_intent_tests {
         *funding.lock().unwrap() = Some(weak.clone());
         assert!(flush_acknowledged());
         assert_eq!(
-            weak.upgrade().unwrap().bytes(),
+            weak.upgrade().unwrap().lock().unwrap().bytes(),
             8192,
             "a completed, unconsumed result still owns its prepaid storage"
         );
@@ -2054,6 +2064,25 @@ mod refused_intent_tests {
             "receiver cancellation drops data before credit"
         );
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn completed_recovery_results_release_working_scratch_without_losing_their_credit() {
+        let mut results = Vec::new();
+        // Retaining all 16 working reservations would exceed the unchanged
+        // shared ceiling. Completed results need only their own bounded data.
+        for _ in 0..16 {
+            let result = recovery_job(8 * 1024 * 1024, 8192, || vec![0_u8; 4096]).unwrap();
+            assert!(flush_acknowledged());
+            assert_eq!(result._allocation.lock().unwrap().bytes(), 8192);
+            results.push(result);
+        }
+        for result in results {
+            let bytes = result.try_recv().unwrap();
+            assert_eq!(bytes.len(), 4096);
+            drop(bytes); // The payment remains live through data disposal.
+        }
     }
 
     #[test]

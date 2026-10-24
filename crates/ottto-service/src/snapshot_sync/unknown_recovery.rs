@@ -666,8 +666,19 @@ impl std::error::Error for CorruptBody {}
 fn job<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<Ticket<T>> {
+    job_with_result_funds(4 * MANIFEST_MAX, operation)
+}
+fn catalog_job(
+    operation: impl FnOnce() -> Result<Vec<Manifest>> + Send + 'static,
+) -> Result<Ticket<Vec<Manifest>>> {
+    job_with_result_funds(4 * ACTIVE_MAX * MANIFEST_MAX, operation)
+}
+fn job_with_result_funds<T: Send + 'static>(
+    retained: usize,
+    operation: impl FnOnce() -> Result<T> + Send + 'static,
+) -> Result<Ticket<T>> {
     Ok(Ticket {
-        receiver: store::recovery_job(IO_FUNDS, move || {
+        receiver: store::recovery_job(IO_FUNDS, retained, move || {
             let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
                 Ok(result) => result,
                 Err(_) => return Err(fault()),
@@ -735,8 +746,13 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
     {
         return Err(fault());
     }
-    let (updates, waiting) = {
+    let (updates, waiting, _handoff_funds) = {
         let mut outcomes = OUTCOMES.lock().map_err(|_| fault())?;
+        // Keep received manifests paid after removing their tickets and until
+        // replacement, without reversing the Catalog -> OUTCOMES lock order.
+        let count = outcomes.get(support).map_or(0, Vec::len);
+        let handoff = money::ShadowReservation::admit(count.saturating_mul(4 * MANIFEST_MAX))
+            .ok_or_else(fault)?;
         let mut updates = Vec::new();
         let mut waiting = false;
         if let Some(tickets) = outcomes.get_mut(support) {
@@ -752,7 +768,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
                 outcomes.remove(support);
             }
         }
-        (updates, waiting)
+        (updates, waiting, handoff)
     };
     for updated in updates {
         replace(support, updated)?;
@@ -763,7 +779,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
     let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
     if !catalogs.contains_key(support) {
         let root = dir(support);
-        let ticket = job(move || load_for_startup(&root, now))?;
+        let ticket = catalog_job(move || load_for_startup(&root, now))?;
         catalogs.insert(
             support.to_path_buf(),
             Catalog {
@@ -779,7 +795,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
     let catalog = catalogs.get_mut(support).unwrap();
     if catalog.loading.is_none() && catalog.maintenance_day != Some(now / 86400) {
         let root = dir(support);
-        catalog.loading = Some(job(move || load_for_startup(&root, now))?);
+        catalog.loading = Some(catalog_job(move || load_for_startup(&root, now))?);
         catalog.maintenance_day = Some(now / 86400);
         return Ok(false);
     }
@@ -813,7 +829,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
         .collect::<Vec<_>>();
     if !legacy.is_empty() {
         let support = support.to_path_buf();
-        catalog.loading = Some(job(move || {
+        catalog.loading = Some(catalog_job(move || {
             let root = dir(&support);
             private_dir(&root)?;
             sync_dir(&support)?;
@@ -897,7 +913,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
         }
         // The existing writer completes this before another startup is ready.
         let support_owned = support.to_path_buf();
-        let ticket = job(move || {
+        let ticket = catalog_job(move || {
             terminal(support_owned.clone(), m, reason, now)?;
             load(&dir(&support_owned))
         })?;
@@ -1699,6 +1715,7 @@ pub(super) async fn outcomes(support: &Path) -> Result<()> {
         .remove(support)
         .unwrap_or_default();
     for ticket in tickets {
+        let _handoff = money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(fault)?;
         replace(
             support,
             wait(ticket)
