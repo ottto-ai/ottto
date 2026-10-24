@@ -36936,6 +36936,7 @@ impl ScanIndex {
             };
             let previous = (entry.last_snapshot_fingerprint.is_some()
                 || entry.last_upload_body_witness.is_some()
+                || entry.effective_upload_body_witness_revision != 0
                 || self.confirmed_empty_files.contains(key))
             .then(|| claude_history_upgrade::HeldUploadTuple {
                 last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
