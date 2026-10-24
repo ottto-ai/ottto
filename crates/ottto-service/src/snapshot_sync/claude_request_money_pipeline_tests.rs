@@ -1361,7 +1361,7 @@ fn money_p1b_70k_family_and_midnight_restart_resource_receipt() {
     assert!(first.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     // Closing work must fit the total deadline; tolerate CI scheduling only.
     assert!(first.elapsed_us <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros() as u64, "{first:?}");
-    assert!(first.capture_us <= 300_000, "{first:?}");
+    assert!(first.capture_us <= 125_000, "{first:?}");
     let (capture_input, capture_comparisons, _) = money::capture::work_for_test(&fixture.support);
     assert!(capture_input <= 8 * 1024 * 1024, "{capture_input}");
     assert!(capture_comparisons <= 1_048_576, "{capture_comparisons}");
@@ -1462,7 +1462,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(first_page["page_families"].as_u64().unwrap(), rows.iter().filter(|row| row["row"] == "family").count() as u64);
     assert_eq!(money::reserved_for_test(), 0);
     let (input, comparisons, capture_us) = money::capture::work_for_test(&fixture.support);
-    assert!(capture_us <= 300_000, "capture callback overshoot: {capture_us}");
+    assert!(capture_us <= 125_000, "capture callback overshoot: {capture_us}");
     assert!(input <= 8 * 1024 * 1024, "{input}");
     assert!(comparisons <= 1_048_576, "{comparisons}");
     // Reproduce a native Full rearm. It uses fresh current captures, not the
