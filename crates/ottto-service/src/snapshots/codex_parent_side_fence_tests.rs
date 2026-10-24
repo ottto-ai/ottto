@@ -880,3 +880,123 @@ fn a_fence_use_stamps_the_request_with_the_wrap_epoch() {
         sampled_scan::side_ledger::LedgerEntry::of_request(&index.codex_parent_side_requests[KEY])
     );
 }
+
+/// A live (child-referenced) P grown sparsely to `extent` (`set_len`, no
+/// data written), so the 2 GiB extents cost no IO.
+fn sparse_live_parent(name: &str, extent: u64) -> (Parent, [String; 1], ScanIndex) {
+    let parent = Parent::new(name, 9_000);
+    parent.writer().set_len(extent).unwrap();
+    assert_eq!(parent.len(), extent);
+    let ids = ["019a0000-0000-7000-8000-00000000000c".to_owned()];
+    let mut index = ScanIndex {
+        codex_parent_proof_wrap_epoch: 4,
+        ..ScanIndex::default()
+    };
+    index.codex_parent_ownership_refs.insert(ids[0].clone());
+    (parent, ids, index)
+}
+
+/// FC1 (#656) C-G1: main's certified parse of a live P whose held-FD
+/// extent is over main's 2 GiB cap writes no side state: no record, no
+/// generation, no lifecycle event; a request the seal covers is not cured
+/// and the side ledger entry is untouched.
+#[test]
+fn main_writes_no_side_state_for_a_live_parent_over_the_cap() {
+    let (parent, ids, mut index) = sparse_live_parent("cap-over", MAX_CODEX_JSONL_FILE_BYTES + 1);
+    let mut request = parent.request(SideRequestState::Live, 2);
+    request.needed_extent = 100;
+    index.codex_parent_side_requests.insert(KEY.into(), request);
+    let parse = main_parse(&parent, SideVerdict::Settled, false);
+    assert_eq!(parse.parsed.extent(), MAX_CODEX_JSONL_FILE_BYTES + 1);
+    assert!(
+        parse.seal.sealed_offset() >= request.needed_extent,
+        "covered"
+    );
+    let before = serde_json::to_value(&index).unwrap();
+    let (written, counts) =
+        observe(|| index.write_codex_parent_side_from_main(KEY, &ids, parse, None));
+    assert!(!written);
+    assert_eq!(counts, Counts::default());
+    assert!(index.codex_parent_side.is_empty());
+    assert_eq!(index.codex_parent_side_generation, 0);
+    assert_eq!(index.codex_parent_side_requests[KEY], request, "not cured");
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+
+    // With the side ledger as the request view: the entry is untouched.
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = sampled_scan::SharedCache::default();
+    let ns = namespace_of(Path::new("/idx/cap-over.json"));
+    let key = LedgerKey {
+        ns,
+        p: parent_of(KEY),
+        dev: parent.dev_ino().0,
+        ino: parent.dev_ino().1,
+    };
+    cache
+        .side_ledger()
+        .charge(key, LedgerEntry::of_request(&request), now())
+        .unwrap();
+    let entry = *cache.side_ledger().get(&key).unwrap();
+    let parse = main_parse(&parent, SideVerdict::Settled, false);
+    let (written, counts) =
+        observe(|| index.write_codex_parent_side_from_main(KEY, &ids, parse, Some((&cache, ns))));
+    assert!(!written);
+    assert_eq!(counts, Counts::default());
+    assert_eq!(*cache.side_ledger().get(&key).unwrap(), entry);
+    assert_eq!(serde_json::to_value(&index).unwrap(), before);
+}
+
+/// FC1 (#656) C-G2: at exactly main's cap the gate is false and the
+/// writer is main's: the live P's record is created, the generation takes
+/// +1 and one write is counted.
+#[test]
+fn main_writes_the_side_record_for_a_live_parent_at_the_cap() {
+    let (parent, ids, mut index) = sparse_live_parent("cap-at", MAX_CODEX_JSONL_FILE_BYTES);
+    let parse = main_parse(&parent, SideVerdict::Settled, false);
+    assert_eq!(parse.parsed.extent(), MAX_CODEX_JSONL_FILE_BYTES);
+    let (written, counts) =
+        observe(|| index.write_codex_parent_side_from_main(KEY, &ids, parse, None));
+    assert!(written);
+    assert_eq!(counts.side_records_written, 1);
+    assert_eq!(index.codex_parent_side_generation, 1);
+    let record = &index.codex_parent_side[KEY];
+    assert_eq!((record.generation, record.referenced_epoch), (1, 4));
+    assert_eq!(record.parsed.extent(), MAX_CODEX_JSONL_FILE_BYTES);
+}
+
+/// FC1 (#656) C-G3, the disclosed residual: P sealed at main's cap that
+/// grew past it by the post-commit capture writes nothing, so a request the
+/// seal covers stays uncured (inert: the fence holds P as `FileCapHeld`
+/// before it reads requests).
+#[test]
+fn a_parent_grown_past_the_cap_after_its_seal_keeps_its_request_uncured() {
+    let (mut parent, ids, mut index) = sparse_live_parent("cap-grown", MAX_CODEX_JSONL_FILE_BYTES);
+    let seal = parent.seal(now(), &codex_parent_side_scope().0);
+    let mut request = parent.request(SideRequestState::Live, 2);
+    request.needed_extent = MAX_CODEX_JSONL_FILE_BYTES;
+    index.codex_parent_side_requests.insert(KEY.into(), request);
+    parent
+        .writer()
+        .set_len(MAX_CODEX_JSONL_FILE_BYTES + 1)
+        .unwrap();
+    let parse = SideMainParse {
+        seal,
+        parsed: OpenStamp::capture(&parent.file).unwrap(),
+        verdict: SideVerdict::Settled,
+        unsealed: false,
+    };
+    assert!(
+        parse.seal.sealed_offset() >= request.needed_extent,
+        "covered"
+    );
+    let (written, counts) =
+        observe(|| index.write_codex_parent_side_from_main(KEY, &ids, parse, None));
+    assert!(!written);
+    assert_eq!(counts, Counts::default());
+    assert!(index.codex_parent_side.is_empty());
+    assert_eq!(index.codex_parent_side_generation, 0);
+    assert_eq!(index.codex_parent_side_requests[KEY], request, "uncured");
+    assert_eq!(parent.fence(&mut index, 1, now()).0, SideFence::FileCapHeld);
+}

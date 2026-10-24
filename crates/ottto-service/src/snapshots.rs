@@ -2376,11 +2376,11 @@ fn codex_parent_side_scope() -> crate::transcript_acquisition::Scope {
     ]))
 }
 
-/// U1a-2a: P is over main's Codex file cap, so no side record is kept for it.
-/// The same predicate main's cap sites use.
+/// U1a-2a: P is over main's 2 GiB Codex cap (the unpaged limit). The side
+/// path keeps no record for it, as on main, where such P was never read.
 #[cfg_attr(not(test), allow(dead_code))] // first production caller is the fence
 fn codex_parent_over_cap(len: u64) -> bool {
-    len > max_jsonl_file_bytes(SnapshotSource::Codex)
+    len > MAX_CODEX_JSONL_FILE_BYTES
 }
 
 /// U1a-2a: the pacing a covering side record keeps after its request is
@@ -20154,6 +20154,13 @@ impl ScanIndex {
         side: Option<(&sampled_scan::SharedCache, u128)>,
     ) -> bool {
         use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
+        // FC1 (#656): main never reads a Codex parent over its 2 GiB cap, so
+        // it never writes side state for one. A paged read of such a parent
+        // writes none either: no record, generation or lifecycle event. The
+        // extent is the certified held FD's stamp (at or after the commit).
+        if codex_parent_over_cap(parse.parsed.extent()) {
+            return false;
+        }
         if parse.unsealed && parse.verdict == SideVerdict::Settled {
             return false;
         }

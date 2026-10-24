@@ -2318,9 +2318,10 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
 // unpaged limit with a due side request is opened with no size refusal and
 // becomes side-planned, but #660's G4a (a side read is a singleton read)
 // exits before the G7 charge: no side read starts, no side ledger entry,
-// the request is untouched, nothing is requeued, and `oversized_file_count`
-// equals the control page's (no request). Without the scaled limits the
-// same request starts its side read, so the request itself is due.
+// nothing is requeued, and `oversized_file_count` equals the control page's
+// (no request). The side state (requests, records, ledger) comes out exactly
+// as main's twin leaves it: the same request with P under the unpaged limit
+// but over the singleton, main's G4a exit for a side-planned file.
 #[test]
 fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -2385,8 +2386,13 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
     requested
         .codex_parent_side_requests
         .insert(key.clone(), request);
-    // Production ordering, scaled: singleton < unpaged limit < P's length.
-    let after = with_test_unpaged_limit(len - 1, || {
+    // (ii) Main's twin: singleton < P's length <= the unpaged limit.
+    let twin = with_test_limits(1 << 20, len - 2, 64, || {
+        let (twin, _) = side_page(requested.clone(), &cache);
+        (twin, ledger_entry(cache.as_ref()))
+    });
+    // (i) Production ordering, scaled: singleton < unpaged limit < P's length.
+    with_test_unpaged_limit(len - 1, || {
         with_test_limits(1 << 20, len - 2, 64, || {
             let (_, control) = side_page(settled.clone(), &cache);
             let before = counters(&cache);
@@ -2394,17 +2400,22 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             assert_eq!(counts.side_reads_started, 0, "{counts:?}");
             assert_eq!(counts.side_reads_ended, 0, "{counts:?}");
             assert!(ledger_entry(cache.as_ref()).is_none(), "no G7 charge");
-            assert_eq!(after.codex_parent_side_requests.get(&key), Some(&request));
+            assert_eq!(
+                after.codex_parent_side_requests, twin.0.codex_parent_side_requests,
+                "requests as main's twin"
+            );
+            assert_eq!(after.codex_parent_side, twin.0.codex_parent_side);
+            assert_eq!(
+                ledger_entry(cache.as_ref()),
+                twin.1,
+                "ledger as main's twin"
+            );
             assert!(after.codex_parent_side.is_empty());
             assert_eq!(counters(&cache).deferred, before.deferred, "no requeue");
             assert!(!pending(&after, &path));
             assert_eq!(treated.oversized_file_count, control.oversized_file_count);
             assert_eq!(treated.oversized_file_count, 0);
             assert!(treated.snapshots.is_empty(), "main's Skip");
-            after
         })
     });
-    // Control: the same request at production limits starts its side read.
-    let (_, counts) = observe(|| side_page(after, &cache));
-    assert_eq!(counts.side_reads_started, 1, "{counts:?}");
 }
