@@ -36,8 +36,8 @@ pub(crate) use claude_context_file_birth::{
 mod claude_history_upgrade;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
-    local_count as history_local_count, LocalCount as HistoryLocalCount,
-    REQUEST_OWNED_USAGE_CONTRACT,
+    local_count as history_local_count, with_max_gated_claude_revision,
+    LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
 };
 #[cfg(test)]
 mod claude_history_upgrade_tests;
@@ -36424,7 +36424,13 @@ impl ScanIndex {
         source: SnapshotSource,
         snapshots: &mut Vec<SnapshotItem>,
     ) -> usize {
-        if source != SnapshotSource::ClaudeCode || self.claude_history_emission.files.is_empty() {
+        if source != SnapshotSource::ClaudeCode {
+            return 0;
+        }
+        let guard = self.claude_literal_guard(snapshots);
+        if self.claude_history_emission.files.is_empty()
+            && guard == claude_history_upgrade::LiteralGuard::Open
+        {
             return 0;
         }
         if claude_reemission_stop_latched() {
@@ -36433,7 +36439,7 @@ impl ScanIndex {
         let emission = &mut self.claude_history_emission;
         let before = snapshots.len();
         snapshots.retain(|snapshot| {
-            if emission.permits(snapshot) {
+            if emission.permits(snapshot, &guard) {
                 return true;
             }
             if let Some(gated) = snapshot
@@ -36452,10 +36458,37 @@ impl ScanIndex {
     /// Hook for resend paths outside the page (StateMissing #706 re-offer
     /// leases, #692 in-place resends) and for MONEY's literal items, which
     /// are built after the emission seam: drop every item of a source file
-    /// the history gate holds this cycle, and every request-owned literal
-    /// item of a literal-denied file. They must call it on what they send.
+    /// the history gate holds this cycle, every request-owned literal item
+    /// of a literal-denied file, and every literal the guard denies whether
+    /// or not its file was decided this cycle (C2). They must call it on what
+    /// they send.
     pub(crate) fn retain_claude_history_emission_permitted(&self, items: &mut Vec<SnapshotItem>) {
-        items.retain(|item| self.claude_history_emission.permits(item));
+        let guard = self.claude_literal_guard(items);
+        items.retain(|item| self.claude_history_emission.permits(item, &guard));
+    }
+
+    /// SOURCE h732 C2: the request-owned literal guard for `items`, from the
+    /// active row, the list and the index only.
+    fn claude_literal_guard(&self, items: &[SnapshotItem]) -> claude_history_upgrade::LiteralGuard {
+        claude_history_upgrade::LiteralGuard::for_items(
+            items,
+            self.active_effective_upload_body_witness_revision,
+            &self.claude_reemission_exclusions,
+            self.files
+                .iter()
+                .map(|(key, entry)| (key.as_str(), entry.source_file_fingerprint.as_str())),
+            |key| self.claude_family_listed(key),
+        )
+    }
+
+    /// True when the list names the family of this indexed Claude file (its
+    /// root or the member itself), as the candidate decision reads it.
+    fn claude_family_listed(&self, index_key: &str) -> bool {
+        !self.claude_reemission_exclusions.is_empty()
+            && claude_index_path_member_ref(Path::new(index_key)).is_some_and(|member| {
+                self.claude_reemission_exclusions
+                    .excludes(member.root, member.subagent_stem)
+            })
     }
 
     /// Finalize a held history file without its new bodies: an existing entry
@@ -36530,8 +36563,10 @@ impl ScanIndex {
     /// The one writer of a settled file's `effective_upload_body_witness_revision`.
     /// Claude never downgrades (`max(stored, allowed_active)`); Codex and Pi
     /// keep the exact stamp. Refuses a zero revision, a file excluded for a
-    /// local hold, a file the history gate holds, and a literal-denied file:
-    /// a protected root never stamps to a new revision. MONEY (#699) routes
+    /// local hold, a file the history gate holds, a literal-denied file, and
+    /// under a row that denies the literal any listed family or, while the
+    /// list is paused, any file: a protected root never stamps to a new
+    /// revision. MONEY (#699) routes
     /// its covering-ACK, below-floor and confirmed-empty settlements here.
     /// The only other writer is `re_owe_effective_upload_body_witness_revision`.
     pub(crate) fn stamp_effective_upload_body_witness_revision(
@@ -36553,10 +36588,20 @@ impl ScanIndex {
         {
             return false;
         }
+        // SOURCE h732 C2: a revision whose row denies the request-owned
+        // literal never stamps a listed family, or any file while the list is
+        // paused, whatever this cycle decided (a covering ACK, below-floor or
+        // confirmed-empty settlement of a file that was not a candidate).
+        if claude_history_upgrade::denies_request_owned_literal(allowed_active)
+            && (self.claude_reemission_exclusions.pauses_adoption()
+                || self.claude_family_listed(index_key))
+        {
+            return false;
+        }
         let monotone = self.active_effective_upload_body_witness_revision_monotone;
         // SOURCE F2: no Claude file is stamped above the last revision the
         // history gate is complete for.
-        if monotone && allowed_active > MAX_GATED_CLAUDE_REVISION {
+        if monotone && allowed_active > claude_history_upgrade::max_gated_claude_revision() {
             return false;
         }
         let Some(entry) = self.files.get_mut(index_key) else {

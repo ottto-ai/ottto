@@ -671,58 +671,60 @@ fn only_files_that_grew_after_a_rebuild_emit() {
 /// root is owed and held, never settled as revision-3 history.
 #[test]
 fn revision_three_listed_change_emits_its_ordinary_body_without_the_literal() {
-    use crate::snapshots::{history_local_count, HistoryLocalCount};
-    let fixture = HistoryFixture::new("history-upgrade-revision-three");
-    fixture.baseline();
-    fixture.install_list(&[HISTORY_SESSIONS[0]]);
-    fixture.append(HISTORY_SESSIONS[0], "req_0_2");
-    let revision_3 = HistoryCycle {
-        revision: 3,
-        upload_context: "history-context-2",
-        mint_literal: true,
-        ..HISTORY_REVISION_2
-    };
-    let denied = history_local_count(HistoryLocalCount::ListedLiteralDenied);
-    let changed = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
-    assert_eq!(
-        history_local_count(HistoryLocalCount::ListedLiteralDenied),
-        denied + 1,
-        "listed_literal counts the listed root's change"
-    );
-    assert!(
-        changed.uploaded.contains(HISTORY_SESSIONS[0]),
-        "the listed root's ordinary body emits on a genuine change"
-    );
-    assert_eq!(
-        changed.uploaded_literal,
-        HISTORY_SESSIONS[1..]
-            .iter()
-            .map(|session| session.to_string())
-            .collect::<BTreeSet<_>>(),
-        "no literal item of the listed root; unlisted history carries it"
-    );
-    let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
-    assert_eq!(
-        changed.index.files[&listed].effective_upload_body_witness_revision, 1,
-        "no revision-3 stamp on the listed root"
-    );
-    for session in &HISTORY_SESSIONS[1..] {
-        let key = HistoryFixture::key(&changed.index, session);
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        use crate::snapshots::{history_local_count, HistoryLocalCount};
+        let fixture = HistoryFixture::new("history-upgrade-revision-three");
+        fixture.baseline();
+        fixture.install_list(&[HISTORY_SESSIONS[0]]);
+        fixture.append(HISTORY_SESSIONS[0], "req_0_2");
+        let revision_3 = HistoryCycle {
+            revision: 3,
+            upload_context: "history-context-2",
+            mint_literal: true,
+            ..HISTORY_REVISION_2
+        };
+        let denied = history_local_count(HistoryLocalCount::ListedLiteralDenied);
+        let changed = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
         assert_eq!(
-            changed.index.files[&key].effective_upload_body_witness_revision,
-            3
+            history_local_count(HistoryLocalCount::ListedLiteralDenied),
+            denied + 1,
+            "listed_literal counts the listed root's change"
         );
-    }
-    let quiet = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
-    assert!(
-        quiet.uploaded.is_empty(),
-        "owed and held: {:?}",
-        quiet.uploaded
-    );
-    assert_eq!(
-        quiet.index.files[&listed].effective_upload_body_witness_revision,
-        1
-    );
+        assert!(
+            changed.uploaded.contains(HISTORY_SESSIONS[0]),
+            "the listed root's ordinary body emits on a genuine change"
+        );
+        assert_eq!(
+            changed.uploaded_literal,
+            HISTORY_SESSIONS[1..]
+                .iter()
+                .map(|session| session.to_string())
+                .collect::<BTreeSet<_>>(),
+            "no literal item of the listed root; unlisted history carries it"
+        );
+        let listed = HistoryFixture::key(&changed.index, HISTORY_SESSIONS[0]);
+        assert_eq!(
+            changed.index.files[&listed].effective_upload_body_witness_revision, 1,
+            "no revision-3 stamp on the listed root"
+        );
+        for session in &HISTORY_SESSIONS[1..] {
+            let key = HistoryFixture::key(&changed.index, session);
+            assert_eq!(
+                changed.index.files[&key].effective_upload_body_witness_revision,
+                3
+            );
+        }
+        let quiet = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
+        assert!(
+            quiet.uploaded.is_empty(),
+            "owed and held: {:?}",
+            quiet.uploaded
+        );
+        assert_eq!(
+            quiet.index.files[&listed].effective_upload_body_witness_revision,
+            1
+        );
+    });
 }
 
 /// Addendum 1 item 5: revision 2 lets a listed family's genuine change sync,
@@ -764,42 +766,44 @@ fn revision_two_syncs_listed_changes_and_never_downgrades_three() {
 /// one is held and keeps 2, an unlisted one upgrades back to 3.
 #[test]
 fn a_re_owed_file_goes_back_through_the_gate() {
-    use crate::snapshots::{history_local_count, HistoryLocalCount};
-    let fixture = HistoryFixture::new("history-upgrade-reowe");
-    fixture.baseline();
-    fixture.install_list(&[]);
-    let revision_3 = HistoryCycle {
-        revision: 3,
-        upload_context: "history-context-1",
-        ..HISTORY_REVISION_2
-    };
-    let upgraded = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
-    assert_eq!(upgraded.uploaded.len(), HISTORY_SESSIONS.len());
-    let mut index = upgraded.index;
-    index.activate_effective_upload_body_witness_revision(3);
-    let reowed = history_local_count(HistoryLocalCount::Reowed);
-    for session in &HISTORY_SESSIONS[..2] {
-        let key = HistoryFixture::key(&index, session);
-        assert!(index.re_owe_effective_upload_body_witness_revision(&key, 2));
-    }
-    assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
-    index
-        .save(&fixture.index_path)
-        .expect("save re-owed stamps");
-    fixture.install_list(&[HISTORY_SESSIONS[0]]);
-    let again = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
-    assert_eq!(
-        again.uploaded,
-        BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
-        "the listed re-owed root is held; the unlisted one upgrades"
-    );
-    for (session, revision) in HISTORY_SESSIONS.iter().zip([2, 3, 3]) {
-        let key = HistoryFixture::key(&again.index, session);
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        use crate::snapshots::{history_local_count, HistoryLocalCount};
+        let fixture = HistoryFixture::new("history-upgrade-reowe");
+        fixture.baseline();
+        fixture.install_list(&[]);
+        let revision_3 = HistoryCycle {
+            revision: 3,
+            upload_context: "history-context-1",
+            ..HISTORY_REVISION_2
+        };
+        let upgraded = fixture.cycle("2026-08-02T09:00:00Z", revision_3);
+        assert_eq!(upgraded.uploaded.len(), HISTORY_SESSIONS.len());
+        let mut index = upgraded.index;
+        index.activate_effective_upload_body_witness_revision(3);
+        let reowed = history_local_count(HistoryLocalCount::Reowed);
+        for session in &HISTORY_SESSIONS[..2] {
+            let key = HistoryFixture::key(&index, session);
+            assert!(index.re_owe_effective_upload_body_witness_revision(&key, 2));
+        }
+        assert_eq!(history_local_count(HistoryLocalCount::Reowed), reowed + 2);
+        index
+            .save(&fixture.index_path)
+            .expect("save re-owed stamps");
+        fixture.install_list(&[HISTORY_SESSIONS[0]]);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", revision_3);
         assert_eq!(
-            again.index.files[&key].effective_upload_body_witness_revision, revision,
-            "{session}"
+            again.uploaded,
+            BTreeSet::from([HISTORY_SESSIONS[1].to_string()]),
+            "the listed re-owed root is held; the unlisted one upgrades"
         );
-    }
+        for (session, revision) in HISTORY_SESSIONS.iter().zip([2, 3, 3]) {
+            let key = HistoryFixture::key(&again.index, session);
+            assert_eq!(
+                again.index.files[&key].effective_upload_body_witness_revision, revision,
+                "{session}"
+            );
+        }
+    });
 }
 
 /// Addendum 2 item 14 (#700): with the seen-marker present, an empty load
@@ -1439,12 +1443,8 @@ fn another_destinations_claude_state_is_prior_history() {
         crate::snapshots::PriorHistory::None,
         "this destination's own files are not evidence"
     );
-    // I-r3-1: legacy leftovers that name no other namespace are not a move:
-    // an unscoped pre-destination index and this destination's own v1/v2.
+    // I-r3-1: this destination's own v1/v2 leftovers are not a move.
     for legacy in [
-        fixture
-            .support
-            .join("snapshots/claude_code-scan-index-no-titles.json"),
         own.join("claude_code-scan-index.json"),
         own.join("claude_code-scan-index-v2.json"),
     ] {
@@ -1453,8 +1453,19 @@ fn another_destinations_claude_state_is_prior_history() {
     assert_eq!(
         prior(),
         crate::snapshots::PriorHistory::None,
-        "a same-destination or unscoped legacy leftover is not another destination"
+        "a same-destination legacy leftover is not another destination"
     );
+    // SOURCE h732 C3: an unscoped pre-scoping index names no destination, so
+    // it is not a move, but it is this Mac's history: Here, so a cutoff keeps
+    // it owed, list-gated and paced.
+    std::fs::write(
+        fixture
+            .support
+            .join("snapshots/claude_code-scan-index-no-titles.json"),
+        b"{}",
+    )
+    .expect("unscoped legacy index");
+    assert_eq!(prior(), crate::snapshots::PriorHistory::Here);
     let other = destinations.join("destination-a");
     std::fs::create_dir_all(&other).expect("create other destination");
     std::fs::write(

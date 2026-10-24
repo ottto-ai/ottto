@@ -45,14 +45,15 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Highest active Claude revision the gate is complete for (SOURCE F2).
-/// The revision-3 row is complete (literal-only denial for listed roots and
-/// paused lists, its own no-list cutoff, mtime-only changes held), so this
-/// is 3. Above it every owed upgrade and every listed change is held, no
-/// file is stamped, activation is refused at runtime
+/// Highest active Claude revision the gate is open for (SOURCE F2). The
+/// revision-3 row below exists, but this stays at the current revision until
+/// MONEY's activation PR (#699) raises it with the Claude revision constant
+/// (SOURCE h732 C1). Above it every owed upgrade and every listed change is
+/// held, no file is stamped, activation is refused at runtime
 /// (`activate_effective_upload_body_witness_revision`), and the Claude
-/// revision constant fails to compile. The release check reads this line.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
+/// revision constant fails to compile. The release check reads the next
+/// line, so keep it free of comments and other digits.
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
 /// The request-owned usage literal of MONEY P2 (#699's
 /// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
@@ -109,7 +110,7 @@ pub(super) fn revision_policy(revision: u64) -> Option<RevisionPolicy> {
 }
 
 #[cfg(not(test))]
-fn max_gated_claude_revision() -> u64 {
+pub(super) fn max_gated_claude_revision() -> u64 {
     MAX_GATED_CLAUDE_REVISION
 }
 
@@ -120,7 +121,7 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn max_gated_claude_revision() -> u64 {
+pub(super) fn max_gated_claude_revision() -> u64 {
     MAX_GATED_FOR_TEST.with(std::cell::Cell::get)
 }
 
@@ -566,8 +567,12 @@ impl HistoryEmission {
     }
 
     /// Whether this item may reach an upload path this cycle: no item of a
-    /// held file, and no request-owned literal of a literal-denied file.
-    pub(super) fn permits(&self, item: &super::SnapshotItem) -> bool {
+    /// held file, no request-owned literal of a literal-denied file, and no
+    /// literal the guard denies whatever this cycle decided (C2).
+    pub(super) fn permits(&self, item: &super::SnapshotItem, guard: &LiteralGuard) -> bool {
+        if !guard.permits(item) {
+            return false;
+        }
         let Some(gated) = item
             .source_file_fingerprint
             .as_deref()
@@ -592,6 +597,92 @@ impl HistoryEmission {
             }
         }
         held
+    }
+}
+
+fn is_request_owned_literal(item: &super::SnapshotItem) -> bool {
+    item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT)
+}
+
+/// True when `revision`'s row denies listed (or, while the list is paused,
+/// all) families the request-owned literal. A revision with no row denies it
+/// (fail closed).
+pub(super) fn denies_request_owned_literal(revision: u64) -> bool {
+    revision_policy(revision).map_or(true, |row| {
+        row.listed_emission == ListedEmission::WithoutRequestOwnedLiteral
+    })
+}
+
+/// The request-owned literal items one upload path may carry, read from the
+/// active row, the list and the index, never from this cycle's decisions
+/// (SOURCE h732 C2): a settlement, a re-offer outside the scan hints or an
+/// in-place resend can carry a literal of a listed root that was not a
+/// candidate this cycle.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum LiteralGuard {
+    /// The active row emits the literal, or no family is listed.
+    Open,
+    /// The list is paused: every family may be listed, so no literal passes.
+    DenyAll,
+    /// Only literals of these indexed source files, none of them in a listed
+    /// family, pass. An unknown or unindexed source fails closed.
+    Only(BTreeSet<String>),
+}
+
+impl LiteralGuard {
+    pub(super) fn permits(&self, item: &super::SnapshotItem) -> bool {
+        if !is_request_owned_literal(item) {
+            return true;
+        }
+        match self {
+            Self::Open => true,
+            Self::DenyAll => false,
+            Self::Only(sources) => item
+                .source_file_fingerprint
+                .as_deref()
+                .is_some_and(|source| sources.contains(source)),
+        }
+    }
+
+    /// The guard for `items`. `listed` says whether an indexed key's family
+    /// is listed; `files` yields every indexed key with its source file.
+    pub(super) fn for_items<'a>(
+        items: &[super::SnapshotItem],
+        active_revision: u64,
+        list: &ReemissionExclusions,
+        files: impl Iterator<Item = (&'a str, &'a str)>,
+        listed: impl Fn(&str) -> bool,
+    ) -> Self {
+        let literal_sources = items
+            .iter()
+            .filter(|item| is_request_owned_literal(item))
+            .filter_map(|item| item.source_file_fingerprint.as_deref())
+            .collect::<BTreeSet<_>>();
+        let any_literal = items.iter().any(is_request_owned_literal);
+        if !any_literal || !denies_request_owned_literal(active_revision) {
+            return Self::Open;
+        }
+        if list.pauses_adoption() {
+            return Self::DenyAll;
+        }
+        if list.is_empty() {
+            return Self::Open;
+        }
+        let mut unlisted = BTreeSet::new();
+        let mut denied = BTreeSet::new();
+        for (key, source) in files.filter(|(_, source)| literal_sources.contains(source)) {
+            if listed(key) {
+                denied.insert(source);
+            } else {
+                unlisted.insert(source);
+            }
+        }
+        Self::Only(
+            unlisted
+                .difference(&denied)
+                .map(|source| (*source).to_owned())
+                .collect(),
+        )
     }
 }
 
@@ -746,13 +837,60 @@ struct ActivationRefusedAlarm {
     history_activation_refused: u64,
 }
 
-/// True when `revision` may be activated. Otherwise counts the refusal and
-/// raises one local alarm for it; the caller keeps its active revision.
+#[cfg(not(test))]
+static ACTIVATION_REFUSED_LAST_ALARM: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+thread_local! {
+    static ACTIVATION_REFUSED_LAST_ALARM: std::cell::Cell<Option<std::time::Instant>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn activation_alarm_due(last: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    last.map_or(true, |at| {
+        now.saturating_duration_since(at) >= OWED_WITHOUT_LIST_ALARM_INTERVAL
+    })
+}
+
+#[cfg(not(test))]
+fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
+    let mut last = ACTIVATION_REFUSED_LAST_ALARM
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let due = activation_alarm_due(*last, now);
+    if due {
+        *last = Some(now);
+    }
+    due
+}
+
+#[cfg(test)]
+fn take_activation_alarm_slot(now: std::time::Instant) -> bool {
+    ACTIVATION_REFUSED_LAST_ALARM.with(|last| {
+        let due = activation_alarm_due(last.get(), now);
+        if due {
+            last.set(Some(now));
+        }
+        due
+    })
+}
+
+/// True when `revision` may be activated. Otherwise counts every refusal
+/// and raises a local alarm on the first, then at most hourly (SOURCE h732
+/// nit: #699 may retry each cycle); the caller keeps its active revision.
 pub(super) fn admit_activation(revision: u64, kept_revision: u64) -> bool {
+    admit_activation_at(revision, kept_revision, std::time::Instant::now())
+}
+
+fn admit_activation_at(revision: u64, kept_revision: u64, now: std::time::Instant) -> bool {
     if revision_policy(revision).is_some() {
         return true;
     }
     add_local_count(LocalCount::ActivationRefused);
+    if !take_activation_alarm_slot(now) {
+        return false;
+    }
     crate::local_resource_diagnostics::claude_history_revision_activation_refused(
         &ActivationRefusedAlarm {
             refused_revision: revision,
@@ -955,43 +1093,45 @@ mod tests {
     /// not a genuine change; it is unchanged history, so it is gated.
     #[test]
     fn a_same_size_mtime_only_change_is_not_a_genuine_change() {
-        for touched in [
-            FileExtent {
-                modified_unix_nanos: Some(100_000_000_001),
-                ..EXTENT
-            },
-            FileExtent {
-                modified_unix_seconds: 101,
-                modified_unix_nanos: Some(101_000_000_000),
-                ..EXTENT
-            },
-        ] {
-            assert_eq!(
-                classify(Some(EXTENT), touched, true, None, None),
-                HistoryKind::Owed
+        with_max_gated_claude_revision(3, || {
+            for touched in [
+                FileExtent {
+                    modified_unix_nanos: Some(100_000_000_001),
+                    ..EXTENT
+                },
+                FileExtent {
+                    modified_unix_seconds: 101,
+                    modified_unix_nanos: Some(101_000_000_000),
+                    ..EXTENT
+                },
+            ] {
+                assert_eq!(
+                    classify(Some(EXTENT), touched, true, None, None),
+                    HistoryKind::Owed
+                );
+                assert_eq!(
+                    classify(Some(EXTENT), touched, false, None, None),
+                    HistoryKind::Settled
+                );
+            }
+            let list = installed("");
+            let mut page = HistoryPage::default();
+            let touched = classify(
+                Some(EXTENT),
+                FileExtent {
+                    modified_unix_seconds: 101,
+                    ..EXTENT
+                },
+                true,
+                None,
+                None,
             );
             assert_eq!(
-                classify(Some(EXTENT), touched, false, None, None),
-                HistoryKind::Settled
+                decide(touched, &inputs(&list, true, 3), &mut page, "k", 1),
+                HistoryDecision::Held(HistoryHold::Listed),
+                "a touched listed file is held history, not a listed change"
             );
-        }
-        let list = installed("");
-        let mut page = HistoryPage::default();
-        let touched = classify(
-            Some(EXTENT),
-            FileExtent {
-                modified_unix_seconds: 101,
-                ..EXTENT
-            },
-            true,
-            None,
-            None,
-        );
-        assert_eq!(
-            decide(touched, &inputs(&list, true, 3), &mut page, "k", 1),
-            HistoryDecision::Held(HistoryHold::Listed),
-            "a touched listed file is held history, not a listed change"
-        );
+        });
     }
 
     #[test]
@@ -1037,17 +1177,21 @@ mod tests {
             revision_2.no_list_birth_cutoff_unix_seconds, 1_792_540_800,
             "revision 2 keeps 2026-10-21"
         );
-        let revision_3 = revision_policy(3).unwrap();
-        assert_eq!(
-            revision_3.listed_emission,
-            ListedEmission::WithoutRequestOwnedLiteral
-        );
-        assert_ne!(
-            revision_3.no_list_birth_cutoff_unix_seconds,
-            revision_2.no_list_birth_cutoff_unix_seconds,
-            "each revision carries its own no-list cutoff (F4b)"
-        );
+        // SOURCE h732 C1: revision 3's row opens only when #699 raises MAX.
         assert_eq!(revision_policy(MAX_GATED_CLAUDE_REVISION + 1), None);
+        with_max_gated_claude_revision(3, || {
+            let revision_3 = revision_policy(3).unwrap();
+            assert_eq!(
+                revision_3.listed_emission,
+                ListedEmission::WithoutRequestOwnedLiteral
+            );
+            assert_ne!(
+                revision_3.no_list_birth_cutoff_unix_seconds,
+                revision_2.no_list_birth_cutoff_unix_seconds,
+                "each revision carries its own no-list cutoff (F4b)"
+            );
+            assert_eq!(revision_policy(4), None);
+        });
         with_max_gated_claude_revision(2, || assert_eq!(revision_policy(3), None));
         // SOURCE F2: without a complete row a revision is ungated: an owed
         // upgrade to it is held whatever the list says.
@@ -1174,91 +1318,95 @@ mod tests {
     /// revision's own cutoff.
     #[test]
     fn the_no_list_birth_hold_is_per_revision() {
-        let not_installed = ReemissionExclusions::default();
-        let born_after_revision_2_cutoff = Some(1_792_540_800 + 60);
-        let mut page = HistoryPage::default();
-        for (revision, held) in [(2, false), (3, true)] {
-            let mut owed = inputs(&not_installed, false, revision);
-            owed.no_list_policy = NoListPolicy::HoldUnverified;
-            owed.birth_unix_seconds = born_after_revision_2_cutoff;
-            let decision = decide(HistoryKind::Owed, &owed, &mut page, "k", 1);
-            assert_eq!(
-                decision == HistoryDecision::Held(HistoryHold::NoListBirth),
-                held,
-                "revision {revision}: {decision:?}"
-            );
-        }
+        with_max_gated_claude_revision(3, || {
+            let not_installed = ReemissionExclusions::default();
+            let born_after_revision_2_cutoff = Some(1_792_540_800 + 60);
+            let mut page = HistoryPage::default();
+            for (revision, held) in [(2, false), (3, true)] {
+                let mut owed = inputs(&not_installed, false, revision);
+                owed.no_list_policy = NoListPolicy::HoldUnverified;
+                owed.birth_unix_seconds = born_after_revision_2_cutoff;
+                let decision = decide(HistoryKind::Owed, &owed, &mut page, "k", 1);
+                assert_eq!(
+                    decision == HistoryDecision::Held(HistoryHold::NoListBirth),
+                    held,
+                    "revision {revision}: {decision:?}"
+                );
+            }
+        });
     }
 
     #[test]
     fn listed_change_emits_under_revision_two_and_only_its_literal_is_denied_under_three() {
-        let list = installed("");
-        let mut page = HistoryPage::default();
-        assert_eq!(
-            decide(
-                HistoryKind::Changed,
-                &inputs(&list, true, 2),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::NotOwed
-        );
-        assert_eq!(
-            decide(
-                HistoryKind::Changed,
-                &inputs(&list, true, 3),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::LiteralDenied,
-            "the ordinary body emits; only the request-owned literal is denied"
-        );
-        assert_eq!(
-            decide(
-                HistoryKind::Fresh,
-                &inputs(&list, true, 3),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::LiteralDenied,
-            "a listed root's new file never carries the literal either"
-        );
-        assert_eq!(page.denied_for_reason(LISTED_LITERAL_REASON), 2);
-        assert!(page.denied_summary().contains("listed_literal:installed=2"));
-        assert_eq!(
-            decide(
-                HistoryKind::Changed,
-                &inputs(&list, false, 3),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::NotOwed,
-            "an unlisted change always syncs"
-        );
-        assert_eq!(
-            decide(
-                HistoryKind::Owed,
-                &inputs(&list, false, MAX_GATED_CLAUDE_REVISION + 1),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::Held(HistoryHold::UngatedRevision)
-        );
-        assert_eq!(
-            decide(
-                HistoryKind::Changed,
-                &inputs(&list, true, MAX_GATED_CLAUDE_REVISION + 1),
-                &mut page,
-                "k",
-                1
-            ),
-            HistoryDecision::Held(HistoryHold::UngatedRevision)
-        );
+        with_max_gated_claude_revision(3, || {
+            let list = installed("");
+            let mut page = HistoryPage::default();
+            assert_eq!(
+                decide(
+                    HistoryKind::Changed,
+                    &inputs(&list, true, 2),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::NotOwed
+            );
+            assert_eq!(
+                decide(
+                    HistoryKind::Changed,
+                    &inputs(&list, true, 3),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::LiteralDenied,
+                "the ordinary body emits; only the request-owned literal is denied"
+            );
+            assert_eq!(
+                decide(
+                    HistoryKind::Fresh,
+                    &inputs(&list, true, 3),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::LiteralDenied,
+                "a listed root's new file never carries the literal either"
+            );
+            assert_eq!(page.denied_for_reason(LISTED_LITERAL_REASON), 2);
+            assert!(page.denied_summary().contains("listed_literal:installed=2"));
+            assert_eq!(
+                decide(
+                    HistoryKind::Changed,
+                    &inputs(&list, false, 3),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::NotOwed,
+                "an unlisted change always syncs"
+            );
+            assert_eq!(
+                decide(
+                    HistoryKind::Owed,
+                    &inputs(&list, false, MAX_GATED_CLAUDE_REVISION + 1),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::Held(HistoryHold::UngatedRevision)
+            );
+            assert_eq!(
+                decide(
+                    HistoryKind::Changed,
+                    &inputs(&list, true, MAX_GATED_CLAUDE_REVISION + 1),
+                    &mut page,
+                    "k",
+                    1
+                ),
+                HistoryDecision::Held(HistoryHold::UngatedRevision)
+            );
+        });
     }
 
     /// F3: while the list is paused no family can be shown unlisted, so
@@ -1266,34 +1414,138 @@ mod tests {
     /// history stays held. Revision 2 is unchanged.
     #[test]
     fn a_paused_list_denies_only_the_literal_under_revision_three() {
-        for paused in [
-            installed("not-a-digest\n"),
-            ReemissionExclusions::default().with_state_for_test(ListState::MissingAfterInstall),
-            ReemissionExclusions::default().with_state_for_test(ListState::ClosureOverflow),
-        ] {
-            assert!(paused.pauses_adoption());
-            let mut page = HistoryPage::default();
-            for kind in [HistoryKind::Changed, HistoryKind::Fresh] {
+        with_max_gated_claude_revision(3, || {
+            for paused in [
+                installed("not-a-digest\n"),
+                ReemissionExclusions::default().with_state_for_test(ListState::MissingAfterInstall),
+                ReemissionExclusions::default().with_state_for_test(ListState::ClosureOverflow),
+            ] {
+                assert!(paused.pauses_adoption());
+                let mut page = HistoryPage::default();
+                for kind in [HistoryKind::Changed, HistoryKind::Fresh] {
+                    assert_eq!(
+                        decide(kind, &inputs(&paused, false, 3), &mut page, "k", 1),
+                        HistoryDecision::LiteralDenied
+                    );
+                    assert_eq!(
+                        decide(kind, &inputs(&paused, false, 2), &mut page, "k", 1),
+                        HistoryDecision::NotOwed
+                    );
+                }
                 assert_eq!(
-                    decide(kind, &inputs(&paused, false, 3), &mut page, "k", 1),
-                    HistoryDecision::LiteralDenied
-                );
-                assert_eq!(
-                    decide(kind, &inputs(&paused, false, 2), &mut page, "k", 1),
-                    HistoryDecision::NotOwed
+                    decide(
+                        HistoryKind::Owed,
+                        &inputs(&paused, false, 3),
+                        &mut page,
+                        "k",
+                        1
+                    ),
+                    HistoryDecision::Held(HistoryHold::ListPaused)
                 );
             }
+        });
+    }
+
+    /// SOURCE h732 nit: every refused activation counts; the alarm fires on
+    /// the first, then at most hourly.
+    #[test]
+    fn activation_refusal_alarms_at_most_hourly() {
+        let start = std::time::Instant::now();
+        let refused = local_count(LocalCount::ActivationRefused);
+        let ((), alarms) = crate::local_resource_diagnostics::capture(|| {
+            assert!(!admit_activation_at(4, 2, start));
+            assert!(!admit_activation_at(
+                4,
+                2,
+                start + std::time::Duration::from_secs(60)
+            ));
+            assert!(!admit_activation_at(
+                4,
+                2,
+                start + OWED_WITHOUT_LIST_ALARM_INTERVAL
+            ));
+            assert!(admit_activation_at(2, 2, start));
+        });
+        assert_eq!(alarms.len(), 2, "{alarms:?}");
+        assert_eq!(local_count(LocalCount::ActivationRefused), refused + 3);
+        assert_eq!(
+            alarms[1]["counts"]["history_activation_refused"],
+            refused + 3
+        );
+    }
+
+    /// SOURCE h732 C2: the literal guard reads the active row, the list and
+    /// the index, never this cycle's decisions; unknown sources fail closed.
+    #[test]
+    fn literal_guard_ignores_this_cycles_decisions() {
+        with_max_gated_claude_revision(3, || {
+            let item = |file: Option<&str>, literal: bool| {
+                let mut item = crate::snapshots::tests::sample_session_artifact_item();
+                item.source_file_fingerprint = file.map(Into::into);
+                item.usage_accounting_contract =
+                    literal.then(|| REQUEST_OWNED_USAGE_CONTRACT.into());
+                item
+            };
+            let items = [item(Some("open"), true), item(Some("listed"), true)];
+            let files = || {
+                [
+                    ("open.jsonl", "open"),
+                    ("listed.jsonl", "listed"),
+                    ("alias.jsonl", "open"),
+                ]
+                .into_iter()
+            };
+            let listed = |key: &str| key != "open.jsonl";
+            let list = installed("");
+            let guard = |revision: u64, list: &ReemissionExclusions| {
+                LiteralGuard::for_items(&items, revision, list, files(), listed)
+            };
+            let populated = ReemissionExclusions::parse(format!("{}\n", "a".repeat(64)).as_bytes());
             assert_eq!(
-                decide(
-                    HistoryKind::Owed,
-                    &inputs(&paused, false, 3),
-                    &mut page,
-                    "k",
-                    1
-                ),
-                HistoryDecision::Held(HistoryHold::ListPaused)
+                guard(2, &populated),
+                LiteralGuard::Open,
+                "revision 2 emits it"
             );
-        }
+            assert_eq!(guard(3, &list), LiteralGuard::Open, "nothing is listed");
+            assert_eq!(
+                guard(3, &ReemissionExclusions::default()),
+                LiteralGuard::Open,
+                "a list never installed lists nothing"
+            );
+            for paused in [
+                ListState::Unreadable,
+                ListState::MissingAfterInstall,
+                ListState::MarkerUnwritable,
+                ListState::ClosureOverflow,
+            ] {
+                let paused = ReemissionExclusions::default().with_state_for_test(paused);
+                assert_eq!(guard(3, &paused), LiteralGuard::DenyAll);
+            }
+            let only = guard(3, &populated);
+            assert_eq!(
+                only,
+                LiteralGuard::Only(BTreeSet::new()),
+                "a source any listed key carries is denied, an alias included"
+            );
+            let only_open = LiteralGuard::for_items(&items, 3, &populated, files(), |key| {
+                key == "listed.jsonl"
+            });
+            assert!(only_open.permits(&item(Some("open"), true)));
+            assert!(!only_open.permits(&item(Some("listed"), true)));
+            assert!(!only_open.permits(&item(Some("unindexed"), true)));
+            assert!(!only_open.permits(&item(None, true)));
+            assert!(
+                only_open.permits(&item(Some("listed"), false)),
+                "the body stays"
+            );
+            with_max_gated_claude_revision(2, || {
+                assert!(
+                    denies_request_owned_literal(3),
+                    "a rowless revision fails closed"
+                );
+            });
+            assert!(!denies_request_owned_literal(2));
+        });
     }
 
     #[test]
@@ -1319,16 +1571,19 @@ mod tests {
             item.usage_accounting_contract = literal.then(|| REQUEST_OWNED_USAGE_CONTRACT.into());
             item
         };
-        assert!(emission.permits(&item("denied", false)));
-        assert!(!emission.permits(&item("denied", true)));
-        assert!(!emission.permits(&item("held", false)));
-        assert!(emission.permits(&item("other", true)));
+        let open = LiteralGuard::Open;
+        assert!(emission.permits(&item("denied", false), &open));
+        assert!(!emission.permits(&item("denied", true), &open));
+        assert!(!emission.permits(&item("held", false), &open));
+        assert!(emission.permits(&item("other", true), &open));
         let mut ordinary = item("denied", false);
         ordinary.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
         assert!(
-            emission.permits(&ordinary),
+            emission.permits(&ordinary, &open),
             "session_exclusive v1 on the ordinary body keeps today's rules"
         );
+        assert!(!emission.permits(&item("other", true), &LiteralGuard::DenyAll));
+        assert!(emission.permits(&item("other", false), &LiteralGuard::DenyAll));
         assert!(emission.literal_denied("denied"));
         assert_eq!(
             emission.hold_permitted_for_latch(),
@@ -1340,30 +1595,32 @@ mod tests {
 
     #[test]
     fn re_owe_only_lowers_below_the_active_revision_and_counts() {
-        let before = local_count(LocalCount::Reowed);
-        let mut stored = 3;
-        assert!(!re_owe(&mut stored, 3, 3), "not a lowering");
-        assert!(!re_owe(&mut stored, 4, 3), "never raises");
-        let mut low = 1;
-        assert!(!re_owe(&mut low, 2, 3), "never raises");
-        let mut at_active = 3;
-        assert!(
-            !re_owe(&mut at_active, 2, 2),
-            "must end below the active revision"
-        );
-        assert_eq!(at_active, 3);
-        assert!(re_owe(&mut stored, 2, 3));
-        assert_eq!(stored, 2);
-        let mut decoded = 3;
-        assert!(
-            re_owe(&mut decoded, 2, 0),
-            "before activation the bound is the highest revision with a row"
-        );
-        with_max_gated_claude_revision(2, || {
+        with_max_gated_claude_revision(3, || {
+            let before = local_count(LocalCount::Reowed);
+            let mut stored = 3;
+            assert!(!re_owe(&mut stored, 3, 3), "not a lowering");
+            assert!(!re_owe(&mut stored, 4, 3), "never raises");
+            let mut low = 1;
+            assert!(!re_owe(&mut low, 2, 3), "never raises");
+            let mut at_active = 3;
+            assert!(
+                !re_owe(&mut at_active, 2, 2),
+                "must end below the active revision"
+            );
+            assert_eq!(at_active, 3);
+            assert!(re_owe(&mut stored, 2, 3));
+            assert_eq!(stored, 2);
             let mut decoded = 3;
-            assert!(!re_owe(&mut decoded, 2, 0));
+            assert!(
+                re_owe(&mut decoded, 2, 0),
+                "before activation the bound is the highest revision with a row"
+            );
+            with_max_gated_claude_revision(2, || {
+                let mut decoded = 3;
+                assert!(!re_owe(&mut decoded, 2, 0));
+            });
+            assert_eq!(local_count(LocalCount::Reowed), before + 2);
         });
-        assert_eq!(local_count(LocalCount::Reowed), before + 2);
     }
 
     #[test]

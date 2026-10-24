@@ -351,13 +351,16 @@ const _: () = assert!(
 ///   in its upload ledger (an accepted, quarantined or refused body or
 ///   accepted cache evidence; a generation or replay claim alone is saved
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
-///   sibling of this index; or the re-emission seen-marker.
+///   sibling of this index; or the re-emission seen-marker. Also, when the
+///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
+///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   is not a move, but this Mac did index history, so a cutoff keeps that
+///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
 ///   copy another destination's directory holds (an interrupted bootstrap
 ///   before a re-pair). A leftover is another destination only when it sits
-///   under a different namespace: an unscoped legacy index names no
-///   destination, so it is not a move (I-r3-1); unless a claim
+///   under a different namespace (I-r3-1); unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -404,7 +407,7 @@ fn claude_prior_history(
     // Only a different namespace's directory is another destination. An
     // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
     // no destination; it is usually this Mac's own pre-scoping index, so it
-    // must not hold history as a move (I-r3-1).
+    // must not hold history as a move (I-r3-1). It is `Here` evidence below.
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
@@ -460,8 +463,25 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
+    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
+    // directory fails closed; a missing one is empty.
+    let unscoped_legacy_index = || {
+        let prefix = format!("{slug}-scan-index");
+        match std::fs::read_dir(support_dir.join("snapshots")) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix)),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
+    } else if unscoped_legacy_index() {
+        PriorHistory::Here
     } else {
         PriorHistory::None
     }
