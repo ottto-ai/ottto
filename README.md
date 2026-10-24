@@ -194,6 +194,9 @@ secret-scan, contract checks, release/installer dry-run tests, and a
 self-exported bundle verification. This includes release manifest,
 stable-candidate RC, stable preflight, stable closeout, stable QA template,
 Homebrew, hosted installer, and CycloneDX SBOM generator tests.
+The default `--scope all` runs every step and needs macOS. GitHub CI splits the
+gate: `--scope portable` runs on Linux, and `--scope macos` runs the steps that
+need real macOS tools or macOS `/bin/bash` 3.2 inside the Rust contracts job.
 The skeleton gate also requires `docs/support.md`, the public support runbook
 covering redacted triage, diagnostics, escalation, data boundaries, and
 public-v1 closeout readiness.
