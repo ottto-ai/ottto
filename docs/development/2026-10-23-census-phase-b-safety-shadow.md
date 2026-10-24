@@ -65,7 +65,8 @@ enumerates the call sites. An identity arming (contract-5 or family proof
 re-arm, family correction, legacy witness, owned start, stale-family uncarry,
 cancel, rewind or stale-pending re-arm) takes a held earlier-form key out of
 the bound: the key leaves `n`, and a 16-hex token of the arming's evidence
-stays in `n.r` for one window. The revoke happens once per key per arming, is
+stays in `n.r` for one window. Every consumed token is kept (at most three
+per key; past that a re-entered hold stays held, failing closed). The revoke happens once per key per arming, is
 saved by the same commit as the arming's clear, and is counted in
 `census_duplicate_rebuild_identity_revoked`. The key is then re-offered on the
 next selection and never held, restored or revoked again for that arming.

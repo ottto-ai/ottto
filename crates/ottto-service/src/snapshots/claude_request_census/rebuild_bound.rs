@@ -86,6 +86,9 @@ const PRIOR_BYTES: usize = 64;
 const MAX_ALARMS_PER_TERMINAL: usize = 8;
 /// Identity-arming evidence longer than this revokes nothing.
 const MAX_ARMING_BYTES: usize = 4096;
+/// Distinct armings that may revoke one key in a window; past that a
+/// re-entered hold stays held (fail closed, read through the bound).
+const MAX_REVOKE_TOKENS: usize = 3;
 /// `closed_at` value of a guard that must be stamped at its next apply.
 const UNSTAMPED: u64 = u64::MAX;
 /// The marker value of a present but malformed "N3 initialized" marker.
@@ -150,30 +153,41 @@ pub(crate) struct DuplicateRebuildGuard {
 }
 crate::heap_layout_bound::fields!(DuplicateRebuildGuard; keys, untracked_refused, untracked_refused_at, orphaned, orphaned_at, priors_refused, priors_refused_at, closed_at, revoked, identity_revoked, identity_revoked_at);
 
-/// One identity revoke, `"<token>:<stamp>"`: the arming's token (16 hex
-/// digits of its evidence's SHA-256) and the unix second of the revoke.
+/// One key's identity revokes in the window, `"<token>,<token>:<stamp>"`:
+/// each arming's token (16 hex digits of its evidence's SHA-256), at most
+/// `MAX_REVOKE_TOKENS` distinct, and the unix second of the latest revoke.
+/// Every consumed token is kept, so a re-entered earlier-form hold is never
+/// revoked twice by one arming, whatever armed it in between.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct Revoked {
-    token: String,
+    tokens: Vec<String>,
     at: u64,
 }
-crate::heap_layout_bound::fields!(Revoked; token, at);
+crate::heap_layout_bound::fields!(Revoked; tokens, at);
 
 impl Serialize for Revoked {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        serializer.collect_str(&format_args!("{}:{}", self.token, self.at))
+        serializer.collect_str(&format_args!("{}:{}", self.tokens.join(","), self.at))
     }
 }
 impl<'de> Deserialize<'de> for Revoked {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let malformed = || <D::Error as serde::de::Error>::custom("rebuild guard revoke");
         let text = String::deserialize(deserializer)?;
-        let (token, at) = text.split_once(':').ok_or_else(malformed)?;
-        if token.len() != 16 || !lower_hex(token.as_bytes()) {
-            return Err(malformed());
+        let (tokens, at) = text.split_once(':').ok_or_else(malformed)?;
+        let mut parsed: Vec<String> = Vec::new();
+        for token in tokens.split(',') {
+            if parsed.len() >= MAX_REVOKE_TOKENS
+                || token.len() != 16
+                || !lower_hex(token.as_bytes())
+                || parsed.iter().any(|seen| seen == token)
+            {
+                return Err(malformed());
+            }
+            parsed.push(token.to_owned());
         }
         Ok(Self {
-            token: token.to_owned(),
+            tokens: parsed,
             at: at.parse().map_err(|_| malformed())?,
         })
     }
@@ -845,19 +859,20 @@ pub(crate) fn revoke_for_identity(
     }
     let mut token = crate::snapshots::sha256_hex(&["census_rebuild_identity_revoke:v1", arming]);
     token.truncate(16);
-    if guard
-        .revoked
-        .get(&id)
-        .is_some_and(|revoked| revoked.token == token)
-    {
+    if guard.revoked.get(&id).is_some_and(|revoked| {
+        revoked.tokens.contains(&token) || revoked.tokens.len() >= MAX_REVOKE_TOKENS
+    }) {
         // The same arming already revoked this key once (a re-entered
-        // earlier-form entry): never a second revoke for it.
+        // earlier-form entry): never a second revoke for it. Past the token
+        // cap the re-entered hold stays (fail closed).
         return;
     }
     // The key's slot moves to `r`: tracked keys and revokes share the cap.
     let now = now_unix();
     guard.keys.remove(&id);
-    guard.revoked.insert(id.clone(), Revoked { token, at: now });
+    let revoked = guard.revoked.entry(id.clone()).or_default();
+    revoked.tokens.push(token);
+    revoked.at = now;
     guard.identity_revoked = guard.identity_revoked.saturating_add(1);
     guard.identity_revoked_at = now;
     shadow.rebuild_witness = guard.latest_stamp();
@@ -1207,6 +1222,40 @@ mod tests {
             .expect("guard kept");
         assert_eq!(decoded.closed_at, None);
         assert_eq!(decoded.keys.len(), MAX_TRACKED_KEYS);
+
+        // SI-724-B1b: every slot revoked by the most armings fits the same
+        // bound and decodes intact.
+        let revoked = DuplicateRebuildGuard {
+            revoked: (0..MAX_TRACKED_KEYS)
+                .map(|slot| {
+                    let tokens = (0..MAX_REVOKE_TOKENS)
+                        .map(|token| format!("{token:016x}"))
+                        .collect();
+                    (
+                        format!("{slot:016x}"),
+                        Revoked {
+                            tokens,
+                            at: u64::MAX,
+                        },
+                    )
+                })
+                .collect(),
+            identity_revoked: u64::MAX,
+            identity_revoked_at: u64::MAX,
+            ..DuplicateRebuildGuard::default()
+        };
+        let mut index = ScanIndex::default();
+        index.claude_request_census_shadow.rebuild_bound = Some(Box::new(revoked.clone()));
+        let saved = serde_json::to_vec_pretty(&index).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&saved).unwrap();
+        let raw_guard =
+            serde_json::to_string_pretty(&value["claude_request_census_shadow"]["n"]).unwrap();
+        let saved_guard_bytes = raw_guard.len() + 8 * raw_guard.lines().count();
+        assert!(
+            saved_guard_bytes <= MAX_GUARD_RAW_BYTES / 2,
+            "{saved_guard_bytes}"
+        );
+        assert_eq!(DuplicateRebuildGuard::decode(&raw_guard), revoked);
     }
 
     /// Only real Claude index fingerprints are accepted as priors. Anything
@@ -1358,6 +1407,15 @@ mod tests {
             intact,
             "saved as decoded"
         );
+        let tokens =
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef,1111111111111111,2222222222222222:3"}}"#;
+        let guard = DuplicateRebuildGuard::decode(tokens);
+        assert_eq!(guard.closed_at, None);
+        assert_eq!(
+            guard.revoked["fedcba9876543210"].tokens.len(),
+            MAX_REVOKE_TOKENS
+        );
+        assert_eq!(serde_json::to_string(&guard).unwrap(), tokens);
         for broken in [
             r#"{"r":{"fedcba9876543210":"0123456789abcdef:3","fedcba9876543210":"0123456789abcdef:4"}}"#,
             r#"{"r":{"fedcba9876543210":"0123456789ABCDEF:3"}}"#,
@@ -1366,6 +1424,10 @@ mod tests {
             r#"{"r":{"fedcba987654321":"0123456789abcdef:3"}}"#,
             r#"{"r":{"fedcba9876543210":7}}"#,
             r#"{"r":[]}"#,
+            r#"{"r":{"fedcba9876543210":":3"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef,:3"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef,0123456789abcdef:3"}}"#,
+            r#"{"r":{"fedcba9876543210":"0123456789abcdef,1111111111111111,2222222222222222,3333333333333333:3"}}"#,
         ] {
             assert_eq!(
                 DuplicateRebuildGuard::decode(broken).closed_at,
@@ -1392,7 +1454,7 @@ mod tests {
                     (
                         format!("{slot:016x}"),
                         Revoked {
-                            token: "f".repeat(16),
+                            tokens: vec!["f".repeat(16)],
                             at: 1,
                         },
                     )
@@ -1406,7 +1468,7 @@ mod tests {
         over.revoked.insert(
             format!("{MAX_TRACKED_KEYS:016x}"),
             Revoked {
-                token: "f".repeat(16),
+                tokens: vec!["f".repeat(16)],
                 at: 1,
             },
         );
@@ -1416,6 +1478,54 @@ mod tests {
             Some(UNSTAMPED),
             "past the shared cap"
         );
+    }
+
+    /// SI-724-B1b, MONEY: one revoke per key per arming even when an
+    /// earlier-form hold re-enters between armings (A, then B, then A again
+    /// revokes nothing), every consumed token kept. Past `MAX_REVOKE_TOKENS`
+    /// distinct armings a re-entered hold stays held (fail closed).
+    #[test]
+    fn revokes_keep_every_consumed_arming_across_re_entry() {
+        let _clock = test_support::set_now(1_790_000_000);
+        let key = "/synthetic/re-entry.jsonl";
+        let id = key_id(key);
+        let held = TrackedKey {
+            attempts: vec![1_790_000_000 - 60, 1_790_000_000 - 30],
+            flags: PENDING | EXHAUSTED | HELD,
+            legacy_prior: None,
+        };
+        let mut shadow = ClaudeRequestCensusShadowState {
+            rebuild_bound: Some(Box::default()),
+            ..ClaudeRequestCensusShadowState::default()
+        };
+        let re_enter = |shadow: &mut ClaudeRequestCensusShadowState| {
+            let guard = shadow.rebuild_bound.as_deref_mut().unwrap();
+            guard.keys.insert(id.clone(), held.clone());
+        };
+        let revoked = |shadow: &ClaudeRequestCensusShadowState| {
+            let guard = shadow.rebuild_bound.as_deref().unwrap();
+            (!guard.keys.contains_key(&id), guard.identity_revoked)
+        };
+        let mut expected = 0;
+        for (arming, revokes) in [
+            ("A", true),
+            ("B", true),
+            ("A", false),
+            ("B", false),
+            ("C", true),
+            ("D", false),
+            ("A", false),
+        ] {
+            re_enter(&mut shadow);
+            revoke_for_identity(&mut shadow, key, arming);
+            expected += u64::from(revokes);
+            assert_eq!(revoked(&shadow), (revokes, expected), "{arming}");
+        }
+        let guard = shadow.rebuild_bound.as_deref().unwrap();
+        assert_eq!(guard.revoked[&id].tokens.len(), MAX_REVOKE_TOKENS);
+        // Saved and decoded with every token.
+        let raw = serde_json::to_string(guard).unwrap();
+        assert_eq!(&DuplicateRebuildGuard::decode(&raw), guard);
     }
 
     /// SI-724-B3: a repeated key id in `"k"` is ambiguous and closes the guard.

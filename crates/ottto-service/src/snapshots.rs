@@ -7004,34 +7004,42 @@ pub fn apply_claude_effort_evidence_with_index(
                         .contains_key(*root_session_id)
             })
             .collect::<BTreeSet<_>>();
-        for (index_key, entry) in &mut index.files {
-            let Some((root_session_id, source_session_id)) =
-                claude_index_path_family_member(Path::new(index_key))
-            else {
-                continue;
-            };
-            if newly_proven_roots.contains(&root_session_id)
-                && !current_source_session_ids.contains(source_session_id.as_str())
-            {
-                // Earlier pages uploaded an honest NULL before the terminal
-                // census could prove the family. Reparse them once so the new
-                // durable witness emits the correction on the next pass. The
-                // arming is the new witness itself.
-                // `newly_proven_roots` holds only roots with a witness.
+        // The arming of each newly proven family's correction is its new
+        // witness itself, hashed once per family (`newly_proven_roots` holds
+        // only roots with a witness).
+        let corrections = newly_proven_roots
+            .iter()
+            .map(|root_session_id| {
                 let witness = index
                     .claude_account_family_witnesses
-                    .get(&root_session_id)
+                    .get(*root_session_id)
                     .and_then(|witness| serde_json::to_string(witness).ok())
                     .unwrap_or_default();
                 let arming = format!(
                     "family_correction:{root_session_id}:{}",
                     sha256_hex(&["family_correction:v1", &witness])
                 );
+                (*root_session_id, arming)
+            })
+            .collect::<BTreeMap<_, _>>();
+        for (index_key, entry) in &mut index.files {
+            let Some((root_session_id, source_session_id)) =
+                claude_index_path_family_member(Path::new(index_key))
+            else {
+                continue;
+            };
+            let Some(arming) = corrections.get(&root_session_id) else {
+                continue;
+            };
+            if !current_source_session_ids.contains(source_session_id.as_str()) {
+                // Earlier pages uploaded an honest NULL before the terminal
+                // census could prove the family. Reparse them once so the new
+                // durable witness emits the correction on the next pass.
                 claude_request_census::rearm_source_fingerprint(
                     &mut index.claude_request_census_shadow,
                     index_key,
                     entry,
-                    claude_request_census::SourceRearm::Identity(&arming),
+                    claude_request_census::SourceRearm::Identity(arming),
                 );
             }
         }
