@@ -3697,7 +3697,29 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
             &control.transcript().to_string_lossy(),
             u64::MAX
         ));
-        eprintln!("MONEY_UNKNOWN_DEPENDENCY message_only={message_only} restart=true dependent_post=false unrelated_post=true stamp_withheld=true");
+        assert!(unknown_recovery::held_roots(&control.support, &saved)
+            .unwrap()
+            .roots
+            .contains(dependent));
+        std::fs::write(
+            control
+                .support
+                .join("snapshots/claude_code-reemission-exclusions.txt"),
+            format!("{:x}\n", Sha256::digest(dependent.as_bytes())),
+        )
+        .unwrap();
+        drop(_early);
+        let _due = money::PageClockForTest::new(&control.support, now + 300);
+        control.cycle();
+        assert_eq!(
+            control.server.raw_batches.lock().unwrap().len(),
+            2,
+            "a newly listed dependency denies the entire retained batch at replay time"
+        );
+        assert!(unknown_recovery::active_for_test(&control.support)
+            .iter()
+            .any(|m| !m.ack_saved && m.posts == 1 && m.slot == 1));
+        eprintln!("MONEY_UNKNOWN_DEPENDENCY message_only={message_only} restart=true dependent_post=false unrelated_post=true stamp_withheld=true current_dependency_listing_replay=false post_charge=false");
     }
 }
 
