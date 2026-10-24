@@ -168,8 +168,9 @@ run_step() {
 }
 
 # PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
-# (scripts/public_repo_manifest.sh). A staged bundle carries its generated copy
-# at the root; it must still match its files and the derived manifest.
+# (scripts/public_repo_manifest.sh) and must not be committed. A staged bundle
+# carries its generated copy at the root; it must still match its files and the
+# derived manifest.
 check_root_manifest() {
   if [[ -n "$STAGED_OUTPUT_DIR" ]]; then
     if [[ -f PUBLIC_EXPORT_MANIFEST.json ]]; then
@@ -180,9 +181,7 @@ check_root_manifest() {
     fi
     return
   fi
-  if git ls-files --error-unmatch -- PUBLIC_EXPORT_MANIFEST.json >/dev/null 2>&1; then
-    bash scripts/public_repo_manifest.sh --compare PUBLIC_EXPORT_MANIFEST.json
-  fi
+  bash scripts/public_repo_manifest.sh --guard
 }
 
 check_self_export_matches_tree() {

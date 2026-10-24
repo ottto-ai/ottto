@@ -44,6 +44,7 @@
   references, and operator paths. Follow the contribution/export tooling already
   in this repo.
 - New root export files need `public-export/roots.txt` and `public-export/path-map.tsv`
-  entries. Regenerate `PUBLIC_EXPORT_MANIFEST.json` from the intended clean,
-  Git-tracked export inventory; never include unrelated local files. Run relevant
+  entries. `PUBLIC_EXPORT_MANIFEST.json` is derived from the commit tree
+  (`scripts/public_repo_manifest.sh --facts`); never commit it, and resolve a
+  conflict on it with `git rm PUBLIC_EXPORT_MANIFEST.json`. Run relevant
   export/contract checks when their inputs change.
