@@ -3137,26 +3137,32 @@ fn note_unclean_run(support_dir: &Path, observed: u64) -> bool {
     persisted
 }
 
-/// Persist the debts no synced marker covers yet, from a snapshot taken
-/// outside the mutex: fsync never blocks the producer's in-memory debt
-/// latch. A wake job closes the idle-writer race. A covered debt is not
-/// rewritten, so once the writer has drained its jobs it writes nothing.
+/// Persist the latched debts from a snapshot taken outside the mutex: fsync
+/// never blocks the producer's in-memory debt latch. A wake job closes the
+/// idle-writer race. A debt whose synced marker is still on disk costs one
+/// stat and no write; a missing marker (deleted) is written again, so a
+/// restart keeps the debt. Unsynced debts are written (or retried).
 fn persist_coverage_debt() {
-    let unmarked = COVERAGE_OWED
+    let debts = COVERAGE_OWED
         .lock()
         .ok()
         .map(|owed| {
             owed.iter()
                 .flat_map(|(dir, days)| {
-                    days.values()
-                        .filter(|owed| !owed.marked)
-                        .map(move |owed| (dir.clone(), owed.observed))
+                    days.iter()
+                        .map(move |(day, owed)| (dir.clone(), day.clone(), *owed))
                 })
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    for (dir, observed) in unmarked {
-        owe_coverage(&dir, observed, true);
+    for (dir, day, owed) in debts {
+        let present = || {
+            std::fs::symlink_metadata(owed_path(&dir.join("diagnostics"), &day))
+                .is_ok_and(|meta| meta.file_type().is_file())
+        };
+        if !owed.marked || !present() {
+            owe_coverage(&dir, owed.observed, true);
+        }
     }
 }
 
@@ -3730,27 +3736,43 @@ mod seal_tests {
         assert!(note_unclean_run(&scratch, now + 86_400));
     }
 
-    /// The writer persists a latched debt's marker once. Going idle again
-    /// (after a flush, or another directory's job) must not rewrite it: the
-    /// support directory may be deleted once the writer is flushed (#723
-    /// parity fixture: ENOTEMPTY restoring it). The debt stays latched and
-    /// an earlier page of the day still gets its marker.
+    /// A synced debt marker that is still on disk is never rewritten when
+    /// the writer passes again (wake, idle, flush): one stat, the same
+    /// inode and mtime. A deleted marker is written again on the next pass,
+    /// so a restart keeps the debt; an earlier page of the day re-marks it.
+    #[cfg(unix)]
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
-    fn idle_writer_never_rewrites_a_synced_debt_marker() {
+    fn writer_heals_a_deleted_debt_marker_and_never_rewrites_a_present_one() {
+        use std::os::unix::fs::MetadataExt;
         let scratch = crate::test_scratch::ScratchDir::new("money-idle-debt-marker");
         let now = 1_786_000_000;
         let diagnostics = scratch.join("diagnostics");
         let day = day_stamp(now).unwrap();
         let marker = owed_path(&diagnostics, &day);
+        let stamp = || {
+            let meta = std::fs::metadata(&marker).unwrap();
+            (meta.ino(), meta.modified().unwrap())
+        };
         owe_coverage(&scratch, now, false);
         store::flush();
         assert_eq!(std::fs::read_to_string(&marker).unwrap(), now.to_string());
-        std::fs::remove_dir_all(&diagnostics).unwrap();
+        let synced = stamp();
         store::wake_writer();
         store::flush();
         store::flush();
-        assert!(!diagnostics.exists(), "a synced debt is never rewritten");
+        assert_eq!(stamp(), synced, "a present synced marker is not rewritten");
+        std::fs::remove_dir_all(&diagnostics).unwrap();
+        store::wake_writer();
+        store::flush();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            now.to_string(),
+            "the next pass heals a deleted marker"
+        );
+        let healed = stamp();
+        store::flush();
+        assert_eq!(stamp(), healed, "a healed marker is not rewritten");
         owe_coverage(&scratch, now - 60, false);
         store::flush();
         assert_eq!(
