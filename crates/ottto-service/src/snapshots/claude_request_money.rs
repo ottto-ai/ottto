@@ -3137,19 +3137,35 @@ fn note_unclean_run(support_dir: &Path, observed: u64) -> bool {
     persisted
 }
 
-/// Drain a snapshot outside the mutex: fsync never blocks the producer's
-/// in-memory debt latch. A wake job closes the idle-writer race.
+/// Persist the debts no synced marker covers yet, from a snapshot taken
+/// outside the mutex: fsync never blocks the producer's in-memory debt
+/// latch. A wake job closes the idle-writer race. A covered debt is not
+/// rewritten, so once the writer has drained its jobs it writes nothing.
 fn persist_coverage_debt() {
-    let debts = COVERAGE_OWED
+    let unmarked = COVERAGE_OWED
         .lock()
         .ok()
-        .map(|mut owed| std::mem::take(&mut *owed))
+        .map(|owed| {
+            owed.iter()
+                .flat_map(|(dir, days)| {
+                    days.values()
+                        .filter(|owed| !owed.marked)
+                        .map(move |owed| (dir.clone(), owed.observed))
+                })
+                .collect::<Vec<_>>()
+        })
         .unwrap_or_default();
-    for (dir, days) in debts {
-        for observed in days.into_values() {
-            owe_coverage(&dir, observed, true);
-        }
+    for (dir, observed) in unmarked {
+        owe_coverage(&dir, observed, true);
     }
+}
+
+/// One day's latched debt: the earliest page that owes it, and whether a
+/// marker this process synced holds that page (or an earlier one).
+#[derive(Debug, Clone, Copy)]
+struct OwedDay {
+    observed: u64,
+    marked: bool,
 }
 
 /// False coverage rows owed per support directory: day -> the earliest
@@ -3158,7 +3174,8 @@ fn persist_coverage_debt() {
 /// directory (Sol R3-6), so a restart keeps it: the writer reads the markers
 /// back with every batch. A dropped batch's debt is latched in memory only
 /// (no file I/O under the sync lock); the writer's next batch writes it.
-static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, u64>>> = Mutex::new(BTreeMap::new());
+static COVERAGE_OWED: Mutex<BTreeMap<PathBuf, BTreeMap<String, OwedDay>>> =
+    Mutex::new(BTreeMap::new());
 
 fn day_path(dir: &Path, day: &str) -> PathBuf {
     dir.join(format!("{JSONL_PREFIX}{day}.jsonl"))
@@ -3180,7 +3197,7 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) -> bool {
     };
     let dir = support_dir.join("diagnostics");
     let marker = owed_path(&dir, &day);
-    let persisted = if durable && std::fs::create_dir_all(&dir).is_ok() {
+    let marked = if durable && std::fs::create_dir_all(&dir).is_ok() {
         // Existence cannot prove durability after a failed directory sync.
         // Retry the atomic write and propagate its actual sync result.
         let earliest = std::fs::metadata(&marker)
@@ -3189,22 +3206,31 @@ fn owe_coverage(support_dir: &Path, observed_unix: u64, durable: bool) -> bool {
             .and_then(|_| std::fs::read_to_string(&marker).ok())
             .and_then(|value| value.parse::<u64>().ok())
             .map_or(observed_unix, |old| old.min(observed_unix));
-        store::write_atomic(&marker, earliest.to_string().as_bytes())
+        store::write_atomic(&marker, earliest.to_string().as_bytes()).then_some(earliest)
     } else {
-        false
+        None
     };
     if let Ok(mut owed) = COVERAGE_OWED.lock() {
         let slot = owed
             .entry(support_dir.to_path_buf())
             .or_default()
             .entry(day)
-            .or_insert(observed_unix);
-        *slot = (*slot).min(observed_unix);
+            .or_insert(OwedDay {
+                observed: observed_unix,
+                marked: false,
+            });
+        // A failed marker write is retried when the writer idles; an earlier
+        // page needs a new marker; a later one keeps the synced marker.
+        slot.marked = match marked {
+            Some(earliest) => earliest <= slot.observed.min(observed_unix),
+            None => !durable && slot.marked && observed_unix >= slot.observed,
+        };
+        slot.observed = slot.observed.min(observed_unix);
     }
     if !durable {
         store::wake_writer();
     }
-    persisted
+    marked.is_some()
 }
 
 /// A false row of `day` is on disk: its debt is settled.
@@ -3223,7 +3249,10 @@ fn take_owed_coverage(
         .lock()
         .ok()
         .and_then(|mut owed| owed.remove(support_dir))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(day, owed)| (day, owed.observed))
+        .collect::<BTreeMap<_, _>>();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return owed;
     };
@@ -3699,6 +3728,40 @@ mod seal_tests {
         assert_eq!(std::fs::read(scratch.join(RUN_MARKER)).unwrap(), before);
         std::fs::remove_dir(staged).unwrap();
         assert!(note_unclean_run(&scratch, now + 86_400));
+    }
+
+    /// The writer persists a latched debt's marker once. Going idle again
+    /// (after a flush, or another directory's job) must not rewrite it: the
+    /// support directory may be deleted once the writer is flushed (#723
+    /// parity fixture: ENOTEMPTY restoring it). The debt stays latched and
+    /// an earlier page of the day still gets its marker.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn idle_writer_never_rewrites_a_synced_debt_marker() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-idle-debt-marker");
+        let now = 1_786_000_000;
+        let diagnostics = scratch.join("diagnostics");
+        let day = day_stamp(now).unwrap();
+        let marker = owed_path(&diagnostics, &day);
+        owe_coverage(&scratch, now, false);
+        store::flush();
+        assert_eq!(std::fs::read_to_string(&marker).unwrap(), now.to_string());
+        std::fs::remove_dir_all(&diagnostics).unwrap();
+        store::wake_writer();
+        store::flush();
+        store::flush();
+        assert!(!diagnostics.exists(), "a synced debt is never rewritten");
+        owe_coverage(&scratch, now - 60, false);
+        store::flush();
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            (now - 60).to_string()
+        );
+        assert_eq!(
+            take_owed_coverage(&scratch, &diagnostics, None),
+            BTreeMap::from([(day, now - 60)]),
+            "the debt stays latched until a batch writes it"
+        );
     }
 }
 
