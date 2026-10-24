@@ -890,6 +890,34 @@ fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry(
                 "bounded_sweep_had_unsettled_upload".to_owned(),
                 serde_json::json!(true),
             );
+            // An unchanged, not-yet-due authority record normally skips its
+            // transcript. Give this arm an independent parser-upgrade read
+            // obligation so it also proves that a real held-family read is
+            // never carried or accepted. Keep its revision, witness, retry
+            // deadline and failure budget intact.
+            let terminal_key = saved["files"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .find(|key| key.ends_with(&format!("{REARM_TERMINAL}.jsonl")))
+                .expect("the held terminal is indexed")
+                .clone();
+            let revision = saved["files"][&terminal_key]["source_file_fingerprint"].clone();
+            let dispositions = saved
+                .entry("terminal_jsonl_dispositions".to_owned())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap();
+            assert!(dispositions
+                .insert(
+                    terminal_key,
+                    serde_json::json!({
+                        "source_file_fingerprint": revision,
+                        "parser_generation": "previous-parser-generation",
+                        "loss": {}
+                    }),
+                )
+                .is_none());
         });
     };
     let fix = c1b_held_retry_chain("c1b-held-mark-full-window", "fix", mark);
