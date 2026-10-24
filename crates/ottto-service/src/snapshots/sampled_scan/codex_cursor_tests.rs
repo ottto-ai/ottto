@@ -11151,3 +11151,170 @@ fn continuation_committed_marks_only_the_eof_page() {
         panic!("{}", counters(&cache));
     });
 }
+
+/// c22 Q1 (ruling (a) KEEP): a continuation page still runs
+/// `codex_parent_step_start`, so it may read a parent sample outside its
+/// job's files. That read is charged to the page's singleton budget (one
+/// `SAMPLE_READ_BYTES` per opened parent) and happens once per traversal
+/// (the matched mark), so later continuation pages read and charge nothing.
+/// On the same pages, with the production continuation side pass, the four
+/// §7 exclusions hold: no G7 charge or side-due write (the side ledger and
+/// requests are unchanged), no proof hook job, and no sweep (an orphan side
+/// record and the sweep cursor stay).
+#[test]
+fn continuation_parent_reads_are_page_charged_and_exclusions_hold() {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
+    let parent = fixture.file(SESSION_B);
+    let cache = Arc::new(SharedCache::default());
+    let index_path = Path::new("/tmp/ottto-s1b-q1-index.json");
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        assert!(!members.contains(&local_index_key(&parent)));
+        let traversal = index.traversal.as_ref().expect("the job's traversal");
+        assert!(crate::snapshots::codex_frozen_census_valid(traversal));
+        assert!(
+            traversal
+                .codex_rollout_paths
+                .iter()
+                .any(|path| path.ends_with(&format!("{SESSION_B}.jsonl"))),
+            "the parent is in the frozen census"
+        );
+        // A G7/side-due candidate on the owed parent, and a sweep orphan.
+        let meta = fs::metadata(&parent).unwrap();
+        index.codex_parent_side_requests.insert(
+            local_index_key(&parent),
+            crate::snapshots::SideRequest {
+                dev_ino: (meta.dev(), meta.ino()),
+                needed_extent: meta.len() + 1,
+                state: crate::snapshots::SideRequestState::Live,
+                state_extent: meta.len(),
+                state_ctime: (meta.ctime(), meta.ctime_nsec()),
+                attempt_extent: 0,
+                attempt_ctime: (0, 0),
+                attempts: 0,
+                not_before_unix_seconds: 0,
+                needed_charge: None,
+                referenced_epoch: 0,
+            },
+        );
+        let orphan = "/nonexistent/s1b-q1-orphan-rollout.jsonl".to_owned();
+        index.codex_parent_side.insert(
+            orphan.clone(),
+            serde_json::from_value(serde_json::json!({
+                "verdict": { "kind": "settled" },
+                "seal": {
+                    "stamp": {
+                        "length": 4096,
+                        "device": 1,
+                        "inode": 2,
+                        "modified": [1_792_540_800, 5],
+                        "changed": [1_792_540_800, 5],
+                    },
+                    "scope": crate::snapshots::codex_parent_side_scope().0,
+                    "sample_len": 4096,
+                    "head_sha256": "a".repeat(64),
+                    "boundary_sha256": "b".repeat(64),
+                    "verified_unix_seconds": 1_792_540_800,
+                    "sealed_unix_seconds": 1_792_540_800,
+                },
+                "parsed": {
+                    "dev": 1,
+                    "ino": 2,
+                    "extent": 4096,
+                    "modified": [1_792_540_800, 5],
+                    "changed": [1_792_540_800, 5],
+                },
+                "generation": 1,
+                "referenced_epoch": 0,
+            }))
+            .unwrap(),
+        );
+        for page in 0..64 {
+            // The parent stays owed: referenced, with no completed ledger.
+            index
+                .codex_parent_ownership_refs
+                .insert(SESSION_B.to_owned());
+            index.codex_parent_ownership_ledgers.remove(SESSION_B);
+            let pass = crate::snapshots::begin_codex_continuation_side_pass(
+                &cache, index_path, &mut index,
+            );
+            assert_eq!(pass.kind, crate::snapshots::CodexPageKind::Continuation);
+            let ledger = cache.side_ledger().len();
+            let requests = serde_json::to_value(&index.codex_parent_side_requests).unwrap();
+            let side = serde_json::to_value(&index.codex_parent_side).unwrap();
+            let sweep = index.codex_parent_side_cursor.clone();
+            let matches = crate::snapshots::codex_parent_step_start_matches_for_test();
+            let mut scan = OwnedSourceScan::new_continuation(
+                std::slice::from_ref(&fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                true,
+                &members,
+                Some(secs(600)),
+            )
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()))
+            .with_codex_side_pass(Some(pass));
+            let mut singleton = 0;
+            let mut steps = 0;
+            let result = loop {
+                assert!(steps < 100_000, "page {page}: the page did not finish");
+                steps += 1;
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => {
+                        singleton = next.codex_page.singleton_decoded;
+                        scan = next;
+                    }
+                    OwnedSourceScanStep::Complete {
+                        index: next, scan, ..
+                    } => {
+                        index = next;
+                        break scan;
+                    }
+                }
+            };
+            let matched = crate::snapshots::codex_parent_step_start_matches_for_test() - matches;
+            if page == 0 {
+                // One matching pass, one opened parent: one sample read,
+                // charged to this page's singleton budget.
+                assert_eq!(matched, 1, "{}", counters(&cache));
+                assert_eq!(singleton, SAMPLE_READ_BYTES, "{}", counters(&cache));
+            } else {
+                // The traversal is matched: no further read or charge.
+                assert_eq!(matched, 0, "page {page}: {}", counters(&cache));
+                assert_eq!(singleton, 0, "page {page}: {}", counters(&cache));
+            }
+            // The four exclusions, on the same page.
+            assert_eq!(cache.side_ledger().len(), ledger, "page {page}: no G7");
+            assert_eq!(
+                serde_json::to_value(&index.codex_parent_side_requests).unwrap(),
+                requests,
+                "page {page}: no G7 or side-due write"
+            );
+            assert_eq!(
+                cache.proof_suspended_for_test(),
+                None,
+                "page {page}: no hook job"
+            );
+            assert_eq!(
+                serde_json::to_value(&index.codex_parent_side).unwrap(),
+                side,
+                "page {page}: not swept"
+            );
+            assert!(index.codex_parent_side.contains_key(&orphan));
+            assert_eq!(index.codex_parent_side_cursor, sweep, "page {page}");
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(page > 0, "the job spans continuation pages");
+                assert!(result.continuation_committed(), "{}", counters(&cache));
+                return;
+            }
+        }
+        panic!("{}", counters(&cache));
+    });
+}
