@@ -751,7 +751,9 @@ fn tail_rank(candidate: &CandidateFile) -> (i64, i64) {
 
 /// `context`'s charge outside its shared cache's two locked states, as
 /// `bound(context)` counts it, plus those states' inline layouts, which their
-/// own bounds count again: a few hundred bytes over, never under.
+/// own bounds count again: a few hundred bytes over, never under. The inline
+/// pace table (Stage 1, ~6 KiB) is the exception: left out here, it is
+/// counted only by the cursor state's own bound.
 fn context_overhead(context: &Context) -> Option<usize> {
     use crate::heap_layout_bound::bound;
     use std::mem::{align_of, size_of};
@@ -776,8 +778,11 @@ fn context_overhead(context: &Context) -> Option<usize> {
     } = context;
     // The shared cache's `Arc` payload charge, and the side ledger's fixed
     // charge, which `heap_bound` adds lock-free outside the two locked states
-    // (U1a-2a ss-4, F4b).
+    // (U1a-2a ss-4, F4b). Stage 1: less the inline pace table, which every
+    // caller adds again through the cursor state (`state_for_main` or
+    // `cursor_resident`), so it is counted once (condition 4).
     let shared = size_of::<SharedCache>()
+        .checked_sub(size_of::<codex_cursor::PaceTable>())?
         .checked_add(align_of::<SharedCache>())?
         .checked_add(2 * size_of::<usize>())?
         .checked_add(side_ledger::SIDE_LEDGER_BYTES)?;

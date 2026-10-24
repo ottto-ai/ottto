@@ -111,6 +111,10 @@ use claude_response_records::{
 };
 use codex_compressed_input::OpenedInput;
 pub(crate) use pi_retry_inputs::PiRetryInputs;
+// Stage 1 (N2): the cursor side of a continuation page, for StateMissing's
+// adapter in `snapshot_sync` (inert while continuation pages are disabled).
+#[allow(unused_imports)]
+pub(crate) use sampled_scan::codex_cursor::{CodexCursorPort, CodexCursorTicket};
 
 pub(crate) use context_curve::CONTEXT_CURVE_CONTRACT_VERSION;
 use context_curve::{
@@ -2632,6 +2636,22 @@ pub(crate) fn begin_codex_side_pass(
         gate,
         index_path: index_path.to_path_buf(),
         kind: CodexPageKind::Ordinary,
+    }
+}
+
+/// Stage 1 (§7 exclusions): the pass of a continuation page. C14 runs as on
+/// an ordinary page (its gate and hydration), but the kind excludes G7, side
+/// due, the proof hook (row 31, so no leftover is spent) and the sweep (row
+/// 32) through the `CodexSidePass` predicates.
+#[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
+pub(crate) fn begin_codex_continuation_side_pass(
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+    index: &mut ScanIndex,
+) -> CodexSidePass {
+    CodexSidePass {
+        kind: CodexPageKind::Continuation,
+        ..begin_codex_side_pass(cache, index_path, index)
     }
 }
 
@@ -5310,6 +5330,13 @@ pub struct SourceScanResult {
     /// Slice D1 shadow, measured by a complete Claude terminal scan before
     /// any fold. Count-only; the usage fold copies it into its counters.
     pub(crate) claude_request_census_shadow: Option<ClaudeRequestCensusShadowCounts>,
+    /// Stage 1 hunk A: the paused cursor job's continuation ticket, minted
+    /// at this page's pause (`PauseEnd::Paused` only). None on every other
+    /// end, and on an unaccelerated attempt.
+    continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
+    /// Stage 1 (EOF seam): this continuation page committed its cursor job
+    /// and the native finish succeeded (`PageBudget::continuation_committed`).
+    continuation_committed: bool,
 }
 #[derive(Clone, Debug)]
 pub(crate) struct CodexJoinValidator(codex_file_join::Validation);
@@ -5323,6 +5350,19 @@ impl CodexJoinValidator {
     }
 }
 impl SourceScanResult {
+    /// Stage 1 hunk A: the ticket `CodexCursorPort::ticket_for` reads.
+    #[cfg_attr(not(test), allow(dead_code))] // Read only by the inert port.
+    pub(crate) fn continuation_ticket(
+        &self,
+    ) -> Option<&sampled_scan::codex_cursor::CodexCursorTicket> {
+        self.continuation_ticket.as_ref()
+    }
+    /// Stage 1 (EOF seam): whether this continuation page committed its job,
+    /// the only page StateMissing may build `EofCompletion::new` from.
+    #[cfg_attr(not(test), allow(dead_code))] // Read only by the inert port.
+    pub(crate) fn continuation_committed(&self) -> bool {
+        self.continuation_committed
+    }
     pub(crate) fn validate_codex_checkpoint(&self) -> Result<()> {
         if let Some(validation) = &self.codex_join_validation {
             validation.validate_all()?;
@@ -20822,6 +20862,9 @@ pub(crate) struct OwnedSourceScan {
     codex_selected_flags: BTreeMap<String, (bool, bool)>,
     /// U1a-2a: this Codex pass's side-ledger namespace and gate (C14).
     codex_side_pass: Option<CodexSidePass>,
+    /// Stage 1 hunk A: the ticket this page's pause minted, carried across
+    /// `step` calls into the result.
+    continuation_ticket: Option<sampled_scan::codex_cursor::CodexCursorTicket>,
 }
 struct OwnedActiveFile {
     comparison_target: bool,
@@ -21224,7 +21267,7 @@ impl OwnedSourceScan {
     pub(crate) fn new_with_identity_capture_and_recovery_priority(
         source: SnapshotSource,
         roots: &[PathBuf],
-        mut owned_index: ScanIndex,
+        owned_index: ScanIndex,
         collected_at: &str,
         requested_backfill_window_days: u64,
         file_limit: usize,
@@ -21236,6 +21279,84 @@ impl OwnedSourceScan {
         claude_request_identity_capture: bool,
         recovery_priority: &[PathBuf],
     ) -> Self {
+        Self::new_selecting(
+            source,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            claude_effort_support_dir,
+            hinted_paths,
+            watcher_overflowed,
+            context_curve_enabled,
+            claude_request_identity_capture,
+            recovery_priority,
+            None,
+        )
+    }
+
+    /// Stage 1 hunk D: a Codex continuation page of the paused job whose
+    /// member index keys are `members` (`CodexCursorPort::members` of a
+    /// ready ticket). It selects only those pending paths, and nothing while
+    /// the bounded walk still has pending directories: no hints, audits,
+    /// replay or census fill, and the walk does not advance. Its step only
+    /// resumes the paused job; it never plans or starts an attempt, and
+    /// returns every other identified path to the queue untouched. The page
+    /// stands for `ordinary_equivalent` of the ordinary cadence (StateMissing's
+    /// input, §6); `None` is unknown and ends the attempt's acceleration.
+    #[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_continuation(
+        roots: &[PathBuf],
+        owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        context_curve_enabled: bool,
+        members: &BTreeSet<String>,
+        ordinary_equivalent: Option<std::time::Duration>,
+    ) -> Self {
+        let mut scan = Self::new_selecting(
+            SnapshotSource::Codex,
+            roots,
+            owned_index,
+            collected_at,
+            requested_backfill_window_days,
+            file_limit,
+            artifacts_enabled,
+            None,
+            &[],
+            false,
+            context_curve_enabled,
+            claude_request_identity::capture_by_default(),
+            &[],
+            Some(members),
+        );
+        scan.codex_page.set_continuation(ordinary_equivalent);
+        scan
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_selecting(
+        source: SnapshotSource,
+        roots: &[PathBuf],
+        mut owned_index: ScanIndex,
+        collected_at: &str,
+        requested_backfill_window_days: u64,
+        file_limit: usize,
+        artifacts_enabled: bool,
+        claude_effort_support_dir: Option<&Path>,
+        hinted_paths: &[PathBuf],
+        watcher_overflowed: bool,
+        context_curve_enabled: bool,
+        claude_request_identity_capture: bool,
+        recovery_priority: &[PathBuf],
+        continuation: Option<&BTreeSet<String>>,
+    ) -> Self {
+        let continuation = continuation.filter(|_| source == SnapshotSource::Codex);
         let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
         index.activate_quarantine_witness(source);
@@ -21301,12 +21422,14 @@ impl OwnedSourceScan {
             let traversal = index.traversal.as_mut().expect("traversal initialized");
             refresh_retained_codex_roster(source, traversal, backfill_window_days, &index.files);
             enqueue_watcher_hints(source, traversal, hinted_paths, watcher_overflowed);
-            advance_bounded_directory_traversal(
-                source,
-                traversal,
-                backfill_window_days,
-                &index.files,
-            );
+            if continuation.is_none() {
+                advance_bounded_directory_traversal(
+                    source,
+                    traversal,
+                    backfill_window_days,
+                    &index.files,
+                );
+            }
             release_codex_inventory_hold(source, traversal);
         }
         if source == SnapshotSource::Codex {
@@ -21335,12 +21458,14 @@ impl OwnedSourceScan {
                 .pending_candidates
                 .iter()
                 .any(|candidate| candidate.census_member && !candidate.watcher_hint);
-        let selection_limit =
-            if source == SnapshotSource::Codex && !traversal.pending_directories.is_empty() {
-                0
-            } else {
-                file_limit
-            };
+        let selection_limit = if (source == SnapshotSource::Codex
+            && !traversal.pending_directories.is_empty())
+            || continuation.is_some()
+        {
+            0
+        } else {
+            file_limit
+        };
         let hinted_budget = selection_limit
             .min(MAX_WATCHER_HINTED_FILES_PER_TICK)
             .saturating_sub(usize::from(ordinary_census_pending && file_limit > 0));
@@ -21445,6 +21570,17 @@ impl OwnedSourceScan {
                 break;
             };
             pending_paths.push(candidate);
+        }
+        // Stage 1 hunk D: a continuation page selects only the paused job's
+        // pending paths, in queue order, and none during the walk.
+        if let Some(members) = continuation.filter(|_| traversal.pending_directories.is_empty()) {
+            let (selected, kept) = std::mem::take(&mut traversal.pending_candidates)
+                .into_iter()
+                .partition::<Vec<_>, _>(|candidate| {
+                    members.contains(&local_index_key(&candidate.path))
+                });
+            traversal.pending_candidates = kept.into();
+            pending_paths.extend(selected);
         }
         index.resume_census_window_end = Some(census_window_end.clone());
         let census_unix_seconds = rfc3339_unix_seconds(&census_window_end);
@@ -21709,6 +21845,7 @@ impl OwnedSourceScan {
             codex_page: Default::default(),
             codex_selected_flags,
             codex_side_pass: None,
+            continuation_ticket: None,
         }
     }
     /// U1a-2a: the pass's C14 namespace and gate (`None` for other sources).
@@ -21867,6 +22004,7 @@ impl OwnedSourceScan {
             mut codex_page,
             codex_selected_flags,
             codex_side_pass,
+            mut continuation_ticket,
         } = self;
         // Held while this scan object runs the shared cursor job.
         let (mut active_file, mut codex_cursor_lease) = active_frame.into_parts();
@@ -22534,6 +22672,8 @@ impl OwnedSourceScan {
                             inventory: codex_join_inventory.as_ref(),
                             flags: &codex_selected_flags,
                             census_complete: state_census_complete && sidecar_census_complete,
+                            continuation: codex_page.continuation(),
+                            ordinary_equivalent: codex_page.ordinary_equivalent(),
                         },
                         index,
                         &mut identified_candidates,
@@ -22555,6 +22695,26 @@ impl OwnedSourceScan {
                         // page is spent; a pending path resumes or restarts.
                         sampled_scan::codex_cursor::Resumed::Spent => pending!(),
                         sampled_scan::codex_cursor::Resumed::Idle => {}
+                    }
+                }
+                // Stage 1 hunk D: a continuation page only resumes. Without
+                // an active job it plans and starts nothing: every path it
+                // identified, and every group it prepared, goes back to the
+                // queue untouched, and the page finishes.
+                if codex_page.continuation() {
+                    for candidate in identified_candidates.drain(..) {
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &candidate,
+                        );
+                    }
+                    for group in codex_join_groups.drain(..) {
+                        sampled_scan::codex_cursor::requeue_members(
+                            index,
+                            &codex_selected_flags,
+                            &group.members,
+                        );
                     }
                 }
             }
@@ -22676,6 +22836,12 @@ impl OwnedSourceScan {
                                 .cursor_exhausted(sampled_scan::codex_cursor::Limits::current())
                         {
                             if let Some(lease) = codex_cursor_lease.take() {
+                                // Stage 1 hunk A: minted before the pause
+                                // consumes the job, kept only if it pauses.
+                                let ticket = sampling.as_ref().and_then(|context| {
+                                    context.cache.continuation_ticket(&active, &codex_page)
+                                });
+                                continuation_ticket = None;
                                 if let sampled_scan::codex_cursor::PauseEnd::StateBound(
                                     job,
                                     disclosure,
@@ -22701,6 +22867,8 @@ impl OwnedSourceScan {
                                         index,
                                         sampled_scan::codex_cursor::job_files(&job),
                                     );
+                                } else {
+                                    continuation_ticket = ticket;
                                 }
                                 pending!();
                             }
@@ -23535,6 +23703,10 @@ impl OwnedSourceScan {
                     context
                         .cache
                         .cursor_published(publication, parsed_file.is_ok());
+                    // Stage 1 (EOF seam): the attempt committed and finished.
+                    if parsed_file.is_ok() {
+                        codex_page.note_committed();
+                    }
                 }
                 let mut parsed_file = match parsed_file {
                     Ok(parsed) => parsed,
@@ -25078,6 +25250,8 @@ impl OwnedSourceScan {
                     pending_finalization,
                     codex_legacy_join_baselines,
                     claude_request_census_shadow,
+                    continuation_ticket,
+                    continuation_committed: codex_page.continuation_committed(),
                     codex_join_validation: codex_join_inventory
                         .filter(|_| !codex_join_completed.is_empty())
                         .map(|inventory| codex_file_join::Validation {
@@ -25738,7 +25912,7 @@ impl OwnedSourceScan {
                 {
                     pending!();
                 }
-                match context.cache.cursor_plan(
+                match context.cache.cursor_plan_paced(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
@@ -25747,6 +25921,13 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &key,
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    // Stage 1 guard (§6): a side read is never paced.
+                    side_plan
+                        .is_none()
+                        .then_some(sampled_scan::codex_cursor::PaceProbe {
+                            file: &opened_file,
+                            index,
+                        }),
                 ) {
                     // U1a-2a G4a: a side deferral writes nothing (uncharged).
                     sampled_scan::codex_cursor::StartPlan::Defer if side_plan.is_some() => {
@@ -26235,7 +26416,7 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                let defer = match context.cache.cursor_plan(
+                let defer = match context.cache.cursor_plan_paced(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
@@ -26244,6 +26425,10 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &local_index_key(&active.candidate.path),
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
+                    Some(sampled_scan::codex_cursor::PaceProbe {
+                        file: active.parser.reader.reader.get_ref(),
+                        index,
+                    }),
                 ) {
                     sampled_scan::codex_cursor::StartPlan::Singleton => false,
                     sampled_scan::codex_cursor::StartPlan::Unpaged => {
@@ -26380,6 +26565,7 @@ impl OwnedSourceScan {
             codex_page,
             codex_selected_flags,
             codex_side_pass,
+            continuation_ticket,
         }))
     }
 }
@@ -77444,7 +77630,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
