@@ -93,13 +93,10 @@ const MIN_UPTIME: Duration = Duration::from_secs(15 * 60);
 const RUN_WALL_CAP: Duration = Duration::from_secs(30 * 60);
 
 // Budgets.
-/// Full reads (rewritten files, files live at install) and reads after a
-/// state fallback, per day.
+/// Full reads (rewritten files, and full reads still waiting from an
+/// earlier build's install) and reads after a state fallback, per day.
 /// New bytes are not capped.
 const REPAIR_BYTES_PER_DAY: u64 = 1024 * 1024 * 1024;
-/// A file modified this recently at the first run is "live at install" and
-/// is read from its start once, within the repair budget.
-const LIVE_AT_INSTALL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Audit re-reads of files already read whole, per day (see `audit`).
 const AUDIT_BYTES_PER_DAY: u64 = 100 * 1000 * 1000;
 /// Audited files per day at most, so many small files never turn the audit
