@@ -715,9 +715,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 // selected-file debt still requires its ordinary saved proof.
                 return (m.binding != binding || now >= m.deadline).then_some(Reason::Resolved);
             }
-            if money::recovery_released(support, &m.lineage) {
-                Some(Reason::Released)
-            } else if m.binding != binding {
+            if m.binding != binding {
                 Some(Reason::BindingLost)
             } else if now >= m.deadline {
                 Some(Reason::Expired)
@@ -725,6 +723,8 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 Some(Reason::Exhausted)
             } else if m.slot >= 3 {
                 Some(Reason::AdmissionDenied)
+            } else if money::recovery_released(support, &m.lineage) {
+                Some(Reason::Released)
             } else {
                 None
             }
@@ -1185,7 +1185,7 @@ pub(super) fn initial_post(
                 .map(|e| (e.root.as_str(), e.files.as_slice()))
                 .collect::<Vec<_>>();
             if m.entities.iter().any(|e| e.literal)
-                && (!index.recovery_history_permitted(support, &roots)
+                && (!index.initial_recovery_history_permitted(support, &roots)
                     || current_literal_guard(index, &m) != LiteralPermit::Permit)
             {
                 return Err(Deferred {
@@ -1241,7 +1241,7 @@ pub(super) fn initial_post(
         .map(|e| (e.root.as_str(), e.files.as_slice()))
         .collect::<Vec<_>>();
     if m.entities.iter().any(|e| e.literal)
-        && (!index.recovery_history_permitted(support, &roots)
+        && (!index.initial_recovery_history_permitted(support, &roots)
             || current_literal_guard(index, &m) != LiteralPermit::Permit)
     {
         return Err(Deferred {

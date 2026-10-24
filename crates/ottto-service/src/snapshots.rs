@@ -36892,6 +36892,44 @@ impl ScanIndex {
         support: &Path,
         roots: &[(&str, &[String])],
     ) -> bool {
+        self.recovery_history_permitted_inner(support, roots, false)
+    }
+
+    /// A new offer may use the one timed probe already reserved by decide().
+    /// Immutable UNKNOWN replays never receive this exception. No second
+    /// reservation is minted, and every retained file must name that one key.
+    pub(crate) fn initial_recovery_history_permitted(
+        &mut self,
+        support: &Path,
+        roots: &[(&str, &[String])],
+    ) -> bool {
+        let probe_key = roots.first().and_then(|(_, files)| files.first());
+        let reserved_probe = claude_request_money::adoption_probe_due(support, self)
+            && roots.iter().all(|(_, files)| {
+                !files.is_empty()
+                    && files.iter().all(|file| {
+                        if probe_key != Some(file) {
+                            return false;
+                        }
+                        self.files
+                            .get(file)
+                            .and_then(|entry| {
+                                self.claude_history_emission
+                                    .files
+                                    .get(&entry.source_file_fingerprint)
+                            })
+                            .is_some_and(|gate| gate.index_key == *file && gate.held.is_none())
+                    })
+            });
+        self.recovery_history_permitted_inner(support, roots, reserved_probe)
+    }
+
+    fn recovery_history_permitted_inner(
+        &mut self,
+        support: &Path,
+        roots: &[(&str, &[String])],
+        reserved_initial_probe: bool,
+    ) -> bool {
         self.load_claude_reemission_exclusions(support);
         for (_, files) in roots {
             for file in *files {
@@ -36899,7 +36937,7 @@ impl ScanIndex {
             }
         }
         if claude_reemission_stop_latched()
-            || self.active_request_money_adoption_paused
+            || (self.active_request_money_adoption_paused && !reserved_initial_probe)
             || self.claude_reemission_exclusions.pauses_adoption()
         {
             return false;
