@@ -597,7 +597,8 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     let files = index.files.len();
     let accepted_entities = index.accepted_snapshot_fingerprints.len();
     let rebuilt =
-        quarantine_invalid_scan_index(&path, "decode", None, None, SystemTime::now()).unwrap();
+        quarantine_invalid_scan_index(&path, "decode", None, None, None, SystemTime::now())
+            .unwrap();
     assert!(!path.exists());
     assert!(rebuilt.files.is_empty());
     for slot in 0..2 {

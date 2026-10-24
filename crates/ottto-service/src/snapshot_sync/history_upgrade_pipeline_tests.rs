@@ -657,7 +657,9 @@ fn user_repair_override_rebuild_keeps_history_held() {
     crate::snapshots::with_no_list_cutoff(u64::MAX, || {
         let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
         assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
-        fixture.corrupt_index();
+        // Budget damage keeps the identity fields strictly recoverable, so
+        // the press may rebuild (SI-718-O1); syntax damage refuses it.
+        fixture.exceed_decode_hold_budget();
         let refused = ScanIndex::load_for_snapshot_source_with_origin(
             &fixture.index_path,
             SnapshotSource::ClaudeCode,
@@ -697,6 +699,86 @@ fn user_repair_override_rebuild_keeps_history_held() {
         )
         .unwrap_err();
         assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    });
+}
+
+/// SI-718-O1: the override rebuild keeps the retained owner through a
+/// replacement cycle whose upload is only server-deferred (a partial
+/// settlement), and held history still uploads nothing.
+#[test]
+fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-upgrade-override-identity");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    let owner_key = crate::context_footprint::sha256_hex(&[
+        "session_owner:v1",
+        HISTORY_MACHINE_ID,
+        HISTORY_SESSIONS[0],
+    ]);
+    let owner = "a".repeat(64);
+    let saved = |fixture: &HistoryFixture| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
+            .expect("decode saved index")
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
+        // A retained owner and a true contract latch beside budget damage.
+        let mut value = saved(&fixture);
+        value["session_account_bindings"] =
+            serde_json::json!({ owner_key.clone(): {"account_identifier_hash": owner} });
+        value["claude_request_identity_contract"] = serde_json::json!("prior-contract");
+        value["claude_request_identity_contract_changed"] = serde_json::json!(true);
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
+            .expect("seed prior identity");
+        fixture.exceed_decode_hold_budget();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::ClaudeCode,
+                std::time::SystemTime::now()
+            ),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overridden = fixture.cycle(
+            "2026-08-02T10:00:00Z",
+            HistoryCycle {
+                upload: PipelineUpload::ServerDeferred,
+                ..HISTORY_REVISION_2
+            },
+        );
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        assert!(
+            overridden.uploaded.is_empty(),
+            "the override rebuild re-sent history: {:?}",
+            overridden.uploaded
+        );
+        assert_eq!(overridden.corrections, 0);
+        // The retained owner survived the rebuild, the scan, the partial
+        // settlement and the save: it is still the authority on disk.
+        let value = saved(&fixture);
+        assert_eq!(
+            value["session_account_bindings"][&owner_key]["account_identifier_hash"],
+            serde_json::json!(owner)
+        );
+        // A later cycle keeps it too, and still uploads no held history.
+        let again = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        assert!(again.uploaded.is_empty(), "{:?}", again.uploaded);
+        assert_eq!(
+            saved(&fixture)["session_account_bindings"][&owner_key]["account_identifier_hash"],
+            serde_json::json!(owner)
+        );
     });
 }
 

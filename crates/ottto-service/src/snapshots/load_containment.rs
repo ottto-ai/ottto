@@ -270,6 +270,76 @@ const SCAN_INDEX_OVERRIDE_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
 /// Repair refusal reason: an override already ran or is armed within 24 h.
 pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE: &str =
     "scan_index_rebuild_override_cooldown";
+/// SI-718-O1 refusal: the damaged index's session-identity state could not be
+/// strictly recovered, so the armed override did not rebuild; the source
+/// stays paused and the index stays in place.
+pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE: &str =
+    "scan_index_rebuild_override_identity_unrecoverable";
+
+/// SI-718-O2: the newest override of this source under ANY destination. It
+/// lives in `<support>/snapshots/`, outside every
+/// `destinations/<namespace>/` checkpoint directory (which the temp sweep
+/// alone visits), so restart plus re-pair keeps the 24-hour cooldown. Fixed
+/// source and time only; no session, account or path is stored.
+fn scan_index_override_stamp_path(support_dir: &Path, source: SnapshotSource) -> PathBuf {
+    support_dir.join("snapshots").join(format!(
+        "{}-scan-index-rebuild-override.json",
+        source.api_slug()
+    ))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ScanIndexOverrideStamp {
+    last_override_unix_seconds: u64,
+}
+
+/// A malformed stamp cools from its own mtime; an unreadable one cools
+/// indefinitely. Both fail closed: the seven-day automatic retry still runs.
+fn read_scan_index_override_stamp(support_dir: &Path, source: SnapshotSource) -> Option<u64> {
+    let path = scan_index_override_stamp_path(support_dir, source);
+    match fs::read(&path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => Some(u64::MAX),
+        Ok(bytes) => Some(
+            serde_json::from_slice::<ScanIndexOverrideStamp>(&bytes)
+                .map(|stamp| stamp.last_override_unix_seconds)
+                .ok()
+                .or_else(|| {
+                    fs::metadata(&path)
+                        .and_then(|metadata| metadata.modified())
+                        .ok()
+                        .map(unix_seconds_at)
+                })
+                .unwrap_or(u64::MAX),
+        ),
+    }
+}
+
+fn write_scan_index_override_stamp(
+    support_dir: &Path,
+    source: SnapshotSource,
+    now: SystemTime,
+) -> Result<()> {
+    let path = scan_index_override_stamp_path(support_dir, source);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("create scan index override stamp directory")?;
+    }
+    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let stamp = serde_json::to_vec(&ScanIndexOverrideStamp {
+        last_override_unix_seconds: unix_seconds_at(now),
+    })?;
+    let result = (|| -> Result<()> {
+        let mut file = File::create(&temp_path)?;
+        std::io::Write::write_all(&mut file, &stamp)?;
+        file.sync_all()?;
+        fs::rename(&temp_path, &path)?;
+        sync_checkpoint_parent(&path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result.context("persist scan index override stamp")
+}
 
 /// Per-source override state, process memory only (no paths or contents):
 /// when the guard last refused lifts by itself, the newest override (a
@@ -279,12 +349,15 @@ struct ScanIndexRebuildOverrideState {
     auto_retry_unix_seconds: Option<u64>,
     last_override_unix_seconds: Option<u64>,
     armed: bool,
+    /// The last armed press was refused: identity state unrecoverable.
+    identity_unrecoverable: bool,
 }
 impl ScanIndexRebuildOverrideState {
     const NONE: Self = Self {
         auto_retry_unix_seconds: None,
         last_override_unix_seconds: None,
         armed: false,
+        identity_unrecoverable: false,
     };
 }
 #[cfg(not(test))]
@@ -295,11 +368,18 @@ static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideSt
 #[cfg(not(test))]
 static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
+/// Counter `scan_index_rebuild_override_identity_unrecoverable`: armed
+/// overrides this process refused because identity state was unrecoverable.
+#[cfg(not(test))]
+static SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_REBUILD_OVERRIDE: std::cell::Cell<[ScanIndexRebuildOverrideState; 3]> =
         const { std::cell::Cell::new([ScanIndexRebuildOverrideState::NONE; 3]) };
     static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+    static SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
 }
 
@@ -342,8 +422,14 @@ fn unix_seconds_at(now: SystemTime) -> u64 {
 }
 
 /// A refusal records what the guard read: when it lifts by itself and the
-/// newest durable override, so the cooldown survives a daemon restart.
-fn note_scan_index_rebuild_refusal(source: SnapshotSource, stamps: ScanIndexRebuildWitnessStamps) {
+/// newest durable override, this checkpoint's witness or the source-wide
+/// stamp (SI-718-O2), so the cooldown survives a restart and a re-pair.
+fn note_scan_index_rebuild_refusal(
+    source: SnapshotSource,
+    stamps: ScanIndexRebuildWitnessStamps,
+    support_dir: Option<&Path>,
+) {
+    let source_wide = support_dir.and_then(|dir| read_scan_index_override_stamp(dir, source));
     with_scan_index_rebuild_override(source, |state| {
         // The guard holds through the exact seven-day boundary.
         state.auto_retry_unix_seconds = stamps.newest.map(|stamp| {
@@ -351,7 +437,8 @@ fn note_scan_index_rebuild_refusal(source: SnapshotSource, stamps: ScanIndexRebu
         });
         state.last_override_unix_seconds = state
             .last_override_unix_seconds
-            .max(stamps.newest_override.map(unix_seconds_ceil));
+            .max(stamps.newest_override.map(unix_seconds_ceil))
+            .max(source_wide);
     });
 }
 
@@ -392,9 +479,19 @@ pub(crate) fn arm_scan_index_rebuild_manual_override(
 }
 
 /// A compatible load ends the pause; an unspent press must not wait for a
-/// later, unrelated incident.
+/// later, unrelated incident. A spent press also clears its last refusal.
 fn disarm_scan_index_rebuild_manual_override(source: SnapshotSource) {
-    with_scan_index_rebuild_override(source, |state| state.armed = false);
+    with_scan_index_rebuild_override(source, |state| {
+        state.armed = false;
+        state.identity_unrecoverable = false;
+    });
+}
+
+/// The paused source's last armed override refusal, for the health payload.
+pub(crate) fn scan_index_rebuild_override_refusal(source: SnapshotSource) -> Option<&'static str> {
+    (scan_index_rebuild_paused(source)
+        && with_scan_index_rebuild_override(source, |state| state.identity_unrecoverable))
+    .then_some(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE)
 }
 
 /// When the guard lets an automatic load rebuild this paused source: just
@@ -437,24 +534,51 @@ pub(crate) fn scan_index_rebuild_manual_override_count() -> usize {
     SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(std::cell::Cell::get)
 }
 
+#[cfg(not(test))]
+fn count_scan_index_rebuild_override_identity_unrecoverable() -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+#[cfg(test)]
+fn count_scan_index_rebuild_override_identity_unrecoverable() -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE.with(|counter| {
+        let count = counter.get().saturating_add(1);
+        counter.set(count);
+        count
+    })
+}
+
+/// This thread's `scan_index_rebuild_override_identity_unrecoverable` counter.
+#[cfg(test)]
+pub(crate) fn scan_index_rebuild_override_identity_unrecoverable_count() -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE.with(std::cell::Cell::get)
+}
+
 fn quarantine_invalid_scan_index(
     path: &Path,
     cause: &str,
     discarded_file_entries: Option<usize>,
     source: Option<SnapshotSource>,
+    support_dir: Option<&Path>,
     now: SystemTime,
 ) -> Result<ScanIndex> {
     // Every whole-index fallback shares this decision while the caller holds
     // the checkpoint lock: budget, syntax and canonical identity collision.
-    // Only the source-aware daemon load can spend an armed user Repair; the
-    // unattributed load (audit, retry driver) always refuses.
+    // Only the source-aware daemon load (which names its support directory)
+    // can spend an armed user Repair; the unattributed load (audit, retry
+    // driver) always refuses.
     let recent = scan_index_rebuilt_recently(path, now)?;
-    if recent
-        && !source
-            .is_some_and(|source| with_scan_index_rebuild_override(source, |state| state.armed))
-    {
+    let armed = source
+        .zip(support_dir)
+        .filter(|(source, _)| with_scan_index_rebuild_override(*source, |state| state.armed));
+    if recent {
+        if let Some((source, support_dir)) = armed {
+            return override_scan_index_rebuild_loop(path, cause, source, support_dir, now);
+        }
         if let (Some(source), Ok(stamps)) = (source, scan_index_rebuild_witness_stamps(path)) {
-            note_scan_index_rebuild_refusal(source, stamps);
+            note_scan_index_rebuild_refusal(source, stamps, support_dir);
         }
         emit_scan_index_containment_line(format!(
             "local snapshot scan index load: source={} lenient_hold_budget_exceeded={} refusal_kind=rebuild_loop source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; recent quarantine rebuild alarm, reviewed repair required, never delete the index",
@@ -464,27 +588,19 @@ fn quarantine_invalid_scan_index(
     }
     // The index is only a local incremental-scan optimization. A crash or
     // structural damage must not permanently block collection, but never
-    // overwrite the unreadable witness in place. Past this point a recent
-    // rebuild means an armed user Repair is passing the guard.
-    let overridden = recent;
-    let kind = if overridden {
-        SCAN_INDEX_OVERRIDE_WITNESS_KIND
-    } else {
-        "corrupt"
-    };
-    let quarantine_path = unique_checkpoint_sibling(path, kind);
+    // overwrite the unreadable witness in place.
+    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
     sync_checkpoint_parent(path)?;
-    // Spend the press only once its witness is durable: that witness re-arms
-    // the seven-day clock and carries the 24-hour cooldown.
-    if let Some(source) = source.filter(|_| overridden) {
-        disarm_scan_index_rebuild_manual_override(source);
-        let count = count_scan_index_rebuild_manual_override();
-        emit_scan_index_containment_line(format!(
-            "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair scan_index_rebuild_manual_override={count} guard_rearmed=7d cooldown=24h rebuild=gated; one interactive user Repair passed the seven-day guard, history stays gated",
-            source.api_slug()
-        ));
-    }
+    note_scan_index_quarantine_rebuild(cause, discarded_file_entries, source);
+    Ok(ScanIndex::default())
+}
+
+fn note_scan_index_quarantine_rebuild(
+    cause: &str,
+    discarded_file_entries: Option<usize>,
+    source: Option<SnapshotSource>,
+) {
     let quarantines = SCAN_INDEX_WHOLE_QUARANTINES
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);
@@ -498,10 +614,115 @@ fn quarantine_invalid_scan_index(
         "local snapshot scan index load: source={} lenient_hold_budget_exceeded={} cause={cause} fallback=gated_rebuild history_policy=prior_history_gated_rebuild",
         scan_index_source_label(source), usize::from(cause == "hold_budget")
     ));
-    Ok(ScanIndex::default())
+}
+
+/// One armed user Repair passing the seven-day guard (SI-718-O1). The guard
+/// was keeping the damaged index because it holds session-identity state;
+/// the override keeps that state too. It strictly decodes
+/// `lenient_decode::IDENTITY_CARRY_FIELDS` from the current bytes, refusing
+/// (source stays paused, index untouched, counted, alarmed) when any of them
+/// cannot be recovered, and otherwise durably REPLACES the index with a
+/// generation-0 rebuild that carries them. A replacement scan that then
+/// fails reloads that carried state, never an empty graph. The damaged bytes
+/// stay as the `.corrupt.override.` witness (a hard link), which re-arms the
+/// seven-day clock and is prior-history evidence like any quarantine.
+fn override_scan_index_rebuild_loop(
+    path: &Path,
+    cause: &str,
+    source: SnapshotSource,
+    support_dir: &Path,
+    now: SystemTime,
+) -> Result<ScanIndex> {
+    let carry = File::open(path)
+        .map_err(lenient_decode::Error::from)
+        .and_then(|file| lenient_decode::read_identity_carry(file, source.api_slug()));
+    let carry = match carry {
+        Ok(carry) => carry,
+        Err(error) => {
+            // The press is spent; its 24-hour cooldown stands.
+            disarm_scan_index_rebuild_manual_override(source);
+            with_scan_index_rebuild_override(source, |state| state.identity_unrecoverable = true);
+            if let Ok(stamps) = scan_index_rebuild_witness_stamps(path) {
+                note_scan_index_rebuild_refusal(source, stamps, Some(support_dir));
+            }
+            let count = count_scan_index_rebuild_override_identity_unrecoverable();
+            emit_scan_index_containment_line(format!(
+                "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair override_refused={code} {code}={count} cause={cause} identity_decode={} source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; session-identity state could not be strictly recovered, so the override did not rebuild, alarm, never delete the index",
+                source.api_slug(),
+                error.kind(),
+                code = SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE,
+            ));
+            return Err(anyhow::Error::new(ScanIndexRebuildLoop)
+                .context(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE));
+        }
+    };
+    let mut rebuilt = ScanIndex::default();
+    rebuilt.carry_identity_from(carry);
+    // Stamp the source-wide cooldown first: a crash after it fails closed.
+    write_scan_index_override_stamp(support_dir, source, now)?;
+    let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
+    let quarantine_path = unique_checkpoint_sibling(path, SCAN_INDEX_OVERRIDE_WITNESS_KIND);
+    let result = (|| -> Result<()> {
+        {
+            let mut file = File::create(&temp_path)
+                .with_context(|| format!("create scan index temp {}", temp_path.display()))?;
+            let mut writer = BufWriter::new(&mut file);
+            serde_json::to_writer_pretty(&mut writer, &rebuilt)
+                .context("write override-rebuilt scan index")?;
+            std::io::Write::flush(&mut writer).context("flush override-rebuilt scan index")?;
+            drop(writer);
+            file.sync_all()
+                .context("sync override-rebuilt scan index")?;
+        }
+        // Every crash point leaves either the damaged index (still refused,
+        // the press lost) or the carried rebuild in place.
+        fs::hard_link(path, &quarantine_path)
+            .context("keep the damaged scan index as the override witness")?;
+        sync_checkpoint_parent(path)?;
+        fs::rename(&temp_path, path).context("replace scan index with the override rebuild")?;
+        sync_checkpoint_parent(path)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temp_path);
+    }
+    result?;
+    // Spend the press only once its witness and rebuild are durable: that
+    // witness re-arms the seven-day clock and carries the 24-hour cooldown.
+    disarm_scan_index_rebuild_manual_override(source);
+    let count = count_scan_index_rebuild_manual_override();
+    emit_scan_index_containment_line(format!(
+        "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair scan_index_rebuild_manual_override={count} guard_rearmed=7d cooldown=24h rebuild=gated identity=carried; one interactive user Repair passed the seven-day guard, history stays gated",
+        source.api_slug()
+    ));
+    note_scan_index_quarantine_rebuild(cause, None, Some(source));
+    Ok(rebuilt)
 }
 
 impl ScanIndex {
+    /// SI-718-O1: what an override rebuild keeps from the damaged index
+    /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, strictly decoded). Bindings
+    /// stay authoritative, so conflicting creator evidence defers; held and
+    /// deferred families stay held; duplicate ownership and owned-start /
+    /// stale-carry posture stay fail-closed. The contract token is kept and
+    /// its latch set: nothing proves the rebuilt graph ran under it. Accepted
+    /// acknowledgements carry only from a current ledger, so an unproven one
+    /// re-offers rather than suppresses. Files, traversal and the Codex
+    /// ownership ledgers (the collision-bearing fields) are rebuilt by scan.
+    fn carry_identity_from(&mut self, carry: ScanIndex) {
+        self.session_account_bindings = carry.session_account_bindings;
+        self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
+        self.claude_request_identity_contract = carry.claude_request_identity_contract;
+        self.claude_request_identity_contract_changed = true;
+        self.claude_owned_start_census = carry.claude_owned_start_census;
+        self.claude_stale_family_carry = carry.claude_stale_family_carry;
+        self.claude_duplicate_request_owners = carry.claude_duplicate_request_owners;
+        self.claude_duplicate_request_witness_overflowed =
+            carry.claude_duplicate_request_witness_overflowed;
+        if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
+        }
+    }
+
     /// Apply the per-record checks one record at a time: drop a non-RFC3339
     /// activity clock (the gate re-reads the file to re-derive it) and a
     /// malformed accepted identity (it can never equal a real body

@@ -37454,7 +37454,9 @@ impl ScanIndex {
         source: SnapshotSource,
         support_dir: &Path,
     ) -> Result<(Self, ScanIndexLoadOrigin)> {
-        let (mut index, origin) = match Self::load_inner(path, Some(source)) {
+        let loaded =
+            Self::load_inner_with_support(path, Some(source), Some(support_dir), SystemTime::now());
+        let (mut index, origin) = match loaded {
             Ok(loaded) => {
                 note_scan_index_rebuild_paused(source, false);
                 disarm_scan_index_rebuild_manual_override(source);
@@ -37510,6 +37512,17 @@ impl ScanIndex {
         source: Option<SnapshotSource>,
         now: SystemTime,
     ) -> Result<(Self, LoadOrigin)> {
+        Self::load_inner_with_support(path, source, None, now)
+    }
+
+    /// Only a load that names its support directory can spend an armed user
+    /// Repair override and see the source-wide override stamp.
+    fn load_inner_with_support(
+        path: &Path,
+        source: Option<SnapshotSource>,
+        support_dir: Option<&Path>,
+        now: SystemTime,
+    ) -> Result<(Self, LoadOrigin)> {
         if !path.exists() {
             return Ok((Self::default(), LoadOrigin::Missing));
         }
@@ -37546,6 +37559,7 @@ impl ScanIndex {
                         "codex_identity_collision",
                         Some(discarded),
                         source,
+                        support_dir,
                         now,
                     )
                     .map(|index| (index, LoadOrigin::Quarantined));
@@ -37560,7 +37574,7 @@ impl ScanIndex {
                 } else {
                     "decode"
                 };
-                quarantine_invalid_scan_index(path, cause, None, source, now)
+                quarantine_invalid_scan_index(path, cause, None, source, support_dir, now)
                     .map(|index| (index, LoadOrigin::Quarantined))
                     .map_err(|refusal| refusal.context(error))
             }
@@ -75331,7 +75345,7 @@ mod tests {
         assert!(upload_body.contains(&hash));
     }
 
-    fn valid_v6_batch_request() -> SnapshotBatchRequest {
+    pub(super) fn valid_v6_batch_request() -> SnapshotBatchRequest {
         let row = SnapshotModelUsage {
             evidence_ref: None,
             identity_parts: None,

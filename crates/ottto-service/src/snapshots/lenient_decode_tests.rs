@@ -1847,8 +1847,11 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
         ScanIndexRebuildOverride::NotPaused
     );
-    fs::write(&path, b"{ ").unwrap();
-    refused(b"{ ");
+    // Hold-budget damage: its session-identity fields are strictly
+    // recoverable, so a press may rebuild past the guard (SI-718-O1).
+    let damage = whole_index_damage("budget");
+    fs::write(&path, &damage).unwrap();
+    refused(&damage);
     // The pause names its automatic retry: seven days after the witness.
     let week = 7 * 24 * 60 * 60;
     let retry = scan_index_rebuild_auto_retry_unix_seconds(source).unwrap();
@@ -1859,7 +1862,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
     );
     assert!(scan_index_rebuild_auto_retry_at(source).is_some());
     // Automatic retries never override: the source load keeps refusing.
-    refused(b"{ ");
+    refused(&damage);
 
     assert_eq!(
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
@@ -1870,7 +1873,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
         .unwrap_err()
         .downcast_ref::<ScanIndexRebuildLoop>()
         .is_some());
-    assert_eq!(fs::read(&path).unwrap(), b"{ ");
+    assert_eq!(fs::read(&path).unwrap(), damage);
     // A second press inside 24 hours refuses, armed or spent.
     assert_eq!(
         arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
@@ -1906,7 +1909,7 @@ fn user_repair_override_passes_the_guard_once_and_rearms_it() {
                 .starts_with("index.corrupt.override.")
         })
         .unwrap();
-    assert_eq!(fs::read(&witness).unwrap(), b"{ ");
+    assert_eq!(fs::read(&witness).unwrap(), damage);
     assert_eq!(corrupt_count(scratch.as_ref()), 2);
     assert!(scan_index_rebuilt_recently(&path, SystemTime::now()).unwrap());
 
@@ -2568,4 +2571,425 @@ fn load_refuses_future_quarantine_stamp_and_rebuilds_after_seven_days() {
             .iter()
             .any(|line| line.contains("fallback=gated_rebuild")));
     }
+}
+
+// SI-718-O1/O2: the user Repair override keeps the session-identity state the
+// seven-day guard was protecting, and its cooldown is source-wide.
+const OVERRIDE_OWNER_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const OVERRIDE_OWNER_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+fn reset_override_state_for_restart() {
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+    for source in [
+        SnapshotSource::ClaudeCode,
+        SnapshotSource::Codex,
+        SnapshotSource::Pi,
+    ] {
+        note_scan_index_rebuild_paused(source, false);
+    }
+}
+
+/// Hold-budget damage in the daemon's own field order (`files` before the
+/// identity fields), with `tail` fields appended after every other field.
+fn struct_order_budget_damage(index: &ScanIndex, tail: &str) -> Vec<u8> {
+    let text = serde_json::to_string(index).unwrap();
+    let excess = format!(
+        "\"files\":{{\"excess-held\":{{\"unknown\":\"{}\"}},",
+        "x".repeat(2 * 1024 * 1024)
+    );
+    assert!(text.contains("\"files\":{\"/synthetic/"));
+    let text = text.replacen("\"files\":{", &excess, 1);
+    format!("{}{tail}}}", &text[..text.len() - 1]).into_bytes()
+}
+
+/// An old owner A for `session`, a deferred hold, accepted fingerprints, the
+/// contract token and latch, owned-start and stale-carry posture, duplicate
+/// ownership and the closed duplicate fence.
+fn override_identity_seed(session: &str, latch: bool) -> ScanIndex {
+    let mut index = fixture();
+    index.session_account_bindings.insert(
+        sha256_hex(&["session_owner:v1", "machine-a", session]),
+        SessionAccountBinding {
+            account_identifier_hash: OVERRIDE_OWNER_A.into(),
+            workspace_identifier_hash: Some("c".repeat(64)),
+        },
+    );
+    index
+        .claude_account_deferred_holds
+        .insert("/synthetic/held.jsonl".into(), "d".repeat(64));
+    index.claude_request_identity_contract = Some("prior-contract".into());
+    index.claude_request_identity_contract_changed = latch;
+    index.claude_owned_start_census = serde_json::from_value(
+        serde_json::json!({"member":{"marker_source_file_fingerprint":"fp"}}),
+    )
+    .unwrap();
+    index.claude_stale_family_carry =
+        serde_json::from_value(serde_json::json!({"roots":["carried-family"]})).unwrap();
+    index.claude_duplicate_request_owners = serde_json::from_value(serde_json::json!(
+        {"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]}
+    ))
+    .unwrap();
+    index.claude_duplicate_request_witness_overflowed = true;
+    assert!(!index.accepted_snapshot_fingerprints.is_empty());
+    index
+}
+
+fn as_json<T: serde::Serialize>(value: &T) -> Value {
+    serde_json::to_value(value).unwrap()
+}
+
+fn assert_identity_carried(index: &ScanIndex, seed: &ScanIndex, context: &str) {
+    assert_eq!(
+        as_json(&index.session_account_bindings),
+        as_json(&seed.session_account_bindings),
+        "{context}"
+    );
+    assert_eq!(
+        as_json(&index.claude_account_deferred_holds),
+        as_json(&seed.claude_account_deferred_holds),
+        "{context}"
+    );
+    assert_eq!(
+        index.claude_request_identity_contract, seed.claude_request_identity_contract,
+        "{context}"
+    );
+    assert!(index.claude_request_identity_contract_changed, "{context}");
+    assert_eq!(
+        as_json(&index.claude_owned_start_census),
+        as_json(&seed.claude_owned_start_census),
+        "{context}"
+    );
+    assert_eq!(
+        as_json(&index.claude_stale_family_carry),
+        as_json(&seed.claude_stale_family_carry),
+        "{context}"
+    );
+    assert_eq!(
+        as_json(&index.claude_duplicate_request_owners),
+        as_json(&seed.claude_duplicate_request_owners),
+        "{context}"
+    );
+    assert!(
+        index.claude_duplicate_request_witness_overflowed,
+        "{context}"
+    );
+    assert_eq!(
+        index.accepted_snapshot_fingerprints, seed.accepted_snapshot_fingerprints,
+        "{context}"
+    );
+}
+
+#[test]
+fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
+    let mut item = tests::valid_v6_batch_request().snapshots.remove(0);
+    let session = item.source_session_id.clone();
+    let owner_key = sha256_hex(&["session_owner:v1", "machine-a", &session]);
+    let source = SnapshotSource::ClaudeCode;
+    for (damage_kind, latch) in [("budget", true), ("collision", true), ("budget", false)] {
+        let context = format!("{damage_kind} latch={latch}");
+        reset_override_state_for_restart();
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-override-identity");
+        let path = scratch.join("index.json");
+        let support = scratch.join("support");
+        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+        // The first incident is the pre-existing gated rebuild.
+        fs::write(&path, b"{").unwrap();
+        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+
+        let seed = override_identity_seed(&session, latch);
+        let damage = match damage_kind {
+            "budget" => struct_order_budget_damage(&seed, ""),
+            _ => {
+                let mut seed = seed.clone();
+                let key = "01a03e99-49cf-7460-9fd7-f7dbfd2f05e4";
+                seed.codex_state_only_snapshot_fingerprints
+                    .insert(key.to_string(), "lower".to_string());
+                seed.codex_state_only_snapshot_fingerprints
+                    .insert(key.to_ascii_uppercase(), "upper".to_string());
+                serde_json::to_vec(&seed).unwrap()
+            }
+        };
+        fs::write(&path, &damage).unwrap();
+        let error = load().unwrap_err();
+        assert!(
+            error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+            "{context}: {error:#}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), damage, "{context}");
+
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overrides = scan_index_rebuild_manual_override_count();
+        let before = scan_index_containment_lines_for_test().len();
+        let (rebuilt, origin) = load().unwrap();
+        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined, "{context}");
+        assert!(rebuilt.files.is_empty(), "{context}");
+        assert_eq!(rebuilt.generation, 0, "{context}");
+        assert_identity_carried(&rebuilt, &seed, &context);
+        assert_eq!(scan_index_rebuild_manual_override_count(), overrides + 1);
+        assert!(
+            scan_index_containment_lines_for_test()[before..]
+                .iter()
+                .any(|line| line.contains("override=user_repair")
+                    && line.contains("identity=carried"))
+        );
+        // The damaged bytes are the override witness.
+        let witness = fs::read_dir(scratch.as_ref())
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .find(|path| {
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .starts_with("index.corrupt.override.")
+            })
+            .unwrap();
+        assert_eq!(fs::read(&witness).unwrap(), damage, "{context}");
+        assert!(scan_index_override_stamp_path(&support, source).exists());
+
+        // Post-override failure: the replacement cycle dies before any save.
+        // The next load reads the carried rebuild, still fresh (generation 0,
+        // no files), never an empty identity graph.
+        drop(rebuilt);
+        let (mut reloaded, origin) = load().unwrap();
+        assert_eq!(origin, ScanIndexLoadOrigin::Loaded, "{context}");
+        assert_eq!(reloaded.generation, 0, "{context}");
+        assert!(reloaded.files.is_empty(), "{context}");
+        assert!(!scan_index_rebuild_paused(source));
+        assert_identity_carried(&reloaded, &seed, &context);
+
+        // Post-override evidence: conflicting exact creator B defers and
+        // never replaces the retained owner A.
+        set_session_account_hash(&mut item, Some(OVERRIDE_OWNER_B));
+        let deferred = reloaded.bind_session_accounts(
+            SnapshotSource::ClaudeCode,
+            "machine-a",
+            &mut [item.clone()],
+            &[],
+        );
+        assert!(deferred.contains(&session), "{context}");
+        assert_eq!(
+            reloaded.session_account_bindings[&owner_key].account_identifier_hash,
+            OVERRIDE_OWNER_A
+        );
+
+        // A settled upload saves; a stale writer's CAS then fails. A stays.
+        let mut stale = reloaded.clone();
+        reloaded.save(&path).unwrap();
+        assert!(stale.save(&path).is_err(), "{context}");
+        let mut restarted = load().unwrap().0;
+        assert_eq!(restarted.generation, 1, "{context}");
+        assert_identity_carried(&restarted, &seed, &context);
+        assert!(restarted
+            .bind_session_accounts(
+                SnapshotSource::ClaudeCode,
+                "machine-a",
+                &mut [item.clone()],
+                &[]
+            )
+            .contains(&session));
+        assert_eq!(
+            restarted.session_account_bindings[&owner_key].account_identifier_hash,
+            OVERRIDE_OWNER_A
+        );
+    }
+}
+
+#[test]
+fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
+    let source = SnapshotSource::ClaudeCode;
+    for (case, damage) in [
+        ("syntax", b"{ ".to_vec()),
+        (
+            "bindings",
+            struct_order_budget_damage(&fixture(), ",\"session_account_bindings\":17"),
+        ),
+        (
+            "latch",
+            struct_order_budget_damage(
+                &fixture(),
+                ",\"claude_request_identity_contract_changed\":\"x\"",
+            ),
+        ),
+        (
+            "owned_start",
+            struct_order_budget_damage(&fixture(), ",\"claude_owned_start_census\":17"),
+        ),
+    ] {
+        reset_override_state_for_restart();
+        let scratch = crate::test_scratch::ScratchDir::new("lenient-override-unrecoverable");
+        let path = scratch.join("index.json");
+        let support = scratch.join("support");
+        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+        let refused = || {
+            let error = load().unwrap_err();
+            assert!(
+                error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+                "{case}: {error:#}"
+            );
+            assert!(scan_index_rebuild_paused(source));
+            assert_eq!(fs::read(&path).unwrap(), damage, "{case}");
+            error
+        };
+        fs::write(&path, b"{").unwrap();
+        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+        fs::write(&path, &damage).unwrap();
+        // The whole-index failure wins over the strict field, so the guard
+        // (not a strict refusal) is what pauses the source.
+        refused();
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overrides = scan_index_rebuild_manual_override_count();
+        let refusals = scan_index_rebuild_override_identity_unrecoverable_count();
+        let before = scan_index_containment_lines_for_test().len();
+        let error = refused();
+        assert!(
+            format!("{error:#}").contains(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE),
+            "{case}: {error:#}"
+        );
+        assert_eq!(
+            SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE,
+            "scan_index_rebuild_override_identity_unrecoverable"
+        );
+        // No rebuild: no override witness, no stamp, counted and alarmed.
+        assert_eq!(corrupt_count(scratch.as_ref()), 1, "{case}");
+        assert!(!scan_index_override_stamp_path(&support, source).exists());
+        assert_eq!(scan_index_rebuild_manual_override_count(), overrides);
+        assert_eq!(
+            scan_index_rebuild_override_identity_unrecoverable_count(),
+            refusals + 1
+        );
+        let lines = scan_index_containment_lines_for_test();
+        let alarms = lines[before..]
+            .iter()
+            .filter(|line| {
+                line.contains("override_refused=scan_index_rebuild_override_identity_unrecoverable")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(alarms.len(), 1, "{case}");
+        assert!(alarms[0].contains(&format!(
+            "scan_index_rebuild_override_identity_unrecoverable={}",
+            refusals + 1
+        )));
+        assert!(alarms[0].contains("source=claude_code"));
+        assert!(alarms[0].contains("source_paused=1"));
+        assert!(alarms[0].contains("index_kept=1"));
+        assert!(alarms[0].contains("alarm"));
+        assert!(!lines[before..]
+            .iter()
+            .any(|line| line.contains("fallback=gated_rebuild")));
+        assert_eq!(
+            scan_index_rebuild_override_refusal(source),
+            Some(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE)
+        );
+        // It stays paused: automatic loads keep refusing, and the spent press
+        // keeps its 24-hour cooldown.
+        refused();
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Cooldown
+        );
+        assert_eq!(fs::read(&path).unwrap(), damage, "{case}");
+    }
+}
+
+#[test]
+fn user_repair_override_cooldown_is_source_wide_across_destinations() {
+    reset_override_state_for_restart();
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-override-source-wide");
+    let support = scratch.join("support");
+    let destination = |namespace: &str| {
+        let dir = support.join("snapshots/destinations").join(namespace);
+        fs::create_dir_all(&dir).unwrap();
+        dir.join("claude_code-scan-index-v3.json")
+    };
+    let (a, b) = (destination(&"a".repeat(64)), destination(&"b".repeat(64)));
+    let source = SnapshotSource::ClaudeCode;
+    let load =
+        |path: &Path| ScanIndex::load_for_snapshot_source_with_origin(path, source, &support);
+    let damage = struct_order_budget_damage(&fixture(), "");
+    let refused = |path: &Path| {
+        let error = load(path).unwrap_err();
+        assert!(
+            error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+            "{error:#}"
+        );
+        assert_eq!(fs::read(path).unwrap(), damage);
+    };
+    let pause = |path: &Path| {
+        fs::write(path, b"{").unwrap();
+        assert_eq!(load(path).unwrap().1, ScanIndexLoadOrigin::Quarantined);
+        fs::write(path, &damage).unwrap();
+        refused(path);
+    };
+
+    // Repair consumes the override under destination A.
+    pause(&a);
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    assert_eq!(load(&a).unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    let stamp = scan_index_override_stamp_path(&support, source);
+    assert!(stamp.exists());
+    assert!(!stamp.starts_with(support.join("snapshots/destinations")));
+
+    // Restart, then re-pair: a new destination namespace with no override
+    // witness of its own still sees A's override and cools for 24 hours.
+    reset_override_state_for_restart();
+    pause(&b);
+    assert!(scan_index_rebuild_witness_stamps(&b)
+        .unwrap()
+        .newest_override
+        .is_none());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    assert_eq!(
+        SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE,
+        "scan_index_rebuild_override_cooldown"
+    );
+    refused(&b);
+    // 24 hours after A's override one press is allowed again.
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(
+            source,
+            SystemTime::now() + std::time::Duration::from_secs(25 * 60 * 60)
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+
+    // Clock rollback: a future source-wide stamp still cools.
+    let future = unix_seconds_at(SystemTime::now()) + 48 * 60 * 60;
+    fs::write(
+        &stamp,
+        format!("{{\"last_override_unix_seconds\":{future}}}"),
+    )
+    .unwrap();
+    reset_override_state_for_restart();
+    pause(&destination(&"c".repeat(64)));
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    // A malformed stamp fails closed from its own mtime.
+    fs::write(&stamp, b"not a stamp").unwrap();
+    reset_override_state_for_restart();
+    pause(&destination(&"d".repeat(64)));
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(
+            source,
+            SystemTime::now() + std::time::Duration::from_secs(25 * 60 * 60)
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
 }

@@ -383,7 +383,54 @@ impl Error {
     pub(super) fn quarantines(&self) -> bool {
         matches!(self, Self::Syntax(_) | Self::HoldBudget)
     }
+    /// Content-free kind for refusal lines.
+    pub(super) fn kind(&self) -> &'static str {
+        match self {
+            Self::Syntax(_) => "syntax",
+            Self::Io(_) => "io",
+            Self::Refused(_) => "strict_decode",
+            Self::HoldBudget => "hold_budget",
+        }
+    }
 }
+
+/// Which fields one `Decoder::index` pass decodes; every other field is
+/// skipped by its lexical span, unread.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pass {
+    /// Controls and counters, before any record can spend hold admission.
+    Headers,
+    /// The headers plus `IDENTITY_CARRY_FIELDS` (`read_identity_carry`).
+    IdentityCarry,
+    Full,
+}
+fn header_field(name: &str) -> bool {
+    matches!(
+        name,
+        "schema_version"
+            | "generation"
+            | "accepted_snapshot_fingerprint_ledger_version"
+            | "codex_parent_side_generation"
+            | "codex_parent_proof_wrap_epoch"
+            | "codex_parent_proof_seq"
+            | "codex_proof_index_incarnation"
+    )
+}
+/// SI-718-O1: the session-identity state a user Repair override rebuild
+/// carries from the damaged index (`ScanIndex::carry_identity_from`). Each
+/// uses the load's own strict decoder; the accepted ledger keeps the load's
+/// rule that a malformed fingerprint vouched for nothing.
+pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
+    "session_account_bindings",
+    "claude_account_deferred_holds",
+    "claude_request_identity_contract",
+    "claude_request_identity_contract_changed",
+    "claude_owned_start_census",
+    "claude_stale_family_carry",
+    "claude_duplicate_request_owners",
+    "claude_duplicate_request_witness_overflowed",
+    "accepted_snapshot_fingerprints",
+];
 #[derive(Default)]
 struct Counts {
     drops: ScanIndexLoadDrops,
@@ -765,11 +812,11 @@ fn read_inner<R: BufRead + Seek>(
     // Controls are checked before any record can exhaust hold admission.
     // Otherwise a future ledger placed after damaged records could be renamed
     // as corruption before this build learns it cannot interpret the file.
-    let headers = decoder.index(true)?;
+    let headers = decoder.index(Pass::Headers)?;
     controls(&headers, source)?;
     drop(headers);
     decoder.reader.seek(SeekFrom::Start(0))?;
-    let result = decoder.index(false);
+    let result = decoder.index(Pass::Full);
     if matches!(result, Err(Error::HoldBudget)) {
         // A load has not decided whether a rebuild is permitted yet. The
         // quarantine boundary emits that token after its shared loop guard.
@@ -826,6 +873,39 @@ pub(super) fn read_file(
     }
     result
 }
+/// SI-718-O1: decode only the headers and `IDENTITY_CARRY_FIELDS` of an
+/// index that cannot load whole (syntax, hold budget or a Codex key
+/// collision), with the same per-field decoders as a load. File records,
+/// holds and every other field are skipped unread, so damaged records spend
+/// no admission here. Any error means the identity state is unrecoverable:
+/// the override must not rebuild.
+pub(super) fn read_identity_carry(
+    file: File,
+    source: &'static str,
+) -> std::result::Result<ScanIndex, Error> {
+    let before = sampled_scan::codex_cursor::OpenStamp::capture(&file)?;
+    let mut reader = BufReader::new(file);
+    let input_len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    let census_resources = validate_original(&mut reader)?;
+    let mut decoder = Decoder {
+        reader,
+        input_len,
+        held_bytes: 0,
+        held_count: 0,
+        holds: Holds::default(),
+        counts: Counts::default(),
+        family_spans: BTreeMap::new(),
+        census_resources,
+    };
+    let carry = decoder.index(Pass::IdentityCarry)?;
+    controls(&carry, source)?;
+    if sampled_scan::codex_cursor::OpenStamp::capture(decoder.reader.get_ref())? != before {
+        return Err(Error::Refused("input changed during decode"));
+    }
+    Ok(carry)
+}
+
 struct SideRequestCountGuard;
 impl Drop for SideRequestCountGuard {
     fn drop(&mut self) {
@@ -1134,7 +1214,7 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
         Ok(hash.finalize().into())
     }
-    fn index(&mut self, headers_only: bool) -> std::result::Result<ScanIndex, Error> {
+    fn index(&mut self, pass: Pass) -> std::result::Result<ScanIndex, Error> {
         let mut index = ScanIndex {
             accepted_snapshot_fingerprint_ledger_version: 0,
             ..ScanIndex::default()
@@ -1188,17 +1268,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                     }
                 } else {
                     match name {
-                        _ if headers_only
-                            && !matches!(
-                                name,
-                                "schema_version"
-                                    | "generation"
-                                    | "accepted_snapshot_fingerprint_ledger_version"
-                                    | "codex_parent_side_generation"
-                                    | "codex_parent_proof_wrap_epoch"
-                                    | "codex_parent_proof_seq"
-                                    | "codex_proof_index_incarnation"
-                            ) => {}
+                        _ if match pass {
+                            Pass::Full => false,
+                            Pass::Headers => !header_field(name),
+                            Pass::IdentityCarry => {
+                                !header_field(name) && !IDENTITY_CARRY_FIELDS.contains(&name)
+                            }
+                        } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
                         "upload_context_fingerprint" => {
@@ -1449,7 +1525,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             return Err(Error::Refused("missing files"));
         }
 
-        if !headers_only {
+        if pass == Pass::Full {
             let authority_span = self
                 .family_spans
                 .get("claude_usage_authority_quarantine")

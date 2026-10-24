@@ -31387,6 +31387,12 @@ X-API-Key = "otel_redacted"
         let _home_guard = EnvVarGuard::set_path("HOME", &root);
         fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
             .expect("seed clean config");
+        // Hold-budget damage: valid JSON whose session-identity fields an
+        // override can strictly recover (SI-718-O1); syntax damage cannot.
+        let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
+        damage["files"]["excess-held"] =
+            serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+        let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
         // A second whole-index incident inside seven days pauses the source.
         let pause = |source: SnapshotSource| {
             let path = root.join(format!("{}-scan-index.json", source.api_slug()));
@@ -31394,7 +31400,7 @@ X-API-Key = "otel_redacted"
             let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(&path, source, &root)
                 .expect("first incident rebuilds");
             assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
-            fs::write(&path, b"{ ").expect("second damage");
+            fs::write(&path, &damage).expect("second damage");
             path
         };
         let refused = |path: &Path, source: SnapshotSource| {
@@ -31402,7 +31408,7 @@ X-API-Key = "otel_redacted"
                 .expect_err("the guard refuses");
             assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
             assert!(crate::snapshots::scan_index_rebuild_paused(source));
-            assert_eq!(fs::read(path).expect("index kept"), b"{ ");
+            assert_eq!(fs::read(path).expect("index kept"), damage);
         };
         let daemon = daemon();
         let repair = |token: Option<&str>,
@@ -31503,7 +31509,7 @@ X-API-Key = "otel_redacted"
 
         // A fresh failure inside seven days of the override refuses again,
         // and a press inside 24 hours names the cooldown and the retry time.
-        fs::write(&pi, b"{ ").expect("third damage");
+        fs::write(&pi, &damage).expect("third damage");
         refused(&pi, SnapshotSource::Pi);
         let cooling = repair(
             None,
