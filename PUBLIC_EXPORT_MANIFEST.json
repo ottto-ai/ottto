@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 840,
-  "content_sha256": "1b7c8f3fe43a98f72211a2312e074794dcebe1fcdcc9665ac49f6aa4a696916f",
+  "content_sha256": "94092390d8c5c7c1b06c0628c1312cd47b5736dba74342a15a30a7bfecb2b09b",
   "files": [
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "6014fe8ced38961b0283936817c45090fa2d076dd5fd18be4a05fd1bcf43f7da",
-      "size_bytes": 3445964
+      "sha256": "970884031cd81c11152dc5b25c2c6a65eef168e4d26d1ab3b34359bed7960b26",
+      "size_bytes": 3446981
     },
     {
       "executable": false,
@@ -1763,15 +1763,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "9600c82374f89de9467ea2aac58d1de502311f3ee5157ce88fb8a41a45a4dc91",
-      "size_bytes": 319886
+      "sha256": "73441d89b13edce7172427012f65a5933de7fe189d584f410ab13fb7365e173e",
+      "size_bytes": 320108
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/d1.rs",
-      "sha256": "fc9257bafda146c4567948680f1e1bcdd22f2ca7f70051ca9678cebb067db7b6",
-      "size_bytes": 18233
+      "sha256": "4dc1d31a9167326987a945af529e7bf211c0eb0b5409cac5aef68d4653e2f03d",
+      "size_bytes": 18300
     },
     {
       "executable": false,
@@ -1791,8 +1791,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/rebuild_bound.rs",
-      "sha256": "67a0eb52abe6c9d7d8150967aac204d4b1f91e2954774bc9f861b827054b07db",
-      "size_bytes": 19756
+      "sha256": "ac7b499c6d98b1ff36d6f3d2e784caca250eb4c35351ec5b58b1c860357934db",
+      "size_bytes": 29310
     },
     {
       "executable": false,
@@ -1805,8 +1805,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census_tests.rs",
-      "sha256": "d32035f5f2a9238cb102363a9ec0478a1aeb894635b957d38f91c21dc0ff787e",
-      "size_bytes": 112182
+      "sha256": "c80540948888b2d5b3717f48c6e5b5fc5e6c85169c88050bae071b74f835113e",
+      "size_bytes": 125588
     },
     {
       "executable": false,
@@ -2344,8 +2344,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "5640b6bac747c996c2b7c3544769c8fbbf45803abdfc6ad5e9f950cee95e06ad",
-      "size_bytes": 15394
+      "sha256": "8033abd736a793f22d585fd87fda2efb931216b5059a892ca754f8479a566036",
+      "size_bytes": 15822
     },
     {
       "executable": false,
@@ -5883,7 +5883,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T06:37:07+00:00",
+  "generated_at": "2026-10-24T07:31:14+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 841,
   "public_roots": [
@@ -5922,5 +5922,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "cab4ca53084a5439cbae2d5bb9c688fc3c6e884a"
+  "source_commit": "e2633196de72314a30b4ef2c546cc54aaf9cbcbb"
 }
