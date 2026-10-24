@@ -27,6 +27,7 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
+mod d1;
 mod phase_b;
 use phase_b::{HashIter, SafetyBase64, SafetyHashes};
 #[cfg(test)]
@@ -874,6 +875,22 @@ impl Eq for ClaudeRequestCensus {}
 crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, safety, hash_total, serialized_total, retired_order, extension_order, admission_serialized_total, active_hash_total, safety_incomplete, ambiguous, producer_refused, decode_lost, compact_decode_recovered, revision);
 
 const MAX_RECLAIMED_KEYS: usize = 4096;
+const MAX_UNREAD_ALARMS_PER_TERMINAL: usize = 8;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SafetyIncompleteOverflowCause {
+    DecodeLoss,
+    KeyCap,
+    MalformedMarker,
+}
+impl crate::heap_layout_bound::HeapLayoutBound for SafetyIncompleteOverflowCause {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, _: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        Some(())
+    }
+}
 
 /// A bounded set of exact local keys. No key is logged. Missing/malformed
 /// persisted state is sticky closed, never interpreted as an empty list.
@@ -883,6 +900,8 @@ struct SafetyIncomplete {
     keys: BTreeSet<String>,
     since: u64,
     overflow: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    overflow_cause: Option<SafetyIncompleteOverflowCause>,
     reclaimed: u64,
     #[serde(default)]
     metadata_active: u64,
@@ -894,12 +913,13 @@ impl Default for SafetyIncomplete {
             keys: BTreeSet::new(),
             since: 0,
             overflow: false,
+            overflow_cause: None,
             reclaimed: 0,
             metadata_active: 0,
         }
     }
 }
-crate::heap_layout_bound::fields!(SafetyIncomplete; derivation, keys, since, overflow, reclaimed, metadata_active);
+crate::heap_layout_bound::fields!(SafetyIncomplete; derivation, keys, since, overflow, overflow_cause, reclaimed, metadata_active);
 fn safety_key_hash(key: &str) -> [u8; 32] {
     Sha256::digest(key.as_bytes()).into()
 }
@@ -910,8 +930,19 @@ impl SafetyIncomplete {
     fn closed() -> Self {
         Self {
             overflow: true,
+            overflow_cause: Some(SafetyIncompleteOverflowCause::MalformedMarker),
             ..Self::default()
         }
+    }
+    fn mark_overflow(&mut self, cause: SafetyIncompleteOverflowCause) {
+        self.overflow = true;
+        self.overflow_cause.get_or_insert(cause);
+    }
+    fn overflow_cause(&self) -> Option<SafetyIncompleteOverflowCause> {
+        self.overflow.then(|| {
+            self.overflow_cause
+                .unwrap_or(SafetyIncompleteOverflowCause::MalformedMarker)
+        })
     }
     fn incomplete(&self) -> bool {
         self.overflow || !self.keys.is_empty()
@@ -926,7 +957,7 @@ impl SafetyIncomplete {
         if self.keys.len() < MAX_RECLAIMED_KEYS {
             self.keys.insert(key.to_owned());
         } else if !self.keys.contains(key) {
-            self.overflow = true;
+            self.mark_overflow(SafetyIncompleteOverflowCause::KeyCap);
         }
     }
     fn restored(&mut self, key: &str) {
@@ -1910,7 +1941,10 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
         || index.claude_request_census.decode_lost
         || !index.claude_request_census.ambiguous.is_empty()
     {
-        index.claude_request_census.safety_incomplete.overflow = true;
+        index
+            .claude_request_census
+            .safety_incomplete
+            .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
     }
     Ok(index)
 }
@@ -2035,7 +2069,10 @@ impl<R: std::io::Read> CensusRead<R> {
             || index.claude_request_census.decode_lost
             || !index.claude_request_census.ambiguous.is_empty()
         {
-            index.claude_request_census.safety_incomplete.overflow = true;
+            index
+                .claude_request_census
+                .safety_incomplete
+                .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
         }
         Ok(index)
     }
@@ -2455,7 +2492,9 @@ impl<'de> Visitor<'de> for CensusVisitor {
             if !seen.insert(key.clone()) {
                 census.remove(&key);
                 census.ambiguous.insert(key);
-                census.safety_incomplete.overflow = true;
+                census
+                    .safety_incomplete
+                    .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
                 dropped += 1;
                 map.next_value::<IgnoredAny>()?;
                 continue;
@@ -2494,10 +2533,12 @@ impl<'de> Visitor<'de> for CensusVisitor {
             dropped += u64::from(!kept);
         }
         if !census.ambiguous.is_empty() {
-            census.safety_incomplete.overflow = true;
+            census
+                .safety_incomplete
+                .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
         }
         if census.safety.is_some() {
-            census.safety_incomplete.overflow = true;
+            census.safety_incomplete = SafetyIncomplete::closed();
         }
         if (census.records.is_empty() && dropped == 0) || self.ledger {
             census.safety_incomplete = SafetyIncomplete::default();
@@ -3451,6 +3492,24 @@ pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Pat
     }
 }
 
+/// Preserve the main D1 log shape for ordinary OFF terminals. Retained safety
+/// and ON diagnostics keep the extended phase-B counters, including alarms.
+pub(super) fn serialize_shadow_counts<S: Serializer>(
+    counts: &Option<ClaudeRequestCensusShadowCounts>,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    match counts {
+        Some(counts)
+            if counts.shadow_spec_version == 0
+                && !counts.safety_incomplete
+                && !counts.safety_incomplete_overflow =>
+        {
+            serializer.serialize_some(&d1::CountsLine(counts))
+        }
+        _ => counts.serialize(serializer),
+    }
+}
+
 /// Complete Claude terminal, before any join and before the snapshot_sync
 /// folds: prune records of keys neither indexed nor walked this generation,
 /// then measure the shadow census. Nothing reads the result into a decision.
@@ -3473,10 +3532,6 @@ pub(crate) fn settle_claude_request_census_terminal(
 #[cfg(test)]
 pub(crate) fn d2_shadow_mode_for_test(enabled: bool) -> impl Drop {
     phase_b::ShadowMode::set(enabled)
-}
-
-pub(crate) fn d2_shadow_enabled() -> bool {
-    phase_b::enabled()
 }
 
 pub(crate) fn prepare_claude_request_census_terminal(
@@ -3515,7 +3570,7 @@ pub(crate) fn prepare_claude_request_census_terminal(
         let window = rfc3339_unix_seconds(census_window_end).unwrap_or_default();
         let aged = retire_without_safety(index, window);
         note_transcript_retirements(aged, vanished);
-        return ClaudeRequestCensusShadowCounts::default();
+        return d1::measure(index, window, residue_index_keys);
     }
     let started = std::time::Instant::now();
     let files = &index.files;
@@ -3543,13 +3598,16 @@ pub(crate) fn prepare_claude_request_census_terminal(
     if !phase_b::enabled() {
         *view = None;
         let census = &index.claude_request_census;
-        let existing_safety = !census.retired_order.is_empty()
+        let existing_safety = census.safety_incomplete.overflow
+            || !census.retired_order.is_empty()
             || !census.safety_incomplete.keys.is_empty()
             || index
                 .claude_request_census_shadow
                 .safety_incomplete
                 .is_some();
         let incomplete = existing_safety && census.safety_incomplete.incomplete();
+        let d1 = d1::measure(index, window, residue_index_keys);
+        let census = &index.claude_request_census;
         return ClaudeRequestCensusShadowCounts {
             safety_incomplete: incomplete,
             safety_incomplete_alarm: incomplete
@@ -3561,10 +3619,11 @@ pub(crate) fn prepare_claude_request_census_terminal(
                         >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * 80),
             safety_incomplete_since: census.safety_incomplete.since,
             safety_incomplete_overflow: census.safety_incomplete.overflow,
+            safety_incomplete_overflow_cause: census.safety_incomplete.overflow_cause(),
             safety_reclaimed: census.safety_incomplete.reclaimed,
             safety_metadata_reclaimed_active: census.safety_incomplete.metadata_active,
             safety_reclaimed_keys: census.safety_incomplete.keys.len(),
-            ..ClaudeRequestCensusShadowCounts::default()
+            ..d1
         };
     }
     for extra in index
@@ -3892,6 +3951,7 @@ impl ClaudeRequestCensusJoin {
                 safety_incomplete: census.safety_incomplete.incomplete(),
                 safety_incomplete_since: census.safety_incomplete.since,
                 safety_incomplete_overflow: census.safety_incomplete.overflow,
+                safety_incomplete_overflow_cause: census.safety_incomplete.overflow_cause(),
                 safety_reclaimed: census.safety_incomplete.reclaimed,
                 safety_metadata_reclaimed_active: census.safety_incomplete.metadata_active,
                 safety_reclaimed_keys: census.safety_incomplete.keys.len(),
@@ -4002,7 +4062,10 @@ impl ClaudeRequestCensusJoin {
                     .counts
                     .unread_max_complete_terminals
                     .max(safety.unread_complete_terminals);
-                if age > 7 * 86400 || safety.unread_complete_terminals > 20 {
+                if (age > 7 * 86400 || safety.unread_complete_terminals > 20)
+                    && join.counts.unread_alarm_emitted_keys < MAX_UNREAD_ALARMS_PER_TERMINAL
+                {
+                    join.counts.unread_alarm_emitted_keys += 1;
                     let key_hash = safety_key_id(key);
                     let cause = if safety.acquired < safety.extent {
                         "bound_suffix_unread"
@@ -4983,7 +5046,13 @@ pub(crate) fn assert_selected_reclaim_closed_for_test(index: &ScanIndex, admitte
     assert!(!join.disjointness_complete(true));
     let counts = join.counts(true);
     let view = CensusShadowView::prepare(index, join, counts, "1970-01-01T00:00:07Z").unwrap();
-    assert!(!view.settled_for(index, "any-copy", true, "1970-01-01T00:00:07Z"));
+    let peer = format!("{admitted}.retired.jsonl");
+    let root = claude_index_path_family_member(Path::new(&peer)).unwrap().0;
+    assert!(
+        view.join.coverage.contains_key(&peer),
+        "peer participates in settlement"
+    );
+    assert!(!view.settled_for(index, &root, true, "1970-01-01T00:00:07Z"));
 }
 #[cfg(test)]
 pub(crate) fn seed_pipeline_safety_cases_for_test(index: &mut ScanIndex) {
@@ -5493,6 +5562,179 @@ mod phase_b_tests {
             );
         }
         index
+    }
+
+    #[test]
+    fn off_d1_line_and_counters_equal_frozen_main_across_flips() {
+        let _mode = phase_b::ShadowMode::set(false);
+        let mut index = index_with(vec![
+            (A, record('a', vec![1, 2]).without_safety_for_test()),
+            (B, record('b', vec![2, 3]).without_safety_for_test()),
+        ]);
+        index.claude_request_census_shadow.derivation_drift = 7;
+        let window = rfc3339_unix_seconds(WINDOW).unwrap();
+        let observed = BTreeSet::new();
+        let residue = BTreeSet::new();
+        for (step, open) in [true, false, true].into_iter().enumerate() {
+            if step == 1 {
+                index.claude_request_census.remove(B);
+            } else if step == 2 {
+                index
+                    .claude_request_census
+                    .insert_for_test(B, record('b', vec![2, 3]).without_safety_for_test());
+            }
+            let mut reference_index = index.clone();
+            let mut reference =
+                main_reference::MainAdmission::from_census(&index.claude_request_census);
+            reference.terminal(&reference_index, &observed, window);
+            let expected = reference.measure_d1(&mut reference_index, window, &residue);
+            reference_index.claude_request_census = reference.into_census();
+            let mut view = None;
+            let actual = prepare_claude_request_census_terminal(
+                &mut index, &observed, &residue, WINDOW, &mut view,
+            );
+            assert!(view.is_none());
+            assert_eq!(actual, expected, "D1 counters at step {step}");
+            assert_eq!(actual.would_open, open);
+            assert_eq!(actual.would_open_flips, step as u64);
+            assert_eq!(actual.duplicate_hashes, usize::from(step != 1));
+            let line = |counts| {
+                serde_json::to_vec(&crate::snapshots::ClaudeDuplicateCensusCounts {
+                    request_census: Some(counts),
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            assert_eq!(
+                line(actual),
+                main_reference::counts_line(expected),
+                "D1 counts line at step {step}"
+            );
+            assert_eq!(
+                serde_json::to_vec_pretty(&index).unwrap(),
+                serde_json::to_vec_pretty(&reference_index).unwrap(),
+                "o/f and checkpoint parity"
+            );
+        }
+    }
+
+    #[test]
+    fn safety_overflow_causes_survive_restart_and_decode_loss_is_sticky() {
+        use SafetyIncompleteOverflowCause::{DecodeLoss, KeyCap, MalformedMarker};
+        for enabled in [false, true] {
+            let _mode = phase_b::ShadowMode::set(enabled);
+            let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
+            value["claude_request_census"] = serde_json::json!({"bad": false});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            for mut index in [
+                decode_index(bytes.as_slice()).unwrap(),
+                decode_bounded_index(&bytes).unwrap(),
+            ] {
+                assert_eq!(
+                    index
+                        .claude_request_census
+                        .safety_incomplete
+                        .overflow_cause(),
+                    Some(DecodeLoss)
+                );
+                prepare_claude_request_census_terminal(
+                    &mut index,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    WINDOW,
+                    &mut None,
+                );
+                prepare_safety_checkpoint(&mut index);
+                let bytes = serde_json::to_vec(&index).unwrap();
+                let reloaded = decode_index(bytes.as_slice()).unwrap();
+                assert_eq!(
+                    reloaded
+                        .claude_request_census
+                        .safety_incomplete
+                        .overflow_cause(),
+                    Some(DecodeLoss)
+                );
+                let mut rebuilt = serde_json::to_value(&reloaded).unwrap();
+                rebuilt["claude_request_census_shadow"]["s"]["derivation"] = serde_json::json!(0);
+                let bytes = serde_json::to_vec(&rebuilt).unwrap();
+                assert!(!decode_index(bytes.as_slice())
+                    .unwrap()
+                    .claude_request_census
+                    .safety_incomplete
+                    .incomplete());
+            }
+            let mut marker = SafetyIncomplete::default();
+            for key in 0..=MAX_RECLAIMED_KEYS {
+                marker.note(&format!("key-{key}"), 1, 7);
+            }
+            assert_eq!(marker.keys.len(), MAX_RECLAIMED_KEYS);
+            assert_eq!(marker.overflow_cause(), Some(KeyCap));
+            for key in 0..=MAX_RECLAIMED_KEYS {
+                marker.restored(&format!("key-{key}"));
+            }
+            assert!(marker.keys.is_empty());
+            assert_eq!(marker.overflow_cause(), Some(KeyCap));
+            for marker in [marker, SafetyIncomplete::closed()] {
+                let expected = marker.overflow_cause();
+                assert!(matches!(expected, Some(KeyCap | MalformedMarker)));
+                let mut index = ScanIndex::default();
+                index.claude_request_census.safety_incomplete = marker;
+                prepare_safety_checkpoint(&mut index);
+                let bytes = serde_json::to_vec(&index).unwrap();
+                for mut loaded in [
+                    decode_index(bytes.as_slice()).unwrap(),
+                    decode_bounded_index(&bytes).unwrap(),
+                ] {
+                    let counts = prepare_claude_request_census_terminal(
+                        &mut loaded,
+                        &BTreeSet::new(),
+                        &BTreeSet::new(),
+                        WINDOW,
+                        &mut None,
+                    );
+                    assert!(counts.safety_incomplete_overflow);
+                    assert_eq!(counts.safety_incomplete_overflow_cause, expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unread_alarm_caps_logs_but_counts_every_unread_key() {
+        let _mode = phase_b::ShadowMode::set(true);
+        let mut index = ScanIndex::default();
+        const KEYS: usize = MAX_UNREAD_ALARMS_PER_TERMINAL * 3;
+        for number in 0..KEYS {
+            let mut record = record('a', vec![number as u64]);
+            let safety = record.extra.safety.as_mut().unwrap();
+            safety.ac = false;
+            safety.extent = 100;
+            safety.acquired = 50;
+            safety.unread_since = 1;
+            safety.last_progress_at = 1;
+            safety.unread_complete_terminals = 21;
+            let key = format!("/phase-b/projects/alarm-{number}.jsonl");
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+            entry.source_file_fingerprint = "a".repeat(64);
+            index.files.insert(key.clone(), entry);
+            index.claude_request_census.insert_for_test(&key, record);
+        }
+        for _ in 0..2 {
+            let counts = prepare_claude_request_census_terminal(
+                &mut index,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+                WINDOW,
+                &mut None,
+            );
+            assert_eq!(
+                counts.unread_alarm_emitted_keys,
+                MAX_UNREAD_ALARMS_PER_TERMINAL
+            );
+            assert_eq!(counts.unread_age_alarm_keys, KEYS);
+            assert_eq!(counts.unread_terminal_alarm_keys, KEYS);
+            assert_eq!(counts.shape_lossy_unread, KEYS);
+        }
     }
 
     #[test]
@@ -6693,9 +6935,11 @@ mod phase_b_tests {
             .unwrap()
             .len();
         let mut baseline = main_reference::MainAdmission::from_census(&index.claude_request_census);
+        let mut main_index = index.clone();
         let started = std::time::Instant::now();
         let cpu_started = thread_cpu_micros().expect("native CI thread CPU clock");
-        baseline.terminal(&index, &BTreeSet::new(), window);
+        baseline.terminal(&main_index, &BTreeSet::new(), window);
+        let main_counts = baseline.measure_d1(&mut main_index, window, &BTreeSet::new());
         let main_cpu = thread_cpu_micros().unwrap().saturating_sub(cpu_started);
         let main_wall = started.elapsed().as_micros();
         let started = std::time::Instant::now();
@@ -6713,7 +6957,16 @@ mod phase_b_tests {
         prepare_safety_checkpoint(&mut index);
         assert!(view.is_none());
         assert_eq!(counts.shadow_join_builds, 0);
-        assert!(index.claude_request_census_shadow.is_empty());
+        assert_eq!(counts, main_counts, "OFF D1 counts equal frozen main");
+        assert_eq!(
+            serde_json::to_vec(&index.claude_request_census_shadow).unwrap(),
+            serde_json::to_vec(&main_index.claude_request_census_shadow).unwrap(),
+            "OFF D1 o/f/d state equals frozen main"
+        );
+        assert!(index
+            .claude_request_census_shadow
+            .safety_incomplete
+            .is_none());
         assert!(index
             .claude_request_census
             .safety_records()
@@ -6774,7 +7027,9 @@ mod phase_b_tests {
             baseline.swap_records(&mut index.claude_request_census);
             let start = thread_cpu_micros().unwrap();
             let (aged, dropped) = baseline.terminal(index, &BTreeSet::new(), window);
+            let counts = baseline.measure_d1(index, window, &BTreeSet::new());
             let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
+            assert_eq!(counts, main_counts);
             baseline.swap_records(&mut index.claude_request_census);
             assert_eq!((aged, dropped), (0, 0));
             assert_eq!(
@@ -6798,12 +7053,16 @@ mod phase_b_tests {
             );
             let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
             assert_eq!(counts.shadow_join_builds, 0);
+            assert_eq!(counts, main_counts);
             cpu
         };
-        let measure_own_map = |baseline: &mut main_reference::MainAdmission, index: &ScanIndex| {
+        let measure_own_map = |baseline: &mut main_reference::MainAdmission,
+                               index: &mut ScanIndex| {
             let start = thread_cpu_micros().unwrap();
             let (aged, dropped) = baseline.terminal(index, &BTreeSet::new(), window);
+            let counts = baseline.measure_d1(index, window, &BTreeSet::new());
             let cpu = thread_cpu_micros().unwrap().saturating_sub(start);
+            assert_eq!(counts, main_counts);
             assert_eq!((aged, dropped), (0, 0));
             cpu
         };
@@ -6811,9 +7070,9 @@ mod phase_b_tests {
             if sample % 2 == 0 {
                 main_steady.push(measure_main(&mut steady_baseline, &mut index));
                 off_steady.push(measure_off(&mut index));
-                own_map_steady.push(measure_own_map(&mut steady_baseline, &index));
+                own_map_steady.push(measure_own_map(&mut steady_baseline, &mut index));
             } else {
-                own_map_steady.push(measure_own_map(&mut steady_baseline, &index));
+                own_map_steady.push(measure_own_map(&mut steady_baseline, &mut index));
                 off_steady.push(measure_off(&mut index));
                 main_steady.push(measure_main(&mut steady_baseline, &mut index));
             }
@@ -6852,7 +7111,7 @@ mod phase_b_tests {
             * FILES;
         // Reported, never asserted: shared CI runners are too noisy for a
         // 0.5% gate. Median and min deltas are both printed.
-        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=0 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} first_terminal_memory=distinct steady_samples={STEADY_SAMPLES} steady_order=ABAB steady_memory=shared main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} steady_median_delta_pct={:.3} main_steady_min_cpu_us={main_min} off_steady_min_cpu_us={off_min} steady_min_delta_us={} steady_min_delta_pct={:.3} steady_paired_median_delta_pct={paired_median_pct:.3} own_map_main_median_cpu_us={own_map_median} own_map_main_min_cpu_us={own_map_min} own_map_vs_shared_main_median_pct={:.3} main_samples_us={main_samples} off_samples_us={off_samples} own_map_samples_us={own_map_samples} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=main_reference_shared_map counting_writer=main_serialized_len excludes_main_d1_shadow=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, pct(off_steady, main_steady), off_min as i128 - main_min as i128, pct(off_min, main_min), pct(own_map_median, main_steady), checkpoint_actual.len());
+        eprintln!("FIX3_PHASE_B_OFF files={FILES} hashes={HASHES} inline_record_delta_bytes={inline_delta} census_before_bytes={before_bytes} census_after_bytes={} retained_bytes={retained_bytes} metadata_bytes={metadata_bytes} serialization_delta_per_save={checkpoint_delta} phase_b_joins=0 phase_b_digests=0 diagnostic_lines=1 source_reads=0 main_money_terminal_cpu_us={main_cpu} off_terminal_cpu_us={off_cpu} terminal_cpu_delta_us={} first_terminal_memory=distinct steady_samples={STEADY_SAMPLES} steady_order=ABAB steady_memory=shared main_steady_cpu_us={main_steady} off_steady_cpu_us={off_steady} steady_cpu_delta_us={} steady_median_delta_pct={:.3} main_steady_min_cpu_us={main_min} off_steady_min_cpu_us={off_min} steady_min_delta_us={} steady_min_delta_pct={:.3} steady_paired_median_delta_pct={paired_median_pct:.3} own_map_main_median_cpu_us={own_map_median} own_map_main_min_cpu_us={own_map_min} own_map_vs_shared_main_median_pct={:.3} main_samples_us={main_samples} off_samples_us={off_samples} own_map_samples_us={own_map_samples} thread_cpu_clock=true main_money_terminal_wall_us={main_wall} off_terminal_wall_us={off_wall} checkpoint_after_bytes={} cpu_baseline=main_reference_shared_map counting_writer=main_serialized_len includes_main_d1_shadow=true d1_counts_equal=true runtime_corpus=false", actual.len(), off_cpu as i128 - main_cpu as i128, off_steady as i128 - main_steady as i128, pct(off_steady, main_steady), off_min as i128 - main_min as i128, pct(off_min, main_min), pct(own_map_median, main_steady), checkpoint_actual.len());
     }
 
     #[test]

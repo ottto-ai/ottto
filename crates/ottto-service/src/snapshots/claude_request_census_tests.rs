@@ -790,60 +790,63 @@ fn census_records_follow_the_working_index_through_committable_subset() {
 /// indexed or were walked this generation (review F9).
 #[test]
 fn census_terminal_prune_keeps_indexed_and_walked_keys_only() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let indexed = "/census/projects/census-indexed.jsonl".to_string();
-    let walked = "/census/projects/census-walked.jsonl".to_string();
-    let retired = "/census/projects/census-retired.jsonl".to_string();
-    let mut index = ScanIndex::default();
-    let mut entry = manifest_index_entry(Some("body"));
-    entry.source_file_fingerprint = hex_fingerprint('a');
-    // Modified in this window: not due for transcript retirement.
-    entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
-    index.files.insert(indexed.clone(), entry);
-    index
-        .file_snapshot_fingerprints
-        .insert(indexed.clone(), BTreeSet::from(["body".to_string()]));
-    for (key, seed, hash) in [(&indexed, 'a', 1), (&walked, 'b', 2), (&retired, 'c', 2)] {
-        index.claude_request_census_mut_for_test().insert_for_test(
-            key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &hex_fingerprint(seed),
-                if key == &walked {
-                    rfc3339_unix_seconds(FIRST_WINDOW).unwrap()
-                } else {
-                    1
-                },
-                ClaudeRequestCensusShape::Exact,
-                vec![hash],
-            ),
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let indexed = "/census/projects/census-indexed.jsonl".to_string();
+        let walked = "/census/projects/census-walked.jsonl".to_string();
+        let retired = "/census/projects/census-retired.jsonl".to_string();
+        let mut index = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = hex_fingerprint('a');
+        // Modified in this window: not due for transcript retirement.
+        entry.modified_unix_seconds = rfc3339_unix_seconds(FIRST_WINDOW).expect("window");
+        index.files.insert(indexed.clone(), entry);
+        index
+            .file_snapshot_fingerprints
+            .insert(indexed.clone(), BTreeSet::from(["body".to_string()]));
+        for (key, seed, hash) in [(&indexed, 'a', 1), (&walked, 'b', 2), (&retired, 'c', 2)] {
+            index.claude_request_census_mut_for_test().insert_for_test(
+                key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &hex_fingerprint(seed),
+                    if key == &walked {
+                        rfc3339_unix_seconds(FIRST_WINDOW).unwrap()
+                    } else {
+                        1
+                    },
+                    ClaudeRequestCensusShape::Exact,
+                    vec![hash],
+                ),
+            );
+        }
+        let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+            &mut index,
+            &BTreeSet::from([walked.clone()]),
+            &BTreeSet::new(),
+            FIRST_WINDOW,
+        );
+        assert_eq!(
+            index.claude_request_census_for_test().keys_for_test(),
+            vec![indexed.clone(), walked.clone()]
+        );
+        assert_eq!(
+            index.claude_request_census_for_test().hash_total_for_test(),
+            2
+        );
+        // The retired record's copy of hash 2 no longer makes a duplicate.
+        assert_eq!(counts.duplicate_hashes, 0);
+        assert_eq!(counts.records, 2);
+        assert_eq!(counts.family_keys, 1);
+        assert_eq!(counts.covered_by_fingerprint, 1);
+        assert!(counts.would_open);
+        assert_eq!(
+            index
+                .claude_request_census_shadow_for_test()
+                .would_open_for_test(),
+            Some(true)
         );
     }
-    let counts = crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
-        &mut index,
-        &BTreeSet::from([walked.clone()]),
-        &BTreeSet::new(),
-        FIRST_WINDOW,
-    );
-    assert_eq!(
-        index.claude_request_census_for_test().keys_for_test(),
-        vec![indexed.clone(), walked.clone()]
-    );
-    assert_eq!(
-        index.claude_request_census_for_test().hash_total_for_test(),
-        2
-    );
-    // The retired record's copy of hash 2 no longer makes a duplicate.
-    assert_eq!(counts.duplicate_hashes, 0);
-    assert_eq!(counts.records, 2);
-    assert_eq!(counts.family_keys, 1);
-    assert_eq!(counts.covered_by_fingerprint, 1);
-    assert!(counts.would_open);
-    assert_eq!(
-        index
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        Some(true)
-    );
 }
 
 /// The shadow predicate and per-member status on a synthetic index: coverage
@@ -1390,116 +1393,118 @@ fn legacy_hex_hashes(hashes: &[u64]) -> String {
 /// one; nothing ever quarantines the index. Records round-trip exactly.
 #[test]
 fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-decoder");
-    // Old JSON: no field at all.
-    let old = census_index_json(serde_json::Value::Null);
-    let mut old = old.as_object().expect("object").clone();
-    old.remove("claude_request_census");
-    let loaded = census_load(
-        &scratch,
-        "old",
-        &serde_json::to_string(&old).expect("old json"),
-    );
-    assert_eq!(loaded.claude_request_census_for_test().len_for_test(), 0);
-
-    // Round trip through save and load.
-    let mut index = ScanIndex::default();
-    let mut entry = manifest_index_entry(Some("body"));
-    entry.source_file_fingerprint = hex_fingerprint('a');
-    index
-        .files
-        .insert("/census/projects/census-a.jsonl".to_string(), entry);
-    let record = ClaudeRequestCensusRecord::synthetic_for_test(
-        &hex_fingerprint('a'),
-        7,
-        ClaudeRequestCensusShape::Exact,
-        vec![1, u64::MAX],
-    );
-    index
-        .claude_request_census_mut_for_test()
-        .insert_for_test("/census/projects/census-a.jsonl", record.clone());
-    let round_trip = census_load(
-        &scratch,
-        "round-trip",
-        &serde_json::to_string(&index).expect("index json"),
-    );
-    assert_eq!(
-        round_trip
-            .claude_request_census_for_test()
-            .get("/census/projects/census-a.jsonl"),
-        Some(&record)
-    );
-
-    // Wrong type for the whole field: an empty census.
-    for (name, field) in [
-        ("string", serde_json::json!("records")),
-        ("number", serde_json::json!(7)),
-        ("array", serde_json::json!([1, {"v": 1}])),
-        ("null", serde_json::Value::Null),
-        ("bool", serde_json::json!(true)),
-    ] {
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-decoder");
+        // Old JSON: no field at all.
+        let old = census_index_json(serde_json::Value::Null);
+        let mut old = old.as_object().expect("object").clone();
+        old.remove("claude_request_census");
         let loaded = census_load(
             &scratch,
-            name,
-            &serde_json::to_string(&census_index_json(field)).expect("json"),
+            "old",
+            &serde_json::to_string(&old).expect("old json"),
+        );
+        assert_eq!(loaded.claude_request_census_for_test().len_for_test(), 0);
+
+        // Round trip through save and load.
+        let mut index = ScanIndex::default();
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = hex_fingerprint('a');
+        index
+            .files
+            .insert("/census/projects/census-a.jsonl".to_string(), entry);
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &hex_fingerprint('a'),
+            7,
+            ClaudeRequestCensusShape::Exact,
+            vec![1, u64::MAX],
+        );
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test("/census/projects/census-a.jsonl", record.clone());
+        let round_trip = census_load(
+            &scratch,
+            "round-trip",
+            &serde_json::to_string(&index).expect("index json"),
         );
         assert_eq!(
-            loaded.claude_request_census_for_test().len_for_test(),
-            0,
-            "{name}"
+            round_trip
+                .claude_request_census_for_test()
+                .get("/census/projects/census-a.jsonl"),
+            Some(&record)
         );
-    }
 
-    // Malformed entries are dropped one by one; the good one survives.
-    let good = census_record_json('a', "exact", &[1, 2]);
-    let mut bad_fp = census_record_json('a', "exact", &[1]);
-    bad_fp["fp"] = serde_json::json!("A".repeat(64));
-    let mut short_fp = census_record_json('a', "exact", &[1]);
-    short_fp["fp"] = serde_json::json!("a".repeat(63));
-    let mut ragged = census_record_json('a', "lossy", &[]);
-    ragged["h"] = serde_json::json!("0123");
-    let mut descending = census_record_json('a', "lossy", &[]);
-    descending["h"] = serde_json::json!(legacy_hex_hashes(&[2, 1]));
-    let mut repeated = census_record_json('a', "lossy", &[]);
-    repeated["h"] = serde_json::json!(legacy_hex_hashes(&[1, 1]));
-    let unknown_shape = census_record_json('a', "multi_item", &[1]);
-    let exact_without_ids = census_record_json('a', "exact", &[]);
-    let empty_with_ids = census_record_json('a', "empty", &[1]);
-    let mut negative_derivation = census_record_json('a', "exact", &[1]);
-    negative_derivation["v"] = serde_json::json!(-1);
-    let mut wide_derivation = census_record_json('a', "exact", &[1]);
-    wide_derivation["v"] = serde_json::json!(70_000);
-    let mut wrong_flag = census_record_json('a', "exact", &[1]);
-    wrong_flag["tw"] = serde_json::json!("yes");
-    let mut nested = census_record_json('a', "exact", &[]);
-    nested["h"] = serde_json::json!({"a": [1, 2]});
-    let mut missing_fp = census_record_json('a', "exact", &[1]);
-    missing_fp.as_object_mut().expect("record").remove("fp");
-    let mut forward = census_record_json('a', "exact", &[9]);
-    forward["future"] = serde_json::json!({"anything": [1, "x"]});
-    let mut records = serde_json::json!({
-        "good": good,
-        "bad-fp": bad_fp,
-        "short-fp": short_fp,
-        "ragged": ragged,
-        "descending": descending,
-        "repeated": repeated,
-        "unknown-shape": unknown_shape,
-        "exact-without-ids": exact_without_ids,
-        "empty-with-ids": empty_with_ids,
-        "negative-derivation": negative_derivation,
-        "wide-derivation": wide_derivation,
-        "wrong-flag": wrong_flag,
-        "nested": nested,
-        "missing-fp": missing_fp,
-        "not-an-object": [1, 2, 3],
-        "forward": forward,
-    });
-    records["k".repeat(5_000).as_str()] = census_record_json('a', "exact", &[1]);
-    let mut json = serde_json::to_string(&census_index_json(records)).expect("json");
-    // A duplicated field inside one record is malformed too.
-    json = json.replacen(
+        // Wrong type for the whole field: an empty census.
+        for (name, field) in [
+            ("string", serde_json::json!("records")),
+            ("number", serde_json::json!(7)),
+            ("array", serde_json::json!([1, {"v": 1}])),
+            ("null", serde_json::Value::Null),
+            ("bool", serde_json::json!(true)),
+        ] {
+            let loaded = census_load(
+                &scratch,
+                name,
+                &serde_json::to_string(&census_index_json(field)).expect("json"),
+            );
+            assert_eq!(
+                loaded.claude_request_census_for_test().len_for_test(),
+                0,
+                "{name}"
+            );
+        }
+
+        // Malformed entries are dropped one by one; the good one survives.
+        let good = census_record_json('a', "exact", &[1, 2]);
+        let mut bad_fp = census_record_json('a', "exact", &[1]);
+        bad_fp["fp"] = serde_json::json!("A".repeat(64));
+        let mut short_fp = census_record_json('a', "exact", &[1]);
+        short_fp["fp"] = serde_json::json!("a".repeat(63));
+        let mut ragged = census_record_json('a', "lossy", &[]);
+        ragged["h"] = serde_json::json!("0123");
+        let mut descending = census_record_json('a', "lossy", &[]);
+        descending["h"] = serde_json::json!(legacy_hex_hashes(&[2, 1]));
+        let mut repeated = census_record_json('a', "lossy", &[]);
+        repeated["h"] = serde_json::json!(legacy_hex_hashes(&[1, 1]));
+        let unknown_shape = census_record_json('a', "multi_item", &[1]);
+        let exact_without_ids = census_record_json('a', "exact", &[]);
+        let empty_with_ids = census_record_json('a', "empty", &[1]);
+        let mut negative_derivation = census_record_json('a', "exact", &[1]);
+        negative_derivation["v"] = serde_json::json!(-1);
+        let mut wide_derivation = census_record_json('a', "exact", &[1]);
+        wide_derivation["v"] = serde_json::json!(70_000);
+        let mut wrong_flag = census_record_json('a', "exact", &[1]);
+        wrong_flag["tw"] = serde_json::json!("yes");
+        let mut nested = census_record_json('a', "exact", &[]);
+        nested["h"] = serde_json::json!({"a": [1, 2]});
+        let mut missing_fp = census_record_json('a', "exact", &[1]);
+        missing_fp.as_object_mut().expect("record").remove("fp");
+        let mut forward = census_record_json('a', "exact", &[9]);
+        forward["future"] = serde_json::json!({"anything": [1, "x"]});
+        let mut records = serde_json::json!({
+            "good": good,
+            "bad-fp": bad_fp,
+            "short-fp": short_fp,
+            "ragged": ragged,
+            "descending": descending,
+            "repeated": repeated,
+            "unknown-shape": unknown_shape,
+            "exact-without-ids": exact_without_ids,
+            "empty-with-ids": empty_with_ids,
+            "negative-derivation": negative_derivation,
+            "wide-derivation": wide_derivation,
+            "wrong-flag": wrong_flag,
+            "nested": nested,
+            "missing-fp": missing_fp,
+            "not-an-object": [1, 2, 3],
+            "forward": forward,
+        });
+        records["k".repeat(5_000).as_str()] = census_record_json('a', "exact", &[1]);
+        let mut json = serde_json::to_string(&census_index_json(records)).expect("json");
+        // A duplicated field inside one record is malformed too.
+        json = json.replacen(
         "\"good\":{",
         &format!(
             "\"duplicate-field\":{{\"v\":{CLAUDE_REQUEST_CENSUS_DERIVATION},\"v\":{CLAUDE_REQUEST_CENSUS_DERIVATION},\"fp\":\"{}\",\"s\":\"empty\"}},\"good\":{{",
@@ -1507,121 +1512,128 @@ fn census_decoder_drops_bad_entries_and_never_quarantines_the_index() {
         ),
         1,
     );
-    let loaded = census_load(&scratch, "malformed", &json);
-    let census = loaded.claude_request_census_for_test();
-    assert_eq!(
-        census.keys_for_test(),
-        vec!["forward".to_string(), "good".to_string()]
-    );
-    assert_eq!(census.hash_total_for_test(), 3);
+        let loaded = census_load(&scratch, "malformed", &json);
+        let census = loaded.claude_request_census_for_test();
+        assert_eq!(
+            census.keys_for_test(),
+            vec!["forward".to_string(), "good".to_string()]
+        );
+        assert_eq!(census.hash_total_for_test(), 3);
 
-    // The shadow memory is tolerant too.
-    let mut value = census_index_json(serde_json::json!({}));
-    value["claude_request_census_shadow"] = serde_json::json!({"o": true, "f": 3, "d": "x"});
-    let loaded = census_load(
-        &scratch,
-        "shadow-state",
-        &serde_json::to_string(&value).expect("json"),
-    );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        Some(true)
-    );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .derivation_drift_for_test(),
-        0
-    );
-    value["claude_request_census_shadow"] = serde_json::json!(["bad"]);
-    let loaded = census_load(
-        &scratch,
-        "shadow-state-wrong-type",
-        &serde_json::to_string(&value).expect("json"),
-    );
-    assert_eq!(
-        loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
+        // The shadow memory is tolerant too.
+        let mut value = census_index_json(serde_json::json!({}));
+        value["claude_request_census_shadow"] = serde_json::json!({"o": true, "f": 3, "d": "x"});
+        let loaded = census_load(
+            &scratch,
+            "shadow-state",
+            &serde_json::to_string(&value).expect("json"),
+        );
+        assert_eq!(
+            loaded
+                .claude_request_census_shadow_for_test()
+                .would_open_for_test(),
+            Some(true)
+        );
+        assert_eq!(
+            loaded
+                .claude_request_census_shadow_for_test()
+                .derivation_drift_for_test(),
+            0
+        );
+        value["claude_request_census_shadow"] = serde_json::json!(["bad"]);
+        let loaded = census_load(
+            &scratch,
+            "shadow-state-wrong-type",
+            &serde_json::to_string(&value).expect("json"),
+        );
+        assert_eq!(
+            loaded
+                .claude_request_census_shadow_for_test()
+                .would_open_for_test(),
+            None
+        );
 
-    // An old decoder ignores fields it does not know: a later field never
-    // quarantines this one either.
-    let mut future = census_index_json(serde_json::json!({}));
-    future["claude_request_census_v2"] = serde_json::json!({"x": {"y": 1}});
-    census_load(
-        &scratch,
-        "future-field",
-        &serde_json::to_string(&future).expect("json"),
-    );
+        // An old decoder ignores fields it does not know: a later field never
+        // quarantines this one either.
+        let mut future = census_index_json(serde_json::json!({}));
+        future["claude_request_census_v2"] = serde_json::json!({"x": {"y": 1}});
+        census_load(
+            &scratch,
+            "future-field",
+            &serde_json::to_string(&future).expect("json"),
+        );
+    }
 }
 
 /// TD1c (bounds): the decoder keeps the running hash total within the budget,
 /// refusing an over-budget entry before decoding its hex.
 #[test]
 fn census_decoder_keeps_the_hash_budget() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-decoder-budget");
-    let full = (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect::<Vec<_>>();
-    let records = serde_json::json!({
-        "a-full": census_record_json('a', "lossy", &full),
-        "b-one-more": census_record_json('b', "exact", &[1]),
-        "c-empty": census_record_json('c', "empty", &[]),
-    });
-    let loaded = census_load(
-        &scratch,
-        "budget",
-        &serde_json::to_string(&census_index_json(records)).expect("json"),
-    );
-    let census = loaded.claude_request_census_for_test();
-    assert_eq!(
-        census.keys_for_test(),
-        vec!["a-full".to_string(), "c-empty".to_string()]
-    );
-    assert_eq!(
-        census.hash_total_for_test(),
-        MAX_CLAUDE_REQUEST_CENSUS_HASHES
-    );
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-decoder-budget");
+        let full = (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect::<Vec<_>>();
+        let records = serde_json::json!({
+            "a-full": census_record_json('a', "lossy", &full),
+            "b-one-more": census_record_json('b', "exact", &[1]),
+            "c-empty": census_record_json('c', "empty", &[]),
+        });
+        let loaded = census_load(
+            &scratch,
+            "budget",
+            &serde_json::to_string(&census_index_json(records)).expect("json"),
+        );
+        let census = loaded.claude_request_census_for_test();
+        assert_eq!(
+            census.keys_for_test(),
+            vec!["a-full".to_string(), "c-empty".to_string()]
+        );
+        assert_eq!(
+            census.hash_total_for_test(),
+            MAX_CLAUDE_REQUEST_CENSUS_HASHES
+        );
+    }
 }
 
 /// Production keeps the same budget by storing an `OverBudget` tombstone.
 #[test]
 fn census_records_past_the_budget_become_inert_tombstones() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let mut census = crate::snapshots::claude_request_census::ClaudeRequestCensus::default();
-    census.insert_for_test(
-        "a",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('a'),
-            1,
-            ClaudeRequestCensusShape::Lossy,
-            (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect(),
-        ),
-    );
-    census.insert_for_test(
-        "b",
-        ClaudeRequestCensusRecord::synthetic_for_test(
-            &hex_fingerprint('b'),
-            1,
-            ClaudeRequestCensusShape::Exact,
-            vec![1],
-        ),
-    );
-    let tombstone = census.get("b").expect("tombstone");
-    assert_eq!(
-        tombstone.shape_for_test(),
-        ClaudeRequestCensusShape::OverBudget
-    );
-    assert!(tombstone.request_hashes_for_test().is_empty());
-    assert_eq!(
-        census.hash_total_for_test(),
-        MAX_CLAUDE_REQUEST_CENSUS_HASHES
-    );
-    census.remove("a");
-    assert_eq!(census.hash_total_for_test(), 0);
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let mut census = crate::snapshots::claude_request_census::ClaudeRequestCensus::default();
+        census.insert_for_test(
+            "a",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &hex_fingerprint('a'),
+                1,
+                ClaudeRequestCensusShape::Lossy,
+                (0..MAX_CLAUDE_REQUEST_CENSUS_HASHES as u64).collect(),
+            ),
+        );
+        census.insert_for_test(
+            "b",
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &hex_fingerprint('b'),
+                1,
+                ClaudeRequestCensusShape::Exact,
+                vec![1],
+            ),
+        );
+        let tombstone = census.get("b").expect("tombstone");
+        assert_eq!(
+            tombstone.shape_for_test(),
+            ClaudeRequestCensusShape::OverBudget
+        );
+        assert!(tombstone.request_hashes_for_test().is_empty());
+        assert_eq!(
+            census.hash_total_for_test(),
+            MAX_CLAUDE_REQUEST_CENSUS_HASHES
+        );
+        census.remove("a");
+        assert_eq!(census.hash_total_for_test(), 0);
+    }
 }
 
 /// Layout: both new `ScanIndex` fields are charged through `fields!`, and the
@@ -1672,6 +1684,10 @@ fn census_shadow_counts_encoding_is_bounded() {
         strong_comparison_complete: false,
         safety_incomplete: false,
         safety_incomplete_overflow: false,
+        safety_incomplete_overflow_cause: Some(
+            crate::snapshots::claude_request_census::SafetyIncompleteOverflowCause::MalformedMarker,
+        ),
+        unread_alarm_emitted_keys: usize::MAX,
         safety_incomplete_alarm: false,
         d2_hash_budget_alarm: false,
         legacy_compare_ready: false,
@@ -1821,97 +1837,103 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 5782;
+const CENSUS_SHADOW_WORST_BYTES: usize = 5885;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
 fn census_numeric_overflow_is_isolated_from_load_and_cas() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
-    let mut base = census_index_json(serde_json::json!({}));
-    base["generation"] = serde_json::json!(7);
-    let expected = base.clone();
-    for (name, field, raw) in [
-        ("field", "claude_request_census", "1e400".to_owned()),
-        (
-            "record",
-            "claude_request_census",
-            format!(
-                r#"{{"bad":{{"v":1,"fp":"{}","s":"empty","w":1e400}},"good":{}}}"#,
-                hex_fingerprint('a'),
-                census_record_json('a', "exact", &[1])
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
+        let mut base = census_index_json(serde_json::json!({}));
+        base["generation"] = serde_json::json!(7);
+        let expected = base.clone();
+        for (name, field, raw) in [
+            ("field", "claude_request_census", "1e400".to_owned()),
+            (
+                "record",
+                "claude_request_census",
+                format!(
+                    r#"{{"bad":{{"v":1,"fp":"{}","s":"empty","w":1e400}},"good":{}}}"#,
+                    hex_fingerprint('a'),
+                    census_record_json('a', "exact", &[1])
+                ),
             ),
-        ),
-        (
-            "shadow-field",
-            "claude_request_census_shadow",
-            "1e400".to_owned(),
-        ),
-        (
-            "shadow-record",
-            "claude_request_census_shadow",
-            r#"{"o":true,"f":1e400}"#.to_owned(),
-        ),
-    ] {
-        let marker = "overflow-token";
-        let mut value = base.clone();
-        value[field] = serde_json::json!(marker);
-        let json = serde_json::to_string(&value)
-            .unwrap()
-            .replace(&format!("\"{marker}\""), &raw);
-        let mut loaded = census_load(&scratch, name, &json);
-        let mut actual = serde_json::to_value(&loaded).unwrap();
-        let mut expected = expected.clone();
-        for key in ["claude_request_census", "claude_request_census_shadow"] {
-            actual.as_object_mut().unwrap().remove(key);
-            expected.as_object_mut().unwrap().remove(key);
+            (
+                "shadow-field",
+                "claude_request_census_shadow",
+                "1e400".to_owned(),
+            ),
+            (
+                "shadow-record",
+                "claude_request_census_shadow",
+                r#"{"o":true,"f":1e400}"#.to_owned(),
+            ),
+        ] {
+            let marker = "overflow-token";
+            let mut value = base.clone();
+            value[field] = serde_json::json!(marker);
+            let json = serde_json::to_string(&value)
+                .unwrap()
+                .replace(&format!("\"{marker}\""), &raw);
+            let mut loaded = census_load(&scratch, name, &json);
+            let mut actual = serde_json::to_value(&loaded).unwrap();
+            let mut expected = expected.clone();
+            for key in ["claude_request_census", "claude_request_census_shadow"] {
+                actual.as_object_mut().unwrap().remove(key);
+                expected.as_object_mut().unwrap().remove(key);
+            }
+            assert_eq!(actual, expected, "all other fields: {name}");
+            if name == "record" {
+                assert_eq!(
+                    loaded.claude_request_census_for_test().keys_for_test(),
+                    vec!["good"]
+                );
+            }
+            let bounded_path = scratch.join(format!("{name}-bounded.json"));
+            std::fs::write(&bounded_path, &json).unwrap();
+            loaded
+                .clone()
+                .save_with_read_limit(&bounded_path, 128 * 1024)
+                .expect("bounded CAS also isolates malformed evidence");
+            loaded
+                .save(&scratch.join(format!("{name}.json")))
+                .expect("CAS accepts the same malformed shadow");
+            assert_eq!(loaded.generation, 8);
         }
-        assert_eq!(actual, expected, "all other fields: {name}");
-        if name == "record" {
-            assert_eq!(
-                loaded.claude_request_census_for_test().keys_for_test(),
-                vec!["good"]
-            );
-        }
-        let bounded_path = scratch.join(format!("{name}-bounded.json"));
-        std::fs::write(&bounded_path, &json).unwrap();
-        loaded
-            .clone()
-            .save_with_read_limit(&bounded_path, 128 * 1024)
-            .expect("bounded CAS also isolates malformed evidence");
-        loaded
-            .save(&scratch.join(format!("{name}.json")))
-            .expect("CAS accepts the same malformed shadow");
-        assert_eq!(loaded.generation, 8);
     }
 }
 
 #[test]
 fn census_oversized_hostile_field_is_drained_before_serde_buffers_it() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-hostile");
-    let path = scratch.join("oversized.json");
-    let base = census_index_json(serde_json::json!({}));
-    let mut file = std::fs::File::create(&path).unwrap();
-    let json = serde_json::to_string(&base).unwrap();
-    // Write a hostile scalar without constructing it in the test process.
-    let marker = "\"claude_request_census\":{}";
-    let (before, after) = json.split_once(marker).expect("census field");
-    write!(file, "{before}\"claude_request_census\":\"").unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RAW_BYTES / block.len() {
-        file.write_all(&block).unwrap();
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        use std::io::Write;
+        let scratch = crate::test_scratch::ScratchDir::new("census-hostile");
+        let path = scratch.join("oversized.json");
+        let base = census_index_json(serde_json::json!({}));
+        let mut file = std::fs::File::create(&path).unwrap();
+        let json = serde_json::to_string(&base).unwrap();
+        // Write a hostile scalar without constructing it in the test process.
+        let marker = "\"claude_request_census\":{}";
+        let (before, after) = json.split_once(marker).expect("census field");
+        write!(file, "{before}\"claude_request_census\":\"").unwrap();
+        let block = [b'x'; 8192];
+        for _ in 0..=MAX_RAW_BYTES / block.len() {
+            file.write_all(&block).unwrap();
+        }
+        write!(file, "\"{after}").unwrap();
+        drop(file);
+        let mut loaded = ScanIndex::load(&path).expect("oversized evidence is optional");
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.claude_request_census_for_test().is_empty());
+        loaded
+            .save(&path)
+            .expect("CAS also drains oversized evidence");
     }
-    write!(file, "\"{after}").unwrap();
-    drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("oversized evidence is optional");
-    assert_eq!(loaded.files.len(), 1);
-    assert!(loaded.claude_request_census_for_test().is_empty());
-    loaded
-        .save(&path)
-        .expect("CAS also drains oversized evidence");
 }
 
 #[test]
@@ -2171,198 +2193,213 @@ fn census_shadow_bounds_workspace_without_changing_the_index() {
 
 #[test]
 fn census_decoder_stops_after_attempted_entries_even_when_all_are_rejected() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-attempt-budget");
-    let mut records = String::from("{");
-    for attempted in 0..65_536 {
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-attempt-budget");
+        let mut records = String::from("{");
+        for attempted in 0..65_536 {
+            use std::fmt::Write;
+            write!(records, "\"bad-{attempted}\":0,").unwrap();
+        }
         use std::fmt::Write;
-        write!(records, "\"bad-{attempted}\":0,").unwrap();
-    }
-    use std::fmt::Write;
-    write!(
-        records,
-        "\"after-budget\":{}}}",
-        census_record_json('a', "exact", &[1])
-    )
-    .unwrap();
-    let json = serde_json::to_string(&census_index_json(serde_json::json!({})))
-        .unwrap()
-        .replace(
-            "\"claude_request_census\":{}",
-            &format!("\"claude_request_census\":{records}"),
+        write!(
+            records,
+            "\"after-budget\":{}}}",
+            census_record_json('a', "exact", &[1])
+        )
+        .unwrap();
+        let json = serde_json::to_string(&census_index_json(serde_json::json!({})))
+            .unwrap()
+            .replace(
+                "\"claude_request_census\":{}",
+                &format!("\"claude_request_census\":{records}"),
+            );
+        let loaded = census_load(&scratch, "attempts", &json);
+        assert!(
+            loaded.claude_request_census_for_test().is_empty(),
+            "rejected records must consume interpretation work too"
         );
-    let loaded = census_load(&scratch, "attempts", &json);
-    assert!(
-        loaded.claude_request_census_for_test().is_empty(),
-        "rejected records must consume interpretation work too"
-    );
+    }
 }
 
 #[test]
 fn census_decoder_stops_after_an_oversized_record() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-entry-budget");
-    let path = scratch.join("record.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let (before, after) = base.split_once("\"claude_request_census\":{}").unwrap();
-    let mut file = File::create(&path).unwrap();
-    write!(
-        file,
-        "{before}\"claude_request_census\":{{\"hostile\":{{\"h\":\""
-    )
-    .unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RECORD_BYTES / block.len() {
-        file.write_all(&block).unwrap();
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        use std::io::Write;
+        let scratch = crate::test_scratch::ScratchDir::new("census-entry-budget");
+        let path = scratch.join("record.json");
+        let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
+        let (before, after) = base.split_once("\"claude_request_census\":{}").unwrap();
+        let mut file = File::create(&path).unwrap();
+        write!(
+            file,
+            "{before}\"claude_request_census\":{{\"hostile\":{{\"h\":\""
+        )
+        .unwrap();
+        let block = [b'x'; 8192];
+        for _ in 0..=MAX_RECORD_BYTES / block.len() {
+            file.write_all(&block).unwrap();
+        }
+        write!(
+            file,
+            "\"}},\"after-budget\":{}}}{after}",
+            census_record_json('a', "exact", &[1])
+        )
+        .unwrap();
+        drop(file);
+        let loaded = ScanIndex::load(&path).expect("entry is bounded optional evidence");
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.claude_request_census_for_test().is_empty());
     }
-    write!(
-        file,
-        "\"}},\"after-budget\":{}}}{after}",
-        census_record_json('a', "exact", &[1])
-    )
-    .unwrap();
-    drop(file);
-    let loaded = ScanIndex::load(&path).expect("entry is bounded optional evidence");
-    assert_eq!(loaded.files.len(), 1);
-    assert!(loaded.claude_request_census_for_test().is_empty());
 }
 
 #[test]
 fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-sequence");
-    let base = census_index_json(serde_json::json!({}));
-    // Pre-census ScanIndex fields, in the positional form accepted by Serde.
-    // Keep a real positive record so a field-order change cannot silently
-    // make the bound apply to a different slot.
-    let mut fields = vec![
-        serde_json::json!(SCAN_INDEX_SCHEMA_VERSION),
-        serde_json::json!(0),
-        serde_json::Value::Null,
-        base["files"].clone(),
-        serde_json::json!({}),
-        serde_json::json!({}),
-        serde_json::json!([]),
-        serde_json::json!([]),
-        serde_json::json!({}),
-        serde_json::json!([]),
-        serde_json::json!({}),
-        serde_json::json!([]),
-        serde_json::json!([]),
-        serde_json::json!(false),
-        serde_json::json!([]),
-        serde_json::json!({}),
-        // U1a-2a (#660): the side/proof fields after the parent ledgers
-        // (`serde(skip)` RAM fields take no slot).
-        serde_json::json!({}),
-        serde_json::json!({}),
-        serde_json::json!(0),
-        serde_json::json!(0),
-        serde_json::json!({}),
-        serde_json::Value::Null,
-        serde_json::Value::Null,
-        serde_json::json!(0),
-        serde_json::json!(""),
-        serde_json::json!({}),
-        serde_json::json!({}),
-        serde_json::json!({}),
-        serde_json::json!({}),
-        serde_json::json!({}),
-    ];
-    fields.push(serde_json::json!({"good": census_record_json('a', "exact", &[1])}));
-    fields.push(serde_json::json!("overflow-token"));
-    let json = serde_json::to_string(&fields)
-        .unwrap()
-        .replace("\"overflow-token\"", "1e400");
-    let control: ScanIndex = serde_json::from_str(&json).expect("Serde positional control");
-    assert_eq!(
-        control.claude_request_census_for_test().keys_for_test(),
-        vec!["good"]
-    );
-    let mut loaded = census_load(&scratch, "sequence", &json);
-    assert_eq!(
-        loaded.claude_request_census_for_test(),
-        control.claude_request_census_for_test()
-    );
-    loaded
-        .save(&scratch.join("sequence.json"))
-        .expect("positional CAS remains supported");
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-sequence");
+        let base = census_index_json(serde_json::json!({}));
+        // Pre-census ScanIndex fields, in the positional form accepted by Serde.
+        // Keep a real positive record so a field-order change cannot silently
+        // make the bound apply to a different slot.
+        let mut fields = vec![
+            serde_json::json!(SCAN_INDEX_SCHEMA_VERSION),
+            serde_json::json!(0),
+            serde_json::Value::Null,
+            base["files"].clone(),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!([]),
+            serde_json::json!(false),
+            serde_json::json!([]),
+            serde_json::json!({}),
+            // U1a-2a (#660): the side/proof fields after the parent ledgers
+            // (`serde(skip)` RAM fields take no slot).
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!(0),
+            serde_json::json!(0),
+            serde_json::json!({}),
+            serde_json::Value::Null,
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(""),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+            serde_json::json!({}),
+        ];
+        fields.push(serde_json::json!({"good": census_record_json('a', "exact", &[1])}));
+        fields.push(serde_json::json!("overflow-token"));
+        let json = serde_json::to_string(&fields)
+            .unwrap()
+            .replace("\"overflow-token\"", "1e400");
+        let control: ScanIndex = serde_json::from_str(&json).expect("Serde positional control");
+        assert_eq!(
+            control.claude_request_census_for_test().keys_for_test(),
+            vec!["good"]
+        );
+        let mut loaded = census_load(&scratch, "sequence", &json);
+        assert_eq!(
+            loaded.claude_request_census_for_test(),
+            control.claude_request_census_for_test()
+        );
+        loaded
+            .save(&scratch.join("sequence.json"))
+            .expect("positional CAS remains supported");
+    }
 }
 
 #[test]
 fn census_escaped_shadow_field_name_cannot_bypass_the_reader_bound() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    use std::io::Write;
-    let scratch = crate::test_scratch::ScratchDir::new("census-escaped-bound");
-    let path = scratch.join("escaped.json");
-    let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
-    let escaped = "claude_request_census_shadow"
-        .chars()
-        .map(|ch| format!("\\u{:04x}", ch as u32))
-        .collect::<String>();
-    assert!(escaped.len() > 128, "exercise the longest field spelling");
-    let mut file = File::create(&path).unwrap();
-    write!(file, "{},\"{escaped}\":\"", base.strip_suffix('}').unwrap()).unwrap();
-    let block = [b'x'; 8192];
-    for _ in 0..=MAX_RAW_BYTES / block.len() {
-        file.write_all(&block).unwrap();
-    }
-    write!(file, "\"}}").unwrap();
-    drop(file);
-    let mut loaded = ScanIndex::load(&path).expect("escaped field has the same bounded reader");
-    assert_eq!(loaded.files.len(), 1);
-    assert_eq!(
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        use std::io::Write;
+        let scratch = crate::test_scratch::ScratchDir::new("census-escaped-bound");
+        let path = scratch.join("escaped.json");
+        let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
+        let escaped = "claude_request_census_shadow"
+            .chars()
+            .map(|ch| format!("\\u{:04x}", ch as u32))
+            .collect::<String>();
+        assert!(escaped.len() > 128, "exercise the longest field spelling");
+        let mut file = File::create(&path).unwrap();
+        write!(file, "{},\"{escaped}\":\"", base.strip_suffix('}').unwrap()).unwrap();
+        let block = [b'x'; 8192];
+        for _ in 0..=MAX_RAW_BYTES / block.len() {
+            file.write_all(&block).unwrap();
+        }
+        write!(file, "\"}}").unwrap();
+        drop(file);
+        let mut loaded = ScanIndex::load(&path).expect("escaped field has the same bounded reader");
+        assert_eq!(loaded.files.len(), 1);
+        assert_eq!(
+            loaded
+                .claude_request_census_shadow_for_test()
+                .would_open_for_test(),
+            None
+        );
         loaded
-            .claude_request_census_shadow_for_test()
-            .would_open_for_test(),
-        None
-    );
-    loaded
-        .save(&path)
-        .expect("CAS also bounds escaped field names");
+            .save(&path)
+            .expect("CAS also bounds escaped field names");
+    }
 }
 
 /// The valid shadow state must survive load, CAS and reload byte-for-value,
 /// independently of whether its previous predicate was open or closed.
 #[test]
 fn census_valid_shadow_state_round_trips_exactly() {
-    let _shadow_mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(true);
-    let scratch = crate::test_scratch::ScratchDir::new("census-shadow-roundtrip");
-    for open in [false, true] {
-        for escaped in [false, true] {
-            let expected = serde_json::json!({"o": open, "f": u64::MAX, "d": u64::MAX});
-            let mut value = census_index_json(serde_json::json!({
-                "good": census_record_json('a', "exact", &[1, 2])
-            }));
-            value["claude_request_census_shadow"] = expected.clone();
-            let mut json = serde_json::to_string(&value).unwrap();
-            if escaped {
-                let field = "claude_request_census_shadow"
-                    .chars()
-                    .map(|ch| format!("\\u{:04x}", ch as u32))
-                    .collect::<String>();
-                json = json.replace("claude_request_census_shadow", &field);
+    for enabled in [false, true] {
+        let _shadow_mode =
+            crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-shadow-roundtrip");
+        for open in [false, true] {
+            for escaped in [false, true] {
+                let expected = serde_json::json!({"o": open, "f": u64::MAX, "d": u64::MAX});
+                let mut value = census_index_json(serde_json::json!({
+                    "good": census_record_json('a', "exact", &[1, 2])
+                }));
+                value["claude_request_census_shadow"] = expected.clone();
+                let mut json = serde_json::to_string(&value).unwrap();
+                if escaped {
+                    let field = "claude_request_census_shadow"
+                        .chars()
+                        .map(|ch| format!("\\u{:04x}", ch as u32))
+                        .collect::<String>();
+                    json = json.replace("claude_request_census_shadow", &field);
+                }
+                let name = format!("shadow-{open}-{escaped}");
+                let mut loaded = census_load(&scratch, &name, &json);
+                assert_eq!(
+                    serde_json::to_value(&loaded).unwrap()["claude_request_census_shadow"],
+                    expected
+                );
+                assert_eq!(
+                    loaded
+                        .claude_request_census_for_test()
+                        .hash_total_for_test(),
+                    2
+                );
+                let path = scratch.join(format!("{name}.json"));
+                loaded.save(&path).expect("CAS preserves shadow state");
+                let reloaded = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    serde_json::to_value(&reloaded).unwrap()["claude_request_census_shadow"],
+                    expected
+                );
             }
-            let name = format!("shadow-{open}-{escaped}");
-            let mut loaded = census_load(&scratch, &name, &json);
-            assert_eq!(
-                serde_json::to_value(&loaded).unwrap()["claude_request_census_shadow"],
-                expected
-            );
-            assert_eq!(
-                loaded
-                    .claude_request_census_for_test()
-                    .hash_total_for_test(),
-                2
-            );
-            let path = scratch.join(format!("{name}.json"));
-            loaded.save(&path).expect("CAS preserves shadow state");
-            let reloaded = ScanIndex::load(&path).unwrap();
-            assert_eq!(
-                serde_json::to_value(&reloaded).unwrap()["claude_request_census_shadow"],
-                expected
-            );
         }
     }
 }

@@ -16,12 +16,19 @@ Missing `s` is empty on an upgrade with no `x`/`sb` records; it is closed when e
 The bounded key marker is charged as shadow metadata; record serialization and
 active-plus-safety hash storage retain their existing 47/48 MiB boundaries.
 Healthy complete-terminal prune or full authorized reconstruction removes a
-key. Overflow cannot clear through timeout, prune or restart.
+key. Overflow cannot clear through timeout, prune or restart. A single malformed or
+dropped census record (including a duplicate key) creates sticky decode-loss
+overflow until a derivation-bump rebuild. `safety_incomplete_overflow_cause`
+reports `decode_loss`, `key_cap` or `malformed_marker`; the first cause persists
+with the marker. Old overflow markers without a cause report `malformed_marker`.
 
 Record-local `x` holds acquisition, loss, bounded content pairs and capability
 metadata. `sb` holds retired-only safety hashes using the existing base64 u64
 codec. Existing fields, derivation, money getters and activation gates retain
-their contracts. Ambiguous record keys never become last-wins evidence.
+their contracts. Ambiguous record keys never become last-wins evidence. This applies with phase B
+OFF too: both duplicate census entries are dropped, whereas main used last-wins.
+This corruption-only MONEY-visible difference requires MONEY acknowledgement;
+activation OFF does not restore main's duplicate-key decode policy.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes
@@ -53,8 +60,9 @@ Required safety coverage includes indexed empty files, retained records, walked 
 Round 3 gates phase-B-only work behind `OTTTO_CLAUDE_D2_SHADOW=1`, sampled once
 at process start; the unset/default mode is OFF. This is a diagnostic switch,
 never a D2 decision or money activation switch. OFF creates no optional safety
-fields or retired buffer, uses main's in-place MONEY retirement, emits no new
-shadow line, and skips joins, digests, owner-pair work and extra serialization.
+fields or retired buffer and uses main's in-place MONEY retirement. OFF retains
+main's D1 join, `request_census` counts line and persisted `o`/`f` updates. It
+skips D2 joins, digests, owner-pair work and optional serialization.
 Previously persisted safety still receives safe reclamation/marker handling.
 Old retired or lossy records without required safety remain migration debt when shadow diagnostics are enabled.
 
@@ -75,8 +83,8 @@ Test-only frozen main admission and record encoding provide independent hash
 and byte boundary controls, both with and without reclaim, including full scoped
 MONEY-debt byte comparisons. The OFF fixture uses12,400 files/700,000 hashes and
 prints actual retained bytes, census save delta, inline record-layout delta and
-CPU delta against frozen main MONEY maintenance (D1 shadow comparison excluded
-from both timing arms). CPU measurements are observations, not timing assertions.
+CPU delta against frozen main maintenance including the D1 join, counts and
+`o`/`f` updates in both timing arms. CPU measurements are observations, not timing assertions.
 The128/64 MiB synthetic overlap assertions are retained and require an executed
 CI receipt; their existence alone is not evidence that a limit was met.
 
@@ -96,10 +104,10 @@ the descriptor and chunk storage are allocated only when safety is retained and
 are included in physical accounting. Inline growth is explicitly reported.
 
 OFF with already persisted incomplete safety still reports the cheap marker
-counters and N10/age alarms, without a join or digests. A legacy missing marker
+counters and N10/age alarms alongside main's D1 join, without D2 joins or digests. A legacy missing marker
 with no retained safety does not trigger this exception. The OFF existing-state
 control verifies full-budget main admission, incremental reclaim, persistence,
-alarm and healthy prune; clean OFF state still emits no new shadow line.
+alarm and healthy prune; clean OFF state continues emitting the existing D1 line.
 
 Ordinary tests use production-OFF defaults; shadow-specific controls opt in on
 their own thread. This keeps canonical scan/debt comparisons free of diagnostic
@@ -122,9 +130,9 @@ Round 4 moves `x`/`sb` into an optional census side map. The shared MONEY record
 returns to main's inline layout. Compiled layout and frozen main load-charge /
 resident-bound assertions accompany the existing M4-scale ledger save/load
 fixture. No side map exists in ordinary OFF operation. OFF terminals run main's
-core prune/recount/retirement directly; safety accounting, mutation digests,
-legacy diffs and shadow counters require the diagnostic switch or retained
-safety. Pricing borrows the core record and counts optional fields separately;
+core prune/recount/retirement and D1 diagnostics directly; safety accounting,
+mutation digests, legacy diffs and D2 counters require the diagnostic switch or
+retained safety. Pricing borrows the core record and counts optional fields separately;
 it never clones ledger facts or a retained hash buffer.
 
 Under byte pressure, retiree `x`/`sb` is stripped oldest-first before active `x`
@@ -140,7 +148,9 @@ the strong comparison closed.
 is a new revision; `unread_due_to_growth` counts those observations without
 turning a consumed bound into global unread debt. Dirty old-window evidence
 cannot cover a walked-but-unparsed key. Unread alarms identify only a SHA-256
-key hash prefix (eight hex digits) and acquisition cause. Stale-window pending
+key hash prefix (eight hex digits) and acquisition cause. At most eight key
+alarms are emitted per complete terminal; `unread_alarm_emitted_keys` reports
+emissions while age/terminal counters still count every affected key. Stale-window pending
 is uncomparable and does not enter invalid/other difference counters.
 `dirty_unparsed_keys_known` and `shadow_decision_taps_known` remain false until
 their taps exist; zero decision counters are phase-B construction, not observed
@@ -154,8 +164,20 @@ trip loses `x`, `sb` and `s`: reclaimed retired records then become migration
 debt, and an Exact record loses an `ac=false` restriction. Such downgrade round
 trips remain outside the safety guarantee; no schema or derivation bump is used.
 
-Prior Round-3 CI OFF measurements at 12,400 files / 700,000 hashes were zero
-added save bytes, +8,515 microseconds on the first terminal (+0.78%) and
-+18,240 microseconds on the five-sample steady median (+4.89%). That overhead
-was rejected. Round-4 receipts must demonstrate at most 0.5% OFF CPU and zero
-added save bytes on the same fixture; source changes alone are not a receipt.
+Executed Round-5 CI at 9740394c (run 40050786469) passed all four checks:
+service 4,338 passed / zero failed / 32 ignored; admitted 1,024 files / 700,000
+hashes used 50,642,185 additional overlap bytes and 985,782 workspace bytes,
+with saved qualification. The 12,400-file / 2,097,152-hash control used
+133,530,703 additional overlap bytes and refused its one attempt; it is an
+early-refusal receipt, not admitted coverage. One-slot reclaim allocated zero
+bytes. The 128/64 MiB assertions remain unchanged.
+
+Round-5 OFF CPU timing omitted main's D1 work from both arms. Round 6 restores
+that work in production OFF and in both timing arms. The frozen-main parity
+control compares complete D1 counters, serialized counts lines, `o`/`f` flips
+and whole checkpoint bytes. Legacy decoder/CAS/prune guards run OFF and ON.
+The same 15-sample paired alternating receipt reports medians, minima, paired
+median and raw samples. A shared runner cannot resolve the 0.5% target reliably;
+post-release OFF daemon CPU versus the prior release remains a separate check.
+Exact-head Round-6 receipts are recorded in the PR after CI completes. Activation
+remains OFF; no runtime corpus, seven-day shadow or release evidence is claimed.
