@@ -242,12 +242,31 @@ fn atomic(root: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     let mut filename = target.file_name().ok_or_else(fault)?.to_os_string();
     filename.push(".tmp");
     let staged = root.join(filename);
+    // A crash before rename leaves an uncommitted stage. The authoritative
+    // target (and its counter) is unchanged; replacing that stage cannot
+    // consume or restore a POST slot. Never follow or truncate a foreign link.
+    match fs::symlink_metadata(&staged) {
+        Ok(meta) => {
+            if !meta.is_file() {
+                return Err(fault());
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                if meta.permissions().mode() & 0o777 != 0o600 || meta.nlink() != 1 {
+                    return Err(fault());
+                }
+            }
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound => (),
+        Err(_) => return Err(fault()),
+    }
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
+    options.write(true).create(true).truncate(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
     let mut file = options.open(&staged)?;
     file.write_all(bytes)?;
@@ -1761,6 +1780,34 @@ mod tests {
         prune_receipts(&root, (receipts[0].time_day + 35) * 86400, 0).unwrap();
         assert!(!root.join("receipt-0000.receipt").exists());
         assert!(!root.join("receipt-0001.receipt").exists());
+    }
+
+    #[test]
+    fn interrupted_metadata_stage_does_not_change_committed_counter() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-unknown-staged-counter");
+        let (m, body) = specimen(1000);
+        let m = capture(scratch.to_path_buf(), m, &body).unwrap();
+        let root = dir(&scratch);
+        let staged = path(&root, &m.id, "json.tmp").unwrap();
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&staged).unwrap();
+        file.write_all(b"interrupted metadata").unwrap();
+        file.sync_all().unwrap();
+        drop(file);
+        assert_eq!(load(&root).unwrap()[0].posts, 1);
+        write_manifest(&root, &m).unwrap();
+        assert_eq!(load(&root).unwrap()[0].posts, 1);
+        assert!(!staged.exists());
+        assert_eq!(
+            read_capped(&path(&root, &m.id, "body").unwrap(), BODY_MAX).unwrap(),
+            body
+        );
     }
 
     #[test]
