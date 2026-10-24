@@ -580,13 +580,14 @@ fn exclude_held_effective_body_witness_revision(
 /// Commit a `Completed` upload that left local holds. Every uploaded entity was
 /// accepted or unchanged; only the held revisions are unsettled.
 ///
-/// A hold that the same traversal could still change (`progress_blocking`,
-/// which includes any RetryPending authority family) keeps the conservative
-/// partial commit and marks the sweep unsettled, so the generation needs one
-/// clean follow-up. Otherwise every hold is non-progressing: held keys keep
-/// their committed revision, every other key commits as the no-hold save
-/// would, and the traversal may settle. The caller keeps backfill and replay
-/// completion pending, and the durable hold disclosure keeps health red.
+/// A hold that owes a clean follow-up (`progress_blocking`) keeps the
+/// conservative partial commit and marks the sweep unsettled, so the
+/// generation needs one clean follow-up. Otherwise every hold is
+/// non-progressing (account deferrals and bound authority holds, including
+/// bound RetryPending families under the path-(a) bridge): held keys keep their
+/// committed revision, every other key commits as the no-hold save would, and
+/// the traversal may settle. The caller keeps backfill and replay completion
+/// pending, and the durable hold disclosure keeps health red.
 ///
 /// A non-progressing hold in a Claude family that retains authority evidence
 /// but has no committed entry to restore, as after a historical replay reset,
@@ -630,7 +631,9 @@ fn commit_completed_with_local_holds(
 struct LocalHoldSettlement {
     /// Sessions held locally on this page.
     held_entity_count: usize,
-    /// RetryPending Claude authority families anywhere in the index.
+    /// RetryPending Claude authority families anywhere in the index. They keep
+    /// full completion (backfill, replay) pending, but since the path-(a)
+    /// bridge they no longer make an unrelated page progress-blocking.
     retry_pending_family_count: usize,
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
@@ -670,13 +673,17 @@ impl LocalHoldSettlement {
             retry_pending_family_count,
             held_fingerprints,
             account_deferred_fingerprints,
-            progress_blocking: retry_pending_family_count > 0
-                || !progress_blocking_held_fingerprints.is_empty(),
+            progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
         }
     }
 
     fn any(&self) -> bool {
         self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+
+    /// Whether this page itself held any entity.
+    fn page_held(&self) -> bool {
+        self.held_entity_count > 0
     }
 }
 
@@ -701,8 +708,10 @@ fn settle_completed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
 ) -> UploadIndexSettlement {
-    if !holds.any() {
-        let fully_settled = upload_settled_without_account_holds(&index, true);
+    if !holds.page_held() {
+        // RetryPending debt elsewhere settles this page as a no-hold page
+        // would, and only keeps full completion pending.
+        let fully_settled = upload_settled_without_account_holds(&index, !holds.any());
         return UploadIndexSettlement {
             index,
             fully_settled,
@@ -737,9 +746,10 @@ static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
 /// still discloses the rejected usage. Its holds settle exactly as on a
-/// `Completed` page: when every hold is non-progressing (no RetryPending
-/// family anywhere) and restorable, held keys keep their committed revision
-/// and the traversal may settle; backfill and replay stay pending.
+/// `Completed` page: when every hold on this page is non-progressing and
+/// restorable, held keys keep their committed revision and the traversal may
+/// settle; backfill and replay stay pending. A RetryPending family elsewhere
+/// keeps only full completion pending (path-(a) bridge).
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -748,7 +758,7 @@ fn settle_checkpointed_upload(
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
-        && holds.any()
+        && holds.page_held()
         && !holds.progress_blocking
         && index.locally_held_keys_restorable(
             committed_index,
@@ -763,7 +773,7 @@ fn settle_checkpointed_upload(
             &holds.held_fingerprints,
             &holds.account_deferred_fingerprints,
         )
-    } else if holds.any() {
+    } else if holds.page_held() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -772,7 +782,7 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
+    let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
             UnsettledUploadCause::RejectedWithHolds
@@ -5571,8 +5581,7 @@ fn prepare_sync_source(
     });
     // Absent, quarantined or undecodable: every file would come back new. The
     // load origin decides it (StateMissing M3); an empty saved index counts too.
-    let claude_index_loaded_fresh = load_origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
-        || (index.generation == 0 && index.files.is_empty());
+    let claude_index_loaded_fresh = load_origin.is_fresh(&index);
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -6093,6 +6102,8 @@ fn finish_sync_source(
                 return Err(reason.into());
             }
         };
+        #[cfg(test)]
+        tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
                 "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
@@ -7431,6 +7442,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// RetryPending families whose returning root retains a retirement
+    /// tombstone, separate from all other RetryPending causes. Local only.
+    pub returning_family_grown_held: usize,
     /// Fix 1's skipped full re-arms; absent from the line while empty.
     #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
     pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
@@ -8163,6 +8177,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: index.claude_usage_authority_pending_count(),
         ..disposition.first_proof_hold
@@ -8170,10 +8185,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
-        // until a complete family pass reconstructs the exact witness.
+        // until a complete family pass reconstructs the exact witness. The
+        // debt alone does not mark the sweep unsettled (path-(a) bridge): each
+        // held revision settles or blocks on its own page, and full completion
+        // stays pending while any RetryPending family remains.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -18176,6 +18193,21 @@ mod tests {
     ) -> SyncCounts {
         let root = test_dir(fixture_name);
         std::fs::create_dir_all(&root).expect("create empty Claude scan root");
+        // A RetryPending family is present on disk: a raw-complete census
+        // retires a wholly absent one (path-(a) bridge), so its debt would
+        // no longer withhold anything.
+        for (family_index, (disposition, _)) in dispositions.iter().enumerate() {
+            if *disposition == "retry_pending" {
+                let session = format!("root-{family_index}");
+                std::fs::write(
+                    root.join(format!("{session}.jsonl")),
+                    format!(
+                        "{{\"timestamp\":\"2026-06-01T09:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"req_{session}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+                    ),
+                )
+                .expect("write the held family's present member");
+            }
+        }
         let mut index = claude_usage_authority_index(dispositions);
         let mut scan = crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
@@ -18512,6 +18544,54 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
+    }
+
+    /// Path-(a) bridge: RetryPending debt elsewhere settles a page without
+    /// local holds as no debt would and keeps only full completion pending; a
+    /// second cause beside the debt (a retryable server conflict) still marks
+    /// the sweep.
+    #[test]
+    fn retry_pending_debt_elsewhere_marks_the_sweep_only_with_a_second_cause() {
+        let committed = claude_index_with(serde_json::json!({}));
+        let debt_only = LocalHoldSettlement {
+            held_entity_count: 0,
+            retry_pending_family_count: 1,
+            held_fingerprints: BTreeSet::new(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: false,
+        };
+        let progress = test_upload_progress();
+        let completed =
+            settle_completed_upload(committed.clone(), &committed, &progress, &debt_only);
+        assert!(!completed.index.bounded_sweep_had_unsettled_upload());
+        assert!(completed
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        assert!(
+            !completed.fully_settled,
+            "the debt keeps completion pending"
+        );
+        let rejected =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        assert!(!rejected.fully_settled);
+        let deferred =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
+        assert!(
+            deferred.index.bounded_sweep_had_unsettled_upload(),
+            "a retryable server conflict beside the debt still marks the sweep"
+        );
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"],
+            "the second cause names itself; the debt names nothing"
+        );
+        assert!(!deferred.fully_settled);
     }
 
     /// Diagnostics only: every settlement path that marks the sweep unsettled

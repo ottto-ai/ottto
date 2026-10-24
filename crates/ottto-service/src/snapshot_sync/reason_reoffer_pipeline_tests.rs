@@ -3,18 +3,41 @@
 // cycle, and a test-thread wall clock for the local re-offer schedule only.
 // Nothing waits 24 hours; no provider, credential or runtime state is read.
 use super::*;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 
 const DAY: u64 = 86_400;
 const ORIGINAL_PAIR: &str = "original_pair_candidate_unproved";
 
 thread_local! {
     static CLOCK: Cell<Option<u64>> = const { Cell::new(None) };
+    static EVIDENCE_STATS: RefCell<Option<ClaudeLocalEvidenceStats>> = const { RefCell::new(None) };
 }
 
 /// The synthetic local scheduling clock of this test thread, if set.
 pub(crate) fn clock() -> Option<u64> {
     CLOCK.with(Cell::get)
+}
+
+/// Observe the same counts serialized on the Claude local-evidence line.
+pub(crate) fn record_evidence_stats(stats: &ClaudeLocalEvidenceStats) {
+    if clock().is_some() {
+        EVIDENCE_STATS.with(|slot| slot.replace(Some(stats.clone())));
+    }
+}
+
+/// The scanner uses a wall-clock second, independently of the scheduling
+/// clock. Wait at most one second for a different census window before
+/// re-reading a member whose request set changed.
+fn wait_for_fresh_census_window(previous: &str) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while current_rfc3339() == previous {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            !remaining.is_zero(),
+            "the wall-clock census second must advance"
+        );
+        std::thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 struct ClockGuard;
@@ -239,6 +262,8 @@ impl Drop for ReofferServer {
 
 struct CycleResult {
     result: Result<()>,
+    census_window_end: String,
+    evidence_stats: Option<ClaudeLocalEvidenceStats>,
     leased_offers: usize,
     cache_enabled: bool,
     index: ScanIndex,
@@ -246,6 +271,7 @@ struct CycleResult {
     /// The saved upload ledger as JSON, to read the exact disk form.
     progress_json: serde_json::Value,
     progress_path: PathBuf,
+    index_path: PathBuf,
     /// Distinct exact-body conflicts the scan's cooldown view deferred.
     cooldown_deferred: usize,
 }
@@ -320,6 +346,17 @@ impl ReofferPipeline {
 
     /// One real due cycle at local time `now`.
     fn cycle(&mut self, now: u64) -> CycleResult {
+        self.cycle_with_census(now, true)
+    }
+
+    /// One real due cycle that starts with RetryPending authority debt: its
+    /// scanner terminal withholds the ordinary census (path-(a) bridge), and
+    /// the debt settles in finish.
+    fn cycle_with_authority_debt(&mut self, now: u64) -> CycleResult {
+        self.cycle_with_census(now, false)
+    }
+
+    fn cycle_with_census(&mut self, now: u64, complete: bool) -> CycleResult {
         self.clock.set(now);
         assert_eq!(clock(), Some(now));
         self.cadence.next_due_cycle();
@@ -347,7 +384,12 @@ impl ReofferPipeline {
         .unwrap()
         .expect("real due preparation");
         let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
-        assert!(scan.census_complete, "synthetic census is complete");
+        assert_eq!(
+            scan.census_complete, complete,
+            "synthetic census is complete unless authority debt withholds it"
+        );
+        let census_window_end = preparation.scan_started_at.clone();
+        EVIDENCE_STATS.with(|slot| slot.replace(None));
         let cooldown_deferred = index.reason_reoffer_cooldown_deferred_count();
         let cache_enabled = preparation.cache_observations_enabled;
         let leased_offers = preparation.upload_progress.reason_reoffer_counts.selected;
@@ -376,6 +418,8 @@ impl ReofferPipeline {
             .unwrap_or(serde_json::Value::Null);
         CycleResult {
             result,
+            census_window_end,
+            evidence_stats: EVIDENCE_STATS.with(|slot| slot.take()),
             leased_offers,
             cache_enabled,
             index: ScanIndex::load(&index_path).unwrap(),
@@ -387,6 +431,7 @@ impl ReofferPipeline {
             .unwrap(),
             progress_json,
             progress_path,
+            index_path,
             cooldown_deferred,
         }
     }
@@ -1241,6 +1286,94 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
     );
 }
 
+/// SOURCE condition 5 (Round 13): a protected root, named by the local
+/// re-emission list, whose family a census retired as absent (tombstoned,
+/// witness kept) and whose member then returns, through the real
+/// prepare/finish pipeline and the recording server. The return re-enters
+/// the authority path, and nothing emitted for the root is a request-owned
+/// literal (`claude_request_counting:v1`, the "new v1"), nor is any file of
+/// it stamped with body-witness revision 3. The root either settles its proof
+/// (tombstone cleared, no record) or stays held with nothing offered.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
+    if !supported("protected_returning_root_emits_no_literal_v1_or_revision_3") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-protected-return", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+
+    crate::snapshots::write_claude_reemission_list_for_test(&pipeline.support, &[root]);
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+
+    let offered_before = pipeline.server.offered().len();
+    std::fs::write(&transcript, &bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    let offered = pipeline.server.offered();
+    let root_offers = offered[offered_before..]
+        .iter()
+        .filter(|offer| offer["source_session_id"] == root)
+        .collect::<Vec<_>>();
+    for offer in &root_offers {
+        assert_ne!(
+            offer["usage_accounting_contract"], "claude_request_counting:v1",
+            "no request-owned literal for a protected root"
+        );
+        assert!(
+            !offer.to_string().contains("claude_request_counting"),
+            "no literal body for a protected root"
+        );
+    }
+    if let Some(entry) = returned.index.files.get(&key) {
+        assert_ne!(entry.effective_upload_body_witness_revision, 3);
+        assert!(
+            entry.effective_upload_body_witness_revision
+                <= effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        );
+    }
+    let settled = !returned.index.claude_family_tombstoned_for_test(root)
+        && returned
+            .index
+            .claude_authority_record_for_test(root)
+            .is_none();
+    let held = returned.index.claude_family_tombstoned_for_test(root)
+        && returned
+            .index
+            .claude_authority_record_for_test(root)
+            .is_some()
+        && root_offers.is_empty();
+    assert!(
+        settled || held,
+        "the return re-enters the authority path: settled={settled} held={held}"
+    );
+}
+
 /// The refusal, a conflict on its due daily offer, and the conflict's
 /// ordinary retry made due: the state whose quiet cycles re-read the file.
 fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_json::Value) {
@@ -1953,4 +2086,441 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
         crate::backfill::ClaudeHistoryListIntent::Set
     );
     assert!(crate::snapshots::claude_reemission_seen_marker_path(&pipeline.support).exists());
+}
+
+/// #705's returning tombstoned member remains held by #712 when its
+/// pre-cutoff history belongs to a move without an explicit full claim.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn tombstoned_returning_history_obeys_the_move_hold() {
+    if !supported("tombstoned_returning_history_obeys_the_move_hold") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-return-history-held", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&absent.index_path).unwrap()).unwrap();
+    std::fs::write(&transcript, &bytes).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    saved["claude_history_move_not_full"] = true.into();
+    std::fs::write(&absent.index_path, serde_json::to_vec(&saved).unwrap()).unwrap();
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    let offered_before = pipeline.server.offered().len();
+
+    // Healthy local proof may clear #705's tombstone, but cannot waive
+    // #712's history hold or stamp the body as uploaded.
+    let proved_return = pipeline.cycle(t0 + 1_200);
+    assert!(proved_return.result.is_ok(), "{:?}", proved_return.result);
+    assert_eq!(pipeline.server.offered().len(), offered_before);
+    assert!(!proved_return.index.claude_family_tombstoned_for_test(root));
+    assert_eq!(
+        proved_return.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+
+    // Retire it again, then return without healthy proof. This is the
+    // retained-tombstone case: the history hold and the authority debt both
+    // stay owed. Keep all the original retention and wire assertions below.
+    let mut index = ScanIndex::load(&proved_return.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&proved_return.index_path).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent_again = pipeline.cycle(t0 + 1_800);
+    assert!(absent_again.result.is_ok(), "{:?}", absent_again.result);
+    assert!(!absent_again.index.files.contains_key(&key));
+    assert!(absent_again.index.claude_family_tombstoned_for_test(root));
+    let api = pipeline
+        .support
+        .join("local-otel/claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    std::fs::write(api, b"{ malformed synthetic proof\n").unwrap();
+    std::fs::write(&transcript, bytes).unwrap();
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&absent_again.index_path).unwrap()).unwrap();
+    saved["claude_history_cutoff_unix_seconds"] = current_unix_seconds().into();
+    std::fs::write(
+        &absent_again.index_path,
+        serde_json::to_vec(&saved).unwrap(),
+    )
+    .unwrap();
+    let returned = pipeline.cycle(t0 + 2_400);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    assert_eq!(
+        pipeline.server.offered().len(),
+        offered_before,
+        "history stays held"
+    );
+    assert!(returned.index.claude_family_tombstoned_for_test(root));
+    assert_eq!(
+        returned.index.files[&key].effective_upload_body_witness_revision,
+        0
+    );
+}
+
+/// COST (Round 16): a family whose tombstone was used and that then returns
+/// goes back through the normal authority/proof path, through the real
+/// prepare/finish pipeline and the server's offer recorder. The root is
+/// accepted, retired with its tombstone and returns with the same bytes
+/// while its local proof is unhealthy: it is read against the retained
+/// witness (a bounded RetryPending record re-forms), never as a new file,
+/// and nothing is offered. Once the evidence is healthy, its next changed
+/// revision (a note, so the request set still matches the witness)
+/// re-proves and its body is offered exactly once with the same usage: never
+/// added again as new history, nothing offered twice across later cycles,
+/// and the root is never dropped (indexed, accepted, tombstone cleared).
+/// #712's history hold over a returning member is
+/// `tombstoned_returning_history_obeys_the_move_hold` above.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
+    if !supported("returning_tombstoned_family_is_held_until_proof_then_reoffered_once") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-return-reoffered-once", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let root_offers = |offered: &[serde_json::Value]| {
+        offered
+            .iter()
+            .filter(|offer| offer["source_session_id"] == root)
+            .map(fingerprint_of)
+            .collect::<Vec<_>>()
+    };
+    let accepted = root_offers(&pipeline.server.offered());
+    assert_eq!(accepted.len(), 1, "the root is offered once at first");
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+    let witness = first
+        .index
+        .claude_usage_family_witness_digest_for_test(root)
+        .expect("the proven root keeps a witness");
+
+    // Retire the family: its tombstone stands while it is absent.
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    let offered_before = pipeline.server.offered().len();
+
+    // It returns with the same bytes while its proof is unhealthy: the
+    // tombstone routes it to the authority path, held, nothing offered.
+    let api = pipeline
+        .support
+        .join("local-otel/claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    std::fs::write(&api, b"{ malformed synthetic proof\n").unwrap();
+    std::fs::write(&transcript, &bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    assert!(
+        root_offers(&pipeline.server.offered()[offered_before..]).is_empty(),
+        "nothing is offered before the proof"
+    );
+    let record = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .expect("the returning root re-forms its record, never a new file");
+    assert!(record.bound_to_retained_witness && !record.terminal);
+    assert_eq!(record.proven_witness_fingerprint, witness);
+    assert_eq!(record.failed_reconstruction_count, 1);
+    assert!(returned.index.claude_family_tombstoned_for_test(root));
+
+    // Healthy evidence and a changed revision that adds no request: the
+    // retained witness reconstructs, and its body is offered once.
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let note = serde_json::json!({"timestamp": at, "type": "user", "sessionId": root,
+        "message": {"role": "user", "content": "synthetic note"}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(format!("{note}\n").as_bytes())
+        .unwrap();
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    // It starts with the RetryPending record, which withholds this scan's
+    // census; the next cycle, with the debt settled, completes it again.
+    let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
+    assert!(proved.result.is_ok(), "{:?}", proved.result);
+    let later = pipeline.cycle(t0 + 2_400);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    let offered = pipeline.server.offered();
+    let reoffered = root_offers(&offered[offered_before..]);
+    assert_eq!(reoffered.len(), 1, "re-offered exactly once: {reoffered:?}");
+    let body = |fingerprint: &str| {
+        offered
+            .iter()
+            .find(|offer| fingerprint_of(offer) == fingerprint)
+            .unwrap()
+    };
+    assert_eq!(
+        usage_of(body(&reoffered[0])),
+        usage_of(body(&accepted[0])),
+        "the same usage, never added again as new history"
+    );
+    assert!(later.index.files.contains_key(&key), "never dropped");
+    assert!(later
+        .index
+        .accepted_snapshot_fingerprint_recorded(&reoffered[0]));
+    assert!(later.index.claude_authority_record_for_test(root).is_none());
+    assert!(!later.index.claude_family_tombstoned_for_test(root));
+}
+
+/// A returning family that grew needs one cumulative replacement body.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
+    if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {
+        return;
+    }
+    let root = IDENTITY_PIPELINE_ROOT;
+    let t0 = current_unix_seconds();
+    let mut pipeline = ReofferPipeline::new("patha-grown-return-fresh-window", Answer::Accept, t0);
+    let first = pipeline.cycle(t0);
+    assert!(first.result.is_ok(), "{:?}", first.result);
+    let root_offers = |offered: &[serde_json::Value]| {
+        offered
+            .iter()
+            .filter(|offer| offer["source_session_id"] == root)
+            .map(fingerprint_of)
+            .collect::<Vec<_>>()
+    };
+    let accepted = root_offers(&pipeline.server.offered());
+    assert_eq!(accepted.len(), 1, "the root is offered once at first");
+    let key = first
+        .index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&format!("{root}.jsonl")))
+        .cloned()
+        .expect("the root is indexed");
+    let witness = first
+        .index
+        .claude_usage_family_witness_digest_for_test(root)
+        .expect("the proven root keeps a witness");
+
+    // Retire the family: its tombstone stands while it is absent.
+    let mut index = ScanIndex::load(&first.index_path).unwrap();
+    index.tombstone_claude_family_for_test(root);
+    index.save(&first.index_path).unwrap();
+    let transcript = pipeline
+        .fixture
+        .home
+        .join(".claude/projects/-synthetic-repo")
+        .join(format!("{root}.jsonl"));
+    let bytes = std::fs::read(&transcript).unwrap();
+    std::fs::remove_file(&transcript).unwrap();
+    let absent = pipeline.cycle(t0 + 600);
+    assert!(absent.result.is_ok(), "{:?}", absent.result);
+    assert!(!absent.index.files.contains_key(&key));
+    assert!(absent.index.claude_family_tombstoned_for_test(root));
+    assert!(!reemission_list_path(&pipeline.support).exists());
+    let offered_before = pipeline.server.offered().len();
+
+    // It returns with the same bytes while its proof is unhealthy: the
+    // tombstone routes it to the authority path, held, nothing offered.
+    let api = pipeline
+        .support
+        .join("local-otel/claude-code-effort")
+        .join(format!("{:x}.jsonl", Sha256::digest(root.as_bytes())));
+    std::fs::write(&api, b"{ malformed synthetic proof\n").unwrap();
+    std::fs::write(&transcript, &bytes).unwrap();
+    let returned = pipeline.cycle(t0 + 1_200);
+    assert!(returned.result.is_ok(), "{:?}", returned.result);
+    assert!(
+        root_offers(&pipeline.server.offered()[offered_before..]).is_empty(),
+        "nothing is offered before the proof"
+    );
+    let record = returned
+        .index
+        .claude_authority_record_for_test(root)
+        .expect("the returning root re-forms its record, never a new file");
+    assert!(record.bound_to_retained_witness && !record.terminal);
+    assert_eq!(record.proven_witness_fingerprint, witness);
+    assert_eq!(record.failed_reconstruction_count, 1);
+    assert!(returned.index.claude_family_tombstoned_for_test(root));
+
+    assert_eq!(
+        returned
+            .evidence_stats
+            .as_ref()
+            .expect("Claude evidence fold")
+            .first_proof_hold
+            .census_withheld_retry_pending_family_count,
+        1,
+        "the existing census counter exposes the held RetryPending family"
+    );
+
+    assert_eq!(
+        returned
+            .evidence_stats
+            .as_ref()
+            .unwrap()
+            .returning_family_grown_held,
+        1
+    );
+
+    // Growth needs a new witness. Keep exact reconstruction unchanged and
+    // let the native terminal re-prove in a new wall-clock census window.
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(5))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let grown = serde_json::json!({"timestamp": at, "type": "assistant",
+        "sessionId": root, "requestId": "req_3",
+        "message": {"id": "m3", "model": "claude-haiku-4-5",
+        "usage": {"input_tokens": 30, "output_tokens": 3}}});
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&transcript)
+        .unwrap()
+        .write_all(format!("{grown}\n").as_bytes())
+        .unwrap();
+    // Still-unhealthy evidence holds the genuinely grown returning family.
+    // The dedicated census-line value must expose it while other pending
+    // causes remain in the existing aggregate counter.
+    wait_for_fresh_census_window(&returned.census_window_end);
+    let grown_held = pipeline.cycle_with_authority_debt(t0 + 1_500);
+    assert!(grown_held.result.is_ok(), "{:?}", grown_held.result);
+    assert_ne!(grown_held.census_window_end, returned.census_window_end);
+    let held_stats = grown_held
+        .evidence_stats
+        .as_ref()
+        .expect("Claude evidence fold");
+    assert_eq!(held_stats.returning_family_grown_held, 1);
+    assert_eq!(
+        held_stats
+            .duplicate_census
+            .page_invalidated_member_changed_count,
+        0
+    );
+    assert_eq!(
+        held_stats
+            .first_proof_hold
+            .census_withheld_retry_pending_family_count,
+        1
+    );
+    assert!(grown_held
+        .index
+        .claude_authority_record_for_test(root)
+        .is_some());
+    assert!(grown_held.index.claude_family_tombstoned_for_test(root));
+    assert!(root_offers(&pipeline.server.offered()[offered_before..]).is_empty());
+    write_native_bootstrap_sidecars(&pipeline.fixture, &pipeline.support);
+    // It starts with the RetryPending record, which withholds this scan's
+    // census; the next cycle, with the debt settled, completes it again.
+    wait_for_fresh_census_window(&grown_held.census_window_end);
+    let proved = pipeline.cycle_with_authority_debt(t0 + 1_800);
+    assert!(proved.result.is_ok(), "{:?}", proved.result);
+    assert_ne!(proved.census_window_end, returned.census_window_end);
+    assert_ne!(proved.census_window_end, grown_held.census_window_end);
+    assert_eq!(
+        proved
+            .evidence_stats
+            .as_ref()
+            .unwrap()
+            .returning_family_grown_held,
+        0
+    );
+    assert_eq!(
+        proved
+            .evidence_stats
+            .as_ref()
+            .expect("Claude evidence fold")
+            .duplicate_census
+            .page_invalidated_member_changed_count,
+        0
+    );
+    assert_eq!(
+        proved
+            .evidence_stats
+            .as_ref()
+            .expect("Claude evidence fold")
+            .first_proof_hold
+            .census_withheld_retry_pending_family_count,
+        0
+    );
+    let later = pipeline.cycle(t0 + 2_400);
+    assert!(later.result.is_ok(), "{:?}", later.result);
+    let offered = pipeline.server.offered();
+    let reoffered = root_offers(&offered[offered_before..]);
+    assert_eq!(reoffered.len(), 1, "re-offered exactly once: {reoffered:?}");
+    let body = |fingerprint: &str| {
+        offered
+            .iter()
+            .find(|offer| fingerprint_of(offer) == fingerprint)
+            .unwrap()
+    };
+    assert_ne!(reoffered[0], accepted[0], "growth creates a new body B1");
+    let baseline = usage_of(body(&accepted[0]));
+    assert_eq!(
+        usage_of(body(&reoffered[0])),
+        (baseline.0 + 1, baseline.1 + 30, baseline.2 + 3),
+        "B1 is cumulative B0 plus req_3, superseding B0 rather than adding it again"
+    );
+    assert!(later.index.files.contains_key(&key), "never dropped");
+    assert!(later
+        .index
+        .accepted_snapshot_fingerprint_recorded(&reoffered[0]));
+    assert!(later.index.claude_authority_record_for_test(root).is_none());
+    assert!(!later.index.claude_family_tombstoned_for_test(root));
+    let once_more = pipeline.cycle(t0 + 3_000);
+    assert!(once_more.result.is_ok(), "{:?}", once_more.result);
+    assert_eq!(
+        root_offers(&pipeline.server.offered()[offered_before..]),
+        reoffered,
+        "the accepted cumulative head is not offered again"
+    );
 }
