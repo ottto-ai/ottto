@@ -2900,6 +2900,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
             "revision contract control requires an actual rev-3 literal"
         );
         let mut index = control.saved();
+        index.activate_upload_context(m.context.clone());
         index.activate_effective_upload_body_witness_revision(if downgrade { 2 } else { 3 });
         if !downgrade {
             std::fs::write(
@@ -2947,6 +2948,39 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
             after.terminal,
             downgrade.then_some(unknown_recovery::Reason::RevisionDowngrade)
         );
+        if !downgrade {
+            assert_eq!(
+                after.slot, 1,
+                "a denied gate skips this due slot without a POST"
+            );
+            std::fs::write(
+                control
+                    .support
+                    .join("snapshots/claude_code-reemission-exclusions.txt"),
+                b"",
+            )
+            .unwrap();
+            let _not_yet = money::PageClockForTest::new(&control.support, now + 301);
+            money_resume::drive_for_test(unknown_recovery::replay_due(
+                &control.support,
+                &mut index,
+                &mut progress,
+                &progress_path,
+                &control.client,
+                &control.device,
+                "device-secret",
+                "otm_test",
+                &namespace,
+                || Ok(()),
+            ))
+            .unwrap();
+            assert_eq!(
+                control.server.raw_batches.lock().unwrap().len(),
+                1,
+                "wait for the +1h slot after a gate denial"
+            );
+        }
+
         assert!(money::money_due(
             &control.support,
             &control.transcript().to_string_lossy(),
@@ -3106,6 +3140,11 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
             std::fs::write(control.support.join("claude-request-owned-live.off"), b"").unwrap();
         }
         let mut index = control.saved();
+        index.activate_upload_context(
+            unknown_recovery::active_for_test(&control.support)[0]
+                .context
+                .clone(),
+        );
         index.activate_effective_upload_body_witness_revision(3);
         drop(clock);
         let _due = money::PageClockForTest::new(&control.support, now + 300);

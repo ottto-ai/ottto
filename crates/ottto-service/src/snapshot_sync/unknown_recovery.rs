@@ -44,6 +44,7 @@ pub(super) struct Manifest {
     pub deadline: u64,
     /// Includes the original physical POST; 1 + at most three replays.
     pub posts: u8,
+    pub slot: u8,
     pub not_before: u64,
     pub length: usize,
     pub sha256: String,
@@ -58,6 +59,7 @@ pub(super) struct Manifest {
 #[serde(rename_all = "snake_case")]
 pub(super) enum Reason {
     Exhausted,
+    AdmissionDenied,
     Expired,
     BindingLost,
     CorruptCustody,
@@ -269,6 +271,7 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         || !valid_id(&m.binding)
         || m.posts == 0
         || m.posts > 4
+        || m.slot > 3
         || m.length > BODY_MAX
         || m.length == 0
         || m.deadline != m.created.saturating_add(DEADLINE)
@@ -335,6 +338,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             created: 0,
             deadline: DEADLINE,
             posts: 1,
+            slot: 0,
             not_before: 0,
             length: 0,
             sha256: "00".repeat(32),
@@ -611,6 +615,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                     created: now,
                     deadline: now.saturating_add(DEADLINE),
                     posts: 1,
+                    slot: 0,
                     not_before: 0,
                     length: 0,
                     sha256: "00".repeat(32),
@@ -636,6 +641,8 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 Some(Reason::Expired)
             } else if m.posts >= 4 {
                 Some(Reason::Exhausted)
+            } else if m.slot >= 3 {
+                Some(Reason::AdmissionDenied)
             } else {
                 None
             }
@@ -702,11 +709,10 @@ pub(super) fn due(support: &Path, now: u64) -> Result<Vec<Manifest>> {
             m.terminal.is_none()
                 && !m.ack_saved
                 && m.posts < 4
+                && m.slot < 3
                 && now < m.deadline
                 && now >= m.not_before
-                && now
-                    >= m.created
-                        .saturating_add(REPLAY_AT[usize::from(m.posts - 1)])
+                && now >= m.created.saturating_add(REPLAY_AT[usize::from(m.slot)])
         })
         .cloned()
         .collect())
@@ -733,10 +739,12 @@ pub(super) fn replay_ticket(support: &Path, mut m: Manifest, now: u64) -> Result
             || digest(&bytes) != m.sha256
             || now >= m.deadline
             || m.posts >= 4
+            || m.slot >= 3
         {
             return Err(fault());
         }
         m.posts += 1;
+        m.slot += 1;
         write_manifest(&root, &m)?;
         Ok((m, bytes, funds))
     })
@@ -930,6 +938,7 @@ pub(super) fn manifest(
         created: now,
         deadline: now.saturating_add(DEADLINE),
         posts: 1,
+        slot: 0,
         not_before: now,
         length: 0,
         sha256: String::new(),
@@ -1316,16 +1325,22 @@ pub(super) async fn replay_due(
         }
         let guard = current_literal_guard(index, &m);
         if !admitted(index, support, &binding, &m, guard)? {
-            if guard == LiteralPermit::DenyAll {
-                let updated = wait(outcome_ticket(
-                    support,
-                    m,
-                    Some(Reason::RevisionDowngrade),
-                    0,
-                )?)
-                .await?;
-                replace(support, updated)?;
-            }
+            let mut m = m;
+            m.slot = m.slot.saturating_add(1).min(3);
+            let reason = if guard == LiteralPermit::DenyAll {
+                Some(Reason::RevisionDowngrade)
+            } else if m.slot >= 3 {
+                Some(Reason::AdmissionDenied)
+            } else {
+                None
+            };
+            let next = if m.slot < 3 {
+                m.created.saturating_add(REPLAY_AT[usize::from(m.slot)])
+            } else {
+                m.deadline
+            };
+            let updated = wait(outcome_ticket(support, m, reason, next)?).await?;
+            replace(support, updated)?;
             continue;
         }
         authority()?;
@@ -1446,6 +1461,7 @@ mod tests {
                 created,
                 deadline: created + DEADLINE,
                 posts: 1,
+                slot: 0,
                 not_before: created,
                 length: bytes.len(),
                 sha256: digest(&bytes),
