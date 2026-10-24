@@ -57,7 +57,7 @@ use std::collections::{BTreeMap, BinaryHeap};
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// The shadow's shared per-page work budget: physical bytes read, metadata
 /// calls (stat/open) and a deadline. Every reader of the shadow (tail, audit,
@@ -72,11 +72,11 @@ pub(crate) struct ClaudeLedgerWork {
 }
 
 impl ClaudeLedgerWork {
-    pub(crate) fn new(max_bytes: u64, max_stats: u64, max_elapsed: Duration) -> Self {
+    pub(crate) fn new(max_bytes: u64, max_stats: u64, deadline: Instant) -> Self {
         Self {
             bytes_left: max_bytes,
             stats_left: max_stats,
-            deadline: Instant::now() + max_elapsed,
+            deadline,
             stopped: false,
         }
     }
@@ -253,6 +253,7 @@ impl ClaudeTelemetryTail {
         BTreeMap<String, ClaudeRootTelemetry>,
     ) {
         let mut counts = ClaudeTelemetryTailCounts::default();
+        let starting_bytes = work.bytes_left();
         let dir = support_dir.join(STORE_DIR);
         let mut roots = BTreeMap::new();
         for root in page_roots {
@@ -326,6 +327,8 @@ impl ClaudeTelemetryTail {
         }
         counts.sweep_complete_through = telemetry_complete_through(ledger);
         counts.budget_stopped = work.stopped;
+        // Includes anchors, audits, first-pass read-ahead and verification.
+        counts.bytes_read = starting_bytes - work.bytes_left();
         (counts, roots)
     }
 }
@@ -511,9 +514,15 @@ fn anchor_at(file: &mut File, offset: u64, work: &mut ClaudeLedgerWork) -> Optio
     let start = offset.saturating_sub(ANCHOR_BYTES);
     let mut bytes = [0_u8; ANCHOR_BYTES as usize];
     let bytes = &mut bytes[..(offset - start) as usize];
+    if bytes.len() as u64 > work.bytes_left() || work.late() {
+        work.stopped = true;
+        return None;
+    }
     file.seek(SeekFrom::Start(start)).ok()?;
-    file.read_exact(bytes).ok()?;
-    work.debit(bytes.len() as u64);
+    let mut reader = CountingRead::new(&mut *file);
+    let read = reader.read_exact(bytes);
+    work.debit(reader.read);
+    read.ok()?;
     let mut digest = Sha256::new();
     digest.update(b"claude_telemetry_anchor:v1\0");
     digest.update(&*bytes);
@@ -628,8 +637,12 @@ fn read_again_matches(
     }
     let range = end - start;
     // Its own allowance: the pass is bounded by the read it checks.
-    let mut again_work = ClaudeLedgerWork::new(range + 1, 0, Duration::from_millis(250));
-    let mut counting = CountingRead::new((&mut *file).take(range - skip));
+    let mut again_work =
+        ClaudeLedgerWork::new((range + 1).min(work.bytes_left()), 0, work.deadline);
+    // The underlying reader, including BufReader read-ahead, cannot fetch
+    // beyond the remaining physical allowance. A short pass cannot certify.
+    let physical_limit = (range - skip).min(work.bytes_left());
+    let mut counting = CountingRead::new((&mut *file).take(physical_limit));
     let again = {
         let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, &mut counting);
         let mut oversized = 0;
@@ -644,6 +657,10 @@ fn read_again_matches(
         )
     };
     work.debit(counting.read);
+    if counting.read < range - skip {
+        work.stopped = true;
+        return false;
+    }
     // Where each pass left an oversized line (0: on a line boundary). The
     // second pass runs to the end the first reached, never short of it.
     let first_skip = match first.stop {
@@ -1003,7 +1020,14 @@ fn read_file(
         counts.files_refused_budget += 1;
         return FileRead::Debt;
     }
-    let read_bytes = remaining.min(work.bytes_left()).min(room_bytes);
+    // Every committed slice needs a final anchor. Do not spend its bytes
+    // on read-ahead, or a bounded page would repeatedly discard its prefix.
+    let readable = work.bytes_left().saturating_sub(ANCHOR_BYTES);
+    if readable == 0 {
+        work.stopped = true;
+        return FileRead::Stopped;
+    }
+    let read_bytes = remaining.min(readable).min(room_bytes);
     // The ledger's room, not the work budget, cut this read.
     let room_cut = room_bytes < remaining.min(work.bytes_left());
     let Some(_admitted) =
@@ -1073,13 +1097,14 @@ fn read_file(
         return FileRead::Debt;
     };
     if written {
+        let before = work.bytes_left();
         let anchored = match resume {
             Some(state) => anchor_at(&mut file, state.offset, work) == Some(state.anchor),
             None => true,
         };
         let start_sum = resume.map_or(0, |state| state.line_sum);
-        if !anchored
-            || !read_again_matches(
+        let verified = anchored
+            && read_again_matches(
                 &mut file,
                 start,
                 skip,
@@ -1087,8 +1112,9 @@ fn read_file(
                 start_sum,
                 &scan,
                 work,
-            )
-        {
+            );
+        counts.bytes_read += before - work.bytes_left();
+        if !verified {
             counts.files_raced += 1;
             return FileRead::Debt;
         }

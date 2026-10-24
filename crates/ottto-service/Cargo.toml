@@ -19,6 +19,7 @@ flate2.workspace = true
 hmac.workspace = true
 getrandom.workspace = true
 libc.workspace = true
+log.workspace = true
 notify.workspace = true
 notify-debouncer-full.workspace = true
 ottto-core = { path = "../ottto-core" }
@@ -32,6 +33,7 @@ security-framework-sys.workspace = true
 serde.workspace = true
 serde_json = { workspace = true, features = ["raw_value"] }
 sha2.workspace = true
+ring.workspace = true
 thiserror.workspace = true
 time.workspace = true
 toml_edit.workspace = true

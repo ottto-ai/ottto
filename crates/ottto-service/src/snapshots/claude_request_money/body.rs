@@ -370,6 +370,11 @@ pub(crate) fn build_claude_request_body(
         let mut old_rows = BTreeMap::<ClaudeLiveKey, (ClaudeMoneyTokens, u64, Option<u64>)>::new();
         for bucket in &item.usage_buckets {
             for row in &bucket.model_usage {
+                position += 1;
+                if position % 1024 == 0 && ctx.late() {
+                    body.unbuilt = true;
+                    return body;
+                }
                 let tokens = ClaudeMoneyTokens::from_model_usage(row);
                 let cost = row.cost_usd.as_deref().and_then(parse_usd_micros);
                 body.old.add(tokens.conserved(), row.request_count, cost);

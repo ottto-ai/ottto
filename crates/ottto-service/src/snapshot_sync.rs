@@ -8140,6 +8140,11 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &api_report,
         &trace_report,
         scan_result.census_complete,
+        &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage {
+            census_complete: scan_result.census_complete,
+            fence_invalid: disposition.duplicate_census.census_invalid,
+            authority_retry: index.claude_usage_authority_pending_count() > 0,
+        },
     );
     Ok((disposition, census_withheld, stats))
 }
