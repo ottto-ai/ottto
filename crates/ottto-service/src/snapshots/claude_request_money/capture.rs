@@ -899,6 +899,16 @@ mod bounded_tests {
         assert!(work[&scope].exhausted);
         assert!(work[&scope].input <= PAGE_INPUT_BYTES);
         assert!(work[&scope].comparisons <= PAGE_COMPARISONS);
+        let spent = work[&scope].micros;
+        drop(work);
+        assert_eq!(take_capture_us(Path::new("unrelated-capture-page")), 0);
+        assert_eq!(take_capture_us(&scope), spent);
+        assert_eq!(take_capture_us(&scope), 0);
+        assert_eq!(
+            work_for_test(&scope).2,
+            spent,
+            "reporting never refunds work"
+        );
         println!("MONEY_P1B_CAPTURE admitted_files={accepted} attempted_files=4096 input_cap={PAGE_INPUT_BYTES} comparisons_cap={PAGE_COMPARISONS} time_cap_us={PAGE_CAPTURE_US}");
     }
 
