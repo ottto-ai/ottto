@@ -9545,6 +9545,24 @@ pub(crate) fn claude_reemission_member_walks_for_test() -> usize {
     CLAUDE_REEMISSION_MEMBER_WALKS_FOR_TEST.with(std::cell::Cell::get)
 }
 
+/// A subagent file's family `subagents` directory: its nearest `subagents`
+/// ancestor, as `claude_index_path_member_ref` reads it, whose parent is the
+/// family's `root` directory. `None` when the path does not have that shape.
+fn claude_family_subagents_dir<'a>(path: &'a Path, root: &str) -> Option<&'a Path> {
+    path.parent()?
+        .ancestors()
+        .find(|ancestor| {
+            ancestor.file_name().and_then(std::ffi::OsStr::to_str) == Some("subagents")
+        })
+        .filter(|subagents| {
+            subagents
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(std::ffi::OsStr::to_str)
+                == Some(root)
+        })
+}
+
 fn claude_index_path_member_ref(path: &Path) -> Option<ClaudeIndexPathMemberRef<'_>> {
     if path.extension().and_then(|value| value.to_str()) != Some("jsonl") {
         return None;
@@ -24680,7 +24698,7 @@ impl OwnedSourceScan {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} claude_reemission_family_closure_root_absent_excluded={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -24704,8 +24722,14 @@ impl OwnedSourceScan {
                         claude_reemission_stop_withheld_folds(),
                         history_upgrade.owed,
                         history_upgrade.permitted,
-                        history_upgrade.denied_summary()
+                        history_upgrade.denied_summary(),
+                        history_upgrade.family_closure_root_absent_excluded
                     );
+                    if history_upgrade.family_closure_root_absent_excluded > 0 {
+                        crate::local_resource_diagnostics::claude_reemission_family_closure_root_absent_excluded(
+                            history_upgrade.family_closure_root_absent_excluded,
+                        );
+                    }
                 }
                 // A remove/rename hint can arrive after bounded reconciliation has already
                 // passed this key. Removing it only from `observed_index_keys` is then too
@@ -36257,7 +36281,7 @@ impl ScanIndex {
             self.claude_history_cutoff_unix_seconds,
             birth_unix_seconds,
         );
-        claude_history_upgrade::decide(
+        let decision = claude_history_upgrade::decide(
             kind,
             &claude_history_upgrade::PolicyInputs {
                 exclusions: &self.claude_reemission_exclusions,
@@ -36271,7 +36295,42 @@ impl ScanIndex {
             page,
             &key,
             candidate.size_bytes,
-        )
+        );
+        if matches!(
+            decision,
+            HistoryDecision::Held(HistoryHold::Listed | HistoryHold::ListedChanged)
+        ) && self.claude_reemission_held_through_absent_root(candidate)
+        {
+            page.note_family_closure_root_absent();
+        }
+        decision
+    }
+
+    /// A subagent member listed only through its family root, whose root
+    /// file `<root>.jsonl` is absent: the closure alone holds it. Counted
+    /// for diagnostics; only held members pay this lookup.
+    fn claude_reemission_held_through_absent_root(&self, candidate: &CandidateFile) -> bool {
+        let Some(member) = claude_index_path_member_ref(&candidate.path) else {
+            return false;
+        };
+        let Some(stem) = member.subagent_stem else {
+            return false;
+        };
+        if self
+            .claude_reemission_exclusions
+            .lists_member(member.root, stem)
+        {
+            return false;
+        }
+        claude_family_subagents_dir(&candidate.path, member.root)
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+            .is_some_and(|project| {
+                matches!(
+                    fs::symlink_metadata(project.join(format!("{}.jsonl", member.root))),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                )
+            })
     }
 
     /// StateMissing M1: a list line may name only a member (`root_stem`). On a
@@ -36316,23 +36375,7 @@ impl ScanIndex {
         }
         let root_directory;
         let subagents = if member.subagent_stem.is_some() {
-            // The nearest `subagents` ancestor, as the member parser reads it.
-            let Some(subagents) = candidate
-                .path
-                .parent()
-                .and_then(|parent| {
-                    parent.ancestors().find(|ancestor| {
-                        ancestor.file_name().and_then(std::ffi::OsStr::to_str) == Some("subagents")
-                    })
-                })
-                .filter(|subagents| {
-                    subagents
-                        .parent()
-                        .and_then(Path::file_name)
-                        .and_then(std::ffi::OsStr::to_str)
-                        == Some(root)
-                })
-            else {
+            let Some(subagents) = claude_family_subagents_dir(&candidate.path, root) else {
                 self.claude_reemission_exclusions.list_root(root);
                 return;
             };

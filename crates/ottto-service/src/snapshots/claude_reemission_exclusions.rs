@@ -278,6 +278,12 @@ impl ReemissionExclusions {
         self.digests.insert(root_digest.as_str().to_owned());
     }
 
+    /// True when this member's own full id (`root_stem`) is listed, not only
+    /// its family root.
+    pub(crate) fn lists_member(&self, root_session_id: &str, subagent_stem: &str) -> bool {
+        !self.is_empty() && self.contains(&HexDigest::of(root_session_id, Some(subagent_stem)))
+    }
+
     /// Forget the families walked so far: each scan pass walks afresh.
     pub(crate) fn begin_pass(&mut self) {
         self.walked_roots.clear();
