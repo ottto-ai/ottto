@@ -1,6 +1,6 @@
 {
-  "candidate_file_count": 838,
-  "content_sha256": "aaebed666ff3d32e41bfd72432549ed82a178235fd273bd5e1e649bc612645dc",
+  "candidate_file_count": 839,
+  "content_sha256": "a648d5b31f458ac57c11f10183d153aebc2f9b7e2ef6d9aed8ebdabb17f46df3",
   "files": [
     {
       "executable": false,
@@ -1630,8 +1630,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "b6d1ce2eaee237da0b44ed43b206fb39ead29ca2936454185b94a0a0f1a74475",
-      "size_bytes": 3445374
+      "sha256": "9f60fa11b158804772ed6b7ba54c6cc89e7bf59769cb1a6a832d0758d80143f7",
+      "size_bytes": 3445449
     },
     {
       "executable": false,
@@ -1763,15 +1763,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census.rs",
-      "sha256": "ff48c628507dd72f6146c09c00a3723ef1a5951e23f8da625b58a64111103991",
-      "size_bytes": 310081
+      "sha256": "624524925f817b35fed9ef2829d672cfcd52210db7af64da34728919fdee6052",
+      "size_bytes": 316008
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census/d1.rs",
-      "sha256": "d3551d7f25b45171b8a1d387338454e12457b8ced916f0a7995c0adf575271b1",
-      "size_bytes": 18073
+      "sha256": "42f3807d21cade02bd221297417e528d9d58ee4ef124f73f4f4c56a66134744b",
+      "size_bytes": 18153
     },
     {
       "executable": false,
@@ -1790,9 +1790,16 @@
     {
       "executable": false,
       "mode": "0644",
+      "path": "crates/ottto-service/src/snapshots/claude_request_census/shadow_admission.rs",
+      "sha256": "4224f51ee677f01d0c20f2c1767fd87d06460b1b267da5d6937772f7612518f6",
+      "size_bytes": 6392
+    },
+    {
+      "executable": false,
+      "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_census_tests.rs",
-      "sha256": "44c25d2112f4f20aa67c2311fc1a0d80fdce1280c9450f3e5cc215efaf21212b",
-      "size_bytes": 92544
+      "sha256": "d8721ba725310f32551e088de2e7bdc285e4f366e9c3fc95c37ae67d91dd7d78",
+      "size_bytes": 97057
     },
     {
       "executable": false,
@@ -2330,8 +2337,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/development/2026-10-23-census-phase-b-safety-shadow.md",
-      "sha256": "c0eed577f24cabb31829dce150109410b7e78f05ff0e98ff5f4b595c545cba75",
-      "size_bytes": 12638
+      "sha256": "7a22f79cd8673f101b8fad9323d9ce2c8f7ff1ec60ee6b4c8bee40161c4f4ece",
+      "size_bytes": 14456
     },
     {
       "executable": false,
@@ -5871,7 +5878,7 @@
   ],
   "generated_at": "2026-10-23T22:24:35+00:00",
   "generated_by": "public_repo_export_bundle.sh",
-  "output_file_count": 839,
+  "output_file_count": 840,
   "public_roots": [
     ".cargo/audit.toml",
     ".github/dependabot.yml",

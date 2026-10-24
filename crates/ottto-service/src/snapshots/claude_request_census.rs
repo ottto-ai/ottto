@@ -29,6 +29,7 @@ use std::path::Path;
 use std::sync::Arc;
 mod d1;
 mod phase_b;
+mod shadow_admission;
 use phase_b::{HashIter, SafetyBase64, SafetyHashes};
 #[cfg(test)]
 pub(crate) mod main_reference;
@@ -1674,9 +1675,10 @@ pub(crate) struct ClaudeRequestCensusShadowState {
     /// S3(d) tripwire: a verified complete re-parse at an unchanged
     /// fingerprint and derivation changed the hash set or shape.
     derivation_drift: u64,
+    decode_duplicate_keys_dropped: u64,
     safety_incomplete: Option<SafetyIncomplete>,
 }
-crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, safety_incomplete);
+crate::heap_layout_bound::fields!(ClaudeRequestCensusShadowState; would_open, would_open_flips, derivation_drift, decode_duplicate_keys_dropped, safety_incomplete);
 
 impl ClaudeRequestCensusShadowState {
     fn closed() -> Self {
@@ -1892,6 +1894,9 @@ impl Serialize for ClaudeRequestCensusShadowState {
         if self.derivation_drift > 0 {
             map.serialize_entry("d", &self.derivation_drift)?;
         }
+        if self.decode_duplicate_keys_dropped > 0 {
+            map.serialize_entry("a", &self.decode_duplicate_keys_dropped)?;
+        }
         if let Some(state) = &self.safety_incomplete {
             map.serialize_entry("s", state)?;
         }
@@ -1926,6 +1931,7 @@ pub(super) fn decode_bounded_index(bytes: &[u8]) -> anyhow::Result<ScanIndex> {
     }
     let mut index = decoded?;
     reader.invalidate_duplicates(&mut index);
+    reader.recover_ambiguous_keys(&mut index);
     index.claude_request_census.safety_incomplete = index
         .claude_request_census_shadow
         .safety_incomplete
@@ -2008,6 +2014,7 @@ struct CensusRead<R> {
     seen_census: bool,
     seen_shadow: bool,
     ambiguous_census: bool,
+    ambiguous_keys: BTreeSet<String>,
     duplicate_census: bool,
     duplicate_shadow: bool,
     shadow_key: bool,
@@ -2036,6 +2043,7 @@ impl<R: std::io::Read> CensusRead<R> {
             seen_census: false,
             seen_shadow: false,
             ambiguous_census: false,
+            ambiguous_keys: BTreeSet::new(),
             duplicate_census: false,
             duplicate_shadow: false,
             shadow_key: false,
@@ -2054,6 +2062,7 @@ impl<R: std::io::Read> CensusRead<R> {
         // Buffering only the underlying file would still call our Read per byte.
         let mut index = serde_json::from_reader(std::io::BufReader::new(&mut *self))?;
         self.invalidate_duplicates(&mut index);
+        self.recover_ambiguous_keys(&mut index);
         index.claude_request_census.safety_incomplete = index
             .claude_request_census_shadow
             .safety_incomplete
@@ -2077,6 +2086,30 @@ impl<R: std::io::Read> CensusRead<R> {
                 .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
         }
         Ok(index)
+    }
+
+    fn recover_ambiguous_keys(&mut self, index: &mut ScanIndex) {
+        // Normalization serializes only surviving rows. Carry duplicate-key
+        // identities across that boundary for both normal and bounded CAS reads.
+        index
+            .claude_request_census
+            .ambiguous
+            .append(&mut self.ambiguous_keys);
+        let count = index.claude_request_census.ambiguous.len() as u64;
+        if count == 0 {
+            return;
+        }
+        let state = &mut index.claude_request_census_shadow;
+        state.decode_duplicate_keys_dropped =
+            state.decode_duplicate_keys_dropped.saturating_add(count);
+        for key in &index.claude_request_census.ambiguous {
+            if let Some(entry) = index.files.get_mut(key) {
+                // Existing candidate selection treats an empty fingerprint as
+                // Parse(Rearmed). Persist this debt through save/restart until
+                // the next authorized transcript pass rebuilds its record.
+                entry.source_file_fingerprint.clear();
+            }
+        }
     }
 
     fn invalidate_duplicates(&self, index: &mut ScanIndex) {
@@ -2207,8 +2240,10 @@ impl<R: std::io::Read> CensusRead<R> {
             drop(bytes);
             serde_json::to_vec(&state).expect("shadow serialization")
         } else {
-            let census = serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
+            let mut census =
+                serde_json::from_slice::<ClaudeRequestCensus>(&bytes).unwrap_or_default();
             self.ambiguous_census |= census.decode_lost || !census.ambiguous.is_empty();
+            self.ambiguous_keys.append(&mut census.ambiguous);
             drop(bytes);
             serde_json::to_vec(&census).expect("census serialization")
         })
@@ -2613,6 +2648,7 @@ impl<'de> Visitor<'de> for ShadowStateVisitor {
                 ("o", Loose::Bool(would_open)) => state.would_open = Some(would_open),
                 ("f", Loose::U64(flips)) => state.would_open_flips = flips,
                 ("d", Loose::U64(drift)) => state.derivation_drift = drift,
+                ("a", Loose::U64(dropped)) => state.decode_duplicate_keys_dropped = dropped,
                 _ => {}
             }
         }
@@ -3504,7 +3540,8 @@ pub(super) fn serialize_shadow_counts<S: Serializer>(
         Some(counts)
             if counts.shadow_spec_version == 0
                 && !counts.safety_incomplete
-                && !counts.safety_incomplete_overflow =>
+                && !counts.safety_incomplete_overflow
+                && counts.decode_duplicate_keys_dropped == 0 =>
         {
             serializer.serialize_some(&d1::CountsLine(counts))
         }
@@ -3916,6 +3953,7 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusCoverage {
 #[derive(Debug)]
 pub(crate) struct ClaudeRequestCensusJoin {
     counts: ClaudeRequestCensusShadowCounts,
+    admission: shadow_admission::Admission,
     coverage: BTreeMap<String, ClaudeRequestCensusCoverage>,
     shared_keys: BTreeSet<String>,
     unknown_roots: BTreeSet<String>,
@@ -3942,6 +3980,22 @@ impl ClaudeRequestCensusJoin {
         observed_index_keys: &BTreeSet<String>,
     ) -> Self {
         let census = &index.claude_request_census;
+        let inventory_within_limits = index.files.len() <= MAX_DECODE_ENTRIES
+            && census.records.len() <= MAX_DECODE_ENTRIES
+            && observed_index_keys.len() <= MAX_DECODE_ENTRIES
+            && residue_index_keys.len() <= MAX_DECODE_ENTRIES
+            && index
+                .files
+                .keys()
+                .chain(census.records.keys())
+                .chain(observed_index_keys.iter())
+                .chain(residue_index_keys.iter())
+                .all(|key| key.len() <= MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES);
+        let workspace = inventory_within_limits
+            .then(|| Self::workspace_bound(index, observed_index_keys, residue_index_keys))
+            .flatten();
+        let admission = shadow_admission::Admission::estimate(index, workspace);
+
         let mut join = Self {
             counts: ClaudeRequestCensusShadowCounts {
                 // Birth stubs are no record.
@@ -3985,6 +4039,9 @@ impl ClaudeRequestCensusJoin {
                     .filter(|(_, record)| record.retired.is_some() && record.safety.is_none())
                     .count(),
                 decode_ambiguous_keys: census.ambiguous.len(),
+                decode_duplicate_keys_dropped: index
+                    .claude_request_census_shadow
+                    .decode_duplicate_keys_dropped,
                 producer_refused_keys: census.producer_refused as usize,
                 safety_compact_decode_recovered: usize::from(census.compact_decode_recovered),
                 records: census.safety_records().count(),
@@ -3995,6 +4052,7 @@ impl ClaudeRequestCensusJoin {
                     >= MAX_CLAUDE_REQUEST_CENSUS_HASHES * 80,
                 ..ClaudeRequestCensusShadowCounts::default()
             },
+            admission,
             key_reasons: BTreeMap::new(),
             shared_reasons: BTreeMap::new(),
             retired_shared_keys: BTreeSet::new(),
@@ -4003,22 +4061,9 @@ impl ClaudeRequestCensusJoin {
             shared_keys: BTreeSet::new(),
             unknown_roots: BTreeSet::new(),
         };
-        // Shadow-only workspace bound. Oversized inventories remain closed;
-        // ordinary scan decisions and existing resource caps are unchanged.
-        if index.files.len() > MAX_DECODE_ENTRIES
-            || census.records.len() > MAX_DECODE_ENTRIES
-            || observed_index_keys.len() > MAX_DECODE_ENTRIES
-            || residue_index_keys.len() > MAX_DECODE_ENTRIES
-            || Self::workspace_bound(index, observed_index_keys, residue_index_keys)
-                .map_or(true, |bytes| bytes > MAX_SHADOW_WORKSPACE_BYTES)
-            || index
-                .files
-                .keys()
-                .chain(census.records.keys())
-                .chain(observed_index_keys.iter())
-                .chain(residue_index_keys.iter())
-                .any(|key| key.len() > MAX_CLAUDE_REQUEST_CENSUS_KEY_BYTES)
-        {
+        // Both estimates carry the independently calibrated error allowance.
+        // An unavailable estimate closes diagnostics, as do inventory limits.
+        if !inventory_within_limits || join.admission.refused_by().is_some() {
             join.counts.transient_limited = true;
             join.counts.shadow_healthy_terminals_memory_refused = 1;
             join.counts.shadow_healthy_terminal_refusal_rate_ppm = 1_000_000;
@@ -4789,7 +4834,7 @@ impl CensusShadowView {
             .saturating_mul(1024)
             .saturating_add(counts.transient_peak_bytes)
             .saturating_add(basis_bytes);
-        if estimate > MAX_SHADOW_WORKSPACE_BYTES {
+        if !shadow_admission::workspace_fits(estimate) {
             counts.legacy_compare_budget_refused = true;
             counts.shadow_work_limited = 1;
             counts.shadow_healthy_terminals_memory_refused = 1;
@@ -5501,6 +5546,7 @@ mod reader_regression_tests {
                 would_open: Some(true),
                 would_open_flips: 7,
                 derivation_drift: 0,
+                decode_duplicate_keys_dropped: 0,
                 safety_incomplete: None,
             },
             ..ScanIndex::default()
@@ -6414,6 +6460,7 @@ mod phase_b_tests {
     #[test]
     fn synthetic_scale_receipt_includes_old_new_and_checkpoint_decode_overlap() {
         let _shadow_mode = phase_b::ShadowMode::set(true);
+        let calibration = admitted_scale_calibration();
         const FILES: usize = 12400;
         let mut index = ScanIndex::default();
         let mut next = 0_u64;
@@ -6435,13 +6482,14 @@ mod phase_b_tests {
         }
         prepare_safety_checkpoint(&mut index);
         let checkpoint = serde_json::to_vec_pretty(&index).unwrap();
-        let ((counts, workspace), allocation) =
+        let ((counts, workspace, admission), allocation) =
             crate::retry_allocation_probe::measure_caller_thread(|| {
                 let old = index.clone();
                 let working = index.clone();
                 let (join, workspace) = crate::retry_allocation_probe::measure(|| {
                     ClaudeRequestCensusJoin::new(&working, 7, &BTreeSet::new())
                 });
+                let admission = join.admission;
                 let counts = join.counts(true);
                 let saved = decode_index(checkpoint.as_slice()).unwrap();
                 assert_eq!(
@@ -6449,10 +6497,19 @@ mod phase_b_tests {
                     MAX_CLAUDE_REQUEST_CENSUS_HASHES
                 );
                 assert_eq!(old.claude_request_census.records().count(), FILES);
-                (counts, workspace.requested_peak_with_overlap)
+                (counts, workspace.requested_peak_with_overlap, admission)
             });
-        eprintln!("FIX3_PHASE_B_SCALE files={FILES} hashes={} requested_peak_with_overlap={} workspace_peak={} attempted={} refused={} refusal_rate_ppm={} includes_old_new_checkpoint_decode=true per_caller_thread=true runtime_corpus=false",
-            next, allocation.requested_peak_with_overlap, workspace, counts.shadow_healthy_terminals_attempted, counts.shadow_healthy_terminals_memory_refused, counts.shadow_healthy_terminal_refusal_rate_ppm);
+        let (refused_by, limit, requested) = admission.refusal_receipt();
+        assert!(matches!(
+            admission.refused_by(),
+            Some(shadow_admission::Refusal::Workspace)
+        ));
+        assert!(requested > limit);
+        eprintln!("FIX3_PHASE_B_SCALE files={FILES} hashes={} requested_peak_with_overlap={} workspace_peak={} attempted={} refused={} refusal_rate_ppm={} estimated_peak_bytes={} actual_allocator_peak_bytes={} measured_error_ppm={} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by={refused_by} limit={limit} requested={requested} calibration_estimate_bytes={} calibration_actual_bytes={} calibration_effective_bound_bytes={} includes_old_new_checkpoint_decode=true per_caller_thread=true runtime_corpus=false",
+            next, allocation.requested_peak_with_overlap, workspace, counts.shadow_healthy_terminals_attempted, counts.shadow_healthy_terminals_memory_refused, counts.shadow_healthy_terminal_refusal_rate_ppm,
+            admission.additional_estimate, allocation.requested_peak_with_overlap, calibration.error_ppm,
+            shadow_admission::ERROR_ALLOWANCE_PPM, admission.effective_additional(), admission.workspace_estimate, admission.effective_workspace(),
+            calibration.estimated, calibration.actual, calibration.effective);
         assert!(
             workspace <= 64 * 1024 * 1024,
             "workspace receipt: {workspace}"
@@ -7265,8 +7322,27 @@ mod phase_b_tests {
             scoped_money_bytes(baseline.into_census(), B, 'b', "b")
         );
     }
+    #[derive(Clone, Copy)]
+    struct ScaleCalibration {
+        estimated: usize,
+        actual: usize,
+        error_ppm: usize,
+        effective: usize,
+    }
+    fn admitted_scale_calibration() -> ScaleCalibration {
+        static CALIBRATION: std::sync::OnceLock<ScaleCalibration> = std::sync::OnceLock::new();
+        *CALIBRATION.get_or_init(measure_admitted_scale)
+    }
     #[test]
     fn admitted_scale_receipt_covers_view_comparison_and_saved_equality() {
+        let _shadow_mode = phase_b::ShadowMode::set(true);
+        let calibration = admitted_scale_calibration();
+        assert!(calibration.actual <= shadow_admission::ADDITIONAL_PEAK_CAP);
+        assert!(calibration.estimated > 0);
+        assert!(calibration.effective <= shadow_admission::ADDITIONAL_PEAK_CAP);
+        assert!(calibration.error_ppm <= shadow_admission::ERROR_ALLOWANCE_PPM);
+    }
+    fn measure_admitted_scale() -> ScaleCalibration {
         let _shadow_mode = phase_b::ShadowMode::set(true);
         const FILES: usize = 1024;
         const HASHES: usize = 700000;
@@ -7324,6 +7400,14 @@ mod phase_b_tests {
             .len()
             .saturating_sub(reference_bytes);
         drop(baseline);
+        let admission = shadow_admission::Admission::estimate(
+            &index,
+            ClaudeRequestCensusJoin::workspace_bound(&index, &BTreeSet::new(), &BTreeSet::new()),
+        );
+        assert!(
+            admission.refused_by().is_none(),
+            "reference must admit: {admission:?}"
+        );
         let ((qualified, workspace), allocation) =
             crate::retry_allocation_probe::measure_caller_thread(|| {
                 let old = index.clone();
@@ -7367,7 +7451,27 @@ mod phase_b_tests {
             "admitted additional overlap {additional}"
         );
         assert_eq!(qualified.shadow_healthy_terminals_memory_refused, 0);
-        eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families);
+        assert!(
+            additional <= admission.effective_additional(),
+            "calibrated peak bound covers pre-existing charges too"
+        );
+        assert!(workspace <= admission.effective_workspace());
+        let actual_allocator_peak = allocation.requested_peak_with_overlap;
+        let error_ppm = shadow_admission::measured_error_ppm(
+            admission.additional_estimate,
+            actual_allocator_peak,
+        );
+        assert!(error_ppm <= shadow_admission::ERROR_ALLOWANCE_PPM,
+            "measured reference error {error_ppm} exceeds applied allowance; estimate={} actual={actual_allocator_peak}", admission.additional_estimate);
+        assert!(admission.effective_additional() <= shadow_admission::ADDITIONAL_PEAK_CAP);
+        let calibration = ScaleCalibration {
+            estimated: admission.additional_estimate,
+            actual: actual_allocator_peak,
+            error_ppm,
+            effective: admission.effective_additional(),
+        };
+        eprintln!("FIX3_PHASE_B_ADMITTED_SCALE files={FILES} hashes={HASHES} additional_overlap_bytes={additional} born_scope_peak_bytes={} original_shadow_heap_bound_bytes={original_extra} original_checkpoint_delta_bytes={checkpoint_extra} workspace_peak_bytes={workspace} compared_families={} saved_qualified=true estimated_peak_bytes={} actual_allocator_peak_bytes={actual_allocator_peak} measured_error_ppm={error_ppm} applied_error_allowance_ppm={} effective_bound_bytes={} workspace_estimate_bytes={} effective_workspace_bound_bytes={} refused_by=none limit={} requested={} includes_retired_safety=true includes_checkpoint_serialization_decode=true runtime_corpus=false", allocation.requested_peak_with_overlap, qualified.legacy_compare_families, admission.additional_estimate, shadow_admission::ERROR_ALLOWANCE_PPM, admission.effective_additional(), admission.workspace_estimate, admission.effective_workspace(), shadow_admission::ADDITIONAL_PEAK_CAP, admission.effective_additional());
+        calibration
     }
     #[test]
     fn off_with_preexisting_safety_keeps_reclaim_marker_and_alarm() {

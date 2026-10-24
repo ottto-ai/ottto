@@ -1733,6 +1733,7 @@ fn census_shadow_counts_encoding_is_bounded() {
         strong_admissions_via_excusal: usize::MAX,
         dirty_unparsed_keys: usize::MAX,
         decode_ambiguous_keys: usize::MAX,
+        decode_duplicate_keys_dropped: u64::MAX,
         producer_refused_keys: usize::MAX,
         shadow_post_save_mismatch_keys: usize::MAX,
         legacy_compare_families: usize::MAX,
@@ -1837,7 +1838,7 @@ fn census_shadow_counts_encoding_is_bounded() {
 }
 
 const CENSUS_SHADOW_MAX_BYTES: usize = 8 * 1024;
-const CENSUS_SHADOW_WORST_BYTES: usize = 5885;
+const CENSUS_SHADOW_WORST_BYTES: usize = 5938;
 
 /// Literal tokens matter: Value cannot represent the overflow that regressed
 /// load and the compare-and-swap reader. Compare every other persisted field.
@@ -2454,4 +2455,100 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         "ordinary index corruption is still quarantined"
     );
     assert!(loaded.files.is_empty());
+}
+
+/// MONEY N3: corruption is counted durably and the next ordinary scan rebuilds
+/// the affected transcript record, even when source bytes never change.
+#[test]
+fn census_duplicate_key_counts_and_rearms_only_its_file_until_rebuilt() {
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let scratch = crate::test_scratch::ScratchDir::new("census-duplicate-rebuild");
+        let root = scratch.join("projects");
+        for name in ["duplicate", "healthy"] {
+            census_write(
+                &root,
+                &format!("{name}.jsonl"),
+                &[census_response(
+                    name,
+                    Some(&format!("req-{name}")),
+                    &format!("msg-{name}"),
+                    1,
+                    10,
+                )],
+            );
+        }
+        let mut original = ScanIndex::default();
+        census_scan(&root, &mut original, FIRST_WINDOW);
+        let key = census_key(&original, &root, "duplicate.jsonl");
+        let healthy = census_key(&original, &root, "healthy.jsonl");
+        let healthy_fp = original.files[&healthy].source_file_fingerprint.clone();
+        let expected = original
+            .claude_request_census_for_test()
+            .get(&key)
+            .unwrap()
+            .request_hashes_for_test()
+            .to_vec();
+        let mut value = serde_json::to_value(&original).unwrap();
+        let row = serde_json::to_string(&value["claude_request_census"][&key]).unwrap();
+        let healthy_row = serde_json::to_string(&value["claude_request_census"][&healthy]).unwrap();
+        let quoted_key = serde_json::to_string(&key).unwrap();
+        let quoted_healthy = serde_json::to_string(&healthy).unwrap();
+        value["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
+        let duplicate_map =
+            format!("{{{quoted_key}:{row},{quoted_key}:{row},{quoted_healthy}:{healthy_row}}}");
+        let raw = serde_json::to_string(&value)
+            .unwrap()
+            .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &duplicate_map);
+        for bounded in [false, true] {
+            let path = scratch.join(format!("index-{bounded}.json"));
+            std::fs::write(&path, &raw).unwrap();
+            let mut index = if bounded {
+                crate::snapshots::claude_request_census::decode_bounded_index(raw.as_bytes())
+                    .unwrap()
+            } else {
+                ScanIndex::load(&path).unwrap()
+            };
+            assert!(index.claude_request_census_for_test().get(&key).is_none());
+            assert!(
+                index.files[&key].source_file_fingerprint.is_empty(),
+                "next pass must parse Rearmed"
+            );
+            assert_eq!(index.files[&healthy].source_file_fingerprint, healthy_fp);
+            let counts =
+                crate::snapshots::claude_request_census::settle_claude_request_census_terminal(
+                    &mut index,
+                    &BTreeSet::new(),
+                    &BTreeSet::new(),
+                    FIRST_WINDOW,
+                );
+            assert_eq!(counts.decode_duplicate_keys_dropped, 1);
+            let line = serde_json::to_value(ClaudeDuplicateCensusCounts {
+                request_census: Some(counts),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(line["request_census"]["decode_duplicate_keys_dropped"], 1);
+            index
+                .save(&path)
+                .expect("corruption counter and rearm debt survive CAS");
+            let mut restarted = ScanIndex::load(&path).unwrap();
+            assert!(restarted.files[&key].source_file_fingerprint.is_empty());
+            assert_eq!(
+                serde_json::to_value(&restarted).unwrap()["claude_request_census_shadow"]["a"],
+                1
+            );
+            census_scan(&root, &mut restarted, SECOND_WINDOW);
+            let rebuilt = restarted
+                .claude_request_census_for_test()
+                .get(&key)
+                .expect("next scan rebuilds missing census");
+            assert_eq!(rebuilt.request_hashes_for_test(), expected);
+            assert!(!restarted.files[&key].source_file_fingerprint.is_empty());
+            assert_eq!(
+                serde_json::to_value(&restarted).unwrap()["claude_request_census_shadow"]["a"],
+                1
+            );
+        }
+    }
 }

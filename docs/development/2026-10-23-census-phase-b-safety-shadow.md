@@ -27,8 +27,14 @@ metadata. `sb` holds retired-only safety hashes using the existing base64 u64
 codec. Existing fields, derivation, money getters and activation gates retain
 their contracts. Ambiguous record keys never become last-wins evidence. This applies with phase B
 OFF too: both duplicate census entries are dropped, whereas main used last-wins.
-This corruption-only MONEY-visible difference requires MONEY acknowledgement;
-activation OFF does not restore main's duplicate-key decode policy.
+MONEY accepts this corruption-only difference subject to durable counting and
+next-pass reconstruction. `decode_duplicate_keys_dropped` is cumulative and
+persists as root shadow `a`; it is present in the census line with OFF too.
+Both persisted decoder paths retain ambiguous key identities across normalization
+and clear only those indexed source fingerprints, using the existing
+`Parse(Rearmed)` path. Save/restart preserves that debt; the next ordinary
+transcript scan rebuilds the record. A successful rebuild clears the key's
+ambiguity, while the corruption count and sticky safety marker retain history.
 
 The terminal builds one diagnostic join. The usage fold compares same-window
 legacy duplicate keys before authority/fence mutation; full request hashes
@@ -181,3 +187,24 @@ median and raw samples. A shared runner cannot resolve the 0.5% target reliably;
 post-release OFF daemon CPU versus the prior release remains a separate check.
 Exact-head Round-6 receipts are recorded in the PR after CI completes. Activation
 remains OFF; no runtime corpus, seven-day shadow or release evidence is claimed.
+
+
+Resource admission now assesses the join/view workspace and an additional-peak
+estimate before allocating the D2 join. The peak model reserves six serialized
+inventory equivalents plus the independently computed workspace layout bound.
+Both estimates are multiplied by `1 + error allowance`, with checked integer
+ceil rounding; unavailable/overflowed estimates refuse. The caps stay 128 MiB
+additional peak and 64 MiB workspace.
+
+The applied error allowance is a conservative 50% calibration ceiling, not a
+claimed measurement. The admitted 1,024-file/700,000-hash reference measures
+absolute relative error against its allocator's complete born-in-scope peak;
+CI requires that measured error to fit the applied allowance and the adjusted
+peak to fit 128 MiB. Its pre-existing shadow-layout/checkpoint charges remain
+separate in `additional_overlap_bytes`, with the original 128 MiB assertion.
+Both scale receipts print estimate, actual allocator peak, measured reference
+error, applied allowance, effective bound and workspace estimate. The full
+receipt additionally names `refused_by`, `limit` and `requested`; its allocator
+observation under 128 MiB cannot override a refused workspace admission bound.
+The full-scale row remains an early-refusal control, not admitted coverage.
+The phase-E real-M4/headroom decision is outside this phase-B change.
