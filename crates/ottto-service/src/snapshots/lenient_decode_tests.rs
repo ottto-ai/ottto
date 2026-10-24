@@ -3567,3 +3567,70 @@ fn carried_ack_age_survives_restart_and_alarms_without_eviction_until_release() 
         );
     }
 }
+
+#[test]
+fn carried_ack_clock_scalars_bound_malformed_spans_across_load_cas_and_override() {
+    for field in [
+        "accepted_rebuild_pending_since_unix_seconds",
+        "accepted_rebuild_last_alarm_unix_seconds",
+    ] {
+        for bounded in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("carried-ack-clock-span");
+            let path = scratch.join("index.json");
+            let mut carried = ScanIndex::default();
+            carried.carry_identity_from(fixture()).unwrap();
+            carried.accepted_rebuild_pending_since_unix_seconds = Some(u64::MAX);
+            carried.accepted_rebuild_last_alarm_unix_seconds = Some(u64::MAX);
+            carried.save(&path).unwrap();
+            let valid = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                valid.accepted_rebuild_pending_since_unix_seconds,
+                Some(u64::MAX)
+            );
+            assert_eq!(
+                valid.accepted_rebuild_last_alarm_unix_seconds,
+                Some(u64::MAX)
+            );
+            let mut value = serde_json::to_value(&carried).unwrap();
+            value[field] = Value::String("x".repeat(2 * 1024 * 1024));
+            let bytes = serde_json::to_vec(&value).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            let loaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(serde_json::to_value(&loaded).unwrap().get(field), None);
+            assert_eq!(
+                loaded.accepted_snapshot_fingerprints,
+                carried.accepted_snapshot_fingerprints
+            );
+            assert_eq!(
+                loaded.accepted_rebuild_incidence,
+                carried.accepted_rebuild_incidence
+            );
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            let recovered =
+                lenient_decode::read_identity_carry(File::open(&path).unwrap(), "claude_code")
+                    .unwrap();
+            assert_eq!(serde_json::to_value(&recovered).unwrap().get(field), None);
+            assert_eq!(
+                recovered.accepted_snapshot_fingerprints,
+                carried.accepted_snapshot_fingerprints
+            );
+            if bounded {
+                carried
+                    .save_with_read_limit(&path, 4 * 1024 * 1024)
+                    .unwrap();
+            } else {
+                carried.save(&path).unwrap();
+            }
+            let reloaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                reloaded.accepted_snapshot_fingerprints,
+                carried.accepted_snapshot_fingerprints
+            );
+            assert_eq!(
+                reloaded.accepted_rebuild_incidence,
+                carried.accepted_rebuild_incidence
+            );
+            assert_eq!(corrupt_count(scratch.as_ref()), 0);
+        }
+    }
+}

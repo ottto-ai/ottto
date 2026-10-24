@@ -1046,6 +1046,15 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.reader.seek(SeekFrom::Start(span.start + span.len))?;
         result
     }
+    // A u64 needs at most 20 wire bytes (null needs four). Reject a wider
+    // diagnostic scalar before Serde can buffer a malformed JSON string.
+    fn diagnostic_timestamp(&mut self, span: Span) -> std::result::Result<Option<u64>, Error> {
+        if span.len > 20 {
+            return Ok(None);
+        }
+        self.history_scalar(span, None)
+    }
+
     // History scalars repair only type damage, without allocating a Value for
     // an arbitrarily large malformed record. Seek/I/O errors still propagate.
     fn history_scalar<T: serde::de::DeserializeOwned>(
@@ -1635,11 +1644,11 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "accepted_rebuild_pending_since_unix_seconds" => {
                             index.accepted_rebuild_pending_since_unix_seconds =
-                                self.history_scalar(value, None)?;
+                                self.diagnostic_timestamp(value)?;
                         }
                         "accepted_rebuild_last_alarm_unix_seconds" => {
                             index.accepted_rebuild_last_alarm_unix_seconds =
-                                self.history_scalar(value, None)?;
+                                self.diagnostic_timestamp(value)?;
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
