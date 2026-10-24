@@ -37402,6 +37402,7 @@ impl ScanIndex {
         let (mut index, origin) = match Self::load_inner(path, Some(source)) {
             Ok(loaded) => {
                 note_scan_index_rebuild_paused(source, false);
+                disarm_scan_index_rebuild_manual_override(source);
                 loaded
             }
             Err(error) => {

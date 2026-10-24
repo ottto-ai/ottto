@@ -198,8 +198,15 @@ pub(crate) fn scan_index_rebuild_paused(source: SnapshotSource) -> bool {
     state & scan_index_source_bit(source) != 0
 }
 
-fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
-    let now = now.duration_since(UNIX_EPOCH)?.as_nanos();
+/// Newest rename stamps among this checkpoint's rebuild witnesses: every
+/// quarantine, and user-Repair override rebuilds alone.
+#[derive(Debug, Default, Clone, Copy)]
+struct ScanIndexRebuildWitnessStamps {
+    newest: Option<u128>,
+    newest_override: Option<u128>,
+}
+
+fn scan_index_rebuild_witness_stamps(path: &Path) -> Result<ScanIndexRebuildWitnessStamps> {
     let stem = path
         .file_stem()
         .context("scan index has no file stem")?
@@ -209,6 +216,7 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
+    let mut stamps = ScanIndexRebuildWitnessStamps::default();
     for entry in fs::read_dir(parent)? {
         let entry = entry?;
         let name = entry.file_name();
@@ -219,6 +227,10 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         else {
             continue;
         };
+        let (is_override, tail) = match tail.strip_prefix(SCAN_INDEX_OVERRIDE_WITNESS_SEGMENT) {
+            Some(tail) => (true, tail),
+            None => (false, tail),
+        };
         let Some((pid, stamp)) = tail.split_once('.') else {
             continue;
         };
@@ -228,12 +240,201 @@ fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
         let Ok(stamp) = stamp.parse::<u128>() else {
             continue;
         };
-        // A future timestamp is conservative under clock rollback.
-        if now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS {
-            return Ok(true);
+        stamps.newest = stamps.newest.max(Some(stamp));
+        if is_override {
+            stamps.newest_override = stamps.newest_override.max(Some(stamp));
         }
     }
-    Ok(false)
+    Ok(stamps)
+}
+
+fn scan_index_rebuilt_recently(path: &Path, now: SystemTime) -> Result<bool> {
+    let now = now.duration_since(UNIX_EPOCH)?.as_nanos();
+    // A future timestamp is conservative under clock rollback.
+    Ok(scan_index_rebuild_witness_stamps(path)?
+        .newest
+        .is_some_and(|stamp| now.saturating_sub(stamp) <= SCAN_INDEX_REBUILD_COOLDOWN_NANOS))
+}
+
+// User Repair override (#718 follow-up, SOURCE ruling): one explicit,
+// interactive Repair of a paused source passes the seven-day guard once. The
+// override rebuild is the ordinary gated rebuild (quarantined origin, so the
+// #712 history gate, protected list and latches apply) and its witness
+// re-arms the seven-day clock. Transcripts stay on disk: late, not lost.
+/// The override witness keeps `.corrupt.`, so prior-history detection, the
+/// sweep's keep rule and the seven-day clock treat it as any quarantine; this
+/// extra segment is the durable evidence for the 24-hour cooldown.
+const SCAN_INDEX_OVERRIDE_WITNESS_SEGMENT: &str = "override.";
+const SCAN_INDEX_OVERRIDE_WITNESS_KIND: &str = "corrupt.override";
+const SCAN_INDEX_OVERRIDE_COOLDOWN_SECONDS: u64 = 24 * 60 * 60;
+/// Repair refusal reason: an override already ran or is armed within 24 h.
+pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE: &str =
+    "scan_index_rebuild_override_cooldown";
+
+/// Per-source override state, process memory only (no paths or contents):
+/// when the guard last refused lifts by itself, the newest override (a
+/// durable witness stamp or this process's press) and one armed press.
+#[derive(Debug, Clone, Copy)]
+struct ScanIndexRebuildOverrideState {
+    auto_retry_unix_seconds: Option<u64>,
+    last_override_unix_seconds: Option<u64>,
+    armed: bool,
+}
+impl ScanIndexRebuildOverrideState {
+    const NONE: Self = Self {
+        auto_retry_unix_seconds: None,
+        last_override_unix_seconds: None,
+        armed: false,
+    };
+}
+#[cfg(not(test))]
+static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideState; 3]> =
+    std::sync::Mutex::new([ScanIndexRebuildOverrideState::NONE; 3]);
+/// Counter `scan_index_rebuild_manual_override`: override rebuilds run by
+/// this process.
+#[cfg(not(test))]
+static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+thread_local! {
+    static SCAN_INDEX_REBUILD_OVERRIDE: std::cell::Cell<[ScanIndexRebuildOverrideState; 3]> =
+        const { std::cell::Cell::new([ScanIndexRebuildOverrideState::NONE; 3]) };
+    static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+fn scan_index_source_slot(source: SnapshotSource) -> usize {
+    scan_index_source_bit(source).trailing_zeros() as usize
+}
+
+#[cfg(not(test))]
+fn with_scan_index_rebuild_override<T>(
+    source: SnapshotSource,
+    update: impl FnOnce(&mut ScanIndexRebuildOverrideState) -> T,
+) -> T {
+    let mut states = SCAN_INDEX_REBUILD_OVERRIDE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    update(&mut states[scan_index_source_slot(source)])
+}
+
+#[cfg(test)]
+fn with_scan_index_rebuild_override<T>(
+    source: SnapshotSource,
+    update: impl FnOnce(&mut ScanIndexRebuildOverrideState) -> T,
+) -> T {
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| {
+        let mut states = cell.get();
+        let result = update(&mut states[scan_index_source_slot(source)]);
+        cell.set(states);
+        result
+    })
+}
+
+fn unix_seconds_ceil(nanos: u128) -> u64 {
+    u64::try_from(nanos.div_ceil(1_000_000_000)).unwrap_or(u64::MAX)
+}
+
+fn unix_seconds_at(now: SystemTime) -> u64 {
+    now.duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+/// A refusal records what the guard read: when it lifts by itself and the
+/// newest durable override, so the cooldown survives a daemon restart.
+fn note_scan_index_rebuild_refusal(source: SnapshotSource, stamps: ScanIndexRebuildWitnessStamps) {
+    with_scan_index_rebuild_override(source, |state| {
+        // The guard holds through the exact seven-day boundary.
+        state.auto_retry_unix_seconds = stamps.newest.map(|stamp| {
+            unix_seconds_ceil(stamp.saturating_add(SCAN_INDEX_REBUILD_COOLDOWN_NANOS + 1))
+        });
+        state.last_override_unix_seconds = state
+            .last_override_unix_seconds
+            .max(stamps.newest_override.map(unix_seconds_ceil));
+    });
+}
+
+/// What one interactive user Repair press did to a rebuild-loop pause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanIndexRebuildOverride {
+    /// The rebuild-loop guard is not pausing this source; nothing armed.
+    NotPaused,
+    /// The next source load runs one gated rebuild past the guard.
+    Armed,
+    /// An override already ran or is armed within 24 hours.
+    Cooldown,
+}
+
+/// Arm one rebuild past the seven-day guard. Only the companion's
+/// interactive Repair calls this; Verify, automatic retries and token (CLI
+/// or agent) requests never do.
+pub(crate) fn arm_scan_index_rebuild_manual_override(
+    source: SnapshotSource,
+    now: SystemTime,
+) -> ScanIndexRebuildOverride {
+    if !scan_index_rebuild_paused(source) {
+        return ScanIndexRebuildOverride::NotPaused;
+    }
+    let now = unix_seconds_at(now);
+    with_scan_index_rebuild_override(source, |state| {
+        // A future stamp is a cooldown under clock rollback.
+        let cooling = state
+            .last_override_unix_seconds
+            .is_some_and(|last| now.saturating_sub(last) <= SCAN_INDEX_OVERRIDE_COOLDOWN_SECONDS);
+        if state.armed || cooling {
+            return ScanIndexRebuildOverride::Cooldown;
+        }
+        state.armed = true;
+        state.last_override_unix_seconds = Some(now);
+        ScanIndexRebuildOverride::Armed
+    })
+}
+
+/// A compatible load ends the pause; an unspent press must not wait for a
+/// later, unrelated incident.
+fn disarm_scan_index_rebuild_manual_override(source: SnapshotSource) {
+    with_scan_index_rebuild_override(source, |state| state.armed = false);
+}
+
+/// When the guard lets an automatic load rebuild this paused source: just
+/// after seven days from the newest rebuild witness its refusal read.
+fn scan_index_rebuild_auto_retry_unix_seconds(source: SnapshotSource) -> Option<u64> {
+    if !scan_index_rebuild_paused(source) {
+        return None;
+    }
+    with_scan_index_rebuild_override(source, |state| state.auto_retry_unix_seconds)
+}
+
+/// That retry time as RFC 3339, for the health payload and Repair copy.
+pub(crate) fn scan_index_rebuild_auto_retry_at(source: SnapshotSource) -> Option<String> {
+    let seconds = i64::try_from(scan_index_rebuild_auto_retry_unix_seconds(source)?).ok()?;
+    OffsetDateTime::from_unix_timestamp(seconds)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+#[cfg(not(test))]
+fn count_scan_index_rebuild_manual_override() -> usize {
+    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .saturating_add(1)
+}
+
+#[cfg(test)]
+fn count_scan_index_rebuild_manual_override() -> usize {
+    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(|counter| {
+        let count = counter.get().saturating_add(1);
+        counter.set(count);
+        count
+    })
+}
+
+/// This thread's `scan_index_rebuild_manual_override` counter.
+#[cfg(test)]
+pub(crate) fn scan_index_rebuild_manual_override_count() -> usize {
+    SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(std::cell::Cell::get)
 }
 
 fn quarantine_invalid_scan_index(
@@ -245,7 +446,16 @@ fn quarantine_invalid_scan_index(
 ) -> Result<ScanIndex> {
     // Every whole-index fallback shares this decision while the caller holds
     // the checkpoint lock: budget, syntax and canonical identity collision.
-    if scan_index_rebuilt_recently(path, now)? {
+    // Only the source-aware daemon load can spend an armed user Repair; the
+    // unattributed load (audit, retry driver) always refuses.
+    let recent = scan_index_rebuilt_recently(path, now)?;
+    if recent
+        && !source
+            .is_some_and(|source| with_scan_index_rebuild_override(source, |state| state.armed))
+    {
+        if let (Some(source), Ok(stamps)) = (source, scan_index_rebuild_witness_stamps(path)) {
+            note_scan_index_rebuild_refusal(source, stamps);
+        }
         emit_scan_index_containment_line(format!(
             "local snapshot scan index load: source={} lenient_hold_budget_exceeded={} refusal_kind=rebuild_loop source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; recent quarantine rebuild alarm, reviewed repair required, never delete the index",
             scan_index_source_label(source), usize::from(cause == "hold_budget")
@@ -254,10 +464,27 @@ fn quarantine_invalid_scan_index(
     }
     // The index is only a local incremental-scan optimization. A crash or
     // structural damage must not permanently block collection, but never
-    // overwrite the unreadable witness in place.
-    let quarantine_path = unique_checkpoint_sibling(path, "corrupt");
+    // overwrite the unreadable witness in place. Past this point a recent
+    // rebuild means an armed user Repair is passing the guard.
+    let overridden = recent;
+    let kind = if overridden {
+        SCAN_INDEX_OVERRIDE_WITNESS_KIND
+    } else {
+        "corrupt"
+    };
+    let quarantine_path = unique_checkpoint_sibling(path, kind);
     fs::rename(path, &quarantine_path).context("quarantine invalid local snapshot scan index")?;
     sync_checkpoint_parent(path)?;
+    // Spend the press only once its witness is durable: that witness re-arms
+    // the seven-day clock and carries the 24-hour cooldown.
+    if let Some(source) = source.filter(|_| overridden) {
+        disarm_scan_index_rebuild_manual_override(source);
+        let count = count_scan_index_rebuild_manual_override();
+        emit_scan_index_containment_line(format!(
+            "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair scan_index_rebuild_manual_override={count} guard_rearmed=7d cooldown=24h rebuild=gated; one interactive user Repair passed the seven-day guard, history stays gated",
+            source.api_slug()
+        ));
+    }
     let quarantines = SCAN_INDEX_WHOLE_QUARANTINES
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1);

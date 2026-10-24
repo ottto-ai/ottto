@@ -1826,6 +1826,119 @@ fn hold_budget_floor_and_seven_day_rebuild_loop_guard() {
 }
 
 #[test]
+fn user_repair_override_passes_the_guard_once_and_rearms_it() {
+    let scratch = crate::test_scratch::ScratchDir::new("lenient-user-repair-override");
+    let path = scratch.join("index.json");
+    let source = SnapshotSource::Codex;
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, scratch.as_ref());
+    let refused = |damage: &[u8]| {
+        let error = load().unwrap_err();
+        assert!(
+            error.downcast_ref::<ScanIndexRebuildLoop>().is_some(),
+            "{error:#}"
+        );
+        assert!(scan_index_rebuild_paused(source));
+        assert_eq!(fs::read(&path).unwrap(), damage);
+    };
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    // A press with no pause arms nothing for a later incident.
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::NotPaused
+    );
+    fs::write(&path, b"{ ").unwrap();
+    refused(b"{ ");
+    // The pause names its automatic retry: seven days after the witness.
+    let week = 7 * 24 * 60 * 60;
+    let retry = scan_index_rebuild_auto_retry_unix_seconds(source).unwrap();
+    let now = unix_seconds_at(SystemTime::now());
+    assert!(
+        retry > now + week - 60 && retry <= now + week + 1,
+        "{retry} vs {now}"
+    );
+    assert!(scan_index_rebuild_auto_retry_at(source).is_some());
+    // Automatic retries never override: the source load keeps refusing.
+    refused(b"{ ");
+
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    // The unattributed load (audit, retry driver) cannot spend the press.
+    assert!(ScanIndex::load(&path)
+        .unwrap_err()
+        .downcast_ref::<ScanIndexRebuildLoop>()
+        .is_some());
+    assert_eq!(fs::read(&path).unwrap(), b"{ ");
+    // A second press inside 24 hours refuses, armed or spent.
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    assert_eq!(scan_index_rebuild_manual_override_count(), 0);
+    let before = scan_index_containment_lines_for_test().len();
+    let (index, origin) = load().unwrap();
+    assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+    assert!(index.files.is_empty());
+    assert!(!scan_index_rebuild_paused(source));
+    assert_eq!(scan_index_rebuild_manual_override_count(), 1);
+    let lines = scan_index_containment_lines_for_test();
+    let overrides = lines[before..]
+        .iter()
+        .filter(|line| line.contains("override=user_repair"))
+        .collect::<Vec<_>>();
+    assert_eq!(overrides.len(), 1);
+    assert!(overrides[0].contains("scan_index_rebuild_manual_override=1"));
+    assert!(overrides[0].contains("source=codex"));
+    assert!(lines[before..]
+        .iter()
+        .any(|line| line.contains("fallback=gated_rebuild")
+            && line.contains("history_policy=prior_history_gated_rebuild")));
+    // The override witness keeps the damaged bytes and re-arms the clock.
+    let witness = fs::read_dir(scratch.as_ref())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("index.corrupt.override.")
+        })
+        .unwrap();
+    assert_eq!(fs::read(&witness).unwrap(), b"{ ");
+    assert_eq!(corrupt_count(scratch.as_ref()), 2);
+    assert!(scan_index_rebuilt_recently(&path, SystemTime::now()).unwrap());
+
+    // A fresh failure inside seven days of the override refuses again; the
+    // spent press does not carry over.
+    fs::write(&path, b"{  ").unwrap();
+    refused(b"{  ");
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    // The cooldown is the durable witness, so it survives a daemon restart.
+    SCAN_INDEX_REBUILD_OVERRIDE.with(|cell| cell.set([ScanIndexRebuildOverrideState::NONE; 3]));
+    refused(b"{  ");
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Cooldown
+    );
+    // After 24 hours one more press is allowed; the guard still refuses
+    // every load that is not that press.
+    refused(b"{  ");
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(
+            source,
+            SystemTime::now() + std::time::Duration::from_secs(25 * 60 * 60)
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+    assert_eq!(scan_index_rebuild_manual_override_count(), 1);
+}
+
+#[test]
 fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
     let mut seed = fixture();
     seed.insert_retry_pending_claude_authority_for_test("valid-family");

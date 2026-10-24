@@ -2680,7 +2680,14 @@ fn local_health_source_for_status(
             projection_revision: projection_revision.saturating_sub(1),
             blocking_reason: Some(snapshots::SCAN_INDEX_REBUILD_LOOP_CODE.to_string()),
             next_action: Some("review_scan_index_repair".to_string()),
-            clear_condition: Some("successful compatible scan-index load after reviewed repair or cooldown; preserve the index and quarantine witnesses, never delete the index".to_string()),
+            // The automatic retry time is the guard's own witness stamp plus
+            // seven days; a user Repair may run one gated rebuild sooner.
+            clear_condition: Some(format!(
+                "successful compatible scan-index load after a user Repair (one gated rebuild per 24 h) or the automatic retry{}; preserve the index and quarantine witnesses, never delete the index",
+                snapshots::scan_index_rebuild_auto_retry_at(snapshot_source)
+                    .map(|at| format!(" (auto_retry_at={at})"))
+                    .unwrap_or_default()
+            )),
         };
     }
     let has_verify_attention =
@@ -5454,6 +5461,26 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("never delete the index"));
+        // The automatic retry time rides in the existing clear_condition:
+        // seven days after the quarantine witness this pause read.
+        let retry_at = source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .split_once("auto_retry_at=")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(at, _)| at)
+            .expect("clear_condition names auto_retry_at");
+        let retry_at =
+            time::OffsetDateTime::parse(retry_at, &time::format_description::well_known::Rfc3339)
+                .unwrap();
+        let week_out = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+        assert!((retry_at - week_out).abs() < time::Duration::minutes(5));
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.clear_condition.contains("auto_retry_at=")));
         assert_eq!(
             health
                 .sources

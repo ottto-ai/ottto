@@ -643,6 +643,63 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     });
 }
 
+/// User Repair override (#718): one interactive Repair of a rebuild-loop
+/// pause runs the same #712-gated rebuild as the first incident. On an
+/// unverified Mac history stays held, so no file comes back as new history,
+/// and the override witness re-arms the seven-day guard.
+#[test]
+fn user_repair_override_rebuild_keeps_history_held() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-upgrade-user-repair-override");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
+        fixture.corrupt_index();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::ClaudeCode,
+                std::time::SystemTime::now()
+            ),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overridden = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        assert!(
+            overridden.uploaded.is_empty(),
+            "the override rebuild re-sent history: {:?}",
+            overridden.uploaded
+        );
+        assert_eq!(overridden.corrections, 0);
+        assert_eq!(overridden.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        assert_eq!(overridden.index.files.len(), HISTORY_SESSIONS.len());
+        for entry in overridden.index.files.values() {
+            assert_eq!(entry.effective_upload_body_witness_revision, 0);
+            assert!(entry.last_upload_body_witness.is_none());
+        }
+        fixture.corrupt_index();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    });
+}
+
 /// Addendum 1 items 2 and 5 (P2), SOURCE F2: revision 3 is above
 /// `MAX_GATED_CLAUDE_REVISION`, so the gate holds every upgrade
 /// (`ungated_revision`) and a listed family's genuine change is denied; no

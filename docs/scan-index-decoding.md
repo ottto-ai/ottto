@@ -32,6 +32,16 @@ existing backup name supplies the rename timestamp (mtime survives rename);
 no new durable state is added. Future timestamps also block a rebuild, covering
 clock rollback. All same-checkpoint corruption backups conservatively count,
 including syntax and identity-collision quarantines. Syntax/truncation still quarantines on load.
+A paused source reports `scan_index_rebuild_loop` with its automatic retry time
+(`auto_retry_at=`, the newest backup stamp plus seven days) in the health
+`clear_condition`. One interactive user Repair from the signed companion
+(token-less `repair`, not dry run) may pass the guard once: the next source load
+runs the same gated rebuild, renames the witness to `.corrupt.override.`, counts
+`scan_index_rebuild_manual_override` and logs one line. That witness re-arms the
+seven-day guard and is the durable 24-hour cooldown; a second press inside it
+returns `scan_index_rebuild_override_cooldown`. Verify, automatic retries,
+unattributed loads and token (CLI or agent) Repairs never override. Transcripts
+stay on disk, so a paused source's sessions arrive late, not lost.
 Malformed schema, generation, ledger or monotone controls refuse with the source
 file unchanged. Ambiguous duplicate fields also refuse. Each refused decode
 emits one content-free fixed-category containment line; the future-ledger path
