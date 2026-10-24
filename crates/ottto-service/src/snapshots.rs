@@ -30432,6 +30432,43 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
     }
 }
 
+/// Prepare synthetic native input before a timing/fairness probe. The
+/// returned closure runs the real finalizers/capture hooks, with no fixture
+/// file I/O between them. Production scanning is unchanged.
+#[cfg(test)]
+pub(crate) fn prepare_money_finalizers_for_test(index: &ScanIndex) -> impl FnOnce() {
+    let prepared = index
+        .files
+        .iter()
+        .map(|(key, entry)| {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            for line in std::fs::read_to_string(key)
+                .expect("synthetic transcript")
+                .lines()
+            {
+                apply_claude_code_line(
+                    &serde_json::from_str(line).expect("synthetic record"),
+                    &mut accumulator,
+                );
+            }
+            (
+                PathBuf::from(key),
+                entry.source_file_fingerprint.clone(),
+                accumulator,
+            )
+        })
+        .collect::<Vec<_>>();
+    move || {
+        for (path, fingerprint, mut accumulator) in prepared {
+            let mut capture = claude_request_money::ClaudeResponseCapture::begin(&path);
+            accumulator.finalize_claude_responses_captured(capture.as_mut());
+            if let Some(capture) = capture {
+                capture.deposit(local_index_key(&path), fingerprint);
+            }
+        }
+    }
+}
+
 fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) {
     if accumulator.source_session_id.is_none() {
         accumulator.source_session_id = string_at(value, &["sessionId"])

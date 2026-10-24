@@ -1421,6 +1421,19 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         money::store::flush();
         (counts, elapsed)
     };
+    let (native_counts, native_shadow_elapsed) = run(&armed, &armed_index, now - 1);
+    let native_money_us = native_shadow_elapsed.as_micros() + u128::from(native_counts.capture_us);
+    println!("MONEY_P1B_LOCK money_us={native_money_us} native_us={} native_baseline_us={} deadline_us=250000 ci_tolerance_us=25000 native_info_only=true", armed_scan_elapsed.as_micros().saturating_sub(u128::from(native_counts.capture_us)), baseline_scan_elapsed.as_micros());
+    assert_eq!(native_counts.refused_deadline, 1, "long native Full must not refresh the expired money deadline");
+    assert_eq!(native_counts.captures_taken, 0);
+    assert_eq!(native_counts.message_records_written, 0);
+    assert!(money_jsonl_rows(&fixture.support).iter().any(|row| row["row"] == "page" && row["observed_unix"] == now - 1 && row["refused"] == true && row["coverage_complete"] == false));
+    // Keep all admitted-page accounting/progress assertions below. Run the
+    // real finalizers on prepared synthetic input, so native I/O does not
+    // consume this separate probe's wall deadline before admission.
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&armed_index);
+    money::capture::begin_page(&fixture.support);
+    replay();
     let (counts, elapsed) = run(&armed, &armed_index, now);
     let shadow_lock_work = elapsed + std::time::Duration::from_micros(counts.capture_us);
     assert!(shadow_lock_work <= money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE,
@@ -1430,7 +1443,7 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     assert_eq!(counts.refused_deadline, 0, "whole-page refusal loses family accounting: {counts:?}");
     assert!(counts.admitted_peak_bytes <= money::SHADOW_MEMORY_CEILING_BYTES as u64);
     let rows = money_jsonl_rows(&fixture.support);
-    let first_page = rows.iter().find(|row| row["row"] == "page").unwrap();
+    let first_page = rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now).unwrap();
     let expected_families = armed.snapshots.iter().map(|item| money::hashed_id_for_test(
         item.attribution_facts.iter().find(|fact| fact.field == "root_session_ref")
             .map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id)))
@@ -1476,6 +1489,10 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     let mut following_index = ScanIndex::default();
     let reread = scan(&mut following_index);
     assert_eq!(reread.scanned_file_count, armed.scanned_file_count, "fresh index must Full-reparse every selected file");
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&following_index);
+    money::capture::purge_scope_for_test(&fixture.support);
+    money::capture::begin_page(&fixture.support);
+    replay();
     let following_captures = money::capture::keys_for_test(&fixture.support);
     assert!(!following_captures.is_empty(), "following page is Full with captures, not Skip");
     let captured_roots = following_captures.iter().map(|(key, fingerprint)| {
@@ -1609,6 +1626,10 @@ fn money_p1b_full_rotation_builds_every_family_in_65_and_129_root_pages() {
             assert_eq!(full.scanned_file_count, family_count);
             assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), serde_json::to_vec(&baseline.snapshots).unwrap());
             assert_eq!(serde_json::to_vec(&index).unwrap(), serde_json::to_vec(&baseline_index).unwrap());
+            let replay = crate::snapshots::prepare_money_finalizers_for_test(&index);
+            money::capture::purge_scope_for_test(&fixture.support);
+            money::capture::begin_page(&fixture.support);
+            replay();
             let mut current_captures = money::capture::keys_for_test(&fixture.support);
             // A cold page captures all these small roots; only the first64
             // in the canonical scheduling order can be consumed. Following

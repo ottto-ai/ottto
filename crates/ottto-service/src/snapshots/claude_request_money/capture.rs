@@ -52,7 +52,7 @@ struct Work {
     input: usize,
     comparisons: usize,
     micros: u64,
-    reported_micros: u64,
+    first: Option<Instant>,
     exhausted: bool,
 }
 const PAGE_INPUT_BYTES: usize = 8 * 1024 * 1024;
@@ -174,6 +174,77 @@ pub(crate) fn begin_page(scope: &Path) {
     }
 }
 
+/// One wall deadline begins with the first money finalizer, never at
+/// native page start. Native gaps consume it without adding money time.
+fn start_clock(scope: &Path, first: Instant) {
+    if let Ok(mut pages) = WORK.lock() {
+        let work = pages.entry(scope.to_path_buf()).or_default();
+        if work.first.is_none() {
+            *work = Work {
+                first: Some(first),
+                ..Default::default()
+            };
+        }
+    }
+}
+
+struct MoneyTimer {
+    scope: PathBuf,
+    started: Instant,
+}
+impl MoneyTimer {
+    fn new(scope: &Path, started: Instant) -> Self {
+        start_clock(scope, started);
+        Self {
+            scope: scope.to_path_buf(),
+            started,
+        }
+    }
+}
+impl Drop for MoneyTimer {
+    fn drop(&mut self) {
+        if let Ok(mut pages) = WORK.lock() {
+            let work = pages.entry(self.scope.clone()).or_default();
+            work.micros = work
+                .micros
+                .saturating_add(self.started.elapsed().as_micros() as u64);
+        }
+    }
+}
+
+pub(super) struct PageClock {
+    pub(super) deadline: Instant,
+    pub(super) capture_us: u64,
+}
+
+pub(super) fn take_page_clock(scope: &Path, shadow_started: Instant) -> PageClock {
+    WORK.lock().map_or(
+        PageClock {
+            deadline: shadow_started + super::PAGE_MAX_ELAPSED,
+            capture_us: 0,
+        },
+        |mut pages| {
+            let work = pages.entry(scope.to_path_buf()).or_default();
+            let first = work.first.take();
+            PageClock {
+                deadline: first.unwrap_or(shadow_started) + super::PAGE_MAX_ELAPSED,
+                capture_us: if first.is_some() { work.micros } else { 0 },
+            }
+        },
+    )
+}
+
+/// Functional shadow fixtures exclude setup/writer waits explicitly. The
+/// native-gap and lock receipts use the real clock and never call this.
+#[cfg(test)]
+pub(super) fn shadow_clock_for_test(scope: &Path) {
+    if let Ok(mut pages) = WORK.lock() {
+        if let Some(work) = pages.get_mut(scope).filter(|work| work.first.is_some()) {
+            work.first = Some(Instant::now() - Duration::from_micros(work.micros));
+        }
+    }
+}
+
 fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
     WORK.lock().is_ok_and(|mut pages| {
         let work = pages.entry(scope.to_path_buf()).or_default();
@@ -183,6 +254,9 @@ fn spend_work(scope: &Path, bytes: usize, comparisons: usize) -> bool {
             || input > PAGE_INPUT_BYTES
             || comparisons > PAGE_COMPARISONS
             || work.micros >= PAGE_CAPTURE_US
+            || work
+                .first
+                .is_some_and(|first| first.elapsed() >= Duration::from_micros(PAGE_CAPTURE_US))
         {
             work.exhausted = true;
             return false;
@@ -298,30 +372,31 @@ impl ClaudeResponseCapture {
     /// A capture for the Claude file at `path`, or None when the shadow is
     /// not armed for it.
     pub(crate) fn begin(path: &Path) -> Option<Self> {
+        let started = Instant::now();
         let mut scope = None;
         super::guarded(|| scope = super::capture_armed(path));
-        scope
-            .filter(|scope| {
-                PLANS.lock().is_ok_and(|plans| {
-                    plans
-                        .get(scope)
-                        .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
-                        .map_or(true, |plan| {
-                            super::super::claude_index_path_member_ref(path).is_some_and(|member| {
-                                // A different native page must not be gated by the
-                                // previous page's plan. Only its known roots rotate.
-                                plan.keys
-                                    .get(&super::family_key(member.root))
-                                    .map(|(_, eligible)| *eligible)
-                                    .unwrap_or(true)
-                            })
-                        })
+        let scope = scope?;
+        let _timer = MoneyTimer::new(&scope, started);
+        if !spend_work(&scope, 0, 0) {
+            return None;
+        }
+        let eligible = PLANS.lock().is_ok_and(|plans| {
+            plans
+                .get(&scope)
+                .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
+                .map_or(true, |plan| {
+                    super::super::claude_index_path_member_ref(path).is_some_and(|member| {
+                        plan.keys
+                            .get(&super::family_key(member.root))
+                            .map(|(_, eligible)| *eligible)
+                            .unwrap_or(true)
+                    })
                 })
-            })
-            .map(|scope| Self {
-                scope,
-                ..Self::default()
-            })
+        });
+        eligible.then(|| Self {
+            scope: scope.clone(),
+            ..Self::default()
+        })
     }
 
     /// Every entry point the live finalizer calls runs here (StateMissing
@@ -329,6 +404,7 @@ impl ClaudeResponseCapture {
     /// latch (the shadow is off for the process), the capture is refused
     /// and never deposited, and the live parse goes on unchanged.
     fn contained(&mut self, run: impl FnOnce(&mut Self)) {
+        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if self.refused {
             return;
         }
@@ -337,7 +413,6 @@ impl ClaudeResponseCapture {
             return;
         }
         let mut finished = false;
-        let started = Instant::now();
         super::guarded(|| {
             #[cfg(test)]
             if PANIC_FOR_TEST.with(std::cell::Cell::get) {
@@ -346,11 +421,6 @@ impl ClaudeResponseCapture {
             run(self);
             finished = true;
         });
-        let elapsed = started.elapsed().as_micros() as u64;
-        if let Ok(mut work) = WORK.lock() {
-            let work = work.entry(self.scope.clone()).or_default();
-            work.micros = work.micros.saturating_add(elapsed);
-        }
         if !finished {
             self.refuse();
         }
@@ -636,6 +706,7 @@ impl ClaudeResponseCapture {
     /// and fingerprint (replacing any earlier one). After the panic latch
     /// the capture is dropped instead (its funds are refunded).
     pub(crate) fn deposit(self, index_key: String, fingerprint: String) {
+        let _timer = MoneyTimer::new(&self.scope, Instant::now());
         if super::SHADOW_PANICKED.load(Ordering::Acquire) {
             return;
         }
@@ -744,20 +815,6 @@ pub(crate) fn keys_for_test(scope: &Path) -> Vec<(String, String)> {
 
 pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
-}
-
-/// This scope's capture work since its previous shadow call. Reporting
-/// never refunds the cumulative work budget; unrelated fixture scopes
-/// cannot donate elapsed work to another page's resource receipt.
-pub(crate) fn take_capture_us(scope: &Path) -> u64 {
-    WORK.lock().map_or(0, |mut pages| {
-        let Some(work) = pages.get_mut(scope) else {
-            return 0;
-        };
-        let elapsed = work.micros.saturating_sub(work.reported_micros);
-        work.reported_micros = work.micros;
-        elapsed
-    })
 }
 
 /// Accepted cumulative work, including work whose resident capture was dropped.
@@ -902,9 +959,11 @@ mod bounded_tests {
         assert!(work[&scope].comparisons <= PAGE_COMPARISONS);
         let spent = work[&scope].micros;
         drop(work);
-        assert_eq!(take_capture_us(Path::new("unrelated-capture-page")), 0);
-        assert_eq!(take_capture_us(&scope), spent);
-        assert_eq!(take_capture_us(&scope), 0);
+        assert_eq!(
+            take_page_clock(Path::new("unrelated-capture-page"), Instant::now()).capture_us,
+            0
+        );
+        assert_eq!(take_page_clock(&scope, Instant::now()).capture_us, spent);
         assert_eq!(
             work_for_test(&scope).2,
             spent,

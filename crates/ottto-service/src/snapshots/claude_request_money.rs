@@ -94,9 +94,9 @@ pub(crate) const SHADOW_MEMORY_CEILING_BYTES: usize = 64 * 1024 * 1024;
 /// The shared per-page I/O budget of every shadow reader.
 const WORK_MAX_BYTES: u64 = 16 * 1024 * 1024;
 const WORK_MAX_STATS: u64 = 1024;
-/// Total synchronous money work allowance, including capture callbacks,
-/// shadow closing and handoff. Already-spent capture work is debited on
-/// shadow entry; native parsing and unrelated sync work are outside it.
+/// Money-added synchronous work under the lock, including capture and
+/// closing. One absolute wall deadline starts at the first money finalizer;
+/// native gaps consume the deadline but are excluded from added work.
 pub(crate) const PAGE_MAX_ELAPSED: Duration = Duration::from_millis(250);
 /// Leave bounded closing work inside the total, rather than after expiry.
 const PAGE_CLOSE_RESERVE: Duration = Duration::from_millis(100);
@@ -1233,6 +1233,7 @@ pub(crate) fn shadow_page_at(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     store::prime_credit_for_test(support_dir, utc_day(now));
+    capture::shadow_clock_for_test(support_dir);
     shadow_page_ready_for_test(
         support_dir,
         snapshots,
@@ -1307,10 +1308,11 @@ fn shadow_page_with_coverage(
     now: u64,
 ) -> ClaudeRequestMoneyShadowCounts {
     let started = Instant::now();
-    let capture_us = capture::take_capture_us(&shadow_scope(support_dir));
-    let remaining = PAGE_MAX_ELAPSED.saturating_sub(Duration::from_micros(capture_us));
-    let deadline = started + remaining.saturating_sub(PAGE_CLOSE_RESERVE);
-    let close_deadline = started + remaining.saturating_sub(Duration::from_millis(10));
+    let scope_key = shadow_scope(support_dir);
+    let clock = capture::take_page_clock(&scope_key, started);
+    let capture_us = clock.capture_us;
+    let deadline = clock.deadline - PAGE_CLOSE_RESERVE;
+    let close_deadline = clock.deadline - Duration::from_millis(10);
     let snapshot = next_snapshot();
     let day = utc_day(now);
     let epoch = process_epoch();
@@ -1330,7 +1332,14 @@ fn shadow_page_with_coverage(
         rows: Default::default(),
         scope: Default::default(),
     };
-    let scope_key = shadow_scope(support_dir);
+    if Instant::now() >= clock.deadline {
+        // Native gaps can exhaust the wall deadline before any diagnostic
+        // page is admitted. Close with one false page, without starting a
+        // ledger load, identity walk, body or digest after expiry.
+        counts.refused_deadline = 1;
+        purge_captures(&scope_key, &mut counts);
+        return refuse(&end, None, index, snapshots.len(), counts);
+    }
     let Some(root_funds) = ShadowReservation::admit(snapshots.len().saturating_mul(64)) else {
         counts.refused_budget = 1;
         return refuse(&end, None, index, snapshots.len(), counts);
