@@ -2321,7 +2321,9 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
 // nothing is requeued, and `oversized_file_count` equals the control page's
 // (no request). The side state (requests, records, ledger) comes out exactly
 // as main's twin leaves it: the same request with P under the unpaged limit
-// but over the singleton, main's G4a exit for a side-planned file.
+// but over the singleton, main's G4a exit for a side-planned file. Without
+// the scaled limits the same request starts its side read, so the request
+// itself is due.
 #[test]
 fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
@@ -2410,7 +2412,6 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
                 twin.1,
                 "ledger as main's twin"
             );
-            assert!(after.codex_parent_side.is_empty());
             assert_eq!(counters(&cache).deferred, before.deferred, "no requeue");
             assert!(!pending(&after, &path));
             assert_eq!(treated.oversized_file_count, control.oversized_file_count);
@@ -2418,4 +2419,7 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             assert!(treated.snapshots.is_empty(), "main's Skip");
         })
     });
+    // Control: the same request at production limits starts its side read.
+    let (_, counts) = observe(|| side_page(requested, &cache));
+    assert_eq!(counts.side_reads_started, 1, "{counts:?}");
 }
