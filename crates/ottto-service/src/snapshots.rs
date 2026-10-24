@@ -35,6 +35,11 @@ pub(crate) use claude_context_file_birth::{
 };
 mod claude_history_upgrade;
 #[cfg(test)]
+pub(crate) use claude_history_upgrade::{
+    local_count as history_local_count, with_max_gated_claude_revision,
+    LocalCount as HistoryLocalCount, REQUEST_OWNED_USAGE_CONTRACT,
+};
+#[cfg(test)]
 mod claude_history_upgrade_tests;
 mod claude_reemission_exclusions;
 #[cfg(test)]
@@ -100,10 +105,12 @@ mod traversal_transition;
 #[cfg(test)]
 mod usage_occurrence_retention_tests;
 use cache_observations::{CacheObservations, OwnedRequest, RequestSlot};
+pub(crate) use claude_history_upgrade::{
+    note_prior_history_unverified, PriorHistory, MAX_GATED_CLAUDE_REVISION,
+};
 use claude_history_upgrade::{
     HistoryDecision, HistoryEmission, HistoryHold, HistoryPage, NoListPolicy,
 };
-pub(crate) use claude_history_upgrade::{PriorHistory, MAX_GATED_CLAUDE_REVISION};
 use claude_reemission_exclusions::{ListState, MemberDirStamp, ReemissionExclusions};
 use claude_request_census::{ClaudeRequestCensus, ClaudeRequestCensusShadowState};
 use claude_response_records::{
@@ -24705,7 +24712,7 @@ impl OwnedSourceScan {
                     // Count-only attribution of why Claude files were selected
                     // on this page. No path, session, or identifier is named.
                     eprintln!(
-                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} claude_reemission_family_closure_root_absent_excluded={}",
+                        "local snapshot census claude parse reasons: upload_context_matches={} {} compaction_summary_unlinked_parent={} body_witness_adoption_deferred={} body_witness_adoption_excluded={} body_witness_adoption_held_no_list={} body_witness_adoption_exclusions_invalid={} body_witness_adoption_list={} body_witness_adoption_stop={} body_witness_adoption_stop_withheld_folds={} history_upgrade_owed={} history_upgrade_permitted={} history_emission_denied={} history_listed_literal_roots={} history_reowed={} history_activation_refused={} claude_reemission_family_closure_root_absent_excluded={}",
                         index.upload_context_fingerprint == index.active_upload_context_fingerprint,
                         CANDIDATE_PARSE_REASON_NAMES
                             .iter()
@@ -24724,12 +24731,19 @@ impl OwnedSourceScan {
                         history_upgrade
                             .denied_for(&[HistoryHold::NoListBirth, HistoryHold::MoveNotFull]),
                         u8::from(index.claude_reemission_exclusions.is_invalid()),
-                        index.claude_reemission_exclusions.state().as_str(),
+                        index.claude_reemission_exclusions.status(),
                         claude_reemission_stop_reason(),
                         claude_reemission_stop_withheld_folds(),
                         history_upgrade.owed,
                         history_upgrade.permitted,
                         history_upgrade.denied_summary(),
+                        history_upgrade.listed_literal_roots.len(),
+                        claude_history_upgrade::local_count(
+                            claude_history_upgrade::LocalCount::Reowed
+                        ),
+                        claude_history_upgrade::local_count(
+                            claude_history_upgrade::LocalCount::ActivationRefused
+                        ),
                         history_upgrade.family_closure_root_absent_excluded
                     );
                     if history_upgrade.family_closure_root_absent_excluded > 0 {
@@ -25394,11 +25408,11 @@ impl OwnedSourceScan {
                 let correction_only = parse_reason
                     == Some(CandidateParseReason::AuthorityQuarantine)
                     && index.claude_authority_correction_only(&candidate);
+                // A listed genuine change is never held (it is literal-only
+                // denied), so a held correction-only member is unchanged.
                 match history {
-                    HistoryDecision::Held(hold)
-                        if (adoption_only
-                            || (correction_only && hold != HistoryHold::ListedChanged))
-                            && !comparison_target =>
+                    HistoryDecision::Held(_)
+                        if (adoption_only || correction_only) && !comparison_target =>
                     {
                         decision = CandidateDecision::Skip;
                     }
@@ -25406,6 +25420,9 @@ impl OwnedSourceScan {
                         index.gate_claude_history_candidate(&candidate, Some(hold));
                     }
                     HistoryDecision::Owed => index.gate_claude_history_candidate(&candidate, None),
+                    HistoryDecision::LiteralDenied => {
+                        index.deny_claude_history_literal(&candidate);
+                    }
                     HistoryDecision::NotOwed => {}
                 }
             }
@@ -36160,9 +36177,18 @@ impl ScanIndex {
 
     /// Select before taking the committed baseline and scanning. Nonzero
     /// revisions adopt each unchanged file once; zero opts out of adoption.
+    /// A revision with no history-policy row is refused: the previous active
+    /// revision stays, and one local alarm is raised and counted.
     pub fn activate_effective_upload_body_witness_revision(&mut self, revision: u64) {
-        self.active_effective_upload_body_witness_revision = revision;
-        self.active_effective_upload_body_witness_revision_monotone = false;
+        // A refused revision keeps only the previous revision and its flag;
+        // the per-pass resets below run either way (StateMissing R6).
+        if claude_history_upgrade::admit_activation(
+            revision,
+            self.active_effective_upload_body_witness_revision,
+        ) {
+            self.active_effective_upload_body_witness_revision = revision;
+            self.active_effective_upload_body_witness_revision_monotone = false;
+        }
         self.effective_upload_body_witness_revision_excluded_source_files
             .clear();
         self.claude_history_emission = HistoryEmission::default();
@@ -36197,8 +36223,8 @@ impl ScanIndex {
             Some((member.root, member.subagent_stem?))
         }));
         self.claude_reemission_exclusions = exclusions;
-        if self.claude_reemission_exclusions.state() == ListState::MissingAfterInstall {
-            crate::local_resource_diagnostics::claude_reemission_list_missing();
+        if let Some(cause) = self.claude_reemission_exclusions.missing_cause() {
+            crate::local_resource_diagnostics::claude_reemission_list_missing(cause.as_str());
         }
     }
 
@@ -36363,12 +36389,15 @@ impl ScanIndex {
             &key,
             candidate.size_bytes,
         );
-        if matches!(
-            decision,
-            HistoryDecision::Held(HistoryHold::Listed | HistoryHold::ListedChanged)
-        ) && self.claude_reemission_held_through_absent_root(candidate)
+        if matches!(decision, HistoryDecision::Held(HistoryHold::Listed))
+            && self.claude_reemission_held_through_absent_root(candidate)
         {
             page.note_family_closure_root_absent();
+        }
+        if decision == HistoryDecision::LiteralDenied {
+            if let Some(member) = claude_index_path_member_ref(&candidate.path) {
+                page.note_listed_literal_root(member.root);
+            }
         }
         decision
     }
@@ -36545,7 +36574,6 @@ impl ScanIndex {
             .map(|entry| claude_history_upgrade::HeldUploadTuple {
                 last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
                 last_upload_body_witness: entry.last_upload_body_witness.clone(),
-                revision: entry.effective_upload_body_witness_revision,
                 file_snapshot_fingerprints: self.file_snapshot_fingerprints.get(&key).cloned(),
                 confirmed_empty: self.confirmed_empty_files.contains(&key),
             });
@@ -36556,11 +36584,26 @@ impl ScanIndex {
             .or_insert_with(|| claude_history_upgrade::GatedHistory {
                 index_key: key,
                 held: None,
+                literal_denied: false,
                 previous,
                 local: BTreeSet::new(),
             });
         if gated.held.is_none() {
             gated.held = hold;
+        }
+    }
+
+    /// Record a literal-only denial before its parse: the file's ordinary
+    /// body emits, its request-owned literal items do not, and it does not
+    /// stamp the active revision, so it stays owed and gated.
+    fn deny_claude_history_literal(&mut self, candidate: &CandidateFile) {
+        self.gate_claude_history_candidate(candidate, None);
+        if let Some(gated) = self
+            .claude_history_emission
+            .files
+            .get_mut(&candidate.source_file_fingerprint)
+        {
+            gated.literal_denied = true;
         }
     }
 
@@ -36584,7 +36627,13 @@ impl ScanIndex {
         source: SnapshotSource,
         snapshots: &mut Vec<SnapshotItem>,
     ) -> usize {
-        if source != SnapshotSource::ClaudeCode || self.claude_history_emission.files.is_empty() {
+        if source != SnapshotSource::ClaudeCode {
+            return 0;
+        }
+        let guard = self.claude_literal_guard(snapshots);
+        if self.claude_history_emission.files.is_empty()
+            && guard == claude_history_upgrade::LiteralGuard::Open
+        {
             return 0;
         }
         if claude_reemission_stop_latched() {
@@ -36593,31 +36642,56 @@ impl ScanIndex {
         let emission = &mut self.claude_history_emission;
         let before = snapshots.len();
         snapshots.retain(|snapshot| {
-            let Some(gated) = snapshot
+            if emission.permits(snapshot, &guard) {
+                return true;
+            }
+            if let Some(gated) = snapshot
                 .source_file_fingerprint
                 .as_ref()
                 .and_then(|fingerprint| emission.files.get_mut(fingerprint))
                 .filter(|gated| gated.held.is_some())
-            else {
-                return true;
-            };
-            gated.local.insert(snapshot.snapshot_fingerprint.clone());
+            {
+                gated.local.insert(snapshot.snapshot_fingerprint.clone());
+            }
             false
         });
         before - snapshots.len()
     }
 
     /// Hook for resend paths outside the page (StateMissing #706 re-offer
-    /// leases, #692 in-place resends): drop every item of a source file the
-    /// history gate holds this cycle. They must call it on what they send.
+    /// leases, #692 in-place resends) and for MONEY's literal items, which
+    /// are built after the emission seam: drop every item of a source file
+    /// the history gate holds this cycle, every request-owned literal item
+    /// of a literal-denied file, and every literal the guard denies whether
+    /// or not its file was decided this cycle (C2). They must call it on what
+    /// they send.
     pub(crate) fn retain_claude_history_emission_permitted(&self, items: &mut Vec<SnapshotItem>) {
-        items.retain(|item| {
-            item.source_file_fingerprint
-                .as_deref()
-                .map_or(true, |fingerprint| {
-                    self.claude_history_emission_held(fingerprint).is_none()
-                })
-        });
+        let guard = self.claude_literal_guard(items);
+        items.retain(|item| self.claude_history_emission.permits(item, &guard));
+    }
+
+    /// SOURCE h732 C2: the request-owned literal guard for `items`, from the
+    /// active row, the list and the index only.
+    fn claude_literal_guard(&self, items: &[SnapshotItem]) -> claude_history_upgrade::LiteralGuard {
+        claude_history_upgrade::LiteralGuard::for_items(
+            items,
+            self.active_effective_upload_body_witness_revision,
+            &self.claude_reemission_exclusions,
+            self.files
+                .iter()
+                .map(|(key, entry)| (key.as_str(), entry.source_file_fingerprint.as_str())),
+            |key| self.claude_family_listed(key),
+        )
+    }
+
+    /// True when the list names the family of this indexed Claude file (its
+    /// root or the member itself), as the candidate decision reads it.
+    fn claude_family_listed(&self, index_key: &str) -> bool {
+        !self.claude_reemission_exclusions.is_empty()
+            && claude_index_path_member_ref(Path::new(index_key)).is_some_and(|member| {
+                self.claude_reemission_exclusions
+                    .excludes(member.root, member.subagent_stem)
+            })
     }
 
     /// Finalize a held history file without its new bodies: an existing entry
@@ -36642,12 +36716,11 @@ impl ScanIndex {
             return false;
         };
         let key = index_key.to_owned();
-        let (last_snapshot_fingerprint, last_upload_body_witness, revision, members, empty) =
+        let (last_snapshot_fingerprint, last_upload_body_witness, members, empty) =
             match gated.previous {
                 Some(previous) => (
                     previous.last_snapshot_fingerprint,
                     previous.last_upload_body_witness,
-                    previous.revision,
                     previous.file_snapshot_fingerprints,
                     previous.confirmed_empty,
                 ),
@@ -36667,13 +36740,12 @@ impl ScanIndex {
                         format!("{:x}", digest.finalize())
                     });
                     let empty = gated.local.is_empty();
-                    (group, None, 0, (!empty).then(BTreeSet::new), empty)
+                    (group, None, (!empty).then(BTreeSet::new), empty)
                 }
             };
         if let Some(entry) = self.files.get_mut(&key) {
             entry.last_snapshot_fingerprint = last_snapshot_fingerprint;
             entry.last_upload_body_witness = last_upload_body_witness;
-            entry.effective_upload_body_witness_revision = revision;
         }
         match members {
             Some(members) => {
@@ -36694,9 +36766,12 @@ impl ScanIndex {
     /// The one writer of a settled file's `effective_upload_body_witness_revision`.
     /// Claude never downgrades (`max(stored, allowed_active)`); Codex and Pi
     /// keep the exact stamp. Refuses a zero revision, a file excluded for a
-    /// local hold, and a file the history gate holds: a protected root never
-    /// stamps to a new revision. MONEY (#699) routes its covering-ACK,
-    /// below-floor and confirmed-empty settlements here.
+    /// local hold, a file the history gate holds, a literal-denied file, and
+    /// under a row that denies the literal any listed family or, while the
+    /// list is paused, any file: a protected root never stamps to a new
+    /// revision. MONEY (#699) routes
+    /// its covering-ACK, below-floor and confirmed-empty settlements here.
+    /// The only other writer is `re_owe_effective_upload_body_witness_revision`.
     pub(crate) fn stamp_effective_upload_body_witness_revision(
         &mut self,
         index_key: &str,
@@ -36710,13 +36785,26 @@ impl ScanIndex {
             || self
                 .claude_history_emission_held(source_file_fingerprint)
                 .is_some()
+            || self
+                .claude_history_emission
+                .literal_denied(source_file_fingerprint)
+        {
+            return false;
+        }
+        // SOURCE h732 C2: a revision whose row denies the request-owned
+        // literal never stamps a listed family, or any file while the list is
+        // paused, whatever this cycle decided (a covering ACK, below-floor or
+        // confirmed-empty settlement of a file that was not a candidate).
+        if claude_history_upgrade::denies_request_owned_literal(allowed_active)
+            && (self.claude_reemission_exclusions.pauses_adoption()
+                || self.claude_family_listed(index_key))
         {
             return false;
         }
         let monotone = self.active_effective_upload_body_witness_revision_monotone;
         // SOURCE F2: no Claude file is stamped above the last revision the
         // history gate is complete for.
-        if monotone && allowed_active > MAX_GATED_CLAUDE_REVISION {
+        if monotone && allowed_active > claude_history_upgrade::max_gated_claude_revision() {
             return false;
         }
         let Some(entry) = self.files.get_mut(index_key) else {
@@ -36730,6 +36818,27 @@ impl ScanIndex {
             allowed_active
         };
         true
+    }
+
+    /// The only way to lower a file's `effective_upload_body_witness_revision`
+    /// (owner B): only downward, and only below the active revision (before
+    /// any activation, below the highest revision with a policy row), so the
+    /// file is owed again and goes back through the history gate. Counts
+    /// `history_reowed`. Returns false and writes nothing otherwise. MONEY's
+    /// census 3 -> 2 path (#699) calls it.
+    pub(crate) fn re_owe_effective_upload_body_witness_revision(
+        &mut self,
+        index_key: &str,
+        to: u64,
+    ) -> bool {
+        let active = self.active_effective_upload_body_witness_revision;
+        self.files.get_mut(index_key).is_some_and(|entry| {
+            claude_history_upgrade::re_owe(
+                &mut entry.effective_upload_body_witness_revision,
+                to,
+                active,
+            )
+        })
     }
 
     /// Record the contract-5 contract a prepared Claude cycle builds bodies
@@ -37110,6 +37219,7 @@ impl ScanIndex {
         // reprice a previously joined contribution during ordinary replay.
         self.files
             .retain(|_, entry| entry.retain_history_evidence());
+        let active = self.active_effective_upload_body_witness_revision;
         for entry in self.files.values_mut() {
             if entry.has_unverified_source() {
                 let due = entry.unverified_deadline().unwrap_or(0);
@@ -37117,7 +37227,11 @@ impl ScanIndex {
             }
             entry.last_snapshot_fingerprint = None;
             entry.last_upload_body_witness = None;
-            entry.effective_upload_body_witness_revision = 0;
+            claude_history_upgrade::re_owe(
+                &mut entry.effective_upload_body_witness_revision,
+                0,
+                active,
+            );
             if !entry.has_unverified_source() {
                 entry.scan_identity_version = None;
             }
@@ -38012,7 +38126,11 @@ impl ScanIndex {
                 let mut uncommitted = entry.clone();
                 uncommitted.last_snapshot_fingerprint = None;
                 uncommitted.last_upload_body_witness = None;
-                uncommitted.effective_upload_body_witness_revision = 0;
+                claude_history_upgrade::re_owe(
+                    &mut uncommitted.effective_upload_body_witness_revision,
+                    0,
+                    self.active_effective_upload_body_witness_revision,
+                );
                 uncommitted.codex_joined_member_set = None;
                 uncommitted.codex_applied_tier_receipt = None;
                 uncommitted.codex_applied_tier_receipt_required = false;
@@ -38404,8 +38522,8 @@ impl ScanIndex {
                     if let Some(entry) = result.files.get_mut(key) {
                         entry.last_snapshot_fingerprint = None;
                         entry.last_upload_body_witness = None;
-                        entry.effective_upload_body_witness_revision = 0;
                     }
+                    result.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
                 None => {
                     result.files.remove(key);
@@ -38519,8 +38637,8 @@ impl ScanIndex {
                     if let Some(entry) = self.files.get_mut(key) {
                         entry.last_snapshot_fingerprint = None;
                         entry.last_upload_body_witness = None;
-                        entry.effective_upload_body_witness_revision = 0;
                     }
+                    self.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
                 None => {
                     self.files.remove(key);
@@ -63768,6 +63886,7 @@ mod tests {
             "claude_reemission_list_missing_after_install"
         );
         assert_eq!(alarms[0]["source"], "claude_code");
+        assert_eq!(alarms[0]["counts"]["cause"], "seen_marker");
         // Paused: even entities newer than the cutoff wait, with old stamps.
         let paused = with_no_list_cutoff(0, || {
             claude_context_backfill_scan(&root, &mut index, MAX_BACKFILL_FILES_PER_SOURCE)
