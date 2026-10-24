@@ -556,9 +556,12 @@ crate::heap_layout_bound::fields!(GatedHistory; index_key, held, literal_denied,
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HistoryEmission {
     pub(super) files: BTreeMap<String, GatedHistory>,
+    // Count-only diagnostics for carried files skipped before parsing. They
+    // never enter the emission map or change any gate/finalization decision.
+    pub(super) skipped_carried_entries: usize,
 }
 
-crate::heap_layout_bound::fields!(HistoryEmission; files);
+crate::heap_layout_bound::fields!(HistoryEmission; files, skipped_carried_entries);
 
 impl HistoryEmission {
     pub(super) fn held(&self, source_file_fingerprint: &str) -> Option<HistoryHold> {

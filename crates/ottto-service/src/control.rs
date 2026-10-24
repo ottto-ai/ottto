@@ -4089,6 +4089,9 @@ fn repair_source(
     if dry_run {
         return Ok(plan);
     }
+    if let Some(plan) = scan_index_rebuild_override_repair(daemon, authorization, &source, &plan) {
+        return Ok(plan);
+    }
 
     // Pi has no local telemetry config to patch; its failure mode is an
     // expired/consumed provider OAuth credential that only a provider re-sign-in
@@ -4164,6 +4167,93 @@ fn repair_source(
         };
     }
     Ok(plan)
+}
+
+/// User Repair override of the seven-day scan-index rebuild-loop guard.
+///
+/// Origin: only the companion's Repair button counts. It sends a token-less
+/// `repair` (`dry_run: false`) as `client_kind: companion_app`, which
+/// `request_authorization` grants as `TrustedCompanionApp` only for a
+/// same-uid, Developer ID-signed Companion peer; the CLI (`ottto fix`) and
+/// agents present the control token. Verify, including `repair: true`, never
+/// reaches `repair_source`, and automatic retries are loads, not commands.
+/// A source the guard is not pausing takes the ordinary Repair path.
+fn scan_index_rebuild_override_repair(
+    daemon: &LocalDaemon,
+    authorization: &RequestAuthorization,
+    source: &SourceKind,
+    plan: &RepairPlan,
+) -> Option<RepairPlan> {
+    if *authorization != RequestAuthorization::TrustedCompanionApp {
+        return None;
+    }
+    let snapshot_source = match source {
+        SourceKind::ClaudeCode => crate::snapshots::SnapshotSource::ClaudeCode,
+        SourceKind::Codex => crate::snapshots::SnapshotSource::Codex,
+        SourceKind::Pi => crate::snapshots::SnapshotSource::Pi,
+    };
+    let outcome = crate::snapshots::arm_scan_index_rebuild_manual_override(
+        snapshot_source,
+        SystemTime::now(),
+    );
+    let retry = crate::snapshots::scan_index_rebuild_auto_retry_at(snapshot_source)
+        .map(|at| format!(" Ottto retries by itself at {at}."))
+        .unwrap_or_default();
+    let mut plan = plan.clone();
+    plan.actions.clear();
+    match outcome {
+        crate::snapshots::ScanIndexRebuildOverride::NotPaused => return None,
+        crate::snapshots::ScanIndexRebuildOverride::Armed => {
+            plan.status = RepairPlanStatus::Running;
+            plan.authority.message = StableMessage {
+                code: "scan_index_rebuild_override_armed".to_string(),
+                text: format!(
+                    "{} local record will be rebuilt on the next sync; older sessions are re-checked slowly.",
+                    source_display_name(source)
+                ),
+            };
+            // Run that sync now instead of waiting for the next cycle.
+            #[cfg(not(test))]
+            if let Err(error) =
+                crate::snapshot_sync::spawn_one_shot_local_snapshot_sync(daemon.clone())
+            {
+                eprintln!(
+                    "local snapshot sync after user Repair override unavailable: {}",
+                    crate::snapshot_sync::safe_error(&error)
+                );
+            }
+            #[cfg(test)]
+            let _ = daemon;
+        }
+        crate::snapshots::ScanIndexRebuildOverride::IdentityUnrecoverable => {
+            plan.status = RepairPlanStatus::Blocked;
+            plan.authority.message = StableMessage {
+                code: crate::snapshots::SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE
+                    .to_string(),
+                text: format!(
+                    "{} local record is too damaged for Repair to rebuild safely.{retry}",
+                    source_display_name(source)
+                ),
+            };
+        }
+        crate::snapshots::ScanIndexRebuildOverride::Refused(code) => {
+            plan.status = RepairPlanStatus::Blocked;
+            plan.authority.message = StableMessage {
+                code: code.to_string(),
+                text: format!("Repair could not safely recover the local record. The source stays paused and its files are kept.{retry}"),
+            };
+        }
+        crate::snapshots::ScanIndexRebuildOverride::Cooldown => {
+            plan.status = RepairPlanStatus::Blocked;
+            plan.authority.message = StableMessage {
+                code: crate::snapshots::SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE.to_string(),
+                text: format!(
+                    "Repair was already used for this source in the last 24 hours.{retry}"
+                ),
+            };
+        }
+    }
+    Some(plan)
 }
 
 /// Build an actionable Pi recovery plan: a manual provider re-sign-in (which the
@@ -31540,6 +31630,206 @@ X-API-Key = "otel_redacted"
         assert_eq!(result.message.code, "setup_run_connection_missing");
         assert!(result.message.text.contains("Use Sign in in the Ottto app"));
         assert!(!result.message.text.contains("/apps"));
+    }
+
+    #[test]
+    #[serial]
+    fn only_the_companion_repair_press_overrides_a_rebuild_loop_pause() {
+        use crate::snapshots::{ScanIndex, ScanIndexLoadOrigin, SnapshotSource};
+        let _lock = lock_backend_test_env();
+        let root = control_test_root("repair-rebuild-loop-override");
+        create_control_test_dir(&root.join(".codex"));
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        fs::write(root.join(".codex/config.toml"), "model = \"gpt-6.1-sol\"\n")
+            .expect("seed clean config");
+        // Hold-budget damage: valid JSON whose session-identity fields an
+        // override can strictly recover (SI-718-O1); syntax damage cannot.
+        let mut damage = serde_json::to_value(ScanIndex::default()).expect("index value");
+        damage["files"]["excess-held"] =
+            serde_json::json!({"unknown": "x".repeat(2 * 1024 * 1024)});
+        let damage = serde_json::to_vec(&damage).expect("damaged index bytes");
+        // A second whole-index incident inside seven days pauses the source.
+        let pause = |source: SnapshotSource| {
+            let path = root.join(format!("{}-scan-index.json", source.api_slug()));
+            fs::write(&path, b"{").expect("first damage");
+            let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(&path, source, &root)
+                .expect("first incident rebuilds");
+            assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+            fs::write(&path, &damage).expect("second damage");
+            path
+        };
+        let refused = |path: &Path, source: SnapshotSource| {
+            let error = ScanIndex::load_for_snapshot_source_with_origin(path, source, &root)
+                .expect_err("the guard refuses");
+            assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
+            assert!(crate::snapshots::scan_index_rebuild_paused(source));
+            assert_eq!(fs::read(path).expect("index kept"), damage);
+        };
+        let daemon = daemon();
+        let repair = |token: Option<&str>,
+                      client_kind: LocalClientKind,
+                      dry_run: bool,
+                      peer: Option<LocalClientPeer>| {
+            let response = handle_request_with_peer(
+                &daemon,
+                LocalControlRequest {
+                    request_id: "req_repair_rebuild_loop".to_string(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: token.map(str::to_string),
+                    client_kind: Some(client_kind),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Repair {
+                        source: SourceKind::Pi,
+                        dry_run,
+                    },
+                },
+                peer,
+            );
+            assert!(response.ok, "{response:?}");
+            serde_json::from_value::<RepairPlan>(response.payload.expect("payload"))
+                .expect("repair plan")
+        };
+
+        // Verify, even with repair, is not the Repair press.
+        let codex = pause(SnapshotSource::Codex);
+        refused(&codex, SnapshotSource::Codex);
+        let result = verify_source(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            true,
+        )
+        .expect("verification returns account state");
+        assert_eq!(result.status, SourceVerificationStatus::AccountNotConnected);
+        refused(&codex, SnapshotSource::Codex);
+
+        let pi = pause(SnapshotSource::Pi);
+        refused(&pi, SnapshotSource::Pi);
+        // The token-authorized CLI or agent Repair keeps its ordinary path.
+        let cli = repair(Some("token"), LocalClientKind::Cli, false, None);
+        assert_eq!(cli.authority.message.code, "pi_provider_reauth_required");
+        refused(&pi, SnapshotSource::Pi);
+        // A companion dry run proposes only.
+        let proposed = repair(
+            None,
+            LocalClientKind::CompanionApp,
+            true,
+            Some(LocalClientPeer::trusted_for_tests()),
+        );
+        assert_eq!(proposed.status, RepairPlanStatus::Proposed);
+        refused(&pi, SnapshotSource::Pi);
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            0
+        );
+
+        // The interactive press arms exactly one gated rebuild.
+        let armed = repair(
+            None,
+            LocalClientKind::CompanionApp,
+            false,
+            Some(LocalClientPeer::trusted_for_tests()),
+        );
+        assert_eq!(armed.status, RepairPlanStatus::Running);
+        assert_eq!(
+            armed.authority.message.code,
+            "scan_index_rebuild_override_armed"
+        );
+        assert!(armed.actions.is_empty());
+        let again = repair(
+            None,
+            LocalClientKind::CompanionApp,
+            false,
+            Some(LocalClientPeer::trusted_for_tests()),
+        );
+        assert_eq!(again.status, RepairPlanStatus::Blocked);
+        assert_eq!(
+            again.authority.message.code,
+            "scan_index_rebuild_override_cooldown"
+        );
+        let (index, origin) =
+            ScanIndex::load_for_snapshot_source_with_origin(&pi, SnapshotSource::Pi, &root)
+                .expect("the armed press passes the guard once");
+        assert_eq!(origin, ScanIndexLoadOrigin::Quarantined);
+        assert!(index.files.is_empty());
+        assert!(!crate::snapshots::scan_index_rebuild_paused(
+            SnapshotSource::Pi
+        ));
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        // Codex was never armed: Verify spent nothing.
+        refused(&codex, SnapshotSource::Codex);
+
+        // A fresh failure inside seven days of the override refuses again,
+        // and a press inside 24 hours names the cooldown and the retry time.
+        fs::write(&pi, &damage).expect("third damage");
+        refused(&pi, SnapshotSource::Pi);
+        let cooling = repair(
+            None,
+            LocalClientKind::CompanionApp,
+            false,
+            Some(LocalClientPeer::trusted_for_tests()),
+        );
+        assert_eq!(cooling.status, RepairPlanStatus::Blocked);
+        assert_eq!(
+            cooling.authority.message.code,
+            "scan_index_rebuild_override_cooldown"
+        );
+        assert!(cooling
+            .authority
+            .message
+            .text
+            .contains("retries by itself at"));
+        refused(&pi, SnapshotSource::Pi);
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        // Another source's syntax refusal returns its actual reason again on
+        // the next companion press; it never claims Repair was already used.
+        fs::write(&codex, b"{ ").expect("unrecoverable identity");
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::Codex,
+                SystemTime::now()
+            ),
+            crate::snapshots::ScanIndexRebuildOverride::Armed
+        );
+        assert!(ScanIndex::load_for_snapshot_source_with_origin(
+            &codex,
+            SnapshotSource::Codex,
+            &root
+        )
+        .is_err());
+        let plan = propose_repair_plan(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("ordinary repair plan");
+        // Reuse the ordinary plan's authority; the override only changes its
+        // result and message after the signed-companion origin check.
+        let plan = scan_index_rebuild_override_repair(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            &SourceKind::Codex,
+            &plan,
+        );
+        let plan = plan.expect("paused source has an override result");
+        assert_eq!(plan.status, RepairPlanStatus::Blocked);
+        assert_eq!(
+            plan.authority.message.code,
+            "scan_index_rebuild_override_identity_unrecoverable"
+        );
+        assert!(!plan.authority.message.text.contains("already used"));
+        assert!(!plan.authority.message.text.contains("will be rebuilt"));
+        assert!(!plan.authority.message.text.contains("Armed"));
+        assert!(plan.authority.message.text.contains("too damaged"));
+        assert!(plan.authority.message.text.contains("retries by itself at"));
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
