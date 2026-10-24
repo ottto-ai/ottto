@@ -2033,13 +2033,21 @@ fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
     // Still-unhealthy evidence holds the genuinely grown returning family.
     // The dedicated census-line value must expose it while other pending
     // causes remain in the existing aggregate counter.
+    wait_for_fresh_census_window(&returned.census_window_end);
     let grown_held = pipeline.cycle_with_authority_debt(t0 + 1_500);
     assert!(grown_held.result.is_ok(), "{:?}", grown_held.result);
+    assert_ne!(grown_held.census_window_end, returned.census_window_end);
     let held_stats = grown_held
         .evidence_stats
         .as_ref()
         .expect("Claude evidence fold");
     assert_eq!(held_stats.returning_family_grown_held, 1);
+    assert_eq!(
+        held_stats
+            .duplicate_census
+            .page_invalidated_member_changed_count,
+        0
+    );
     assert_eq!(
         held_stats
             .first_proof_hold
