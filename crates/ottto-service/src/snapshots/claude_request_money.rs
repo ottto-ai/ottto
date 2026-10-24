@@ -1552,13 +1552,20 @@ fn shadow_page_with_coverage(
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
             let deferred = (order.len() - position) as u64;
+            let compare_until = end.close_deadline - Duration::from_millis(10);
             for (root, key, turn) in &order[position..] {
                 let state = coverage_view.family(root);
                 // Only a current acknowledged publication can be unchanged.
                 // The writer computes the canonical digest before returning
                 // its acknowledgement, so new/expired/in-flight rows need no
                 // synchronous SHA of the entire deferred wire template.
-                let unchanged = published_digest(ledger, key, day, epoch)
+                // A comparison is optional; never let canonical hashing of
+                // a large suffix consume the retention/save/handoff slice.
+                // Without a completed comparison we publish the explicit
+                // failure, whose digest is finalized by the writer.
+                let unchanged = (Instant::now() < compare_until)
+                    .then(|| published_digest(ledger, key, day, epoch))
+                    .flatten()
                     .is_some_and(|digest| failure_digest.deferred(root, &state, ledger) == digest);
                 if unchanged {
                     counts.unchanged += 1;
