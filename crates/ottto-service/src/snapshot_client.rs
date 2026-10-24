@@ -2080,7 +2080,8 @@ impl SnapshotApiClient {
             } else {
                 (
                     if retained.is_some() {
-                        ureq::AgentBuilder::new()
+                        crate::retry_tls::agent_builder()
+                            .resolver(crate::net_resilience::shared_fallback_resolver())
                             .redirects(0)
                             .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
                             .timeout_read(SNAPSHOT_BATCH_HTTP_READ_TIMEOUT)

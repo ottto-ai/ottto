@@ -4527,6 +4527,11 @@ impl LiveForTest {
 impl Drop for LiveForTest {
     fn drop(&mut self) {
         if self.inserted {
+            // Release this synthetic owner's parked future and recovery graph
+            // even when an assertion unwinds before its normal closeout.
+            crate::snapshot_sync::money_resume::forget_for_test(&self.support);
+            crate::snapshot_sync::unknown_recovery::forget(&self.support);
+            store::flush();
             if let Ok(mut dirs) = LIVE_TEST_DIRS.lock() {
                 dirs.retain(|dir| dir != &self.support);
             }

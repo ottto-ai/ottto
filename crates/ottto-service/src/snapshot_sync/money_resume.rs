@@ -527,7 +527,7 @@ pub(super) fn pending_for_test(support: &Path) -> bool {
 }
 
 #[cfg(test)]
-pub(super) fn forget_for_test(support_dir: &Path) {
+pub(crate) fn forget_for_test(support_dir: &Path) {
     let mut slot = PENDING.lock().unwrap();
     if slot
         .as_ref()

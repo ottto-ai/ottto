@@ -238,10 +238,9 @@ fn atomic(root: &Path, target: &Path, bytes: &[u8]) -> Result<()> {
     if footprint(root)?.saturating_add(bytes.len() as u64) > TOTAL_MAX {
         return Err(fault());
     }
-    let staged = target.with_extension(format!(
-        "{}.tmp",
-        target.extension().unwrap().to_string_lossy()
-    ));
+    let mut filename = target.file_name().ok_or_else(fault)?.to_os_string();
+    filename.push(".tmp");
+    let staged = root.join(filename);
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -518,7 +517,11 @@ fn job<T: Send + 'static>(
 ) -> Result<Ticket<T>> {
     Ok(Ticket {
         receiver: store::recovery_job(IO_FUNDS, move || {
-            operation().map_err(|error| {
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)) {
+                Ok(result) => result,
+                Err(_) => return Err(fault()),
+            };
+            result.map_err(|error| {
                 if error.is::<CorruptBody>() {
                     error
                 } else {
@@ -712,7 +715,9 @@ pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> boo
         return true;
     };
     let Some(catalog) = catalogs.get(support) else {
-        return true;
+        // No known attempt is no UNKNOWN scope. The network coordinator must
+        // finish startup reconciliation before it can authorize any POST.
+        return false;
     };
     catalog.loading.is_some()
         || catalog.entries.iter().any(|m| {
@@ -918,8 +923,9 @@ pub(super) fn invalidate(support: &Path) {
 }
 
 #[cfg(test)]
-pub(super) fn forget(support: &Path) {
+pub(crate) fn forget(support: &Path) {
     CATALOGS.lock().unwrap().remove(support);
+    OUTCOMES.lock().unwrap().remove(support);
 }
 
 impl crate::snapshots::ClaudeHistoryEmissionItem for Entity {
