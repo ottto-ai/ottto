@@ -140,7 +140,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             // clean telemetry sweep finish. Bounded; it must then accept.
             6
         } else if ack_save_fault {
-            3 // Fault, immediate held retry, then the timed recovery probe.
+            3 // Fault, immediate hold, then hold beyond the probe deadline.
         } else {
             1
         };
@@ -155,9 +155,9 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
             if recovered {
                 break;
             }
-            // A failed local ACK save legitimately pauses new offers. Prove
-            // the immediate retry stays held before advancing to the real
-            // thirty-minute recovery-probe deadline; do not clear the pause.
+            // A failed local ACK save leaves an unknown outcome. Prove it
+            // stays held both immediately and beyond the thirty-minute probe
+            // deadline: elapsed time cannot turn an unknown ACK into proof.
             let _clock = money::PageClockForTest::new(
                 &support,
                 now + if ack_save_fault && cycle == 1 {
@@ -229,11 +229,28 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 let (preparation, index, scan) =
                     collect_native_preparation_with_rotation(frame, false);
                 assert!(index.request_money_live_revision());
-                if ack_save_fault && cycle == 1 || ledger_fault && recovering {
+                if ack_save_fault && cycle > 0 || ledger_fault && recovering {
                     assert!(
                         index.request_money_adoption_paused(),
                         "uncertain ACK/custody recovery must retain the history pause"
                     );
+                    assert!(
+                        !money::adoption_probe_due(&support, &index),
+                        "unknown ACK/recovery cannot use a known-outcome probe"
+                    );
+                    if ack_save_fault {
+                        money::store::with_ledger_for_test(&support, |ledger| {
+                            let rates = ledger
+                                .get(&format!("{}rates", money::adoption_prefix(&index)))
+                                .expect("offered outcome remains durably accounted");
+                            assert_ne!(
+                                rates.money_revision()[0] & 0x80,
+                                0,
+                                "the lost local ACK leaves the outcome unknown"
+                            );
+                        })
+                        .unwrap();
+                    }
                     assert!(
                         scan.snapshots.iter().all(|item| {
                             item.source_file_fingerprint
@@ -328,16 +345,19 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                     progress_path.with_extension(format!("json.{}.tmp", std::process::id())),
                 )
                 .unwrap();
-            } else if ack_save_fault && cycle == 1 {
+            } else if ack_save_fault && cycle > 0 {
                 assert!(
                     result.is_ok(),
                     "paused retry completes its local work: {result:?}"
                 );
-                assert!(paused, "failed ACK save must retain the rate pause");
+                assert!(
+                    paused,
+                    "failed ACK save must retain the unknown-outcome pause"
+                );
                 assert_eq!(
                     server.offered.lock().unwrap().len(),
                     1,
-                    "the immediate retry cannot re-offer before its recovery deadline"
+                    "an unknown ACK cannot re-offer, even after the probe deadline"
                 );
                 assert!(saved
                     .files
@@ -346,6 +366,12 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 assert!(
                     money::money_due(&support, &transcript.to_string_lossy(), u64::MAX),
                     "a held retry cannot retire the uncertain ACK debt"
+                );
+                let offered = server.offered.lock().unwrap();
+                let fp = offered[0]["snapshot_fingerprint"].as_str().unwrap();
+                assert!(
+                    !saved.accepted_snapshot_fingerprint_recorded(fp),
+                    "unknown local ACK must not become a selected acceptance"
                 );
             } else if ledger_fault && cycle == 0 {
                 assert!(
