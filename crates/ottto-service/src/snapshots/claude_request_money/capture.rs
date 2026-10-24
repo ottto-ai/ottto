@@ -87,11 +87,8 @@ fn plan_next_page_while<'a>(
     if !within_deadline() {
         return false;
     }
-    let old = match PLANS.try_lock() {
-        Ok(mut plans) => plans.remove(scope),
-        Err(_) => return false,
-    };
-    drop(old);
+    // Keep the funded old plan, including unacknowledged consumed turns,
+    // until the replacement is complete and can be installed atomically.
     let mut funds = Funds::default();
     if !funds
         .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>()))
@@ -978,6 +975,33 @@ mod bounded_tests {
         assert!(keys[..NEXT_PAGE_FAMILIES]
             .iter()
             .all(|key| plan.keys[key].1));
+        drop(plans);
+        let funded = capture_reserved();
+        let checks = std::cell::Cell::new(0);
+        assert!(!plan_next_page_while(
+            &support,
+            keys.iter().map(|key| (key.as_str(), 9000)),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() <= 7
+            }
+        ));
+        assert_eq!(
+            capture_reserved(),
+            funded,
+            "old plan stays funded; partial replacement refunds"
+        );
+        assert_eq!(
+            scheduling_turn(&support, &keys[100], 0),
+            100,
+            "mid-walk expiry must preserve unacknowledged consumed turns"
+        );
+        let plans = PLANS.lock().unwrap();
+        assert!(plans[&support].keys[&keys[0]].1);
+        assert!(
+            !plans[&support].keys[&keys[100]].1,
+            "interruption never changes the next Full to all-eligible"
+        );
         drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);

@@ -1587,6 +1587,91 @@ fn money_p1b_dense_deferred_day_suppresses_unchanged_rows_and_closes() {
     money::disable_shadow_for_test(&fixture.support);
 }
 
+/// Natural Full/Skip pages must not repeatedly publish the same deferred
+/// suffix. No BodyDeadline fault: the 64 body turns and all shared/closing
+/// work consume the real first-finalizer deadline on every admitted probe.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_natural_dense_full_and_skip_day_does_not_seal() {
+    let fixture = PipelineFixture::new("money-p1b-natural-deferred-day");
+    for at in 0..2048 {
+        let session = format!("{at:08x}-1234-4567-890a-123456789abc");
+        std::fs::write(fixture.root.join(format!("{session}.jsonl")),
+            pipeline_transcript_line(&session, &format!("req-{at}"), 7)).unwrap();
+    }
+    let scan = |index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode, std::slice::from_ref(&fixture.root), index,
+        "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+    let mut baseline_index = ScanIndex::default();
+    let baseline = scan(&mut baseline_index);
+    let expected_bytes = serde_json::to_vec(&baseline.snapshots).unwrap();
+    let expected_index = serde_json::to_vec(&baseline_index).unwrap();
+    money::enable_shadow_for_test(&fixture.support);
+    money::store::prime_credit_for_test(&fixture.support, 0);
+    money::set_page_fault_for_test(money::PageFault::None);
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let mut suppressed = 0;
+    let mut deferred_emitted = 0;
+    let mut max_wall_us = 0;
+    let mut max_emitted_after_first = 0;
+    for page in 0..32 {
+        let is_full = page % 2 == 0;
+        let (full, index) = if is_full {
+            let mut index = ScanIndex::default();
+            let full = scan(&mut index);
+            assert_eq!(full.scanned_file_count, 2051);
+            assert_eq!(serde_json::to_vec(&full.snapshots).unwrap(), expected_bytes);
+            assert_eq!(serde_json::to_vec(&index).unwrap(), expected_index);
+            (full, index)
+        } else {
+            let mut index = baseline_index.clone();
+            let skip = scan(&mut index);
+            assert_eq!(skip.scanned_file_count, 0, "following unchanged native page is Skip");
+            assert_eq!(serde_json::to_vec(&skip.snapshots).unwrap(), expected_bytes);
+            (skip, index)
+        };
+        let replay = is_full.then(|| crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index));
+        money::capture::purge_scope_for_test(&fixture.support);
+        money::capture::begin_page(&fixture.support);
+        if let Some(replay) = replay { replay(); }
+        let started = std::time::Instant::now();
+        let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete, now + page);
+        let total_us = started.elapsed().as_micros() + u128::from(counts.capture_us);
+        assert!(total_us <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+        max_wall_us = max_wall_us.max(total_us);
+        assert_eq!(counts.refused_deadline, 0, "{counts:?}");
+        assert_eq!(counts.families, 2051, "{counts:?}");
+        assert_eq!(counts.ledger_save_late, 0, "closing slices are reserved: {counts:?}");
+        assert_eq!(counts.jsonl_sealed, 0, "{counts:?}");
+        if !is_full { assert_eq!(counts.captures_taken, 0); }
+        money::store::flush();
+        let rows = money_jsonl_rows(&fixture.support);
+        let current = rows.iter().filter(|row| row["row"] == "family" && row["observed_unix"] == now + page).collect::<Vec<_>>();
+        let emitted = current.iter().filter(|row| row["p1_reasons"] == serde_json::json!(["deadline"])).count();
+        let page_row = rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now + page).unwrap();
+        assert_eq!(page_row["written"].as_u64().unwrap() + page_row["failed"].as_u64().unwrap()
+            + page_row["unchanged"].as_u64().unwrap(), 2051);
+        assert_eq!(current.len() as u64 + counts.unchanged, 2051, "no silent omission");
+        if page > 0 {
+            // At most two sets of64 can actually change: newly selected
+            // captures and the preceding page's selected roots. Stable
+            // deferred roots may not be charged another version.
+            assert!(counts.unchanged >= 2051 - 128, "natural suppression: {counts:?}");
+            assert!(emitted <= 128, "stable deferred suffix re-emitted: {emitted}: {counts:?}");
+            max_emitted_after_first = max_emitted_after_first.max(emitted);
+        }
+        suppressed += counts.unchanged;
+        deferred_emitted += emitted;
+        assert!(!rows.iter().any(|row| row["truncated"] == true), "natural pages cannot seal the day");
+    }
+    let bytes = std::fs::metadata(fixture.support.join("diagnostics/claude-request-money-shadow-20260802.jsonl")).unwrap().len();
+    assert!(bytes < 8 * 1024 * 1024);
+    println!("MONEY_P1B_NATURAL_DAY pages=32 full=16 skip=16 families=2051 body_deadline_fault=0 suppressed={suppressed} emitted_deferred={deferred_emitted} max_emitted_after_first={max_emitted_after_first} bytes={bytes} day_cap=8388608 sealed=0 max_money_us={max_wall_us} deadline_us=250000 ci_tolerance_us=25000");
+    money::disable_shadow_for_test(&fixture.support);
+}
+
 /// Reaching an uncaptured family must not spend its capture turn. Native
 /// Full byte parity is checked separately; real finalizers on prepared
 /// current input isolate turn fairness from native I/O consuming the wall

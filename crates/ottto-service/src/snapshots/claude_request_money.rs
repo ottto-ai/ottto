@@ -849,10 +849,10 @@ struct ShadowLine<'a> {
 // ---------------------------------------------------------------- output
 
 fn hashed_id(value: &str) -> String {
-    let mut digest = Sha256::new();
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
     digest.update(b"claude_request_money_shadow:v1\0");
     digest.update(value.as_bytes());
-    hex_bytes(&digest.finalize()[..8])
+    hex_bytes(&digest.finish().as_ref()[..8])
 }
 
 /// One side of a B1 grain row.
@@ -1546,14 +1546,22 @@ fn shadow_page_with_coverage(
     }
     for position in 0..order.len() {
         let (root, key, turn) = order[position].clone();
-        if scope.is_none() || preflight_check(end.deadline).is_err() {
+        if !capture_turns.contains(root)
+            || scope.is_none()
+            || preflight_check(end.deadline).is_err()
+        {
             let deferred_started = Instant::now();
             // Closing hashes only the admitted canonical failure template.
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
             let deferred = (order.len() - position) as u64;
-            let compare_until = end.close_deadline - Duration::from_millis(10);
-            for (root, key, turn) in &order[position..] {
+            // Reserve retention (10ms), plan (10ms), and save (10ms)
+            // separately; none can consume the following slice.
+            let compare_until = end.close_deadline - Duration::from_millis(30);
+            let suffix = &order[position..];
+            let mut first_uncompared = None;
+            for at in deferred_comparison_order(suffix.len(), ledger.deferred_compare_cursor) {
+                let (root, key, turn) = &suffix[at];
                 let state = coverage_view.family(root);
                 // Only a current acknowledged publication can be unchanged.
                 // The writer computes the canonical digest before returning
@@ -1563,7 +1571,11 @@ fn shadow_page_with_coverage(
                 // a large suffix consume the retention/save/handoff slice.
                 // Without a completed comparison we publish the explicit
                 // failure, whose digest is finalized by the writer.
-                let unchanged = (Instant::now() < compare_until)
+                let compare = Instant::now() < compare_until;
+                if !compare {
+                    first_uncompared.get_or_insert(at);
+                }
+                let unchanged = compare
                     .then(|| published_digest(ledger, key, day, epoch))
                     .flatten()
                     .is_some_and(|digest| failure_digest.deferred(root, &state, ledger) == digest);
@@ -1589,6 +1601,7 @@ fn shadow_page_with_coverage(
                     deferred: Some((root.to_string(), state)),
                 });
             }
+            ledger.deferred_compare_cursor = first_uncompared.unwrap_or(0);
             counts.families += deferred;
             counts.families_unbuilt += deferred;
             counts.families_deadline_deferred += deferred;
@@ -1771,6 +1784,8 @@ fn shadow_page_with_coverage(
         ledger,
         now,
         end.close_deadline
+            .checked_sub(Duration::from_millis(20))
+            .expect("closing reserve")
             .min(Instant::now() + Duration::from_millis(10)),
     );
     // This only selects optional captures; it grants no publication or
@@ -1781,6 +1796,8 @@ fn shadow_page_with_coverage(
             &scope_key,
             order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
             end.close_deadline
+                .checked_sub(Duration::from_millis(10))
+                .expect("closing reserve")
                 .min(Instant::now() + Duration::from_millis(10)),
         );
     } else {
@@ -2517,12 +2534,14 @@ fn write_semantic(rows: &mut FamilyRows, writer: &mut impl Write) -> serde_json:
 #[derive(Default)]
 struct DeadlineDigest {
     template: Option<DeadlineTemplate>,
+    #[cfg(test)]
+    misses: usize,
 }
 struct DeadlineTemplate {
     census: &'static str,
     reason: Option<coverage::CensusReason>,
     statuses: BTreeMap<&'static str, u64>,
-    prefix: Sha256,
+    prefix: ring::digest::Context,
     bytes: Vec<u8>,
     suffix: usize,
 }
@@ -2553,7 +2572,7 @@ impl DeadlineDigest {
         let mut hash = template.prefix.clone();
         hash.update(family.as_bytes());
         hash.update(&template.bytes[template.suffix..]);
-        u64::from_be_bytes(hash.finalize()[..8].try_into().expect("digest"))
+        u64::from_be_bytes(hash.finish().as_ref()[..8].try_into().expect("digest"))
     }
 
     fn digest(&mut self, rows: &mut FamilyRows) -> u64 {
@@ -2566,6 +2585,10 @@ impl DeadlineDigest {
                 && template.statuses == rows.row.key_statuses
         });
         if !matches {
+            #[cfg(test)]
+            {
+                self.misses += 1;
+            }
             // Fixed admitted buffer: future schema growth cannot allocate
             // beyond the template allowance before falling back.
             self.template = None;
@@ -2583,7 +2606,7 @@ impl DeadlineDigest {
                 .expect("canonical family field")
                 + needle.len();
             let suffix = start + rows.row.family.len();
-            let mut prefix = Sha256::new();
+            let mut prefix = ring::digest::Context::new(&ring::digest::SHA256);
             prefix.update(&bytes[..start]);
             self.template = Some(DeadlineTemplate {
                 census: rows.row.census,
@@ -3015,31 +3038,49 @@ fn union_revision_by(members: &BTreeSet<String>, deadline: Instant) -> Option<[u
     Some(digest.finalize().into())
 }
 
-/// Drop family memos no page rebuilt within the retention window.
+/// Start unfinished comparisons first next page without changing capture turns.
+fn deferred_comparison_order(len: usize, start: usize) -> impl Iterator<Item = usize> {
+    (0..len).map(move |at| (at + start % len) % len)
+}
+
+/// Drop family memos no page rebuilt within the retention window. Cursor
+/// advancement includes fresh records, so a fresh prefix cannot hide stale
+/// records indefinitely. Scratch and work are bounded independently of size.
 fn drop_old_family_memos(ledger: &mut ClaudeLedger, now: u64, deadline: Instant) -> u64 {
+    const PER_PAGE: usize = 256;
+    let Some(_scratch) = ShadowReservation::admit(PER_PAGE * 256) else {
+        return 0;
+    };
     let cutoff = now.saturating_sub(FAMILY_MEMO_RETENTION_SECONDS);
-    let stale = ledger
+    let due = ledger
         .census()
-        .records_with_prefix(FAMILY_KEY_PREFIX)
+        .records_with_prefix_after(FAMILY_KEY_PREFIX, &ledger.family_cursor)
         .take_while(|_| Instant::now() < deadline)
-        .filter(|(_, record)| {
-            record.family_memo().is_some_and(|(_, memo)| {
+        .take(PER_PAGE)
+        .map(|(key, record)| {
+            let stale = record.family_memo().is_some_and(|(_, memo)| {
                 // An unreached family's scheduling turn may remain at zero;
                 // retention follows its real last publication, not that priority.
                 memo.published
                     .map_or(record.window(), |published| published.attempted)
                     < cutoff
-            })
+            });
+            (key.clone(), stale)
         })
-        .map(|(key, _)| key.clone())
         .collect::<Vec<_>>();
+    if due.is_empty() && Instant::now() < deadline {
+        ledger.family_cursor.clear();
+    }
     let mut dropped = 0;
-    for key in &stale {
+    for (key, stale) in due {
         if Instant::now() >= deadline {
             break;
         }
-        ledger.remove(key);
-        dropped += 1;
+        if stale {
+            ledger.remove(&key);
+            dropped += 1;
+        }
+        ledger.family_cursor = key;
     }
     dropped
 }
@@ -3821,6 +3862,111 @@ mod round3_tests {
 #[cfg(test)]
 mod digest_deadline_tests {
     use super::*;
+    #[test]
+    fn money_p1b_deferred_digest_profile_preserves_canonical_sha256() {
+        let coverage = coverage::InterimFamilyCoverage {
+            census_complete: true,
+            ..Default::default()
+        };
+        let ledger = ClaudeLedger::new_for_test();
+        let roots = (0..8192)
+            .map(|at| format!("{at:08x}-1234-4567-890a-123456789abc"))
+            .collect::<Vec<_>>();
+        let started = Instant::now();
+        let states = roots
+            .iter()
+            .map(|root| std::hint::black_box(coverage.family(root)))
+            .collect::<Vec<_>>();
+        let coverage_us = started.elapsed().as_micros();
+        let started = Instant::now();
+        let identities = roots.iter().map(|root| hashed_id(root)).collect::<Vec<_>>();
+        let identity_us = started.elapsed().as_micros();
+        for (root, identity) in roots.iter().zip(&identities) {
+            let mut old = Sha256::new();
+            old.update(b"claude_request_money_shadow:v1\0");
+            old.update(root.as_bytes());
+            assert_eq!(*identity, hex_bytes(&old.finalize()[..8]));
+        }
+        let mut cached = DeadlineDigest::default();
+        let started = Instant::now();
+        let digests = roots
+            .iter()
+            .zip(&states)
+            .map(|(root, state)| cached.deferred(root, state, &ledger))
+            .collect::<Vec<_>>();
+        let digest_us = started.elapsed().as_micros();
+        let template = cached.template.as_ref().unwrap();
+        let started = Instant::now();
+        for (at, identity) in identities.iter().enumerate() {
+            let mut bytes = template.bytes.clone();
+            bytes[template.suffix - 16..template.suffix].copy_from_slice(identity.as_bytes());
+            let expected = Sha256::digest(&bytes);
+            assert_eq!(
+                digests[at],
+                u64::from_be_bytes(expected[..8].try_into().unwrap())
+            );
+        }
+        let software_us = started.elapsed().as_micros();
+        let misses = cached.misses;
+        assert_eq!(misses, 1, "one template per uniform census shape");
+        assert!(
+            digest_us <= 175_000,
+            "8192 complete comparisons must fit the optional window plus CI tolerance: {digest_us}"
+        );
+        println!("MONEY_P1B_DIGEST rows=8192 coverage_us={coverage_us} identity_us={identity_us} deferred_us={digest_us} software_oracle_us={software_us} template_misses={misses}");
+    }
+
+    #[test]
+    fn interrupted_deferred_comparisons_rotate_without_changing_capture_turns() {
+        let mut start = 0;
+        let mut seen = BTreeSet::new();
+        for _ in 0..3 {
+            let order = deferred_comparison_order(7, start).collect::<Vec<_>>();
+            seen.extend(order.iter().take(3).copied());
+            start = order[3]; // same production rule: first unfinished comparison
+        }
+        assert_eq!(seen, (0..7).collect());
+        assert_eq!(deferred_comparison_order(0, start).count(), 0);
+    }
+
+    #[test]
+    fn family_retention_cursor_reaches_stale_records_beyond_a_fresh_prefix() {
+        let mut ledger = ClaudeLedger::new_for_test();
+        let now = FAMILY_MEMO_RETENTION_SECONDS + 100;
+        for at in 0..600 {
+            let key = format!("{FAMILY_KEY_PREFIX}{at:064x}");
+            assert_eq!(
+                ledger.insert(
+                    key,
+                    ClaudeRequestCensusRecord::family_record(
+                        [0; 32],
+                        if at == 599 { 1 } else { now },
+                        ClaudeFamilyMemo::default()
+                    )
+                ),
+                ClaudeRequestCensusInsert::Stored
+            );
+        }
+        let deadline = || Instant::now() + Duration::from_secs(1);
+        assert_eq!(drop_old_family_memos(&mut ledger, now, deadline()), 0);
+        assert_eq!(
+            ledger.family_cursor,
+            format!("{FAMILY_KEY_PREFIX}{:064x}", 255)
+        );
+        assert_eq!(drop_old_family_memos(&mut ledger, now, Instant::now()), 0);
+        assert_eq!(
+            ledger.family_cursor,
+            format!("{FAMILY_KEY_PREFIX}{:064x}", 255)
+        );
+        assert_eq!(drop_old_family_memos(&mut ledger, now, deadline()), 0);
+        assert_eq!(drop_old_family_memos(&mut ledger, now, deadline()), 1);
+        assert!(ledger
+            .get(&format!("{FAMILY_KEY_PREFIX}{:064x}", 599))
+            .is_none());
+        assert_eq!(drop_old_family_memos(&mut ledger, now, deadline()), 0);
+        assert!(ledger.family_cursor.is_empty());
+        println!("MONEY_P1B_RETENTION records=600 batch=256 expired_advanced=0 stale_tail_dropped=1 wrapped=1");
+    }
     #[test]
     fn cached_deadline_digest_matches_canonical_bytes_across_families_and_census_shapes() {
         use coverage::CensusReason;

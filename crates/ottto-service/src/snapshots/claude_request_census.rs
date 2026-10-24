@@ -736,9 +736,22 @@ impl ClaudeRequestCensus {
         &'a self,
         prefix: &'a str,
     ) -> impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)> + 'a {
+        self.records_with_prefix_after(prefix, "")
+    }
+
+    /// Resume a prefix walk without rescanning records before its cursor.
+    pub(crate) fn records_with_prefix_after<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+    ) -> impl Iterator<Item = (&'a String, &'a ClaudeRequestCensusRecord)> + 'a {
         self.records
             .range::<str, _>((
-                std::ops::Bound::Included(prefix),
+                if after < prefix {
+                    std::ops::Bound::Included(prefix)
+                } else {
+                    std::ops::Bound::Excluded(after)
+                },
                 std::ops::Bound::Unbounded,
             ))
             .take_while(move |(key, _)| key.starts_with(prefix))

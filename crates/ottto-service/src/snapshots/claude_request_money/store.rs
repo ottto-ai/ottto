@@ -144,6 +144,10 @@ pub(crate) struct ClaudeLedger {
     /// Where the `mh:` round-robin resumes (process memory only: pruning
     /// is housekeeping, a stale record is never a holder).
     pub(crate) message_cursor: String,
+    /// Bounded housekeeping resumes after this family key.
+    pub(crate) family_cursor: String,
+    /// First deferred comparison on the next page (scheduling only).
+    pub(crate) deferred_compare_cursor: usize,
     /// When this process last took a save (None: not yet).
     last_save: Option<Instant>,
     /// The UTC day (`yyyymmdd`) of `save_bytes_today`.
@@ -190,6 +194,8 @@ impl ClaudeLedger {
             oversized_shards: 0,
             load_damaged: false,
             message_cursor: String::new(),
+            family_cursor: String::new(),
+            deferred_compare_cursor: 0,
             last_save: None,
             save_day: 0,
             save_bytes_today: 0,
