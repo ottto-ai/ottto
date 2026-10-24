@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "d6aca78005e03681642be88861cf1d4163798ebf44dad0f1e5dfae52ac6713a4",
+  "content_sha256": "cf8d2c4b9c55dda0158b6da0f206b25724b638e475641957ea6e8dd780eb1d8d",
   "files": [
     {
       "executable": false,
@@ -20,8 +20,8 @@
       "executable": false,
       "mode": "0644",
       "path": ".github/workflows/ci.yml",
-      "sha256": "9005b94670e681b24fd6b8106b43f900d100bd9dd648e94d29fdc106f8137490",
-      "size_bytes": 4011
+      "sha256": "bab313e0f7b8fcc79c73957bca636a7cf0da5ab13b9a3172cc37683fa48f9a5d",
+      "size_bytes": 4632
     },
     {
       "executable": false,
@@ -90,8 +90,8 @@
       "executable": false,
       "mode": "0644",
       "path": "README.md",
-      "sha256": "8436f8a8af7fdb5b960a89b15030ee0abefa225d068e41579f9420d55b4e6deb",
-      "size_bytes": 55926
+      "sha256": "f7fa9c2a00b7d8bf13d299ad28f4cc4897e526a6f8ab5edaafdc49a60c798ecc",
+      "size_bytes": 56164
     },
     {
       "executable": false,
@@ -5333,8 +5333,8 @@
       "executable": false,
       "mode": "0644",
       "path": "public-export/README.md",
-      "sha256": "a739d15c1e8a4150483bcfd42654ba1b109cbf229e8d3cabaeeab54e64338a47",
-      "size_bytes": 11557
+      "sha256": "760a8257f3c6eebc7bd3dd577f0ef665546b279795d6b59736656eed6f26f02e",
+      "size_bytes": 11686
     },
     {
       "executable": false,
@@ -5613,15 +5613,15 @@
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_skeleton_check.sh",
-      "sha256": "f5253b9b4fb96d16581a5c8985e55715eff3105e417c8f43d46986a71cfee5b1",
-      "size_bytes": 8765
+      "sha256": "0263a76d307dcdc76ad99cac5d02b09121e0ca5d7e884d8618cc548443d91154",
+      "size_bytes": 9014
     },
     {
       "executable": true,
       "mode": "0755",
       "path": "scripts/public_repo_surface_ci.sh",
-      "sha256": "a75dc375c5ec2dc958b1cd9c7ba2425cd04675c01642a7ef0dc4febc6db98871",
-      "size_bytes": 8132
+      "sha256": "2bf8eeefcf00ca402cdad5e299249f18e0c87de9b2da66ba967e917b3de9dda0",
+      "size_bytes": 9967
     },
     {
       "executable": false,
@@ -5841,7 +5841,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T03:23:34+00:00",
+  "generated_at": "2026-10-24T08:13:08+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 835,
   "public_roots": [
@@ -5880,5 +5880,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "29e38996bd469c84faf74aaf57da4301e6677c36"
+  "source_commit": "3d7f1fff5f08fc644241ad5d2a61ec46b7b54f7f"
 }
