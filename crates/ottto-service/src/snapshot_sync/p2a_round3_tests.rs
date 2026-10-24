@@ -3133,3 +3133,72 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
     }
     crate::snapshots::restart_claude_reemission_stop_for_test();
 }
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
+    for status in [429, 503, 409, 412, 413, 422] {
+        let mut control = P2aControl::new(FinishOutcome::HttpFailure {
+            status,
+            retry_after: 7200,
+        });
+        let _live = money::LiveForTest::new(&control.support);
+        let now = current_unix_seconds();
+        let clock = money::PageClockForTest::new(&control.support, now);
+        control.cycle();
+        let m = unknown_recovery::active_for_test(&control.support)
+            .pop()
+            .unwrap();
+        assert_eq!(m.posts, 1);
+        assert_eq!(
+            control.server.raw_batches.lock().unwrap().len(),
+            1,
+            "no in-place resend or singleton isolation"
+        );
+        assert!(control
+            .saved()
+            .files
+            .values()
+            .all(|e| e.effective_upload_body_witness_revision != 3));
+        if matches!(status, 429 | 503) {
+            assert!(m.terminal.is_none());
+            assert_eq!(m.not_before, now + 7200);
+            drop(clock);
+            control.restart();
+            {
+                let _early = money::PageClockForTest::new(&control.support, now + 7199);
+                control.cycle();
+            }
+            assert_eq!(
+                control.server.raw_batches.lock().unwrap().len(),
+                1,
+                "server backoff overrides the +5m slot"
+            );
+            {
+                let _due = money::PageClockForTest::new(&control.support, now + 7200);
+                control.cycle();
+            }
+            assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
+            assert_eq!(
+                unknown_recovery::active_for_test(&control.support)[0].posts,
+                2
+            );
+        } else {
+            let expected = match status {
+                409 | 412 => unknown_recovery::Reason::HttpConflict,
+                413 => unknown_recovery::Reason::Oversize,
+                _ => unknown_recovery::Reason::Validation,
+            };
+            assert_eq!(m.terminal, Some(expected));
+        }
+    }
+}

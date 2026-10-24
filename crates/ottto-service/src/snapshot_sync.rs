@@ -6221,7 +6221,8 @@ async fn finish_sync_source_resume(
             &upload_destination_namespace,
             ensure_authority,
         )
-        .await?;
+        .await
+        .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
     }
     codex_scan_diagnostics::after_existing_census_fence(
         source,
@@ -6723,7 +6724,13 @@ async fn finish_sync_source_resume(
                     response.validate_entity_ack_with_head_cas(&request, enforce_head_cas)?;
                     Ok(response)
                 },
-                |progress| progress.save(&upload_progress_path),
+                |progress| {
+                    progress.save(&upload_progress_path)?;
+                    if source_money_resume(source, support_dir) {
+                        unknown_recovery::ack_saved(support_dir, progress)?;
+                    }
+                    Ok(())
+                },
             );
             if result
                 .as_ref()
@@ -6896,7 +6903,11 @@ async fn finish_sync_source_resume(
                 tests::permanent_finish_pipeline_tests::p2a_before_ack_save_for_test(
                     &upload_progress_path,
                 );
-                progress.save(&upload_progress_path)
+                progress.save(&upload_progress_path)?;
+                if source_money_resume(source, support_dir) {
+                    unknown_recovery::ack_saved(support_dir, progress)?;
+                }
+                Ok(())
             },
         )
         .and_then(|result| {

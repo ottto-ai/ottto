@@ -47,6 +47,7 @@ pub(super) struct Manifest {
     pub length: usize,
     pub sha256: String,
     pub head_cas: bool,
+    pub ack_saved: bool,
     pub entities: Vec<Entity>,
     pub terminal: Option<Reason>,
 }
@@ -105,8 +106,27 @@ impl std::error::Error for Deferred {}
 pub(super) fn now(support: &Path) -> u64 {
     money::recovery_now(support)
 }
+#[derive(Debug)]
+struct CustodyFault;
+impl std::fmt::Display for CustodyFault {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money recovery custody fault")
+    }
+}
+impl std::error::Error for CustodyFault {}
 fn fault() -> anyhow::Error {
-    anyhow!("request money recovery custody fault")
+    CustodyFault.into()
+}
+
+pub(super) fn faulted(support: &Path, error: &anyhow::Error) {
+    if error.is::<CustodyFault>() {
+        if let Ok(mut catalogs) = CATALOGS.lock() {
+            if let Some(catalog) = catalogs.get_mut(support) {
+                catalog.fault = true;
+            }
+        }
+        eprintln!("claude_request_money recovery_custody_fault=1");
+    }
 }
 fn dir(support: &Path) -> PathBuf {
     support.join("claude-money-recovery")
@@ -309,6 +329,7 @@ fn load(root: &Path) -> Result<Vec<Manifest>> {
             length: 0,
             sha256: "00".repeat(32),
             head_cas: false,
+            ack_saved: false,
             entities: Vec::new(),
             terminal: Some(Reason::CorruptCustody),
         });
@@ -359,7 +380,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
         return Err(fault());
     }
     m.length = body.len();
-    m.sha256 = digest(&body);
+    m.sha256 = digest(body);
     validate_manifest(&m)?;
     // Includes payload temp, manifest replacement temp and terminal receipt.
     let reserve = body.len() as u64 + 2 * MANIFEST_MAX as u64 + 2048;
@@ -370,7 +391,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     if payload.exists() || path(&root, &m.id, "json")?.exists() {
         return Err(fault());
     }
-    atomic(&root, &payload, &body)?;
+    atomic(&root, &payload, body)?;
     // The immutable body is durable before the send intent, which consumes the
     // original slot even if the process dies before its first POST.
     write_manifest(&root, &m)?;
@@ -440,7 +461,8 @@ fn job<T: Send + 'static>(
     operation: impl FnOnce() -> Result<T> + Send + 'static,
 ) -> Result<Ticket<T>> {
     Ok(Ticket {
-        receiver: store::recovery_job(IO_FUNDS, operation).ok_or_else(fault)?,
+        receiver: store::recovery_job(IO_FUNDS, move || operation().map_err(|_| fault()))
+            .ok_or_else(fault)?,
     })
 }
 pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
@@ -454,6 +476,7 @@ pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
 
 #[derive(Default)]
 struct Catalog {
+    fault: bool,
     funds: Vec<money::ShadowReservation>,
     entries: Vec<Manifest>,
     loading: Option<Ticket<Vec<Manifest>>>,
@@ -463,6 +486,21 @@ static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new())
 /// Called before activity/token networking, including when the source's
 /// network backoff would otherwise skip its finish. Expiry does not need HTTP.
 pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
+    let result = startup_inner(support, binding, now);
+    if let Err(error) = &result {
+        faulted(support, error);
+    }
+    result
+}
+fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
+    if CATALOGS
+        .lock()
+        .map_err(|_| fault())?
+        .get(support)
+        .is_some_and(|c| c.fault)
+    {
+        return Err(fault());
+    }
     let (updates, waiting) = {
         let mut outcomes = OUTCOMES.lock().map_err(|_| fault())?;
         let mut updates = Vec::new();
@@ -495,6 +533,7 @@ pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
         catalogs.insert(
             support.to_path_buf(),
             Catalog {
+                fault: false,
                 funds: Vec::new(),
                 entries: Vec::new(),
                 loading: Some(ticket),
@@ -548,6 +587,7 @@ pub(super) fn startup(support: &Path, binding: &str, now: u64) -> Result<bool> {
                     length: 0,
                     sha256: "00".repeat(32),
                     head_cas: false,
+                    ack_saved: false,
                     entities: Vec::new(),
                     terminal: Some(Reason::CorruptCustody),
                 };
@@ -606,9 +646,10 @@ pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> boo
     };
     catalog.loading.is_some()
         || catalog.entries.iter().any(|m| {
-            m.entities
-                .iter()
-                .any(|e| e.files.iter().any(|f| f == key) || root == Some(e.root.as_str()))
+            !m.ack_saved
+                && m.entities
+                    .iter()
+                    .any(|e| e.files.iter().any(|f| f == key) || root == Some(e.root.as_str()))
         })
 }
 pub(super) fn add(support: &Path, m: Manifest) -> Result<()> {
@@ -630,6 +671,7 @@ pub(super) fn due(support: &Path, now: u64) -> Result<Vec<Manifest>> {
         .iter()
         .filter(|m| {
             m.terminal.is_none()
+                && !m.ack_saved
                 && m.posts < 4
                 && now < m.deadline
                 && now >= m.not_before
@@ -693,6 +735,30 @@ pub(super) fn replace(support: &Path, m: Manifest) -> Result<()> {
     *slot = m;
     Ok(())
 }
+pub(super) fn ack_saved(support: &Path, progress: &SnapshotUploadProgress) -> Result<()> {
+    let mut catalogs = CATALOGS.lock().map_err(|_| fault())?;
+    let Some(catalog) = catalogs.get_mut(support) else {
+        return Ok(());
+    };
+    for m in &mut catalog.entries {
+        if !m.ack_saved
+            && m.entities
+                .iter()
+                .all(|e| progress.contains_body(&e.fingerprint, &e.witness))
+        {
+            m.ack_saved = true;
+            let ticket = outcome_ticket(support, m.clone(), m.terminal, m.not_before)?;
+            OUTCOMES
+                .lock()
+                .map_err(|_| fault())?
+                .entry(support.to_path_buf())
+                .or_default()
+                .push(ticket);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn resolve_saved(
     support: &Path,
     progress: &SnapshotUploadProgress,
@@ -703,17 +769,19 @@ pub(super) fn resolve_saved(
         return Ok(());
     };
     for m in &mut catalog.entries {
-        if m.entities.iter().all(|e| {
-            progress.contains_body(&e.fingerprint, &e.witness)
-                || progress
-                    .quarantined_fingerprints
-                    .get(&e.fingerprint)
-                    .is_some_and(|q| q.upload_body_witness.as_deref() == Some(&e.witness))
-                || progress
-                    .permanent_rejections
-                    .get(&e.fingerprint)
-                    .is_some_and(|q| q.body_witness == e.witness)
-        }) {
+        if m.ack_saved
+            || m.entities.iter().all(|e| {
+                progress.contains_body(&e.fingerprint, &e.witness)
+                    || progress
+                        .quarantined_fingerprints
+                        .get(&e.fingerprint)
+                        .is_some_and(|q| q.upload_body_witness.as_deref() == Some(&e.witness))
+                    || progress
+                        .permanent_rejections
+                        .get(&e.fingerprint)
+                        .is_some_and(|q| q.body_witness == e.witness)
+            })
+        {
             // This in-memory mark is reached only AFTER ACK and selected saves.
             // Startup commits the release latch and count-only terminal receipt.
             m.terminal = Some(Reason::Resolved);
@@ -779,6 +847,11 @@ pub(super) fn manifest(
     binding: String,
     head_cas: bool,
 ) -> Result<Manifest> {
+    let head_cas = head_cas
+        || request
+            .snapshots
+            .iter()
+            .any(|item| item.cache_observations.is_some());
     let _metadata_funds = money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(fault)?;
     let mut entities = Vec::new();
     let mut metadata_bytes = 0_usize;
@@ -830,31 +903,37 @@ pub(super) fn manifest(
         length: 0,
         sha256: String::new(),
         head_cas,
+        ack_saved: false,
         entities,
         terminal: None,
     })
 }
 
+#[derive(Default)]
 pub(super) enum SendState {
+    #[default]
     Empty,
     Reserving(Manifest, Vec<u8>, money::ShadowReservation),
     Ready(Manifest, Vec<u8>, money::ShadowReservation),
-}
-impl Default for SendState {
-    fn default() -> Self {
-        Self::Empty
-    }
 }
 
 pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()> {
     let ticket = match std::mem::take(state) {
         SendState::Reserving(m, body, funds) => {
-            money_resume::until(|| money::recovery_reserve_receipt(support, &m.id)).await?;
+            std::future::poll_fn(|_| match money::recovery_reserve_receipt(support, &m.id) {
+                money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
+                money::MoneyReceipt::Pending => std::task::Poll::Pending,
+                money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
+            })
+            .await
+            .inspect_err(|error| faulted(support, error))?;
             capture_ticket(support, m, body, funds)?
         }
         _ => return Err(fault()),
     };
-    let (m, bytes, funds) = wait(ticket).await?;
+    let (m, bytes, funds) = wait(ticket)
+        .await
+        .inspect_err(|error| faulted(support, error))?;
     add(support, m.clone())?;
     *state = SendState::Ready(m, bytes, funds);
     Ok(())
@@ -863,6 +942,7 @@ pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()
 /// Return Pending to the async owner instead of waiting on disk under its lock.
 /// Once ready, send the retained wire bytes directly. Ordinary uploader retry,
 /// auth fallback, bisection and gzip are never entered for this episode.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn initial_post(
     support: &Path,
     index: &mut ScanIndex,
@@ -875,6 +955,28 @@ pub(super) fn initial_post(
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
     if matches!(state, SendState::Empty) {
         let m = manifest(support, index, request, binding.to_owned(), head_cas)?;
+        if CATALOGS
+            .lock()
+            .map_err(|_| fault())?
+            .get(support)
+            .is_some_and(|c| {
+                c.entries.iter().any(|old| {
+                    !old.ack_saved
+                        && old.entities.iter().any(|e| {
+                            m.entities
+                                .iter()
+                                .any(|new| new.root == e.root || new.session == e.session)
+                        })
+                })
+            })
+        {
+            return Err(Deferred {
+                reason: None,
+                not_before: now(support),
+                route_unavailable: false,
+            }
+            .into());
+        }
         if money::recovery_released(support, &m.id) {
             let roots = m
                 .entities
@@ -905,11 +1007,11 @@ pub(super) fn initial_post(
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
             let _body_funds = money::ShadowReservation::admit(BODY_MAX).ok_or_else(fault)?;
-            let body = encode(request, head_cas)?;
+            let body = encode(request, m.head_cas)?;
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
         let funds = money::ShadowReservation::admit(BODY_MAX).ok_or_else(fault)?;
-        let body = encode(request, head_cas)?;
+        let body = encode(request, m.head_cas)?;
         *state = SendState::Reserving(m, body, funds);
         return Err(Pending.into());
     }
@@ -1002,7 +1104,12 @@ pub(super) async fn outcomes(support: &Path) -> Result<()> {
         .remove(support)
         .unwrap_or_default();
     for ticket in tickets {
-        replace(support, wait(ticket).await?)?;
+        replace(
+            support,
+            wait(ticket)
+                .await
+                .inspect_err(|error| faulted(support, error))?,
+        )?;
     }
     Ok(())
 }
@@ -1207,6 +1314,7 @@ pub(super) async fn replay_due(
                 Ok(response)
             });
         drop(bytes);
+        let mut m = m;
         let (reason, not_before) = match result {
             Ok(response) if !response.disabled => {
                 let previous = progress.clone();
@@ -1220,6 +1328,7 @@ pub(super) async fn replay_due(
                     }
                     .into());
                 }
+                m.ack_saved = true;
                 // Selected save occurs in the ordinary finish. No debt or
                 // history stamp can be retired by this in-memory ACK alone.
                 (None, m.deadline)
@@ -1274,6 +1383,7 @@ mod tests {
                 length: bytes.len(),
                 sha256: digest(&bytes),
                 head_cas: false,
+                ack_saved: false,
                 entities: vec![Entity {
                     root: "synthetic-root".into(),
                     session: "synthetic-session".into(),
@@ -1404,12 +1514,8 @@ mod tests {
                     "snapshot_fingerprint":m.entities[0].fingerprint,"occurrence_count":1,
                     "body_witness_version":7,"body_witness_digest":m.entities[0].witness,"unchanged_basis":basis}],
                 "rejected_entities":[],"conflict_entities":[] })).unwrap();
-            // Future basis strings are rejected by the public validator; they
-            // still can never mint a stored witness through recovery.
-            if basis == Some("future_basis") {
-                assert!(validate_ack(&m, &response).is_err());
-                continue;
-            }
+            // Any present basis, including a future basis, overrides an
+            // echoed exact witness: it is resolved but never stored proof.
             validate_ack(&m, &response).unwrap();
             let mut progress = SnapshotUploadProgress::new(
                 "test".into(),

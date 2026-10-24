@@ -36727,20 +36727,27 @@ impl ScanIndex {
     /// directory or entry it cannot read, the root is treated as listed
     /// (held, never sent).
     fn close_claude_reemission_list_over_root_members(&mut self, candidate: &CandidateFile) {
+        self.close_claude_reemission_root_path(&candidate.path);
+    }
+
+    fn close_claude_reemission_root_path(&mut self, path: &Path) {
         const MAX_MEMBER_ENTRIES: usize = 4_096;
         if self.claude_reemission_exclusions.is_empty()
-            || self.claude_reemission_excluded(candidate)
+            || claude_index_path_member_ref(path).is_some_and(|member| {
+                self.claude_reemission_exclusions
+                    .excludes(member.root, member.subagent_stem)
+            })
         {
             return;
         }
-        let Some(member) = claude_index_path_member_ref(&candidate.path) else {
+        let Some(member) = claude_index_path_member_ref(path) else {
             return;
         };
         if member.subagent_stem.is_some() {
             return;
         }
         let root = member.root.to_owned();
-        let mut pending = vec![candidate.path.with_extension("").join("subagents")];
+        let mut pending = vec![path.with_extension("").join("subagents")];
         let mut members = Vec::new();
         let mut visited = 0_usize;
         while let Some(directory) = pending.pop() {
@@ -36884,6 +36891,11 @@ impl ScanIndex {
         roots: &[(&str, &[String])],
     ) -> bool {
         self.load_claude_reemission_exclusions(support);
+        for (_, files) in roots {
+            for file in *files {
+                self.close_claude_reemission_root_path(Path::new(file));
+            }
+        }
         if claude_reemission_stop_latched()
             || self.active_request_money_adoption_paused
             || self.claude_reemission_exclusions.pauses_adoption()

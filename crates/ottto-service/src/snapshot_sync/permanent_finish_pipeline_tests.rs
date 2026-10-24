@@ -7,6 +7,10 @@ enum FinishOutcome {
     Accept,
     LostCommitted,
     LostUncommitted,
+    HttpFailure {
+        status: u16,
+        retry_after: u64,
+    },
     MoneyHeld,
     MoneyRouteUnavailable,
     Permanent,
@@ -132,6 +136,16 @@ impl FinishServer {
 
                     if let Some(hook) = post_hook.lock().unwrap().take() {
                         hook();
+                    }
+                    if let FinishOutcome::HttpFailure {
+                        status,
+                        retry_after,
+                    } = outcome
+                    {
+                        let body = "{\"detail\":\"synthetic refusal\"}";
+                        write!(stream, "HTTP/1.1 {status} Synthetic\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: {retry_after}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                        stream.flush().unwrap();
+                        continue;
                     }
                     if matches!(outcome, FinishOutcome::MoneyRouteUnavailable) {
                         bounded_native_response(&mut stream, "503 Service Unavailable",
