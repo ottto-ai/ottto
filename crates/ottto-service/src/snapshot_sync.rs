@@ -6670,9 +6670,16 @@ async fn finish_sync_source_resume(
                 {
                     continue;
                 }
-                let Some(scratch) =
-                    crate::snapshots::snapshot_upload_body_witness_scratch_bound(item)
-                else {
+                let Some(scratch) = crate::snapshots::snapshot_upload_body_witness_scratch_bound(
+                    item,
+                )
+                .and_then(|witness| {
+                    crate::heap_layout_bound::completed_bound(
+                        item,
+                        crate::snapshots::claude_request_money::SHADOW_MEMORY_CEILING_BYTES,
+                    )
+                    .and_then(|projection| witness.checked_add(projection))
+                }) else {
                     continue;
                 };
                 let Some(_scratch) =
@@ -6684,7 +6691,17 @@ async fn finish_sync_source_resume(
                     }
                     continue;
                 };
-                let witness = snapshot_upload_body_witness(item);
+                // Compare the same final projection used by finalization and
+                // the POST. Local cache patches can exist while wire delivery
+                // is disabled; their raw digest cannot invalidate a saved ACK.
+                let witness = effective_snapshot_upload_body_witness(
+                    item,
+                    &upload_progress,
+                    cache_observations_enabled,
+                    activity_hint.snapshot_head_cas_required,
+                    &legacy_reconciliation_pending,
+                    &claude_authority_disposition,
+                );
                 if upload_progress
                     .accepted_body_witnesses
                     .get(&item.snapshot_fingerprint)
