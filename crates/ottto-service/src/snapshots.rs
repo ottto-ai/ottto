@@ -14796,8 +14796,7 @@ impl SnapshotAccumulator {
         mut capture: Option<&mut claude_request_money::ClaudeResponseCapture>,
     ) {
         if let Some(capture) = capture.as_deref_mut() {
-            let keys = self.claude_responses.message_keys();
-            capture.note_messages(keys.clone().count(), keys);
+            capture.note_messages(self.claude_responses.message_keys());
         }
         let (mut responses, selectors) = std::mem::take(&mut self.claude_responses).into_parts();
         responses.sort_by_key(|response| response.sequence);
@@ -30449,6 +30448,62 @@ fn claude_fork_line_provenance(value: &Value) -> ClaudeForkLineProvenance {
         ClaudeForkLineProvenance::Inherited
     } else {
         ClaudeForkLineProvenance::Invalid
+    }
+}
+
+/// Prepare synthetic native input before a timing/fairness probe. The
+/// returned closure runs the real finalizers/capture hooks, with no fixture
+/// file I/O between them. Production scanning is unchanged.
+#[cfg(test)]
+pub(crate) fn prepare_money_finalizers_for_test(
+    support: &Path,
+    index: &ScanIndex,
+) -> impl FnOnce() {
+    let selected = claude_request_money::capture::planned_families_for_test(support)
+        .unwrap_or_else(|| {
+            index
+                .files
+                .keys()
+                .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
+                .map(|member| claude_request_census::family_key(member.root))
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .take(claude_request_money::capture::NEXT_PAGE_FAMILIES)
+                .collect()
+        });
+    let prepared = index
+        .files
+        .iter()
+        .filter(|(key, _)| {
+            claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                selected.contains(&claude_request_census::family_key(member.root))
+            })
+        })
+        .map(|(key, entry)| {
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            let input = BufReader::new(std::fs::File::open(key).expect("synthetic transcript"));
+            for line in input.lines() {
+                let line = line.expect("synthetic line");
+                apply_claude_code_line(
+                    &serde_json::from_str(&line).expect("synthetic record"),
+                    &mut accumulator,
+                );
+            }
+            (
+                PathBuf::from(key),
+                entry.source_file_fingerprint.clone(),
+                accumulator,
+            )
+        })
+        .collect::<Vec<_>>();
+    move || {
+        for (path, fingerprint, mut accumulator) in prepared {
+            let mut capture = claude_request_money::ClaudeResponseCapture::begin(&path);
+            accumulator.finalize_claude_responses_captured(capture.as_mut());
+            if let Some(capture) = capture {
+                capture.deposit(local_index_key(&path), fingerprint);
+            }
+        }
     }
 }
 

@@ -4,21 +4,22 @@
 //! The loop wakes hourly and runs once per UTC day, after the daemon has
 //! been up for `MIN_UPTIME`, at utility QoS. The day is saved when the run
 //! starts, so a crash never repeats a day. New bytes are read without a cap;
-//! full reads (files rewritten in place, files live at install) share
+//! full reads (files rewritten in place) share
 //! `REPAIR_BYTES_PER_DAY`, newest first, each up to its size when granted,
 //! and the rest wait for a later day (counted). A run stops at
 //! `RUN_WALL_CAP`; each scope commits on its own, so a cut run never counts
 //! anything twice.
 //!
-//! First run (no pins yet) is forward-only: files modified in the last
-//! `LIVE_AT_INSTALL` are read once from their start within the repair
-//! budget; every other file starts at its current size. An install record is
-//! saved before any scope commits. If the first run stops before its pins
-//! are saved, the next run finds the record without pins and resets the
-//! agent forward-only (counted): the history live at install is then never
-//! measured. Later, a file with no pin that was born after the last saved
-//! scan started is new and read from its start; any other file with no pin
-//! (or no known birth time) starts at its current size, counted.
+//! First run (no pins yet) is strictly forward-only: every file it finds,
+//! even one still being written, starts at its current size (counted as
+//! `install_forward_only`); nothing written before the install is read. An
+//! install record is saved before any scope commits. If the first run stops
+//! before its pins are saved, the next run finds the record without pins and
+//! resets the agent the same way (counted). Later, a file with no pin that
+//! was born after the last saved scan started is new and read from its
+//! start; any other file with no pin (or no known birth time) starts at its
+//! current size, counted. Full reads still waiting from an earlier build's
+//! install keep draining within the repair budget.
 //!
 //! Bad state is quarantined and counted. On a later run its files restart
 //! at their current ends; no prior generation or transcript history is replayed.
@@ -53,9 +54,8 @@ use super::upload::{
     upload_scope, UploadOutcome, UploadReceipt, UploadResult, UploadTarget, Uploader,
 };
 use super::{
-    AUDIT_BYTES_PER_DAY, COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, LIVE_AT_INSTALL,
-    MIN_UPTIME, PARSER_VERSION, REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA,
-    WAKE_INTERVAL,
+    AUDIT_BYTES_PER_DAY, COPIED_SLACK_SECS, FORGET_MISSING_DAYS, KEEP_DAYS, MIN_UPTIME,
+    PARSER_VERSION, REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
 use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
@@ -688,7 +688,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
     let at = now.format(&Rfc3339).unwrap_or_default();
     let lines = &stats.lines;
     eprintln!(
-        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_skipped_undated={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
+        "context_composition_v2_metrics at={at} source={} bytes_new={} bytes_repair={} bytes_head={} bytes_failed={} files_read={} files_failed={} quarantined={} new_files={} dormant_found={} install_forward_only={} verdict_deferred={} lines={} prefix_skipped={} classifier_skipped={} too_long={} bad_lines={} dropped_calls={} dropped_items={} unnamed_files={} name_lookups_skipped={} web_search_in_call={} scan_errors={} repair_waiting={} repair_waiting_bytes={} repair_restarted={} cold_compacted={} cold_restarted={} bad_state={} agent_resets={} scopes_quarantined={} files_quarantined={} checkpoint_restarts={} pins_rebuilt={} moved={} switched={} archived={} duplicates={} unscoped={} scopes_committed={} scopes_failed={} uploaded={} upload_unchanged={} upload_failed={} upload_dropped_non_v2={} upload_dropped_unsafe={} upload_payload_bytes={} upload_rows_written={} bytes_audit={} audit_files={} audit_differences={} audit_skipped={} audit_skipped_undated={} audit_failed={} files_checked={} full_read_waiting_files={} full_read_backlog_bytes={} bytes_read={} cut={} cpu_ms={} wall_ms={} peak_accounted_bytes={} state_bytes={}",
         source.label(),
         stats.bytes_new,
         stats.bytes_repair,
@@ -699,6 +699,7 @@ fn print_metrics(source: Source, stats: &SourceStats, now: OffsetDateTime) {
         stats.quarantined,
         stats.new_files,
         stats.dormant_found,
+        stats.install_forward_only,
         stats.verdict_deferred,
         lines.lines,
         lines.prefix_skipped,
@@ -908,6 +909,9 @@ pub(super) struct SourceStats {
     pub(super) quarantined: u64,
     pub(super) new_files: u64,
     pub(super) dormant_found: u64,
+    /// Files an install or agent reset started at their current end (a
+    /// subset of `dormant_found`): their earlier bytes are never read.
+    pub(super) install_forward_only: u64,
     /// Fresh openings left unread while their snapshot verdict is pending.
     pub(super) verdict_deferred: u64,
     pub(super) moved: u64,
@@ -1386,21 +1390,20 @@ fn run_source_inner(
     for (key, file) in &present {
         let needs = match index.files.get_mut(key) {
             None => {
-                // Live at install: read once from its start within the
-                // repair budget. Born after the last saved scan: new bytes.
-                // An unknown birth time is never taken as new.
-                let live = first_run && now_secs - file.stamp.0 <= LIVE_AT_INSTALL.as_secs() as i64;
-                let born_later = file
+                // Born after the last saved scan: new bytes, read from zero.
+                // An unknown birth time is never taken as new. An install or
+                // reset has no saved scan, so it starts every file it finds at
+                // its current end, however recently it was written.
+                let new = file
                     .born
                     .zip(previous_scan)
                     .is_some_and(|(born, last)| born >= last);
-                let new = live || born_later;
                 if new && !agent_reset {
                     let pending = opening_verdict_pending(run, source, file, &mut stats);
                     if pending != Some(false) {
                         // No pin or checkpoint is created. Preserve new-byte
-                        // eligibility for the next daily run, even at install;
-                        // it reads Forward from zero without a repair grant.
+                        // eligibility for the next daily run; it reads
+                        // Forward from zero without a repair grant.
                         index.last_scan_started = Some(
                             index
                                 .last_scan_started
@@ -1436,10 +1439,11 @@ fn run_source_inner(
                     }
                 }
                 let start = if new { 0 } else { file.size };
-                let waiting = live;
                 if !new {
                     stats.dormant_found += 1;
-                    if !first_run && !agent_reset {
+                    if first_run || agent_reset {
+                        stats.install_forward_only += 1;
+                    } else {
                         stats.checkpoint_restarts += 1;
                     }
                 }
@@ -1453,7 +1457,7 @@ fn run_source_inner(
                         start,
                         size: file.size,
                         mtime: file.stamp,
-                        waiting,
+                        waiting: false,
                         done: false,
                         last_seen: today,
                         // First seen by the install run when it found it.
