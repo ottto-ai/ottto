@@ -290,6 +290,7 @@ impl Serialize for ScanIndex {
         field!(claude_history_move_not_full, std::ops::Not::not);
         field!(claude_history_move_released, std::ops::Not::not);
         field!(accepted_incidence_pending_census, std::ops::Not::not);
+        field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -368,6 +369,7 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_history_move_not_full",
     "claude_history_move_released",
     "accepted_incidence_pending_census",
+    "accepted_rebuild_incidence",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -434,6 +436,9 @@ pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
     "claude_duplicate_request_owners",
     "claude_duplicate_request_witness_overflowed",
     "accepted_snapshot_fingerprints",
+    "file_snapshot_fingerprints",
+    "accepted_incidence_pending_census",
+    "accepted_rebuild_incidence",
     "historical_replay_generation",
     "context_curve_capability_enabled",
     "context_curve_replay_epoch",
@@ -962,6 +967,64 @@ impl<R: BufRead + Seek> Decoder<R> {
     fn span_optional(&mut self, optional: bool) -> std::result::Result<Span, Error> {
         lexical_span(&mut self.reader, optional, 1)
     }
+    /// The carried debt has its own entry/byte fund. Admit each key and ACK
+    /// before allocation; charge wire bytes plus conservative retained metadata.
+    fn carried_incidence(
+        &mut self,
+        span: Span,
+    ) -> std::result::Result<BTreeMap<String, BTreeSet<String>>, Error> {
+        self.reader.seek(SeekFrom::Start(span.start))?;
+        if self.ws()? != Some(b'{') {
+            return Err(Error::Refused("carried incidence type"));
+        }
+        self.eat(b'{')?;
+        let mut entries = 0usize;
+        let mut bytes = 0u64;
+        let mut result = BTreeMap::new();
+        while self.ws()? != Some(b'}') {
+            let key = self.span()?;
+            entries = entries.saturating_add(1);
+            bytes = bytes.saturating_add(key.len).saturating_add(256);
+            if entries > CARRIED_ACK_ENTRIES_MAX || bytes > CARRIED_ACK_BYTES_MAX as u64 {
+                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+            }
+            let key: String = self.typed(key)?;
+            self.eat(b':')?;
+            if self.ws()? != Some(b'[') {
+                return Err(Error::Refused("carried incidence members type"));
+            }
+            self.eat(b'[')?;
+            let mut members = BTreeSet::new();
+            while self.ws()? != Some(b']') {
+                let fp = self.span()?;
+                entries = entries.saturating_add(1);
+                bytes = bytes
+                    .saturating_add(fp.len.saturating_mul(2))
+                    .saturating_add(256);
+                if entries > CARRIED_ACK_ENTRIES_MAX || bytes > CARRIED_ACK_BYTES_MAX as u64 {
+                    return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+                }
+                let fp: String = self.typed(fp)?;
+                members.insert(fp);
+                if self.ws()? == Some(b',') {
+                    self.eat(b',')?;
+                } else {
+                    break;
+                }
+            }
+            self.eat(b']')?;
+            if result.insert(key, members).is_some() {
+                return Err(Error::Refused("duplicate carried incidence key"));
+            }
+            if self.ws()? == Some(b',') {
+                self.eat(b',')?;
+            } else {
+                break;
+            }
+        }
+        self.eat(b'}')?;
+        Ok(result)
+    }
     fn typed<T: serde::de::DeserializeOwned>(
         &mut self,
         span: Span,
@@ -1129,12 +1192,27 @@ impl<R: BufRead + Seek> Decoder<R> {
         self.eat(b'}')?;
         Ok(values)
     }
-    fn accepted(&mut self, span: Span) -> std::result::Result<BTreeSet<String>, Error> {
+    fn accepted(
+        &mut self,
+        span: Span,
+        bounded_carry: bool,
+    ) -> std::result::Result<BTreeSet<String>, Error> {
         self.reader.seek(SeekFrom::Start(span.start))?;
         self.eat(b'[')?;
         let mut values = BTreeSet::new();
+        let mut charged = 0u64;
+        let mut entries = 0usize;
         while self.ws()? != Some(b']') {
             let value = self.span()?;
+            charged = charged
+                .saturating_add(value.len.saturating_mul(2))
+                .saturating_add(256);
+            entries = entries.saturating_add(1);
+            if bounded_carry
+                && (entries >= CARRIED_ACK_ENTRIES_MAX || charged > CARRIED_ACK_BYTES_MAX as u64)
+            {
+                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+            }
             match self.typed::<String>(value) {
                 Ok(key) if is_snapshot_fingerprint(&key) => {
                     values.insert(key);
@@ -1475,14 +1553,29 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.confirmed_empty_files = self.typed(value)?
                         }
                         "file_snapshot_fingerprints" => {
-                            index.file_snapshot_fingerprints = self.typed(value)?
+                            if pass == Pass::IdentityCarry
+                                && value.len > CARRIED_ACK_BYTES_MAX as u64
+                            {
+                                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+                            }
+                            index.file_snapshot_fingerprints = if pass == Pass::IdentityCarry {
+                                self.carried_incidence(value)?
+                            } else {
+                                self.typed(value)?
+                            }
                         }
                         "snapshot_activity_at" => {
                             index.snapshot_activity_at =
                                 self.records("snapshot_activity_at", value, false)?
                         }
                         "accepted_snapshot_fingerprints" => {
-                            index.accepted_snapshot_fingerprints = self.accepted(value)?
+                            if pass == Pass::IdentityCarry
+                                && value.len > CARRIED_ACK_BYTES_MAX as u64
+                            {
+                                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+                            }
+                            index.accepted_snapshot_fingerprints =
+                                self.accepted(value, pass == Pass::IdentityCarry)?
                         }
                         "accepted_snapshot_fingerprint_ledger_version" => {
                             index.accepted_snapshot_fingerprint_ledger_version =
@@ -1522,6 +1615,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.accepted_incidence_pending_census =
                                 self.history_scalar(value, true)?;
                         }
+                        "accepted_rebuild_incidence" => {
+                            if value.len > CARRIED_ACK_BYTES_MAX as u64 {
+                                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+                            }
+                            index.accepted_rebuild_incidence = self.carried_incidence(value)?;
+                            index.admit_carried_ack_debt()?;
+                        }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }
                 }
@@ -1539,6 +1639,15 @@ impl<R: BufRead + Seek> Decoder<R> {
         }
 
         if pass == Pass::Full {
+            // Migrate the old marker without granting later ACKs blanket retention.
+            if index.accepted_incidence_pending_census
+                && index.accepted_rebuild_incidence.is_empty()
+            {
+                index
+                    .accepted_rebuild_incidence
+                    .insert(String::new(), index.accepted_snapshot_fingerprints.clone());
+            }
+            index.admit_carried_ack_debt()?;
             let authority_span = self
                 .family_spans
                 .get("claude_usage_authority_quarantine")
@@ -1665,6 +1774,13 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine.remove(&key);
+                        }
+                        "accepted_rebuild_incidence" => {
+                            if value.len > CARRIED_ACK_BYTES_MAX as u64 {
+                                return Err(Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+                            }
+                            index.accepted_rebuild_incidence = self.typed(value)?;
+                            index.admit_carried_ack_debt()?;
                         }
                         _ => return Err(Error::Refused("unhandled index field")),
                     }

@@ -782,6 +782,102 @@ fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
     });
 }
 
+/// MONEY P1: seed genuine accepted incidence immediately before the override,
+/// not before a syntax rebuild that would already have erased the ACK ledger.
+/// Retain it through complete census and files held without further parses;
+/// release must reconstruct those files with zero re-offer of accepted history.
+#[test]
+fn user_repair_override_carries_accepted_history_through_census_and_release() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-override-carried-ack-release");
+    let baseline = fixture.baseline();
+    let state = serde_json::to_value(&baseline).unwrap();
+    let accepted = state["accepted_snapshot_fingerprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|fp| fp.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(accepted.len(), HISTORY_SESSIONS.len());
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    assert_eq!(
+        ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support
+        )
+        .unwrap()
+        .1,
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+    );
+    // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    fixture.exceed_decode_hold_budget();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(
+        crate::snapshots::arm_scan_index_rebuild_manual_override(
+            SnapshotSource::ClaudeCode,
+            std::time::SystemTime::now()
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+    let assert_acks = |index: &ScanIndex| {
+        assert!(accepted
+            .iter()
+            .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.scan.census_complete);
+        assert!(held.uploaded.is_empty());
+        assert_eq!(held.corrections, 0);
+        assert!(held.index.current_snapshot_fingerprints().is_empty());
+        assert_acks(&held.index);
+        let carried =
+            serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
+        assert_eq!(carried, state["file_snapshot_fingerprints"]);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert!(again.scan.census_complete);
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "held files never re-parse"
+        );
+        assert!(again.uploaded.is_empty());
+        assert_acks(&again.index);
+        assert_eq!(
+            serde_json::to_value(&again.index).unwrap()["accepted_rebuild_incidence"],
+            carried
+        );
+        fixture.install_list(&[]);
+        let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        assert!(released.scan.census_complete);
+        assert_eq!(
+            released.scan.scanned_file_count,
+            HISTORY_SESSIONS.len(),
+            "release reconstructs each file"
+        );
+        assert!(
+            released.uploaded.is_empty(),
+            "accepted history must never re-offer: {:?}",
+            released.uploaded
+        );
+        assert_eq!(released.corrections, 0);
+        assert_acks(&released.index);
+        assert_eq!(released.index.current_snapshot_fingerprints(), accepted);
+        assert!(serde_json::to_value(&released.index)
+            .unwrap()
+            .get("accepted_rebuild_incidence")
+            .is_none());
+    });
+}
+
 /// Addendum 1 items 2 and 5 (P2), SOURCE F2: revision 3 is above
 /// `MAX_GATED_CLAUDE_REVISION`, so the gate holds every upgrade
 /// (`ungated_revision`) and a listed family's genuine change is denied; no

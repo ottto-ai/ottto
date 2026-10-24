@@ -2022,6 +2022,9 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
             "claude_desktop_census_witness" => {
                 serde_json::json!({"completed_at_unix_seconds":1,"process_id":1,"inventory":"inventory"})
             }
+            "accepted_rebuild_incidence" => {
+                serde_json::json!({"/synthetic/carried.jsonl":["a".repeat(64)]})
+            }
             "claude_stale_family_carry" => serde_json::json!({"roots":["carried-family"]}),
             "traversal" => {
                 serde_json::json!({"context_fingerprint":"context","census_window_end":"2026-10-22T00:00:00Z","scan_roots":["/synthetic"],"pending_directories":[],"pending_candidates":[],"observed_index_keys":["file"],"reconciliation_upper_bound":"file","reconciliation_after":null,"reconciliation_started":true,"counts":{}})
@@ -2839,9 +2842,17 @@ fn user_repair_override_keeps_prior_identity_authoritative_through_failures() {
             restarted.session_account_bindings[&owner_key].account_identifier_hash,
             OVERRIDE_OWNER_A
         );
-        // Once a census re-derived incidence, settlement prunes carried
-        // acknowledgements no current file anchors.
+        // Only reconstructing each carried file retires its debt; census alone
+        // proves neither reconstruction nor the release of history-held files.
         assert!(restarted.accepted_incidence_pending_census, "{context}");
+        assert!(
+            !restarted.accepted_rebuild_incidence.is_empty(),
+            "{context}"
+        );
+        for key in seed.file_snapshot_fingerprints.keys() {
+            restarted.accepted_rebuild_incidence.remove(key);
+        }
+        assert!(restarted.accepted_rebuild_incidence.is_empty(), "{context}");
         restarted.accepted_incidence_pending_census = false;
         restarted.record_accepted_snapshot_fingerprints(&BTreeSet::new());
         assert!(
@@ -2940,12 +2951,22 @@ fn user_repair_override_refuses_when_identity_state_is_unrecoverable() {
             scan_index_rebuild_override_refusal(source),
             Some(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE)
         );
-        // It stays paused: automatic loads keep refusing, and the spent press
-        // keeps its 24-hour cooldown.
+        // Automatic loads keep refusing. A later press gives the SAME refusal,
+        // never "already used": refusal did not spend the successful cooldown.
         refused();
         assert_eq!(
             arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
-            ScanIndexRebuildOverride::Cooldown
+            ScanIndexRebuildOverride::Refused(
+                SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE
+            )
+        );
+        assert_eq!(
+            scan_index_rebuild_override_identity_unrecoverable_count(),
+            refusals + 2
+        );
+        assert_eq!(
+            with_scan_index_rebuild_override(source, |state| state.last_override_unix_seconds),
+            None
         );
         assert_eq!(fs::read(&path).unwrap(), damage, "{case}");
     }
@@ -3045,5 +3066,179 @@ fn user_repair_override_cooldown_is_source_wide_across_destinations() {
             SystemTime::now() + std::time::Duration::from_secs(25 * 60 * 60)
         ),
         ScanIndexRebuildOverride::Armed
+    );
+}
+
+#[test]
+fn carried_ack_debt_is_fixed_while_new_sibling_revisions_prune() {
+    let seed = fixture();
+    let mut rebuilt = ScanIndex::default();
+    rebuilt.carry_identity_from(seed.clone()).unwrap();
+    let initial_debt = rebuilt.accepted_rebuild_incidence.clone();
+    let initial_size = rebuilt.carried_ack_debt_size();
+    assert!(initial_size.0 > 0 && initial_size.1 > 0);
+    assert!(initial_size.0 <= CARRIED_ACK_ENTRIES_MAX);
+    assert!(initial_size.1 <= CARRIED_ACK_BYTES_MAX);
+    // No census can finish, but an ordinary healthy sibling keeps changing.
+    // Only the originally carried ACKs survive; superseded new ACKs do not.
+    for revision in 100..200 {
+        let fp = format!("{revision:064x}");
+        rebuilt
+            .file_snapshot_fingerprints
+            .insert("healthy".into(), BTreeSet::from([fp.clone()]));
+        rebuilt.record_accepted_snapshot_fingerprints(&BTreeSet::from([fp.clone()]));
+        rebuilt.retain_quarantined_fingerprints(&BTreeMap::new());
+        assert_eq!(rebuilt.accepted_rebuild_incidence, initial_debt);
+        assert_eq!(rebuilt.carried_ack_debt_size(), initial_size);
+        let mut expected = seed.accepted_snapshot_fingerprints.clone();
+        expected.insert(fp);
+        assert_eq!(rebuilt.accepted_snapshot_fingerprints, expected);
+    }
+    let scratch = crate::test_scratch::ScratchDir::new("carried-ack-bounded-restart");
+    let path = scratch.join("index.json");
+    rebuilt.save(&path).unwrap();
+    let reloaded = ScanIndex::load(&path).unwrap();
+    assert_eq!(reloaded.accepted_rebuild_incidence, initial_debt);
+    assert_eq!(reloaded.carried_ack_debt_size(), initial_size);
+    assert!(scan_index_containment_lines_for_test()
+        .iter()
+        .any(|line| line.contains(&format!(
+            "scan_index_rebuild_carried_ack_debt_entries={}",
+            initial_size.0
+        )) && line.contains(&format!(
+            "scan_index_rebuild_carried_ack_debt_bytes={}",
+            initial_size.1
+        ))));
+}
+
+#[test]
+fn carried_ack_debt_admission_refuses_before_writes_and_counts_by_code() {
+    let source = SnapshotSource::ClaudeCode;
+    for byte_exhaustion in [false, true] {
+        reset_override_state_for_restart();
+        let scratch = crate::test_scratch::ScratchDir::new("carried-ack-admission");
+        let path = scratch.join("index.json");
+        let support = scratch.join("support");
+        let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+        fs::write(&path, b"{").unwrap();
+        assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+        let mut seed = fixture();
+        if byte_exhaustion {
+            // A key must be admitted before allocating/retaining its String.
+            seed.file_snapshot_fingerprints.insert(
+                "x".repeat(CARRIED_ACK_BYTES_MAX),
+                BTreeSet::from(["0".repeat(64)]),
+            );
+        } else {
+            seed.file_snapshot_fingerprints.insert(
+                "many".into(),
+                (0..CARRIED_ACK_ENTRIES_MAX)
+                    .map(|n| format!("{n:064x}"))
+                    .collect(),
+            );
+        }
+        let damage = struct_order_budget_damage(&seed, "");
+        fs::write(&path, &damage).unwrap();
+        assert!(load()
+            .unwrap_err()
+            .downcast_ref::<ScanIndexRebuildLoop>()
+            .is_some());
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Armed
+        );
+        let budget = scan_index_rebuild_override_refused_count(
+            SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE,
+        );
+        let identity = scan_index_rebuild_override_identity_unrecoverable_count();
+        let manual = scan_index_rebuild_manual_override_count();
+        let error = load().unwrap_err();
+        assert!(format!("{error:#}").contains(SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE));
+        assert_eq!(fs::read(&path).unwrap(), damage);
+        assert_eq!(corrupt_count(scratch.as_ref()), 1);
+        assert!(!scan_index_override_stamp_path(&support, source).exists());
+        assert_eq!(scan_index_rebuild_manual_override_count(), manual);
+        assert_eq!(
+            scan_index_rebuild_override_identity_unrecoverable_count(),
+            identity
+        );
+        assert_eq!(
+            scan_index_rebuild_override_refused_count(
+                SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
+            ),
+            budget + 1
+        );
+        assert_eq!(
+            arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+            ScanIndexRebuildOverride::Refused(SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE)
+        );
+        assert_eq!(
+            scan_index_rebuild_override_refused_count(
+                SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
+            ),
+            budget + 2
+        );
+        assert_eq!(
+            with_scan_index_rebuild_override(source, |state| state.last_override_unix_seconds),
+            None
+        );
+    }
+}
+
+#[test]
+fn override_persistence_refusal_leaves_cooldown_unspent() {
+    reset_override_state_for_restart();
+    let source = SnapshotSource::ClaudeCode;
+    let scratch = crate::test_scratch::ScratchDir::new("override-write-refusal");
+    let path = scratch.join("index.json");
+    let support = scratch.join("support");
+    let load = || ScanIndex::load_for_snapshot_source_with_origin(&path, source, &support);
+    fs::write(&path, b"{").unwrap();
+    assert_eq!(load().unwrap().1, ScanIndexLoadOrigin::Quarantined);
+    let damage = struct_order_budget_damage(&fixture(), "");
+    fs::write(&path, &damage).unwrap();
+    assert!(load()
+        .unwrap_err()
+        .downcast_ref::<ScanIndexRebuildLoop>()
+        .is_some());
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Armed
+    );
+    let stamp = scan_index_override_stamp_path(&support, source);
+    // A synthetic obstruction makes stamp staging fail before replacement.
+    fs::create_dir_all(stamp.with_extension(format!("json.{}.tmp", std::process::id()))).unwrap();
+    let before =
+        scan_index_rebuild_override_refused_count(SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE);
+    let identity = scan_index_rebuild_override_identity_unrecoverable_count();
+    let budget = scan_index_rebuild_override_refused_count(
+        SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE,
+    );
+    let error = load().unwrap_err();
+    assert!(format!("{error:#}").contains(SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE));
+    assert_eq!(fs::read(&path).unwrap(), damage);
+    assert_eq!(corrupt_count(scratch.as_ref()), 1);
+    assert!(!stamp.exists());
+    assert_eq!(
+        with_scan_index_rebuild_override(source, |state| state.last_override_unix_seconds),
+        None
+    );
+    assert_eq!(
+        arm_scan_index_rebuild_manual_override(source, SystemTime::now()),
+        ScanIndexRebuildOverride::Refused(SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE)
+    );
+    assert_eq!(
+        scan_index_rebuild_override_refused_count(SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE),
+        before + 2
+    );
+    assert_eq!(
+        scan_index_rebuild_override_identity_unrecoverable_count(),
+        identity
+    );
+    assert_eq!(
+        scan_index_rebuild_override_refused_count(
+            SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
+        ),
+        budget
     );
 }

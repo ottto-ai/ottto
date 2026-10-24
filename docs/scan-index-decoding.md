@@ -38,15 +38,34 @@ A paused source reports `scan_index_rebuild_loop` with its automatic retry time
 (token-less `repair`, not dry run) may pass the guard once: the next source load
 strictly decodes the session-identity fields (bindings, deferred holds,
 contract token, owned-start census, stale-family carry, duplicate owners and
-fence flag, current-ledger accepted fingerprints) from the damaged bytes and
+fence flag, current-ledger accepted fingerprints and their per-file incidence,
+plus completed replay and curve generations) from the damaged bytes and
 durably replaces the index with a generation-0 gated rebuild that carries them
-(contract latch set; carried acknowledgements kept until the replacement census
-completes), keeps the damaged bytes as `.corrupt.override.`, counts
+(contract latch set; carried acknowledgements retained per file until that
+file is completely reconstructed through the emission policy, including
+history-held files that never re-parse during a full census), keeps the damaged bytes as `.corrupt.override.`, counts
 `scan_index_rebuild_manual_override` and logs one line. If any of those fields
 cannot be strictly recovered (syntax damage included), the override refuses:
-the source stays paused, the index is untouched, the press is spent, and
+the source stays paused, the index is untouched, and the successful-override
+cooldown is not spent. A later press returns the same clear refusal.
 `scan_index_rebuild_override_identity_unrecoverable` is counted, alarmed and
-named in the health `clear_condition`. The witness re-arms the seven-day guard;
+named in the health `clear_condition`. Syntax damage waits for the seven-day
+automatic retry: sessions arrive late, not lost.
+
+Carried ACK debt is separate from ordinary ACKs: only the original identities
+are retained, so superseded healthy-sibling revisions still prune. Entry and
+byte admission charge file keys, ACK strings, duplicate ledger storage and
+bookkeeping before retention: at most 4,096 combined file/identity slots and
+8 MiB. Admission exhaustion refuses before writing the index or cooldown;
+`scan_index_rebuild_override_carried_ack_budget_exhausted` counts that code
+separately from identity, persistence and cooldown refusals. Content-free
+`scan_index_rebuild_carried_ack_debt_entries` and
+`scan_index_rebuild_carried_ack_debt_bytes` disclose the admitted debt size.
+Unknown original incidence stays bounded and retained rather than guessing a
+file or granting new ACKs blanket retention. Releasing a file suppresses its
+already accepted entities and transfers its reconstructed membership to the
+ordinary ACK ledger; a partial commit retires debt only for committed files.
+ The witness re-arms the seven-day guard;
 the 24-hour cooldown is durable per checkpoint and source-wide
 (`<support>/snapshots/<source>-scan-index-rebuild-override.json`, outside every
 destination namespace, so a re-pair does not reset it; future or malformed

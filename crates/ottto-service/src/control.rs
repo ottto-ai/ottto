@@ -4225,6 +4225,13 @@ fn scan_index_rebuild_override_repair(
             #[cfg(test)]
             let _ = daemon;
         }
+        crate::snapshots::ScanIndexRebuildOverride::Refused(code) => {
+            plan.status = RepairPlanStatus::Blocked;
+            plan.authority.message = StableMessage {
+                code: code.to_string(),
+                text: format!("Repair could not safely recover the local record. The source stays paused and its files are kept.{retry}"),
+            };
+        }
         crate::snapshots::ScanIndexRebuildOverride::Cooldown => {
             plan.status = RepairPlanStatus::Blocked;
             plan.authority.message = StableMessage {
@@ -31649,6 +31656,44 @@ X-API-Key = "otel_redacted"
             crate::snapshots::scan_index_rebuild_manual_override_count(),
             1
         );
+        // Another source's syntax refusal returns its actual reason again on
+        // the next companion press; it never claims Repair was already used.
+        fs::write(&codex, b"{ ").expect("unrecoverable identity");
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::Codex,
+                SystemTime::now()
+            ),
+            crate::snapshots::ScanIndexRebuildOverride::Armed
+        );
+        assert!(ScanIndex::load_for_snapshot_source_with_origin(
+            &codex,
+            SnapshotSource::Codex,
+            &root
+        )
+        .is_err());
+        let plan = propose_repair_plan(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            SourceKind::Codex,
+            false,
+        )
+        .expect("ordinary repair plan");
+        // Reuse the ordinary plan's authority; the override only changes its
+        // result and message after the signed-companion origin check.
+        let plan = scan_index_rebuild_override_repair(
+            &daemon,
+            &RequestAuthorization::TrustedCompanionApp,
+            &SourceKind::Codex,
+            &plan,
+        );
+        let plan = plan.expect("paused source has an override result");
+        assert_eq!(plan.status, RepairPlanStatus::Blocked);
+        assert_eq!(
+            plan.authority.message.code,
+            "scan_index_rebuild_override_identity_unrecoverable"
+        );
+        assert!(!plan.authority.message.text.contains("already used"));
         let _ = fs::remove_dir_all(&root);
     }
 

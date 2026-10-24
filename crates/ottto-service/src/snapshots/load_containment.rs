@@ -350,14 +350,14 @@ struct ScanIndexRebuildOverrideState {
     last_override_unix_seconds: Option<u64>,
     armed: bool,
     /// The last armed press was refused: identity state unrecoverable.
-    identity_unrecoverable: bool,
+    refusal: Option<&'static str>,
 }
 impl ScanIndexRebuildOverrideState {
     const NONE: Self = Self {
         auto_retry_unix_seconds: None,
         last_override_unix_seconds: None,
         armed: false,
-        identity_unrecoverable: false,
+        refusal: None,
     };
 }
 #[cfg(not(test))]
@@ -368,19 +368,19 @@ static SCAN_INDEX_REBUILD_OVERRIDE: std::sync::Mutex<[ScanIndexRebuildOverrideSt
 #[cfg(not(test))]
 static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
-/// Counter `scan_index_rebuild_override_identity_unrecoverable`: armed
-/// overrides this process refused because identity state was unrecoverable.
+/// Finite per-code counters: identity, carried-debt admission, persistence,
+/// and cooldown. No error strings or source contents become metric labels.
 #[cfg(not(test))]
-static SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
+static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: [std::sync::atomic::AtomicUsize; 4] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 4];
 #[cfg(test)]
 thread_local! {
     static SCAN_INDEX_REBUILD_OVERRIDE: std::cell::Cell<[ScanIndexRebuildOverrideState; 3]> =
         const { std::cell::Cell::new([ScanIndexRebuildOverrideState::NONE; 3]) };
     static SCAN_INDEX_REBUILD_MANUAL_OVERRIDE: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
-    static SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(0) };
+    static SCAN_INDEX_REBUILD_OVERRIDE_REFUSED: std::cell::Cell<[usize; 4]> =
+        const { std::cell::Cell::new([0; 4]) };
 }
 
 fn scan_index_source_slot(source: SnapshotSource) -> usize {
@@ -451,6 +451,8 @@ pub(crate) enum ScanIndexRebuildOverride {
     Armed,
     /// An override already ran or is armed within 24 hours.
     Cooldown,
+    /// The prior attempt refused without spending a successful-override cooldown.
+    Refused(&'static str),
 }
 
 /// Arm one rebuild past the seven-day guard. Only the companion's
@@ -470,10 +472,14 @@ pub(crate) fn arm_scan_index_rebuild_manual_override(
             .last_override_unix_seconds
             .is_some_and(|last| now.saturating_sub(last) <= SCAN_INDEX_OVERRIDE_COOLDOWN_SECONDS);
         if state.armed || cooling {
+            count_scan_index_rebuild_override_refused(SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE);
             return ScanIndexRebuildOverride::Cooldown;
         }
+        if let Some(code) = state.refusal {
+            count_scan_index_rebuild_override_refused(code);
+            return ScanIndexRebuildOverride::Refused(code);
+        }
         state.armed = true;
-        state.last_override_unix_seconds = Some(now);
         ScanIndexRebuildOverride::Armed
     })
 }
@@ -483,15 +489,15 @@ pub(crate) fn arm_scan_index_rebuild_manual_override(
 fn disarm_scan_index_rebuild_manual_override(source: SnapshotSource) {
     with_scan_index_rebuild_override(source, |state| {
         state.armed = false;
-        state.identity_unrecoverable = false;
+        state.refusal = None;
     });
 }
 
 /// The paused source's last armed override refusal, for the health payload.
 pub(crate) fn scan_index_rebuild_override_refusal(source: SnapshotSource) -> Option<&'static str> {
-    (scan_index_rebuild_paused(source)
-        && with_scan_index_rebuild_override(source, |state| state.identity_unrecoverable))
-    .then_some(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE)
+    scan_index_rebuild_paused(source)
+        .then(|| with_scan_index_rebuild_override(source, |state| state.refusal))
+        .flatten()
 }
 
 /// When the guard lets an automatic load rebuild this paused source: just
@@ -534,26 +540,63 @@ pub(crate) fn scan_index_rebuild_manual_override_count() -> usize {
     SCAN_INDEX_REBUILD_MANUAL_OVERRIDE.with(std::cell::Cell::get)
 }
 
+const CARRIED_ACK_ENTRIES_MAX: usize = 4096;
+const CARRIED_ACK_BYTES_MAX: usize = 8 * 1024 * 1024;
+const CARRIED_ACK_BUDGET_REFUSAL: &str = "carried ACK debt admission exhausted";
+pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE: &str =
+    "scan_index_rebuild_override_carried_ack_budget_exhausted";
+pub(crate) const SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE: &str =
+    "scan_index_rebuild_override_persistence_failed";
+
+fn override_refusal_slot(code: &str) -> usize {
+    match code {
+        SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE => 0,
+        SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE => 1,
+        SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE => 2,
+        SCAN_INDEX_REBUILD_OVERRIDE_COOLDOWN_CODE => 3,
+        _ => unreachable!("fixed override refusal code"),
+    }
+}
 #[cfg(not(test))]
-fn count_scan_index_rebuild_override_identity_unrecoverable() -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE
+fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED[override_refusal_slot(code)]
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         .saturating_add(1)
 }
-
 #[cfg(test)]
-fn count_scan_index_rebuild_override_identity_unrecoverable() -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE.with(|counter| {
-        let count = counter.get().saturating_add(1);
-        counter.set(count);
-        count
+fn count_scan_index_rebuild_override_refused(code: &str) -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| {
+        let mut counters = cell.get();
+        let slot = override_refusal_slot(code);
+        counters[slot] = counters[slot].saturating_add(1);
+        cell.set(counters);
+        counters[slot]
     })
 }
-
-/// This thread's `scan_index_rebuild_override_identity_unrecoverable` counter.
+#[cfg(test)]
+fn scan_index_rebuild_override_refused_count(code: &str) -> usize {
+    SCAN_INDEX_REBUILD_OVERRIDE_REFUSED.with(|cell| cell.get()[override_refusal_slot(code)])
+}
 #[cfg(test)]
 pub(crate) fn scan_index_rebuild_override_identity_unrecoverable_count() -> usize {
-    SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE.with(std::cell::Cell::get)
+    scan_index_rebuild_override_refused_count(
+        SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE,
+    )
+}
+
+fn refuse_scan_index_override(
+    source: SnapshotSource,
+    code: &'static str,
+    cause: &str,
+) -> anyhow::Error {
+    disarm_scan_index_rebuild_manual_override(source);
+    with_scan_index_rebuild_override(source, |state| state.refusal = Some(code));
+    let count = count_scan_index_rebuild_override_refused(code);
+    emit_scan_index_containment_line(format!(
+        "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair override_refused={code} {code}={count} cause={cause} source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; override did not rebuild, alarm, never delete the index",
+        source.api_slug()
+    ));
+    anyhow::Error::new(ScanIndexRebuildLoop).context(code)
 }
 
 fn quarantine_invalid_scan_index(
@@ -633,33 +676,40 @@ fn override_scan_index_rebuild_loop(
     support_dir: &Path,
     now: SystemTime,
 ) -> Result<ScanIndex> {
+    // Every recoverability and debt admission refusal precedes any write.
     let carry = File::open(path)
         .map_err(lenient_decode::Error::from)
         .and_then(|file| lenient_decode::read_identity_carry(file, source.api_slug()));
-    let carry = match carry {
-        Ok(carry) => carry,
-        Err(error) => {
-            // The press is spent; its 24-hour cooldown stands.
-            disarm_scan_index_rebuild_manual_override(source);
-            with_scan_index_rebuild_override(source, |state| state.identity_unrecoverable = true);
-            if let Ok(stamps) = scan_index_rebuild_witness_stamps(path) {
-                note_scan_index_rebuild_refusal(source, stamps, Some(support_dir));
+    let mut rebuilt = ScanIndex::default();
+    let carried = carry.and_then(|carry| rebuilt.carry_identity_from(carry));
+    if let Err(error) = carried {
+        let code = match error {
+            lenient_decode::Error::Refused(CARRIED_ACK_BUDGET_REFUSAL) => {
+                SCAN_INDEX_REBUILD_OVERRIDE_CARRIED_ACK_BUDGET_CODE
             }
-            let count = count_scan_index_rebuild_override_identity_unrecoverable();
-            emit_scan_index_containment_line(format!(
-                "local snapshot scan index load: source={} refusal_kind=rebuild_loop override=user_repair override_refused={code} {code}={count} cause={cause} identity_decode={} source_paused=1 index_kept=1 health_code={SCAN_INDEX_REBUILD_LOOP_CODE}; session-identity state could not be strictly recovered, so the override did not rebuild, alarm, never delete the index",
-                source.api_slug(),
-                error.kind(),
-                code = SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE,
-            ));
-            return Err(anyhow::Error::new(ScanIndexRebuildLoop)
-                .context(SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE));
+            lenient_decode::Error::Io(_) => SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE,
+            _ => SCAN_INDEX_REBUILD_OVERRIDE_IDENTITY_UNRECOVERABLE_CODE,
+        };
+        if let Ok(stamps) = scan_index_rebuild_witness_stamps(path) {
+            note_scan_index_rebuild_refusal(source, stamps, Some(support_dir));
+        }
+        return Err(refuse_scan_index_override(source, code, cause));
+    }
+    // Prepare everything reversible before spending the durable cooldown.
+    let stamp_path = scan_index_override_stamp_path(support_dir, source);
+    let prior_stamp = match fs::read(&stamp_path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => {
+            return Err(refuse_scan_index_override(
+                source,
+                SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE,
+                cause,
+            ))
         }
     };
-    let mut rebuilt = ScanIndex::default();
-    rebuilt.carry_identity_from(carry);
-    // Stamp the source-wide cooldown first: a crash after it fails closed.
-    write_scan_index_override_stamp(support_dir, source, now)?;
+    let mut stamp_attempted = false;
+    let mut replaced = false;
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
     let quarantine_path = unique_checkpoint_sibling(path, SCAN_INDEX_OVERRIDE_WITNESS_KIND);
     let result = (|| -> Result<()> {
@@ -679,13 +729,45 @@ fn override_scan_index_rebuild_loop(
         fs::hard_link(path, &quarantine_path)
             .context("keep the damaged scan index as the override witness")?;
         sync_checkpoint_parent(path)?;
+        // A crash after the stamp still fails closed across re-pairing. A
+        // returned pre-replacement failure rolls it back, so a refused press
+        // never becomes a successful-override cooldown.
+        stamp_attempted = true;
+        write_scan_index_override_stamp(support_dir, source, now)?;
         fs::rename(&temp_path, path).context("replace scan index with the override rebuild")?;
+        replaced = true;
         sync_checkpoint_parent(path)
     })();
-    if result.is_err() {
+    if result.is_err() && !replaced {
         let _ = fs::remove_file(&temp_path);
+        let _ = fs::remove_file(&quarantine_path);
+        let rollback = (|| -> Result<()> {
+            if stamp_attempted {
+                match prior_stamp {
+                    Some(bytes) => {
+                        let mut stamp = File::create(&stamp_path)?;
+                        std::io::Write::write_all(&mut stamp, &bytes)?;
+                        stamp.sync_all()?;
+                    }
+                    None => match fs::remove_file(&stamp_path) {
+                        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                            return Err(error.into())
+                        }
+                        _ => {}
+                    },
+                }
+                sync_checkpoint_parent(&stamp_path)?;
+            }
+            sync_checkpoint_parent(path)
+        })();
+        disarm_scan_index_rebuild_manual_override(source);
+        rollback.context("restore prior cooldown after failed override")?;
+        return Err(refuse_scan_index_override(
+            source,
+            SCAN_INDEX_REBUILD_OVERRIDE_PERSISTENCE_CODE,
+            cause,
+        ));
     }
-    result?;
     // Spend the press only once its witness and rebuild are durable: that
     // witness re-arms the seven-day clock and carries the 24-hour cooldown.
     disarm_scan_index_rebuild_manual_override(source);
@@ -695,6 +777,9 @@ fn override_scan_index_rebuild_loop(
         source.api_slug()
     ));
     note_scan_index_quarantine_rebuild(cause, None, Some(source));
+    // Once replaced, this was an actual override (never a refused press), even
+    // if the final directory sync reports an uncertain durability outcome.
+    result?;
     Ok(rebuilt)
 }
 
@@ -711,7 +796,10 @@ impl ScanIndex {
     /// spurious replay would clear the carried acknowledgements and
     /// owned-start census. Files, traversal and the Codex ownership ledgers
     /// (the collision-bearing fields) are rebuilt by scan.
-    fn carry_identity_from(&mut self, carry: ScanIndex) {
+    fn carry_identity_from(
+        &mut self,
+        mut carry: ScanIndex,
+    ) -> std::result::Result<(), lenient_decode::Error> {
         self.session_account_bindings = carry.session_account_bindings;
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
@@ -722,15 +810,95 @@ impl ScanIndex {
         self.claude_duplicate_request_witness_overflowed =
             carry.claude_duplicate_request_witness_overflowed;
         if carry.accepted_snapshot_fingerprint_ledger_version == SNAPSHOT_ACCEPTED_LEDGER_VERSION {
+            // Keep prior carried incidence, including history-held files whose
+            // ordinary exact set is empty. Add only ORIGINAL accepted identities.
+            let accepted = &carry.accepted_snapshot_fingerprints;
+            for members in carry.accepted_rebuild_incidence.values_mut() {
+                members.retain(|fp| accepted.contains(fp));
+            }
+            for (key, mut members) in carry.file_snapshot_fingerprints {
+                members.retain(|fp| accepted.contains(fp));
+                if !members.is_empty() {
+                    carry
+                        .accepted_rebuild_incidence
+                        .entry(key)
+                        .or_default()
+                        .extend(members);
+                }
+            }
+            carry
+                .accepted_rebuild_incidence
+                .retain(|_, members| !members.is_empty());
+            let anchored = carry
+                .accepted_rebuild_incidence
+                .values()
+                .flat_map(BTreeSet::iter)
+                .collect::<BTreeSet<_>>();
+            let unassigned = accepted
+                .iter()
+                .filter(|fp| !anchored.contains(fp))
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if !unassigned.is_empty() {
+                carry
+                    .accepted_rebuild_incidence
+                    .entry(String::new())
+                    .or_default()
+                    .extend(unassigned);
+            }
+            self.accepted_rebuild_incidence = carry.accepted_rebuild_incidence;
+            self.admit_carried_ack_debt()?;
             self.accepted_snapshot_fingerprints = carry.accepted_snapshot_fingerprints;
         }
-        // No file incidence yet: keep them until the replacement census.
-        self.accepted_incidence_pending_census = !self.accepted_snapshot_fingerprints.is_empty();
+        self.accepted_incidence_pending_census = !self.accepted_rebuild_incidence.is_empty();
+        let (entries, bytes) = self.carried_ack_debt_size();
+        emit_scan_index_containment_line(format!(
+            "local snapshot scan index load: scan_index_rebuild_carried_ack_debt_entries={entries} scan_index_rebuild_carried_ack_debt_bytes={bytes}"
+        ));
         self.historical_replay_generation = carry.historical_replay_generation;
         self.context_curve_capability_enabled = carry.context_curve_capability_enabled;
         self.context_curve_replay_epoch = carry.context_curve_replay_epoch;
         self.completed_context_curve_replay_generation =
             carry.completed_context_curve_replay_generation;
+        Ok(())
+    }
+
+    fn carried_ack_fingerprints(&self) -> BTreeSet<String> {
+        self.accepted_rebuild_incidence
+            .values()
+            .flat_map(BTreeSet::iter)
+            .cloned()
+            .collect()
+    }
+
+    // Charge file slots, identity slots, retained strings, conservative BTree
+    // bookkeeping, and the duplicate ACK ledger storage before accepting debt.
+    fn carried_ack_debt_size(&self) -> (usize, usize) {
+        self.accepted_rebuild_incidence.iter().fold(
+            (0usize, 0usize),
+            |(entries, bytes), (key, members)| {
+                let bytes = bytes.saturating_add(key.len()).saturating_add(256);
+                members.iter().fold(
+                    (entries.saturating_add(1), bytes),
+                    |(entries, bytes), fp| {
+                        (
+                            entries.saturating_add(1),
+                            bytes
+                                .saturating_add(fp.len().saturating_mul(2))
+                                .saturating_add(256),
+                        )
+                    },
+                )
+            },
+        )
+    }
+
+    fn admit_carried_ack_debt(&self) -> std::result::Result<(), lenient_decode::Error> {
+        let (entries, bytes) = self.carried_ack_debt_size();
+        if entries > CARRIED_ACK_ENTRIES_MAX || bytes > CARRIED_ACK_BYTES_MAX {
+            return Err(lenient_decode::Error::Refused(CARRIED_ACK_BUDGET_REFUSAL));
+        }
+        Ok(())
     }
 
     /// Apply the per-record checks one record at a time: drop a non-RFC3339
