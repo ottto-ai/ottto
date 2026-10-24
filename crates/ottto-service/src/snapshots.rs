@@ -14337,6 +14337,37 @@ struct SnapshotAccumulator {
 }
 
 impl SnapshotAccumulator {
+    /// A count that grows with every accepted usage record (its token totals
+    /// and request count) and every Claude response record: P1-RETAIN R0's
+    /// Q-PR15 guard compares it between a retained copy's take and its
+    /// completion. Saturating; no allocation.
+    fn usage_witness(&self) -> u64 {
+        let UsageTotals {
+            input_tokens,
+            output_tokens,
+            cache_read_tokens,
+            cache_creation_5m_tokens,
+            cache_creation_1h_tokens,
+            reasoning_output_tokens,
+            unattributed_total_tokens,
+            request_count,
+            costs: _,
+        } = &self.accepted_usage_totals;
+        [
+            *input_tokens,
+            *output_tokens,
+            *cache_read_tokens,
+            *cache_creation_5m_tokens,
+            *cache_creation_1h_tokens,
+            *reasoning_output_tokens,
+            *unattributed_total_tokens,
+            *request_count,
+            self.claude_response_record_count as u64,
+        ]
+        .into_iter()
+        .fold(0u64, u64::saturating_add)
+    }
+
     fn new(source: SnapshotSource) -> Self {
         Self {
             source,
@@ -16051,6 +16082,312 @@ impl SnapshotAccumulator {
         }
     }
 
+    /// X_out family U1 (#665, c22 amendment 2): what `apply_claude_title_metadata`
+    /// and `into_items` allocate from `metadata`, measured on the resident
+    /// metadata without applying it. `fixed` charges every live copy of each
+    /// string (the accumulator's, the item's clone, and for `source_created_at`
+    /// the rewrite) plus the two transient sets of `session_account_evidence`;
+    /// `per_usage_row` is the account hash each `model_usage` row clones
+    /// (family D multiplies it). A subagent transcript names itself from agent
+    /// metadata on disk (IO): `None`, so the proof releases nothing.
+    fn claude_title_metadata_bound(
+        &self,
+        path: &Path,
+        metadata: &ClaudeTitleMetadata,
+    ) -> Option<TitleMetadataBound> {
+        let stem = path.file_stem().and_then(|value| value.to_str());
+        let Some(session_id) = self.source_session_id.as_deref().or(stem) else {
+            return Some(TitleMetadataBound::default());
+        };
+        if claude_subagent_identity(path).is_some() {
+            return None;
+        }
+        let per_usage_row = metadata
+            .account_identifier_hash(session_id)
+            .map_or(0, str::len);
+        let mut fixed = per_usage_row;
+        let native = stem == Some(session_id);
+        if self.claude_owned_session_id_observed && native {
+            let entries = metadata.original_identity_evidence.get(session_id);
+            // `session_account_evidence` clones at most one value per field.
+            let mut longest = [0usize; 3];
+            for entry in entries.into_iter().flatten() {
+                let values = [
+                    &entry.account_identifier_hash,
+                    &entry.provider_workspace_hash,
+                    &entry.source_created_at,
+                ];
+                for (slot, value) in longest.iter_mut().zip(values) {
+                    *slot = (*slot).max(value.as_ref().map_or(0, String::len));
+                }
+            }
+            let strings = longest
+                .iter()
+                .try_fold(0usize, |sum, len| sum.checked_add(*len))?;
+            let sets = crate::heap_layout_bound::tree_node_bytes::<&String, ()>()?
+                .checked_mul(entries.map_or(0, BTreeSet::len).checked_add(1)?)?
+                .checked_mul(2)?;
+            fixed = fixed
+                .checked_add(strings.checked_mul(3)?)?
+                .checked_add(sets)?;
+        }
+        if native {
+            if let Some(lineage) = metadata.spawn_lineage(session_id) {
+                fixed = fixed.checked_add(lineage.parent_session_id.len())?;
+            }
+        }
+        if let Some(candidate) = metadata.titles.get(session_id) {
+            // The title's normalization scratch and the item's clone
+            // (`desktop_title_bound`), plus both copies of "desktop_title".
+            fixed = fixed
+                .checked_add(desktop_title_bound(candidate.title.len())?)?
+                .checked_add(2 * "desktop_title".len())?;
+        }
+        Some(TitleMetadataBound {
+            fixed,
+            per_usage_row,
+        })
+    }
+
+    /// X_out (#665): an allocation-free upper bound of
+    /// `completed_bound(&parsed_file, ..)` once this Claude transcript is
+    /// finished, together with the finalize and `into_items` scratch beside
+    /// it, measured before any copy or eviction (hunk map §0-§3). `None`, so
+    /// the proof releases nothing: a non-Claude or subagent transcript (its
+    /// agent metadata is read from disk), a workspace whose repository
+    /// identity was not peeked, an unsupported layout, or a bound past
+    /// `limit`.
+    ///
+    /// By family (`x_out_coverage_witness_names_every_finished_field`):
+    /// - R: the response book's `completion_bounds` output; and per resolved
+    ///   response, what its row copies take from this accumulator (the
+    ///   running selector, the model fallback).
+    /// - D and M: every other finished field is a move, a clone, or a
+    ///   derivation no larger than one accumulator field (outside the book),
+    ///   and at most three of each are live at once (the field, its output,
+    ///   one transient), so three charges of the accumulator without the
+    ///   book. Usage rows have `ROW_COPIES` copies, and each emitted row
+    ///   clones the account hash and five cost texts; the vectors `finalize`
+    ///   and `into_items` grow are charged from their lengths.
+    /// - K: constant-capped text: digests, provenance, the unavailable
+    ///   context curve, cost text, attribution facts.
+    /// - U: title metadata (U1), `session_start` (U2) and the peeked
+    ///   repository identity, which `finish` must receive (U3), twice.
+    ///
+    /// Transients without a term (fresh-r1 N1; T6 measures them,
+    /// `x_out_t6_covers_tiny_file_rows_with_attribution`):
+    /// - `snapshot_fingerprint`'s semantic JSON <= the per-row node charge.
+    ///   It holds each usage row twice (the item's `model_usage` and its
+    ///   bucket's), each a 23-key map (at most 5 `(String, Value)` nodes of
+    ///   at most 728 B, about 400 B of keys, clones of the row's strings),
+    ///   plus at most twice its serialized text (about 1 KB): about 13 KB
+    ///   plus 4x the row's strings per row. Each row is charged at least 5
+    ///   whole `(RowKey, BucketRowAccumulator)` nodes, each 256 + 12*8 +
+    ///   11*(216 + 320) = 6,248 B on 64-bit, so at least 31 KB, and 5 copies
+    ///   of its strings: a file row by `3*state` and `2*usage_buckets`, a
+    ///   resolved response by R's `ROW_COPIES + 1` nodes.
+    /// - `enforce_fact_limits`' scratch (the pre-trim facts' text, the
+    ///   dropped field names, their sort and `join`, one `to_vec` buffer
+    ///   escaped 6x) is charged by `fact_limit_scratch_bound` in K, at its
+    ///   caps; no residual relies on the item's slack (c22, r33).
+    /// - `SessionStartState::finish`'s stable sort of the arrived files: no
+    ///   allocation below 21 files, else at most `max(len, 48)` slots of
+    ///   `(String, usize, OpeningFileState)`, at most 3x the `files` map's
+    ///   own entry storage from 21 entries on. That map is accumulator
+    ///   state, so D/M's `3*(accumulator - book)` covers it; U2 charges the
+    ///   collected vector and the candidates.
+    /// - `claude_buffered_request_hashes` (itemless Claude files only, built
+    ///   just before `finish` and live across it) is charged by
+    ///   `buffered_request_hashes_bound` from every record the book stores,
+    ///   limit-exceeded responses included (c22, r35).
+    fn finish_output_bound(&self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
+        use crate::heap_layout_bound::tree_node_bytes;
+        use crate::session_attribution::{
+            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+            MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+            MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+            MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES,
+            MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+        };
+        use claude_response_records::{RFC3339_TEXT_BYTES, ROW_COPIES, SHA256_HEX_TEXT_BYTES};
+        use std::mem::size_of;
+        /// `usd_picos_string`: at most 39 integer digits, a point and 12
+        /// fraction digits, in a `format!` buffer at most twice that.
+        const USD_TEXT_BYTES: usize = 2 * (39 + 1 + 12);
+        /// A top-level Claude item's attribution facts come from four
+        /// producers (`direct_provider_facts`, desktop spawn, launch,
+        /// grouping), each stopping at `MAX_SESSION_ATTRIBUTION_FACTS`
+        /// (`push_labeled_fact`); `extend` at most doubles the capacity.
+        const FACT_SLOTS: usize = 2 * 4 * MAX_SESSION_ATTRIBUTION_FACTS;
+
+        if self.source != SnapshotSource::ClaudeCode
+            || !crate::heap_layout_bound::layout_supported()
+            || claude_subagent_identity(input.path).is_some()
+        {
+            return None;
+        }
+        let FinishOutputInput {
+            path,
+            collected_at,
+            source_file_fingerprint,
+            opened_object_identity,
+            title_metadata,
+            attribution,
+            repository_identity,
+        } = input;
+        let heap = |bytes: Option<usize>| bytes.filter(|bytes| *bytes <= limit);
+        // U1, U2, U3.
+        let title = match title_metadata {
+            Some(metadata) => self.claude_title_metadata_bound(path, metadata)?,
+            None => TitleMetadataBound::default(),
+        };
+        let session_start = self
+            .session_start
+            .finished_heap_bound(attribution, true, limit)?;
+        let repository = match (&self.workspace_path, repository_identity) {
+            (None, _) => 0,
+            (Some(_), Some(identity)) => heap(completed_heap(identity, limit))?.checked_mul(2)?,
+            (Some(_), None) => return None,
+        };
+        // R: the book, and what each resolved response's rows take from here.
+        let responses = self.claude_responses.completion_bounds(limit)?.output?;
+        let resolved = self
+            .claude_responses
+            .values()
+            .filter(|response| !response.record_limit_exceeded)
+            .count();
+        // Charged for every Claude file: whether it is itemless (no positive
+        // usage evidence) is the parser's to know, not this accumulator's.
+        let buffered_records = self
+            .claude_responses
+            .values()
+            .try_fold(0usize, |records, response| {
+                records.checked_add(response.records.len())
+            })?;
+        let request_hashes = buffered_request_hashes_bound(buffered_records)?;
+        let current_selector = heap(completed_heap(&self.current_selector, limit))?;
+        let model_fallback = self
+            .latest_model
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add("unknown".len())?;
+        let per_response = current_selector
+            .checked_mul(2)? // the row's maps and its hoisted billing text
+            .checked_add(model_fallback)?
+            .checked_mul(ROW_COPIES)?;
+        // D and M.
+        let book = heap(completed_heap(&self.claude_responses, limit))?;
+        let state = heap(completed_heap(self, limit))?.checked_sub(book)?;
+        let usage_buckets = heap(completed_heap(&self.usage_buckets, limit))?;
+        let file_rows = self
+            .usage_buckets
+            .values()
+            .try_fold(0usize, |rows, bucket| rows.checked_add(bucket.rows.len()))?;
+        let rows = file_rows.checked_add(resolved)?;
+        let per_row = self
+            .account_identifier_hash
+            .as_ref()
+            .map_or(0, String::capacity)
+            .checked_add(title.per_usage_row)?
+            .checked_add(5 * USD_TEXT_BYTES)?
+            .checked_mul(2)?;
+        // Vectors grown by `push` from the file's own length: cache requests,
+        // usage buckets, the file's rows' `SnapshotModelUsage` slots (the
+        // book charges each resolved response's).
+        let slots = self
+            .cache_requests
+            .len()
+            .checked_mul(2)?
+            .checked_add(4)?
+            .checked_mul(size_of::<cache_observations::OwnedRequest>())?
+            .checked_add(
+                self.usage_buckets
+                    .len()
+                    .checked_mul(2)?
+                    .checked_add(4)?
+                    .checked_mul(size_of::<SnapshotUsageBucket>())?,
+            )?
+            .checked_add(file_rows.checked_mul(7 * size_of::<SnapshotModelUsage>())?)?;
+        // `claude_compaction_summary`'s pairing maps and timestamp vectors.
+        let compaction = tree_node_bytes::<u64, usize>()?
+            .checked_add(tree_node_bytes::<usize, ()>()?.checked_mul(2)?)?
+            .checked_add(3 * size_of::<String>())?
+            .checked_mul(self.claude_compaction_observations.len())?
+            .checked_add((MAX_COMPACTION_TIMESTAMPS + 4) * size_of::<String>())?;
+        // K.
+        let session_id = match self.source_session_id {
+            Some(_) => 0,
+            None => path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .map_or(0, str::len)
+                .checked_mul(3)?,
+        };
+        let context_curve = if self.context_curve_enabled {
+            CONTEXT_CURVE_CONTRACT_VERSION.len()
+                + self.source.parser_version().len()
+                + CLAUDE_CONTEXT_CURVE_OWNERSHIP_REVISION.len()
+                + CONTEXT_CURVE_SAMPLING_REVISION.len()
+                + "ownership_unresolved".len()
+        } else {
+            0
+        };
+        let single_fact = MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+            + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+            + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+            + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
+            + 3 * FACT_LITERAL_BYTES;
+        // Past one fact the wire budget bounds every kept string; capacity is
+        // at most twice the length, at least 8 for each of a fact's 9 texts.
+        let facts = MAX_SESSION_ATTRIBUTION_PAYLOAD_BYTES
+            .checked_add(single_fact)?
+            .checked_add(collected_at.len())?
+            .checked_mul(2)?
+            .checked_add(9 * 8 * MAX_SESSION_ATTRIBUTION_FACTS)?
+            .checked_add(
+                FACT_SLOTS
+                    .checked_mul(size_of::<crate::session_attribution::SessionAttributionFact>())?,
+            )?;
+        let constants = SHA256_HEX_TEXT_BYTES // snapshot_fingerprint
+            .checked_add("final".len())?
+            .checked_add(collected_at.len())?
+            .checked_add(source_file_fingerprint.len().checked_mul(2)?)?
+            .checked_add(opened_object_identity.len())? // the ownership ledger's
+            .checked_add(2 * ("claude_code_jsonl".len() + "uncached".len()))?
+            .checked_add(context_curve)?
+            .checked_add(5 * USD_TEXT_BYTES + "pi_usage_cost".len())?
+            .checked_add("agent_capability_usage:v2".len())?
+            .checked_add(RFC3339_TEXT_BYTES)? // a fallback bucket input
+            .checked_add(session_id)?
+            .checked_add(facts)?
+            .checked_add(fact_limit_scratch_bound(
+                if attribution { 4 } else { 2 },
+                collected_at.len(),
+            )?)?;
+        let mut out = crate::heap_layout_bound::Counter::new(limit);
+        for bytes in [
+            size_of::<ParsedJsonlFile>(),
+            size_of::<SnapshotItem>(), // `vec![item]`
+            responses,
+            resolved.checked_mul(per_response)?,
+            current_selector, // `add_usage_with_selector_placed`'s `merged`
+            state.checked_mul(3)?,
+            usage_buckets.checked_mul(ROW_COPIES.checked_sub(3)?)?,
+            rows.checked_mul(per_row)?,
+            slots,
+            compaction,
+            constants,
+            title.fixed,
+            session_start,
+            repository,
+            request_hashes,
+        ] {
+            out.add(bytes)?;
+        }
+        Some(out.bytes)
+    }
+
     fn apply_first_prompt_fallback(&mut self) {
         if self.title.is_some() {
             return;
@@ -16292,12 +16629,31 @@ impl SnapshotAccumulator {
         Some(delta)
     }
 
+    // Production finishes through `into_items_with_repository_identity`.
+    #[cfg(test)]
     fn into_items(
+        self,
+        path: &Path,
+        collected_at: &str,
+        source_file_fingerprint: String,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+    ) -> Vec<SnapshotItem> {
+        self.into_items_with_repository_identity(
+            path,
+            collected_at,
+            source_file_fingerprint,
+            attribution_context,
+            None,
+        )
+    }
+
+    fn into_items_with_repository_identity(
         mut self,
         path: &Path,
         collected_at: &str,
         source_file_fingerprint: String,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        measured_repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
     ) -> Vec<SnapshotItem> {
         // Defence in depth: the scan already refuses to collect the Workflow
         // journal, but the parse entry points are public, so nothing downstream
@@ -16449,10 +16805,9 @@ impl SnapshotAccumulator {
             self.origin.used_workflow_orchestration =
                 Some(claude_workflows_dir_has_manifest(&workflows_dir));
         }
-        let repository_identity = self
-            .workspace_path
-            .as_deref()
-            .map(cached_repository_identity);
+        let repository_identity = self.workspace_path.as_deref().map(|workspace| {
+            measured_repository_identity.unwrap_or_else(|| cached_repository_identity(workspace))
+        });
         let mut attribution_facts = crate::session_attribution::direct_provider_facts(
             self.source,
             Some(&self.origin),
@@ -16877,20 +17232,231 @@ impl SnapshotAccumulator {
     }
 }
 
+/// Observed-input bound of Claude title metadata (X_out family U1, #665).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct TitleMetadataBound {
+    fixed: usize,
+    per_usage_row: usize,
+}
+
+/// What `SnapshotAccumulator::finish_output_bound` measures besides the
+/// accumulator (X_out, #665): the `finish` arguments, resident at the proof.
+struct FinishOutputInput<'a> {
+    path: &'a Path,
+    collected_at: &'a str,
+    source_file_fingerprint: &'a str,
+    opened_object_identity: &'a str,
+    title_metadata: Option<&'a ClaudeTitleMetadata>,
+    attribution: bool,
+    /// The identity peeked for `workspace_path` (U3); `finish` must take
+    /// exactly this value (`finish_with_repository_identity`).
+    repository_identity: Option<&'a crate::context_footprint::RepositoryIdentity>,
+}
+
+/// A fact's `field`, `kind` and `strength` are literals at their call sites
+/// (every `push_fact`/`push_labeled_fact` caller in `session_attribution.rs`
+/// passes one; the longest is 22 bytes). The contract is stated at
+/// `push_labeled_fact`: `'static` literals of at most 64 bytes; raise this
+/// first for a longer or dynamic one.
+const FACT_LITERAL_BYTES: usize = 64;
+/// Keys and punctuation of one serialized fact, at most 161 bytes: ten keys
+/// (100 bytes) with their quotes and colons (30), the quotes of nine strings
+/// (18), two objects' braces (4), their eight commas and the array's one.
+const FACT_JSON_SYNTAX_BYTES: usize = 192;
+
+/// X_out family K (#665 r33, c22: no residual may rely on slack): the worst
+/// case of what `enforce_fact_limits` (session_attribution.rs:1374-1411)
+/// holds beside an item's facts, from the caps it and `push_labeled_fact`
+/// enforce. Stack-only, checked; `None` on overflow.
+///
+/// `producers` fact lists reach `into_items`' unconditional call: direct
+/// provider and desktop spawn facts always, launch and grouping facts only
+/// with an attribution context (a top-level Claude item: no subagent lists).
+/// Each list stops at `MAX_SESSION_ATTRIBUTION_FACTS` = 24
+/// (session_attribution.rs:28, the `facts.len()` check at 1504). Each fact's
+/// text is a `to_string` copy (capacity = length; `evidence_ref`'s `format!`
+/// text is 71 bytes) of at most: three literals (`FACT_LITERAL_BYTES`), the
+/// value (128, :31, checked at 1506), the label (96, :34, at 1518), the label
+/// source (32, :35, at 1521), the source version (32, :32, at 1507), the
+/// evidence ref (96, :33, at 1512) and `observed_at` (`collected_at`, 1535).
+/// A growing `Vec` briefly holds its old and new buffers (the allocation
+/// probe's overlap). Charged together, though the phases do not all coexist:
+/// - every pre-trim fact's text (K's `facts` term charges only the kept
+///   facts' text);
+/// - `dropped_fields`: at most `24 * producers` names in slots grown by
+///   doubling (old and new at most 3 slots per name), the cloned names (at
+///   most `FACT_LITERAL_BYTES` each), the stable sort's scratch (at most
+///   `max(len, 48)` slots) and the `join` text with its ", " separators;
+/// - one `serde_json::to_vec` buffer (only one is live per loop step) of at
+///   most 24 facts (the count cap truncates first, 1378-1385): each text byte
+///   escapes to at most 6 bytes (`\u00XX`), plus `FACT_JSON_SYNTAX_BYTES` per
+///   fact and the array's brackets. `to_vec` starts at 128 bytes, and each
+///   write is one string's unescaped run, a 6-byte escape or punctuation
+///   (serde_json 1.0.149 `format_escaped_str_contents`), so while every
+///   string fits in 128 bytes each growth doubles: the last buffer is
+///   `128 * 2^k`, with half of it alongside during the copy. A longer
+///   `collected_at` falls back to three times the length (a previous buffer
+///   shorter than the length and a next at most twice that, or the length).
+fn fact_limit_scratch_bound(producers: usize, collected_at: usize) -> Option<usize> {
+    use crate::session_attribution::{
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+        MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+        MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+    };
+    use std::mem::size_of;
+    let text = (3 * FACT_LITERAL_BYTES
+        + MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+        + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+        + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES)
+        .checked_add(collected_at)?;
+    let facts = producers.checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?;
+    let pre_trim = facts.checked_mul(text)?;
+    let dropped = facts
+        .checked_mul(3 * size_of::<String>())? // slots, old and new
+        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES)?)? // cloned names
+        .checked_add(facts.max(48).checked_mul(size_of::<String>())?)? // sort
+        .checked_add(facts.checked_mul(FACT_LITERAL_BYTES + 2)?)?; // `join`
+    let json_len = text
+        .checked_mul(6)?
+        .checked_add(FACT_JSON_SYNTAX_BYTES)?
+        .checked_mul(MAX_SESSION_ATTRIBUTION_FACTS)?
+        .checked_add(2)?;
+    let json = if collected_at <= MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES {
+        let last = json_len
+            .div_ceil(128)
+            .checked_next_power_of_two()?
+            .checked_mul(128)?;
+        last.checked_add(if last > 128 { last / 2 } else { 0 })?
+    } else {
+        json_len.checked_mul(3)?
+    };
+    pre_trim.checked_add(dropped)?.checked_add(json)
+}
+
+/// X_out (#665 r35, c22: no residual may rely on slack): the most
+/// `claude_buffered_request_hashes` (claude_request_census.rs:2218-2239)
+/// holds. The caller builds it for an itemless Claude file just before
+/// `finish` (`snapshots.rs`, `claude_itemless_request_hashes`) and keeps it
+/// across `finish`. It collects one `u64` per book record with a request id
+/// (every response's stored records, limit-exceeded ones included: at most
+/// `records`) through `flat_map`/`filter_map`/`take`, whose lower size hint
+/// is 0: `Vec` starts at 4 slots and doubles, so its last buffer is the
+/// smallest `4 * 2^k` holding them, with half of it alongside during the
+/// last growth (the allocation probe's overlap). `claude_request_hash` and
+/// `sort_unstable`/`dedup` allocate nothing. Stack-only, checked; `None` on
+/// overflow.
+fn buffered_request_hashes_bound(records: usize) -> Option<usize> {
+    if records == 0 {
+        return Some(0);
+    }
+    let last = records.checked_next_power_of_two()?.max(4);
+    let slots = if last > 4 {
+        last.checked_add(last / 2)?
+    } else {
+        last
+    };
+    slots.checked_mul(std::mem::size_of::<u64>())
+}
+
+/// X_out U1 (#665 r36, AutoReview P2): the most a `len`-byte desktop title
+/// allocates in `finish`, charged together: `apply_claude_title_metadata`
+/// (:14746, `candidate.title.clone()`) -> `set_title` (:14612) ->
+/// `normalize_display_title` (:38445) -> `normalize_title` (:38436) and
+/// `is_safe_display_title` (:38553), then `into_items`' clone (:15846).
+/// - The input clone: exact, `len`; dropped only when `normalize_title`
+///   returns.
+/// - `split_whitespace().collect::<Vec<&str>>()`: at most `ceil(len / 2)`
+///   words (every word and every gap is at least one byte), from a lower
+///   size hint of 0, so 4 slots doubling: the last `4 * 2^k` plus the half
+///   beside it during the last growth (the allocation probe's overlap).
+/// - `join(" ")`: one exact allocation of at most `len`
+///   (`join_generic_copy`'s `Vec::with_capacity(reserved_len)`), alongside
+///   the words.
+/// - `chars().take(255).collect::<String>()`: at most
+///   `min(len, 4 * 255)` bytes, reserved from the lower size hint and then
+///   grown by amortized pushes (at least 8): old and new together are under
+///   three times that.
+/// - `is_safe_display_title` (allocates only for at most 120 chars, so 480
+///   bytes): its `to_ascii_lowercase` copy and one helper's at a time
+///   (`looks_like_raw_identifier`, `contains_blocked_prompt_fragment`; the
+///   `custom_title`-only segment vector is not reached for "desktop_title").
+/// - The item's clone of the kept title: exact.
+///
+/// Stack-only, checked; `None` on overflow.
+fn desktop_title_bound(len: usize) -> Option<usize> {
+    const MAX_TITLE_CHARS: usize = 255;
+    const MAX_DISPLAY_CHARS: usize = 120;
+    let words = match len.div_ceil(2) {
+        0 => 0,
+        words => {
+            let last = words.checked_next_power_of_two()?.max(4);
+            let slots = if last > 4 {
+                last.checked_add(last / 2)?
+            } else {
+                last
+            };
+            slots.checked_mul(std::mem::size_of::<&str>())?
+        }
+    };
+    let kept = len.min(4 * MAX_TITLE_CHARS);
+    let collect = kept.max(8).checked_mul(3)?;
+    let safety = kept.min(4 * MAX_DISPLAY_CHARS).checked_mul(2)?;
+    len.checked_mul(2)? // the input and the joined text
+        .checked_add(words)?
+        .checked_add(collect)?
+        .checked_add(safety)?
+        .checked_add(kept)
+}
+
+/// `completed_heap_bound` of `value` on a fresh counter.
+fn completed_heap<T: crate::heap_layout_bound::HeapLayoutBound>(
+    value: &T,
+    limit: usize,
+) -> Option<usize> {
+    let mut counter = crate::heap_layout_bound::Counter::new(limit);
+    value.completed_heap_bound(&mut counter)?;
+    Some(counter.bytes)
+}
+
+type RepositoryIdentityCache =
+    BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
+
+fn repository_identity_cache() -> &'static Mutex<RepositoryIdentityCache> {
+    static CACHE: OnceLock<Mutex<RepositoryIdentityCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn fresh_repository_identity(
+    cache: &RepositoryIdentityCache,
+    workspace: &Path,
+    now: SystemTime,
+) -> Option<crate::context_footprint::RepositoryIdentity> {
+    let (captured_at, identity) = cache.get(workspace)?;
+    now.duration_since(*captured_at)
+        .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
+        .unwrap_or(false)
+        .then(|| identity.clone())
+}
+
+/// Read-only view of the repository-identity cache for the M-a release proof
+/// (#665, X_out family U3): no IO, no insert, no TTL refresh. A miss, an
+/// expired entry or a poisoned lock is `None`, so the proof refuses.
+pub(super) fn peek_repository_identity(
+    workspace: &Path,
+) -> Option<crate::context_footprint::RepositoryIdentity> {
+    let guard = repository_identity_cache().lock().ok()?;
+    fresh_repository_identity(&guard, workspace, SystemTime::now())
+}
+
 fn cached_repository_identity(workspace: &Path) -> crate::context_footprint::RepositoryIdentity {
-    type Cache = BTreeMap<PathBuf, (SystemTime, crate::context_footprint::RepositoryIdentity)>;
-    static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
+    let cache = repository_identity_cache();
     let now = SystemTime::now();
     if let Ok(guard) = cache.lock() {
-        if let Some((captured_at, identity)) = guard.get(workspace) {
-            if now
-                .duration_since(*captured_at)
-                .map(|age| age.as_secs() <= REPOSITORY_IDENTITY_CACHE_TTL_SECONDS)
-                .unwrap_or(false)
-            {
-                return identity.clone();
-            }
+        if let Some(identity) = fresh_repository_identity(&guard, workspace, now) {
+            return identity;
         }
     }
 
@@ -23295,12 +23861,61 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 // E3: the completion step walks the finished job exactly,
-                // once, for the budget its retention consumes below.
-                let (copy_budget, copy_measure) = if active.cursor.is_some() {
-                    sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active)
+                // once, for the budget its retention consumes below. A group
+                // and an unsampled read keep the step-start budget. Any other
+                // sampled singleton is measured exactly at completion
+                // (P1-RETAIN R0, Q-PR13b; `try_lock`, so contention gives 0).
+                // A Tail/Unchanged singleton (shape F) also decides whether a
+                // release of lower-ranked residents would make its copy
+                // fit; that release is deferred into its retention, after
+                // every non-budget gate. Nothing is evicted here. Each branch
+                // also returns the walk behind its budget (`copy_measure`, for
+                // `retire_proof_beside_copy`); `copy_budget` is the
+                // pre-release budget, which main's proof retirement and decode
+                // peak reserve against (U1a-2a, #667).
+                let (retain_budget, copy_measure, release_proof) = if active.cursor.is_some() {
+                    let (budget, measure) =
+                        sampled_scan::completion_copy_budget(sampling.as_ref(), &mut active);
+                    (
+                        sampled_scan::RetainBudget::granted_unclassified(budget),
+                        measure,
+                        None,
+                    )
+                } else if active.sampling.is_some()
+                    && sampled_scan::codex_cursor::byte_charged(&active)
+                {
+                    (
+                        sampled_scan::RetainBudget::granted_unclassified(copy_budget),
+                        step_measure,
+                        None,
+                    )
+                } else if active.sampling.is_some() {
+                    if sampled_scan::borrows_only_retained_reduction(&active) {
+                        sampled_scan::tail_completion_budget(sampling.as_ref(), &mut active)
+                    } else {
+                        let (budget, measure) = sampled_scan::copy_budget_step(
+                            sampling.as_ref(),
+                            Some(&mut *active),
+                            true,
+                        );
+                        (
+                            sampled_scan::RetainBudget::from((budget, measure)),
+                            measure,
+                            None,
+                        )
+                    }
                 } else {
-                    (copy_budget, step_measure)
+                    (
+                        sampled_scan::RetainBudget::granted_unclassified(copy_budget),
+                        step_measure,
+                        None,
+                    )
                 };
+                let copy_budget = retain_budget.raw();
+                // A deferred release's peak-reserved `budget_after`, set where
+                // its retention is attempted; the finalization limit only
+                // where that release actually ran.
+                let mut released_finalization_budget = None;
                 // #631 review M1: the bytes this attempt read, taken before
                 // `finish_job` consumes the acquisition's start offset. An
                 // exact-stamp memo below must not cover anything past them.
@@ -23538,6 +24153,8 @@ impl OwnedSourceScan {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
                 }
                 let mut parser = parser;
+                // The repository identity X_out measured, if any (#665 U3).
+                let mut measured_repository_identity = None;
                 if let Some(replay) = parser.accumulator.codex_tier_replay.take() {
                     match replay.finish() {
                         Ok(receipt) => {
@@ -23644,10 +24261,16 @@ impl OwnedSourceScan {
                     certificate.map(|checkpoint| {
                         parser.retain_sealed_prefix(
                             checkpoint,
-                            if cache_compatible && sealed_only {
-                                copy_budget
+                            // Never a release on a sealed prefix: excluded and
+                            // unsealed keep the pre-release budget for the
+                            // packet only; a retainable job is admitted
+                            // against main's peak-reserved `copy_budget`.
+                            if !cache_compatible {
+                                retain_budget.excluded()
+                            } else if !sealed_only {
+                                retain_budget.unsealed()
                             } else {
-                                0
+                                sampled_scan::RetainBudget::granted_unclassified(copy_budget)
                             },
                         )
                     })
@@ -23692,10 +24315,64 @@ impl OwnedSourceScan {
                         census.record_unreadable(cause, 1);
                         pending!();
                     }
+                    // #667: the decode peak is reserved from the budget the
+                    // copy is admitted against: main's `copy_budget` above for
+                    // a granted one. M-a (S-a): only now, after main's proof
+                    // retirement and that reservation, may a shape-F release be
+                    // proven; its `budget_after` is peak-reserved the same way.
+                    // X_out (#665): Claude's finish-output bound, only for a
+                    // proof. The repository identity it measured (U3) is the
+                    // one `finish` takes below; a miss refuses.
+                    let x_out = sampled_scan::x_out_for(source, || {
+                        release_proof.as_ref()?;
+                        measured_repository_identity = parser
+                            .accumulator
+                            .workspace_path
+                            .as_deref()
+                            .and_then(peek_repository_identity);
+                        parser.finish_output_bound(
+                            FinishOutputInput {
+                                path: &candidate.path,
+                                collected_at: collected_at.as_str(),
+                                source_file_fingerprint: &source_file_fingerprint,
+                                opened_object_identity: &candidate.opened_object_identity,
+                                title_metadata: Some(&claude_title_metadata),
+                                attribution: attribution_context.is_some(),
+                                repository_identity: measured_repository_identity.as_ref(),
+                            },
+                            // `proven_release` checks it against `remaining'`.
+                            usize::MAX,
+                        )
+                    });
+                    let retain_budget = sampled_scan::prove_release(
+                        retain_budget.reserve_peak(copy_budget, |budget| {
+                            parser
+                                .accumulator
+                                .claude_responses
+                                .finish_copy_budget(budget)
+                        }),
+                        release_proof,
+                        sampling.as_ref(),
+                        x_out,
+                        |budget| {
+                            parser
+                                .accumulator
+                                .claude_responses
+                                .finish_copy_budget(budget)
+                        },
+                        |limit| parser.accumulator.claude_responses.decode_peak_bound(limit),
+                    );
+                    released_finalization_budget = retain_budget.released_budget();
+                    #[cfg(test)]
+                    sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::BeforeRetain);
                     match parser.retain_reduction(
                         &acquisition.scope,
                         sampled_scan::now_seconds(),
-                        if cache_compatible { copy_budget } else { 0 },
+                        if cache_compatible {
+                            retain_budget
+                        } else {
+                            retain_budget.excluded()
+                        },
                     ) {
                         Ok(completed) => completed,
                         Err(_) => {
@@ -23712,6 +24389,8 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
+                #[cfg(test)]
+                sampled_scan::test_hooks::fire(sampled_scan::test_hooks::Point::AfterRetain);
                 // U1a-2a G17b + C9′: a side read's certificate, without
                 // retention or any cache event; the same path must still name
                 // the object. Its failures are its charged attempt.
@@ -23805,7 +24484,7 @@ impl OwnedSourceScan {
                 } else {
                     Vec::new()
                 };
-                let parsed_file = parser.finish(
+                let parsed_file = parser.finish_with_repository_identity(
                     &candidate.opened_object_identity,
                     &candidate.path,
                     collected_at.as_str(),
@@ -23814,6 +24493,7 @@ impl OwnedSourceScan {
                     (source == SnapshotSource::ClaudeCode).then_some(&claude_title_metadata),
                     // U1a-2a B8′: a side read takes no attribution context.
                     attribution_context.filter(|_| side_origin.is_none()),
+                    measured_repository_identity,
                 );
                 // A committed cursor attempt counts as published only now (M4).
                 if let Some((context, publication)) =
@@ -23832,7 +24512,9 @@ impl OwnedSourceScan {
                         }
                         pending!();
                     }
-                    Err(_) => {
+                    Err(_error) => {
+                        #[cfg(test)]
+                        sampled_scan::test_hooks::record_finish_error(&_error);
                         if source == SnapshotSource::ClaudeCode {
                             claude_request_census::invalidate_claude_request_census(
                                 index,
@@ -23948,7 +24630,19 @@ impl OwnedSourceScan {
                 } else {
                     None
                 };
-                let finalization_charge = finish_copy_budget.and_then(|budget| {
+                // #667's peak-reserved finalization limit: from `budget_after`
+                // where this completion's deferred release actually ran (and
+                // its peak was reserved there), otherwise main's. `None`
+                // refuses the copy; never 0 or `F_prev` in its place.
+                let finalization_budget = if completed_acquisition
+                    .as_ref()
+                    .is_some_and(|completed| completed.released.is_some())
+                {
+                    released_finalization_budget
+                } else {
+                    finish_copy_budget
+                };
+                let finalization_charge = finalization_budget.and_then(|budget| {
                     crate::heap_layout_bound::completed_bound(&parsed_file, budget)
                 });
                 if finalization_charge.is_none() {
@@ -24748,11 +25442,16 @@ impl OwnedSourceScan {
                     }
                     if let Some(completed) = completed_acquisition {
                         if let Some(context) = sampling.as_ref() {
-                            context.cache.insert(
-                                index_key.clone(),
-                                completed,
-                                finalization_charge.unwrap_or(0),
-                            );
+                            // A clone allocates exactly its length, and is the
+                            // sampled key: R0's insert term assumes both.
+                            let key = index_key.clone();
+                            debug_assert_eq!(key.capacity(), key.len());
+                            debug_assert!(file_sampling
+                                .as_ref()
+                                .map_or(true, |sampled| sampled.key.len() == key.len()));
+                            context
+                                .cache
+                                .insert(key, completed, finalization_charge.unwrap_or(0));
                         }
                     }
                     for key in joined_keys {
@@ -26244,6 +26943,9 @@ impl OwnedSourceScan {
                             scope,
                             mode,
                             audit_due: None,
+                            retained_hint: None,
+                            retained_finalization_charge: 0,
+                            retained_usage: None,
                         });
                     }
                     Err(_) => {
@@ -26255,7 +26957,16 @@ impl OwnedSourceScan {
                 }
             } else if let Some(context) = sampling.as_mut() {
                 let key = local_index_key(&candidate.path);
-                let retained = context.cache.take(&key);
+                let taken = context.cache.take(&key);
+                // Kept beside the moved copy for R0's completion decision.
+                let taken_admission = taken.as_ref().map(|taken| {
+                    (
+                        taken.modified_hint,
+                        taken.finalization_charge,
+                        taken.retained.state.usage_witness(),
+                    )
+                });
+                let retained = taken.map(|taken| taken.retained);
                 let retained_present = retained.is_some();
                 context.admission.attempts = context.admission.attempts.saturating_add(1);
                 context.admission.retained_entry.observe(retained_present);
@@ -26400,11 +27111,21 @@ impl OwnedSourceScan {
                             .as_ref()
                             .and_then(|plan| plan.metrics().audit_due);
                         planned_mode = Some((mode, audit_due));
+                        // Only a continued copy (Tail or Unchanged) carries
+                        // its admission facts; `prepare` falls back to Full
+                        // when the old copy is filtered.
+                        let continued = taken_admission.filter(|_| {
+                            !matches!(mode, crate::transcript_acquisition::ReadMode::Full(_))
+                        });
                         file_sampling = Some(sampled_scan::Active {
                             key,
                             scope,
                             mode,
                             audit_due,
+                            retained_hint: continued.map(|(hint, _, _)| hint),
+                            retained_finalization_charge: continued
+                                .map_or(0, |(_, charge, _)| charge),
+                            retained_usage: continued.map(|(_, _, usage)| usage),
                         });
                     }
                 } else if source == SnapshotSource::Codex
@@ -26471,6 +27192,9 @@ impl OwnedSourceScan {
                             scope,
                             mode,
                             audit_due: None,
+                            retained_hint: None,
+                            retained_finalization_charge: 0,
+                            retained_usage: None,
                         });
                     }
                 }
@@ -27565,6 +28289,44 @@ impl OwnedJsonlParser {
         claude_title_metadata: Option<&ClaudeTitleMetadata>,
         attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
     ) -> Result<ParsedJsonlFile> {
+        self.finish_with_repository_identity(
+            expected_opened_object_identity,
+            path,
+            collected_at,
+            source_file_fingerprint,
+            codex_title_metadata,
+            claude_title_metadata,
+            attribution_context,
+            None,
+        )
+    }
+
+    /// `SnapshotAccumulator::finish_output_bound` (X_out, #665) without the
+    /// scan's live shared inputs (Codex turn traces, parent ledgers): no
+    /// finished field holds them, and `retention_bound` leaves them out the
+    /// same way.
+    fn finish_output_bound(&mut self, input: FinishOutputInput<'_>, limit: usize) -> Option<usize> {
+        let inputs = self.take_live_reduction_inputs();
+        let bound = self.accumulator.finish_output_bound(input, limit);
+        self.restore_live_reduction_inputs(inputs);
+        bound
+    }
+
+    /// `finish`, with the repository identity the M-a release proof measured
+    /// (#665, X_out family U3). `Some` is used as-is, so the finished item never
+    /// re-resolves (IO) a value the proof did not measure.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_with_repository_identity(
+        self,
+        expected_opened_object_identity: &str,
+        path: &Path,
+        collected_at: &str,
+        source_file_fingerprint: String,
+        codex_title_metadata: Option<&CodexTitleMetadata>,
+        claude_title_metadata: Option<&ClaudeTitleMetadata>,
+        attribution_context: Option<&crate::session_attribution::SessionAttributionContext>,
+        repository_identity: Option<crate::context_footprint::RepositoryIdentity>,
+    ) -> Result<ParsedJsonlFile> {
         anyhow::ensure!(
             self.reader.finished && self.reader.failure.is_none(),
             "incomplete parser cannot finalize a file"
@@ -27786,11 +28548,12 @@ impl OwnedJsonlParser {
                     && observation.pair_key.is_none()
             })
             .count();
-        let snapshots = accumulator.into_items(
+        let snapshots = accumulator.into_items_with_repository_identity(
             path,
             collected_at,
             source_file_fingerprint,
             attribution_context,
+            repository_identity,
         );
         // A syntactically valid, positive provider usage record that yields no
         // entity is still loss. Typical causes are an absent/unparseable activity
@@ -32213,6 +32976,8 @@ impl ScanCensus {
         // Preserve the existing public count and operational predicates.
         self.unreadable_path_count += count;
         self.unreadable_causes.record(cause, count as u64);
+        #[cfg(test)]
+        sampled_scan::test_hooks::record_unreadable(cause as usize);
     }
 
     fn add_terminal_jsonl_loss(&mut self, loss: &TerminalJsonlLoss) {
@@ -78364,6 +79129,8 @@ crate::heap_layout_bound::fields!(ScanTraversalResidue; index_keys, blocked_sess
 crate::heap_layout_bound::fields!(CodexInventoryHold; owed, refused_headers, outside_roster, awaiting_directories);
 crate::heap_layout_bound::fields!(SelectorCapture; context, sources);
 crate::heap_layout_bound::fields!(SessionAccountBinding; account_identifier_hash, workspace_identifier_hash);
+// Measurement only (#665, X_out family U3): the identity the release proof peeks.
+crate::heap_layout_bound::fields!(crate::context_footprint::RepositoryIdentity; repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind);
 crate::heap_layout_bound::fields!(SessionAccountEvidence; provider, account_identifier_hash, provider_workspace_hash, identity_hash_scheme, evidence_source, identity_disposition, source_created_at);
 crate::heap_layout_bound::fields!(SessionArtifact; kind, value);
 crate::heap_layout_bound::fields!(SnapshotAccumulator; source, cache_configuration_witness, cache_task_complete_at, cache_pending_idle, cache_active_turns, context_curve_enabled, source_session_id, account_identifier_hash, title, title_source, first_prompt_title, first_prompt_material, provider_skills, started_at, ended_at, last_activity_at, workspace_hash, workspace_path, latest_model, latest_reasoning_effort, latest_turn_id, codex_turn_traces, codex_observed_priority_turns, codex_priority_witnesses_uncapped, codex_tier_replay, codex_counting, current_selector, session_cumulative_usage, codex_session_meta_seen, codex_record_seen, codex_creator_header_id, codex_creator_evidence, codex_creator_evidence_conflicted, claude_desktop_identity, claude_desktop_spawn_lineage, claude_owned_session_id_observed, claude_owned_session_id_conflicted, codex_ownership_boundary, codex_legacy_trigger_seen, codex_legacy_bootstrap_valid, codex_parent_ownership_ledgers, codex_sidecar_created_thread, codex_path_sidecar_candidates, codex_resolved_path_identity, codex_sidecar_identity_ambiguous, codex_sidecar_parent, codex_sidecar_child_created_at_nanos, codex_bind_seed_len, codex_sidecar_projected_next_ordinal, codex_parent_session_ref, codex_parent_signatures, codex_parent_prefix_digest, codex_parent_prefix_decided, codex_parent_prefix_proof, codex_parent_proof_used, codex_parent_proof_mismatch, codex_parent_proof_refusal, codex_proof_decision_only, codex_boundary_buffer_count, codex_proof_ledger_row, codex_parent_ledger_identity_used, codex_parent_unresolvable, codex_parent_ledger_consulted, codex_parent_signature_index, codex_native_created_thread_valid, codex_created_thread_native_only, codex_native_created_thread_header_nanos, codex_native_created_thread_last_nanos, codex_native_created_thread_task_turn_id, codex_native_created_thread_first_turn_bound, codex_physical_signatures, codex_physical_signatures_complete, codex_ordinal_expected, codex_ordinal_sequence_valid, codex_owned_record_seen, codex_is_fork, codex_inherited_usage_records_skipped, codex_duplicate_usage_records_skipped, codex_cumulative_reset_count, codex_context_curve_candidates, codex_context_curve_boundaries, codex_context_curve_exact_supported, codex_last_usage_event_identity, codex_legacy_bootstrap_buffer, accepted_usage_totals, usage_buckets, origin, codex_root_session_ref, codex_spawn_depth, codex_agent_label, activity_tool_counts, activity_call_tools, activity_mcp_tool_counts, activity_mcp_tool_usage_counts, activity_mcp_call_ids, activity_capability_buckets, seen_claude_capability_tool_uses, activity_skills, skill_detector_incomplete, activity_changed_file_hashes, activity_patch_operations, activity_lines_added, activity_lines_deleted, activity_web_searches, activity_mcp_calls, activity_subagent_spawns, artifacts, artifacts_enabled, latency_duration_ms_sum, latency_duration_ms_count, latency_ttft_ms_sum, latency_ttft_ms_count, latency_duration_ms_max, latency_ttft_ms_max, claude_responses, claude_response_sequence, claude_response_record_count, claude_usage_request_ids, claude_usage_occurrences, claude_request_identity_capture, claude_org_markers, cache_observations, cache_requests, cache_requests_complete, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, tool_usage_counts, tool_usage_truncated, seen_pi_usage_keys, dropped_usage_record_count, claude_last_user_ts, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, compaction_count, compaction_timestamps, codex_compaction_sizes, local_context_points, claude_compaction_observations, claude_compaction_link_tip, session_start);

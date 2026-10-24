@@ -348,7 +348,11 @@ fn acquire(
     let mode = parser.prepare_acquisition(old, &scope, debt, now).unwrap();
     while !parser.step().unwrap() {}
     let acquisition = parser
-        .retain_reduction(&scope, now, crate::transcript_cache::ENTRY_BYTES)
+        .retain_reduction(
+            &scope,
+            now,
+            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
+        )
         .unwrap()
         .unwrap();
     let retained = acquisition.reduction.map(|state| Retained {
@@ -883,7 +887,14 @@ fn claude_near_cap_decode_is_reserved_before_retention_without_changing_output()
         let before = crate::retry_allocation_probe::stats().requested_peak_with_overlap;
         let scope = Scope("r1a-near-cap".into());
         // A zero preflight budget declines reuse, never native usage/output.
-        assert!(native.retain_reduction(&scope, 1, 0).unwrap().is_none());
+        assert!(native
+            .retain_reduction(
+                &scope,
+                1,
+                sampled_scan::RetainBudget::granted_unclassified(0)
+            )
+            .unwrap()
+            .is_none());
         let parsed = native
             .finish(
                 &expected,
@@ -979,7 +990,14 @@ fn claude_native_finish_peak_covers_decode_output_and_retained_copy() {
         .claude_responses
         .finish_copy_budget(crate::transcript_cache::ENTRY_BYTES)
         .unwrap();
-    let retained = parser.retain_reduction(&scope, 1, budget).unwrap().unwrap();
+    let retained = parser
+        .retain_reduction(
+            &scope,
+            1,
+            sampled_scan::RetainBudget::granted_unclassified(budget),
+        )
+        .unwrap()
+        .unwrap();
     let retained_charge = charge(&retained).unwrap();
     assert!(retained.reduction.is_some());
     // Born-pointer audit: freeing the pre-existing compact parser cannot hide
@@ -1106,4 +1124,1179 @@ fn claude_hourly_capability_buckets_remain_a_shared_visit_limit_residual() {
         "R1A_SHARED_VISIT_RESIDUAL hourly_tool_uses=2000 buckets=2000 walked=false visits={}",
         whole.visits_for_test()
     );
+}
+
+// #665 X_out (R1a R8; hunk map T1, T3-T6). Receipts: `X_OUT_T3`, `X_OUT_T1`.
+
+/// `progressive_rows`, as its own response (request and message ids `tag`).
+fn progressive_response(count: usize, tag: &str) -> Vec<Value> {
+    progressive_rows(count)
+        .into_iter()
+        .map(|mut row| {
+            row["requestId"] = json!(format!("req_{tag}"));
+            row["message"]["id"] = json!(format!("msg_{tag}"));
+            row
+        })
+        .collect()
+}
+
+/// T3's limits around a peak: unlimited, exact, one short, half, tiny.
+fn t3_limits(peak: usize) -> Vec<usize> {
+    let mut limits = vec![usize::MAX, peak, peak / 2, 1, 0];
+    limits.extend(peak.checked_sub(1));
+    limits.extend(peak.checked_add(1));
+    limits
+}
+
+/// The 80 raw records of `claude_decode_bound_covers_inline_selectors_explicit_slots_and_tools`.
+fn raw_records_80() -> (
+    crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
+    ClaudeSelectorTable,
+) {
+    let mut selectors = ClaudeSelectorTable::default();
+    let mut records = crate::owned_heap::OwnedVec::new();
+    for index in 0..80u16 {
+        let model = Some(MODEL.to_string());
+        let effort = Some("high".to_string());
+        let timestamp = Some(at(1, u64::from(index)));
+        let slot = RequestSlot {
+            request_ref: if index % 2 == 0 {
+                "req_bound"
+            } else {
+                "explicit"
+            }
+            .into(),
+            occurred_at: timestamp.clone().unwrap(),
+            model: model.clone(),
+            effort: effort.clone(),
+            prompt_tokens: Some(4),
+            cache_read_tokens: None,
+            cache_creation_tokens: None,
+            uncached_tokens: None,
+            output_tokens: Some(6),
+        };
+        let selector = selector(&[("region_mode", &format!("region-{index}"), "region")]);
+        let tools = (0..index % 12)
+            .map(|tool| (format!("tool-{tool}"), "Bash".into()))
+            .collect::<BTreeMap<String, String>>();
+        records.push(CompactClaudeResponseRecord::encode(
+            records.first(),
+            index,
+            UsageTotals::default(),
+            model,
+            selectors.intern(selector),
+            effort,
+            Some("req_bound".to_string()),
+            timestamp,
+            None,
+            tools,
+            slot,
+        ));
+    }
+    (records, selectors)
+}
+
+/// R1a R8 (a), (b), T3: on #667's fixtures, `decode_peak_bound`,
+/// `completion_bounds(..).peak`, `finish_copy_budget` and
+/// `decoded_response_peak_bound` equal main's (`main_reference`, verbatim
+/// `bc77deb9`) at every limit, `None` included; off a supported layout both
+/// are the same `None`.
+#[test]
+fn x_out_t3_decode_peak_and_copy_budget_match_main() {
+    use super::claude_response_records::main_reference;
+    let mut two = parser_for(&progressive_rows(128));
+    for row in progressive_response(128, "2") {
+        apply_claude_code_line(&row, &mut two);
+    }
+    let books = [
+        (
+            "progressive_128",
+            parser_for(&progressive_rows(128)).claude_responses,
+        ),
+        (
+            "progressive_cap",
+            parser_for(&progressive_rows(MAX_CLAUDE_RECORDS_PER_RESPONSE)).claude_responses,
+        ),
+        ("two_progressive_128", two.claude_responses),
+        (
+            "realistic_120",
+            parser_for(&realistic_rows(0..120, &[SHELL, CHROME[0]])).claude_responses,
+        ),
+        ("title_only", parser_for(&title_rows()).claude_responses),
+    ];
+    for (label, book) in &books {
+        let reference = main_reference::decode_peak_bound(book, usize::MAX);
+        if !crate::heap_layout_bound::layout_supported() {
+            assert_eq!(book.decode_peak_bound(usize::MAX), reference, "{label}");
+            assert_eq!(
+                book.completion_bounds(usize::MAX).map(|bounds| bounds.peak),
+                reference,
+                "{label}"
+            );
+            eprintln!("X_OUT_T3 fixture={label} layout_supported=false peak={reference:?}");
+            continue;
+        }
+        let peak = reference.expect("main's peak at usize::MAX");
+        let mut nones = 0usize;
+        let limits = t3_limits(peak);
+        for &limit in &limits {
+            let expected = main_reference::decode_peak_bound(book, limit);
+            nones += usize::from(expected.is_none());
+            assert_eq!(
+                book.decode_peak_bound(limit),
+                expected,
+                "{label} limit={limit}"
+            );
+            assert_eq!(
+                book.completion_bounds(limit).map(|bounds| bounds.peak),
+                expected,
+                "{label} limit={limit}"
+            );
+        }
+        for budget in
+            limits
+                .iter()
+                .copied()
+                .chain([2 * peak, 4 * peak, crate::transcript_cache::ENTRY_BYTES])
+        {
+            assert_eq!(
+                book.finish_copy_budget(budget),
+                main_reference::finish_copy_budget(book, budget),
+                "{label} budget={budget}"
+            );
+        }
+        if let Some(short) = peak.checked_sub(1) {
+            assert_eq!(
+                book.decode_peak_bound(short),
+                None,
+                "{label}: (b) at peak-1"
+            );
+        }
+        let output = book
+            .completion_bounds(usize::MAX)
+            .and_then(|bounds| bounds.output);
+        eprintln!(
+            "X_OUT_T3 fixture={label} layout_supported=true peak={peak} limits={} none_limits={nones} output={output:?} parity=ok",
+            limits.len()
+        );
+    }
+
+    let (records, selectors) = raw_records_80();
+    let reference = main_reference::decoded_response_peak_bound(&records, &selectors, usize::MAX);
+    if let Some(peak) = reference {
+        for limit in t3_limits(peak) {
+            assert_eq!(
+                claude_response_records::decoded_response_peak_bound(&records, &selectors, limit),
+                main_reference::decoded_response_peak_bound(&records, &selectors, limit),
+                "raw_80 limit={limit}"
+            );
+        }
+    }
+    eprintln!("X_OUT_T3 fixture=raw_records_80 peak={reference:?} parity=ok");
+}
+
+/// R1a R8 (c): an output term past the limit while the peak fits is
+/// `Some(peak)` with `output: None`; the peak never moves.
+#[test]
+fn x_out_t3_output_past_the_limit_keeps_the_peak() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let book = parser_for(&realistic_rows(0..120, &[SHELL, CHROME[0]])).claude_responses;
+    let full = book.completion_bounds(usize::MAX).unwrap();
+    let output = full.output.expect("output at usize::MAX");
+    assert!(
+        output > full.peak,
+        "precondition: output {output} > peak {}",
+        full.peak
+    );
+    for limit in [full.peak, output - 1] {
+        assert_eq!(
+            book.completion_bounds(limit),
+            Some(claude_response_records::CompletionBounds {
+                peak: full.peak,
+                output: None,
+            }),
+            "limit={limit}"
+        );
+    }
+    assert_eq!(book.completion_bounds(output), Some(full));
+    eprintln!(
+        "X_OUT_T3 case=c peak={} output={output} output_none_from={} parity=ok",
+        full.peak, full.peak
+    );
+}
+
+/// R1a R8 (d): a `record_limit_exceeded` response leaves main's peak and adds
+/// nothing to the output term.
+#[test]
+fn x_out_t3_record_limit_exceeded_response_adds_no_output() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    use super::claude_response_records::main_reference;
+    let base = realistic_rows(0..8, &[SHELL]);
+    let without = parser_for(&base).claude_responses;
+    let mut rows = base;
+    rows.extend(progressive_response(
+        MAX_CLAUDE_RECORDS_PER_RESPONSE + 1,
+        "over",
+    ));
+    let with = parser_for(&rows).claude_responses;
+    assert_eq!(
+        with.values()
+            .filter(|response| response.record_limit_exceeded)
+            .count(),
+        1
+    );
+    let before = without.completion_bounds(usize::MAX).unwrap();
+    let after = with.completion_bounds(usize::MAX).unwrap();
+    assert_eq!(
+        Some(after.peak),
+        main_reference::decode_peak_bound(&with, usize::MAX)
+    );
+    assert_eq!(after.peak, before.peak);
+    assert_eq!(after.output, before.output);
+    assert!(after.output.is_some());
+    eprintln!(
+        "X_OUT_T3 case=d peak={} output={:?} parity=ok",
+        after.peak, after.output
+    );
+}
+
+fn x_out_identity(tag: &str) -> crate::context_footprint::RepositoryIdentity {
+    crate::context_footprint::RepositoryIdentity {
+        repository_hash: Some(format!("hash-{tag}")),
+        repository_label: Some(format!("label-{tag}")),
+        repository_label_source: Some("git_remote".to_string()),
+        repository_identity_source: Some("git".to_string()),
+        workspace_kind: Some("git_repo".to_string()),
+    }
+}
+
+/// Rows of one case under their own workspace (the identity cache is global).
+fn with_cwd(mut rows: Vec<Value>, cwd: &str) -> Vec<Value> {
+    for row in &mut rows {
+        if row.get("cwd").is_some() {
+            row["cwd"] = json!(cwd);
+        }
+    }
+    rows
+}
+
+/// For each assistant row of `rows`, `edit(row_index, row)`.
+fn edit_assistant(mut rows: Vec<Value>, mut edit: impl FnMut(usize, &mut Value)) -> Vec<Value> {
+    for (index, row) in rows.iter_mut().enumerate() {
+        if row["type"] == "assistant" {
+            edit(index, row);
+        }
+    }
+    rows
+}
+
+/// A value's completed heap, without its inline slot (T5 compares fields
+/// whose containers differ: `OwnedVec` before the move, `Vec` after).
+fn completed_heap_only<T: HeapLayoutBound>(value: &T) -> Option<usize> {
+    crate::heap_layout_bound::completed_bound(value, usize::MAX)?
+        .checked_sub(std::mem::size_of_val(value))
+}
+
+fn x_out_input<'a>(
+    path: &'a Path,
+    title: &'a ClaudeTitleMetadata,
+    identity: Option<&'a crate::context_footprint::RepositoryIdentity>,
+) -> FinishOutputInput<'a> {
+    FinishOutputInput {
+        path,
+        collected_at: NOW,
+        source_file_fingerprint: "x-out-fixture",
+        opened_object_identity: "x-out-identity",
+        title_metadata: Some(title),
+        attribution: false,
+        repository_identity: identity,
+    }
+}
+
+/// For the `position`-th assistant row of `rows` (its response record),
+/// `edit(position, row)`.
+fn edit_records(mut rows: Vec<Value>, mut edit: impl FnMut(usize, &mut Value)) -> Vec<Value> {
+    let mut position = 0;
+    for row in &mut rows {
+        if row["type"] == "assistant" {
+            edit(position, row);
+            position += 1;
+        }
+    }
+    rows
+}
+
+/// What a finished item holds from its responses, the outputs X_out family
+/// R bounds: request ids, occurrences, cache requests, tool usage, model and
+/// bucket rows. The rows also carry text `finish_output_bound` charges
+/// outside R (account hash, cost text), so this over-measures R.
+fn family_r_measured(item: &SnapshotItem) -> Option<usize> {
+    completed_heap_only(&item.claude_usage_request_ids)?
+        .checked_add(completed_heap_only(&item.claude_usage_occurrences)?)?
+        .checked_add(completed_heap_only(&item.cache_requests)?)?
+        .checked_add(completed_heap_only(&item.tool_usage)?)?
+        .checked_add(completed_heap_only(&item.model_usage)?)?
+        .checked_add(completed_heap_only(&item.usage_buckets)?)
+}
+
+/// What a T1 case adds around its file (fresh-r1 N1, N3).
+#[derive(Default)]
+struct FinishCase<'a> {
+    /// Finish with a launches-prepared attribution context (X_out's K facts
+    /// and U2's path hash), as the scan does, instead of none.
+    attribution: bool,
+    /// Runs on the read accumulator before X_out is taken: rows that exist
+    /// before `finish` (N1). Family R then bounds only part of the item.
+    prepare: Option<&'a dyn Fn(&mut SnapshotAccumulator)>,
+}
+
+/// What one T1 case measured.
+struct FinishReceipt {
+    x_out: usize,
+    decode_peak: usize,
+    born: usize,
+    /// The largest `snapshot_fingerprint` transient of a finished item, one
+    /// item at a time (N1: its semantic JSON has no X_out term of its own).
+    fingerprint_peak: usize,
+}
+
+/// A launch root with one launch event for `SESSION` in `fixture`'s home, as
+/// `retain_release_tests::LaunchHome` builds it, and a context that has
+/// prepared it.
+fn launch_context(fixture: &TempJsonl) -> crate::session_attribution::SessionAttributionContext {
+    use base64::Engine;
+    let home = fixture.dir.join("home");
+    let raw = json!({"schema":"agent_launch.v1",
+        "controller_session_ref":"a9789dcf-1e4a-4a6e-8abd-f30094efb269",
+        "worker_session_ref":SESSION, "relationship_kind":"launched",
+        "workflow_ref":null, "pr_ref":null, "launch_ts":"2026-09-20T10:00:00Z",
+        "capture_source":"launcher_event:opus_cli_agent", "evidence":"direct"})
+    .to_string();
+    let reduced = crate::launch_events::validate_event(&raw).unwrap();
+    let events = home.join(".ottto/launch-events/processed");
+    fs::create_dir_all(&events).unwrap();
+    fs::write(
+        events.join(format!(
+            "{}.json",
+            crate::launch_events::event_digest(&reduced)
+        )),
+        raw,
+    )
+    .unwrap();
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([13_u8; 32]);
+    let context = crate::session_attribution::SessionAttributionContext::from_activity_hint(
+        SnapshotSource::ClaudeCode,
+        &home,
+        true,
+        Some(&key),
+        Some(crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION),
+    )
+    .unwrap();
+    while !context.prepare_launch_step(&[SESSION.to_owned()]).unwrap() {}
+    assert!(context.launches_prepared(&[SESSION.to_owned()]));
+    context
+}
+
+/// T1, T4, T5, T6 for one file: read it natively, take X_out exactly as the
+/// proof site does (warm U3 identity), then finish inside a born-pointer
+/// allocation audit. Returns the finished items.
+fn assert_x_out_covers_finish(
+    label: &str,
+    rows: &[Value],
+    title: &ClaudeTitleMetadata,
+) -> Vec<SnapshotItem> {
+    assert_x_out_covers_finish_with(label, rows, title, FinishCase::default()).0
+}
+
+/// `assert_x_out_covers_finish` with `case`'s additions, and its receipt.
+fn assert_x_out_covers_finish_with(
+    label: &str,
+    rows: &[Value],
+    title: &ClaudeTitleMetadata,
+    case: FinishCase<'_>,
+) -> (Vec<SnapshotItem>, FinishReceipt) {
+    let fixture = TempJsonl::new(label);
+    fixture.append(rows);
+    let attribution = case.attribution.then(|| launch_context(&fixture));
+    let (mut parser, expected) = native_parser(&fixture.path);
+    while !parser.step().unwrap() {}
+    if let Some(prepare) = case.prepare {
+        prepare(&mut parser.accumulator);
+    }
+    if let Some(workspace) = parser.accumulator.workspace_path.clone() {
+        repository_identity_cache()
+            .lock()
+            .unwrap()
+            .insert(workspace, (SystemTime::now(), x_out_identity(label)));
+    }
+    let identity = parser
+        .accumulator
+        .workspace_path
+        .as_deref()
+        .and_then(peek_repository_identity);
+    let responses = parser.accumulator.claude_responses.values().count();
+    let peak = parser
+        .accumulator
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    let family_r = parser
+        .accumulator
+        .claude_responses
+        .completion_bounds(usize::MAX)
+        .and_then(|bounds| bounds.output)
+        .unwrap_or_else(|| panic!("{label}: family R refused"));
+    let moved_before = (
+        completed_heap_only(&parser.accumulator.claude_file_birth),
+        completed_heap_only(&parser.accumulator.claude_compaction_observations),
+        completed_heap_only(&parser.accumulator.claude_org_markers),
+    );
+    let x_out = parser
+        .finish_output_bound(
+            FinishOutputInput {
+                path: &fixture.path,
+                collected_at: NOW,
+                source_file_fingerprint: "x-out-fixture",
+                opened_object_identity: &expected,
+                title_metadata: Some(title),
+                attribution: attribution.is_some(),
+                repository_identity: identity.as_ref(),
+            },
+            usize::MAX,
+        )
+        .unwrap_or_else(|| panic!("{label}: X_out refused"));
+    let (parsed, actual) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        parser
+            .finish_with_repository_identity(
+                &expected,
+                &fixture.path,
+                NOW,
+                "x-out-fixture".into(),
+                None,
+                Some(title),
+                attribution.as_ref(),
+                identity,
+            )
+            .unwrap()
+    });
+    let output = crate::heap_layout_bound::completed_bound(&parsed, usize::MAX).unwrap();
+    let born = actual.requested_peak_with_overlap;
+    let fingerprint_peak = parsed
+        .snapshots
+        .iter()
+        .map(|item| {
+            crate::retry_allocation_probe::measure_caller_thread(|| {
+                snapshot_fingerprint(SnapshotSource::ClaudeCode, item)
+            })
+            .1
+            .requested_peak_with_overlap
+        })
+        .max()
+        .unwrap_or(0);
+    eprintln!(
+        "X_OUT_T1 case={label} responses={responses} items={} x_out={x_out} output={output} decode_peak={peak} born_finish_peak={born} output_slack={} peak_slack={} born_ratio={:.4} fingerprint_peak={fingerprint_peak} attribution={}",
+        parsed.snapshots.len(),
+        x_out - output.min(x_out),
+        (x_out + peak) - born.min(x_out + peak),
+        born as f64 / (x_out + peak) as f64,
+        attribution.is_some(),
+    );
+    // T4: no JSON capacity on a Claude item.
+    for item in &parsed.snapshots {
+        assert!(item.cache_observations.is_none(), "{label}");
+        assert!(item.cache_observations_state.is_none(), "{label}");
+        assert!(item.cache_base_head_etag.is_none(), "{label}");
+    }
+    // T5: family M fields are no larger after the move.
+    if let [item] = parsed.snapshots.as_slice() {
+        let after = (
+            completed_heap_only(&item.claude_file_birth),
+            completed_heap_only(&item.claude_context_curve_boundaries),
+            completed_heap_only(&item.claude_org_markers),
+        );
+        let le = |after: Option<usize>, before: Option<usize>| {
+            after
+                .zip(before)
+                .is_some_and(|(after, before)| after <= before)
+        };
+        assert!(
+            le(after.0, moved_before.0)
+                && le(after.1, moved_before.1)
+                && le(after.2, moved_before.2),
+            "{label}: T5 after={after:?} before={moved_before:?}"
+        );
+    }
+    // T1: the finished value is within X_out, and what it holds from its
+    // responses is within family R.
+    eprintln!("X_OUT_T1 case={label} family=composed measured={output} bound={x_out}");
+    if let ([item], None) = (parsed.snapshots.as_slice(), case.prepare) {
+        let measured = family_r_measured(item).expect("finished item measured");
+        eprintln!("X_OUT_T1 case={label} family=R measured={measured} bound={family_r}");
+        assert!(
+            measured <= family_r,
+            "{label}: family R measured={measured} > bound={family_r}"
+        );
+    }
+    assert!(output <= x_out, "{label}: output={output} > x_out={x_out}");
+    // T6: everything born in finish coexists within X_out plus the decode peak.
+    assert!(
+        born <= x_out + peak,
+        "{label}: born_finish_peak={born} > x_out={x_out} + decode_peak={peak}"
+    );
+    (
+        parsed.snapshots,
+        FinishReceipt {
+            x_out,
+            decode_peak: peak,
+            born,
+            fingerprint_peak,
+        },
+    )
+}
+
+/// T1 (adversarial sweep, R1a R8 union cases), with T4-T6 per case.
+#[test]
+fn x_out_t1_bounds_the_finished_claude_file() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let none = ClaudeTitleMetadata::default();
+    let case = |label: &str, rows: Vec<Value>| {
+        assert_x_out_covers_finish(
+            label,
+            &with_cwd(rows, &format!("/work/x-out-{label}")),
+            &none,
+        )
+    };
+    case("responses-0", title_rows());
+    for count in [1, 2, 3, 7, 8, 9] {
+        case(
+            &format!("responses-{count}"),
+            realistic_rows(0..count, &[SHELL, CHROME[0]]),
+        );
+    }
+    // R1a R8 union cases: one multi-record response (thinking, text, one
+    // record per tool) whose records differ in (i) selectors, (ii) tool uses,
+    // (iii) whether they carry `model` (the third record is the first to);
+    // then all three at once beside a second response. Selectors differ by
+    // key per record, never by one key's value: a conflicting value fails the
+    // whole response (`merge_claude_response_selector`), which finishes
+    // nothing.
+    const UNION_TOOLS: [&str; 4] = [SHELL, CHROME[0], CHROME[1], CHROME[2]];
+    let distinct_selectors = |position: usize, row: &mut Value| {
+        let usage = row["message"]["usage"].as_object_mut().unwrap();
+        usage.remove("service_tier");
+        usage.remove("speed");
+        let (key, value) = [
+            ("service_tier", "standard"),
+            ("speed", "standard"),
+            ("inference_geo", "us"),
+        ][position % 3];
+        usage.insert(key.to_string(), json!(value));
+    };
+    let late_model = |position: usize, row: &mut Value| {
+        if position < 2 {
+            row["message"].as_object_mut().unwrap().remove("model");
+        }
+    };
+    let mut union_all = edit_records(realistic_turn(0, &UNION_TOOLS), |position, row| {
+        distinct_selectors(position, row);
+        late_model(position, row);
+    });
+    union_all.extend(realistic_turn(1, &[SHELL]));
+    for (label, rows, responses) in [
+        (
+            "union-selectors",
+            edit_records(realistic_turn(0, &UNION_TOOLS), distinct_selectors),
+            1,
+        ),
+        ("union-tools", realistic_turn(0, &UNION_TOOLS), 1),
+        (
+            "union-late-model",
+            edit_records(realistic_turn(0, &UNION_TOOLS), late_model),
+            1,
+        ),
+        ("union-all", union_all, 2),
+    ] {
+        let items = case(label, rows);
+        let [item] = items.as_slice() else {
+            panic!(
+                "{label}: {} items, the union must finish into one",
+                items.len()
+            );
+        };
+        assert_eq!(
+            item.claude_usage_request_ids.len(),
+            responses,
+            "{label}: every response resolved"
+        );
+        assert!(
+            !item.model_usage.is_empty() && item.model_usage.iter().all(|row| row.model == MODEL),
+            "{label}: rows take the late model"
+        );
+    }
+    let tools: Vec<String> = (0..201)
+        .map(|tool| format!("mcp__x-out__tool_{tool:03}"))
+        .collect();
+    let tools: Vec<&str> = tools.iter().map(String::as_str).collect();
+    case("tools-201", realistic_rows(0..2, &tools));
+    let first_request = format!("req_011CU{:019}", 0);
+    case(
+        "duplicate-request-ids",
+        edit_assistant(realistic_rows(0..3, &[SHELL]), |_, row| {
+            row["requestId"] = json!(first_request);
+        }),
+    );
+    case(
+        "missing-request-id",
+        // The second turn's rows (title rows, then four rows per turn).
+        edit_assistant(realistic_rows(0..3, &[SHELL]), |index, row| {
+            if (7..10).contains(&index) {
+                row.as_object_mut().unwrap().remove("requestId");
+            }
+        }),
+    );
+    let models = [
+        "c".to_string(),
+        "m".repeat(23),
+        "m".repeat(24),
+        "m".repeat(64),
+        "m".repeat(300),
+    ];
+    let mut rows = Vec::new();
+    for (index, model) in models.iter().enumerate() {
+        rows.extend(edit_assistant(realistic_turn(index, &[SHELL]), |_, row| {
+            row["message"]["model"] = json!(model);
+        }));
+    }
+    case("model-lengths", rows);
+    let mut rows = Vec::new();
+    for index in 0..70 {
+        rows.extend(edit_assistant(realistic_turn(index, &[SHELL]), |_, row| {
+            row["message"]["usage"]["inference_geo"] = json!(format!("geo-{index:03}"));
+        }));
+    }
+    case("selectors-70", rows);
+    let mut rows = realistic_rows(0..3, &[SHELL]);
+    rows.push(
+        json!({"type":"system", "subtype":"compact_boundary", "sessionId": SESSION,
+        "timestamp": at(100, 0), "uuid": "x-out-boundary", "parentUuid": null,
+        "cwd": "/work/r1a-fixture",
+        "compactMetadata": {"trigger": "auto", "preTokens": 900000, "postTokens": 4000}}),
+    );
+    rows.extend(realistic_rows(3..5, &[SHELL]));
+    case("compaction", rows);
+
+    let mut titled = ClaudeTitleMetadata::default();
+    titled.titles.insert(
+        SESSION.to_string(),
+        ClaudeTitleCandidate {
+            title: format!("  {}  ", "a desktop title ".repeat(12)),
+            user_set: true,
+        },
+    );
+    assert_x_out_covers_finish(
+        "title",
+        &with_cwd(realistic_rows(0..3, &[SHELL]), "/work/x-out-title"),
+        &titled,
+    );
+}
+
+/// X_out U3 and U1 controls (c22 amendment 2): a workspace whose identity is
+/// not warm in the cache, or a subagent transcript, has no X_out, so the
+/// proof releases nothing; the same file with a warm identity has one.
+#[test]
+fn x_out_refuses_a_cold_workspace_and_a_subagent() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let workspace = "/work/x-out-cold-workspace";
+    let accumulator = parser_for(&with_cwd(realistic_rows(0..3, &[SHELL]), workspace));
+    assert_eq!(peek_repository_identity(Path::new(workspace)), None);
+    let path = PathBuf::from(format!("/p/{SESSION}.jsonl"));
+    let title = ClaudeTitleMetadata::default();
+    let identity = x_out_identity("cold-control");
+    assert_eq!(
+        accumulator.finish_output_bound(x_out_input(&path, &title, None), usize::MAX),
+        None
+    );
+    assert!(accumulator
+        .finish_output_bound(x_out_input(&path, &title, Some(&identity)), usize::MAX)
+        .is_some());
+    let subagent = PathBuf::from("/p/x-out-parent/subagents/agent-x-out.jsonl");
+    assert_eq!(
+        accumulator
+            .finish_output_bound(x_out_input(&subagent, &title, Some(&identity)), usize::MAX),
+        None
+    );
+}
+
+/// fresh-r1 N3: the composed T1/T6 check with a launches-prepared
+/// attribution context (X_out's K facts, U2's path hash) and title metadata
+/// carrying an account hash and original identity evidence (U1's per-row
+/// hash, evidence strings and sets).
+#[test]
+fn x_out_t1_bounds_a_finish_with_attribution_and_identity_evidence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let account = "a".repeat(64);
+    let mut title = ClaudeTitleMetadata::default();
+    title.titles.insert(
+        SESSION.to_string(),
+        ClaudeTitleCandidate {
+            title: "an attributed desktop title".to_string(),
+            user_set: true,
+        },
+    );
+    title
+        .account_identifier_hashes
+        .insert(SESSION.to_string(), BTreeSet::from([account.clone()]));
+    title.original_identity_evidence.insert(
+        SESSION.to_string(),
+        BTreeSet::from([
+            ClaudeDesktopIdentityEvidence {
+                account_identifier_hash: Some(account.clone()),
+                provider_workspace_hash: Some("w".repeat(64)),
+                source_created_at: Some("2026-09-20T09:59:00.000Z".to_string()),
+                imported: false,
+            },
+            ClaudeDesktopIdentityEvidence {
+                account_identifier_hash: Some("b".repeat(64)),
+                provider_workspace_hash: None,
+                source_created_at: Some("2026-09-21T10:00:00.000Z".to_string()),
+                imported: true,
+            },
+        ]),
+    );
+    let (items, receipt) = assert_x_out_covers_finish_with(
+        "attributed",
+        &with_cwd(realistic_rows(0..3, &[SHELL]), "/work/x-out-attributed"),
+        &title,
+        FinishCase {
+            attribution: true,
+            prepare: None,
+        },
+    );
+    let [item] = items.as_slice() else {
+        panic!("attributed: {} items", items.len());
+    };
+    let launched = item
+        .attribution_facts
+        .iter()
+        .any(|fact| fact.evidence.kind == "launcher_event");
+    let hashed = item
+        .model_usage
+        .iter()
+        .chain(
+            item.usage_buckets
+                .iter()
+                .flat_map(|bucket| &bucket.model_usage),
+        )
+        .filter(|row| row.account_identifier_hash.as_deref() == Some(account.as_str()))
+        .count();
+    eprintln!(
+        "X_OUT_N3 facts={} launcher_fact={launched} account_hashed_rows={hashed} session_account_evidence={} x_out={} decode_peak={} born={}",
+        item.attribution_facts.len(),
+        item.session_account_evidence.is_some(),
+        receipt.x_out,
+        receipt.decode_peak,
+        receipt.born,
+    );
+    assert!(launched, "precondition: the launch context applied");
+    assert!(hashed >= 1, "precondition: rows carry the account hash");
+    assert!(
+        item.session_account_evidence.is_some(),
+        "precondition: the identity evidence applied"
+    );
+}
+
+/// fresh-r1 N1: `finish`'s semantic JSON (`snapshot_fingerprint`) has no
+/// X_out term of its own; the per-row node charge covers it
+/// (`finish_output_bound`'s doc). The fact-limit scratch is charged by
+/// `fact_limit_scratch_bound` (r33). A few hundred tiny rows
+/// that exist before `finish` (one model each, so each is its own row; the
+/// rows' smallest per-row charge), with the attribution context on: every
+/// allocation born in `finish` is within X_out plus the decode peak (T6),
+/// and the fingerprint's transient is within five whole
+/// `(RowKey, BucketRowAccumulator)` nodes per usage row. Claude has no file
+/// rows of its own before `finish` (every usage record waits in the
+/// response book), so the rows are added as `add_usage_with_selector` adds
+/// any row.
+#[test]
+fn x_out_t6_covers_tiny_file_rows_with_attribution() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const TINY_ROWS: usize = 300;
+    let prepare = |accumulator: &mut SnapshotAccumulator| {
+        for row in 0..TINY_ROWS {
+            accumulator.add_usage_with_selector(
+                Some(format!("m{row:03}")),
+                UsageTotals {
+                    input_tokens: 1,
+                    output_tokens: 1,
+                    request_count: 1,
+                    ..UsageTotals::default()
+                },
+                SelectorCapture::default(),
+                Some(&at(row as u64, 0)),
+                None,
+            );
+        }
+    };
+    let (items, receipt) = assert_x_out_covers_finish_with(
+        "tiny-file-rows",
+        &with_cwd(realistic_rows(0..1, &[SHELL]), "/work/x-out-tiny-file-rows"),
+        &ClaudeTitleMetadata::default(),
+        FinishCase {
+            attribution: true,
+            prepare: Some(&prepare),
+        },
+    );
+    let [item] = items.as_slice() else {
+        panic!("tiny-file-rows: {} items", items.len());
+    };
+    let usage_rows = item.model_usage.len();
+    let bucket_rows: usize = item
+        .usage_buckets
+        .iter()
+        .map(|bucket| bucket.model_usage.len())
+        .sum();
+    let node = crate::heap_layout_bound::tree_node_bytes::<RowKey, BucketRowAccumulator>().unwrap();
+    eprintln!(
+        "X_OUT_N1 tiny_rows={TINY_ROWS} usage_rows={usage_rows} bucket_rows={bucket_rows} facts={} node={node} fingerprint_peak={} fingerprint_per_row={} five_nodes={} born={} x_out={} decode_peak={} born_ratio={:.4}",
+        item.attribution_facts.len(),
+        receipt.fingerprint_peak,
+        receipt.fingerprint_peak / usage_rows.max(1),
+        5 * node,
+        receipt.born,
+        receipt.x_out,
+        receipt.decode_peak,
+        receipt.born as f64 / (receipt.x_out + receipt.decode_peak) as f64,
+    );
+    assert!(
+        usage_rows > TINY_ROWS,
+        "precondition: every tiny row is its own row"
+    );
+    assert!(
+        receipt.fingerprint_peak <= usage_rows * 5 * node,
+        "N1: fingerprint transient {} > {usage_rows} rows x 5 nodes of {node} B",
+        receipt.fingerprint_peak
+    );
+}
+
+/// #665 r33 (c22: no residual may rely on slack). `fact_limit_scratch_bound`
+/// covers `enforce_fact_limits` at its adversarial maximum, measured on the
+/// function itself: 96 facts (four producers at the 24-fact cap), every text
+/// at its cap and made of control characters, so each byte escapes to six.
+/// No transcript fixture produces facts like these; the end-to-end T6 rows
+/// (`x_out_t6_covers_tiny_file_rows_with_attribution`, T1 attributed) cover
+/// the term inside `finish_output_bound`.
+#[test]
+fn x_out_fact_limit_scratch_covers_adversarial_facts() {
+    use crate::session_attribution::{
+        SessionAttributionFact, SessionFieldEvidence, MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES,
+        MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES,
+        MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES, MAX_SESSION_ATTRIBUTION_FACTS,
+        MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES, MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let text = |len: usize| "\u{1}".repeat(len);
+    let fact = || SessionAttributionFact {
+        field: text(FACT_LITERAL_BYTES),
+        value: text(MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES),
+        display_label: Some(text(MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES)),
+        display_label_source: Some(text(MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES)),
+        evidence: SessionFieldEvidence {
+            kind: text(FACT_LITERAL_BYTES),
+            strength: text(FACT_LITERAL_BYTES),
+            observed_at: text(NOW.len()),
+            source_version: text(MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES),
+            evidence_ref: text(MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES),
+        },
+    };
+    let per_fact = 3 * FACT_LITERAL_BYTES
+        + MAX_SESSION_ATTRIBUTION_FACT_VALUE_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_BYTES
+        + MAX_SESSION_ATTRIBUTION_DISPLAY_LABEL_SOURCE_BYTES
+        + MAX_SESSION_ATTRIBUTION_SOURCE_VERSION_BYTES
+        + MAX_SESSION_ATTRIBUTION_EVIDENCE_REF_BYTES
+        + NOW.len();
+    let count = 4 * MAX_SESSION_ATTRIBUTION_FACTS;
+    let mut facts: Vec<SessionAttributionFact> = (0..count).map(|_| fact()).collect();
+    let bound = fact_limit_scratch_bound(4, NOW.len()).unwrap();
+    let pre_trim = count * per_fact;
+
+    // One `to_vec` buffer at the count cap: maximal escaping, and the
+    // doubling the term derives (its last buffer is exactly `128 * 2^k`).
+    let buffer = serde_json::to_vec(&facts[..MAX_SESSION_ATTRIBUTION_FACTS]).unwrap();
+    let json_len = (6 * per_fact + FACT_JSON_SYNTAX_BYTES) * MAX_SESSION_ATTRIBUTION_FACTS + 2;
+    let last = json_len.div_ceil(128).next_power_of_two() * 128;
+    assert!(
+        buffer.len() >= MAX_SESSION_ATTRIBUTION_FACTS * 6 * per_fact,
+        "precondition: every text byte escapes to six ({} B)",
+        buffer.len()
+    );
+    assert!(buffer.len() <= json_len, "syntax: {} B", buffer.len());
+    assert_eq!(buffer.capacity(), last, "len {}", buffer.len());
+    assert!(last + last / 2 <= bound - pre_trim);
+    drop(buffer);
+
+    let ((), scratch) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        crate::session_attribution::enforce_fact_limits(&mut facts)
+    });
+    let born = scratch.requested_peak_with_overlap;
+    eprintln!(
+        "X_OUT_FACTS facts={count} kept={} per_fact={per_fact} pre_trim={pre_trim} born_scratch={born} json_len={json_len} json_last={last} term={} term_off={} slack={}",
+        facts.len(),
+        bound,
+        fact_limit_scratch_bound(2, NOW.len()).unwrap(),
+        bound - (pre_trim + born).min(bound),
+    );
+    // Two escaped facts (about 7.5 KB) fit the 8,192-byte budget; three do not.
+    assert_eq!(facts.len(), 2, "precondition: the budget loop popped 22");
+    assert!(
+        born >= last + last / 2,
+        "precondition: the last growth's old and new buffers were measured"
+    );
+    assert!(
+        pre_trim + born <= bound,
+        "fact-limit scratch {pre_trim} + {born} > term {bound}"
+    );
+}
+
+/// Zero-usage Claude rows (no positive usage evidence anywhere: an itemless
+/// file): `responses[i]` content-block records of response `i`, all with
+/// the response's request id.
+fn itemless_rows(responses: &[usize]) -> Vec<Value> {
+    let mut rows = Vec::new();
+    for (index, &records) in responses.iter().enumerate() {
+        for record in 0..records {
+            let mut row = envelope(
+                "assistant",
+                format!("i{index:04}-{record:05}"),
+                at(
+                    60 * index as u64 + (record / 1000) as u64,
+                    (record % 1000) as u64,
+                ),
+            );
+            row["requestId"] = json!(format!("req_011CI{index:019}"));
+            row["message"] = json!({
+                "id": format!("msg_01ITM{index:019}"),
+                "type": "message",
+                "role": "assistant",
+                "model": MODEL,
+                "content": [{"type": "text", "text": "."}],
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 0, "output_tokens": 0},
+            });
+            rows.push(row);
+        }
+    }
+    rows
+}
+
+/// #665 r35 (c22 ruling on F2): `buffered_request_hashes_bound` charges the
+/// request-hash vector the caller builds for an itemless Claude file before
+/// `finish` and keeps across it. The book holds a response of more than
+/// 1,562 records (past R's per-response domination), one past
+/// `MAX_CLAUDE_RECORDS_PER_RESPONSE` (R charges it nothing; its 4,096 stored
+/// records still feed the vector) and fifty one-record responses. The
+/// vector's measured peak is within the term, its capacity is the derived
+/// `4 * 2^k`, and the vector plus `finish`, in production order, stay
+/// within X_out plus the decode peak.
+#[test]
+fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const LONG: usize = 1_600;
+    const OVER: usize = 4_200;
+    const SHORT: usize = 50;
+    let mut shape = vec![LONG, OVER];
+    shape.extend(std::iter::repeat_n(1, SHORT));
+    let fixture = TempJsonl::new("itemless-hashes");
+    fixture.append(&with_cwd(
+        itemless_rows(&shape),
+        "/work/x-out-itemless-hashes",
+    ));
+    let (mut parser, expected) = native_parser(&fixture.path);
+    while !parser.step().unwrap() {}
+    assert!(
+        !parser.positive_usage_evidence,
+        "precondition: no positive usage evidence (itemless)"
+    );
+    let book = &parser.accumulator.claude_responses;
+    let stored: usize = book.values().map(|response| response.records.len()).sum();
+    let over: Vec<usize> = book
+        .values()
+        .filter(|response| response.record_limit_exceeded)
+        .map(|response| response.records.len())
+        .collect();
+    let longest = book
+        .values()
+        .filter(|response| !response.record_limit_exceeded)
+        .map(|response| response.records.len())
+        .max()
+        .unwrap_or(0);
+    assert_eq!(over, vec![MAX_CLAUDE_RECORDS_PER_RESPONSE], "precondition");
+    assert!(longest > 1_562, "precondition: longest {longest}");
+    assert_eq!(stored, LONG + MAX_CLAUDE_RECORDS_PER_RESPONSE + SHORT);
+
+    if let Some(workspace) = parser.accumulator.workspace_path.clone() {
+        repository_identity_cache().lock().unwrap().insert(
+            workspace,
+            (SystemTime::now(), x_out_identity("itemless-hashes")),
+        );
+    }
+    let identity = parser
+        .accumulator
+        .workspace_path
+        .as_deref()
+        .and_then(peek_repository_identity);
+    let title = ClaudeTitleMetadata::default();
+    let peak = parser
+        .accumulator
+        .claude_responses
+        .decode_peak_bound(usize::MAX)
+        .unwrap();
+    let term = buffered_request_hashes_bound(stored).unwrap();
+    let x_out = parser
+        .finish_output_bound(
+            FinishOutputInput {
+                path: &fixture.path,
+                collected_at: NOW,
+                source_file_fingerprint: "x-out-fixture",
+                opened_object_identity: &expected,
+                title_metadata: Some(&title),
+                attribution: false,
+                repository_identity: identity.as_ref(),
+            },
+            usize::MAX,
+        )
+        .expect("X_out");
+
+    // The vector alone, as the caller builds it.
+    let (hashes, alone) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        super::claude_request_census::claude_buffered_request_hashes(&parser)
+    });
+    let last = stored.next_power_of_two().max(4);
+    let distinct = hashes.len();
+    assert_eq!(hashes.capacity(), last, "the derived doubling");
+    let vector_peak = alone.requested_peak_with_overlap;
+    drop(hashes);
+
+    // Production order: the vector, then `finish` beside it.
+    let ((hashes, parsed), actual) = crate::retry_allocation_probe::measure_caller_thread(|| {
+        let hashes = super::claude_request_census::claude_buffered_request_hashes(&parser);
+        let parsed = parser
+            .finish_with_repository_identity(
+                &expected,
+                &fixture.path,
+                NOW,
+                "x-out-fixture".into(),
+                None,
+                Some(&title),
+                None,
+                identity,
+            )
+            .unwrap();
+        (hashes, parsed)
+    });
+    let born = actual.requested_peak_with_overlap;
+    eprintln!(
+        "X_OUT_HASHES stored={stored} longest={longest} limit_exceeded={} distinct={distinct} capacity={last} vector_peak={vector_peak} term={term} x_out={x_out} decode_peak={peak} born={born} items={} born_ratio={:.4}",
+        over[0],
+        parsed.snapshots.len(),
+        born as f64 / (x_out + peak) as f64,
+    );
+    drop(hashes);
+    assert!(
+        vector_peak <= term,
+        "request-hash vector {vector_peak} > term {term}"
+    );
+    assert!(
+        vector_peak >= 8 * (last + last / 2),
+        "precondition: the last growth's old and new buffers were measured"
+    );
+    assert!(
+        born <= x_out + peak,
+        "itemless: born {born} > x_out {x_out} + decode peak {peak}"
+    );
+}
+
+/// #665 r36 (AutoReview P2, U1): `desktop_title_bound` covers a desktop
+/// title's normalization scratch at adversarial lengths near the sidecar
+/// file cap (`MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES`): one-byte words (the
+/// most words a length allows), one unbroken word, and a short title that
+/// reaches `is_safe_display_title`'s allocations. Measured on
+/// `normalize_display_title` with its input clone, plus the item's clone of
+/// the kept title; then end to end, born within X_out plus the decode peak.
+#[test]
+fn x_out_u1_charges_desktop_title_normalization() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let near_cap = MAX_CLAUDE_DESKTOP_SESSION_FILE_BYTES as usize - 4 * 1024;
+    let cases = [
+        ("spaced", "a ".repeat(near_cap / 2)),
+        ("unbroken", "x".repeat(near_cap)),
+        ("safe", "  Investigate   cache\tpolicy  drift  ".to_string()),
+    ];
+    for (label, title) in &cases {
+        let bound = desktop_title_bound(title.len()).unwrap();
+        let (kept, normalized) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            normalize_display_title(title.clone(), "desktop_title")
+        });
+        let kept_len = kept.as_ref().map_or(0, String::len);
+        let peak = normalized.requested_peak_with_overlap;
+        let words = title.split_whitespace().count();
+        eprintln!(
+            "X_OUT_U1 case={label} len={} words={words} kept={kept_len} normalize_peak={peak} item_clone={kept_len} term={bound} slack={}",
+            title.len(),
+            bound - (peak + kept_len).min(bound),
+        );
+        assert!(
+            peak + kept_len <= bound,
+            "{label}: normalization {peak} + clone {kept_len} > term {bound}"
+        );
+        match *label {
+            "spaced" => {
+                let last = words.next_power_of_two();
+                assert!(
+                    peak >= 16 * (last + last / 2),
+                    "precondition: the words vector's last growth was measured"
+                );
+            }
+            "safe" => assert_eq!(kept.as_deref(), Some("Investigate cache policy drift")),
+            _ => assert!(kept.is_none(), "{label}: over 120 chars is not displayed"),
+        }
+    }
+    for (label, title) in cases {
+        let mut titled = ClaudeTitleMetadata::default();
+        titled.titles.insert(
+            SESSION.to_string(),
+            ClaudeTitleCandidate {
+                title,
+                user_set: true,
+            },
+        );
+        let label = format!("u1-{label}");
+        assert_x_out_covers_finish(
+            &label,
+            &with_cwd(
+                realistic_rows(0..3, &[SHELL]),
+                &format!("/work/x-out-{label}"),
+            ),
+            &titled,
+        );
+    }
 }

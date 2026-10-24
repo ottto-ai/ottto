@@ -1224,11 +1224,9 @@ fn candidate_parse_reasons_name_the_selecting_gate() {
     );
 }
 
-// Contract 5 reads this pass's census to decide whether transcript markers may
-// tag a request that has no telemetry of its own. Fence coverage excuses a
-// family held by a bound authority quarantine, but that family's requests were
-// not compared in this window. An unmarked copy of such an original under a
-// new root carries the original's request and org marker, and must not tag it.
+// Contract 5 withdraws transcript markers even when the census is complete.
+// A quarantine can excuse fence coverage without comparing an original, but
+// neither that excusal nor the fully compared control authorizes copied tags.
 fn transcript_ownership<'i>(
     index: &'i ScanIndex,
     disposition: &ClaudeUsageAuthorityDisposition,
@@ -1309,14 +1307,13 @@ fn transcript_ownership_needs_quarantined_originals_observed() {
         assert_eq!(item.cost, before.cost);
     };
 
-    // Control: every indexed member was compared, so the copy's marker org
-    // stands.
+    // Control: every indexed member was compared; marker tags still withdraw.
     let (counts, _, copy) = run(ScanIndex::default());
     assert!(
         counts.census_complete && counts.coverage_complete,
         "{counts:?}"
     );
-    assert_eq!(bases(&copy), [identity::TRANSCRIPT_ORG]);
+    assert!(bases(&copy).is_empty());
     conserved(&copy);
 
     // The original is indexed, held by a bound terminal quarantine, and its
