@@ -769,6 +769,14 @@ fn malformed_or_absent_side_requests_leave_the_rest_of_the_index_alone() {
 
     value["codex_parent_side_requests"] = serde_json::json!([]);
     fs::write(&path, serde_json::to_vec_pretty(&value).unwrap()).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    assert!(
+        ScanIndex::load(&path).is_err(),
+        "an unsupported outer shape refuses in place"
+    );
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    // Original syntax failure still exercises the existing quarantine contract.
+    fs::write(&path, b"{\"files\":").unwrap();
     let rebuilt = ScanIndex::load(&path).unwrap();
     assert!(!path.exists());
     assert!(rebuilt.accepted_snapshot_fingerprints.is_empty());

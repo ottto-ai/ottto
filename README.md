@@ -440,7 +440,10 @@ This workspace contains the Phase 1 protocol/core foundation and the first Phase
   logout, device writes, and Cloud-session mutations fail with
   `identity_mutation_in_progress` and are safe to retry. Setup and login are
   idempotent no-ops while a bound user is already connected; they cannot create
-  a pending-claim overlay over a healthy binding. Rejected or unauthorized
+  a pending-claim overlay over a healthy binding. Once Verify or an agent read
+  records that Ottto ended the setup run or refused the device credential, or
+  no setup-run binding is left, login starts a reconnect claim instead; the
+  bound user is kept and completing the claim replaces the binding. Rejected or unauthorized
   setup-run polling is terminal locally instead of retrying a stale run.
 - `ottto logout --forget-installation --confirm` is the explicit destructive
   reset path. It first disconnects this Mac in Ottto and releases its server

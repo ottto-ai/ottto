@@ -268,14 +268,21 @@ struct EmptyCounts {}
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
     traversal_point("bounded_traversal_transition", source, counts);
 }
+#[derive(Serialize)]
+struct ListMissingCause {
+    cause: &'static str,
+}
+
 /// Local alarm, once per Claude cycle while it lasts: the re-emission list was
 /// installed once and its file is now missing, so the one-time history
-/// re-read is paused. No path, id or wire event.
-pub(crate) fn claude_reemission_list_missing() {
+/// re-read is paused. `cause` names why it reads installed: the seen-marker,
+/// Set intent, or intent that could not be read (addendum 3). No path, id or
+/// wire event.
+pub(crate) fn claude_reemission_list_missing(cause: &'static str) {
     traversal_point(
         "claude_reemission_list_missing_after_install",
         "claude_code",
-        &EmptyCounts {},
+        &ListMissingCause { cause },
     );
 }
 /// Local alarm, at most hourly: Claude history owes an upgrade to the active
@@ -317,6 +324,23 @@ pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
             history_proof_correction_deferred: members,
             history_proof_correction_deferred_total: previous.saturating_add(members),
         },
+    );
+}
+/// Local diagnostic, at most hourly: the backfill state's
+/// `prior_history_unverified` marker has been read set since the given time
+/// (first seen by this process). Counts and times only; no path, id or wire
+/// event.
+pub(crate) fn claude_prior_history_unverified(counts: &impl Serialize) {
+    traversal_point("claude_prior_history_unverified", "claude_code", counts);
+}
+/// Local alarm, once per refusal: a body-witness revision with no history
+/// policy row was not activated, and the previous active revision was kept.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_history_revision_activation_refused(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_revision_activation_refused",
+        "claude_code",
+        counts,
     );
 }
 static REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL: std::sync::atomic::AtomicU64 =

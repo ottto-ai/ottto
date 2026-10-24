@@ -365,11 +365,16 @@ const _: () = assert!(
 ///   in its upload ledger (an accepted, quarantined or refused body or
 ///   accepted cache evidence; a generation or replay claim alone is saved
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
-///   sibling of this index; or the re-emission seen-marker.
+///   sibling of this index; or the re-emission seen-marker. Also, when the
+///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
+///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   is not a move, but this Mac did index history, so a cutoff keeps that
+///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
-///   copy another destination or a legacy layout left in the support
-///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   copy another destination's directory holds (an interrupted bootstrap
+///   before a re-pair). A leftover is another destination only when it sits
+///   under a different namespace (I-r3-1); unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -413,6 +418,10 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
+    // Only a different namespace's directory is another destination. An
+    // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
+    // no destination; it is usually this Mac's own pre-scoping index, so it
+    // must not hold history as a move (I-r3-1). It is `Here` evidence below.
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
@@ -430,15 +439,13 @@ fn claude_prior_history(
                     Err(error) => error.kind() != std::io::ErrorKind::NotFound,
                 }
         };
-        let snapshots = support_dir.join("snapshots");
-        holds_claude_state(&snapshots)
-            || match std::fs::read_dir(snapshots.join("destinations")) {
-                Ok(mut destinations) => destinations.any(|destination| match destination {
-                    Ok(destination) => holds_claude_state(&destination.path()),
-                    Err(_) => true,
-                }),
-                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-            }
+        match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
+            Ok(mut destinations) => destinations.any(|destination| match destination {
+                Ok(destination) => holds_claude_state(&destination.path()),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     };
     // Fails closed: only a positively missing marker is absent (h695 N2).
     let seen_marker = || match std::fs::symlink_metadata(
@@ -470,8 +477,25 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
+    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
+    // directory fails closed; a missing one is empty.
+    let unscoped_legacy_index = || {
+        let prefix = format!("{slug}-scan-index");
+        match std::fs::read_dir(support_dir.join("snapshots")) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix)),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
+    } else if unscoped_legacy_index() {
+        PriorHistory::Here
     } else {
         PriorHistory::None
     }
@@ -1436,7 +1460,7 @@ impl SnapshotUploadProgress {
             return false;
         }
         let current = index
-            .current_snapshot_fingerprint_refs()
+            .eligible_snapshot_fingerprint_refs()
             .collect::<BTreeSet<_>>();
         let latest = reason_reoffer::latest_valid_deadline(scope.now);
         let counts = &mut self.reason_reoffer_counts;
@@ -2020,7 +2044,9 @@ impl SnapshotUploadProgress {
         let indexed = index
             .files
             .keys()
-            .map(|key| cache_head_index_key(key))
+            .map(String::as_str)
+            .chain(index.decode_held_file_keys())
+            .map(cache_head_index_key)
             .collect::<BTreeSet<_>>();
         let before = self.pending_cache_heads.len();
         self.pending_cache_heads
@@ -2191,10 +2217,20 @@ impl SnapshotUploadProgress {
                     .map(|file| ((file.clone(), item.snapshot_fingerprint.clone()), item))
             })
             .collect::<BTreeMap<_, _>>();
+        let opaque_files = index
+            .decode_held_file_keys()
+            .map(cache_head_index_key)
+            .collect::<BTreeSet<_>>();
         self.pending_cache_heads.retain(|file, pending| {
+            if opaque_files.contains(file) {
+                return true;
+            }
             let Some((index_key, entry)) = current_files.get(file) else {
                 return !census_complete;
             };
+            if index.decode_holds_file(index_key) {
+                return true;
+            }
             // Neither held absence nor a changed aggregate alone certifies
             // enrichment. Rebinding comes from the current admitted raw item.
             if entry.source_file_fingerprint != pending.source_file_fingerprint
@@ -2232,9 +2268,12 @@ impl SnapshotUploadProgress {
                 .get(*index_key)
                 .is_some_and(|entities| {
                     entities.iter().all(|entity| {
-                        pending.settled_entities.contains(entity)
-                            || (self.accepted_fingerprints.contains(entity)
-                                && !index.quarantined_snapshot_fingerprints.contains_key(entity))
+                        !index.decode_holds_entity(entity)
+                            && (pending.settled_entities.contains(entity)
+                                || (self.accepted_fingerprints.contains(entity)
+                                    && !index
+                                        .quarantined_snapshot_fingerprints
+                                        .contains_key(entity)))
                     })
                 });
             !(all_siblings_settled
@@ -2468,6 +2507,27 @@ fn save_index_and_publish_manifest(
         );
     }
     Ok(())
+}
+
+// Exercise the real durable-save/publication boundary from decoder rescans.
+#[cfg(test)]
+pub(crate) fn decode_hold_manifest_published_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    source: SnapshotSource,
+    complete: bool,
+) -> Result<bool> {
+    let namespace = "lenient-decode-rescan";
+    save_index_and_publish_manifest(
+        index,
+        path,
+        namespace,
+        source,
+        complete,
+        "2026-01-01T00:00:00Z",
+        "2026-10-22T00:00:00Z",
+    )?;
+    Ok(cached_source_manifest(namespace, source).is_some())
 }
 
 // Test-only empty-ACK/shed boundary; invokes the real locked partial save.
@@ -5584,6 +5644,11 @@ fn prepare_sync_source(
             support_dir,
         )
     });
+    if let Some(prior) = prior_claude_history {
+        crate::snapshots::note_prior_history_unverified(
+            prior == crate::snapshots::PriorHistory::Unverified,
+        );
+    }
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -6066,9 +6131,11 @@ fn finish_sync_source(
         };
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
-                crate::snapshots::claude_api_cache_creation_rejection_count()
+                crate::snapshots::claude_api_cache_creation_rejection_count(),
+                stats.full_rearm_suppression.full_rearm_suppressed,
+                stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
@@ -7400,6 +7467,9 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// Fix 1's skipped full re-arms; absent from the line while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
+    pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -7871,6 +7941,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         ..Default::default()
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
+    let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
         Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
@@ -7887,7 +7958,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             );
             api_read = evidence;
         }
-        Err(_) => stats.effort_evidence_load_failed = true,
+        Err(_) => {
+            stats.effort_evidence_load_failed = true;
+            full_rearm_evidence_complete = false;
+        }
     }
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
@@ -7911,11 +7985,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 )
                 .is_empty();
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired
-                && emission_permitted
-                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
-                identity_unhealthy_roots.insert(session_id.clone());
+                full_rearm_evidence_complete = false;
+                if emission_permitted {
+                    identity_unhealthy_roots.insert(session_id.clone());
+                }
             }
             paired
         })
@@ -7962,6 +8037,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
@@ -7989,6 +8065,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
+            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -8013,6 +8090,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
     });
+    if !full_rearm_evidence_complete {
+        index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
+    }
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
@@ -8116,6 +8196,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
@@ -11266,6 +11347,49 @@ mod tests {
             "due retry also survives actual finalizer no-op selection"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn opaque_file_decode_hold_keeps_pending_cache_head_custody() {
+        let root = cache_effective_wire_fixture_root();
+        let mut index = ScanIndex::default();
+        let mut result = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let item = result.snapshots.remove(0);
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        let path = root.join("index.json");
+        index.save(&path).unwrap();
+        let key = index.files.keys().next().unwrap().clone();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"][&key]["size_bytes"] = serde_json::json!([]);
+        value["unknown_padding"] = serde_json::json!("p".repeat(8192));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.decode_held_file_keys().collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+        assert!(!progress.prune_pending_cache_head_orphans_from_loaded_index(&loaded));
+        assert_eq!(progress.pending_cache_heads.len(), 1);
+        progress.retire_pending_cache_heads(&loaded, &[], &BTreeSet::new(), true, &BTreeMap::new());
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "opaque absence cannot settle a cache-head obligation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

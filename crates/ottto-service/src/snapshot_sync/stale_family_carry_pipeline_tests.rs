@@ -238,6 +238,19 @@ fn c1b_liveness(run: &C1bRun) -> Vec<C1bLiveness> {
     run.windows.iter().map(C1bWindow::liveness).collect()
 }
 
+/// This control measures C1b alone. Fix 2's window/cap has separate pipeline
+/// coverage below and intentionally keeps eligible unwitnessed families too.
+fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
+    c1a_edit_index(fixture, |saved| {
+        let progress = saved
+            .get_mut("claude_full_rearm_progress")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the preceding full re-arm recorded progress");
+        progress.remove("full_rearm_window");
+        progress.remove("full_rearm_window_next");
+    });
+}
+
 /// T0/T1, the unrelated-red-window shape: an unrelated session turns the
 /// 08:10 window red. BASE re-arms every family parsed there at each retry
 /// start, so the unchanged witnessed family is re-read at 08:20 and 08:30
@@ -257,8 +270,8 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let family = rearm_family_sessions().len() as u64;
-    let fix = c1b_red_chain("c1b-red-window", "fix", |_| {});
-    let base = c1b_base_red_chain("c1b-red-window-base", |_| {});
+    let fix = c1b_red_chain("c1b-red-window", "fix", c1b_without_full_rearm_window);
+    let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
     let [_, _, base_retry, base_repaired, _] = &base.windows;
     // Preconditions on BASE: both retries re-arm and re-read the family, and
@@ -633,4 +646,121 @@ fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
     assert_eq!(fix.heads_after, base.heads_after);
     assert_eq!(fix.witness_after, base.witness_after);
     assert_eq!(fix.family_pending_after, base.family_pending_after);
+}
+
+/// Fix 2's clean follow-up: the red 08:10 window, the full-rearm window the
+/// 08:00 full re-arm opened, instead finished needing a clean follow-up (a
+/// page of it settled partially), so the 08:20 start is a fresh walk.
+fn fix2_clean_followup(fixture: &RearmFixture) {
+    c1a_edit_index(fixture, |saved| {
+        assert!(
+            saved
+                .get("claude_full_rearm_progress")
+                .and_then(|progress| progress.get("full_rearm_window"))
+                .is_some(),
+            "the 08:10 start opened a full-rearm window"
+        );
+        saved.remove("traversal");
+        saved.insert(
+            "bounded_sweep_had_unsettled_upload".to_owned(),
+            serde_json::json!(true),
+        );
+    });
+}
+
+/// Fix 2, real pipeline: the clean follow-up after the full-rearm window
+/// carries the unchanged witnessed family, where BASE re-arms every stale
+/// family. Unwitnessed sessions keep the re-arm, nothing is credited (the
+/// census stays invalid while the fence stays closed), the accepted heads and
+/// the witness never change, and every window's liveness equals BASE.
+#[test]
+#[serial(source_manifests)]
+fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
+    if !c1a_layout_supported("fix2_clean_followup") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len() as u64;
+    let fix = c1b_red_chain("fix2-clean-followup", "fix", fix2_clean_followup);
+    let base = c1b_base_red_chain("fix2-clean-followup-base", fix2_clean_followup);
+    let [_, _, followup, repaired, _] = &fix.windows;
+    let [_, _, base_followup, _, _] = &base.windows;
+    let start = followup.start.as_ref().expect("a follow-up start");
+    let base_start = base_followup.start.as_ref().expect("a follow-up start");
+    assert_eq!(start.reason, base_start.reason);
+    assert_ne!(
+        start.reason, "terminal_unhealthy_retry",
+        "a clean follow-up"
+    );
+    assert_eq!(
+        start.stale_pending_families,
+        base_start.stale_pending_families
+    );
+    // Preconditions on BASE: the clean follow-up re-reads the family.
+    assert_eq!(base_followup.family_reads as u64, family);
+    assert_eq!(base_start.carried_pending_families, Some(0));
+    // FLIPS: the unchanged family is carried, not re-read.
+    assert_eq!(followup.family_reads, 0, "the carried family is not read");
+    assert!(
+        followup.parsed.contains(REARM_TERMINAL),
+        "unwitnessed: BASE"
+    );
+    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_index_files, Some(family));
+    assert_eq!(
+        start.rearmed_index_files.map(|files| files + family),
+        base_start.rearmed_index_files,
+        "every other stale family keeps the BASE re-arm"
+    );
+    assert_eq!(
+        c1b_liveness(&fix),
+        c1b_liveness(&base),
+        "liveness is BASE's"
+    );
+    assert!(repaired.census_complete && repaired.fence_before && repaired.fence_after);
+    assert!(
+        repaired.census_invalid,
+        "no credit: the census stays invalid"
+    );
+    assert_eq!(
+        fix.heads_after, fix.heads_after_red,
+        "accepted heads unchanged"
+    );
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(
+        fix.witness_after, fix.witness_after_red,
+        "witness unchanged"
+    );
+    assert_eq!(fix.witness_after, base.witness_after);
+}
+
+/// Control, SI I3: a late API row gives the root's requests account evidence
+/// before the clean follow-up, so the sidecar-inclusive selection of every
+/// member changes (M1) and the family is re-read exactly as BASE's re-arm
+/// does. Every window's liveness equals BASE.
+#[test]
+#[serial(source_manifests)]
+fn fix2_late_api_row_rereads_the_family_like_base() {
+    if !c1a_layout_supported("fix2_late_api_row") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let between = |fixture: &RearmFixture| {
+        fix2_clean_followup(fixture);
+        c1a_late_account_row(fixture);
+    };
+    let fix = c1b_red_chain("fix2-late-api-row", "fix", between);
+    let base = c1b_base_red_chain("fix2-late-api-row-base", between);
+    let family = rearm_family_sessions().len();
+    assert_eq!(
+        fix.windows[2].family_reads, family,
+        "M1 re-selects every member"
+    );
+    assert_eq!(base.windows[2].family_reads, family);
+    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
+        assert_eq!(window.family_reads, base_window.family_reads);
+    }
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(fix.witness_after, base.witness_after);
 }
