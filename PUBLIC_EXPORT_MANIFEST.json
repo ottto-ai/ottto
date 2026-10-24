@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "372bdec755038ddcfdb9cab09a351a2418dc20b782432f98e1e9235f8378dee8",
+  "content_sha256": "593fbb0019caa3efffd4ae84ebec6b2f291ae6b056df33467279bd4c31eba283",
   "files": [
     {
       "executable": false,
@@ -4038,8 +4038,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-22-patha-authority-hold-bridge.md",
-      "sha256": "a80667db3911ea1933a6d160c2f77c0dda63911725247eda3f410bb6b92f7767",
-      "size_bytes": 14883
+      "sha256": "d8220458b70316489c573fb88360c267ecd1ea05a9b92e150aa17224fd0c41c1",
+      "size_bytes": 15262
     },
     {
       "executable": false,
@@ -5841,7 +5841,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T01:40:41+00:00",
+  "generated_at": "2026-10-24T01:41:18+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 835,
   "public_roots": [
@@ -5880,5 +5880,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "c1a37174dbcdd46174854648916c03195843c328"
+  "source_commit": "dfafa477caef47b2d8dc8c69eecf1140a65d968b"
 }
