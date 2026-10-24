@@ -1,7 +1,8 @@
 //! Bounded custody for an authorized batch whose outcome may be unknown.
 //! The payload is final identity-encoded wire JSON, never a recipe for a POST.
 //! Payload/manifest work runs on the existing money writer. A fresh gate-OFF
-//! caller allocates no catalog; existing custody is retired before networking.
+//! caller allocates no catalog; existing custody gets privacy/terminal upkeep
+//! before networking.
 use super::*;
 use crate::snapshots::claude_request_money::{self as money, store};
 use std::fs::{self, File, OpenOptions};
@@ -817,10 +818,7 @@ fn startup_inner(support: &Path, binding: &str, now: u64) -> Result<bool> {
                 // successful last replay as exhausted UNKNOWN. At the hard
                 // privacy deadline (or binding loss), retire known custody;
                 // selected-file debt still requires its ordinary saved proof.
-                return (m.binding != binding
-                    || now >= m.deadline
-                    || !money::request_owned_live(support))
-                .then_some(Reason::Resolved);
+                return (m.binding != binding || now >= m.deadline).then_some(Reason::Resolved);
             }
             if m.binding != binding {
                 Some(Reason::BindingLost)
