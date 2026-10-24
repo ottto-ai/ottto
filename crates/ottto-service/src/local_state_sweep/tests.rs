@@ -116,11 +116,14 @@ fn lock_is_free(path: &Path) -> bool {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::EWOULDBLOCK)
         );
+    } else {
+        // Unlock the shared open file description even if a child inherited it.
+        drop(HeldLock(file.into()));
     }
     free
 }
 
-fn hold_lock(path: &Path) -> fs::File {
+fn hold_lock(path: &Path) -> HeldLock {
     let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -131,7 +134,7 @@ fn hold_lock(path: &Path) -> fs::File {
         0,
         "test takes the lock"
     );
-    file
+    HeldLock(file.into())
 }
 
 fn listing(dir: &Path) -> Vec<(String, u64, i64, i64, i64)> {
@@ -1388,6 +1391,1054 @@ fn lock_hardlinked_after_the_first_look_is_never_flocked() {
     ));
     drop(live_holder);
     assert!(lock_is_free(&lock));
+}
+
+const DAY: Duration = Duration::from_secs(24 * 60 * 60);
+/// Another pid above every pid_max, for a second copy of a dead writer.
+const OTHER_DEAD_PID: i32 = DEAD_PID - 1;
+
+fn nanos_at(time: SystemTime) -> u128 {
+    time.duration_since(UNIX_EPOCH).unwrap().as_nanos()
+}
+
+fn quarantine_name(base: &str, pid: i32, named: SystemTime) -> String {
+    format!("{base}.corrupt.{pid}.{}.json", nanos_at(named))
+}
+
+/// The group's existing lock and a rebuilt canonical file, as the daemon
+/// leaves them after a quarantine.
+fn rebuilt_group(dest: &Path, base: &str) {
+    let lock = dest.join(format!("{base}.lock"));
+    if !lock.exists() {
+        write(&lock, b"");
+    }
+    let canonical = dest.join(format!("{base}.json"));
+    if !canonical.exists() {
+        write(&canonical, b"{\"generation\":1}");
+    }
+}
+
+/// A 1000-byte quarantined copy of a dead writer, named at `named`, in a
+/// rebuilt group. Every file here gets the current ctime and birthtime, so
+/// a copy is the group's newest only through a later name: a test names
+/// its newest copy after the moment it plants the others.
+fn plant_copy(dest: &Path, base: &str, pid: i32, named: SystemTime) -> PathBuf {
+    rebuilt_group(dest, base);
+    let copy = dest.join(quarantine_name(base, pid, named));
+    write(&copy, &[9_u8; 1000]);
+    copy
+}
+
+fn set_mtime(path: &Path, time: SystemTime) {
+    fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(time)
+        .unwrap();
+}
+
+/// Production rules with no other daemon, `age` from now: files written
+/// before this call are at least `age` old.
+fn after(age: Duration) -> Policy {
+    Policy {
+        now: SystemTime::now() + age,
+        ..now()
+    }
+}
+
+/// `after(age)`, where every writer pid reads as an exited stranger.
+fn names_and_locks_only_after(age: Duration) -> Policy {
+    Policy {
+        own_pid: 0,
+        probe: |_| PidState::Dead,
+        ..after(age)
+    }
+}
+
+fn entry_for<'r>(report: &'r SweepReport, path: &Path) -> &'r EntryReport {
+    let name = path.file_name().unwrap().to_str().unwrap();
+    report
+        .entries
+        .iter()
+        .find(|entry| entry.path.ends_with(&format!("/{name}")))
+        .unwrap_or_else(|| panic!("no entry for {name}"))
+}
+
+#[test]
+fn quarantine_grammar_matches_its_writers_exactly() {
+    let accepted = [
+        (
+            "claude_code-scan-index-v3.corrupt.123.1761100000000000000.json",
+            "claude_code-scan-index-v3",
+            123,
+            1_761_100_000_000_000_000,
+        ),
+        (
+            "codex-scan-index-v3-upload-progress.corrupt.2147483647.0.json",
+            "codex-scan-index-v3-upload-progress",
+            i32::MAX,
+            0,
+        ),
+        (
+            "pi-scan-index-v3.corrupt.7.18446744073709551615.json",
+            "pi-scan-index-v3",
+            7,
+            u64::MAX,
+        ),
+    ];
+    for (name, base, pid, name_nanos) in accepted {
+        assert_eq!(
+            quarantine_member(name),
+            Some((base.to_string(), Some(QuarantineCopy { pid, name_nanos }))),
+            "{name}"
+        );
+        // Never a temp.
+        assert_eq!(parse_artifact(name), None, "{name}");
+    }
+    // In a family, but not a name the writers produce: it holds its group.
+    for (name, base) in [
+        (
+            "claude_code-scan-index-v3.corrupt.12.34.json.bak",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "claude_code-scan-index-v3.corrupt.012.34.json",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "claude_code-scan-index-v3.corrupt.12.034.json",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "claude_code-scan-index-v3.corrupt.0.34.json",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "claude_code-scan-index-v3.corrupt.12.json",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "claude_code-scan-index-v3.corrupt.12.34.5.json",
+            "claude_code-scan-index-v3",
+        ),
+        (
+            "codex-scan-index-v3-upload-progress.corrupt.12.18446744073709551616.json",
+            "codex-scan-index-v3-upload-progress",
+        ),
+        (
+            "pi-scan-index-v3.corrupt.2147483648.34.json",
+            "pi-scan-index-v3",
+        ),
+    ] {
+        assert_eq!(
+            quarantine_member(name),
+            Some((base.to_string(), None)),
+            "{name}"
+        );
+    }
+    for name in [
+        "claude_code-scan-index-v3.json",
+        "claude_code-scan-index-v3.lock",
+        "claude_code-scan-index-v3.json.corrupt.1761100000000000000",
+        "snapshot_upload_receipts.json.corrupt.1761100000000000000",
+        "claude_code-scan-index-v2.corrupt.12.34.json",
+        "claude_code-scan-index.corrupt.12.34.json",
+        "claude_code-scan-index-no-titles.corrupt.12.34.json",
+        "codex-scan-index-attribution-labels-v3.corrupt.12.34.json",
+        "pi-terminal-status-v1.corrupt.12.34.json",
+        "gemini-scan-index-v3.corrupt.12.34.json",
+        "claude-scan-index-v3.corrupt.12.34.json",
+        "CLAUDE_CODE-scan-index-v3.corrupt.12.34.json",
+        ".claude_code-scan-index-v3.corrupt.12.34.json",
+        "claude_code-scan-index-v3.cleared.12.34.json",
+        "claude_code-scan-index-v3-upload-progress.cleared.12.34.json",
+        "claude_code-scan-index-v3.json.12.tmp",
+    ] {
+        assert_eq!(quarantine_member(name), None, "{name}");
+    }
+}
+
+#[test]
+fn real_scan_index_quarantine_is_recognized_and_aged_out() {
+    let f = fixture();
+    let path = f.dest.join(format!("{INDEX}.json"));
+    write(&path, b"{ not a scan index");
+    let before = nanos_at(SystemTime::now());
+
+    let rebuilt = ScanIndex::load(&path).expect("an invalid index is quarantined");
+
+    let after_load = nanos_at(SystemTime::now());
+    assert_eq!(rebuilt.generation, 0);
+    let copies: Vec<String> = fs::read_dir(&f.dest)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.contains(".corrupt."))
+        .collect();
+    assert_eq!(copies.len(), 1, "{copies:?}");
+    let (base, copy) = quarantine_member(&copies[0]).expect("a quarantine name");
+    let copy = copy.expect("spelled as the grammar expects");
+    assert_eq!(base, INDEX);
+    assert_eq!(copy.pid, std::process::id() as i32);
+    assert!((before..=after_load).contains(&u128::from(copy.name_nanos)));
+    // The daemon rebuilds the canonical file on its next save.
+    ScanIndex::default().save(&path).expect("rebuild");
+    let copy_path = f.dest.join(&copies[0]);
+    // This test process wrote it; take it as exited, like a restarted daemon.
+    let gone_writer = names_and_locks_only_after;
+
+    let report = apply(&f.support, &gone_writer(400 * DAY));
+    assert_eq!(report.skipped.quarantine_kept_newest, 1);
+    assert!(copy_path.exists());
+
+    // Once a later quarantine supersedes it, it ages out.
+    let newer = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let report = apply(&f.support, &gone_writer(8 * DAY));
+    assert_eq!(report.removed_quarantine, 1);
+    assert!(!copy_path.exists());
+    assert!(newer.exists());
+    assert_eq!(
+        ScanIndex::load(&path).expect("canonical intact").generation,
+        1
+    );
+}
+
+#[test]
+fn newest_copy_is_kept_at_any_age() {
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let canonical = f.dest.join(format!("{INDEX}.json"));
+    let lock = f.dest.join(format!("{INDEX}.lock"));
+    let lock_inode = fs::metadata(&lock).unwrap().ino();
+
+    let report = apply(&f.support, &after(400 * DAY));
+
+    assert_eq!(
+        (report.removed_quarantine, report.bytes_removed_quarantine),
+        (1, 1000)
+    );
+    assert_eq!((report.removed, report.bytes_removed), (0, 0));
+    assert_eq!(
+        report.skipped,
+        SkipCounts {
+            quarantine_kept_newest: 1,
+            ..SkipCounts::default()
+        }
+    );
+    assert_eq!(report.errors, 0);
+    assert_eq!(entry_for(&report, &newest).lock, LockState::NotChecked);
+    assert!(newest.exists());
+    let entry = entry_for(&report, &copy);
+    assert_eq!(entry.artifact, Some(ArtifactKind::QuarantineCopy));
+    assert_eq!(entry.outcome, EntryOutcome::Removed);
+    assert_eq!(entry.lock, LockState::Acquired);
+    assert!(!copy.exists());
+    assert_eq!(fs::read(&canonical).unwrap(), b"{\"generation\":1}");
+    assert_eq!(fs::metadata(&lock).unwrap().ino(), lock_inode);
+    assert!(lock_is_free(&lock));
+
+    // Still kept, alone, however old.
+    for age in [8 * DAY, 36 * DAY, 400 * DAY, 4000 * DAY] {
+        let report = apply(&f.support, &after(age));
+        assert_eq!(report.removed_quarantine, 0);
+        assert_eq!(report.skipped.quarantine_kept_newest, 1);
+        assert!(newest.exists());
+    }
+}
+
+/// A group of one is its own newest copy: never removed, never locked,
+/// never changed, in plan or apply, at any age.
+#[test]
+fn group_of_one_is_never_touched() {
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() - 400 * DAY);
+    set_mtime(&copy, SystemTime::now() - 400 * DAY);
+    let before = listing(&f.dest);
+    for age in [Duration::ZERO, 7 * DAY, 36 * DAY, 400 * DAY, 4000 * DAY] {
+        for mode in [Mode::Plan, Mode::Apply] {
+            let policy = Policy {
+                before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+                ..names_and_locks_only_after(age)
+            };
+
+            let report = sweep(&f.support, mode, &policy, true);
+
+            assert_eq!(report.removed_quarantine, 0, "{mode:?} after {age:?}");
+            assert_eq!(report.candidates, 0, "{mode:?} after {age:?}");
+            let entry = entry_for(&report, &copy);
+            assert_eq!(entry.reason, Some(SkipReason::QuarantineKeptNewest));
+            assert_eq!(entry.lock, LockState::NotChecked);
+            assert_eq!(listing(&f.dest), before);
+        }
+    }
+}
+
+/// The plan for a group never removes all of it, nor a newest copy, for
+/// any mix of ages and name timestamps; a plan that would is cancelled.
+#[test]
+fn plan_never_removes_every_copy_of_a_group() {
+    let week = QUARANTINE_OTHER_MIN_AGE.as_nanos() as i128;
+    let ages = [0, week - 1, week, 8 * week, 400 * week];
+    let names = [0_u64, 1, 2, u64::MAX];
+    let choices: Vec<(i128, u64)> = ages
+        .iter()
+        .flat_map(|&age| names.iter().map(move |&name| (age, name)))
+        .collect();
+    let mut plans = 0;
+    for size in 1..=3_u32 {
+        for pick in 0..choices.len().pow(size) {
+            let copies: Vec<(i128, u64)> = (0..size)
+                .map(|slot| choices[pick / choices.len().pow(slot) % choices.len()])
+                .collect();
+            let plan = quarantine_plan(&copies);
+            assert_eq!(plan.len(), copies.len());
+            assert!(plan.iter().any(Option::is_some), "{copies:?} -> {plan:?}");
+            let youngest = copies.iter().map(|copy| copy.0).min();
+            let latest = copies.iter().map(|copy| copy.1).max();
+            for (copy, keep) in copies.iter().zip(&plan) {
+                if Some(copy.0) == youngest || Some(copy.1) == latest {
+                    assert_eq!(*keep, Some(SkipReason::QuarantineKeptNewest));
+                } else if copy.0 < week {
+                    assert_eq!(*keep, Some(SkipReason::QuarantineRecent));
+                } else {
+                    assert_eq!(*keep, None, "{copies:?}");
+                }
+            }
+            plans += 1;
+        }
+    }
+    assert!(plans > 8_000);
+    assert_eq!(quarantine_plan(&[]), Vec::new());
+
+    // The last-copy check alone cancels a plan that would empty a group.
+    let mut emptying = vec![None, None];
+    keep_last_copies(&mut emptying);
+    assert_eq!(emptying, vec![Some(SkipReason::QuarantineKeptNewest); 2]);
+    let mut partial = vec![None, Some(SkipReason::QuarantineRecent)];
+    keep_last_copies(&mut partial);
+    assert_eq!(partial, vec![None, Some(SkipReason::QuarantineRecent)]);
+
+    // A kept copy gone by the time the lock is held stops the removal.
+    let f = fixture();
+    let older = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let vanish = newest.clone();
+    let policy = Policy {
+        before_recheck: Some(Box::new(move |_name: &str| {
+            fs::remove_file(&vanish).unwrap();
+        })),
+        ..after(8 * DAY)
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.changed, 1);
+    assert_eq!(entry_for(&report, &older).lock, LockState::Acquired);
+    assert!(older.exists() && !newest.exists());
+}
+
+#[test]
+fn older_copy_is_kept_until_7_days() {
+    let f = fixture();
+    let older = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now() - 30 * DAY);
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + 3 * DAY);
+
+    let report = apply(&f.support, &after(6 * DAY));
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(
+        entry_for(&report, &older).reason,
+        Some(SkipReason::QuarantineRecent)
+    );
+    assert_eq!(
+        entry_for(&report, &newest).reason,
+        Some(SkipReason::QuarantineKeptNewest)
+    );
+    assert!(older.exists() && newest.exists());
+
+    let report = apply(&f.support, &after(8 * DAY));
+
+    assert_eq!(report.removed_quarantine, 1);
+    assert_eq!(report.skipped.quarantine_kept_newest, 1);
+    assert!(!older.exists());
+    assert!(newest.exists());
+}
+
+#[test]
+fn every_tied_or_differently_newest_copy_is_kept() {
+    let f = fixture();
+    let named = SystemTime::now() - 40 * DAY;
+    // Tied by the name's timestamp; the second one has the later ctime.
+    let tied = [
+        plant_copy(&f.dest, INDEX, DEAD_PID, named),
+        plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, named),
+    ];
+
+    let report = apply(&f.support, &after(8 * DAY));
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    assert!(tied.iter().all(|copy| copy.exists()));
+
+    let report = apply(&f.support, &after(400 * DAY));
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    assert!(tied.iter().all(|copy| copy.exists()));
+
+    // Newest by name, but written first; the other is newest by its file
+    // times. Both are kept as newest.
+    let by_name = plant_copy(&f.dest, PROGRESS, DEAD_PID, SystemTime::now() - DAY);
+    std::thread::sleep(Duration::from_millis(20));
+    let by_times = plant_copy(
+        &f.dest,
+        PROGRESS,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 40 * DAY,
+    );
+
+    let report = apply(&f.support, &after(8 * DAY));
+
+    assert_eq!(report.removed_quarantine, 0);
+    // These two, and the tied index copies still kept.
+    assert_eq!(report.skipped.quarantine_kept_newest, 4);
+    for copy in [&by_name, &by_times] {
+        assert_eq!(
+            entry_for(&report, copy).reason,
+            Some(SkipReason::QuarantineKeptNewest)
+        );
+    }
+    assert!(by_name.exists() && by_times.exists());
+    assert!(tied.iter().all(|copy| copy.exists()));
+}
+
+#[test]
+fn just_quarantined_copy_with_an_ancient_mtime_is_kept() {
+    let ancient = SystemTime::now() - 400 * DAY;
+    // The name's timestamp is recent: a rename keeps the old index's mtime.
+    let f = fixture();
+    let older = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, ancient);
+    set_mtime(&older, ancient);
+    let policy = after(10 * DAY);
+    let fresh = plant_copy(
+        &f.dest,
+        INDEX,
+        DEAD_PID,
+        policy.now - Duration::from_secs(60),
+    );
+    set_mtime(&fresh, ancient);
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed_quarantine, 1);
+    assert!(!older.exists());
+    assert_eq!(
+        entry_for(&report, &fresh).reason,
+        Some(SkipReason::QuarantineKeptNewest)
+    );
+    assert!(fresh.exists());
+
+    // Only the ctime is recent: an ancient name and mtime are not enough.
+    let f = fixture();
+    let renamed = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, ancient);
+    set_mtime(&renamed, ancient);
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now());
+
+    let report = apply(&f.support, &after(Duration::from_secs(60 * 60)));
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(
+        entry_for(&report, &renamed).reason,
+        Some(SkipReason::QuarantineRecent)
+    );
+    assert!(renamed.exists() && newest.exists());
+}
+
+#[test]
+fn future_timestamps_keep_the_whole_group() {
+    let f = fixture();
+    let old = plant_copy(
+        &f.dest,
+        INDEX,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    );
+    let policy = after(30 * DAY);
+    let future_name = plant_copy(&f.dest, INDEX, DEAD_PID, policy.now + DAY);
+    let mut old_progress = Vec::new();
+    for pid in [DEAD_PID, OTHER_DEAD_PID] {
+        old_progress.push(plant_copy(
+            &f.dest,
+            PROGRESS,
+            pid,
+            SystemTime::now() - 400 * DAY,
+        ));
+    }
+    set_mtime(&old_progress[1], policy.now + DAY);
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_recent, 2);
+    assert_eq!(report.skipped.quarantine_group_incomplete, 2);
+    assert_eq!(
+        entry_for(&report, &old).reason,
+        Some(SkipReason::QuarantineGroupIncomplete)
+    );
+    assert!(old.exists() && future_name.exists());
+    assert!(old_progress.iter().all(|copy| copy.exists()));
+}
+
+#[test]
+fn group_without_a_rebuilt_canonical_is_kept() {
+    let outside = fixture();
+    let outside_canonical = outside.root.join("outside.json");
+    write(&outside_canonical, b"{\"generation\":9}");
+    type Break = Box<dyn Fn(&Path)>;
+    let cases: [(&str, Break); 5] = [
+        (
+            "missing",
+            Box::new(|canonical: &Path| fs::remove_file(canonical).unwrap()),
+        ),
+        ("empty", Box::new(|canonical: &Path| write(canonical, b""))),
+        (
+            "unreadable",
+            Box::new(|canonical: &Path| {
+                fs::set_permissions(canonical, fs::Permissions::from_mode(0o200)).unwrap()
+            }),
+        ),
+        (
+            "directory",
+            Box::new(|canonical: &Path| {
+                fs::remove_file(canonical).unwrap();
+                private_dir(canonical);
+            }),
+        ),
+        (
+            "symlink",
+            Box::new(move |canonical: &Path| {
+                fs::remove_file(canonical).unwrap();
+                symlink(&outside_canonical, canonical).unwrap();
+            }),
+        ),
+    ];
+    for (case, break_canonical) in cases {
+        let f = fixture();
+        let copy = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now());
+        break_canonical(&f.dest.join(format!("{INDEX}.json")));
+
+        let report = apply(&f.support, &after(40 * DAY));
+
+        assert_eq!(report.removed_quarantine, 0, "{case}");
+        assert_eq!(report.skipped.quarantine_no_canonical, 1, "{case}");
+        assert!(copy.exists(), "{case}");
+    }
+
+    // Gone by the time the lock is held.
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, SystemTime::now());
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let canonical = f.dest.join(format!("{INDEX}.json"));
+    let policy = Policy {
+        before_recheck: Some(Box::new(move |_name: &str| {
+            fs::remove_file(&canonical).unwrap();
+        })),
+        ..after(40 * DAY)
+    };
+
+    let report = apply(&f.support, &policy);
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_no_canonical, 1);
+    assert_eq!(entry_for(&report, &copy).lock, LockState::Acquired);
+    assert!(copy.exists() && newest.exists());
+}
+
+#[test]
+fn listing_cut_short_prunes_nothing() {
+    let f = fixture();
+    let old = plant_copy(
+        &f.dest,
+        INDEX,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    );
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let removable = || after(8 * DAY);
+
+    // Over the entry cap: the lock, the canonical file and two copies.
+    let report = apply(
+        &f.support,
+        &Policy {
+            max_entries: 3,
+            ..removable()
+        },
+    );
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.too_many_entries, 1);
+
+    // Out of time before the destination is listed.
+    let report = apply(
+        &f.support,
+        &Policy {
+            time_budget: Duration::ZERO,
+            ..removable()
+        },
+    );
+    assert!(report.time_budget_exhausted);
+    assert_eq!(report.removed_quarantine, 0);
+    assert!(old.exists() && newest.exists());
+
+    // Unreadable destination.
+    if unsafe { libc::geteuid() } != 0 {
+        fs::set_permissions(&f.dest, fs::Permissions::from_mode(0o000)).unwrap();
+        let report = apply(&f.support, &removable());
+        fs::set_permissions(&f.dest, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.removed_quarantine, 0);
+        assert!(old.exists() && newest.exists());
+    }
+
+    // The same tree in full.
+    let report = apply(&f.support, &removable());
+    assert_eq!(report.removed_quarantine, 1);
+    assert!(!old.exists() && newest.exists());
+}
+
+#[test]
+fn deadline_during_the_group_look_prunes_nothing() {
+    let f = fixture();
+    let mut old = Vec::new();
+    for pid in [OTHER_DEAD_PID, OTHER_DEAD_PID - 1] {
+        old.push(plant_copy(
+            &f.dest,
+            INDEX,
+            pid,
+            SystemTime::now() - 400 * DAY,
+        ));
+    }
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let mut names: Vec<String> = fs::read_dir(&f.dest)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let members: Vec<(&str, Option<QuarantineCopy>)> = names
+        .iter()
+        .filter_map(|name| Some((name.as_str(), quarantine_member(name)?.1)))
+        .collect();
+    assert_eq!(members.len(), 3);
+    let dir = fs::File::open(&f.dest).expect("open destination");
+    let relative = format!("snapshots/destinations/{DESTINATION}");
+
+    // The look asks the deadline once per member, then once per decision.
+    for checks in 0..=members.len() {
+        let policy = Policy {
+            expire_after_checks: Some(checks),
+            before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+            ..after(8 * DAY)
+        };
+        let mut sweep = Sweep {
+            mode: Mode::Apply,
+            policy: &policy,
+            started: Instant::now(),
+            record_entries: true,
+            report: SweepReport::default(),
+            deadline_checks: 0,
+        };
+
+        let finished = sweep.prune_group(dir.as_raw_fd(), &relative, INDEX, &members);
+
+        assert!(!finished, "after {checks} checks");
+        assert_eq!(sweep.report.removed_quarantine, 0, "after {checks} checks");
+        assert!(sweep.report.entries.is_empty(), "after {checks} checks");
+        assert!(old.iter().all(|copy| copy.exists()) && newest.exists());
+    }
+
+    // A whole pass cut off at any later point never removes the newest
+    // copy and releases every lock.
+    for checks in members.len() + 1.. {
+        assert!(checks < 1_000, "the pass never finished");
+        let policy = Policy {
+            expire_after_checks: Some(checks),
+            ..after(8 * DAY)
+        };
+        let report = apply(&f.support, &policy);
+        assert!(newest.exists(), "after {checks} checks");
+        assert!(lock_is_free(&f.dest.join(format!("{INDEX}.lock"))));
+        if !report.time_budget_exhausted {
+            break;
+        }
+    }
+    assert!(old.iter().all(|copy| !copy.exists()));
+    assert!(newest.exists());
+}
+
+#[test]
+fn groups_are_per_destination_and_per_base() {
+    let f = fixture();
+    let other_dest = f
+        .support
+        .join("snapshots")
+        .join("destinations")
+        .join(OTHER_DESTINATION);
+    private_dir(&other_dest);
+    let older = plant_copy(
+        &f.dest,
+        INDEX,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    );
+    let soon = SystemTime::now() + DAY;
+    let later_still = SystemTime::now() + 2 * DAY;
+    let newest = [
+        plant_copy(&f.dest, INDEX, DEAD_PID, soon),
+        // Later than the first destination's newest, in other groups.
+        plant_copy(&other_dest, INDEX, DEAD_PID, later_still),
+        plant_copy(&f.dest, PROGRESS, DEAD_PID, later_still),
+        plant_copy(&f.dest, "codex-scan-index-v3", DEAD_PID, later_still),
+        plant_copy(
+            &f.dest,
+            "claude_code-scan-index-v3-upload-progress",
+            DEAD_PID,
+            later_still,
+        ),
+    ];
+
+    let report = apply(&f.support, &after(8 * DAY));
+
+    assert_eq!(report.removed_quarantine, 1);
+    assert!(!older.exists());
+    assert_eq!(report.skipped.quarantine_kept_newest, 5);
+    assert!(newest.iter().all(|copy| copy.exists()));
+}
+
+#[test]
+fn receipts_and_lookalikes_are_untouched() {
+    let f = fixture();
+    let ancient = SystemTime::now() - 400 * DAY;
+    for source in SOURCES {
+        for suffix in QUARANTINE_BASES {
+            rebuilt_group(&f.dest, &format!("{source}{suffix}"));
+        }
+    }
+    rebuilt_group(&f.dest, TERMINAL);
+    let nanos = nanos_at(ancient);
+    let lookalikes = [
+        format!("snapshot_upload_receipts.json.corrupt.{nanos}"),
+        format!("{INDEX}.json.corrupt.{nanos}"),
+        format!("{INDEX}.corrupt.{DEAD_PID}.{nanos}.json.bak"),
+        format!("{INDEX}.corrupt.{DEAD_PID}.0{nanos}.json"),
+        format!("claude_code-scan-index-v2.corrupt.{DEAD_PID}.{nanos}.json"),
+        format!("claude_code-scan-index-no-titles.corrupt.{DEAD_PID}.{nanos}.json"),
+        format!("{TERMINAL}.corrupt.{DEAD_PID}.{nanos}.json"),
+        format!("gemini-scan-index-v3.corrupt.{DEAD_PID}.{nanos}.json"),
+        format!("{PROGRESS}.corrupt.{DEAD_PID}.{nanos}.5.json"),
+    ];
+    for name in &lookalikes {
+        write(&f.dest.join(name), b"keep");
+        set_mtime(&f.dest.join(name), ancient);
+    }
+    // Real copies in the two groups a lookalike holds.
+    let held = [
+        plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, ancient),
+        plant_copy(&f.dest, PROGRESS, OTHER_DEAD_PID, ancient),
+    ];
+    // A group without lookalikes still ages out.
+    let pi = "pi-scan-index-v3";
+    let pi_old = plant_copy(&f.dest, pi, OTHER_DEAD_PID, ancient);
+    let pi_newest = plant_copy(&f.dest, pi, DEAD_PID, SystemTime::now() + DAY);
+    // Receipts quarantine next to the support root's receipts.
+    let mut elsewhere = Vec::new();
+    for dir in [f.support.clone(), f.support.join("snapshots")] {
+        let receipt = dir.join(format!("snapshot_upload_receipts.json.corrupt.{nanos}"));
+        write(&receipt, b"keep");
+        elsewhere.push(receipt);
+        elsewhere.push(plant_copy(&dir, INDEX, OTHER_DEAD_PID, ancient));
+    }
+
+    let report = apply(&f.support, &after(8 * DAY));
+
+    assert_eq!(report.removed_quarantine, 1);
+    assert!(!pi_old.exists() && pi_newest.exists());
+    assert_eq!(report.skipped.quarantine_group_incomplete, 2);
+    assert!(held.iter().all(|copy| copy.exists()));
+    for name in &lookalikes {
+        assert_eq!(fs::read(f.dest.join(name)).unwrap(), b"keep", "{name}");
+    }
+    assert!(elsewhere.iter().all(|path| path.exists()));
+    // Lookalikes are not reported as artifacts at all.
+    assert_eq!(report.entries.len(), 4);
+}
+
+#[test]
+fn symlinked_or_hardlinked_copies_are_kept() {
+    let f = fixture();
+    let victim = f.root.join("victim");
+    write(&victim, b"victim");
+    set_mtime(&victim, SystemTime::now() - 400 * DAY);
+    let linked = f.dest.join(quarantine_name(
+        INDEX,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    ));
+    rebuilt_group(&f.dest, INDEX);
+    symlink(&victim, &linked).unwrap();
+    let held = plant_copy(&f.dest, INDEX, DEAD_PID - 2, SystemTime::now() - 400 * DAY);
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let hardlinked = plant_copy(
+        &f.dest,
+        PROGRESS,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    );
+    let other_name = f.root.join("other-name");
+    fs::hard_link(&hardlinked, &other_name).unwrap();
+    let progress_newest = plant_copy(&f.dest, PROGRESS, DEAD_PID, SystemTime::now() + DAY);
+
+    let report = apply(&f.support, &after(40 * DAY));
+
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.unsafe_entry, 2);
+    assert_eq!(report.skipped.quarantine_group_incomplete, 3);
+    assert_eq!(fs::read(&victim).unwrap(), b"victim");
+    assert!(fs::symlink_metadata(&linked).is_ok());
+    assert!(held.exists() && newest.exists());
+    assert!(hardlinked.exists() && other_name.exists() && progress_newest.exists());
+}
+
+#[test]
+fn quarantined_copy_guards_match_the_temps() {
+    let old = || SystemTime::now() - 400 * DAY;
+
+    // Each group also has a newer copy, which is never removed.
+    let newer = |dest: &Path| plant_copy(dest, INDEX, OTHER_DEAD_PID, SystemTime::now() + DAY);
+
+    // Lock held by another descriptor.
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
+    let held = hold_lock(&f.dest.join(format!("{INDEX}.lock")));
+    let report = apply(&f.support, &after(40 * DAY));
+    assert_eq!(report.skipped.locked, 1);
+    assert_eq!(entry_for(&report, &copy).lock, LockState::Held);
+    assert!(copy.exists());
+    drop(held);
+
+    // No lock file: none is created.
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
+    let lock = f.dest.join(format!("{INDEX}.lock"));
+    fs::remove_file(&lock).unwrap();
+    let report = apply(&f.support, &after(40 * DAY));
+    assert_eq!(report.skipped.no_lock_file, 1);
+    assert!(copy.exists() && !lock.exists());
+
+    // Another daemon is running: no lock is taken.
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
+    let policy = Policy {
+        other_daemon: daemon_probe(|| Ok(true)),
+        before_recheck: Some(Box::new(|name: &str| panic!("took a lock for {name}"))),
+        ..after(40 * DAY)
+    };
+    let report = apply(&f.support, &policy);
+    assert_eq!(report.skipped.other_daemon, 1);
+    assert_eq!(report.other_daemon_check, OtherDaemonState::Present);
+    assert!(copy.exists());
+    assert!(lock_is_free(&f.dest.join(format!("{INDEX}.lock"))));
+
+    // Live, own and unknown writer pids. A live writer is injected rather
+    // than spawned: a child being spawned briefly shares every open lock
+    // of this process, which other tests' lock checks would see.
+    const LIVE: i32 = DEAD_PID - 3;
+    let f = fixture();
+    let live: Vec<PathBuf> = [LIVE, std::process::id() as i32, 1]
+        .into_iter()
+        .map(|pid| plant_copy(&f.dest, INDEX, pid, old()))
+        .collect();
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let one_live = Policy {
+        probe: |pid| match pid {
+            LIVE => PidState::Alive,
+            pid => probe_pid(pid),
+        },
+        ..after(8 * DAY)
+    };
+    let report = apply(&f.support, &one_live);
+    assert_eq!(report.skipped.live_pid, 3);
+    assert_eq!(report.removed_quarantine, 0);
+    assert!(live.iter().all(|copy| copy.exists()) && newest.exists());
+    let unknown = Policy {
+        probe: |_| PidState::Unknown,
+        ..after(8 * DAY)
+    };
+    let report = apply(&f.support, &unknown);
+    assert_eq!(report.skipped.live_pid, 3);
+    // Once every writer is gone, the old copies go.
+    let report = apply(&f.support, &names_and_locks_only_after(8 * DAY));
+    assert_eq!(report.removed_quarantine, 3);
+    assert!(newest.exists());
+
+    // Replaced before the unlink.
+    let f = fixture();
+    let copy = plant_copy(&f.dest, INDEX, DEAD_PID, old());
+    newer(&f.dest);
+    let replace = copy.clone();
+    let policy = Policy {
+        before_recheck: Some(Box::new(move |_name: &str| {
+            fs::remove_file(&replace).unwrap();
+            write(&replace, b"a different file");
+        })),
+        ..after(40 * DAY)
+    };
+    let report = apply(&f.support, &policy);
+    assert_eq!(report.skipped.changed, 1);
+    assert_eq!(fs::read(&copy).unwrap(), b"a different file");
+}
+
+#[test]
+fn plan_lists_quarantined_copies_without_touching_them() {
+    let f = fixture();
+    let older = plant_copy(
+        &f.dest,
+        INDEX,
+        OTHER_DEAD_PID,
+        SystemTime::now() - 400 * DAY,
+    );
+    let newest = plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+    let held = hold_lock(&f.dest.join(format!("{INDEX}.lock")));
+    let before = listing(&f.dest);
+
+    let report = sweep(&f.support, Mode::Plan, &after(8 * DAY), true);
+
+    assert_eq!((report.candidates, report.candidate_bytes), (1, 1000));
+    assert_eq!(report.removed_quarantine, 0);
+    let entry = entry_for(&report, &older);
+    assert_eq!(entry.outcome, EntryOutcome::WouldRemove);
+    assert_eq!(entry.artifact, Some(ArtifactKind::QuarantineCopy));
+    assert_eq!(entry.lock, LockState::NotChecked);
+    assert_eq!(
+        entry_for(&report, &newest).reason,
+        Some(SkipReason::QuarantineKeptNewest)
+    );
+    assert_eq!(report.skipped.locked, 0);
+    assert_eq!(listing(&f.dest), before);
+    drop(held);
+
+    // The hidden command prints the same, and `--apply` removes it.
+    let run = |apply: bool| {
+        let mut out = Vec::new();
+        local_state_sweep_command(&f.support, apply, true, &[], after(8 * DAY), &mut out)
+            .expect("command");
+        serde_json::from_slice::<serde_json::Value>(&out).expect("json output")
+    };
+    let plan = run(false);
+    let entries = plan["entries"].as_array().unwrap();
+    let outcome = |name: &Path| {
+        let name = name.file_name().unwrap().to_str().unwrap();
+        entries
+            .iter()
+            .find(|entry| entry["path"].as_str().unwrap().ends_with(name))
+            .unwrap()
+            .clone()
+    };
+    assert_eq!(outcome(&older)["outcome"], "would_remove");
+    assert_eq!(outcome(&older)["artifact"], "quarantine_copy");
+    assert_eq!(outcome(&newest)["reason"], "quarantine_kept_newest");
+    assert_eq!(listing(&f.dest), before);
+
+    let applied = run(true);
+    assert_eq!(applied["removed_quarantine"], 1);
+    assert_eq!(applied["bytes_removed_quarantine"], 1000);
+    assert_eq!(applied["skipped"]["quarantine_kept_newest"], 1);
+    assert!(!older.exists() && newest.exists());
+}
+
+#[test]
+fn quarantine_log_line_is_content_free() {
+    let f = fixture();
+    let named = SystemTime::now() - 400 * DAY;
+    plant_copy(&f.dest, INDEX, OTHER_DEAD_PID, named);
+    plant_copy(&f.dest, INDEX, DEAD_PID, SystemTime::now() + DAY);
+
+    let report = apply(&f.support, &after(8 * DAY));
+    let line = report.log_line("startup").expect("line when removed");
+
+    assert!(
+        line.starts_with(
+            "{\"schema_version\":1,\"stage\":\"startup\",\"removed\":0,\"bytes_removed\":0,\"removed_quarantine\":1,\"bytes_removed_quarantine\":1000,"
+        ),
+        "{line}"
+    );
+    assert!(line.contains("\"quarantine_kept_newest\":1"), "{line}");
+    for forbidden in [
+        "/",
+        DESTINATION,
+        &DESTINATION[..8],
+        "scan-index",
+        "claude_code",
+        "corrupt",
+        ".json",
+        "path",
+        &DEAD_PID.to_string(),
+        &OTHER_DEAD_PID.to_string(),
+        &nanos_at(named).to_string()[..10],
+    ] {
+        assert!(!line.contains(forbidden), "{forbidden} in {line}");
+    }
+    // A kept copy alone is still reported, without content.
+    let report = apply(&f.support, &after(8 * DAY));
+    let line = report.log_line("startup").expect("line when kept");
+    assert!(line.contains("\"removed_quarantine\":0"), "{line}");
+    assert!(line.contains("\"quarantine_kept_newest\":1"), "{line}");
+}
+
+/// A destination whose two Claude quarantine groups were swept: each had
+/// an old and a newer copy, and only the old ones went. For
+/// `claude_prior_history`'s own test in `snapshot_sync`.
+pub(crate) struct SweptClaudeGroups {
+    _fixture: Fixture,
+    pub(crate) support: PathBuf,
+    /// The destination's Claude index, `claude_code-scan-index-v3.json`.
+    pub(crate) index_path: PathBuf,
+    /// The copy each group kept: the index's, then its upload progress's.
+    pub(crate) kept: [PathBuf; 2],
+}
+
+pub(crate) fn swept_claude_quarantine_groups() -> SweptClaudeGroups {
+    let f = fixture();
+    let progress = "claude_code-scan-index-v3-upload-progress";
+    let mut kept = Vec::new();
+    for base in [INDEX, progress] {
+        let old = plant_copy(&f.dest, base, OTHER_DEAD_PID, SystemTime::now());
+        kept.push(plant_copy(&f.dest, base, DEAD_PID, SystemTime::now() + DAY));
+        let report = apply(&f.support, &after(400 * DAY));
+        assert_eq!(report.removed_quarantine, 1, "{base}");
+        assert!(!old.exists(), "{base}");
+    }
+    let report = apply(&f.support, &after(4000 * DAY));
+    assert_eq!(report.removed_quarantine, 0);
+    assert_eq!(report.skipped.quarantine_kept_newest, 2);
+    assert!(kept.iter().all(|copy| copy.exists()));
+    SweptClaudeGroups {
+        support: f.support.clone(),
+        index_path: f.dest.join(format!("{INDEX}.json")),
+        kept: kept.try_into().expect("two groups"),
+        _fixture: f,
+    }
+}
+
+#[test]
+fn quarantine_policy_is_the_owner_decision() {
+    assert_eq!(QUARANTINE_OTHER_MIN_AGE, 7 * DAY);
+    assert_eq!(
+        QUARANTINE_BASES,
+        ["-scan-index-v3", "-scan-index-v3-upload-progress"]
+    );
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]

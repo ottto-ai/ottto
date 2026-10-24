@@ -1,5 +1,6 @@
 //! Removes snapshot checkpoint temp files that a daemon left behind when it
-//! died mid-save.
+//! died mid-save, and ages out old quarantined copies of invalid
+//! checkpoints.
 //!
 //! Every artifact recognized here is created and then renamed or removed by
 //! its writer while that writer holds a non-blocking exclusive flock on the
@@ -14,6 +15,10 @@
 //!   under `SnapshotProgressLock`.
 //! - `<base>.cleared.<pid>.<nanos>.json`: `SnapshotUploadProgress::clear`,
 //!   under `SnapshotProgressLock`.
+//! - `<base>.corrupt.<pid>.<nanos>.json`: the scan index's and the upload
+//!   progress's loads rename a file they reject to this name
+//!   (`quarantine_invalid_scan_index` under `CheckpointLock`,
+//!   `quarantine_invalid_progress` under `SnapshotProgressLock`).
 //!
 //! Taking the same lock therefore proves no writer is between creating and
 //! settling such a file. Only a single-link lock file owned by this user is
@@ -47,15 +52,34 @@
 //! support directory a daemon of this user can use (the environment's and
 //! the account database's home), so it only ever runs on copies.
 //!
+//! Nothing reads a quarantined copy's contents again; it is kept as
+//! evidence, and its name next to the Claude index is prior-history
+//! evidence (`claude_prior_history` in `snapshot_sync`), so every group
+//! keeps at least one copy for good. Copies are pruned per group, one exact
+//! base in one destination directory, and only from a complete look at the
+//! whole group: the directory was listed in full, and every member is a
+//! safe regular file with no future timestamp. A copy's age counts from the
+//! newest of its name's timestamp, mtime, ctime and birthtime, since a
+//! rename keeps the old index's mtime. The group's newest copies (by that
+//! age, and by the name's timestamp; ties all count) are never removed;
+//! every other copy is removed once 7 days old, and a plan that would leave
+//! the group empty removes nothing from it. A group is pruned only while its
+//! canonical `<base>.json` exists as a non-empty regular file of this user,
+//! which shows the daemon rebuilt it; a copy is never opened or read. Each
+//! removal takes the same guards as a temp: the existing lock, a writer pid
+//! that no longer exists, no other daemon, and an unchanged identity, with
+//! the canonical file and a kept copy of the group checked again under the
+//! lock.
+//!
 //! Only `<support>/snapshots/destinations/<64 lowercase hex>/` is visited,
 //! one level deep, through directory descriptors that never follow symlinks.
 //! The support directory itself is opened one component at a time from `/`,
 //! so a symlink anywhere on its path, or a `.`, `..`, empty or trailing-slash
-//! component, skips the whole pass. Canonical checkpoints, lock files,
-//! quarantined `*.corrupt.*` copies, directories and anything else are never
-//! removed, and no lock file is ever created. Startup and the hidden
-//! `local-state-sweep` command share this code; the command's plan mode
-//! takes no locks and changes nothing.
+//! component, skips the whole pass. Canonical checkpoints, lock files, the
+//! upload receipts' `json.corrupt.*` copies, directories and anything else
+//! are never removed, and no lock file is ever created. Startup and the
+//! hidden `local-state-sweep` command share this code; the command's plan
+//! mode takes no locks and changes nothing.
 //!
 //! The time budget is checked before every directory entry, path component
 //! and candidate, and no directory is fsynced: an unlink lost to a crash is
@@ -69,6 +93,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, OsStr};
 use std::io::{ErrorKind, Write};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -77,7 +102,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 /// Exact `SnapshotSource::api_slug` values.
 const SOURCES: [&str; 3] = ["claude_code", "codex", "pi"];
@@ -85,6 +110,13 @@ const MIN_AGE: Duration = Duration::from_secs(60 * 60);
 const MAX_DIR_ENTRIES: usize = 10_000;
 const TIME_BUDGET: Duration = Duration::from_secs(10);
 const SCHEMA_VERSION: u32 = 1;
+/// A quarantined copy other than its group's newest is kept at least this
+/// long; the newest are never removed.
+const QUARANTINE_OTHER_MIN_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+/// Canonical base suffixes whose loads quarantine an invalid file: the scan
+/// index (`quarantine_invalid_scan_index`) and its upload progress
+/// (`quarantine_invalid_progress`).
+const QUARANTINE_BASES: [&str; 2] = ["-scan-index-v3", "-scan-index-v3-upload-progress"];
 /// The only executable that links the checkpoint writers.
 const DAEMON_EXECUTABLE: &str = ottto_core::OTTTO_SERVICE_BINARY_NAME;
 
@@ -99,6 +131,9 @@ enum ArtifactKind {
     TerminalTemp,
     /// `<base>.cleared.<pid>.<nanos>.json`
     ClearedTombstone,
+    /// `<base>.corrupt.<pid>.<nanos>.json`, aged out by group instead of
+    /// by `parse_artifact`.
+    QuarantineCopy,
 }
 
 /// Canonical base suffixes and the artifacts their writers are proven to
@@ -171,7 +206,46 @@ fn parse_artifact_suffix(kind: ArtifactKind, rest: &str) -> Option<(i32, Option<
         ArtifactKind::ClearedTombstone => {
             pid_and_nanos(rest.strip_prefix(".cleared.")?.strip_suffix(".json")?)
         }
+        ArtifactKind::QuarantineCopy => None,
     }
+}
+
+/// A quarantined copy's writer pid and the nanoseconds in its name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct QuarantineCopy {
+    pid: i32,
+    name_nanos: u64,
+}
+
+/// For a name in a quarantine family, `<base>.corrupt.<anything>`, its exact
+/// base and, when the rest is `<pid>.<nanos>.json` exactly as the writers
+/// spell it, the parsed copy. A family name that does not parse is not a
+/// copy, but it keeps its group from being pruned.
+fn quarantine_member(name: &str) -> Option<(String, Option<QuarantineCopy>)> {
+    for source in SOURCES {
+        let Some(after_source) = name.strip_prefix(source) else {
+            continue;
+        };
+        for suffix in QUARANTINE_BASES {
+            let Some(rest) = after_source
+                .strip_prefix(suffix)
+                .and_then(|rest| rest.strip_prefix(".corrupt."))
+            else {
+                continue;
+            };
+            let copy = rest
+                .strip_suffix(".json")
+                .and_then(|middle| middle.split_once('.'))
+                .and_then(|(pid, nanos)| {
+                    Some(QuarantineCopy {
+                        pid: parse_pid(pid)?,
+                        name_nanos: parse_nanos(nanos)?,
+                    })
+                });
+            return Some((format!("{source}{suffix}"), copy));
+        }
+    }
+    None
 }
 
 /// A writer's `std::process::id()`: plain decimal in `1..=i32::MAX`.
@@ -196,6 +270,48 @@ fn parse_nanos(value: &str) -> Option<u64> {
         return None;
     }
     value.parse::<u64>().ok()
+}
+
+/// What happens to each copy of one fully looked-at group, given its
+/// `(age, name nanos)`: `None` removes it, `Some` keeps it for that reason.
+/// The newest copies, by age and by the name's timestamp (ties all count),
+/// are never removed; every other copy goes once 7 days old.
+fn quarantine_plan(copies: &[(i128, u64)]) -> Vec<Option<SkipReason>> {
+    let youngest = copies.iter().map(|&(age, _)| age).min();
+    let latest_name = copies.iter().map(|&(_, name_nanos)| name_nanos).max();
+    let mut plan: Vec<Option<SkipReason>> = copies
+        .iter()
+        .map(|&(age, name_nanos)| {
+            if Some(age) == youngest || Some(name_nanos) == latest_name {
+                Some(SkipReason::QuarantineKeptNewest)
+            } else if age < QUARANTINE_OTHER_MIN_AGE.as_nanos() as i128 {
+                Some(SkipReason::QuarantineRecent)
+            } else {
+                None
+            }
+        })
+        .collect();
+    keep_last_copies(&mut plan);
+    plan
+}
+
+/// A plan that would remove every copy of a group removes none: a
+/// quarantined copy next to the Claude index is prior-history evidence
+/// (`claude_prior_history`), so a group is never emptied. The newest rule
+/// already keeps one; this holds even if that rule changes.
+fn keep_last_copies(plan: &mut [Option<SkipReason>]) {
+    if plan.iter().all(Option::is_none) {
+        plan.fill(Some(SkipReason::QuarantineKeptNewest));
+    }
+}
+
+/// What a quarantined copy's removal checks again under its group's lock:
+/// the canonical file still shows a rebuild, and a copy the plan keeps is
+/// still there.
+#[derive(Clone, Copy)]
+struct KeptGroup<'a> {
+    canonical: &'a CStr,
+    kept: &'a CStr,
 }
 
 fn is_destination_name(name: &str) -> bool {
@@ -592,6 +708,16 @@ enum SkipReason {
     UnsafeEntry,
     TooManyEntries,
     OtherDaemon,
+    /// One of its group's newest quarantined copies, which are never
+    /// removed.
+    QuarantineKeptNewest,
+    /// Another quarantined copy younger than 7 days, or one with a future
+    /// timestamp.
+    QuarantineRecent,
+    /// The group's canonical file is missing or not a rebuilt one.
+    QuarantineNoCanonical,
+    /// Another member of the group could not be fully looked at.
+    QuarantineGroupIncomplete,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
@@ -604,6 +730,10 @@ struct SkipCounts {
     unsafe_entry: u64,
     too_many_entries: u64,
     other_daemon: u64,
+    quarantine_kept_newest: u64,
+    quarantine_recent: u64,
+    quarantine_no_canonical: u64,
+    quarantine_group_incomplete: u64,
 }
 
 impl SkipCounts {
@@ -617,6 +747,10 @@ impl SkipCounts {
             SkipReason::UnsafeEntry => &mut self.unsafe_entry,
             SkipReason::TooManyEntries => &mut self.too_many_entries,
             SkipReason::OtherDaemon => &mut self.other_daemon,
+            SkipReason::QuarantineKeptNewest => &mut self.quarantine_kept_newest,
+            SkipReason::QuarantineRecent => &mut self.quarantine_recent,
+            SkipReason::QuarantineNoCanonical => &mut self.quarantine_no_canonical,
+            SkipReason::QuarantineGroupIncomplete => &mut self.quarantine_group_incomplete,
         };
         *count += 1;
     }
@@ -630,6 +764,10 @@ impl SkipCounts {
             + self.unsafe_entry
             + self.too_many_entries
             + self.other_daemon
+            + self.quarantine_kept_newest
+            + self.quarantine_recent
+            + self.quarantine_no_canonical
+            + self.quarantine_group_incomplete
     }
 }
 
@@ -686,8 +824,11 @@ struct EntryReport {
 
 #[derive(Debug, Default, Serialize)]
 struct SweepReport {
+    /// Temps only; quarantined copies are counted apart.
     removed: u64,
     bytes_removed: u64,
+    removed_quarantine: u64,
+    bytes_removed_quarantine: u64,
     /// Plan mode: files that passed every check except the lock.
     candidates: u64,
     candidate_bytes: u64,
@@ -707,12 +848,15 @@ impl SweepReport {
             stage: &'static str,
             removed: u64,
             bytes_removed: u64,
+            removed_quarantine: u64,
+            bytes_removed_quarantine: u64,
             skipped: &'a SkipCounts,
             errors: u64,
             time_budget_exhausted: bool,
             other_daemon_check: OtherDaemonState,
         }
         if self.removed == 0
+            && self.removed_quarantine == 0
             && self.skipped.total() == 0
             && self.errors == 0
             && !self.time_budget_exhausted
@@ -724,6 +868,8 @@ impl SweepReport {
             stage,
             removed: self.removed,
             bytes_removed: self.bytes_removed,
+            removed_quarantine: self.removed_quarantine,
+            bytes_removed_quarantine: self.bytes_removed_quarantine,
             skipped: &self.skipped,
             errors: self.errors,
             time_budget_exhausted: self.time_budget_exhausted,
@@ -985,6 +1131,11 @@ impl Sweep<'_> {
         lock: LockState,
     ) {
         let (outcome, reason) = match verdict {
+            Verdict::Removed if artifact == Some(ArtifactKind::QuarantineCopy) => {
+                self.report.removed_quarantine += 1;
+                self.report.bytes_removed_quarantine += bytes;
+                (EntryOutcome::Removed, None)
+            }
             Verdict::Removed => {
                 self.report.removed += 1;
                 self.report.bytes_removed += bytes;
@@ -1224,14 +1375,14 @@ impl Sweep<'_> {
         let Some(names) = self.list(directory, relative) else {
             return;
         };
-        for name in names {
+        for name in &names {
             if self.out_of_time() {
                 break;
             }
-            let Some(artifact) = parse_artifact(&name) else {
+            let Some(artifact) = parse_artifact(name) else {
                 continue;
             };
-            let (verdict, bytes, lock) = self.consider(directory.as_raw_fd(), &name, &artifact);
+            let (verdict, bytes, lock) = self.consider(directory.as_raw_fd(), name, &artifact);
             self.record_artifact(
                 format!("{relative}/{name}"),
                 Some(artifact.kind),
@@ -1239,6 +1390,9 @@ impl Sweep<'_> {
                 &verdict,
                 lock,
             );
+        }
+        if !self.report.time_budget_exhausted {
+            self.sweep_quarantine(directory.as_raw_fd(), relative, &names);
         }
     }
 
@@ -1263,59 +1417,271 @@ impl Sweep<'_> {
         if !first.is_regular() || first.uid != self.policy.uid || first.nlink != 1 {
             return not_checked(Verdict::Skip(SkipReason::UnsafeEntry), bytes);
         }
-        let Ok(lock_name) = CString::new(format!("{}.lock", artifact.base)) else {
-            return not_checked(Verdict::Error, bytes);
+        let (lock_name, lock_identity) = match self.lock_file(dir, &artifact.base) {
+            Ok(lock) => lock,
+            Err(verdict) => return not_checked(verdict, bytes),
         };
-        // A hard-linked lock may be another tree's live lock: never flock it.
-        let lock_identity = match stat_at(dir, &lock_name) {
+        if !self.old_enough(&first, artifact.name_nanos) {
+            return not_checked(Verdict::Skip(SkipReason::Recent), bytes);
+        }
+        self.unlink_under_lock(
+            dir,
+            name,
+            &c_name,
+            &first,
+            &lock_name,
+            &lock_identity,
+            artifact.pid,
+            None,
+        )
+    }
+
+    /// The base's existing lock file: a single-link regular file of this
+    /// user. A hard-linked lock may be another tree's live lock: never
+    /// flock it.
+    fn lock_file(
+        &self,
+        dir: RawFd,
+        base: &str,
+    ) -> std::result::Result<(CString, Identity), Verdict> {
+        let Ok(lock_name) = CString::new(format!("{base}.lock")) else {
+            return Err(Verdict::Error);
+        };
+        match stat_at(dir, &lock_name) {
             Ok(identity)
                 if identity.is_regular()
                     && identity.uid == self.policy.uid
                     && identity.nlink == 1 =>
             {
-                identity
+                Ok((lock_name, identity))
             }
-            Ok(_) => return not_checked(Verdict::Skip(SkipReason::UnsafeEntry), bytes),
+            Ok(_) => Err(Verdict::Skip(SkipReason::UnsafeEntry)),
             Err(error) if error.kind() == ErrorKind::NotFound => {
-                return not_checked(Verdict::Skip(SkipReason::NoLockFile), bytes)
+                Err(Verdict::Skip(SkipReason::NoLockFile))
             }
-            Err(_) => return not_checked(Verdict::Error, bytes),
-        };
-        if !self.old_enough(&first, artifact.name_nanos) {
-            return not_checked(Verdict::Skip(SkipReason::Recent), bytes);
+            Err(_) => Err(Verdict::Error),
         }
-        if !self.writer_gone(artifact.pid) {
-            return not_checked(Verdict::Skip(SkipReason::LivePid), bytes);
+    }
+
+    /// Ages out the quarantined copies among a fully listed destination's
+    /// `names`, one group (one exact base) at a time. Returns early, with
+    /// nothing more removed, once the time budget runs out.
+    fn sweep_quarantine(&mut self, dir: RawFd, relative: &str, names: &[String]) {
+        let mut groups: BTreeMap<String, Vec<(&str, Option<QuarantineCopy>)>> = BTreeMap::new();
+        for name in names {
+            if let Some((base, copy)) = quarantine_member(name) {
+                groups.entry(base).or_default().push((name.as_str(), copy));
+            }
+        }
+        for (base, members) in groups {
+            if !self.prune_group(dir, relative, &base, &members) {
+                return;
+            }
+        }
+    }
+
+    /// Looks at every member of one group before deciding anything; a
+    /// member that cannot be looked at fully keeps the whole group. Returns
+    /// `false` when the time budget ran out.
+    fn prune_group(
+        &mut self,
+        dir: RawFd,
+        relative: &str,
+        base: &str,
+        members: &[(&str, Option<QuarantineCopy>)],
+    ) -> bool {
+        struct Look<'n> {
+            name: &'n str,
+            c_name: CString,
+            copy: QuarantineCopy,
+            identity: Identity,
+            age: i128,
+        }
+        let path = |name: &str| format!("{relative}/{name}");
+        let kind = Some(ArtifactKind::QuarantineCopy);
+        let mut looks = Vec::new();
+        let mut complete = true;
+        for &(name, copy) in members {
+            if self.out_of_time() {
+                return false;
+            }
+            // A family name its writers cannot produce is left alone.
+            let (Some(copy), Ok(c_name)) = (copy, CString::new(name)) else {
+                complete = false;
+                continue;
+            };
+            let unsafe_entry = Verdict::Skip(SkipReason::UnsafeEntry);
+            let (verdict, bytes) = match stat_at(dir, &c_name) {
+                Ok(identity)
+                    if identity.is_regular()
+                        && identity.uid == self.policy.uid
+                        && identity.nlink == 1 =>
+                {
+                    match self.age(&identity, Some(copy.name_nanos)) {
+                        Some(age) => {
+                            looks.push(Look {
+                                name,
+                                c_name,
+                                copy,
+                                identity,
+                                age,
+                            });
+                            continue;
+                        }
+                        None => (
+                            Verdict::Skip(SkipReason::QuarantineRecent),
+                            identity.bytes(),
+                        ),
+                    }
+                }
+                Ok(identity) => (unsafe_entry, identity.bytes()),
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    (Verdict::Skip(SkipReason::Changed), 0)
+                }
+                Err(_) => (Verdict::Error, 0),
+            };
+            complete = false;
+            self.record_artifact(path(name), kind, bytes, &verdict, LockState::NotChecked);
+        }
+        let canonical = match CString::new(format!("{base}.json")) {
+            Ok(canonical) if complete && self.rebuilt(dir, &canonical) => canonical,
+            _ => {
+                let verdict = Verdict::Skip(if complete {
+                    SkipReason::QuarantineNoCanonical
+                } else {
+                    SkipReason::QuarantineGroupIncomplete
+                });
+                for look in &looks {
+                    let bytes = look.identity.bytes();
+                    self.record_artifact(
+                        path(look.name),
+                        kind,
+                        bytes,
+                        &verdict,
+                        LockState::NotChecked,
+                    );
+                }
+                return true;
+            }
+        };
+        let ages: Vec<(i128, u64)> = looks
+            .iter()
+            .map(|look| (look.age, look.copy.name_nanos))
+            .collect();
+        let plan = quarantine_plan(&ages);
+        // The plan keeps a copy of every group; it must still be there under
+        // each removal's lock.
+        let Some(kept) = plan.iter().position(Option::is_some) else {
+            return true;
+        };
+        let group = KeptGroup {
+            canonical: &canonical,
+            kept: &looks[kept].c_name,
+        };
+        for (look, keep) in looks.iter().zip(&plan) {
+            if self.out_of_time() {
+                return false;
+            }
+            let bytes = look.identity.bytes();
+            let (verdict, bytes, lock) = match keep {
+                Some(reason) => (Verdict::Skip(*reason), bytes, LockState::NotChecked),
+                None => match self.lock_file(dir, base) {
+                    Ok((lock_name, lock_identity)) => self.unlink_under_lock(
+                        dir,
+                        look.name,
+                        &look.c_name,
+                        &look.identity,
+                        &lock_name,
+                        &lock_identity,
+                        look.copy.pid,
+                        Some(group),
+                    ),
+                    Err(verdict) => (verdict, bytes, LockState::NotChecked),
+                },
+            };
+            self.record_artifact(path(look.name), kind, bytes, &verdict, lock);
+        }
+        true
+    }
+
+    /// Whether the canonical `<base>.json` shows the daemon rebuilt the
+    /// quarantined checkpoint: a non-empty regular file this user owns and
+    /// can read. It is never opened.
+    fn rebuilt(&self, dir: RawFd, canonical: &CStr) -> bool {
+        stat_at(dir, canonical).is_ok_and(|identity| {
+            identity.is_regular()
+                && identity.uid == self.policy.uid
+                && identity.mode & 0o400 != 0
+                && identity.size > 0
+        })
+    }
+
+    /// The guards from the writer pid on, shared by temps and quarantined
+    /// copies: a writer pid that no longer exists, no other daemon, the
+    /// flock on the already checked `lock_name`, then under it an unchanged
+    /// identity, the pid again and, for a quarantined copy, a canonical
+    /// file that still shows a rebuild and a kept copy of its group that is
+    /// still there. Plan mode stops before the lock.
+    #[allow(clippy::too_many_arguments)]
+    fn unlink_under_lock(
+        &mut self,
+        dir: RawFd,
+        name: &str,
+        c_name: &CStr,
+        first: &Identity,
+        lock_name: &CStr,
+        lock_identity: &Identity,
+        pid: i32,
+        group: Option<KeptGroup<'_>>,
+    ) -> (Verdict, u64, LockState) {
+        let bytes = first.bytes();
+        let not_checked = |verdict| (verdict, bytes, LockState::NotChecked);
+        #[cfg(not(test))]
+        let _ = name;
+        if !self.writer_gone(pid) {
+            return not_checked(Verdict::Skip(SkipReason::LivePid));
         }
         if self.mode == Mode::Plan {
-            return not_checked(Verdict::WouldRemove, bytes);
+            return not_checked(Verdict::WouldRemove);
         }
         if self.other_daemon_may_run() {
-            return not_checked(Verdict::Skip(SkipReason::OtherDaemon), bytes);
+            return not_checked(Verdict::Skip(SkipReason::OtherDaemon));
         }
-        let _lock = match self.lock(dir, &lock_name, &lock_identity) {
+        let _lock = match self.lock(dir, lock_name, lock_identity) {
             Ok(lock) => lock,
             Err(LockFailure::Skip(SkipReason::Locked)) => {
                 return (Verdict::Skip(SkipReason::Locked), bytes, LockState::Held)
             }
-            Err(LockFailure::Skip(reason)) => return not_checked(Verdict::Skip(reason), bytes),
-            Err(LockFailure::Error) => return not_checked(Verdict::Error, bytes),
+            Err(LockFailure::Skip(reason)) => return not_checked(Verdict::Skip(reason)),
+            Err(LockFailure::Error) => return not_checked(Verdict::Error),
         };
         let acquired = |verdict| (verdict, bytes, LockState::Acquired);
         #[cfg(test)]
         if let Some(hook) = &self.policy.before_recheck {
             hook(name);
         }
-        match stat_at(dir, &c_name) {
-            Ok(second) if second == first => {}
+        match stat_at(dir, c_name) {
+            Ok(second) if second == *first => {}
             Ok(_) => return acquired(Verdict::Skip(SkipReason::Changed)),
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 return acquired(Verdict::Skip(SkipReason::Changed))
             }
             Err(_) => return acquired(Verdict::Error),
         }
-        if !self.writer_gone(artifact.pid) {
+        if !self.writer_gone(pid) {
             return acquired(Verdict::Skip(SkipReason::LivePid));
+        }
+        if let Some(group) = group {
+            if !self.rebuilt(dir, group.canonical) {
+                return acquired(Verdict::Skip(SkipReason::QuarantineNoCanonical));
+            }
+            match stat_at(dir, group.kept) {
+                Ok(_) => {}
+                Err(error) if error.kind() == ErrorKind::NotFound => {
+                    return acquired(Verdict::Skip(SkipReason::Changed))
+                }
+                Err(_) => return acquired(Verdict::Error),
+            }
         }
         if unsafe { libc::unlinkat(dir, c_name.as_ptr(), 0) } != 0 {
             let error = std::io::Error::last_os_error();
@@ -1373,10 +1739,16 @@ impl Sweep<'_> {
     /// The newest of every timestamp, including one recorded in the name,
     /// must be at least `min_age` old. A future timestamp is never old.
     fn old_enough(&self, identity: &Identity, name_nanos: Option<u64>) -> bool {
+        self.age(identity, name_nanos)
+            .is_some_and(|age| age >= self.policy.min_age.as_nanos() as i128)
+    }
+
+    /// Nanoseconds since the newest of every timestamp, including one
+    /// recorded in the name; `None` for a timestamp in the future or a
+    /// clock before the epoch.
+    fn age(&self, identity: &Identity, name_nanos: Option<u64>) -> Option<i128> {
         const NANOS: i128 = 1_000_000_000;
-        let Ok(now) = self.policy.now.duration_since(UNIX_EPOCH) else {
-            return false;
-        };
+        let now = self.policy.now.duration_since(UNIX_EPOCH).ok()?;
         let now = now.as_nanos() as i128;
         let to_nanos =
             |(seconds, nanos): (i64, i64)| i128::from(seconds) * NANOS + i128::from(nanos);
@@ -1387,7 +1759,7 @@ impl Sweep<'_> {
         if let Some(name_nanos) = name_nanos {
             newest = newest.max(i128::from(name_nanos));
         }
-        newest <= now && now - newest >= self.policy.min_age.as_nanos() as i128
+        (newest <= now).then_some(now - newest)
     }
 
     /// Only a pid that is not ours and that the kernel says does not exist.
@@ -1615,9 +1987,11 @@ fn local_state_sweep_command(
             .unwrap_or_default();
         writeln!(
             out,
-            "removed {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}, other daemon check {other_daemon_check}",
+            "removed {} ({} bytes), removed quarantined {} ({} bytes), candidates {} ({} bytes), skipped {}, errors {}, other daemon check {other_daemon_check}",
             report.removed,
             report.bytes_removed,
+            report.removed_quarantine,
+            report.bytes_removed_quarantine,
             report.candidates,
             report.candidate_bytes,
             report.skipped.total(),
