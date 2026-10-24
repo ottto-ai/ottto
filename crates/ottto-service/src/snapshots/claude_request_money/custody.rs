@@ -734,9 +734,11 @@ impl Custody {
                 })
                 .filter_map(move |slot| {
                     let expanded = slot.key.expand(key, path);
-                    expanded
-                        .starts_with(prefix)
-                        .then(|| (expanded, slot.value.view()))
+                    if expanded.starts_with(prefix) {
+                        Some((expanded, slot.value.view()))
+                    } else {
+                        None
+                    }
                 })
         })
     }
