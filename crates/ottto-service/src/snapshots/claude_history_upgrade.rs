@@ -628,9 +628,11 @@ pub(super) fn denies_request_owned_literal(revision: u64) -> bool {
 /// candidate this cycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum LiteralGuard {
-    /// The active row emits the literal, or no family is listed.
+    /// No literal item, or the literal's revision is active and no family
+    /// is listed.
     Open,
-    /// The list is paused: every family may be listed, so no literal passes.
+    /// The active revision is below the literal's (S-726-1) or has no row,
+    /// or the list is paused (every family may be listed): no literal passes.
     DenyAll,
     /// Only literals of these indexed source files, none of them in a listed
     /// family, pass. An unknown or unindexed source fails closed.
@@ -661,18 +663,21 @@ impl LiteralGuard {
         files: impl Iterator<Item = (&'a str, &'a str)>,
         listed: impl Fn(&str) -> bool,
     ) -> Self {
+        if !items.iter().any(is_request_owned_literal) {
+            return Self::Open;
+        }
+        // S-726-1: no literal is sent below the revision whose row carries
+        // it (revision 3), nor under a revision with no row.
+        let literal_row = revision_policy(active_revision)
+            .is_some_and(|row| row.listed_emission == ListedEmission::WithoutRequestOwnedLiteral);
+        if !literal_row || list.pauses_adoption() {
+            return Self::DenyAll;
+        }
         let literal_sources = items
             .iter()
             .filter(|item| is_request_owned_literal(item))
             .filter_map(|item| item.source_file_fingerprint.as_deref())
             .collect::<BTreeSet<_>>();
-        let any_literal = items.iter().any(is_request_owned_literal);
-        if !any_literal || !denies_request_owned_literal(active_revision) {
-            return Self::Open;
-        }
-        if list.pauses_adoption() {
-            return Self::DenyAll;
-        }
         if list.is_empty() {
             return Self::Open;
         }
@@ -1509,11 +1514,13 @@ mod tests {
                 LiteralGuard::for_items(&items, revision, list, files(), listed)
             };
             let populated = ReemissionExclusions::parse(format!("{}\n", "a".repeat(64)).as_bytes());
-            assert_eq!(
-                guard(2, &populated),
-                LiteralGuard::Open,
-                "revision 2 emits it"
-            );
+            // S-726-1: below revision 3 no literal passes, listed or not.
+            for below in [&populated, &list, &ReemissionExclusions::default()] {
+                assert_eq!(guard(2, below), LiteralGuard::DenyAll);
+            }
+            with_max_gated_claude_revision(2, || {
+                assert_eq!(guard(3, &list), LiteralGuard::DenyAll, "rowless");
+            });
             assert_eq!(guard(3, &list), LiteralGuard::Open, "nothing is listed");
             assert_eq!(
                 guard(3, &ReemissionExclusions::default()),

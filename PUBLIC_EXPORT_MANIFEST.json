@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 835,
-  "content_sha256": "1f8710780753b8e3df34ba351f97b6c7cf94170d463f154b4530925afea3c52d",
+  "content_sha256": "d6f45cdb310280ff8ee9f75ef9ea8d5206545cae8ab7e3fbef88f44426f318f4",
   "files": [
     {
       "executable": false,
@@ -1700,15 +1700,15 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_history_upgrade.rs",
-      "sha256": "3bb4d5f1f5feda7933773bc7322b209be0d61ab29d8b55fb98d38229fb6a29f4",
-      "size_bytes": 67106
+      "sha256": "3eab05976ee5879f713077335d223c45a8e64f956f1c44506ae7f63a935dcd8e",
+      "size_bytes": 67667
     },
     {
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_history_upgrade_tests.rs",
-      "sha256": "92e1be640203d51582ee724c0b403d1c808b4626357fcb2408258ee20b1084c6",
-      "size_bytes": 64798
+      "sha256": "5219b914ccdf94df7f680b065d659a01cabc5ff89504ba6b4b83950e6561d216",
+      "size_bytes": 67988
     },
     {
       "executable": false,
@@ -5848,7 +5848,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T08:58:38+00:00",
+  "generated_at": "2026-10-24T09:02:21+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 836,
   "public_roots": [
@@ -5887,5 +5887,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "11242fe0bd948f4e31547c5b14cbc08abb7f125a"
+  "source_commit": "70930a754b14af9c0467f00cb657cecb1d3f8a2c"
 }
