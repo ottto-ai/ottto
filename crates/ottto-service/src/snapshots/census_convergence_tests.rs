@@ -2650,8 +2650,9 @@ fn a_downgrade_that_drops_the_marker_and_set_fails_closed() {
 // indexed) take no slot, so more of them than the cap never block it; they
 // stay indexed files, never new ones. An indexed entry whose file the walk
 // did not see is absent (H729-1), and a root the walk saw only through an
-// unindexed member needs a tombstone too. More absent roots than free slots
-// keep the fence up, publish it and alarm at most hourly.
+// unindexed or confirmed-empty member needs a tombstone too (the normal
+// retirement would not cover its later disappearance). More absent roots
+// than free slots keep the fence up, publish it and alarm at most hourly.
 #[test]
 fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     let cap = MAX_CLAUDE_RETIRED_FAMILY_TOMBSTONES;
@@ -2687,24 +2688,37 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
         // Seen by the walk, but never indexed.
         witness_only(&mut index, "absent-unindexed");
         observed.insert(key("absent-unindexed"));
+        // Seen and indexed, but confirmed empty: its proof may be unsettled.
+        witness_only(&mut index, "absent-empty");
+        let mut entry = manifest_index_entry(None);
+        entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+        index.files.insert(key("absent-empty"), entry);
+        index.confirmed_empty_files.insert(key("absent-empty"));
+        observed.insert(key("absent-empty"));
         for number in 0..absent {
             witness_only(&mut index, &format!("absent-{number:02}"));
         }
-        index.fill_claude_retired_family_tombstones_for_test(cap - 4, 0);
+        index.fill_claude_retired_family_tombstones_for_test(cap - 5, 0);
         index.claude_retired_family_tombstones_uncertain = true;
         (index, observed)
     };
 
-    // Four free slots, four roots needing one, more than the cap present.
+    // Five free slots, five roots needing one, more than the cap present.
     let (mut index, observed) = fenced(2);
-    assert!(index.claude_usage_family_witnesses.len() > cap + 4);
+    assert!(index.claude_usage_family_witnesses.len() > cap + 5);
     assert!(matches!(
         drain_fence_at_clean_terminal(&mut index, observed.clone()),
-        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 4, .. }
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 5, .. }
     ));
     assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(index.claude_retired_family_tombstones_for_test().len(), cap);
-    for root in ["absent-stale", "absent-unindexed", "absent-00", "absent-01"] {
+    for root in [
+        "absent-stale",
+        "absent-unindexed",
+        "absent-empty",
+        "absent-00",
+        "absent-01",
+    ] {
         assert!(index.claude_family_tombstoned_for_test(root), "{root}");
     }
     for root in &present_roots {
@@ -2759,7 +2773,7 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     assert!(index.claude_retired_family_tombstones_uncertain_for_test());
     assert_eq!(
         index.claude_retired_family_tombstones_for_test().len(),
-        cap - 4
+        cap - 5
     );
     assert_eq!(alarms.len(), 1, "rate limited");
     assert_eq!(
@@ -2770,7 +2784,7 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
         alarms[0]["counts"]["absent_family_tombstone_uncertain"],
         json!(true)
     );
-    assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], json!(4));
+    assert_eq!(alarms[0]["counts"]["free_tombstone_slots"], json!(5));
     assert_eq!(
         decision(
             &index,
@@ -2789,9 +2803,60 @@ fn the_fence_drain_skips_present_roots_and_only_absent_roots_block_it() {
     }
     assert!(matches!(
         drain_fence_at_clean_terminal(&mut index, observed),
-        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 2, .. }
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 3, .. }
     ));
     assert!(!index.claude_retired_family_tombstones_uncertain_for_test());
+}
+
+// SOURCE Round 15, checkpoint selection: the drain exempts a present root by
+// the working index. When a partial checkpoint then drops that root's new
+// entry (its body is not held by the server yet), the root would be
+// unindexed and untombstoned, so the checkpoint keeps the fence up. A
+// checkpoint that keeps the entry keeps the lowered fence.
+#[test]
+fn a_partial_checkpoint_that_drops_an_exempted_entry_keeps_the_fence() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let key = "/synthetic/projects/fresh/fresh-00.jsonl".to_string();
+    let fenced = || {
+        let mut index = ScanIndex::default();
+        index.insert_retry_pending_claude_authority_for_test("fresh-00");
+        index.claude_usage_authority_quarantine.remove("fresh-00");
+        index.claude_retired_family_tombstones_uncertain = true;
+        index
+    };
+    let committed = fenced();
+    let mut working = fenced();
+    let mut entry = manifest_index_entry(Some("unheld-body"));
+    entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.to_string());
+    working.files.insert(key.clone(), entry);
+    assert!(matches!(
+        drain_fence_at_clean_terminal(&mut working, BTreeSet::from([key.clone()])),
+        ClaudeTombstoneFenceRepair::Lowered { tombstoned: 0, .. }
+    ));
+    assert!(!working.claude_retired_family_tombstones_uncertain_for_test());
+
+    let dropped = working.committable_subset(&committed, &BTreeSet::new(), &BTreeMap::new());
+    assert!(!dropped.files.contains_key(&key));
+    assert!(!dropped.claude_family_tombstoned_for_test("fresh-00"));
+    assert!(dropped.claude_retired_family_tombstones_uncertain_for_test());
+    assert_eq!(
+        decision(&dropped, &test_candidate(PathBuf::from(&key))),
+        (
+            CandidateDecision::Parse,
+            Some(CandidateParseReason::AuthorityQuarantine)
+        ),
+        "never a new file"
+    );
+
+    let kept = working.committable_subset(
+        &committed,
+        &BTreeSet::from(["unheld-body".to_string()]),
+        &BTreeMap::new(),
+    );
+    assert!(kept.files.contains_key(&key));
+    assert!(!kept.claude_retired_family_tombstones_uncertain_for_test());
 }
 
 // SOURCE Round 15: the accepted upgrade false positive. A pre-bridge index

@@ -8872,13 +8872,18 @@ fn claude_tombstone_repair_scratch_admitted(
 }
 
 /// Witnessed roots one complete traversal saw on disk, each to whether every
-/// member the walk observed is indexed (SOURCE Round 15). Only `true` roots
-/// are present for the fence drain: an indexed entry whose file the walk did
-/// not see is absent (H729-1), and a member the walk saw but the index does
-/// not hold (residue, or a file it could not index) could be read as a new
-/// file once the fence is down, so its root needs a tombstone too.
+/// member the walk observed is indexed with a body (SOURCE Round 15). Only
+/// `true` roots are present for the fence drain: an indexed entry whose file
+/// the walk did not see is absent (H729-1), and a member the walk saw but the
+/// index does not hold (residue, or a file it could not index) could be read
+/// as a new file once the fence is down, so its root needs a tombstone too.
+/// So does a root with a confirmed-empty member: a returning member that
+/// parses empty is indexed with no record while its proof is unsettled, and
+/// the normal reserve-before-retire covers only RetryPending records, so its
+/// later disappearance would prune the witness.
 fn claude_fence_present_roots<'k>(
     files: &BTreeMap<String, ScanIndexEntry>,
+    confirmed_empty_files: &BTreeSet<String>,
     witnesses: &BTreeMap<String, ClaudeUsageFamilyWitness>,
     observed_index_keys: &'k BTreeSet<String>,
     residue_index_keys: &'k BTreeSet<String>,
@@ -8893,7 +8898,9 @@ fn claude_fence_present_roots<'k>(
         if !witnesses.contains_key(member.root) {
             continue;
         }
-        let indexed = may_be_indexed && files.contains_key(index_key);
+        let indexed = may_be_indexed
+            && files.contains_key(index_key)
+            && !confirmed_empty_files.contains(index_key);
         *present.entry(member.root).or_insert(true) &= indexed;
     }
     present
@@ -38257,7 +38264,8 @@ impl ScanIndex {
     /// disk, when they all fit under the cap. Otherwise the fence stays.
     ///
     /// A root is present only when the walk observed a member of it and
-    /// every member the walk observed is indexed (`claude_fence_present_roots`).
+    /// every member the walk observed is indexed and not confirmed empty
+    /// (`claude_fence_present_roots`).
     /// Indexed presence alone never waives a slot (H729-1): an indexed entry
     /// whose file the walk did not see counts as absent, like a partial
     /// checkpoint's restored entry of a retired root. Present roots are left
@@ -38297,6 +38305,7 @@ impl ScanIndex {
         let present = if scratch_admitted {
             claude_fence_present_roots(
                 &self.files,
+                &self.confirmed_empty_files,
                 &self.claude_usage_family_witnesses,
                 observed_index_keys,
                 residue_index_keys,
@@ -40140,12 +40149,29 @@ impl ScanIndex {
         };
         let mut files = BTreeMap::new();
         let mut safe_keys = BTreeSet::new();
+        // SOURCE Round 15: a fence this page's terminal drained exempted
+        // present roots by their working entries. If this subset drops one
+        // (a new entry the server does not hold yet), its root would be
+        // unindexed and untombstoned, so the subset keeps the fence up.
+        let fence_drained_here = previous.claude_retired_family_tombstones_uncertain
+            && !self.claude_retired_family_tombstones_uncertain;
+        let mut drops_exempted_member = false;
         for (key, entry) in &self.files {
             if safe(key, entry.last_snapshot_fingerprint.as_deref()) {
                 files.insert(key.clone(), entry.clone());
                 safe_keys.insert(key.clone());
             } else if let Some(committed) = previous.files.get(key) {
                 files.insert(key.clone(), committed.clone());
+            } else if fence_drained_here && !drops_exempted_member {
+                drops_exempted_member =
+                    claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                        self.claude_usage_family_witnesses.contains_key(member.root)
+                            && !claude_root_tombstoned_in(
+                                &self.claude_retired_family_tombstones,
+                                false,
+                                member.root,
+                            )
+                    });
             }
         }
         // A complete census may prune vanished/aged paths from `self`, but a
@@ -40285,7 +40311,8 @@ impl ScanIndex {
             claude_retired_family_tombstones_initialized: self
                 .claude_retired_family_tombstones_initialized,
             claude_retired_family_tombstones_uncertain: self
-                .claude_retired_family_tombstones_uncertain,
+                .claude_retired_family_tombstones_uncertain
+                || drops_exempted_member,
             claude_duplicate_request_owners: self.claude_duplicate_request_owners.clone(),
             claude_duplicate_request_witness_overflowed: self
                 .claude_duplicate_request_witness_overflowed,
