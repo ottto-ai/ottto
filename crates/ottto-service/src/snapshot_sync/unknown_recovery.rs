@@ -1032,11 +1032,15 @@ pub(super) fn resolve_saved(
                             selection.revision,
                         )
                     })
-                || selected
-                    .quarantined_snapshot_fingerprints
+                || progress
+                    .quarantined_fingerprints
                     .get(&entity.fingerprint)
                     .is_some_and(|record| {
                         record.upload_body_witness.as_deref() == Some(entity.witness.as_str())
+                            && selected
+                                .quarantined_snapshot_fingerprints
+                                .get(&entity.fingerprint)
+                                == Some(record)
                     })
         });
         if m.terminal.is_none() && m.ack_saved && selected_outcomes {
