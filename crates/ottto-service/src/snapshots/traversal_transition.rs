@@ -28,6 +28,10 @@ struct Previous {
     counts: ScanTraversalCounts,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Serialize)]
 pub(super) struct Starting {
     event: &'static str,
@@ -46,6 +50,22 @@ pub(super) struct Starting {
     pub(super) rearmed_index_files: usize,
     pub(super) carried_pending_families: usize,
     pub(super) carried_index_files: usize,
+    /// Fix 2: stale families whose pending came from a full-rearm window,
+    /// how many of them were carried, the files of the rest re-read whole,
+    /// and the families and files the per-deadline cap kept without reparse.
+    /// Omitted while zero, so every other start row keeps its bytes.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_carried_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_rearmed_files: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_rearmed_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_rearm_capped_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_rearm_capped_files: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -90,6 +110,12 @@ impl Starting {
             rearmed_index_files: 0,
             carried_pending_families: 0,
             carried_index_files: 0,
+            rearm_window_families: 0,
+            rearm_window_carried_families: 0,
+            rearm_window_rearmed_files: 0,
+            rearm_window_rearmed_families: 0,
+            stale_rearm_capped_families: 0,
+            stale_rearm_capped_files: 0,
         }
     }
 
@@ -864,5 +890,60 @@ mod tests {
             );
             assert_complete_max_row(rows[0].clone());
         }
+    }
+
+    /// Fix 2's start counts are omitted while zero, so every other start row
+    /// keeps its bytes, and at maximum width the row stays within budget.
+    #[test]
+    fn full_rearm_window_start_counts_are_omitted_at_zero_and_bounded() {
+        const FIELDS: [&str; 6] = [
+            "rearm_window_families",
+            "rearm_window_carried_families",
+            "rearm_window_rearmed_files",
+            "rearm_window_rearmed_families",
+            "stale_rearm_capped_families",
+            "stale_rearm_capped_files",
+        ];
+        let source = SnapshotSource::ClaudeCode;
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
+        let (_, rows) = capture(|| Starting::capture(source, &index, T1, true, 1).emit(source));
+        for field in FIELDS {
+            assert!(rows[0]["counts"].get(field).is_none(), "{field}");
+        }
+
+        index.generation = u64::MAX;
+        index.traversal.as_mut().unwrap().counts = max_traversal_counts();
+        let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+        starting.context_matches = false;
+        starting.prior_unsettled_upload = false;
+        starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
+        starting.retry_due = Some(false);
+        starting.stale_pending_families = usize::MAX;
+        starting.rearmed_index_files = usize::MAX;
+        starting.carried_pending_families = usize::MAX;
+        starting.carried_index_files = usize::MAX;
+        starting.rearm_window_families = usize::MAX;
+        starting.rearm_window_carried_families = usize::MAX;
+        starting.rearm_window_rearmed_files = usize::MAX;
+        starting.rearm_window_rearmed_families = usize::MAX;
+        starting.stale_rearm_capped_families = usize::MAX;
+        starting.stale_rearm_capped_files = usize::MAX;
+        starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
+        let previous = starting.previous.as_mut().unwrap();
+        previous.window_unix_seconds = Some(u64::MAX);
+        previous.pending_directories = usize::MAX;
+        previous.pending_candidates = usize::MAX;
+        previous.retry_attempt = u8::MAX;
+        previous.retry_not_before_unix_seconds = Some(u64::MAX);
+        previous.watcher_overflow = false;
+        previous.retryable_problems = false;
+        previous.unsettled_residue = false;
+        let (_, rows) = capture(|| starting.emit(source));
+        assert_eq!(rows.len(), 1);
+        for field in FIELDS {
+            assert_eq!(rows[0]["counts"][field], json!(usize::MAX), "{field}");
+        }
+        assert_complete_max_row(rows[0].clone());
     }
 }
