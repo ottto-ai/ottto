@@ -24,6 +24,14 @@ const BODY_FUNDS: usize = BODY_MAX + 4 * MANIFEST_MAX;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub(super) struct FileSelection {
+    group: Option<String>,
+    body: Option<String>,
+    revision: u64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Entity {
     pub root: String,
     pub session: String,
@@ -32,6 +40,8 @@ pub(super) struct Entity {
     pub witness_version: Option<u64>,
     pub files: Vec<String>,
     pub file_revisions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub file_selections: Vec<FileSelection>,
     pub source_fingerprint: Option<String>,
     pub literal: bool,
     pub cache_patch: Option<crate::snapshots::CacheObservations>,
@@ -317,6 +327,12 @@ fn validate_manifest(m: &Manifest) -> Result<()> {
         || m.entities.iter().any(|e| {
             e.files.len() > 256
                 || e.files.len() != e.file_revisions.len()
+                || e.files.len() != e.file_selections.len()
+                || e.file_selections.iter().any(|selection| {
+                    !matches!(selection.revision, 2 | 3)
+                        || selection.group.as_ref().is_some_and(|s| !valid_digest(s))
+                        || selection.body.as_ref().is_some_and(|s| !valid_digest(s))
+                })
                 || e.file_revisions.iter().any(|r| r.len() > 256)
                 || e.session.len() > 1024
                 || e.root.len() > 1024
@@ -998,29 +1014,31 @@ pub(super) fn resolve_saved(
         return Ok(());
     };
     for m in &mut catalog.entries {
-        let selected_outcomes =
-            m.entities.iter().all(|entity| {
-                selected.accepted_snapshot_fingerprint_recorded(&entity.fingerprint)
-                    && progress.accepted_body_witnesses.get(&entity.fingerprint)
-                        == Some(&entity.witness)
-                    && (!entity.literal
-                        || entity.files.iter().zip(&entity.file_revisions).all(
-                            |(key, revision)| {
-                                selected.selected_request_money_body_recorded(
-                                    key,
-                                    revision,
-                                    &entity.fingerprint,
-                                    &entity.witness,
-                                )
-                            },
-                        ))
-                    || selected
-                        .quarantined_snapshot_fingerprints
-                        .get(&entity.fingerprint)
-                        .is_some_and(|record| {
-                            record.upload_body_witness.as_deref() == Some(entity.witness.as_str())
-                        })
-            });
+        let selected_outcomes = m.entities.iter().all(|entity| {
+            selected.accepted_snapshot_fingerprint_recorded(&entity.fingerprint)
+                && progress.accepted_body_witnesses.get(&entity.fingerprint)
+                    == Some(&entity.witness)
+                && entity
+                    .files
+                    .iter()
+                    .zip(&entity.file_revisions)
+                    .zip(&entity.file_selections)
+                    .all(|((key, revision), selection)| {
+                        selected.selected_upload_tuple_recorded(
+                            key,
+                            revision,
+                            selection.group.as_deref(),
+                            selection.body.as_deref(),
+                            selection.revision,
+                        )
+                    })
+                || selected
+                    .quarantined_snapshot_fingerprints
+                    .get(&entity.fingerprint)
+                    .is_some_and(|record| {
+                        record.upload_body_witness.as_deref() == Some(entity.witness.as_str())
+                    })
+        });
         if m.terminal.is_none() && m.ack_saved && selected_outcomes {
             // This in-memory mark is reached only AFTER ACK and selected saves.
             // Startup commits the release latch and count-only terminal receipt.
@@ -1121,17 +1139,41 @@ pub(super) fn manifest(
         let root = money::family_root(item).to_string();
         let mut files = Vec::new();
         let mut file_revisions = Vec::new();
+        let mut file_selections = Vec::new();
         for key in index
             .files
             .keys()
             .filter(|key| money::logical_family_member(index, key).is_some_and(|(r, _)| r == root))
         {
-            metadata_bytes = metadata_bytes.saturating_add(key.len());
+            let entry = &index.files[key];
+            metadata_bytes = metadata_bytes
+                .saturating_add(key.len())
+                .saturating_add(
+                    entry
+                        .last_snapshot_fingerprint
+                        .as_ref()
+                        .map_or(0, String::len),
+                )
+                .saturating_add(
+                    entry
+                        .last_upload_body_witness
+                        .as_ref()
+                        .map_or(0, String::len),
+                );
             if files.len() >= 256 || key.len() > 4096 || metadata_bytes > MANIFEST_MAX / 2 {
                 return Err(fault());
             }
             files.push(key.clone());
             file_revisions.push(index.files[key].source_file_fingerprint.clone());
+            file_selections.push(FileSelection {
+                group: entry.last_snapshot_fingerprint.clone(),
+                body: entry.last_upload_body_witness.clone(),
+                revision: if index.request_money_live_revision() {
+                    3
+                } else {
+                    effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+                },
+            });
         }
         lineage.update((item.source_session_id.len() as u64).to_be_bytes());
         lineage.update(item.source_session_id.as_bytes());
@@ -1149,6 +1191,7 @@ pub(super) fn manifest(
             witness_version: crate::snapshot_client::snapshot_ack_body_witness_version(item)?,
             files,
             file_revisions,
+            file_selections,
             source_fingerprint: item.source_file_fingerprint.clone(),
             cache_patch: item.cache_observations.clone(),
             literal: item.usage_accounting_contract.as_deref()
@@ -1767,6 +1810,11 @@ mod tests {
                     witness_version: Some(7),
                     files: vec!["/fixture/file.jsonl".into()],
                     file_revisions: vec!["34".repeat(32)],
+                    file_selections: vec![FileSelection {
+                        group: Some("56".repeat(32)),
+                        body: Some("78".repeat(32)),
+                        revision: 3,
+                    }],
                     source_fingerprint: Some("34".repeat(32)),
                     literal: true,
                     cache_patch: None,

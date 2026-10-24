@@ -36542,30 +36542,25 @@ impl ScanIndex {
     }
 
     /// A saved accepted entity can coexist with a held file's older upload
-    /// tuple. Recovery custody remains needed until the selected literal file
-    /// carries both exact singleton-set witnesses and its covering revision.
-    pub(crate) fn selected_request_money_body_recorded(
+    /// tuple. Recovery custody remains needed until the selected file carries
+    /// the original aggregate witnesses and the requested covering revision.
+    pub(crate) fn selected_upload_tuple_recorded(
         &self,
         key: &str,
         source_revision: &str,
-        fingerprint: &str,
-        body: &str,
+        group: Option<&str>,
+        body: Option<&str>,
+        revision: u64,
     ) -> bool {
         let Some(entry) = self.files.get(key) else {
             return false;
         };
-        let singleton = |domain: &[u8], value: &str| {
-            let mut digest = Sha256::new();
-            update_length_prefixed(&mut digest, domain);
-            update_length_prefixed(&mut digest, value.as_bytes());
-            format!("{:x}", digest.finalize())
-        };
         entry.source_file_fingerprint == source_revision
-            && entry.effective_upload_body_witness_revision == 3
-            && entry.last_snapshot_fingerprint.as_ref()
-                == Some(&singleton(b"snapshot_file_entity_set:v1", fingerprint))
-            && entry.last_upload_body_witness.as_ref()
-                == Some(&singleton(b"snapshot_file_upload_body_set:v1", body))
+            && entry.effective_upload_body_witness_revision == revision
+            && group.is_some()
+            && body.is_some()
+            && entry.last_snapshot_fingerprint.as_deref() == group
+            && entry.last_upload_body_witness.as_deref() == body
     }
 
     /// Mark the sweep unsettled by a path that does not name itself.
