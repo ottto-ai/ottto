@@ -7,7 +7,7 @@ use super::*;
 use crate::snapshots::claude_request_money::{self as money, store};
 use std::fs::{self, File, OpenOptions};
 use std::io::Read;
-use std::sync::mpsc::{Receiver, TryRecvError};
+use std::sync::mpsc::TryRecvError;
 
 const BODY_MAX: usize = 4 * 1024 * 1024;
 const MANIFEST_MAX: usize = 64 * 1024;
@@ -640,7 +640,7 @@ fn publish_status(root: &Path, now: u64, active_batches: usize) -> Result<()> {
 type Prepared = (Manifest, Vec<u8>, money::ShadowReservation);
 
 pub(super) struct Ticket<T> {
-    receiver: Receiver<Result<T>>,
+    receiver: store::RecoveryJob<Result<T>>,
 }
 impl<T> Ticket<T> {
     pub fn take(&self) -> Result<Option<T>> {

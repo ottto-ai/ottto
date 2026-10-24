@@ -52,7 +52,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 pub(crate) const LEDGER_DIR: &str = "claude-request-custody-v2";
@@ -588,7 +588,7 @@ enum Job {
         release: Receiver<()>,
     },
     Checkpoint(Box<CheckpointPayload>, ShadowReservation),
-    Recovery(Box<dyn FnOnce() + Send>, ShadowReservation),
+    Recovery(Box<dyn FnOnce() + Send>, Arc<ShadowReservation>),
 }
 
 enum Slot {
@@ -876,13 +876,27 @@ fn run_writer(receiver: Receiver<Job>) {
     }
 }
 
+/// The result receiver retains the same admission as the writer. Field order
+/// drops an unconsumed payload before releasing its allocation on cancellation.
+pub(crate) struct RecoveryJob<T> {
+    result: Receiver<T>,
+    _allocation: Arc<ShadowReservation>,
+}
+impl<T> RecoveryJob<T> {
+    pub(crate) fn try_recv(&self) -> Result<T, TryRecvError> {
+        self.result.try_recv()
+    }
+}
+
 /// Recovery uses the existing bounded writer/outbox, never another worker or
-/// a filesystem wait while the sync owner holds its lock.
+/// a filesystem wait while the sync owner holds its lock. Payment follows a
+/// completed result until the caller has consumed or dropped its ticket.
 pub(crate) fn recovery_job<T: Send + 'static>(
     bytes: usize,
     operation: impl FnOnce() -> T + Send + 'static,
-) -> Option<Receiver<T>> {
-    let funds = ShadowReservation::admit(bytes)?;
+) -> Option<RecoveryJob<T>> {
+    let funds = Arc::new(ShadowReservation::admit(bytes)?);
+    let retained = funds.clone();
     let (done, result) = sync_channel(1);
     submit(Job::Recovery(
         Box::new(move || {
@@ -891,7 +905,10 @@ pub(crate) fn recovery_job<T: Send + 'static>(
         funds,
     ))
     .ok()?;
-    Some(result)
+    Some(RecoveryJob {
+        result,
+        _allocation: retained,
+    })
 }
 
 pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
@@ -1990,6 +2007,55 @@ pub(crate) fn stall_writer_for_test() -> WriterStallForTest {
 #[cfg(test)]
 mod refused_intent_tests {
     use super::*;
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn completed_recovery_payload_keeps_payment_until_receiver_cancellation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        struct Payload {
+            bytes: Vec<u8>,
+            funding: Arc<Mutex<Option<std::sync::Weak<ShadowReservation>>>>,
+            paid_on_drop: Arc<AtomicBool>,
+        }
+        impl Drop for Payload {
+            fn drop(&mut self) {
+                assert_eq!(self.bytes.len(), 4096);
+                self.paid_on_drop.store(
+                    self.funding
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(std::sync::Weak::upgrade)
+                        .is_some(),
+                    Ordering::SeqCst,
+                );
+            }
+        }
+        let funding = Arc::new(Mutex::new(None));
+        let paid = Arc::new(AtomicBool::new(false));
+        let saved_funding = funding.clone();
+        let saved_paid = paid.clone();
+        let receipt = recovery_job(8192, move || Payload {
+            bytes: vec![0; 4096],
+            funding: saved_funding,
+            paid_on_drop: saved_paid,
+        })
+        .unwrap();
+        let weak = Arc::downgrade(&receipt._allocation);
+        *funding.lock().unwrap() = Some(weak.clone());
+        assert!(flush_acknowledged());
+        assert_eq!(
+            weak.upgrade().unwrap().bytes(),
+            8192,
+            "a completed, unconsumed result still owns its prepaid storage"
+        );
+        drop(receipt);
+        assert!(
+            paid.load(Ordering::SeqCst),
+            "receiver cancellation drops data before credit"
+        );
+        assert!(weak.upgrade().is_none());
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn completed_load_refusal_enables_collection_then_recovers_without_losing_debt() {
