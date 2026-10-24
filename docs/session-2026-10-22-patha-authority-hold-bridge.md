@@ -103,11 +103,16 @@ terminal owed a clean follow-up that the same debt could never satisfy.
   is tombstoned within the cap; it runs before the census fold, so a
   tombstoned root keeps its witness until its proof settles. A root is
   present when the walk observed a member of it and every member it
-  observed is indexed. Indexed presence alone never waives a slot (Round 14,
-  H729-1): an indexed entry whose file the walk did not see is absent (a
-  partial checkpoint restores a retired member's old entry beside the
-  retirement), and a root seen only through an unindexed member also takes a
-  tombstone. Present roots are handled lazily: while present each is read as
+  observed is indexed and not confirmed empty. Indexed presence alone never
+  waives a slot (Round 14, H729-1): an indexed entry whose file the walk did
+  not see is absent (a partial checkpoint restores a retired member's old
+  entry beside the retirement), and a root seen only through an unindexed
+  member also takes a tombstone. So does a root with a confirmed-empty
+  member (Round 15 review): a returning member that parses empty is indexed
+  with no record while its proof is unsettled, and the normal retirement
+  covers only RetryPending records. A partial checkpoint that drops an entry
+  of a witnessed, untombstoned root after its page drained the fence keeps
+  the fence up. Present roots are handled lazily: while present each is read as
   an indexed file, never a new one, and if one later disappears the normal
   reserve-before-retire tombstones it. So present roots, however many, never
   block the drain. More absent roots than free slots keep the fence up,
