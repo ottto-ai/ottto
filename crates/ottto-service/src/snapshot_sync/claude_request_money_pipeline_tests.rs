@@ -1075,6 +1075,51 @@ fn money_shadow_writes_every_page_and_owes_coverage_for_lost_batches() {
     assert_eq!(money::reserved_for_test(), 0);
 }
 
+/// #736: a dropped first page owes its day a false row before any batch (no
+/// run marker exists to recover it). If its synced marker is deleted, the
+/// writer's next pass writes it again, so a restart keeps the debt and the
+/// next same-day batch writes the false row: never false complete coverage.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_shadow_deleted_debt_marker_survives_restart() {
+    let response = census_pipeline_window("2026-08-02T07:00:00Z");
+    let (fixture, index, scan) = money_armed_scan("money-shadow-deleted-debt-marker");
+    money::owe_coverage_for_test(&fixture.support, response + 3600, false);
+    money::store::flush();
+    assert_eq!(money_owed_markers(&fixture.support), 1);
+    assert!(
+        !fixture.support.join(".claude-request-money-run.json").exists(),
+        "no batch ran: only the marker keeps the debt across a restart"
+    );
+    std::fs::remove_dir_all(fixture.support.join("diagnostics")).unwrap();
+    money::store::flush();
+    assert_eq!(money_owed_markers(&fixture.support), 1, "the next pass heals it");
+    money::store::restart_for_test(&fixture.support);
+    let page = |now| {
+        let counts = money::shadow_page_at(
+            &fixture.support,
+            &scan.snapshots,
+            &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete,
+            now,
+        );
+        money::store::flush();
+        counts
+    };
+    page(response + 3601);
+    let owed = money_jsonl_rows(&fixture.support)
+        .into_iter()
+        .filter(|row| row["row"] == "page" && row["dropped"] == true)
+        .collect::<Vec<_>>();
+    assert_eq!(owed.len(), 1, "{owed:?}");
+    assert_eq!(owed[0]["coverage_complete"], false);
+    assert_eq!(owed[0]["observed_unix"], response + 3600);
+    assert_eq!(money_owed_markers(&fixture.support), 0, "a written debt is settled");
+    assert_eq!(money::reserved_for_test(), 0);
+}
+
 /// Owed-coverage markers in the support directory's diagnostics.
 fn money_owed_markers(support: &Path) -> usize {
     std::fs::read_dir(support.join("diagnostics"))
