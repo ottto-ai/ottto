@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 834,
-  "content_sha256": "e2e489dea9f86e1df0b23aaa168fad9d825222f7328e6fd64c28bc29d0a47039",
+  "content_sha256": "d6aca78005e03681642be88861cf1d4163798ebf44dad0f1e5dfae52ac6713a4",
   "files": [
     {
       "executable": false,
@@ -1098,8 +1098,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/context_composition/v2/tests.rs",
-      "sha256": "af9bc638f9b4c3758d1c59db4507a5f42b30614868485895f74652472ed1508f",
-      "size_bytes": 206082
+      "sha256": "e7597301971b4620353a0f99610435262545f7f3d9459801fafda59b307cd5e6",
+      "size_bytes": 208205
     },
     {
       "executable": false,
@@ -4052,8 +4052,8 @@
       "executable": false,
       "mode": "0644",
       "path": "docs/session-2026-10-24-composition-install-forward-only.md",
-      "sha256": "abde38288ac9ed14c9fb4d136020c40de6acbaefabbad82617a7cb97933bc6b5",
-      "size_bytes": 2074
+      "sha256": "90386599589c0b0002159791c75638a7c9c7c7fa6a3755c808708e8066a4e3d8",
+      "size_bytes": 2354
     },
     {
       "executable": false,
@@ -5841,7 +5841,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T01:57:10+00:00",
+  "generated_at": "2026-10-24T03:23:34+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 835,
   "public_roots": [
@@ -5880,5 +5880,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "65b8eafef544037363784f9b3c98ba6315fb785a"
+  "source_commit": "29e38996bd469c84faf74aaf57da4301e6677c36"
 }
