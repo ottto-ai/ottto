@@ -36687,7 +36687,7 @@ impl ScanIndex {
             self.claude_history_cutoff_unix_seconds,
             birth_unix_seconds,
         );
-        claude_history_upgrade::decide(
+        let decision = claude_history_upgrade::decide(
             kind,
             &claude_history_upgrade::PolicyInputs {
                 exclusions: &self.claude_reemission_exclusions,
@@ -36718,7 +36718,14 @@ impl ScanIndex {
             page,
             &key,
             candidate.size_bytes,
-        )
+        );
+        // Changed/fresh/settled probes use the same single reservation as an
+        // owed probe. Carry that already-earned permit to the emission seam;
+        // it cannot authorize another file or an immutable UNKNOWN replay.
+        if matches!(decision, HistoryDecision::NotOwed) && page.owns_money_probe(&key) {
+            self.gate_claude_history_candidate(candidate, None);
+        }
+        decision
     }
 
     /// StateMissing M1: a list line may name only a member (`root_stem`). On a

@@ -352,6 +352,10 @@ pub(crate) struct HistoryPage {
 crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, money_probe, owed, permitted, denied);
 
 impl HistoryPage {
+    pub(super) fn owns_money_probe(&self, key: &str) -> bool {
+        self.money_probe.as_deref() == Some(key)
+    }
+
     fn reserve_money_probe(&mut self, key: &str, bytes: u64) -> bool {
         if self
             .money_probe
