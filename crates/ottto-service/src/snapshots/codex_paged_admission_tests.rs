@@ -2314,19 +2314,19 @@ fn a_waiter_starts_within_one_page_of_the_jobs_end() {
     });
 }
 
-// C-S1 (#660 side read x FC1): an unchanged `Bounded` parent over the
-// unpaged limit with a due side request is opened with no size refusal and
-// becomes side-planned, but #660's G4a (a side read is a singleton read)
-// exits before the G7 charge: no side read starts, no side ledger entry,
+// C-S1 (#660 side pass x FC1): twin parity of the FC1 main read over the
+// unpaged limit. With #660's side pass on and a side request for P, the page
+// over the scaled unpaged limit (P `Bounded`, opened with no size refusal)
+// leaves the same side state (requests, records, ledger) and emits the same
+// snapshots (complete field-by-field equality) as main's twin, where P is
+// under the unpaged limit: no side read starts or ends, no side ledger entry,
 // nothing is requeued, and `oversized_file_count` equals the control page's
-// (no request). The side state (requests, records, ledger) and the emitted
-// snapshots (complete field-by-field equality) come out exactly as main's twin
-// leaves them: the same request with P under the unpaged limit but over the
-// singleton, main's G4a exit for a side-planned file. Without
-// the scaled limits the same request starts its side read, so the request
-// itself is due.
+// and is 0. These pages are not finalized, so P is main-parsed on every page:
+// it is not main's Skip and is never side-planned. The side-plan paths (the
+// due refusal and the G4a exit before G7) are F1 and F2 in
+// `codex_parent_side_read_tests`.
 #[test]
-fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
+fn bounded_main_read_over_the_unpaged_limit_matches_main_twin() {
     use crate::local_resource_diagnostics::codex_side_lifecycle::observe;
     use sampled_scan::side_ledger::{parent_of, GateOpen, LedgerKey};
     if !layout() {
@@ -2431,13 +2431,7 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
             );
         })
     });
-    // Control: the same request at production limits starts its side read.
-    let (_, counts) = observe(|| side_page(requested, &cache));
-    assert_eq!(counts.side_reads_started, 1, "{counts:?}");
-    eprintln!(
-        "FC1_C_S1_COMPLETE parity=pass positive_control=pass side_reads_started={}",
-        counts.side_reads_started
-    );
+    eprintln!("FC1_C_S1_COMPLETE parity=pass");
 }
 
 /// C-S1: complete, ordered equality of two emitted snapshot lists. The
@@ -2448,7 +2442,11 @@ fn side_requested_bounded_parent_over_the_unpaged_limit_is_never_side_read() {
 /// covers serde-skipped state); `Arc`/`Box` compare their pointee contents.
 /// The three fields whose types have no derived equality are compared
 /// recursively, each destructured exhaustively too.
-fn assert_snapshots_identical(left: &[SnapshotItem], right: &[SnapshotItem], context: &str) {
+pub(super) fn assert_snapshots_identical(
+    left: &[SnapshotItem],
+    right: &[SnapshotItem],
+    context: &str,
+) {
     assert_eq!(left.len(), right.len(), "snapshot count differs; {context}");
     for (at, (left, right)) in left.iter().zip(right).enumerate() {
         assert_snapshot_identical(left, right, &format!("snapshot {at}; {context}"));
