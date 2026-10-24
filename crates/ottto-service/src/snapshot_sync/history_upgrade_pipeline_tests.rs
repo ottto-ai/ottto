@@ -139,6 +139,20 @@ impl HistoryFixture {
         std::fs::write(&self.index_path, b"{not json").expect("corrupt saved index");
     }
 
+    /// Valid JSON with more damaged records than the lenient hold admission.
+    /// This must take the same quarantined-origin history gate as syntax loss.
+    fn exceed_decode_hold_budget(&self) {
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&self.index_path).expect("read synthetic index"))
+                .expect("decode synthetic index");
+        for n in 0..4097 {
+            value["files"][format!("/synthetic-damage/{n}.jsonl")] =
+                serde_json::json!({"size_bytes": []});
+        }
+        std::fs::write(&self.index_path, serde_json::to_vec(&value).unwrap())
+            .expect("write excessive record damage");
+    }
+
     fn index_path_for(&self, destination: Option<&str>) -> PathBuf {
         destination.map_or_else(
             || self.index_path.clone(),
@@ -663,6 +677,369 @@ fn only_files_that_grew_after_a_rebuild_emit() {
     });
 }
 
+/// User Repair override (#718): one interactive Repair of a rebuild-loop
+/// pause runs the same #712-gated rebuild as the first incident. On an
+/// unverified Mac history stays held, so no file comes back as new history,
+/// and the override witness re-arms the seven-day guard.
+#[test]
+fn user_repair_override_rebuild_keeps_history_held() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-upgrade-user-repair-override");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
+        // Budget damage keeps the identity fields strictly recoverable, so
+        // the press may rebuild (SI-718-O1); syntax damage refuses it.
+        fixture.exceed_decode_hold_budget();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::ClaudeCode,
+                std::time::SystemTime::now()
+            ),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overridden = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        assert!(
+            overridden.uploaded.is_empty(),
+            "the override rebuild re-sent history: {:?}",
+            overridden.uploaded
+        );
+        assert_eq!(overridden.corrections, 0);
+        assert_eq!(overridden.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        assert_eq!(overridden.index.files.len(), HISTORY_SESSIONS.len());
+        for entry in overridden.index.files.values() {
+            assert_eq!(entry.effective_upload_body_witness_revision, 0);
+            assert!(entry.last_upload_body_witness.is_none());
+        }
+        fixture.corrupt_index();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    });
+}
+
+/// SI-718-O1: the override rebuild keeps the retained owner through a
+/// replacement cycle whose upload is only server-deferred (a partial
+/// settlement), and held history still uploads nothing.
+#[test]
+fn user_repair_override_keeps_prior_owner_through_a_deferred_upload() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-upgrade-override-identity");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    let owner_key = crate::context_footprint::sha256_hex(&[
+        "session_owner:v1",
+        HISTORY_MACHINE_ID,
+        HISTORY_SESSIONS[0],
+    ]);
+    let owner = "a".repeat(64);
+    let saved = |fixture: &HistoryFixture| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(&fixture.index_path).expect("read saved index"))
+            .expect("decode saved index")
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.uploaded.is_empty(), "{:?}", held.uploaded);
+        // A retained owner and a true contract latch beside budget damage.
+        let mut value = saved(&fixture);
+        value["session_account_bindings"] =
+            serde_json::json!({ owner_key.clone(): {"account_identifier_hash": owner} });
+        value["claude_request_identity_contract"] = serde_json::json!("prior-contract");
+        value["claude_request_identity_contract_changed"] = serde_json::json!(true);
+        std::fs::write(&fixture.index_path, serde_json::to_vec(&value).unwrap())
+            .expect("seed prior identity");
+        fixture.exceed_decode_hold_budget();
+        let refused = ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support,
+        )
+        .unwrap_err();
+        assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(
+            crate::snapshots::arm_scan_index_rebuild_manual_override(
+                SnapshotSource::ClaudeCode,
+                std::time::SystemTime::now()
+            ),
+            ScanIndexRebuildOverride::Armed
+        );
+        let overridden = fixture.cycle(
+            "2026-08-02T10:00:00Z",
+            HistoryCycle {
+                upload: PipelineUpload::ServerDeferred,
+                ..HISTORY_REVISION_2
+            },
+        );
+        assert_eq!(
+            crate::snapshots::scan_index_rebuild_manual_override_count(),
+            1
+        );
+        assert!(
+            overridden.uploaded.is_empty(),
+            "the override rebuild re-sent history: {:?}",
+            overridden.uploaded
+        );
+        assert_eq!(overridden.corrections, 0);
+        // The retained owner survived the rebuild, the scan, the partial
+        // settlement and the save: it is still the authority on disk.
+        let value = saved(&fixture);
+        assert_eq!(
+            value["session_account_bindings"][&owner_key]["account_identifier_hash"],
+            serde_json::json!(owner)
+        );
+        // A later cycle keeps it too, and still uploads no held history.
+        let again = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        assert!(again.uploaded.is_empty(), "{:?}", again.uploaded);
+        assert_eq!(
+            saved(&fixture)["session_account_bindings"][&owner_key]["account_identifier_hash"],
+            serde_json::json!(owner)
+        );
+    });
+}
+
+/// MONEY P1: seed genuine accepted incidence immediately before the override,
+/// not before a syntax rebuild that would already have erased the ACK ledger.
+/// Retain it through complete census and files held without further parses;
+/// release must reconstruct those files with zero re-offer of accepted history.
+#[test]
+fn user_repair_override_carries_accepted_history_through_census_and_release() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-override-carried-ack-release");
+    let baseline = fixture.baseline();
+    let state = serde_json::to_value(&baseline).unwrap();
+    let accepted = state["accepted_snapshot_fingerprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|fp| fp.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(accepted.len(), HISTORY_SESSIONS.len());
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    assert_eq!(
+        ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support
+        )
+        .unwrap()
+        .1,
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+    );
+    // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    fixture.exceed_decode_hold_budget();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(
+        crate::snapshots::arm_scan_index_rebuild_manual_override(
+            SnapshotSource::ClaudeCode,
+            std::time::SystemTime::now()
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+    let assert_acks = |index: &ScanIndex| {
+        assert!(accepted
+            .iter()
+            .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.scan.census_complete);
+        assert!(held.uploaded.is_empty());
+        assert_eq!(held.corrections, 0);
+        assert!(held.index.current_snapshot_fingerprints().is_empty());
+        assert_acks(&held.index);
+        let carried =
+            serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
+        assert_eq!(carried, state["file_snapshot_fingerprints"]);
+        assert!(
+            crate::snapshots::scan_index_containment_lines_for_test()
+                .iter()
+                .any(|line| line
+                    .contains("retained_carried_entries=3 history_held_carried_entries=3"))
+        );
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert!(again.scan.census_complete);
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "held files never re-parse"
+        );
+        assert!(again.uploaded.is_empty());
+        let lines = crate::snapshots::scan_index_containment_lines_for_test();
+        let census = lines
+            .iter()
+            .rev()
+            .find(|line| line.starts_with("local snapshot census: source=claude_code "))
+            .unwrap();
+        assert!(
+            census.contains("retained_carried_entries=3 history_held_carried_entries=3"),
+            "{census}"
+        );
+        assert_acks(&again.index);
+        assert_eq!(
+            serde_json::to_value(&again.index).unwrap()["accepted_rebuild_incidence"],
+            carried
+        );
+        fixture.install_list(&[]);
+        let released = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+        assert!(released.scan.census_complete);
+        assert_eq!(
+            released.scan.scanned_file_count,
+            HISTORY_SESSIONS.len(),
+            "release reconstructs each file"
+        );
+        assert!(
+            released.uploaded.is_empty(),
+            "accepted history must never re-offer: {:?}",
+            released.uploaded
+        );
+        assert_eq!(released.corrections, 0);
+        assert_acks(&released.index);
+        assert_eq!(released.index.current_snapshot_fingerprints(), accepted);
+        assert!(
+            crate::snapshots::scan_index_containment_lines_for_test()
+                .iter()
+                .any(|line| line
+                    .contains("retained_carried_entries=0 history_held_carried_entries=0"))
+        );
+        assert!(serde_json::to_value(&released.index)
+            .unwrap()
+            .get("accepted_rebuild_incidence")
+            .is_none());
+    });
+}
+
+/// SOURCE N1 third half: vanished history releases only on a healthy complete terminal.
+#[test]
+fn user_repair_carried_history_vanished_file_releases_at_healthy_terminal() {
+    use crate::snapshots::ScanIndexRebuildOverride;
+    let fixture = HistoryFixture::new("history-override-carried-ack-gone");
+    let baseline = fixture.baseline();
+    let state = serde_json::to_value(&baseline).unwrap();
+    let accepted = state["accepted_snapshot_fingerprints"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|fp| fp.as_str().unwrap().to_owned())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(accepted.len(), HISTORY_SESSIONS.len());
+    fixture.corrupt_backfill_state();
+    fixture.corrupt_index();
+    assert_eq!(
+        ScanIndex::load_for_snapshot_source_with_origin(
+            &fixture.index_path,
+            SnapshotSource::ClaudeCode,
+            &fixture.support
+        )
+        .unwrap()
+        .1,
+        crate::snapshots::ScanIndexLoadOrigin::Quarantined
+    );
+    // Seed ACKs RIGHT BEFORE damage/override. No intervening rebuild or settlement.
+    std::fs::write(&fixture.index_path, serde_json::to_vec(&baseline).unwrap()).unwrap();
+    fixture.exceed_decode_hold_budget();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(
+        crate::snapshots::arm_scan_index_rebuild_manual_override(
+            SnapshotSource::ClaudeCode,
+            std::time::SystemTime::now()
+        ),
+        ScanIndexRebuildOverride::Armed
+    );
+    let assert_acks = |index: &ScanIndex| {
+        assert!(accepted
+            .iter()
+            .all(|fp| index.accepted_snapshot_fingerprint_recorded(fp)));
+    };
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let held = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert!(held.scan.census_complete);
+        assert!(held.uploaded.is_empty());
+        assert_eq!(held.corrections, 0);
+        assert!(held.index.current_snapshot_fingerprints().is_empty());
+        assert_acks(&held.index);
+        let carried =
+            serde_json::to_value(&held.index).unwrap()["accepted_rebuild_incidence"].clone();
+        assert_eq!(carried, state["file_snapshot_fingerprints"]);
+        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert!(again.scan.census_complete);
+        assert_eq!(
+            again.scan.scanned_file_count, 0,
+            "held files never re-parse"
+        );
+        assert!(again.uploaded.is_empty());
+        assert_acks(&again.index);
+        assert_eq!(
+            serde_json::to_value(&again.index).unwrap()["accepted_rebuild_incidence"],
+            carried
+        );
+        // A vanished held file releases only at a healthy complete terminal;
+        // the other history-held files keep their original carried incidence.
+        let vanished_key = HistoryFixture::key(&again.index, HISTORY_SESSIONS[0]);
+        let vanished_acks = state["file_snapshot_fingerprints"][&vanished_key]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|fp| fp.as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        std::fs::remove_file(fixture.root.join(format!("{}.jsonl", HISTORY_SESSIONS[0]))).unwrap();
+        let gone = fixture.cycle("2026-08-02T10:30:00Z", HISTORY_REVISION_2);
+        assert!(gone.scan.census_complete);
+        assert!(gone.uploaded.is_empty());
+        assert!(!gone.index.files.contains_key(&vanished_key));
+        let gone_state = serde_json::to_value(&gone.index).unwrap();
+        let debt = gone_state["accepted_rebuild_incidence"]
+            .as_object()
+            .unwrap();
+        assert!(!debt.contains_key(&vanished_key));
+        assert_eq!(debt.len(), HISTORY_SESSIONS.len() - 1);
+        assert!(gone_state["accepted_incidence_pending_census"]
+            .as_bool()
+            .unwrap());
+        let remaining = accepted
+            .difference(&vanished_acks)
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        assert!(remaining
+            .iter()
+            .all(|fp| gone.index.accepted_snapshot_fingerprint_recorded(fp)));
+        assert!(vanished_acks
+            .iter()
+            .all(|fp| !gone.index.accepted_snapshot_fingerprint_recorded(fp)));
+    });
+}
+
 /// SOURCE Amendment 14 (owner B ruling 1): under revision 3 a LISTED root's
 /// genuine transcript change emits its ORDINARY body; no request-owned
 /// literal item and no revision-3 stamp reaches that file, and
@@ -829,6 +1206,40 @@ fn seen_marker_rebuild_latch_and_cutoff_feed_one_decision() {
         "an installed empty list paces history; the marker was not there at load"
     );
     fixture.corrupt_index();
+    let current_bytes = std::fs::read(&fixture.index_path).unwrap();
+    let refused = ScanIndex::load_for_snapshot_source_with_origin(
+        &fixture.index_path,
+        SnapshotSource::ClaudeCode,
+        &fixture.support,
+    )
+    .unwrap_err();
+    assert!(format!("{refused:#}").contains("scan_index_rebuild_loop"));
+    assert_eq!(std::fs::read(&fixture.index_path).unwrap(), current_bytes);
+    // This second incident occurs after the seven-day cooldown. Model elapsed
+    // time in the fixture's rename stamp, retaining the exact prior witness.
+    let backups = std::fs::read_dir(&fixture.base)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("claude-scan-index.corrupt.")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(backups.len(), 1);
+    let prior_bytes = std::fs::read(&backups[0]).unwrap();
+    let prior_stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos()
+        - 8 * 24 * 60 * 60 * 1_000_000_000;
+    let older_backup = fixture.base.join(format!(
+        "claude-scan-index.corrupt.{}.{prior_stamp}.json",
+        std::process::id()
+    ));
+    std::fs::rename(&backups[0], &older_backup).unwrap();
+    assert_eq!(std::fs::read(&older_backup).unwrap(), prior_bytes);
     let latched = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
     assert!(latched.uploaded.is_empty(), "{:?}", latched.uploaded);
     let newcomer = "a7777777-7777-4777-8777-777777777777";
@@ -1581,6 +1992,93 @@ fn seen_marker_without_the_list_pauses_all_history() {
     }
 }
 
+/// The lenient decoder's remaining budget rebuild must compose with the full
+/// prior-history gate. NewFile-shaped history is never emitted on the held
+/// paths; the allowed unlisted history is still paced at revision <= 2.
+#[test]
+fn over_budget_rebuild_preserves_history_holds_list_latch_and_pacing() {
+    // No intended list plus unreadable prior evidence: fail closed, not fresh.
+    let fixture = HistoryFixture::new("history-budget-unverified");
+    fixture.baseline();
+    fixture.corrupt_backfill_state();
+    fixture.exceed_decode_hold_budget();
+    crate::snapshots::with_no_list_cutoff(u64::MAX, || {
+        let rebuilt = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(rebuilt.scan.scanned_file_count, HISTORY_SESSIONS.len());
+        assert!(
+            rebuilt.scan.snapshots.is_empty(),
+            "no NewFile history emission"
+        );
+        assert!(rebuilt.uploaded.is_empty());
+        assert_eq!(rebuilt.corrections, 0);
+        assert!(rebuilt.index.current_snapshot_fingerprints().is_empty());
+        assert!(rebuilt.index.files.values().all(|entry| {
+            entry.effective_upload_body_witness_revision == 0
+                && entry.last_upload_body_witness.is_none()
+        }));
+    });
+    assert!(
+        std::fs::read_dir(&fixture.base)
+            .unwrap()
+            .flatten()
+            .any(|entry| { entry.file_name().to_string_lossy().contains(".corrupt.") }),
+        "the excessive damage actually triggered a rebuild"
+    );
+
+    // An intended protected list first latches the rebuild; after restart,
+    // only unlisted history can pass, within the normal page budget.
+    let fixture = HistoryFixture::new("history-budget-intended-list");
+    fixture.baseline();
+    fixture.install_list(&[HISTORY_SESSIONS[0]]);
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
+    fixture.exceed_decode_hold_budget();
+    let latched = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    assert_eq!(latched.scan.scanned_file_count, HISTORY_SESSIONS.len());
+    assert!(
+        latched.scan.snapshots.is_empty(),
+        "latch denies NewFile history"
+    );
+    assert!(latched.uploaded.is_empty());
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    let mut sent = Vec::new();
+    crate::snapshots::with_body_witness_adoption_page_budget(1, || {
+        for hour in 10..14 {
+            let outcome =
+                fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+            assert!(!outcome.uploaded.contains(HISTORY_SESSIONS[0]));
+            assert!(outcome
+                .index
+                .files
+                .values()
+                .all(|entry| { entry.effective_upload_body_witness_revision <= 2 }));
+            sent.push(outcome.uploaded.len());
+        }
+    });
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    assert_eq!(sent, vec![1, 1, 0, 0]);
+
+    // A lost intended list must keep holding after a restart too.
+    let fixture = HistoryFixture::new("history-budget-missing-list");
+    fixture.baseline();
+    fixture.install_list(&[]);
+    fixture.cycle("2026-08-02T08:30:00Z", HISTORY_BASELINE);
+    std::fs::remove_file(
+        fixture
+            .support
+            .join("snapshots/claude_code-reemission-exclusions.txt"),
+    )
+    .unwrap();
+    fixture.exceed_decode_hold_budget();
+    for hour in [9, 10] {
+        let outcome = fixture.cycle(&format!("2026-08-02T{hour:02}:00:00Z"), HISTORY_REVISION_2);
+        assert!(
+            outcome.scan.snapshots.is_empty(),
+            "missing list denies history"
+        );
+        assert!(outcome.uploaded.is_empty());
+        crate::snapshots::restart_claude_reemission_stop_for_test();
+    }
+}
 fn history_subagent_line(session: &str, agent: &str) -> String {
     format!(
         "{{\"timestamp\":\"2026-08-02T07:00:10Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"agentId\":\"{agent}\",\"isSidechain\":true,\"requestId\":\"req_{session}_{agent}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
