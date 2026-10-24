@@ -193,3 +193,42 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
         _funds: funds,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn a_frozen_dependency_path_cannot_escape_by_changing_family_and_hashes() {
+        let support = crate::test_scratch::ScratchDir::new("money-recovery-file-scope");
+        store::reload_for_test(&support).unwrap();
+        store::with_ledger_for_test(&support, |ledger| {
+            assert!(store::checkpoint_for_test(&support, ledger))
+        })
+        .unwrap();
+        let old = "22222222-2222-4222-8222-222222222222";
+        let new = "33333333-3333-4333-8333-333333333333";
+        let key = format!("/fixture/projects/-repo/{new}.jsonl");
+        let mut frozen = Scope::seed([old.to_owned()]);
+        frozen.roots.get_mut(old).unwrap().push(key.clone());
+        let mut index = ScanIndex::default();
+        index.files.insert(
+            key.clone(),
+            serde_json::from_value(serde_json::json!({
+                "size_bytes":1, "modified_unix_seconds":2,
+                "source_file_fingerprint":"00".repeat(32), "last_snapshot_fingerprint":null
+            }))
+            .unwrap(),
+        );
+        // Current identity and evidence no longer connect the two roots. The
+        // original contributing path still binds the immutable attempt.
+        let closed = close(&support, &index, &frozen).unwrap();
+        assert!(closed
+            .roots
+            .get(new)
+            .is_some_and(|files| files.contains(&key)));
+        assert!(closed.roots.contains_key(old));
+        store::forget_for_test(&support);
+    }
+}
