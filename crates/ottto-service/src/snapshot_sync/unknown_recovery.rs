@@ -674,6 +674,9 @@ pub(super) fn trace_for_test(
         serde_json::json!({"ack":m.ack_saved,"terminal":m.terminal,"posts":m.posts,
             "entities":m.entities.iter().take(4).map(|e| serde_json::json!({
                 "fp8":e.fingerprint.get(..8),"literal":e.literal,"files":e.files.len(),
+                "source_file":e.source_fingerprint.is_some(),
+                "family_files":index.files.keys().filter(|key|money::logical_family_member(index,key)
+                    .is_some_and(|(root,_)|root==e.root)).take(5).count(),
                 "accepted":progress.accepted_fingerprints.contains(&e.fingerprint),
                 "body":progress.accepted_body_witnesses.get(&e.fingerprint)==Some(&e.witness),
                 "retry":progress.active_quarantine_retries.contains(&e.fingerprint),
