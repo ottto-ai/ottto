@@ -704,7 +704,7 @@ impl P2aControl {
             &snapshot_upload_destination_namespace(&self.device, "device-secret"),
             self.client.recovery_origin(),
             "otm_test",
-            "",
+            &self.daemon.snapshot_scan_account_witness().unwrap(),
         );
         for _ in 0..32 {
             if unknown_recovery::startup(&self.support, &binding, now).unwrap() {
@@ -2977,6 +2977,7 @@ fn p2a_unknown_late_revision_deny_contract_releases_without_post_charge() {
         "device-secret",
         "otm_test",
         &namespace,
+        &control.daemon.snapshot_scan_account_witness().unwrap(),
         original.policy,
         || {
             checks.set(checks.get() + 1);
@@ -3079,6 +3080,7 @@ fn p2a_unknown_pause_installed_after_counter_commit_is_current_before_post() {
             "device-secret",
             "otm_test",
             &namespace,
+            &control.daemon.snapshot_scan_account_witness().unwrap(),
             attempt.policy,
             || {
                 calls.set(calls.get() + 1);
@@ -3129,6 +3131,7 @@ fn p2a_unknown_pause_installed_after_counter_commit_is_current_before_post() {
             "device-secret",
             "otm_test",
             &namespace,
+            &control.daemon.snapshot_scan_account_witness().unwrap(),
             attempt.policy,
             || Ok(()),
         ))
@@ -3229,6 +3232,81 @@ fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
         assert!(!money::money_due(&control.support, &key, u64::MAX));
     }
     eprintln!("MONEY_UNKNOWN_REOFFER_BOUND newer_revision_requires_post=true later_window_requires_post=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_credentials() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let account = |subject: &str| {
+        let mut account = ottto_protocol::LocalAccountBinding::not_connected();
+        account.state = ottto_protocol::LocalAccountState::Connected;
+        account.user = Some(ottto_protocol::LocalAccountUser {
+            id: subject.into(),
+            email: format!("{subject}@example.invalid"),
+            display_name: None,
+        });
+        account.organization = Some(ottto_protocol::LocalAccountOrganization {
+            id: "synthetic-org".into(),
+            name: "Synthetic".into(),
+        });
+        account.connected_at = Some("2026-10-24T00:00:00Z".into());
+        account
+    };
+    let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    control.daemon = test_daemon("otm_test").with_account(account("first"));
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle_deferred();
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    let original = unknown_recovery::active_for_test(&control.support)
+        .pop()
+        .unwrap();
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    control.restart();
+    control.daemon = test_daemon("otm_test").with_account(account("second"));
+    assert_eq!(
+        snapshot_upload_destination_namespace(&control.device, "device-secret"),
+        namespace
+    );
+    let current = unknown_recovery::binding(
+        &namespace,
+        control.client.recovery_origin(),
+        "otm_test",
+        &control.daemon.snapshot_scan_account_witness().unwrap(),
+    );
+    assert_ne!(
+        current, original.binding,
+        "account authority is part of the durable binding"
+    );
+    drop(clock);
+    let _due = money::PageClockForTest::new(&control.support, now + 300);
+    control.recovery_startup(now + 300);
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "old-account bytes never replay"
+    );
+    let status: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(control.support.join("claude-money-recovery/status")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(status["unknown_outcome_unresolved"], 1);
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    eprintln!("MONEY_UNKNOWN_ACCOUNT_BINDING same_credentials=true restarted=true old_account_post=false unresolved_receipt=true debt_preserved=true");
 }
 
 #[test]
@@ -3508,6 +3586,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
             "device-secret",
             "otm_test",
             &namespace,
+            &control.daemon.snapshot_scan_account_witness().unwrap(),
             unknown_recovery::active_for_test(&control.support)[0].policy,
             || Ok(()),
         ))
@@ -3544,6 +3623,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
                 "device-secret",
                 "otm_test",
                 &namespace,
+                &control.daemon.snapshot_scan_account_witness().unwrap(),
                 m.policy,
                 || Ok(()),
             ))
@@ -3954,6 +4034,7 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
             "device-secret",
             "otm_test",
             &namespace,
+            &control.daemon.snapshot_scan_account_witness().unwrap(),
             unknown_recovery::active_for_test(&control.support)[0].policy,
             || Ok(()),
         ))

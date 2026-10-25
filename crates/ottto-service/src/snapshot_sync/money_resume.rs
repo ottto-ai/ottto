@@ -500,8 +500,12 @@ fn start_admitted(
     let hint = preparation.money_policy.ok_or_else(admission_refused)?;
     let client = preparation.receipt_client.clone();
     let resume_client = client.clone();
-    let recovery_binding =
-        super::unknown_recovery::binding(&destination, client.recovery_origin(), machine_id, "");
+    let recovery_binding = super::unknown_recovery::binding(
+        &destination,
+        client.recovery_origin(),
+        machine_id,
+        &account_witness,
+    );
     let owned_device = device.clone();
     let owned_secret = zeroize::Zeroizing::new(device_secret.to_owned());
     let machine_id = machine_id.to_owned();

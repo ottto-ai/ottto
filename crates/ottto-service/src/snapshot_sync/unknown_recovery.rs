@@ -235,18 +235,18 @@ pub(super) fn existing_recovery_state(support: &Path) -> Result<bool> {
 fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
-pub(super) fn binding(namespace: &str, origin: &str, machine: &str, context: &str) -> String {
+pub(super) fn binding(namespace: &str, origin: &str, machine: &str, account: &[u8; 32]) -> String {
     let mut hash = Sha256::new();
     for field in [
-        "unknown_ack:v1",
-        namespace,
-        origin,
-        machine,
-        "claude_code",
-        context,
+        b"unknown_ack:v2".as_slice(),
+        namespace.as_bytes(),
+        origin.as_bytes(),
+        machine.as_bytes(),
+        b"claude_code".as_slice(),
+        account.as_slice(),
     ] {
         hash.update((field.len() as u64).to_be_bytes());
-        hash.update(field.as_bytes());
+        hash.update(field);
     }
     format!("{:x}", hash.finalize())
 }
@@ -1953,10 +1953,11 @@ pub(super) async fn replay_due(
     secret: &str,
     machine: &str,
     namespace: &str,
+    account: &[u8; 32],
     policy: [u8; 32],
     authority: impl Fn() -> Result<()>,
 ) -> Result<()> {
-    let binding = binding(namespace, client.recovery_origin(), machine, "");
+    let binding = binding(namespace, client.recovery_origin(), machine, account);
     let (due, _scope_funds) = due(support, now(support))?;
     for m in due {
         if m.binding != binding

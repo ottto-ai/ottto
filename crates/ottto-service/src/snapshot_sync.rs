@@ -4171,7 +4171,7 @@ fn sync_once_with_retry(
             &snapshot_upload_destination_namespace(&device, &device_secret),
             client.recovery_origin(),
             &machine_id,
-            "",
+            &account_witness,
         );
         // Preserve normal heartbeat cadence for an unexpired, current owner.
         // Binding/account loss cancels speculative work before reconciliation.
@@ -5502,7 +5502,7 @@ fn prepare_sync_source(
             &snapshot_upload_destination_namespace(device, device_secret),
             client.recovery_origin(),
             machine_id,
-            "",
+            &account_witness,
         );
         if !unknown_recovery::startup(support_dir, &binding, unknown_recovery::now(support_dir))? {
             return Err(crate::source_rotation::LocalRefusal(
@@ -6342,6 +6342,7 @@ async fn finish_sync_source_resume(
             device_secret,
             machine_id,
             &upload_destination_namespace,
+            &account_witness,
             money_policy.expect("prepared recovery policy"),
             ensure_authority,
         )
@@ -6683,7 +6684,7 @@ async fn finish_sync_source_resume(
                 &upload_destination_namespace,
                 client.recovery_origin(),
                 machine_id,
-                "",
+                &account_witness,
             )
         });
         if let Some(binding) = recovery_binding.as_deref() {
@@ -6887,7 +6888,7 @@ async fn finish_sync_source_resume(
                 &upload_destination_namespace,
                 client.recovery_origin(),
                 machine_id,
-                "",
+                &account_witness,
             )
         });
     let probes = scan_result
