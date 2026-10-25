@@ -2585,6 +2585,7 @@ mod request_money_clock_regressions {
                         reasoning_effort: None,
                         timestamp: Some(at.into()),
                         event_clock_complete: complete,
+                        desktop_request: false,
                         effective_input_context: 10,
                     },
                 );

@@ -2458,6 +2458,7 @@ async fn build_page_with_coverage(
                 &mut applied_rest,
             );
         }
+        #[cfg_attr(test, allow(unused_mut))]
         let mut body_deadline = end.deadline;
         let (root, key, turn) = order[position].clone();
         let eligible = capture_turns.contains(root) && preflight_check(end.deadline).is_ok();
@@ -2617,59 +2618,61 @@ async fn build_page_with_coverage(
                 if !(live || collect_entities) && keys.len() != 1 {
                     continue;
                 }
-                let Some(key) = keys
-                    .iter()
-                    .find(|key| {
-                        index.files.get(*key).is_some_and(|entry| {
+                // Capture every matching physical alias once. Repeatedly
+                // choosing the first key strands byte-identical copies and
+                // leaves their message custody incomplete.
+                for key in keys.iter().filter(|key| {
+                    keys.len() == 1
+                        || index.files.get(*key).is_some_and(|entry| {
                             item.source_file_fingerprint.as_deref()
-                                == Some(&entry.source_file_fingerprint)
+                                == Some(entry.source_file_fingerprint.as_str())
                         })
-                    })
-                    .or_else(|| (keys.len() == 1).then(|| &keys[0]))
-                else {
-                    continue;
-                };
-                let fingerprints = [
-                    item.source_file_fingerprint.as_deref(),
-                    index
-                        .files
-                        .get(key)
-                        .map(|entry| entry.source_file_fingerprint.as_str()),
-                ];
-                if let Some((fingerprint, capture)) =
-                    fingerprints.iter().flatten().find_map(|fingerprint| {
-                        capture::take_capture(&scope_key, key, fingerprint)
-                            .map(|capture| (*fingerprint, capture))
-                    })
-                {
-                    counts.captures_taken += 1;
-                    note_message_record(
-                        ledger,
-                        index,
-                        key,
-                        fingerprint,
-                        &capture,
-                        live,
-                        &mut counts,
-                    );
-                    // Families reached earlier may have scoped this file.
-                    scope.refresh_file(index, ledger.census(), key);
-                    family_captures.insert(
-                        (
-                            root.to_owned(),
-                            if live || collect_entities {
-                                item.source_file_fingerprint.clone().unwrap_or_default()
-                            } else {
-                                item.source_session_id.clone()
-                            },
-                        ),
-                        capture,
-                    );
+                }) {
+                    if Instant::now() >= body_deadline {
+                        break;
+                    }
+                    let fingerprints = [
+                        item.source_file_fingerprint.as_deref(),
+                        index
+                            .files
+                            .get(key)
+                            .map(|entry| entry.source_file_fingerprint.as_str()),
+                    ];
+                    if let Some((fingerprint, capture)) =
+                        fingerprints.iter().flatten().find_map(|fingerprint| {
+                            capture::take_capture(&scope_key, key, fingerprint)
+                                .map(|capture| (*fingerprint, capture))
+                        })
+                    {
+                        counts.captures_taken += 1;
+                        note_message_record(
+                            ledger,
+                            index,
+                            key,
+                            fingerprint,
+                            &capture,
+                            live,
+                            &mut counts,
+                        );
+                        // Families reached earlier may have scoped this file.
+                        scope.refresh_file(index, ledger.census(), key);
+                        family_captures.insert(
+                            (
+                                root.to_owned(),
+                                if live || collect_entities {
+                                    item.source_file_fingerprint.clone().unwrap_or_default()
+                                } else {
+                                    item.source_session_id.clone()
+                                },
+                            ),
+                            capture,
+                        );
+                    }
                 }
             }
         }
         #[cfg(test)]
-        let body_deadline =
+        let mut body_deadline =
             if BUDGET_EXPIRES_AFTER_CAPTURE.with(std::cell::Cell::get) == Some(position) {
                 (end.deadline, later_families) = (started, started);
                 started
