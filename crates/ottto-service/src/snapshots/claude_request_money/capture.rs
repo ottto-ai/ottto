@@ -826,6 +826,19 @@ struct Entry {
 /// Waiting captures by (scope, index key).
 static STORE: Mutex<BTreeMap<(PathBuf, String), Entry>> = Mutex::new(BTreeMap::new());
 
+/// The index keys `scope` holds captures for: on a Full parse, the files of
+/// the planned families. Bounded by the capture funds.
+pub(crate) fn captured_index_keys(scope: &Path) -> Vec<String> {
+    let Ok(store) = STORE.lock() else {
+        return Vec::new();
+    };
+    store
+        .keys()
+        .filter(|(entry_scope, _)| entry_scope == scope)
+        .map(|(_, key)| key.clone())
+        .collect()
+}
+
 /// The capture of the parse at `index_key` with `fingerprint`, removed from
 /// the store. None when it was never captured, expired or is of another
 /// revision (then it stays for its own revision's page); a refused capture

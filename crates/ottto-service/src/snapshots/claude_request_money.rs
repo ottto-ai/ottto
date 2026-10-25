@@ -1821,9 +1821,21 @@ fn shadow_page_body(
     }
     // Scheduling keys each root (family key and turn) inside the setup slice.
     // Only the oldest turns are selected before family zero; past the stop,
-    // they are the oldest of the roots keyed so far. The rest is keyed and
-    // sorted after family zero.
-    let mut unkeyed = roots.keys().copied();
+    // they are the oldest of the roots keyed so far. Roots with a fresh
+    // capture (the installed plan's families on a Full parse) are keyed
+    // first, so a cut-off schedule still picks a captured family zero. The
+    // rest is keyed and sorted after family zero.
+    let captured_roots = capture::captured_index_keys(&scope_key)
+        .iter()
+        .filter_map(|key| super::claude_index_path_member_ref(Path::new(key)))
+        .filter_map(|member| roots.get_key_value(member.root).map(|(root, _)| *root))
+        .collect::<BTreeSet<_>>();
+    let mut unkeyed = captured_roots.iter().copied().chain(
+        roots
+            .keys()
+            .copied()
+            .filter(|root| !captured_roots.contains(root)),
+    );
     let mut order = Vec::with_capacity(roots.len());
     for root in unkeyed.by_ref() {
         order.push(schedule_entry(&scope_key, ledger, root));

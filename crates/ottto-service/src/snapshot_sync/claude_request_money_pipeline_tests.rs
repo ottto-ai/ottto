@@ -1662,12 +1662,40 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
     assert!(probe_built > 0, "{probe:?}");
     assert!(probe.families_unbuilt < probe.families, "{probe:?}");
-    let (skip, skip_elapsed) = run(&reread, &following_index, now + 3);
+    // MONEY round 4: a planned Full page whose scheduling is cut off at the
+    // setup stop after one root still builds a freshly captured, prior
+    // incomplete family zero within the real allowance.
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &following_index);
+    money::capture::purge_scope_for_test(&fixture.support);
+    money::capture::begin_page(&fixture.support);
+    replay();
+    let stalled_captured = money::capture::keys_for_test(&fixture.support).iter()
+        .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
+        .collect::<BTreeSet<_>>();
+    assert!(!stalled_captured.is_empty(), "the stalled page is Full with captures");
+    money::set_page_fault_for_test(money::PageFault::ScheduleStall);
+    let (stalled, stalled_elapsed) = run(&reread, &following_index, now + 3);
+    money::set_page_fault_for_test(money::PageFault::None);
+    assert_eq!(stalled.refused_deadline, 0, "{stalled:?}");
+    assert_eq!(stalled.families_keyed_after_first, stalled.families - 1, "scheduling was cut off after one root: {stalled:?}");
+    assert!(u128::from(stalled.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{stalled:?}");
+    let stalled_schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert_eq!(stalled_schedule.len() as u64, stalled.families, "{stalled:?}");
+    assert!(stalled_captured.contains(&stalled_schedule[0]) && pending_capture_families.contains(&stalled_schedule[0]),
+        "family zero is a captured prior incomplete family: {}", stalled_schedule[0]);
+    let stalled_families = page_families(&money_jsonl_rows(&fixture.support));
+    let stalled_first = stalled_families.iter().find(|row| row["family"] == stalled_schedule[0].as_str())
+        .unwrap_or_else(|| panic!("family zero is written: {stalled:?}"));
+    assert!(stalled_first["category"] != "unbuilt" && stalled_first["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !stalled_first["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "family zero is built: {stalled_first}");
+    let (skip, skip_elapsed) = run(&reread, &following_index, now + 4);
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL admitted_finalizer_probe=true reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_clock=real next_captures={} next_captured_deferred={} next_captured_deadline={} next_real_built={} next_real_unbuilt={} next_deadline_built={} next_progressed={} next_apply_us={} next_setup_us={} next_money_us={} next_wall_us={} probe_clock=injected probe_captures={} probe_progressed={} probe_built={} probe_unbuilt={} skip_unbuilt={} skip_wall_us={}",
-        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, built, following.families_unbuilt, deadline_built, progressed, following.result_apply_us, following.family_setup_us, following.money_us, following_elapsed.as_micros(), probe_captures.len(), probe_progressed, probe_built, probe.families_unbuilt, skip.families_unbuilt, skip_elapsed.as_micros());
+    println!("MONEY_P1B_FULL admitted_finalizer_probe=true reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_clock=real next_captures={} next_captured_deferred={} next_captured_deadline={} next_real_built={} next_real_unbuilt={} next_deadline_built={} next_progressed={} next_apply_us={} next_setup_us={} next_money_us={} next_wall_us={} probe_clock=injected probe_captures={} probe_progressed={} probe_built={} probe_unbuilt={} stalled_keyed_after_first={} stalled_unbuilt={} stalled_money_us={} stalled_wall_us={} skip_unbuilt={} skip_wall_us={}",
+        armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, built, following.families_unbuilt, deadline_built, progressed, following.result_apply_us, following.family_setup_us, following.money_us, following_elapsed.as_micros(), probe_captures.len(), probe_progressed, probe_built, probe.families_unbuilt, stalled.families_keyed_after_first, stalled.families_unbuilt, stalled.money_us, stalled_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
     money::disable_shadow_for_test(&fixture.support);
 }
 
