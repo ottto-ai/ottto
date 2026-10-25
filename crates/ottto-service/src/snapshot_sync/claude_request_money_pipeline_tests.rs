@@ -894,6 +894,10 @@ fn money_shadow_upfront_minimum_refusal_purges_captures() {
         let (fixture, index, scan) = money_armed_scan("money-page-minimum-refusal");
         let captured = money::capture::keys_for_test(&fixture.support).len();
         assert!(captured > 0);
+        // Prepare while the scope is unpaged: this fixture helper requires
+        // capture eligibility. Invoke its real capture hooks after refusal
+        // to verify that the now-closed scope denies those same inputs.
+        let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
         money::store::prime_credit_for_test(&fixture.support, 0);
         let now = census_pipeline_window("2026-08-02T08:00:00Z");
         let counts = money::with_shadow_ceiling_for_test(ceiling, || money::shadow_page_at(
@@ -905,7 +909,7 @@ fn money_shadow_upfront_minimum_refusal_purges_captures() {
         assert!(counts.admission_bytes > ceiling as u64, "{counts:?}");
         assert_eq!(counts.captures_purged, captured as u64, "{counts:?}");
         assert!(money::capture::keys_for_test(&fixture.support).is_empty());
-        let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+        assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(false));
         money::capture::begin_page(&fixture.support);
         replay();
         assert!(money::capture::keys_for_test(&fixture.support).is_empty(), "refusal remains paged and closed");
