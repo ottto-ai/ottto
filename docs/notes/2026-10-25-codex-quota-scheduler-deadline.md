@@ -34,11 +34,14 @@ size, and modification and status-change times; a directory by device, inode,
 owner, group and mode.
 
 - Settings: the scheduled slots and the running sign-in's home, kept while the
-  settings file and every managed slot's home and slot directory keep their
-  stamps and the default home path is the same. Settings that could not be
-  read in full are not kept.
-- Credentials: a home's login mark, kept while the home directory and its
-  `auth.json` keep their stamps. A claimed account lapses when its earliest
+  settings file and every directory from `/` to each managed slot's home (the
+  chain the settings check for privacy) keep their stamps and the default home
+  path is the same. The chain is stamped between two reads of the settings and
+  kept only when both name the same homes. Settings that could not be read in
+  full are not kept.
+- Credentials: a home's login mark, kept while every directory from `/` to the
+  home (the chain the credential reader checks) and its `auth.json` keep their
+  stamps. A claimed account lapses when its earliest
   token expires; a credential that could not be read is not kept.
 - Saved files: kept while the file keeps its stamp; every write by the daemon
   drops it.
@@ -55,5 +58,10 @@ thread.
 
 New unit tests cover the next-due time against the existing due check, the
 sleep bound, a round's next-due time including a switched login, and both
-caches' invalidation by a rewrite, a permission change, a token expiry, a
-daemon write and an in-place rewrite of the same size.
+caches' invalidation by a rewrite, a permission change on the credential or
+on a directory above the home, a token expiry, a daemon write and an in-place
+rewrite of the same size.
+
+Strict AutoReview (Codex) found that the slot cache stamped only the home and
+its parent while the settings check the whole chain from `/`; both caches now
+stamp the whole chain.

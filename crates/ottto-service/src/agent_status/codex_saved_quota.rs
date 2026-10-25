@@ -436,9 +436,10 @@ where
     value
 }
 
-/// [`login_mark`] for deciding what the schedule reads: kept while the home
-/// directory and its `auth.json` keep their stamps and no claimed token has
-/// expired. Binding a reading to its login and serving one read the file.
+/// [`login_mark`] for deciding what the schedule reads: kept while every
+/// directory from `/` to the home (the chain the credential reader checks)
+/// and its `auth.json` keep their stamps and no claimed token has expired.
+/// Binding a reading to its login and serving one read the file.
 fn planned_login_mark(home: &Path, home_trust: CodexHomeTrust, now: u64) -> LoginMark {
     static MARKS: OnceLock<PlannedCache<(PathBuf, bool), LoginMark>> = OnceLock::new();
     let key = (
@@ -446,7 +447,11 @@ fn planned_login_mark(home: &Path, home_trust: CodexHomeTrust, now: u64) -> Logi
         home_trust == CodexHomeTrust::ProviderDefault,
     );
     planned(&MARKS, &key, now, || {
-        let stamps = Planned::<LoginMark>::stamps([home.to_path_buf(), home.join("auth.json")]);
+        let stamps = Planned::<LoginMark>::stamps(
+            home.ancestors()
+                .map(Path::to_path_buf)
+                .chain([home.join("auth.json")]),
+        );
         let (mark, lasts) = login_mark_lasting(home, home_trust);
         (mark, lasts, stamps)
     })
@@ -1323,40 +1328,49 @@ struct PlannedSlots {
 }
 
 /// The stored settings' slots, kept while the settings file and every
-/// managed slot's directories (the home and the slot directory above it,
-/// whose privacy the settings check) keep their stamps, and the default home
-/// is the same. Settings that could not be read in full are not kept.
+/// directory from `/` to each managed slot's home (the chain whose privacy
+/// the settings check) keep their stamps, and the default home is the same.
+/// Settings that could not be read in full are not kept.
 fn planned_slots(now: u64) -> PlannedSlots {
     static SLOTS: OnceLock<PlannedCache<(PathBuf, PathBuf), PlannedSlots>> = OnceLock::new();
     let settings = default_support_dir().join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME);
     let key = (settings.clone(), default_codex_home());
     planned(&SLOTS, &key, now, || {
         let mut stamps = Planned::<PlannedSlots>::stamps([settings]);
-        let store = FileCodexAccountSlotSettingsStore::default();
-        let status = store.load();
-        let signing_in = store.active_sign_in();
-        let (slots, complete) =
-            codex_home_slots_checked(status.as_ref().unwrap_or(&empty_codex_accounts_status()));
-        let complete = complete && status.is_ok() && signing_in.is_ok();
-        let signing_in = signing_in
-            .ok()
-            .flatten()
-            .map(|active| home_key(&active.home));
-        stamps.extend(Planned::<PlannedSlots>::stamps(
-            slots
-                .iter()
-                .filter(|slot| slot.ownership == CodexAccountSlotOwnershipV1::Managed)
-                .flat_map(|slot| {
-                    [
-                        Some(slot.home.clone()),
-                        slot.home.parent().map(Path::to_path_buf),
-                    ]
-                })
-                .flatten(),
-        ));
-        let lasts = complete.then_some(Lasts::WhileUnchanged);
-        (PlannedSlots { slots, signing_in }, lasts, stamps)
+        let (first, _) = stored_slots();
+        // The directories are known only from the settings: stamped after a
+        // first look and checked again by a second one, so a change between
+        // the two looks is not kept unseen.
+        let chains = managed_home_chains(&first.slots);
+        stamps.extend(Planned::<PlannedSlots>::stamps(chains.iter().cloned()));
+        let (slots, complete) = stored_slots();
+        let complete = complete && managed_home_chains(&slots.slots) == chains;
+        (slots, complete.then_some(Lasts::WhileUnchanged), stamps)
     })
+}
+
+/// The stored settings' slots, and whether every settings read succeeded.
+fn stored_slots() -> (PlannedSlots, bool) {
+    let store = FileCodexAccountSlotSettingsStore::default();
+    let status = store.load();
+    let signing_in = store.active_sign_in();
+    let (slots, complete) =
+        codex_home_slots_checked(status.as_ref().unwrap_or(&empty_codex_accounts_status()));
+    let complete = complete && status.is_ok() && signing_in.is_ok();
+    let signing_in = signing_in
+        .ok()
+        .flatten()
+        .map(|active| home_key(&active.home));
+    (PlannedSlots { slots, signing_in }, complete)
+}
+
+/// Every directory from `/` to each managed slot's home.
+fn managed_home_chains(slots: &[CodexHomeSlot]) -> BTreeSet<PathBuf> {
+    slots
+        .iter()
+        .filter(|slot| slot.ownership == CodexAccountSlotOwnershipV1::Managed)
+        .flat_map(|slot| slot.home.ancestors().map(Path::to_path_buf))
+        .collect()
 }
 
 fn scheduled_homes_from(
@@ -2766,6 +2780,22 @@ mod tests {
         let refused = planned_login_mark(&home, trust, now);
         assert_eq!(refused, login_mark(&home, trust));
         assert_eq!(refused.binding, None);
+
+        // A directory above the home that turns group-writable: the reader
+        // refuses the whole chain, and so does the kept login.
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o600)).unwrap();
+            settle(&auth);
+            let kept = planned_login_mark(&home, trust, now);
+            assert!(kept.binding.is_some());
+            assert_eq!(kept, login_mark(&home, trust));
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o770)).unwrap();
+            let unsafe_parent = planned_login_mark(&home, trust, now);
+            assert_eq!(unsafe_parent, login_mark(&home, trust));
+            assert_eq!(unsafe_parent.binding, None);
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
         let _ = std::fs::remove_dir_all(root);
     }
 
