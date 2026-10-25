@@ -1759,6 +1759,50 @@ fn money_p1b_schedule_stall_still_builds_first_scheduled_family() {
     money_p1b_stall_still_builds_first_scheduled_family("money-p1b-schedule-stall", money::PageFault::ScheduleStall);
 }
 
+/// MONEY round 4 review: scheduling cut off after keying a captured root and
+/// an older uncaptured one still makes the captured root family zero (on
+/// equal turns plain schedule order would pick the older, uncaptured root
+/// and defer the captured one), so its fresh capture is built, not purged.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_cut_off_schedule_keeps_a_captured_family_zero() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-cut-off-captured-zero");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let _ = money::take_shadow_lines_for_test();
+    let captured = money::captured_roots_for_test(&fixture.support).into_iter()
+        .max_by_key(|root| money::family_key_for_test(root)).expect("the scan captured its families");
+    money::keep_captures_of_root_for_test(&fixture.support, &captured);
+    assert_eq!(money::captured_roots_for_test(&fixture.support), BTreeSet::from([captured.clone()]));
+    money::set_schedule_stall_after_for_test(2);
+    money::set_page_fault_for_test(money::PageFault::ScheduleStall);
+    let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::set_schedule_stall_after_for_test(0);
+    money::store::flush();
+    println!("MONEY_P1B_CUT_OFF families={} keyed_after_first={} unbuilt={} captures_taken={} captures_purged={} money_us={}",
+        counts.families, counts.families_keyed_after_first, counts.families_unbuilt, counts.captures_taken, counts.captures_purged, counts.money_us);
+    assert_eq!(counts.refused_deadline + counts.refused_budget, 0, "{counts:?}");
+    assert!(counts.families >= 3, "{counts:?}");
+    assert_eq!(counts.families_keyed_after_first, counts.families - 2, "scheduling was cut off after two roots: {counts:?}");
+    assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+    let schedule = money::last_page_schedule_for_test();
+    assert_eq!(schedule.len() as u64, counts.families, "{schedule:?}");
+    assert!(schedule.iter().all(|root| *root == captured || money::family_key_for_test(root) < money::family_key_for_test(&captured)),
+        "every other root is older on equal turns, so the second keyed root is older and uncaptured: {schedule:?}");
+    assert_eq!(schedule[0], captured, "the captured root is family zero: {schedule:?}");
+    assert!(counts.captures_taken > 0, "{counts:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let first = rows.iter().find(|row| row["row"] == "family" && row["family"] == money::hashed_id_for_test(&captured).as_str())
+        .unwrap_or_else(|| panic!("family zero is written: {counts:?}"));
+    assert!(first["category"] != "unbuilt" && first["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !first["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "family zero is built: {first}");
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
 fn money_p1b_stall_still_builds_first_scheduled_family(name: &str, fault: money::PageFault) {
     let (fixture, index, scan) = money_armed_scan(name);
     let now = census_pipeline_window("2026-08-02T08:00:00Z");

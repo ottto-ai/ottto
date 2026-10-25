@@ -572,7 +572,8 @@ pub(crate) enum PageFault {
     SetupOverrun,
     /// Common setup used everything up to its stop.
     SetupStall,
-    /// Scheduling used everything up to the setup stop after keying one root.
+    /// Scheduling used everything up to the setup stop after keying one root
+    /// (or as many as `set_schedule_stall_after_for_test` says).
     ScheduleStall,
     /// The batch's admission is refused.
     BatchRefused,
@@ -591,6 +592,41 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static PAGE_SCHEDULE: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+// After how many keyed roots `PageFault::ScheduleStall` stalls (0: one).
+#[cfg(test)]
+thread_local! {
+    static SCHEDULE_STALL_AFTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_schedule_stall_after_for_test(roots: usize) {
+    SCHEDULE_STALL_AFTER.with(|after| after.set(roots));
+}
+
+#[cfg(test)]
+pub(crate) fn family_key_for_test(root: &str) -> String {
+    family_key(root)
+}
+
+/// The family roots the scope holds waiting captures for.
+#[cfg(test)]
+pub(crate) fn captured_roots_for_test(scope: &Path) -> BTreeSet<String> {
+    capture::captured_index_keys(scope)
+        .iter()
+        .filter_map(|key| super::claude_index_path_member_ref(Path::new(key)))
+        .map(|member| member.root.to_owned())
+        .collect()
+}
+
+/// Drop every waiting capture except those of `root`'s family files.
+#[cfg(test)]
+pub(crate) fn keep_captures_of_root_for_test(scope: &Path, root: &str) {
+    capture::retain_for_test(scope, |key| {
+        super::claude_index_path_member_ref(Path::new(key))
+            .is_some_and(|member| member.root == root)
+    });
 }
 
 #[cfg(test)]
@@ -1420,10 +1456,12 @@ fn schedule_order(left: &(&str, String, u64), right: &(&str, String, u64)) -> st
 }
 
 /// After family zero: key the roots scheduling did not reach and order the
-/// rest of the page (family zero keeps its place). Charged to money time
+/// page after the reserved turns (`head`, which keep their places; with
+/// every root keyed this is the full schedule order). Charged to money time
 /// like every deadline row it feeds.
 fn complete_schedule<'r>(
     order: &mut Vec<(&'r str, String, u64)>,
+    head: usize,
     unkeyed: &mut impl Iterator<Item = &'r str>,
     scope_key: &Path,
     ledger: &ClaudeLedger,
@@ -1436,9 +1474,7 @@ fn complete_schedule<'r>(
     let keyed = order.len();
     order.extend(unkeyed.map(|root| schedule_entry(scope_key, ledger, root)));
     counts.families_keyed_after_first = (order.len() - keyed) as u64;
-    if order.len() > 1 {
-        order[1..].sort_by(schedule_order);
-    }
+    order[head..].sort_by(schedule_order);
     #[cfg(test)]
     PAGE_SCHEDULE.with(|schedule| {
         *schedule.borrow_mut() = order
@@ -1840,7 +1876,9 @@ fn shadow_page_body(
     for root in unkeyed.by_ref() {
         order.push(schedule_entry(&scope_key, ledger, root));
         #[cfg(test)]
-        if faulted(PageFault::ScheduleStall) {
+        if faulted(PageFault::ScheduleStall)
+            && order.len() == SCHEDULE_STALL_AFTER.with(std::cell::Cell::get).max(1)
+        {
             // Scheduling used everything up to the setup stop.
             while Instant::now() < setup_deadline {
                 std::hint::spin_loop();
@@ -1850,11 +1888,20 @@ fn shadow_page_body(
             break;
         }
     }
+    // A cut-off schedule ranks the captured roots it keyed first: family
+    // zero and the other reserved turns then hold the captured bodies.
+    let cut_off = order.len() < roots.len();
+    let head_order = |left: &(&str, String, u64), right: &(&str, String, u64)| {
+        let uncaptured = |entry: &(&str, String, u64)| cut_off && !captured_roots.contains(entry.0);
+        uncaptured(left)
+            .cmp(&uncaptured(right))
+            .then_with(|| schedule_order(left, right))
+    };
     let head = order.len().min(capture::NEXT_PAGE_FAMILIES);
     if order.len() > head {
-        order.select_nth_unstable_by(head - 1, schedule_order);
+        order.select_nth_unstable_by(head - 1, head_order);
     }
-    order[..head].sort_by(schedule_order);
+    order[..head].sort_by(head_order);
     let mut schedule_complete = false;
     let capture_turns = order[..head]
         .iter()
@@ -1942,6 +1989,7 @@ fn shadow_page_body(
         if !capture_turns.contains(root) || preflight_check(end.deadline).is_err() {
             complete_schedule(
                 &mut order,
+                head,
                 &mut unkeyed,
                 &scope_key,
                 ledger,
@@ -2261,6 +2309,7 @@ fn shadow_page_body(
         // loop decides whether another family remains.
         complete_schedule(
             &mut order,
+            head,
             &mut unkeyed,
             &scope_key,
             ledger,
@@ -2271,6 +2320,7 @@ fn shadow_page_body(
     }
     complete_schedule(
         &mut order,
+        head,
         &mut unkeyed,
         &scope_key,
         ledger,

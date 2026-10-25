@@ -885,6 +885,13 @@ pub(crate) fn purge_scope_for_test(scope: &Path) {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn retain_for_test(scope: &Path, keep: impl Fn(&str) -> bool) {
+    if let Ok(mut store) = STORE.lock() {
+        store.retain(|(entry_scope, key), _| entry_scope != scope || keep(key));
+    }
+}
+
 /// Current, fingerprint-bound store entries, without consuming any capture.
 #[cfg(test)]
 pub(crate) fn keys_for_test(scope: &Path) -> Vec<(String, String)> {
