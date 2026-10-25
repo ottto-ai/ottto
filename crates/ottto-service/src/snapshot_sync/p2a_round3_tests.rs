@@ -3714,6 +3714,7 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for message_only in [false, true] {
+        let _trace = unknown_recovery::scope_trace_for_test();
         let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
@@ -3776,7 +3777,11 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         control.recovery_startup(now + 299);
         let current_scope = unknown_recovery::held_roots(&control.support, &saved)
             .expect("current dependency evidence must admit this three-file control");
-        assert!(current_scope.roots.contains(dependent));
+        assert!(
+            current_scope.roots.contains(dependent),
+            "actual scopes: {:?}",
+            unknown_recovery::scope_events_for_test()
+        );
         assert!(
             !current_scope.roots.contains(unrelated),
             "renamed request and message identities must be independent; message_only={message_only}"
@@ -3786,7 +3791,8 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         assert_eq!(
             posts.len(),
             2,
-            "only unrelated fresh work may POST; message_only={message_only}; retained scopes={:?}",
+            "only unrelated fresh work may POST; message_only={message_only}; actual scopes={:?}; retained scopes={:?}",
+            unknown_recovery::scope_events_for_test(),
             active
                 .iter()
                 .map(|m| (&m.scope.roots, m.posts, m.ack_saved))

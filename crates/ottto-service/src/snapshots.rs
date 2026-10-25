@@ -36911,6 +36911,16 @@ impl ScanIndex {
             return;
         }
         let held = crate::snapshot_sync::unknown_recovery::held_roots(support, self);
+        #[cfg(test)]
+        crate::snapshot_sync::unknown_recovery::trace_scope_for_test(|| {
+            format!(
+                "emission_scope roots={:?} catalog_ready={} ledger_ready={} last_close={}",
+                held.as_ref().map(|scope| &scope.roots),
+                crate::snapshot_sync::unknown_recovery::initialized(support),
+                claude_request_money::recovery_scope::evidence_ready_for_test(support),
+                claude_request_money::recovery_scope::last_stage_for_test(),
+            )
+        });
         for snapshot in snapshots {
             if held.as_ref().is_some_and(|roots| {
                 !roots
