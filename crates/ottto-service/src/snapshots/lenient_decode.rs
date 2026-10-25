@@ -1761,15 +1761,16 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "claude_money_birth_store" => {
                             // Optional money hints cannot rebuild or pause an otherwise valid index.
                             // Bound allocation before decoding; do not carry through identity repair.
-                            index.claude_money_birth_store =
-                                if !value.resource && value.len <= 4 * 1024 * 1024 {
-                                    self.typed::<claude_money_birth_store::BirthStore>(value)
-                                        .ok()
-                                        .and_then(claude_money_birth_store::BirthStore::valid)
-                                        .unwrap_or_default()
-                                } else {
-                                    Default::default()
-                                };
+                            let decoded = if !value.resource && value.len <= 4 * 1024 * 1024 {
+                                self.typed::<claude_money_birth_store::BirthStore>(value)
+                                    .ok()
+                            } else {
+                                None
+                            };
+                            if decoded.is_none() {
+                                self.counts.drops.activity += 1;
+                            }
+                            index.claude_money_birth_store = decoded.unwrap_or_default();
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
