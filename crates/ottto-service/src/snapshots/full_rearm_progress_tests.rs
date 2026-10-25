@@ -1295,8 +1295,7 @@ fn rebuild_candidate(rearm: &Rearm, origin: ScanIndexLoadOrigin) -> ScanIndex {
     index.claude_duplicate_request_witness_overflowed = false;
     index.claude_duplicate_fence_rearm_attempt = CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT;
     index.settle_claude_index_load(&rearm.root.join("index.json"), origin);
-    index.claude_full_rearm_progress.rebuild_read_full =
-        index.claude_full_rearm_progress.rebuild_load_eligible;
+    index.claude_full_rearm_progress.rebuild_read_full = index.claude_rebuild_read_load_eligible;
     index.claude_full_rearm_progress.traversal_origin = Some(ClaudeFullRearmWindow {
         context_fingerprint: "rebuild-context".to_string(),
         process: claude_full_rearm_process(),
@@ -1458,7 +1457,7 @@ fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_fil
         ScanIndexLoadOrigin::Quarantined,
     ] {
         let mut index = rebuild_candidate(&rearm, origin);
-        assert!(!index.claude_full_rearm_progress.rebuild_load_eligible);
+        assert!(!index.claude_rebuild_read_load_eligible);
         seal_claude_complete_rebuild_read(&mut index, &rebuild_reads(&rearm.index()), true);
         assert!(index
             .claude_full_rearm_progress
@@ -1470,7 +1469,7 @@ fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_fil
     }
     let mut empty = ScanIndex::default();
     empty.settle_claude_index_load(&rearm.root.join("empty.json"), ScanIndexLoadOrigin::Loaded);
-    assert!(!empty.claude_full_rearm_progress.rebuild_load_eligible);
+    assert!(!empty.claude_rebuild_read_load_eligible);
 }
 
 /// Real discovery/parser wiring, plus fail-closed reuse of unchanged files.
