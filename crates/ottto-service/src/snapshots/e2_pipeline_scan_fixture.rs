@@ -5,8 +5,13 @@ use crate::transcript_acquisition::Scope;
 #[derive(Default)]
 pub(crate) struct E2ScanFixture {
     cache: Arc<sampled_scan::SharedCache>,
+    observed: Mutex<Vec<PathBuf>>,
 }
 impl E2ScanFixture {
+    pub(crate) fn paths(&self) -> Vec<PathBuf> {
+        self.observed.lock().unwrap().clone()
+    }
+
     pub(crate) fn evict(&self) {
         self.cache.clear();
     }
@@ -22,6 +27,8 @@ impl E2ScanFixture {
         births: &BTreeMap<PathBuf, i128>,
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        self.observed.lock().unwrap().clear();
+        let mut seen = BTreeSet::new();
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             roots,
@@ -43,6 +50,12 @@ impl E2ScanFixture {
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.
             if let Some(active) = scan.active_file.as_deref_mut() {
+                if seen.insert(active.candidate.path.clone()) {
+                    self.observed
+                        .lock()
+                        .unwrap()
+                        .push(active.candidate.path.clone());
+                }
                 if let Some(birth) = births.get(&active.candidate.path) {
                     if !active
                         .parser
@@ -79,4 +92,8 @@ pub(crate) fn without_money_folds(scan: &mut SourceScanResult) {
 
 pub(crate) fn birth_store_bytes(index: &ScanIndex) -> Vec<u8> {
     serde_json::to_vec(&index.claude_money_birth_store).unwrap()
+}
+
+pub(crate) fn with_history_byte_limit<T>(limit: u64, f: impl FnOnce() -> T) -> T {
+    with_body_witness_adoption_byte_budget(limit, f)
 }

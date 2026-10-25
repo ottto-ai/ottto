@@ -1203,3 +1203,7 @@ pub(in crate::snapshots) fn selected_twin_roots<'a>(
         .filter_map(|(member, _)| selected.get(&member).cloned())
         .collect()
 }
+
+#[cfg(test)]
+#[path = "e2_pipeline_observer_tests.rs"]
+pub(crate) mod pipeline_test_observer;

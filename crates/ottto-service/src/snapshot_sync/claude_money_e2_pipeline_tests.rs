@@ -124,7 +124,12 @@ impl Corpus {
             &self.births,
             hints,
         );
-        Page { index, scan, modes }
+        Page {
+            index,
+            scan,
+            modes,
+            disposition: Default::default(),
+        }
     }
     fn reload(&self, index: &mut ScanIndex) -> ScanIndex {
         let path = self.base.join("scan-index.json");
@@ -141,25 +146,57 @@ struct Page {
     index: ScanIndex,
     scan: SourceScanResult,
     modes: (usize, usize, usize),
+    disposition: crate::snapshots::ClaudeUsageAuthorityDisposition,
 }
 impl Page {
     fn enrich(&mut self, corpus: &Corpus) -> crate::snapshots::ClaudeUsageAuthorityDisposition {
-        let (disposition, _, _) =
+        let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&corpus.support, &mut self.scan, &mut self.index);
+        self.index
+            .veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut self.scan.snapshots);
+        let deferred = self.index.bind_session_accounts_with_mixed(
+            SnapshotSource::ClaudeCode,
+            "e2-synthetic-machine",
+            &mut self.scan.snapshots,
+            &[],
+            &disposition.mixed_uploads,
+        );
+        disposition.defer_sessions(deferred);
         apply_upload_policy(
             SnapshotSource::ClaudeCode,
             &mut self.scan.snapshots,
             SnapshotUploadPolicy::default(),
         );
+        let backfill = crate::backfill::load_backfill_state(&corpus.support);
+        apply_backfill_cutoff_with_claude_corrections(
+            &mut self.scan,
+            &self.index,
+            &disposition,
+            &backfill,
+        );
+        self.disposition = disposition.clone();
         disposition
     }
     fn finish(&mut self) {
+        exclude_held_effective_body_witness_revision(
+            &mut self.index,
+            &self.scan.snapshots,
+            &self.disposition,
+        );
         finalize_scan_after_policy_with_body_witness(
             SnapshotSource::ClaudeCode,
             &mut self.scan,
             &mut self.index,
             snapshot_upload_body_witness,
         );
+        LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut self.index,
+            &mut self.scan,
+            &self.disposition,
+        );
+        self.index
+            .retain_claude_history_emission_permitted(&mut self.scan.snapshots);
     }
     fn receipt(&self) -> Vec<(String, String, String)> {
         self.scan
@@ -218,6 +255,12 @@ fn trace(request: &str, agent: &str) -> crate::claude_local_otel::ClaudeTraceOwn
         Sha256::digest(serde_json::to_vec(&row).unwrap())
     );
     row
+}
+fn e2_progress() -> SnapshotUploadProgress {
+    SnapshotUploadProgress::new(
+        format!("{:064x}", 99),
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
 }
 fn request(items: &[SnapshotItem]) -> SnapshotBatchRequest {
     SnapshotBatchRequest {
@@ -285,6 +328,7 @@ fn ack(batch: &[SnapshotItem]) -> Result<crate::snapshot_client::SnapshotBatchRe
         response.accepted_entities.push(reference);
         response.accepted += 1;
     }
+    response.sessions_reconciled = response.accepted;
     Ok(response)
 }
 fn total(page: &Page) -> u64 {
@@ -327,9 +371,10 @@ fn ready(
         index: p.index.clone(),
         scan: p.scan.clone(),
         modes: p.modes,
+        disposition: p.disposition.clone(),
     };
     send.finish();
-    let (result, _, _) = upload(&send.scan.snapshots, &mut test_upload_progress(), ack);
+    let (result, _, _) = upload(&send.scan.snapshots, &mut e2_progress(), ack);
     assert_eq!(
         result.unwrap(),
         ResumableUploadResult::Completed,
@@ -346,6 +391,16 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
         &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20)),
     );
     c.agent(0, &line(ROOT, "agent", AT, 3));
+    c.write_at(
+        &format!("alternate/{ROOT}.jsonl"),
+        &line(ROOT, "r1", AT, 10),
+        "2026-08-02T07:03:00Z",
+    );
+    c.write_at(
+        &format!("{COPY}.jsonl"),
+        &(line(COPY, "r1", AT, 10) + &line(COPY, "branch-own", "2026-08-02T07:04:00Z", 2)),
+        "2026-08-02T07:03:00Z",
+    );
     c.evidence(&[api("r1", 10, 100)], &[]);
     let scanner = E2ScanFixture::default();
     let mut dark = c.raw(&scanner, ScanIndex::default(), 100, false, &[]);
@@ -360,7 +415,7 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
     dark.finish();
     reference.finish();
     assert_eq!(dark.receipt(), reference.receipt());
-    let (mut a, mut b) = (test_upload_progress(), test_upload_progress());
+    let (mut a, mut b) = (e2_progress(), e2_progress());
     let (ra, ba, oa) = upload(&dark.scan.snapshots, &mut a, ack);
     let (rb, bb, ob) = upload(&reference.scan.snapshots, &mut b, ack);
     assert_eq!(ra.unwrap(), rb.unwrap());
@@ -388,7 +443,7 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-modes");
-        let path = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let path = c.root(ROOT, &line(ROOT, "copied", "2026-08-02T06:58:00Z", 10));
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
         literal(&first);
@@ -405,7 +460,16 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         let mut tail = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(tail.modes, (0, 1, 0));
         literal(&tail);
-        assert_eq!(total(&tail), 2);
+        assert_eq!(total(&tail), 1);
+        assert_eq!(tail.scan.snapshots[0].removed_request_count, Some(1));
+        assert_eq!(
+            tail.scan.snapshots[0]
+                .removed_usage
+                .as_ref()
+                .unwrap()
+                .input_tokens,
+            10
+        );
         let full = ready(&c, &E2ScanFixture::default(), prior, 100, true);
         assert_mode(full.modes, (1, 0, 0));
         assert_eq!(
@@ -416,7 +480,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
         let prior = c.reload(&mut tail.index);
         // Unaccepted exact body remains due; a fresh sidecar is read even if
         // the transcript prefix and length are unchanged.
-        c.evidence(&[api("r1", 10, 100), api("r2", 20, 200)], &[]);
+        c.evidence(&[api("copied", 10, 100), api("r2", 20, 200)], &[]);
         let unchanged = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(unchanged.modes, (0, 0, 1));
         let oracle = ready(&c, &E2ScanFixture::default(), prior.clone(), 100, true);
@@ -424,7 +488,8 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
             canonical(&unchanged.scan.snapshots),
             canonical(&oracle.scan.snapshots)
         );
-        assert_eq!(total(&unchanged), 2);
+        assert_eq!(total(&unchanged), 1);
+        assert_eq!(unchanged.scan.snapshots[0].removed_request_count, Some(1));
         scanner.evict();
         let evicted = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(evicted.modes, (1, 0, 0));
@@ -444,14 +509,18 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
 fn mutation_case(kind: &str) {
     e2::with_enabled(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
-        let contents = line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20);
+        let contents = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11)
+            + &line(ROOT, "r1", AT, 10)
+            + &line(ROOT, "r2", "2026-08-02T07:01:00Z", 20);
         let path = c.root(ROOT, &contents);
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, true);
         first.finish();
         let prior = c.reload(&mut first.index);
         let changed = match kind {
-            "truncate" => line(ROOT, "r1", AT, 10),
+            "truncate" => {
+                line(ROOT, "copied", "2026-08-02T06:58:00Z", 11) + &line(ROOT, "r1", AT, 10)
+            }
             "same-size" => contents.replace("\"input_tokens\":20", "\"input_tokens\":30"),
             "inode" => contents.clone(),
             _ => unreachable!(),
@@ -469,6 +538,15 @@ fn mutation_case(kind: &str) {
         let actual = ready(&c, &scanner, prior.clone(), 100, true);
         assert_mode(actual.modes, (1, 0, 0));
         literal(&actual);
+        assert_eq!(actual.scan.snapshots[0].removed_request_count, Some(1));
+        assert_eq!(
+            actual.scan.snapshots[0]
+                .removed_usage
+                .as_ref()
+                .unwrap()
+                .input_tokens,
+            11
+        );
         let oracle = ready(&c, &E2ScanFixture::default(), prior, 100, true);
         assert_eq!(
             canonical(&actual.scan.snapshots),
@@ -504,20 +582,17 @@ fn e2_pipeline_inode_replacement_matches_full() {
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
     e2::with_enabled(|| {
         let mut c = Corpus::new("e2-pipeline-pages");
-        for (n, session) in [ROOT, COPY, PIPELINE_SESSIONS[0]].iter().enumerate() {
-            c.root(
-                session,
-                &line(session, &format!("req-{n}"), AT, 10 + n as u64),
-            );
-        }
+        c.root(ROOT, &line(ROOT, "root", AT, 10));
+        c.agent(0, &line(ROOT, "agent-0", AT, 11));
+        c.agent(1, &line(ROOT, "agent-1", AT, 12));
         let scanner = E2ScanFixture::default();
-        let full = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let full = ready(&c, &scanner, ScanIndex::default(), 100, true);
         literal(&full);
         assert_eq!(full.scan.snapshots.len(), 3);
         let mut index = ScanIndex::default();
         let mut observed = BTreeMap::new();
         for _ in 0..6 {
-            let mut page = ready(&c, &scanner, index, 1, false);
+            let mut page = ready(&c, &scanner, index, 1, true);
             for item in &page.scan.snapshots {
                 observed.insert(item.source_session_id.clone(), canonical(item));
             }
@@ -550,7 +625,7 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
         assert_eq!(total(&first), 1);
         first.finish();
         let before = birth_store_bytes(&first.index);
-        let mut prior = c.reload(&mut first.index);
+        let prior = c.reload(&mut first.index);
         assert_eq!(before, birth_store_bytes(&prior));
         let moved = c.write_at(
             &format!("moved/{ROOT}.jsonl"),
@@ -558,11 +633,6 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
             "2026-08-02T07:01:00Z",
         );
         std::fs::remove_file(&original).unwrap();
-        // Drop the old file entry as a completed pruning pass would. Birth
-        // lineage must remain usable independently of that path's entry.
-        prior
-            .files
-            .retain(|key, _| !key.ends_with(&format!("/projects/{ROOT}.jsonl")));
         let mut moved_page = ready(&c, &scanner, prior, 100, false);
         assert_eq!(total(&moved_page), 1, "a move inherits the original cutoff");
         moved_page.finish();
@@ -608,6 +678,15 @@ fn twins(reverse: bool) {
         );
         let scanner = E2ScanFixture::default();
         let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let paths = scanner.paths();
+        assert_eq!(paths.len(), 2, "both real twin files were opened");
+        assert!(
+            paths[0].ends_with(format!(
+                "{}/{ROOT}.jsonl",
+                if reverse { new_dir } else { old_dir }
+            )),
+            "fixture must exercise the requested discovery order"
+        );
         literal(&first);
         assert_eq!(
             total(&first),
@@ -654,51 +733,35 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
         literal(&complete);
         assert_eq!(total(&complete), 2);
         complete.finish();
-        let mut progress = test_upload_progress();
+        let mut progress = e2_progress();
         let (result, _, _) = upload(&complete.scan.snapshots, &mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
         complete
             .index
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let prior = c.reload(&mut complete.index);
-        let accepted_before = prior.current_snapshot_fingerprints();
         std::fs::OpenOptions::new()
             .append(true)
             .open(&twin)
             .unwrap()
             .write_all(line(ROOT, "r3", "2026-08-02T07:04:00Z", 30).as_bytes())
             .unwrap();
-        let mut page = c.raw(
-            &scanner,
-            prior.clone(),
-            1,
-            false,
-            std::slice::from_ref(&twin),
+        let mut page = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&twin));
+        page.enrich(&c);
+        assert!(
+            !page.scan.snapshots.is_empty(),
+            "both twins must co-schedule at the file-count boundary"
         );
-        let disposition = page.enrich(&c);
-        // Either co-schedule both twins and publish all 3, or hold the
-        // partial family and keep the previous complete accepted head.
-        if !page.scan.snapshots.is_empty() {
-            assert_eq!(
-                total(&page),
-                3,
-                "a partial twin must never overwrite complete history"
-            );
-        } else {
-            page.finish();
-            let holds = LocalHoldSettlement::classify(
-                SnapshotSource::ClaudeCode,
-                &mut page.index,
-                &mut page.scan,
-                &disposition,
-            );
-            let settled = settle_completed_upload(page.index, &prior, &progress, &holds);
-            assert_eq!(
-                settled.index.current_snapshot_fingerprints(),
-                accepted_before
-            );
-            assert!(!settled.fully_settled, "withheld family remains owed");
-        }
+        assert_eq!(
+            scanner.paths().len(),
+            2,
+            "both twin paths must actually be opened"
+        );
+        assert_eq!(
+            total(&page),
+            3,
+            "a partial twin must never overwrite complete history"
+        );
         assert!(original.is_file());
     });
 }
@@ -772,6 +835,26 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
             .iter()
             .find(|s| s.source_session_id == COPY)
             .unwrap();
+        let tuple = |s: &SnapshotItem| {
+            (
+                s.request_count,
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_read_tokens,
+                s.cache_creation_5m_tokens,
+                s.cache_creation_1h_tokens,
+            )
+        };
+        let root = p
+            .scan
+            .snapshots
+            .iter()
+            .find(|s| s.source_session_id == ROOT)
+            .unwrap();
+        assert_eq!(tuple(root), (1, 10, 10, 3, 5, 2));
+        assert_eq!(tuple(copied), (1, 0, 0, 3, 5, 2));
+        assert_eq!(copied.removed_request_count, Some(1));
+        assert_eq!(root.removed_request_count, Some(0));
         let removed = copied.removed_usage.as_ref().unwrap();
         assert_eq!(
             (
@@ -823,8 +906,11 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
             .unwrap();
         assert_eq!((root.request_count, root.input_tokens), (2, 17));
         assert_eq!((agent.request_count, agent.input_tokens), (2, 25));
-        let counter = serde_json::to_value(e2::take_counts()).unwrap();
-        assert!(counter["side_call_root_fallback"].as_u64().unwrap_or(0) > 0);
+        assert_eq!(
+            e2::pipeline_test_observer::root_fallbacks(&p.scan.snapshots),
+            1,
+            "exactly one side call used the counted root fallback"
+        );
     });
 }
 
@@ -841,7 +927,7 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
             Some(false)
         );
         first.finish();
-        let mut progress = test_upload_progress();
+        let mut progress = e2_progress();
         upload(&first.scan.snapshots, &mut progress, ack).0.unwrap();
         first
             .index
@@ -858,10 +944,27 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
         literal(&after);
         assert_eq!(total(&after), 1);
         assert_eq!(after.scan.snapshots[0].telemetry_owned_complete, Some(true));
-        assert!(after.scan.snapshots[0].model_usage.iter().any(|r| r
-            .selector_context
-            .get("request_usage_origin")
-            .is_some_and(|v| v == "telemetry_matched")));
+        assert!(after.scan.snapshots[0]
+            .model_usage
+            .iter()
+            .filter(|r| r.request_count > 0)
+            .all(|r| r
+                .selector_context
+                .get("request_usage_origin")
+                .is_some_and(|v| v == "telemetry_matched")));
+        assert_eq!(
+            after.scan.snapshots[0]
+                .model_usage
+                .iter()
+                .map(|r| r.request_count)
+                .sum::<u64>(),
+            1
+        );
+        assert_eq!(after.scan.snapshots[0].input_tokens, 10);
+        assert_ne!(
+            after.scan.snapshots[0].snapshot_fingerprint,
+            first.scan.snapshots[0].snapshot_fingerprint
+        );
     });
 }
 
@@ -871,6 +974,18 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
         let mut c = Corpus::new("e2-pipeline-side-other-page");
         let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.agent(0, &line(ROOT, "agent", AT, 20));
+        c.evidence(&[api("root", 10, 100), api("agent", 20, 200)], &[]);
+        let scanner = E2ScanFixture::default();
+        let mut baseline = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        baseline.finish();
+        let mut baseline_progress = e2_progress();
+        upload(&baseline.scan.snapshots, &mut baseline_progress, ack)
+            .0
+            .unwrap();
+        baseline
+            .index
+            .record_accepted_snapshot_fingerprints(&baseline_progress.accepted_fingerprints);
+        let prior = c.reload(&mut baseline.index);
         c.evidence(
             &[
                 api("root", 10, 100),
@@ -879,10 +994,6 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             ],
             &[trace("side", "000")],
         );
-        let scanner = E2ScanFixture::default();
-        let mut baseline = ready(&c, &scanner, ScanIndex::default(), 100, false);
-        baseline.finish();
-        let prior = c.reload(&mut baseline.index);
         std::fs::OpenOptions::new()
             .append(true)
             .open(&root)
@@ -891,17 +1002,16 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             .unwrap();
         let mut p = c.raw(&scanner, prior, 1, false, std::slice::from_ref(&root));
         p.enrich(&c);
-        let r = p
+        let root_body = p
             .scan
             .snapshots
             .iter()
-            .find(|s| s.source_session_id == ROOT);
-        if let Some(root) = r {
-            assert_eq!(
-                root.input_tokens, 11,
-                "trace-named side call must never fall back to a different root"
-            );
-        }
+            .find(|s| s.source_session_id == ROOT)
+            .expect("hinted root must be published on its page");
+        assert_eq!(
+            root_body.input_tokens, 11,
+            "trace-named side call must never fall back to root"
+        );
         // An absent agent must stay due or be co-scheduled. Observe the next
         // real bounded pages; a named side call must eventually reach it.
         let mut items = p.scan.snapshots.clone();
@@ -913,6 +1023,10 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             next.finish();
             index = c.reload(&mut next.index);
         }
+        assert!(items
+            .iter()
+            .filter(|s| s.source_session_id == ROOT)
+            .all(|s| s.input_tokens == 11));
         assert!(items.iter().any(|s| s.source_session_id==format!("{ROOT}_agent-000") && s.input_tokens==25),"off-page named agent must eventually publish its side call");
     });
 }
@@ -952,7 +1066,7 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
         p.finish();
         let original = canonical(&p.scan.snapshots);
         let fingerprints = p.receipt();
-        let mut progress = test_upload_progress();
+        let mut progress = e2_progress();
         let (failed, first, order) = upload(&p.scan.snapshots, &mut progress, |_| {
             Err(anyhow!("synthetic connection reset before ACK"))
         });
@@ -991,6 +1105,19 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
         );
         // Late telemetry must not mutate an already captured retry body.
         c.evidence(&[api("own", 20, 200), api("agent", 5, 50)], &[]);
+        let mut late = ready(
+            &c,
+            &E2ScanFixture::default(),
+            restart.index.clone(),
+            100,
+            false,
+        );
+        late.finish();
+        assert_ne!(
+            late.receipt(),
+            fingerprints,
+            "fresh OTEL really changes the current body while the frozen retry stays exact"
+        );
         let (result, resent, _) = upload(&copies, &mut progress, |batch| {
             let mut response = ack(batch)?;
             let refused = response.accepted_entities.pop().unwrap();
@@ -1053,7 +1180,7 @@ fn family_count_case(count: usize) {
         literal(&p);
         assert_eq!(p.scan.snapshots.len(), count);
         p.finish();
-        let mut progress = test_upload_progress();
+        let mut progress = e2_progress();
         let (result, _, order) = upload(&p.scan.snapshots, &mut progress, ack);
         assert_eq!(result.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(
@@ -1131,13 +1258,216 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
             bytes_above - bytes_below < 32,
             "adjacent model lengths bracket the actual 2 MiB boundary"
         );
-        let (r, _, b) = upload(&below.scan.snapshots, &mut test_upload_progress(), ack);
+        let (r, _, b) = upload(&below.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(b.len(), 1);
-        let (r, _, b) = upload(&above.scan.snapshots, &mut test_upload_progress(), ack);
+        let (r, _, b) = upload(&above.scan.snapshots, &mut e2_progress(), ack);
         assert_eq!(r.unwrap(), ResumableUploadResult::Completed);
         assert_eq!(b.iter().map(Vec::len).collect::<Vec<_>>(), vec![3, 1]);
         assert_eq!(b[0][0], ROOT);
         println!("E2_PIPELINE_BYTE_BOUNDARY below={bytes_below} above={bytes_above} limit={SNAPSHOT_BATCH_MAX_BYTES}");
+    });
+}
+
+#[test]
+fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
+    e2::with_enabled(|| {
+        let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
+        c.root(ROOT, &line(ROOT, "original", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut original = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        assert_eq!(total(&original), 1);
+        original.finish();
+        let prior = c.reload(&mut original.index);
+        c.write_at(
+            &format!("{COPY}.jsonl"),
+            &line(COPY, "original", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let branch = ready(&c, &scanner, prior, 100, false);
+        literal(&branch);
+        let totals = branch.scan.snapshots.iter().fold([0_u64; 8], |mut sum, s| {
+            for (target, n) in sum.iter_mut().zip([
+                s.request_count,
+                s.input_tokens,
+                s.output_tokens,
+                s.cache_read_tokens,
+                s.cache_creation_5m_tokens,
+                s.cache_creation_1h_tokens,
+                s.reasoning_output_tokens,
+                s.unattributed_total_tokens,
+            ]) {
+                *target += n;
+            }
+            sum
+        });
+        assert_eq!(
+            totals,
+            [1, 10, 10, 3, 5, 2, 0, 0],
+            "a /branch containing only copied history cannot duplicate original money"
+        );
+        assert!(
+            branch
+                .scan
+                .snapshots
+                .iter()
+                .map(|s| s.removed_request_count.unwrap_or(0))
+                .sum::<u64>()
+                > 0,
+            "deliberate /branch must expose copy_skipped > 0"
+        );
+    });
+}
+
+fn restored_twins(reverse: bool, equal: bool) {
+    e2::with_enabled(|| {
+        let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
+        let (a, b) = if reverse {
+            ("z-original", "a-copy")
+        } else {
+            ("a-original", "z-copy")
+        };
+        c.write_at(
+            &format!("{a}/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:02:00Z",
+        );
+        c.write_at(
+            &format!("{b}/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            if equal {
+                "2026-08-02T07:02:00Z"
+            } else {
+                "2026-08-02T07:03:00Z"
+            },
+        );
+        let scanner = E2ScanFixture::default();
+        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        let opened = scanner.paths();
+        assert_eq!(opened.len(), 2);
+        assert!(
+            opened[0].ends_with(format!("{}/{ROOT}.jsonl", if reverse { b } else { a })),
+            "actual discovery order"
+        );
+        literal(&first);
+        assert_eq!(
+            total(&first),
+            1,
+            "all-prebirth restored twins must count once on their first page"
+        );
+        first.finish();
+        let prior = c.reload(&mut first.index);
+        let again = ready(&c, &scanner, prior, 100, false);
+        literal(&again);
+        assert_eq!(
+            total(&again),
+            1,
+            "restart and repeated page cannot change the total"
+        );
+    });
+}
+#[test]
+fn e2_pipeline_restored_twins_earlier_first() {
+    restored_twins(false, false);
+}
+#[test]
+fn e2_pipeline_restored_twins_later_first() {
+    restored_twins(true, false);
+}
+#[test]
+fn e2_pipeline_restored_twins_equal_birth_forward() {
+    restored_twins(false, true);
+}
+#[test]
+fn e2_pipeline_restored_twins_equal_birth_reverse() {
+    restored_twins(true, true);
+}
+
+#[test]
+fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
+    e2::with_enabled(|| {
+        let mut c = Corpus::new("e2-pipeline-delayed-move");
+        let old = c.root(ROOT, &line(ROOT, "r1", AT, 10));
+        let scanner = E2ScanFixture::default();
+        let mut first = ready(&c, &scanner, ScanIndex::default(), 100, false);
+        first.finish();
+        let prior = c.reload(&mut first.index);
+        std::fs::remove_file(old).unwrap();
+        let mut absent = ready(&c, &scanner, prior, 100, false);
+        absent.finish();
+        let prior = c.reload(&mut absent.index);
+        c.write_at(
+            &format!("new-location/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:03:00Z",
+        );
+        let moved = ready(&c, &E2ScanFixture::default(), prior, 100, false);
+        literal(&moved);
+        assert_eq!(
+            total(&moved),
+            1,
+            "lineage survives a real deletion scan and durable reload"
+        );
+        assert_eq!(moved.scan.snapshots[0].removed_request_count, Some(0));
+    });
+}
+
+#[test]
+fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
+    e2::with_enabled(|| {
+        let mut c = Corpus::new("e2-pipeline-twin-byte-hold");
+        c.write_at(
+            &format!("a/{ROOT}.jsonl"),
+            &line(ROOT, "r1", AT, 10),
+            "2026-08-02T07:00:00Z",
+        );
+        c.write_at(
+            &format!("z/{ROOT}.jsonl"),
+            &(line(ROOT, "r1", AT, 10) + &line(ROOT, "r2", "2026-08-02T07:03:10Z", 20)),
+            "2026-08-02T07:03:00Z",
+        );
+        let scanner = E2ScanFixture::default();
+        let mut old = ScanIndex::default();
+        old.activate_effective_upload_body_witness_revision(1);
+        let mut first = ready(&c, &scanner, old, 100, false);
+        literal(&first);
+        assert_eq!(total(&first), 2);
+        first.finish();
+        let mut progress = e2_progress();
+        upload(&first.scan.snapshots, &mut progress, ack).0.unwrap();
+        first
+            .index
+            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+        let mut prior = c.reload(&mut first.index);
+        let before = prior.current_snapshot_fingerprints();
+        prior.activate_effective_upload_body_witness_revision(2);
+        let committed = prior.clone();
+        let mut held =
+            crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
+                ready(&c, &scanner, prior, 1, false)
+            });
+        assert!(
+            held.scan.snapshots.is_empty(),
+            "byte-limited twin family emits no partial replacement"
+        );
+        held.finish();
+        let holds = LocalHoldSettlement::classify(
+            SnapshotSource::ClaudeCode,
+            &mut held.index,
+            &mut held.scan,
+            &held.disposition,
+        );
+        let mut settlement = settle_completed_upload(held.index, &committed, &progress, &holds);
+        settle_index_after_upload(&mut settlement.index, &committed, &progress);
+        let restored = c.reload(&mut settlement.index);
+        assert_eq!(
+            restored.current_snapshot_fingerprints(),
+            before,
+            "previous complete accepted history survives hold and disk reload"
+        );
+        assert!(
+            scanner.paths().is_empty(),
+            "strict byte budget refuses the complete twin group before either file is read"
+        );
     });
 }
