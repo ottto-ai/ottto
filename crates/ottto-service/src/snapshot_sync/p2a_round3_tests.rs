@@ -3802,7 +3802,11 @@ fn p2a_unknown_root_hold_survives_a_body_without_a_physical_fingerprint() {
     control.recovery_startup(now);
     let mut index = control.saved();
     index.load_claude_reemission_exclusions(&control.support);
-    let mut body: SnapshotItem = serde_json::from_value(control.offers()[0].clone()).unwrap();
+    // A rebuilt/virtual body has a declared family but no physical identity.
+    // SnapshotItem is intentionally serialize-only; use the existing typed carrier.
+    let mut body = crate::snapshots::cache_adapter_tests::cache_fixture_item();
+    body.source_session_id = IDENTITY_PIPELINE_ROOT.into();
+    body.attribution_facts.clear();
     body.source_file_fingerprint = None;
     let key = control.transcript().to_string_lossy().into_owned();
     let fingerprint = index.files[&key].source_file_fingerprint.clone();
