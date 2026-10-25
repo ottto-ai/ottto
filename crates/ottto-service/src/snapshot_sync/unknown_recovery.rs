@@ -1368,6 +1368,7 @@ pub(super) fn resolve_saved(
                     .all(|(key, selection)| {
                         selection.offer.is_some_and(|offer| {
                             money::recovery_offer_debt_retired(support, key, offer)
+                                && !money::money_due(support, key, u64::MAX)
                         })
                     })
         });

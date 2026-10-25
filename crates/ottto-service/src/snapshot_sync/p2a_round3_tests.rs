@@ -4460,6 +4460,7 @@ fn p2a_unknown_shed_blocks_unrelated_snapshot_posts_at_the_cycle_boundary() {
             retry_after: 7200,
         });
         let _live = money::LiveForTest::new(&control.support);
+        clear_shed_streak(SnapshotSource::ClaudeCode);
         control.cycle_shed(Duration::from_secs(7200));
         let original = std::fs::read_to_string(control.transcript()).unwrap();
         let fresh = "33333333-3333-4333-8333-333333333333";
