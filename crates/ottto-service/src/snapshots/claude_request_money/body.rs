@@ -119,44 +119,57 @@ pub(crate) fn reported_live_key(
     row: &ClaudeApiRow<'_>,
     occurrence: Option<&super::super::ClaudeTranscriptUsageOccurrence>,
 ) -> Option<ClaudeLiveKey> {
-    let mut selector = occurrence
-        .map(|occurrence| SelectorCapture::clone(&occurrence.selector))
-        .unwrap_or_default();
-    if !row.speed.trim().is_empty() {
-        insert_selector_raw(
-            &mut selector,
-            "speed_mode",
-            "claude_code.api_request.speed",
-            &serde_json::Value::String(row.speed.to_string()),
-        );
-    }
-    let reported_effort = CLAUDE_EFFORT_TIERS
-        .contains(&row.effort)
-        .then(|| row.effort.to_string());
-    let effort = occurrence
-        .and_then(|occurrence| occurrence.reasoning_effort.clone())
-        .or(reported_effort);
-    let (model, timestamp) = match occurrence {
-        Some(occurrence) => (
-            occurrence
-                .model
-                .clone()
-                .unwrap_or_else(|| row.model.to_string()),
-            match &occurrence.timestamp {
-                Some(timestamp) => timestamp.clone(),
-                None => row.observed_at()?,
-            },
-        ),
-        None => (row.model.to_string(), row.observed_at()?),
+    let inputs = reported_inputs(row.model, row.speed, row.effort, occurrence);
+    let timestamp = match inputs.timestamp {
+        Some(timestamp) => timestamp.to_owned(),
+        None => row.observed_at()?,
     };
+    let model = inputs.model.to_owned();
     let (bucket_start, _) = activity_bucket_from_timestamp(&timestamp)?;
-    let (row_key, mut context, _) = build_row_identity(&model, &selector, effort.as_deref());
+    let (row_key, mut context, _) = build_row_identity(&model, &inputs.selector, inputs.effort);
     for (name, value) in row_key.billing_fields() {
         if let Some(value) = value {
             context.insert(name.to_owned(), value.to_owned());
         }
     }
     Some((bucket_start, model, context))
+}
+
+/// Common reported enrichment only. Callers keep their placement/output rules:
+/// P1 uses its legacy base and omits effort from the reduced context; E2 uses
+/// native placement and retains effort on the emitted row.
+pub(super) struct ReportedInputs<'a> {
+    pub(super) selector: SelectorCapture,
+    pub(super) effort: Option<&'a str>,
+    pub(super) model: &'a str,
+    pub(super) timestamp: Option<&'a str>,
+}
+
+pub(super) fn reported_inputs<'a>(
+    model: &'a str,
+    speed: &str,
+    effort: &'a str,
+    occurrence: Option<&'a super::super::ClaudeTranscriptUsageOccurrence>,
+) -> ReportedInputs<'a> {
+    let mut selector = occurrence
+        .map(|o| SelectorCapture::clone(&o.selector))
+        .unwrap_or_default();
+    if !speed.trim().is_empty() {
+        insert_selector_raw(
+            &mut selector,
+            "speed_mode",
+            "claude_code.api_request.speed",
+            &serde_json::Value::String(speed.to_owned()),
+        );
+    }
+    ReportedInputs {
+        selector,
+        effort: occurrence
+            .and_then(|o| o.reasoning_effort.as_deref())
+            .or_else(|| CLAUDE_EFFORT_TIERS.contains(&effort).then_some(effort)),
+        model: occurrence.and_then(|o| o.model.as_deref()).unwrap_or(model),
+        timestamp: occurrence.and_then(|o| o.timestamp.as_deref()),
+    }
 }
 
 /// One side of a grain slice.
