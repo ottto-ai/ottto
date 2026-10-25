@@ -2886,10 +2886,21 @@ pub(crate) fn begin_codex_side_pass(
     index_path: &Path,
     index: &mut ScanIndex,
 ) -> CodexSidePass {
+    begin_codex_side_pass_of(cache, index_path, index, CodexPageKind::Ordinary)
+}
+
+/// C14 for a page of `kind`: the same gate read, prune and hydrate; only an
+/// ordinary page resets the gate (`SideLedger::begin_pass_of`, C-1).
+fn begin_codex_side_pass_of(
+    cache: &sampled_scan::SharedCache,
+    index_path: &Path,
+    index: &mut ScanIndex,
+    kind: CodexPageKind,
+) -> CodexSidePass {
     let ns = sampled_scan::side_ledger::namespace_of(index_path);
     let (gate, wanted) = cache
         .side_ledger()
-        .open_index_pass(ns, sampled_scan::now_seconds());
+        .open_index_pass(ns, sampled_scan::now_seconds(), kind);
     // R2-L2: one SHA-256 per file key, with the leaf lock released (C14 is
     // single-threaded under `SNAPSHOT_SYNC_LOCK`).
     let keys = wanted
@@ -2906,23 +2917,30 @@ pub(crate) fn begin_codex_side_pass(
         ns,
         gate,
         index_path: index_path.to_path_buf(),
-        kind: CodexPageKind::Ordinary,
+        kind,
     }
 }
 
-/// Stage 1 (§7 exclusions): the pass of a continuation page. C14 runs as on
-/// an ordinary page (its gate and hydration), but the kind excludes G7, side
-/// due, the proof hook (row 31, so no leftover is spent) and the sweep (row
-/// 32) through the `CodexSidePass` predicates.
+/// Stage 1 (§7 exclusions): the pass of a continuation page. C14 prunes and
+/// hydrates as on an ordinary page, but reads the gate without resetting it
+/// (C-1: the page charges nothing and saves only at EOF), and the kind
+/// excludes G7, side due, the proof hook (row 31, so no leftover is spent)
+/// and the sweep (row 32) through the `CodexSidePass` predicates.
 #[cfg_attr(not(test), allow(dead_code))] // Inert until Stage 1 enables it.
 pub(crate) fn begin_codex_continuation_side_pass(
     cache: &sampled_scan::SharedCache,
     index_path: &Path,
     index: &mut ScanIndex,
 ) -> CodexSidePass {
-    CodexSidePass {
-        kind: CodexPageKind::Continuation,
-        ..begin_codex_side_pass(cache, index_path, index)
+    begin_codex_side_pass_of(cache, index_path, index, CodexPageKind::Continuation)
+}
+
+/// K8 (Stage 1 C-1 controls): the pass's outage gate, for `snapshot_sync`
+/// tests.
+#[cfg(test)]
+impl CodexSidePass {
+    pub(crate) fn side_allowed_for_test(&self) -> bool {
+        self.gate.side_allowed
     }
 }
 

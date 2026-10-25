@@ -189,16 +189,55 @@ impl ContinuationFixture {
         inputs: &mut ContinuationInputs,
     ) -> std::result::Result<SourcePreparation, ContinuationRefusal> {
         let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+        self.prepare_on(&cache, inputs)
+    }
+
+    fn prepare_on(
+        &self,
+        cache: &std::sync::Arc<crate::snapshots::sampled_scan::SharedCache>,
+        inputs: &mut ContinuationInputs,
+    ) -> std::result::Result<SourcePreparation, ContinuationRefusal> {
         prepare_continuation_source(
             &self.home,
             &self.support_dir,
-            &cache,
+            cache,
             inputs,
             &BTreeSet::new(),
             Some(Duration::from_secs(300)),
             Instant::now() + Duration::from_secs(20),
         )
         .unwrap()
+    }
+
+    /// An ordinary Codex pass's C14 on this destination, and its C15 when
+    /// its save succeeded. Returns that pass's gate.
+    fn ordinary_side_pass(
+        &self,
+        cache: &crate::snapshots::sampled_scan::SharedCache,
+        saved: bool,
+    ) -> bool {
+        let (_, mut index) = self.load();
+        let pass = crate::snapshots::begin_codex_side_pass(cache, &self.index_path, &mut index);
+        if saved {
+            let mark = crate::snapshots::codex_side_save_mark(cache, &self.index_path);
+            crate::snapshots::note_codex_side_pass_saved(cache, &self.index_path, false, mark);
+        }
+        pass.side_allowed_for_test()
+    }
+
+    /// A refused continuation prepare after a saved ordinary pass: the
+    /// refusal, no save, the context still cached, and the next ordinary
+    /// pass not gated.
+    fn assert_refused(&self, refusal: ContinuationRefusal) {
+        let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+        self.ordinary_side_pass(&cache, true);
+        let mut minted = self.preparation(true);
+        let mut inputs = take_continuation_inputs(&mut minted);
+        let before = self.disk();
+        assert_eq!(self.prepare_on(&cache, &mut inputs).err(), Some(refusal));
+        assert_eq!(self.disk(), before, "no save, no claim, no reset");
+        assert!(inputs.holds_attribution(), "a refusal keeps it cached");
+        assert!(self.ordinary_side_pass(&cache, true), "no gate reset");
     }
 }
 
@@ -481,5 +520,164 @@ fn no_continuation_output_serializes_the_attribution_key() {
     ] {
         assert!(!output.contains(&encoded), "{name}");
         assert!(!output.contains(&hex), "{name}");
+    }
+}
+
+/// K1.1 (C-1 lease): a destination whose ordinary prepare armed an
+/// admission re-offer refuses before any read.
+#[test]
+fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
+    let fixture = ContinuationFixture::quiescent("continuation-prepare-admission");
+    let (_, mut index) = fixture.load();
+    let fingerprint = "e".repeat(64);
+    index.file_snapshot_fingerprints.insert(
+        "/synthetic/admission.jsonl".into(),
+        BTreeSet::from([fingerprint.clone()]),
+    );
+    // A refusal under a smaller item limit, as before a reviewed admission
+    // increase.
+    index.quarantined_snapshot_fingerprints.insert(
+        fingerprint,
+        SnapshotQuarantineRecord {
+            witness: SnapshotQuarantineWitness {
+                item_wire_byte_limit: 128 * 1024,
+                ..snapshot_quarantine_witness(SnapshotSource::Codex)
+            },
+            retry_after_unix_seconds: 0,
+            upload_body_witness: None,
+            failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+            disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+        },
+    );
+    // The ordinary prepare's arming and save.
+    assert!(index.prepare_snapshot_admission_reoffer(SNAPSHOT_QUARANTINE_RETRY_LIMIT_PER_CYCLE));
+    index.save(&fixture.index_path).unwrap();
+    assert!(fixture.load().1.snapshot_admission_reoffer_pending());
+    fixture.assert_refused(ContinuationRefusal::AdmissionReoffer);
+}
+
+/// K1.1 (C-1 lease): an accepted ledger the legacy settlement has not yet
+/// migrated (the unproven version the first migration wrote) refuses
+/// before any read.
+#[test]
+fn a_pending_legacy_settlement_refuses_the_continuation_prepare() {
+    let fixture = ContinuationFixture::quiescent("continuation-prepare-legacy");
+    let (_, index) = fixture.load();
+    let mut value = serde_json::to_value(&index).unwrap();
+    value["accepted_snapshot_fingerprint_ledger_version"] = serde_json::json!(1);
+    let mut index: ScanIndex = serde_json::from_value(value).unwrap();
+    assert!(index.legacy_settlement_ledger_needs_migration());
+    assert!(!index.snapshot_admission_reoffer_pending());
+    index.save(&fixture.index_path).unwrap();
+    assert!(fixture.load().1.legacy_settlement_ledger_needs_migration());
+    fixture.assert_refused(ContinuationRefusal::LegacySettlement);
+}
+
+/// K1 (a″, C-1 lease): a due quarantine retry the ordinary selection would
+/// lease (and save) refuses at the pure probe, before C14.
+#[test]
+fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
+    let fixture = ContinuationFixture::quiescent("continuation-prepare-claim");
+    let (mut progress, _) = fixture.load();
+    progress.quarantined_fingerprints.insert(
+        "f".repeat(64),
+        SnapshotQuarantineRecord {
+            witness: snapshot_quarantine_witness(SnapshotSource::Codex),
+            retry_after_unix_seconds: 0,
+            upload_body_witness: None,
+            failed_reconstruction_count: 1,
+            disposition: SnapshotQuarantineDisposition::RetryPending,
+        },
+    );
+    progress.save(&fixture.upload_progress_path).unwrap();
+    fixture.assert_refused(ContinuationRefusal::UploadClaim);
+}
+
+/// K1 (a″, C-1 lease): a due, exactly bound reason re-offer. The ordinary
+/// selection that activates a re-offer always reports a claim, so the page
+/// refuses at the pure probe, before C14 (UploadClaim); the post-claim
+/// ReasonReoffer arm stays the backstop and is not reachable from disk.
+#[test]
+fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
+    let fixture = ContinuationFixture::quiescent("continuation-prepare-reoffer");
+    let fingerprint = "d".repeat(64);
+    let body = "b".repeat(64);
+    let (mut progress, mut index) = fixture.load();
+    index.file_snapshot_fingerprints.insert(
+        "/synthetic/reoffer.jsonl".into(),
+        BTreeSet::from([fingerprint.clone()]),
+    );
+    index.quarantined_snapshot_fingerprints.insert(
+        fingerprint.clone(),
+        SnapshotQuarantineRecord {
+            witness: snapshot_quarantine_witness(SnapshotSource::Codex),
+            retry_after_unix_seconds: 0,
+            upload_body_witness: Some(body.clone()),
+            failed_reconstruction_count: MAX_SNAPSHOT_RECONSTRUCTION_FAILURES,
+            disposition: SnapshotQuarantineDisposition::UnprovenTerminal,
+        },
+    );
+    progress.permanent_rejections.insert(
+        fingerprint,
+        PermanentSnapshotRejection {
+            body_witness: body,
+            reason: crate::upload_receipts::RejectedUsageReason::Other,
+            reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: 0,
+            }),
+        },
+    );
+    index.save(&fixture.index_path).unwrap();
+    progress.save(&fixture.upload_progress_path).unwrap();
+    let (progress, index) = fixture.load();
+    assert!(!index.snapshot_admission_reoffer_pending());
+    let now = reason_reoffer::now_unix_seconds();
+    let mut selected = progress.clone();
+    assert!(prepare_upload_progress_for_cycle_with_reoffer(
+        &mut selected,
+        &index,
+        &cycle_replay_generation(SnapshotSource::Codex, false, &index, CONTINUATION_NAMESPACE),
+        false,
+        Some(&reason_reoffer::Scope {
+            index: &index,
+            now,
+            window_start_unix_seconds: now.saturating_sub(30 * 86_400),
+        }),
+    ));
+    assert_eq!(
+        selected.active_reason_reoffers.len(),
+        1,
+        "a claimed re-offer"
+    );
+    fixture.assert_refused(ContinuationRefusal::UploadClaim);
+}
+
+/// C-1 (a), (b), (d) on the production continuation prepare: its C14 runs
+/// (the page prepares; it is non-EOF, never saved, or dropped as a refusal
+/// after C14 drops it) and the next ordinary pass keeps the last ordinary
+/// save's outcome.
+#[test]
+fn a_prepared_continuation_page_keeps_the_ordinary_side_gate() {
+    for ordinary_saved in [true, false] {
+        let fixture = ContinuationFixture::quiescent(if ordinary_saved {
+            "continuation-prepare-gate-saved"
+        } else {
+            "continuation-prepare-gate-failed"
+        });
+        let cache = std::sync::Arc::new(crate::snapshots::sampled_scan::SharedCache::default());
+        assert!(fixture.ordinary_side_pass(&cache, ordinary_saved));
+        let mut minted = fixture.preparation(true);
+        let mut inputs = take_continuation_inputs(&mut minted);
+        let before = fixture.disk();
+        let prepared = fixture
+            .prepare_on(&cache, &mut inputs)
+            .unwrap_or_else(|refusal| panic!("refused: {}", refusal.label()));
+        drop(prepared);
+        assert_eq!(fixture.disk(), before);
+        assert_eq!(
+            fixture.ordinary_side_pass(&cache, true),
+            ordinary_saved,
+            "the next ordinary pass"
+        );
     }
 }

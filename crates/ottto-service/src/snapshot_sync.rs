@@ -6204,7 +6204,8 @@ fn prepare_continuation_source(
     if claim_needed {
         return Ok(Err(ContinuationRefusal::UploadClaim));
     }
-    // C14, on the index exactly as loaded, as the ordinary prepare runs it.
+    // C14, on the index exactly as loaded, as the ordinary prepare runs it,
+    // except that the outage gate is read, never reset (C-1).
     let codex_side_pass =
         crate::snapshots::begin_codex_continuation_side_pass(cache, &inputs.index_path, &mut index);
     let checkpoint_namespace = inputs

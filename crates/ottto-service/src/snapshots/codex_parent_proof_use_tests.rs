@@ -2841,3 +2841,57 @@ fn the_side_sweep_never_runs_on_a_continuation_pass() {
     scene.hook(&cache, &mut PageBudget::default());
     assert!(!scene.index.codex_parent_side.contains_key(&orphan));
 }
+
+/// Stage 1 C-1 (a), (b), (d), on the production passes: a continuation
+/// page's C14 (non-EOF, or refused after C14: it charges nothing and never
+/// saves) neither closes nor opens the outage gate. After a saved ordinary
+/// pass the next ordinary pass may charge and due side work; after a failed
+/// ordinary save it stays gated.
+#[test]
+fn a_continuation_pass_neither_closes_nor_opens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    for ordinary_saved in [true, false] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        assert!(
+            begin_codex_side_pass(&cache, index_path, &mut index)
+                .gate
+                .side_allowed
+        );
+        if ordinary_saved {
+            let mark = codex_side_save_mark(&cache, index_path);
+            note_codex_side_pass_saved(&cache, index_path, false, mark);
+        }
+        for _ in 0..3 {
+            let continuation = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+            assert_eq!(continuation.kind, CodexPageKind::Continuation);
+            assert_eq!(continuation.gate.side_allowed, ordinary_saved);
+            assert!(!continuation.side_charge_allowed() && !continuation.side_due_allowed());
+        }
+        let next = begin_codex_side_pass(&cache, index_path, &mut index);
+        assert_eq!(next.gate.side_allowed, ordinary_saved, "the next ordinary");
+        assert_eq!(next.side_charge_allowed(), ordinary_saved);
+        assert_eq!(next.side_due_allowed(), ordinary_saved);
+    }
+}
+
+/// Stage 1 C-1 (c): the EOF continuation page's full save (C15, `full`,
+/// mark read before it) is what reopens a gate a failed ordinary save
+/// closed.
+#[test]
+fn an_eof_continuation_save_reopens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    begin_codex_side_pass(&cache, index_path, &mut index);
+    // That ordinary save failed: no C15.
+    let eof = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+    assert!(!eof.gate.side_allowed);
+    let mark = codex_side_save_mark(&cache, index_path);
+    note_codex_side_pass_saved(&cache, index_path, true, mark);
+    assert!(
+        begin_codex_side_pass(&cache, index_path, &mut index)
+            .gate
+            .side_allowed
+    );
+}
