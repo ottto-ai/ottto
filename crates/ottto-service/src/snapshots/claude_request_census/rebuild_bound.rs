@@ -27,8 +27,13 @@
 //!   the entry keeps its real fingerprint and is not re-read (MONEY P1a).
 //! - Stamps live in the shadow state and the daemon saves a grant before its
 //!   scan can read (`persist_grants`), so a crash cannot erase an attempt.
-//! - A future stamp counts as recent (clamped to now: fail closed under clock
-//!   rollback, and it still expires one window after it is first seen).
+//! - Stamps are used exactly as persisted (MONEY 724h condition 3). A wall
+//!   clock that goes backward never clamps, expires or shrinks one: a stamp
+//!   after now still counts toward the bound, the witness and any closure.
+//!   Behind the guard's latest persisted stamp, time is no new authority: no
+//!   grant is made or reused, no new key admitted and no read admitted
+//!   (`grant_clock_regressed`, counted like an exhausted key), until the
+//!   clock passes that stamp. A grant found spent stays spent in its process.
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
 //!   reached the key yet does not spend an attempt. A grant authorizes a read
@@ -423,34 +428,55 @@ pub(crate) fn decode_isolated_marker(bytes: Option<&[u8]>) -> u64 {
         .map_or(MARKER_REFUSED, decode_marker)
 }
 
-/// Clamp a future stamp to `now` (recent, fail closed); true while it is
-/// inside the window.
-fn recent(stamp: &mut u64, now: u64) -> bool {
+/// True while `stamp` is inside the window.
+fn recent(stamp: u64, now: u64) -> bool {
     within(stamp, now, WINDOW_SECONDS)
 }
 
 /// `recent` for a rearm stamp (or the witness, which may be one): it counts
 /// for `ATTEMPT_WINDOW_SECONDS`.
-fn counted(stamp: &mut u64, now: u64) -> bool {
+fn counted(stamp: u64, now: u64) -> bool {
     within(stamp, now, ATTEMPT_WINDOW_SECONDS)
 }
 
-fn within(stamp: &mut u64, now: u64, window: u64) -> bool {
-    *stamp = (*stamp).min(now);
-    now - *stamp <= window
+/// MONEY 724h condition 3: a stamp is kept exactly as persisted. One after
+/// `now` (the wall clock went backward) still counts and is never clamped:
+/// backward time never expires a stamp early, frees budget or reopens a
+/// closure, and a clock moving forward again never finds it shrunk.
+fn within(stamp: u64, now: u64, window: u64) -> bool {
+    now <= stamp || now - stamp <= window
 }
 
-/// MONEY 724h P2: `tracked`'s grant (its latest counted stamp, saved before
-/// the scan) can no longer authorize a read: pending, neither refused nor
-/// started, and older than `N3_GRANT_MAX_LOAD_TO_READ`.
-fn grant_expired(tracked: &TrackedKey, now: u64) -> bool {
-    tracked.has(PENDING)
-        && !tracked.has(EXHAUSTED)
-        && !tracked.has(STARTED)
-        && tracked
-            .attempts
-            .last()
-            .is_some_and(|stamp| now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ))
+/// MONEY 724h P2 and condition 3: why `tracked`'s grant (its latest counted
+/// stamp, saved before the scan) can no longer authorize a read, if it is
+/// pending, neither refused nor started. Before `high_water`, the guard's
+/// latest persisted stamp (which bounds the grant's own), the wall clock went
+/// backward: no new authority. Past `N3_GRANT_MAX_LOAD_TO_READ` the span is
+/// over.
+fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
+    if !tracked.has(PENDING) || tracked.has(EXHAUSTED) || tracked.has(STARTED) {
+        return None;
+    }
+    let stamp = *tracked.attempts.last()?;
+    if now < high_water.max(stamp) {
+        Some("grant_clock_regressed")
+    } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ) {
+        Some("grant_read_span_expired")
+    } else {
+        None
+    }
+}
+
+/// A grant found spent stays spent in this process: its saved grant is
+/// forgotten, so no later load reuses it, even after the wall clock moves
+/// back inside its span. Only a new counted attempt reads the key.
+fn spend(id: &str, tracked: &TrackedKey) {
+    let stamp = tracked.attempts.last().copied();
+    with_persisted(|grants| {
+        if grants.get(id).copied() == stamp {
+            grants.remove(id);
+        }
+    });
 }
 
 impl TrackedKey {
@@ -498,31 +524,31 @@ impl DuplicateRebuildGuard {
             .unwrap_or_else(Self::closed)
     }
 
-    /// Clamp future stamps to `now` and forget whatever left the window.
+    /// Forget whatever left the window; a future stamp is kept as persisted
+    /// (MONEY 724h condition 3).
     fn settle_clock(&mut self, now: u64) {
-        if let Some(mut closed) = self.closed_at {
-            self.closed_at = recent(&mut closed, now).then_some(closed);
+        if let Some(closed) = self.closed_at {
+            self.closed_at = recent(closed, now).then_some(closed);
         }
-        if self.untracked_refused > 0 && !recent(&mut self.untracked_refused_at, now) {
+        if self.untracked_refused > 0 && !recent(self.untracked_refused_at, now) {
             self.untracked_refused = 0;
             self.untracked_refused_at = 0;
         }
-        if self.orphaned > 0 && !recent(&mut self.orphaned_at, now) {
+        if self.orphaned > 0 && !recent(self.orphaned_at, now) {
             self.orphaned = 0;
             self.orphaned_at = 0;
         }
-        if self.priors_refused > 0 && !recent(&mut self.priors_refused_at, now) {
+        if self.priors_refused > 0 && !recent(self.priors_refused_at, now) {
             self.priors_refused = 0;
             self.priors_refused_at = 0;
         }
-        if self.identity_revoked > 0 && !recent(&mut self.identity_revoked_at, now) {
+        if self.identity_revoked > 0 && !recent(self.identity_revoked_at, now) {
             self.identity_revoked = 0;
             self.identity_revoked_at = 0;
         }
-        self.revoked
-            .retain(|_, revoked| recent(&mut revoked.at, now));
+        self.revoked.retain(|_, revoked| recent(revoked.at, now));
         for key in self.keys.values_mut() {
-            key.attempts.retain_mut(|stamp| counted(stamp, now));
+            key.attempts.retain(|stamp| counted(*stamp, now));
             key.attempts.sort_unstable();
         }
     }
@@ -691,9 +717,9 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             *guard
         }
         None => {
-            let mut stamp = witness;
+            // A future witness (the wall clock went backward) is recent.
             lost = !priors_refused
-                && (priors_seen || marker != 0 || (witness != 0 && counted(&mut stamp, now)));
+                && (priors_seen || marker != 0 || (witness != 0 && counted(witness, now)));
             if lost {
                 DuplicateRebuildGuard::closed()
             } else {
@@ -711,6 +737,10 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     if guard.closed_at == Some(UNSTAMPED) {
         guard.closed_at = Some(now);
     }
+    // MONEY 724h condition 3: behind the guard's latest persisted stamp the
+    // wall clock went backward. That time is no new authority: no grant is
+    // made or reused, and no new key is admitted, until the clock passes it.
+    let regressed = now < guard.latest_stamp();
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
     if lost && priors.is_empty() {
@@ -800,6 +830,8 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             } else {
                 "guard_state_closed"
             })
+        } else if regressed {
+            Some("grant_clock_regressed")
         } else if guard.keys.len() + guard.revoked.len() >= MAX_TRACKED_KEYS {
             // A revoke moves its key's slot to `r` for one window.
             Some("tracked_key_cap")
@@ -874,17 +906,23 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         }
         // MONEY 724g/724h P2: this process's saved grant authorizes a read
         // only while its own stamp is still one of the key's counted attempts
-        // and within `N3_GRANT_MAX_LOAD_TO_READ` of now. Past either (or
-        // clamped by a clock rollback) it is spent, never moved forward: the
-        // read needs a fresh counted attempt below, from the same budget.
+        // and within `N3_GRANT_MAX_LOAD_TO_READ` of now. Past either, or
+        // with the wall clock behind the guard's latest stamp (condition 3),
+        // it is spent, never moved forward: the read needs a fresh counted
+        // attempt below, from the same budget.
         let unspent = if tracked.has(EXHAUSTED) || tracked.has(STARTED) {
             None
         } else {
             with_persisted(|grants| grants.get(id).copied()).filter(|stamp| {
                 tracked.attempts.contains(stamp)
+                    && !regressed
                     && now <= stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ)
             })
         };
+        if unspent.is_none() {
+            // Spent (or never this process's): never reused later.
+            spend(id, tracked);
+        }
         if unspent.is_some() && open {
             // This process saved the grant and has not started its read. A
             // closed guard refuses it below instead. Its stamp stays: the
@@ -894,7 +932,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             }
             continue;
         }
-        if open && tracked.attempts.len() < MAX_ATTEMPTS_PER_WINDOW {
+        if open && !regressed && tracked.attempts.len() < MAX_ATTEMPTS_PER_WINDOW {
             tracked.attempts.push(now);
             tracked.flags = PENDING | (tracked.flags & CURRENT);
             transient.grants.push((id.clone(), now));
@@ -1108,9 +1146,21 @@ pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
     if guard.keys.is_empty() {
         return false;
     }
-    guard.keys.get(&key_id(key)).is_some_and(|tracked| {
-        tracked.has(HELD) || (!tracked.has(CURRENT) && grant_expired(tracked, now_unix()))
+    let id = key_id(key);
+    guard.keys.get(&id).is_some_and(|tracked| {
+        tracked.has(HELD) || (!tracked.has(CURRENT) && admission_refused(guard, &id, tracked))
     })
+}
+
+/// MONEY 724h P2 and condition 3, as candidate selection admits a read:
+/// `tracked`'s grant is spent (its span over, or the wall clock behind the
+/// guard's latest persisted stamp). A spent grant stays spent (`spend`).
+fn admission_refused(guard: &DuplicateRebuildGuard, id: &str, tracked: &TrackedKey) -> bool {
+    let spent = grant_spent(tracked, now_unix(), guard.latest_stamp()).is_some();
+    if spent {
+        spend(id, tracked);
+    }
+    spent
 }
 
 /// Candidate selection: `key` holds an unspent grant of this load, so its
@@ -1127,8 +1177,13 @@ pub(crate) fn rearmed(index: &ScanIndex, key: &str) -> bool {
             .claude_request_census_shadow
             .rebuild_bound
             .as_deref()
-            .and_then(|guard| guard.keys.get(&key_id(key)))
-            .is_some_and(|tracked| !grant_expired(tracked, now_unix()))
+            .is_some_and(|guard| {
+                let id = key_id(key);
+                guard
+                    .keys
+                    .get(&id)
+                    .is_some_and(|tracked| !admission_refused(guard, &id, tracked))
+            })
 }
 
 /// A Claude parse is starting: the current rearm of this key is being spent.
@@ -1203,30 +1258,31 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     // grant still re-reads its intact fingerprint: an identity-armed empty
     // fingerprint is the identity path's read, never this bound's.
     let now = now_unix();
+    let high_water = guard.latest_stamp();
     let transient = &index.claude_request_census.rebuild_transient;
     let rearmed_ids: BTreeMap<String, &String> = transient
         .rearmed
         .iter()
         .map(|key| (key_id(key), key))
         .collect();
-    let spent: BTreeSet<&str> = guard
+    let spent: BTreeMap<&str, &'static str> = guard
         .keys
         .iter()
-        .filter(|(id, key)| {
-            grant_expired(key, now)
-                && (!key.has(CURRENT)
-                    || rearmed_ids
-                        .get(*id)
-                        .and_then(|key| index.files.get(*key))
-                        .is_some_and(|entry| !entry.source_file_fingerprint.is_empty()))
+        .filter_map(|(id, key)| Some((id, key, grant_spent(key, now, high_water)?)))
+        .filter(|(id, key, _)| {
+            !key.has(CURRENT)
+                || rearmed_ids
+                    .get(*id)
+                    .and_then(|key| index.files.get(*key))
+                    .is_some_and(|entry| !entry.source_file_fingerprint.is_empty())
         })
-        .map(|(id, _)| id.as_str())
+        .map(|(id, _, cause)| (id.as_str(), cause))
         .collect();
     let mut emitted = 0;
     let tracked = guard
         .keys
         .iter()
-        .filter(|(id, key)| key.has(EXHAUSTED) || spent.contains(id.as_str()))
+        .filter(|(id, key)| key.has(EXHAUSTED) || spent.contains_key(id.as_str()))
         .map(|(id, key)| {
             // A closed guard refuses until it reopens; otherwise the oldest
             // stamp's expiry allows the next counted attempt.
@@ -1235,21 +1291,33 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
                     .first()
                     .map_or(0, |stamp| stamp.saturating_add(ATTEMPT_WINDOW_SECONDS + 1))
             };
+            // Behind the guard's latest stamp, nothing is admitted until the
+            // wall clock passes it.
+            let regressed = now < high_water;
+            let after_regression = || high_water.saturating_add(1);
             let (cause, retry_after) = match guard.closed_at {
-                _ if !key.has(EXHAUSTED) => (
-                    "grant_read_span_expired",
-                    // The next load grants a new counted attempt if the
-                    // budget allows one.
-                    if key.attempts.len() < MAX_ATTEMPTS_PER_WINDOW {
-                        now
-                    } else {
-                        oldest()
-                    },
-                ),
+                _ if !key.has(EXHAUSTED) => {
+                    let cause = spent[id.as_str()];
+                    (
+                        cause,
+                        // The next load grants a new counted attempt if the
+                        // budget allows one.
+                        if key.attempts.len() >= MAX_ATTEMPTS_PER_WINDOW {
+                            oldest()
+                        } else if regressed {
+                            after_regression()
+                        } else {
+                            now
+                        },
+                    )
+                }
                 Some(closed_at) if key.attempts.len() < MAX_ATTEMPTS_PER_WINDOW => (
                     "guard_state_closed",
                     closed_at.saturating_add(WINDOW_SECONDS + 1),
                 ),
+                _ if regressed && key.attempts.len() < MAX_ATTEMPTS_PER_WINDOW => {
+                    ("grant_clock_regressed", after_regression())
+                }
                 _ if key.has(HELD) => ("legacy_rearm_held", oldest()),
                 _ => ("rebuild_bound_7d", oldest()),
             };
@@ -1262,14 +1330,17 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
         .iter()
         .map(|(id, cause)| {
             let retry_after = match *cause {
-                "guard_state_closed" | "guard_lost" => {
-                    guard.closed_at.unwrap_or(guard.untracked_refused_at)
+                "grant_clock_regressed" => high_water.saturating_add(1),
+                cause => match cause {
+                    "guard_state_closed" | "guard_lost" => {
+                        guard.closed_at.unwrap_or(guard.untracked_refused_at)
+                    }
+                    "orphaned_rearm" => guard.orphaned_at,
+                    "priors_decode_refused" => guard.priors_refused_at,
+                    _ => guard.untracked_refused_at,
                 }
-                "orphaned_rearm" => guard.orphaned_at,
-                "priors_decode_refused" => guard.priors_refused_at,
-                _ => guard.untracked_refused_at,
-            }
-            .saturating_add(WINDOW_SECONDS + 1);
+                .saturating_add(WINDOW_SECONDS + 1),
+            };
             (id.as_str(), *cause, 0, retry_after)
         });
     for (id, cause, attempts, retry_after) in tracked.chain(untracked) {

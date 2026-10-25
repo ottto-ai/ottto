@@ -54,7 +54,12 @@ forward: the key is skipped (an earlier checkpoint's marked empty is held),
 counted as exhausted with cause `grant_read_span_expired`, and read only
 through a new counted attempt from the same budget, saved before its scan. A
 stamp counts for one window plus that span, so any rolling seven days hold at
-most two actual reads, whenever each load ran. At most 512 keys are tracked, one compact line each in the saved
+most two actual reads, whenever each load ran. Stamps are used exactly as
+persisted (MONEY 724h condition 3): a wall clock that goes backward never
+clamps or expires one early, and behind the guard's latest stamp no grant is
+made or reused, no new key admitted and no read admitted
+(`grant_clock_regressed`, counted as exhausted) until the clock passes it; a
+grant found spent stays spent in its process. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.
 

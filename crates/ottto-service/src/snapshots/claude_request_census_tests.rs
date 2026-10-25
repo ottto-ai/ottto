@@ -2838,10 +2838,13 @@ fn census_duplicate_rebuild_future_stamp_refuses_until_a_clean_decode() {
         let mut index = ScanIndex::load(&path).unwrap();
         assert!(!census_rebuild_rearms(&index, &key, &fingerprint));
         assert!(bound::exhausted(&index, &key));
+        // MONEY 724h condition 3: kept exactly as persisted, never clamped
+        // to now (a clamp would shrink their window once the clock catches
+        // up).
         assert_eq!(
             bound::attempts(&index, &key),
-            vec![N3_T0, N3_T0],
-            "clamped to now"
+            vec![future, future],
+            "kept as persisted"
         );
         assert_eq!(census_exhausted_counter(&mut index), 1);
         assert_eq!(census_rebuild_alarms(&key, "rebuild_bound_7d"), 1);
@@ -4372,6 +4375,231 @@ fn census_duplicate_rebuild_read_past_the_grant_span_needs_a_new_counted_attempt
                     "{case} restart={restart}: no free read"
                 );
                 assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+            }
+        }
+    }
+}
+
+/// MONEY 724h condition 3: a wall clock that goes backward is no new
+/// authority. A grant made at `N3_T0` and reached with the clock one hour
+/// back is spent: nothing is read (an earlier checkpoint's marked empty is
+/// held), the census line counts it as exhausted (`grant_clock_regressed`),
+/// alarmed. A reload while the clock is still behind makes no new attempt.
+/// Once the clock passes the stamp again the spent grant is never reused,
+/// even within its span: its attempt still counts, and only a new counted
+/// attempt, saved before its scan, reads the key. An identity-armed empty
+/// fingerprint still takes the identity path: never held, never counted. In
+/// one process and across a restart; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_backward_clock_spends_the_grant() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants, SourceRearm,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier", "identity"] {
+            for restart in [false, true] {
+                let case = format!("shadow={enabled} {form} restart={restart}");
+                bound::restart();
+                let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-clock-back");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let clock = bound::set_now(N3_T0);
+                let mut index = ScanIndex::load(&path).unwrap();
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                if form == "identity" {
+                    census_identity_clear(
+                        &mut index,
+                        &key,
+                        SourceRearm::Identity("identity_contract:clock-back"),
+                    );
+                }
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}: at the load"
+                );
+                drop(clock);
+
+                // The scan reaches the key with the wall clock one hour back.
+                let back = N3_T0 - 3_600;
+                let clock = bound::set_now(back);
+                if form == "identity" {
+                    assert!(!bound::held(&index, &key), "{case}: never held");
+                    assert_eq!(
+                        census_rebuild_decision(&index, &key, &fingerprint),
+                        rearmed,
+                        "{case}: the identity path reads it"
+                    );
+                    assert_eq!(census_rebuild_counters(&mut index), (0, 0), "{case}");
+                    assert_eq!(census_rebuild_alarms(&key, "grant_clock_regressed"), 0);
+                    continue;
+                }
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: no read on backward time"
+                );
+                assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+                assert_eq!(
+                    census_rebuild_counters(&mut index),
+                    (1, 0),
+                    "{case}: counted as exhausted"
+                );
+                assert_eq!(
+                    census_rebuild_alarms(&key, "grant_clock_regressed"),
+                    1,
+                    "{case}: alarmed"
+                );
+                drop(clock);
+
+                // Reloaded while the clock is still behind: no new attempt.
+                if restart {
+                    bound::restart();
+                }
+                let clock = bound::set_now(back + 60);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+                assert!(bound::exhausted(&index, &key), "{case}");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: still no new authority"
+                );
+                assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                assert_eq!(
+                    census_rebuild_alarms(&key, "grant_clock_regressed"),
+                    if restart { 2 } else { 1 },
+                    "{case}: once per process"
+                );
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                assert_eq!(
+                    bound::saved_stamps(&path, &key),
+                    vec![N3_T0],
+                    "{case}: nothing stamped on backward time"
+                );
+                drop(clock);
+
+                // The clock passes the stamp again, inside the old grant's
+                // span: the spent grant is not reused.
+                let forward = N3_T0 + 60;
+                let _clock = bound::set_now(forward);
+                let mut index = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    bound::attempts(&index, &key),
+                    vec![N3_T0, forward],
+                    "{case}: the spent attempt still counts; a new one reads"
+                );
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}"
+                );
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                assert_eq!(
+                    bound::saved_stamps(&path, &key),
+                    vec![N3_T0, forward],
+                    "{case}: saved before the scan"
+                );
+            }
+        }
+    }
+}
+
+/// MONEY 724h condition 3: backward time never frees budget or shrinks a
+/// stamp's window. Two reads at real times 60 s and 1 d + 60 s; the wall
+/// clock then runs three days behind for a while (no third read: both
+/// stamps lie ahead of it and still count), and comes forward again. Each
+/// cycle loads, reads later and saves its index, so a clamp of the stamps
+/// would have been persisted. The stamps stay as persisted, and any real
+/// seven days hold at most two actual reads. In one process and with a
+/// restart before every cycle; current and earlier forms; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_backward_clock_never_frees_budget_or_shrinks_the_window() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, note_duplicate_rebuild_started,
+        persist_duplicate_rebuild_grants,
+    };
+    const WINDOW: u64 = 7 * N3_DAY;
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    // (real load, real read, how far the wall clock runs behind), offsets
+    // from N3_T0.
+    let schedule = [
+        (0, 60, 0),
+        (N3_DAY, N3_DAY + 60, 0),
+        (2 * N3_DAY, 2 * N3_DAY + 60, 3 * N3_DAY),
+        (5 * N3_DAY, 5 * N3_DAY + 60, 3 * N3_DAY),
+        // A clamp to the backward clock would have freed both slots here.
+        (6 * N3_DAY + N3_SPAN + 2, 6 * N3_DAY + N3_SPAN + 62, 0),
+        (N3_ATTEMPT_WINDOW + 1, N3_ATTEMPT_WINDOW + 61, 0),
+        (8 * N3_DAY, 8 * N3_DAY + 60, 0),
+        (
+            N3_DAY + N3_ATTEMPT_WINDOW + 1,
+            N3_DAY + N3_ATTEMPT_WINDOW + 61,
+            0,
+        ),
+    ];
+    let expected = [
+        60,
+        N3_DAY + 60,
+        N3_ATTEMPT_WINDOW + 61,
+        N3_DAY + N3_ATTEMPT_WINDOW + 61,
+    ]
+    .map(|offset| N3_T0 + offset);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for restarts in [false, true] {
+                let case = format!("shadow={enabled} {form} restarts={restarts}");
+                bound::restart();
+                let scratch =
+                    crate::test_scratch::ScratchDir::new("census-rebuild-clock-back-window");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let mut reads: Vec<u64> = Vec::new();
+                for (cycle, (load, read, behind)) in schedule.into_iter().enumerate() {
+                    let (load, read) = (N3_T0 + load, N3_T0 + read);
+                    if restarts {
+                        bound::restart();
+                    }
+                    let clock = bound::set_now(load - behind);
+                    let mut index = ScanIndex::load(&path).unwrap();
+                    persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                    drop(clock);
+                    let clock = bound::set_now(read - behind);
+                    if census_rebuild_decision(&index, &key, &fingerprint) == rearmed {
+                        reads.push(read);
+                        let in_window = reads.iter().filter(|earlier| read - **earlier <= WINDOW);
+                        assert!(
+                            in_window.count() <= MAX_N3_REARMS_PER_WINDOW,
+                            "{case}: more than two reads in seven real days: {reads:?}"
+                        );
+                        note_duplicate_rebuild_started(&mut index, Path::new(&key));
+                    }
+                    // The cycle's own save, on its (possibly backward) clock.
+                    index.save(&path).unwrap();
+                    drop(clock);
+                    if behind > 0 {
+                        assert_eq!(
+                            bound::saved_stamps(&path, &key),
+                            vec![N3_T0, N3_T0 + N3_DAY],
+                            "{case} cycle {cycle}: kept as persisted, never clamped"
+                        );
+                    }
+                }
+                assert_eq!(reads, expected, "{case}");
             }
         }
     }
