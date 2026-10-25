@@ -3748,6 +3748,13 @@ holder_view: crate::snapshots::claude_request_money::coverage::ClaudeHolderView 
         );
         assert_eq!(body.new.requests, item.request_count);
         assert!(body.grains.values().any(|(_, new)| new.cost_micros == 100));
+        // Ordinary OFF remains composed main's diff projection. This does not
+        // suppress the full-body mismatched-price assertions above.
+        let ordinary = c.build_mode(A, NOW, false, false).0;
+        assert_eq!(ordinary.new.tokens, ordinary.old.tokens);
+        assert_eq!(ordinary.new.requests, ordinary.old.requests);
+        assert_eq!(ordinary.new.cost_micros, 0);
+        assert!(ordinary.grains.values().all(|(_, new)| new.cost_micros == 0));
     }
 
     // A fixture projection of the already-built grains lets contract-5 verify

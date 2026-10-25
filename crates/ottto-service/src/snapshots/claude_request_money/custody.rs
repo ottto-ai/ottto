@@ -1279,13 +1279,26 @@ impl Custody {
     pub(crate) fn remove(&mut self, key: &str) {
         let _ = self.take(key);
     }
+    fn routed_file_binding(carrier: &str, file: &FileCustody) -> bool {
+        file.logical.is_some()
+            || file.slots().any(|slot| {
+                slot.key.entity().is_some()
+                    || ((slot.key.starts_with("fam:") || slot.key.starts_with("adopt:member:v1:"))
+                        && carrier
+                            .strip_prefix("file:")
+                            .map_or(true, |key| slot.key != key))
+            })
+    }
+    fn routed_telemetry_binding(file: &TelemetryCustody) -> bool {
+        file.slots()
+            .any(|slot| slot.key.entity().is_some() || slot.key.starts_with("adopt:member:v1:"))
+    }
     fn recount_globals(&mut self) {
-        self.primary_bindings = self.files.values().any(|file| {
-            file.logical.is_some() || file.slots().any(|slot| slot.key.entity().is_some())
-        }) || self
-            .telemetry
-            .values()
-            .any(|file| file.slots().any(|slot| slot.key.entity().is_some()));
+        self.primary_bindings = self
+            .files
+            .iter()
+            .any(|(carrier, file)| Self::routed_file_binding(carrier, file))
+            || self.telemetry.values().any(Self::routed_telemetry_binding);
         self.offers = self
             .files
             .values()
@@ -2432,6 +2445,18 @@ impl Custody {
                 self.offers = self.offers.saturating_sub(entry_offers);
             }
         }
+        if valid {
+            // META/control can load before data shards. Restore this derived
+            // routing hint incrementally, independently of shard arrival order.
+            self.primary_bindings |= self
+                .files
+                .get::<str>(key.as_ref())
+                .is_some_and(|file| Self::routed_file_binding(&key, file))
+                || self
+                    .telemetry
+                    .get::<str>(key.as_ref())
+                    .is_some_and(Self::routed_telemetry_binding);
+        }
         valid
     }
     pub(super) fn zero_control(&self) -> impl Serialize + '_ {
@@ -2985,6 +3010,7 @@ impl Custody {
                 self.replace(&address, Some(ambiguous));
                 let after = self.carrier_size(&target).0;
                 self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+                self.primary_bindings = true;
                 changes.push(FieldChange {
                     carrier: target,
                     before,
@@ -3024,6 +3050,7 @@ impl Custody {
                     return Some((changes, false));
                 }
                 self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+                self.primary_bindings = true;
                 changes.push(FieldChange {
                     carrier: target,
                     before,
@@ -3200,6 +3227,55 @@ impl Custody {
 #[cfg(test)]
 mod compact_layout_tests {
     use super::*;
+    #[test]
+    fn loaded_primary_memo_routing_survives_control_first_and_missing_logical_hint() {
+        let root = "a1111111-1111-4111-8111-111111111111";
+        let path = "/fixture/projects/root.jsonl";
+        let key = super::super::super::claude_request_census::family_key(root);
+        let record = Record::family_record(
+            [7; 32],
+            42,
+            super::super::super::claude_request_census::ClaudeFamilyMemo {
+                snapshot: 5,
+                ..Default::default()
+            },
+        );
+        let mut original = Custody::default();
+        assert!(original.bind_file(path, root.into(), root.into(), None));
+        assert_eq!(original.insert(key.clone(), record.clone()), Insert::Stored);
+        let wire = serde_json::to_value(&original).unwrap();
+        let entries = wire.as_object().unwrap();
+        let mut loaded = Custody::default();
+        // Match production: global META can precede any data shard.
+        for (carrier, value) in entries
+            .iter()
+            .filter(|(k, _)| k.as_str() == CONTROL || k.as_str() == EVER)
+            .chain(
+                entries
+                    .iter()
+                    .filter(|(k, _)| k.as_str() != CONTROL && k.as_str() != EVER),
+            )
+        {
+            assert!(loaded.absorb_entry(
+                carrier.clone(),
+                &value.to_string(),
+                super::super::store::LEDGER_MAX_RECORDS
+            ));
+        }
+        assert!(loaded.primary_bindings);
+        assert_eq!(loaded.get(&key).unwrap().to_owned_record(), record);
+        // Orphan/promotion overlap may retain the memo after logical metadata
+        // is absent. The actual non-default carrier still requires routing.
+        loaded
+            .files
+            .get_mut::<str>(format!("file:{}", digest(path)).as_str())
+            .unwrap()
+            .logical = None;
+        loaded.recount_globals();
+        assert!(loaded.primary_bindings);
+        assert_eq!(loaded.get(&key).unwrap().to_owned_record(), record);
+    }
+
     #[test]
     fn rebinding_a_cloned_query_keeps_the_original_payload_and_query_identity() {
         let binding = |body: &str| {

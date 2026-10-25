@@ -1151,7 +1151,10 @@ pub(crate) fn build_claude_request_body(
     if family.collect_entities {
         finalize_shadow(&mut body, family);
     } else {
-        // Main's diff projection needs no full entity/contribution copies.
+        // Main's OFF diff projection needs no full entity/contribution copies.
+        // In particular counted_slice deliberately counts a telemetry-token
+        // mismatch without inventing a pricing grain (as composed main does).
+        // Full-mode pricing above/finalize_shadow remains independently tested.
         let mut tokens = i128::from(body.old.tokens);
         let mut requests = i128::from(body.old.requests);
         for (old, new) in body.grains.values() {

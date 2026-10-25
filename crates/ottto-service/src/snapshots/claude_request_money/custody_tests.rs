@@ -1008,6 +1008,13 @@ fn recovery_takes_current_empty_parse_capture_without_a_snapshot_item() {
         assert!(!ledger.recovering());
     })
     .unwrap();
+    // Completed empties must leave the capture head. Otherwise 64 of them
+    // can starve every changed nonempty family on later live pages.
+    page();
+    assert!(
+        last_page_schedule_for_test().is_empty(),
+        "a rebuilt empty family has no outstanding scheduled capture"
+    );
 }
 
 #[test]

@@ -2172,7 +2172,15 @@ async fn build_page_with_coverage(
     if live {
         // Empty parses have no SnapshotItem. They still need a scheduled
         // capture turn to rebuild message custody after a damaged ledger.
+        let empty_setup_limit =
+            first_family_deadline - FIRST_FAMILY_SETUP_RESERVE - SCHEDULE_SETUP_RESERVE;
         for key in &index.confirmed_empty_files {
+            if Instant::now() >= empty_setup_limit {
+                break;
+            }
+            if !store::rebuild_due(support_dir, key) {
+                continue;
+            }
             if let Some(root) = selection::logical_family_root_ref(index, key) {
                 items_by_root.entry(root).or_default();
             }
@@ -2248,12 +2256,14 @@ async fn build_page_with_coverage(
     );
     counts.result_apply_us = applying.elapsed().as_micros() as u64;
     let mut applied_rest = false;
+    let mut empty_captures_consumed = BTreeSet::new();
     if live && ledger.recovering() {
         for key in capture::captured_index_keys(&scope_key) {
             if Instant::now() >= setup_deadline {
                 break;
             }
-            if !index.confirmed_empty_files.contains(&key) {
+            if !index.confirmed_empty_files.contains(&key) || !ledger.census().rebuild_needed(&key)
+            {
                 continue;
             }
             let Some(entry) = index.files.get(&key) else {
@@ -2272,6 +2282,11 @@ async fn build_page_with_coverage(
                     true,
                     &mut counts,
                 );
+                if !ledger.census().rebuild_needed(&key) {
+                    if let Some(root) = selection::logical_family_root_ref(index, &key) {
+                        empty_captures_consumed.insert(root.to_owned());
+                    }
+                }
             }
         }
     }
@@ -2285,11 +2300,16 @@ async fn build_page_with_coverage(
     // capture (the installed plan's families on a Full parse) are keyed
     // first, so a cut-off schedule still picks a captured family zero. The
     // rest is keyed and sorted after family zero.
-    let captured_roots = capture::captured_index_keys(&scope_key)
+    let mut captured_roots = capture::captured_index_keys(&scope_key)
         .iter()
         .filter_map(|key| super::claude_index_path_member_ref(Path::new(key)))
         .filter_map(|member| roots.get_key_value(member.root).map(|(root, _)| *root))
         .collect::<BTreeSet<_>>();
+    for root in &empty_captures_consumed {
+        if let Some((root, _)) = roots.get_key_value(root.as_str()) {
+            captured_roots.insert(*root);
+        }
+    }
     let mut unkeyed = captured_roots.iter().copied().chain(
         roots
             .keys()
@@ -2631,7 +2651,8 @@ async fn build_page_with_coverage(
             .ok_or("deadline"),
             _ => Err("deadline"),
         };
-        let capture_consumed = !family_captures.is_empty();
+        let capture_consumed =
+            !family_captures.is_empty() || empty_captures_consumed.contains(root);
         let scratch = prepared.and_then(|()| {
             family_preflight(
                 root,
