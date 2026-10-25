@@ -217,6 +217,12 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
                 });
                 let frame = match frame {
                     Ok(Some(frame)) => frame,
+                    Ok(None) if retained_progress.is_none() => {
+                        // Ordinary recovery retirement can park preparation
+                        // before this turn has collected its first page.
+                        money::store::flush();
+                        continue;
+                    }
                     Ok(None) => break (Ok(()), retained_progress.expect("resumed progress path")),
                     Err(error)
                         if error
