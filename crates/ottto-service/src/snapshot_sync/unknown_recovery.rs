@@ -773,6 +773,7 @@ pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
 #[derive(Default)]
 struct Catalog {
     fault: bool,
+    loaded: bool,
     awaiting_ack: BTreeSet<String>,
     funds: Vec<money::ShadowReservation>,
     entries: Vec<Manifest>,
@@ -851,6 +852,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
             support.to_path_buf(),
             Catalog {
                 fault: false,
+                loaded: false,
                 awaiting_ack: BTreeSet::new(),
                 funds: Vec::new(),
                 entries: Vec::new(),
@@ -880,6 +882,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
             .ok_or_else(fault)?;
         let funds = money::ShadowReservation::admit(charge).ok_or_else(capacity_full)?;
         catalog.entries = entries;
+        catalog.loaded = true;
         catalog.funds.clear();
         catalog.funds.push(funds);
         catalog.loading = None;
@@ -993,6 +996,27 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
         return Ok(false);
     }
     Ok(true)
+}
+
+/// Ordinary cleanup of already validated, unexpired custody is Claude work,
+/// not a reason to skip health or unrelated sources. Cold loads, expiry,
+/// disable and binding loss must still finish before any cycle networking.
+pub(super) fn networking_ready(support: &Path, binding: Option<&str>, now: u64) -> bool {
+    CATALOGS.lock().ok().is_some_and(|catalogs| {
+        catalogs.get(support).is_some_and(|catalog| {
+            catalog.loaded
+                && !catalog.fault
+                && (catalog.entries.is_empty() || money::request_owned_live(support))
+                && catalog.entries.iter().all(|m| {
+                    now < m.deadline
+                        && binding.map_or(true, |binding| m.binding == binding)
+                        && !matches!(
+                            m.terminal,
+                            Some(Reason::Expired | Reason::Disabled | Reason::BindingLost)
+                        )
+                })
+        })
+    })
 }
 
 pub(crate) fn initialized(support: &Path) -> bool {

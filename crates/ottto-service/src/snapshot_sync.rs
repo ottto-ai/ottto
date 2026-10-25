@@ -4143,7 +4143,12 @@ fn sync_once_with_retry(
             && !unknown_recovery::expired_payload(support_dir, now)?;
         if !owner_current {
             money_resume::cancel_owner(daemon);
-            if !unknown_recovery::offline_startup(support_dir, now)? {
+            let ready = match unknown_recovery::offline_startup(support_dir, now) {
+                Ok(ready) => ready,
+                Err(error) if error.is::<unknown_recovery::CapacityFull>() => false,
+                Err(error) => return Err(error),
+            };
+            if !ready && !unknown_recovery::networking_ready(support_dir, None, now) {
                 return Err(crate::source_rotation::LocalRefusal(
                     "request money privacy checkpoint pending",
                 )
@@ -4188,7 +4193,12 @@ fn sync_once_with_retry(
             &account_witness,
         )? {
             money_resume::cancel_owner(daemon);
-            if !unknown_recovery::startup(support_dir, &binding, now)? {
+            let ready = match unknown_recovery::startup(support_dir, &binding, now) {
+                Ok(ready) => ready,
+                Err(error) if error.is::<unknown_recovery::CapacityFull>() => false,
+                Err(error) => return Err(error),
+            };
+            if !ready && !unknown_recovery::networking_ready(support_dir, Some(&binding), now) {
                 return Err(crate::source_rotation::LocalRefusal(
                     "request money identity checkpoint pending",
                 )

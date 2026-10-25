@@ -3309,6 +3309,24 @@ fn p2a_completed_finish_keeps_catalog_and_quiet_privacy_cycles_ready() {
         unknown_recovery::initialized(&control.support),
         "completed finish must retain its reconciled catalog; cancellation still invalidates"
     );
+    // Do not drain ordinary retirement first: a completed live POST must not
+    // make the next real cycle refuse all health/status and other sources.
+    let collection = AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    crate::agent_status_refresh::with_test_collection(collection, || {
+        sync_once_with_retry(
+            &control.fixture.home,
+            &control.support,
+            &control.daemon,
+            &mut retry,
+        )
+    })
+    .unwrap();
     let now = current_unix_seconds();
     control.recovery_startup(now);
     assert!(unknown_recovery::offline_startup(&control.support, now).unwrap());
@@ -3531,7 +3549,14 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     index.save(&control.index_path).unwrap();
     unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
-    control.recovery_startup(now);
+    money_resume::drive_for_test(std::future::poll_fn(|_| {
+        match unknown_recovery::startup(&control.support, &binding, now) {
+            Ok(true) => std::task::Poll::Ready(Ok(())),
+            Ok(false) => std::task::Poll::Pending,
+            Err(error) => std::task::Poll::Ready(Err(error)),
+        }
+    }))
+    .unwrap();
     assert!(unknown_recovery::active_for_test(&control.support).is_empty());
     progress.prepare_quarantine_retries(&BTreeMap::new());
     assert_eq!(
