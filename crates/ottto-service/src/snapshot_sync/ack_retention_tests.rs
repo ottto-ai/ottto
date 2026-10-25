@@ -828,6 +828,7 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
                 .insert(format!("session-{entity}"), fp.clone());
             progress.record_body(&fp, &fp);
         }
+        committed.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let unindexed = "f".repeat(64);
         progress.record_body(&unindexed, &"a".repeat(64));
         committed.save(&index_path).unwrap();
