@@ -1520,17 +1520,35 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             "2026-08-02T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
+        let mut progress = e2_progress();
+        // Production Completed settlement of one ordinary page, then reload.
+        let settle = |c: &Corpus,
+                      committed: &ScanIndex,
+                      mut page: Page,
+                      progress: &mut SnapshotUploadProgress| {
+            page.finish();
+            upload(&page.scan.snapshots, progress, ack).0.unwrap();
+            let holds = LocalHoldSettlement::classify(
+                SnapshotSource::ClaudeCode,
+                &mut page.index,
+                &mut page.scan,
+                &page.disposition,
+            );
+            let mut settled = settle_completed_upload(page.index, committed, progress, &holds);
+            settle_index_after_upload(&mut settled.index, committed, progress);
+            c.reload(&mut settled.index)
+        };
         let old = ScanIndex::default();
-        let mut first = ready(&c, &scanner, old, 100, false);
+        let first = ready(&c, &scanner, old.clone(), 100, false);
         literal(&first);
         assert_eq!(total(&first), 2);
-        first.finish();
-        let mut progress = e2_progress();
-        upload(&first.scan.snapshots, &mut progress, ack).0.unwrap();
-        first
-            .index
-            .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
-        let mut prior = c.reload(&mut first.index);
+        let prior = settle(&c, &old, first, &mut progress);
+        // A fresh index's first page records the identity contract, which
+        // re-arms every family file for one re-read. Consume that one-time
+        // re-read on an ordinary page, so the byte-limited page below has no
+        // reason to read the twins except the owed adoption.
+        let warm = ready(&c, &scanner, prior.clone(), 100, false);
+        let mut prior = settle(&c, &prior, warm, &mut progress);
         let before = prior.current_snapshot_fingerprints();
         assert_eq!(
             before.len(),
