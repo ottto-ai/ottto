@@ -1392,6 +1392,9 @@ impl<R: std::io::Read> CensusRead<R> {
             }
         }
         if overflow {
+            if self.selection_state && !self.syntax_only {
+                return Ok(super::claude_request_money::capped_selection_json());
+            }
             return Ok(b"null".to_vec());
         }
         // Parsing is isolated from the enclosing index, including numeric
@@ -3554,6 +3557,9 @@ mod memo_accounting_tests {
 
 /// Rearm physical revision-3 evidence whose optional logical selection was lost.
 pub(super) fn repair_money_selection_loss(index: &mut ScanIndex) {
+    if super::claude_request_money::selections_capped(&index.claude_money_files) {
+        return;
+    }
     let mut reowe = Vec::new();
     for (key, entry) in &index.files {
         if super::claude_index_path_member_ref(std::path::Path::new(key)).is_none() {

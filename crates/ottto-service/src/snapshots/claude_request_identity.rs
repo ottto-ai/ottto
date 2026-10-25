@@ -507,10 +507,6 @@ impl Grouping {
             .groups
             .get(bucket_start)
             .and_then(|rows| rows.get(row_key));
-        #[cfg(test)]
-        if found.is_none() {
-            eprintln!("REQUEST_MONEY_REPRODUCE missing_key test={:?} bucket={bucket_start} expected={row_key:?} groups={:?}", std::thread::current().name(), self.groups.iter().map(|(bucket, rows)| (bucket, rows.keys().collect::<Vec<_>>())).collect::<Vec<_>>());
-        }
         found
     }
 
@@ -772,13 +768,6 @@ pub(crate) fn apply_grouped(
 
 fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligible> {
     if row_counts(row) != amounts.counts {
-        #[cfg(test)]
-        eprintln!(
-            "REQUEST_MONEY_REPRODUCE counts test={:?} row={:?} grouped={:?}",
-            std::thread::current().name(),
-            row_counts(row),
-            amounts.counts
-        );
         return Err(Ineligible::RowsNotReproduced);
     }
     for (index, wire) in row_costs(row).into_iter().enumerate() {
@@ -790,12 +779,6 @@ fn reproduces(row: &SnapshotModelUsage, amounts: &Amounts) -> Result<(), Ineligi
                 }
             }
             _ => {
-                #[cfg(test)]
-                eprintln!(
-                    "REQUEST_MONEY_REPRODUCE cost_field={index} test={:?} row={wire:?} grouped={:?}",
-                    std::thread::current().name(),
-                    amounts.wire(index)
-                );
                 return Err(Ineligible::RowsNotReproduced);
             }
         }

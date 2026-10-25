@@ -517,8 +517,7 @@ impl<'i> ClaudeScopeFiles<'i> {
         let mut files = Self::default();
         let residue = index
             .claude_request_census
-            .records()
-            .map(|(key, _)| key)
+            .retained_file_keys()
             .filter(|key| !index.files.contains_key(*key));
         for key in index.files.keys().chain(residue) {
             if Instant::now() >= deadline {
@@ -1443,6 +1442,37 @@ mod unbuilt_lifecycle_tests {
             _ => unreachable!(),
         }
         index
+    }
+
+    #[test]
+    fn scope_walk_retains_unindexed_birth_stub_as_lost_debt() {
+        let index = index(6);
+        assert!(!index.files.contains_key(OLDER));
+        assert!(index.claude_request_census.get(OLDER).is_none());
+        assert!(index.claude_request_census.retained_birth(OLDER).is_some());
+        let files =
+            ClaudeScopeFiles::walk(&index, &BTreeSet::from(["A", "B"]), deadline()).unwrap();
+        assert!(
+            files.groups["-same"].contains(&OLDER),
+            "residue must reach group scope"
+        );
+        let ledger = store::ClaudeLedger::new_for_test();
+        let scope = ClaudeLedgerScope::build(
+            &index,
+            ledger.census(),
+            &BTreeSet::from(["-same"]),
+            &BTreeSet::new(),
+            deadline(),
+        )
+        .unwrap();
+        assert_eq!(
+            scope.debt.lost, 1,
+            "a birth-only missing member is unknown debt"
+        );
+        assert_eq!(
+            classify(&index, &ledger).0,
+            ClaudeRequestVerdict::Undecided(ClaudeUndecidedBy::UnbuiltOlder)
+        );
     }
 
     #[test]

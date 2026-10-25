@@ -332,6 +332,7 @@ struct NativeBootstrapServer {
     stop: Arc<std::sync::atomic::AtomicBool>,
     worker: Option<std::thread::JoinHandle<()>>,
     bodies: Arc<Mutex<Vec<serde_json::Value>>>,
+    envelopes: Arc<Mutex<Vec<serde_json::Value>>>,
 }
 
 impl NativeBootstrapServer {
@@ -344,6 +345,8 @@ impl NativeBootstrapServer {
         let done = stop.clone();
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let captured = bodies.clone();
+        let envelopes = Arc::new(Mutex::new(Vec::new()));
+        let captured_envelopes = envelopes.clone();
         let worker = std::thread::spawn(move || {
             while !done.load(Ordering::Relaxed) {
                 let (mut stream, _) = match listener.accept() {
@@ -395,6 +398,7 @@ impl NativeBootstrapServer {
                             "snapshot_fingerprint":item["snapshot_fingerprint"],"occurrence_count":1,
                             "body_witness_version":version,"body_witness_digest":version.map(|_|digest)})
                     }).collect::<Vec<_>>();
+                    captured_envelopes.lock().unwrap().push(value.clone());
                     captured.lock().unwrap().extend(items.iter().cloned());
                     serde_json::json!({"accepted":items.len(),"sessions_reconciled":items.len(),
                         "session_ids":[],"disabled":false,"disabled_reason":null,
@@ -411,6 +415,7 @@ impl NativeBootstrapServer {
             stop,
             worker: Some(worker),
             bodies,
+            envelopes,
         }
     }
 }
@@ -787,6 +792,71 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
 
 /// CI runs this exact test source at main and the candidate against the same
 /// saved input tree. No production endpoint or host account is involved.
+// This same fixture is copied into, and run by, independently compiled main
+// and candidate binaries. Complete copied-family rows are compared in the
+// receipt; only the publication sequence (a process/time nonce) is normalized.
+fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
+    use crate::snapshots::claude_request_money as money;
+    let mut receipts = Vec::new();
+    for (case, units, copied) in [("large-family", 7_000, false), ("copied-member", 1, true)] {
+        let root = base.join(format!("shadow-regression-{case}"));
+        if root.exists() { std::fs::remove_dir_all(&root).unwrap(); }
+        let support = root.join("support");
+        let projects = root.join("projects");
+        std::fs::create_dir_all(&support).unwrap();
+        let session = "a1111111-1111-4111-8111-111111111111";
+        let text = (0..units).map(|at| serde_json::json!({
+            "timestamp":"2026-08-02T07:00:00Z","type":"assistant","sessionId":session,
+            "requestId":format!("req_{at}"),"message":{"id":format!("msg_{at}"),
+                "model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1}}
+        }).to_string()+"\n").collect::<String>();
+        for project in if copied { vec!["-one", "-two"] } else { vec!["-one"] } {
+            let path = projects.join(project).join(format!("{session}.jsonl"));
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &text).unwrap();
+        }
+        money::enable_shadow_for_test(&support);
+        let mut index = ScanIndex::default();
+        let scan = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode, &[projects], &mut index,
+            "2026-08-02T08:00:00Z", 183, 16, true).unwrap();
+        assert!(!scan.snapshots.is_empty());
+        let counts = money::shadow_page_at(&support, &scan.snapshots, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(),
+            scan.census_complete, 1_785_657_600);
+        money::store::flush();
+        if copied {
+            assert_eq!(counts.captures_taken, 0, "OFF must not consume ambiguous physical members: {counts:?}");
+        } else {
+            assert!(counts.captures_taken > 0, "large input must exercise capture preflight: {counts:?}");
+            assert_eq!(counts.families_unbuilt, 0, "main admits this >6k-unit family OFF: {counts:?}");
+            assert_eq!(counts.families_budget_deferred, 0, "OFF does not allocate the live body: {counts:?}");
+        }
+        let mut paths = std::fs::read_dir(support.join("diagnostics")).unwrap().flatten()
+            .map(|entry| entry.path()).filter(|path| path.file_name().unwrap().to_string_lossy()
+                .starts_with("claude-request-money-shadow-")).collect::<Vec<_>>();
+        paths.sort();
+        let mut rows = paths.iter().flat_map(|path| std::fs::read_to_string(path).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert!(rows.iter().any(|row| row["row"] == "family"));
+        for row in &mut rows { row.as_object_mut().unwrap().insert("snapshot".into(), 0.into()); }
+        receipts.push(serde_json::json!({"case":case,"units":units,"rows":rows}));
+        money::capture::purge_scope_for_test(&support);
+        money::disable_shadow_for_test(&support);
+    }
+    serde_json::json!(receipts)
+}
+
+#[test]
+#[serial]
+#[serial(claude_request_money_shadow)]
+fn money_gate_off_large_and_copied_families_preserve_main_shadow_admission() {
+    let scratch = crate::test_scratch::ScratchDir::new("money-off-shadow-main");
+    let _ = money_gate_off_shadow_regression_receipt(&scratch);
+}
+
 #[test]
 #[serial]
 #[serial(source_cadences)]
@@ -1048,6 +1118,7 @@ fn money_gate_off_saved_fixture_receipt() {
             )
         });
         let mut decision = "refused";
+        let mut parity_item = None;
         let mut local_markers = Vec::new();
         if let Ok(Some(mut frame)) = frame {
             for n in 0..history {
@@ -1072,6 +1143,7 @@ fn money_gate_off_saved_fixture_receipt() {
                 );
                 local_markers.push(format!("{:?}", item.claude_org_markers));
             }
+            parity_item = scan.snapshots.first().cloned().or(parity_item);
             let result = crate::agent_status_refresh::with_test_collection(collection(), || {
                 finish_sync_source(
                     preparation,
@@ -1092,10 +1164,20 @@ fn money_gate_off_saved_fixture_receipt() {
             decision = if result.is_ok() { "accepted" } else { "failed" };
             assert!(result.is_ok(), "saved-fixture finish failed: {result:?}");
         }
-        let mut offers = server.bodies.lock().unwrap().clone();
-        for item in &mut offers {
-            item.as_object_mut().unwrap().remove("collected_at");
+        let mut envelopes = server.envelopes.lock().unwrap().clone();
+        for envelope in &mut envelopes {
+            for item in envelope["snapshots"].as_array_mut().unwrap() {
+                item.as_object_mut().unwrap().remove("collected_at");
+            }
         }
+        // Compare the entire POST, including every batch capability. Only
+        // collection time is volatile across the independently built binaries.
+        let envelope_bytes = serde_json::to_vec(&envelopes).unwrap();
+        let envelope_digest = format!("{:x}", Sha256::digest(&envelope_bytes));
+        let offers = envelopes.iter()
+            .flat_map(|batch| batch["snapshots"].as_array().unwrap().iter().cloned())
+            .collect::<Vec<_>>();
+        assert_eq!(offers.len(), server.bodies.lock().unwrap().len());
         // A successful finish transfers ACKs to the scan index and clears
         // transient upload progress. Assert durable acceptance of actual POSTs.
         let saved = ScanIndex::load(&index_path).unwrap();
@@ -1173,6 +1255,32 @@ fn money_gate_off_saved_fixture_receipt() {
                 );
             }
         }
+        let mut all_source_batches = Vec::new();
+        for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex, SnapshotSource::Pi] {
+            let mut item = parity_item.as_ref().expect("fixture has a real item").clone();
+            item.collected_at = "2026-10-25T00:00:00Z".into();
+            let request = crate::snapshots::SnapshotBatchRequest {
+                schema_version: crate::snapshots::SNAPSHOT_SCHEMA_VERSION,
+                source: source.api_slug().into(), machine_id: "fixed-envelope-machine".into(),
+                collector_version: Some("fixed-envelope-collector".into()), snapshots: vec![item],
+                upload_policy: crate::snapshots::SnapshotUploadPolicy::default(),
+                client_report: crate::client_report::ClientReport::empty(),
+            };
+            let before = crate::snapshots::snapshot_upload_body_witness(&request.snapshots[0]);
+            for (kind, bytes) in [
+                ("ordinary", serde_json::to_vec(&request).unwrap()),
+                ("cas", serde_json::to_vec(&request.wire_with_head_cas()).unwrap()),
+                ("retry", crate::snapshot_retry::encode_json(&request, crate::snapshot_retry::REQUEST_BYTES).unwrap()),
+                ("cas_retry", crate::snapshot_retry::encode_json(&request.wire_with_head_cas(), crate::snapshot_retry::REQUEST_BYTES).unwrap()),
+            ] {
+                let full: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                assert!(full.get("usage_decrease_hold_ack_contract").is_none(), "legacy {source:?}/{kind} envelope changed");
+                assert_eq!(before, crate::snapshots::snapshot_upload_body_witness(&request.snapshots[0]));
+                all_source_batches.push(serde_json::json!({"source":source.api_slug(),"kind":kind,
+                    "bytes":String::from_utf8(bytes.clone()).unwrap(),"sha256":format!("{:x}",Sha256::digest(&bytes)),
+                    "body_witness":before,"revision":full["snapshots"][0]["semantic_envelope"]}));
+            }
+        }
         let ledger_after = money_saved_ledger_files(&support);
         assert_eq!(
             ledger_before, ledger_after,
@@ -1207,12 +1315,15 @@ fn money_gate_off_saved_fixture_receipt() {
         // identity bytes. The workflow diffs both receipts against main.
         receipts.push(serde_json::json!({"history":history,"decision":decision,"accepted":accepted,
             "local_claude_org_markers":local_markers,"offers":offers,
+            "full_envelopes":envelopes,"full_envelope_bytes":envelope_bytes.len(),
+            "full_envelope_sha256":envelope_digest,"all_source_batches":all_source_batches,
             "saved_fingerprints":saved.current_snapshot_fingerprints(),
             "saved_index_bytes":std::fs::metadata(&index_path).unwrap().len(),
             "live_selection_records":selections,
             "money_ledger":ledger_before.iter().map(|(path,bytes,digest,_)|
                 serde_json::json!({"path":path,"bytes":bytes,"sha256":digest})).collect::<Vec<_>>()}));
     }
+    receipts.push(serde_json::json!({"off_shadow_regressions":money_gate_off_shadow_regression_receipt(&base)}));
     std::fs::write(output, serde_json::to_vec_pretty(&receipts).unwrap()).unwrap();
     #[cfg(unix)]
     if let Ok(next_binary) = std::env::var("OTTTO_MONEY_PARITY_NEXT_BINARY") {

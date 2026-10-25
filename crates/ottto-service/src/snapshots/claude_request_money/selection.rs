@@ -16,6 +16,91 @@ pub(crate) struct MoneyFileSelection {
 }
 crate::heap_layout_bound::fields!(MoneyFileSelection; revision, root, member, consumed, synthetic_body, reparse_union);
 
+// A reserved local entry distinguishes capacity refusal from lost evidence.
+// A capped index pauses live adoption; it never re-arms intentionally omitted
+// selections or re-offers an untracked synthetic body after restart.
+const CAPACITY_KEY: &str = "!selection-capacity";
+const MAX_SELECTIONS: usize = 65_536;
+const MAX_SELECTION_KEY: usize = 4096;
+const MAX_SELECTION_RECORD: usize = 8192;
+const MAX_SELECTION_BYTES: usize = super::super::claude_request_census::MAX_RAW_BYTES;
+
+fn capacity_marker() -> MoneyFileSelection {
+    MoneyFileSelection {
+        revision: "0".repeat(64),
+        root: String::new(),
+        member: String::new(),
+        consumed: None,
+        synthetic_body: None,
+        reparse_union: None,
+    }
+}
+fn mark_capacity(states: &mut BTreeMap<String, MoneyFileSelection>) {
+    states.insert(CAPACITY_KEY.into(), capacity_marker());
+}
+pub(crate) fn selections_capped(states: &BTreeMap<String, MoneyFileSelection>) -> bool {
+    states.contains_key(CAPACITY_KEY)
+}
+pub(crate) fn capped_selection_json() -> Vec<u8> {
+    serde_json::to_vec(&BTreeMap::from([(CAPACITY_KEY, capacity_marker())])).unwrap()
+}
+fn valid_state(state: &MoneyFileSelection) -> bool {
+    let digest = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
+    digest(&state.revision)
+        && state.root.len() <= 128
+        && state.member.len() <= 128
+        && state.consumed.as_deref().map_or(true, digest)
+        && state.synthetic_body.as_deref().map_or(true, digest)
+}
+
+/// Compact raw JSON keeps pretty index saves inside the same raw-field cap
+/// as the decoder. Existing valid entries retain deterministic key order.
+fn bounded_selection_json(states: &BTreeMap<String, MoneyFileSelection>) -> (String, bool) {
+    let marker = format!(
+        "{}:{}",
+        serde_json::to_string(CAPACITY_KEY).unwrap(),
+        serde_json::to_string(&capacity_marker()).unwrap()
+    );
+    let mut rows = Vec::new();
+    let mut bytes = 2;
+    let mut capped = selections_capped(states);
+    for (key, state) in states {
+        if key == CAPACITY_KEY {
+            continue;
+        }
+        let value = serde_json::to_string(state).expect("selection JSON");
+        let key_json = serde_json::to_string(key).expect("selection key JSON");
+        let charge = key_json.len() + 1 + value.len() + usize::from(!rows.is_empty());
+        if key.len() > MAX_SELECTION_KEY
+            || value.len() > MAX_SELECTION_RECORD
+            || !valid_state(state)
+            || rows.len() >= MAX_SELECTIONS
+            || bytes + charge + marker.len() + 1 > MAX_SELECTION_BYTES
+        {
+            capped = true;
+            continue;
+        }
+        bytes += charge;
+        rows.push(format!("{key_json}:{value}"));
+    }
+    if capped {
+        if rows.len() == MAX_SELECTIONS {
+            rows.pop();
+        }
+        rows.insert(0, marker);
+    }
+    (format!("{{{}}}", rows.join(",")), capped)
+}
+pub(crate) struct BoundedSelections<'a>(pub(crate) &'a BTreeMap<String, MoneyFileSelection>);
+impl Serialize for BoundedSelections<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let (json, _) = bounded_selection_json(self.0);
+        serde_json::value::RawValue::from_string(json)
+            .map_err(serde::ser::Error::custom)?
+            .serialize(serializer)
+    }
+}
+
 pub(crate) fn record_logical_member(
     index: &mut ScanIndex,
     key: &str,
@@ -23,7 +108,13 @@ pub(crate) fn record_logical_member(
     item: &SnapshotItem,
 ) {
     let root = claude_snapshot_family_root_ref(item);
-    if item.source_session_id.len() > 128 || root.len() > 128 {
+    if item.source_session_id.len() > 128
+        || root.len() > 128
+        || key.len() > MAX_SELECTION_KEY
+        || (index.claude_money_files.len() >= MAX_SELECTIONS
+            && !index.claude_money_files.contains_key(key))
+    {
+        mark_capacity(&mut index.claude_money_files);
         return;
     }
     let consumed = index
@@ -130,6 +221,9 @@ pub(crate) fn stage_selection_fingerprints(
     if !request_owned_live(support) {
         return true;
     }
+    if selections_capped(&index.claude_money_files) {
+        return false;
+    }
     let deadline = Instant::now() + PAGE_MAX_ELAPSED;
     let Some(_funds) = ShadowReservation::admit(
         index
@@ -205,9 +299,13 @@ pub(crate) fn stage_selection_fingerprints(
             .expect("selected state")
             .consumed = Some(consumed.clone());
     }
-    index
-        .claude_money_files
-        .retain(|key, state| state.synthetic_body.is_some() || index.files.contains_key(key));
+    index.claude_money_files.retain(|key, state| {
+        key == CAPACITY_KEY || state.synthetic_body.is_some() || index.files.contains_key(key)
+    });
+    if bounded_selection_json(&index.claude_money_files).1 {
+        mark_capacity(&mut index.claude_money_files);
+        return false;
+    }
     true
 }
 
@@ -443,8 +541,9 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
             let mut result = BTreeMap::new();
             let mut seen = BTreeSet::new();
             while let Some(key) = map.next_key::<String>()? {
-                if seen.len() >= 65_536 || key.len() > 4096 {
+                if seen.len() >= MAX_SELECTIONS || key.len() > MAX_SELECTION_KEY {
                     map.next_value::<IgnoredAny>()?;
+                    mark_capacity(&mut result);
                     continue;
                 }
                 let raw = map.next_value::<Box<serde_json::value::RawValue>>()?;
@@ -452,18 +551,12 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
                     result.remove(&key);
                     continue;
                 }
-                if raw.get().len() > 8192 {
+                if raw.get().len() > MAX_SELECTION_RECORD {
+                    mark_capacity(&mut result);
                     continue;
                 }
                 if let Ok(state) = serde_json::from_str::<MoneyFileSelection>(raw.get()) {
-                    let digest =
-                        |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
-                    if digest(&state.revision)
-                        && state.root.len() <= 128
-                        && state.member.len() <= 128
-                        && state.consumed.as_deref().map_or(true, digest)
-                        && state.synthetic_body.as_deref().map_or(true, digest)
-                    {
+                    if valid_state(&state) {
                         result.insert(key, state);
                     }
                 }
@@ -472,6 +565,9 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
         }
     }
     let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+    if raw.get().len() > MAX_SELECTION_BYTES {
+        return Ok(BTreeMap::from([(CAPACITY_KEY.into(), capacity_marker())]));
+    }
     let mut isolated = serde_json::Deserializer::from_str(raw.get());
     Ok(serde::de::Deserializer::deserialize_map(&mut isolated, Selections).unwrap_or_default())
 }
@@ -486,6 +582,9 @@ pub(crate) fn synthetic_fingerprints(index: &ScanIndex) -> impl Iterator<Item = 
 
 pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &mut Vec<SnapshotItem>) {
     items.retain(|item| {
+        if selections_capped(&index.claude_money_files) && synthetic(item) {
+            return false;
+        }
         let key = store::money_key("synthetic:", &item.source_session_id);
         if synthetic(item)
             && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
@@ -522,6 +621,10 @@ pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &mut Vec<Snapshot
                     reparse_union: None,
                 },
             );
+            if bounded_selection_json(&index.claude_money_files).1 {
+                mark_capacity(&mut index.claude_money_files);
+                return false;
+            }
         } else if item.source_file_fingerprint.is_some()
             && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
         {
@@ -542,7 +645,8 @@ pub(crate) fn selected_money_files(
         .claude_money_files
         .iter()
         .filter(|(key, state)| {
-            state.synthetic_body.is_some()
+            key.as_str() == CAPACITY_KEY
+                || state.synthetic_body.is_some()
                 || index.files.contains_key(*key)
                 || previous.files.contains_key(*key)
         })
@@ -566,6 +670,9 @@ pub(crate) fn selected_money_files(
                 selected.remove(key);
             }
         }
+    }
+    if selections_capped(&index.claude_money_files) {
+        mark_capacity(&mut selected);
     }
     selected
 }
@@ -614,41 +721,129 @@ mod decoder_tests {
 mod integration_selection_regressions {
     use super::*;
     #[test]
-    fn assembled_lenient_decode_rearms_lost_claude_selection_without_touching_codex() {
-        let scratch = crate::test_scratch::ScratchDir::new("money-selection-assembled");
-        let path = scratch.join("index.json");
-        let key = "/home/projects/-fixture/a1111111-1111-4111-8111-111111111111.jsonl";
-        let codex = "/home/sessions/2026/10/rollout-native.jsonl";
-        let mut index = ScanIndex::default();
-        let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&"d".repeat(64)));
-        entry.source_file_fingerprint = "a".repeat(64);
-        entry.last_upload_body_witness = Some("e".repeat(64));
-        entry.effective_upload_body_witness_revision = 3;
-        index.files.insert(key.into(), entry.clone());
-        entry.effective_upload_body_witness_revision = 24;
-        index.files.insert(codex.into(), entry);
-        index.claude_request_census.insert_for_test(
-            key,
-            ClaudeRequestCensusRecord::synthetic_for_test(
-                &"a".repeat(64),
-                1,
-                super::super::super::claude_request_census::ClaudeRequestCensusShape::Exact,
-                vec![1],
+    fn capped_save_reload_never_reowes_or_reoffers_and_keeps_census_on_second_load() {
+        crate::snapshots::claude_history_upgrade::with_max_gated_claude_revision(3, || {
+            let scratch = crate::test_scratch::ScratchDir::new("money-selection-cap");
+            let path = scratch.join("index.json");
+            let key = "/home/projects/-fixture/ffffffff-ffff-4fff-8fff-ffffffffffff.jsonl";
+            let mut index = ScanIndex::default();
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&"d".repeat(64)));
+            entry.source_file_fingerprint = "a".repeat(64);
+            entry.effective_upload_body_witness_revision = 3;
+            index.files.insert(key.into(), entry);
+            index.claude_request_census.insert_for_test(
+                key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    super::super::super::claude_request_census::ClaudeRequestCensusShape::Exact,
+                    vec![1],
+                ),
+            );
+            for at in 0..=MAX_SELECTIONS {
+                let mut state = capacity_marker();
+                state.root = "root".into();
+                state.member = format!("member-{at}");
+                index
+                    .claude_money_files
+                    .insert(format!("/capacity/{at:06}"), state);
+            }
+            index.save(&path).unwrap();
+            let raw: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+            assert!(raw["claude_money_files"].as_object().unwrap().len() <= MAX_SELECTIONS);
+            let bytes = serde_json::to_vec(&raw["claude_money_files"]).unwrap();
+            assert!(bytes.len() <= MAX_SELECTION_BYTES);
+            for (_, value) in raw["claude_money_files"].as_object().unwrap() {
+                assert!(serde_json::to_vec(value).unwrap().len() <= MAX_SELECTION_RECORD);
+            }
+            let mut first = ScanIndex::load(&path).unwrap();
+            assert!(selections_capped(&first.claude_money_files));
+            assert_eq!(first.files[key].effective_upload_body_witness_revision, 3);
+            let census = serde_json::to_vec(&first.claude_request_census).unwrap();
+            assert!(first.claude_request_census.get(key).is_some());
+            let mut synthetic = super::super::synthetic_carrier("overflow", "2026-08-03T10:00:00Z");
+            synthetic.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+            let mut items = vec![synthetic];
+            finalize_synthetic(&mut first, &mut items);
+            assert!(
+                items.is_empty(),
+                "capacity refusal cannot create a repeated untracked offer"
+            );
+            first.save(&path).unwrap();
+            let second = ScanIndex::load(&path).unwrap();
+            assert_eq!(second.files[key].effective_upload_body_witness_revision, 3);
+            assert_eq!(
+                serde_json::to_vec(&second.claude_request_census).unwrap(),
+                census
+            );
+            assert_eq!(
+                serde_json::to_vec(&first.claude_money_files).unwrap(),
+                serde_json::to_vec(&second.claude_money_files).unwrap()
+            );
+        });
+    }
+
+    #[test]
+    fn selection_writer_and_reader_share_key_record_and_raw_field_caps() {
+        for (key, state) in [
+            ("k".repeat(MAX_SELECTION_KEY + 1), capacity_marker()),
+            (
+                "record".into(),
+                MoneyFileSelection {
+                    root: "x".repeat(MAX_SELECTION_RECORD),
+                    ..capacity_marker()
+                },
             ),
-        );
-        let mut wire = serde_json::to_value(&index).unwrap();
-        wire["claude_money_files"] = serde_json::json!({key: {"revision": false}});
-        std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
-        let loaded = ScanIndex::load(&path).unwrap();
-        assert_eq!(loaded.files[key].effective_upload_body_witness_revision, 2);
-        assert!(
-            loaded.claude_request_census.get(key).is_none(),
-            "selection loss invalidates evidence even without a birth stub"
-        );
-        assert_eq!(
-            loaded.files[codex].effective_upload_body_witness_revision,
-            24
-        );
+        ] {
+            let states = BTreeMap::from([(key, state)]);
+            let (json, capped) = bounded_selection_json(&states);
+            assert!(capped);
+            let mut decoder = serde_json::Deserializer::from_str(&json);
+            let read = decode_selections(&mut decoder).unwrap();
+            assert!(selections_capped(&read));
+            assert_eq!(read.len(), 1);
+        }
+    }
+
+    #[test]
+    fn assembled_lenient_decode_rearms_lost_claude_selection_without_touching_codex() {
+        crate::snapshots::claude_history_upgrade::with_max_gated_claude_revision(3, || {
+            let scratch = crate::test_scratch::ScratchDir::new("money-selection-assembled");
+            let path = scratch.join("index.json");
+            let key = "/home/projects/-fixture/a1111111-1111-4111-8111-111111111111.jsonl";
+            let codex = "/home/sessions/2026/10/rollout-native.jsonl";
+            let mut index = ScanIndex::default();
+            let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&"d".repeat(64)));
+            entry.source_file_fingerprint = "a".repeat(64);
+            entry.last_upload_body_witness = Some("e".repeat(64));
+            entry.effective_upload_body_witness_revision = 3;
+            index.files.insert(key.into(), entry.clone());
+            entry.effective_upload_body_witness_revision = 24;
+            index.files.insert(codex.into(), entry);
+            index.claude_request_census.insert_for_test(
+                key,
+                ClaudeRequestCensusRecord::synthetic_for_test(
+                    &"a".repeat(64),
+                    1,
+                    super::super::super::claude_request_census::ClaudeRequestCensusShape::Exact,
+                    vec![1],
+                ),
+            );
+            let mut wire = serde_json::to_value(&index).unwrap();
+            wire["claude_money_files"] = serde_json::json!({key: {"revision": false}});
+            std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+            let loaded = ScanIndex::load(&path).unwrap();
+            assert_eq!(loaded.files[key].effective_upload_body_witness_revision, 2);
+            assert!(
+                loaded.claude_request_census.get(key).is_none(),
+                "selection loss invalidates evidence even without a birth stub"
+            );
+            assert_eq!(
+                loaded.files[codex].effective_upload_body_witness_revision,
+                24
+            );
+        });
     }
     #[test]
     fn accepted_synthetic_noop_requires_the_same_body_and_never_commits_a_refused_correction() {

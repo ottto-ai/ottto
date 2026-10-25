@@ -236,7 +236,12 @@ impl Serialize for ScanIndex {
         field!(held claude_usage_family_witnesses);
         field!(held claude_usage_family_pending);
         field!(claude_request_census, ClaudeRequestCensus::is_empty);
-        field!(claude_money_files, BTreeMap::is_empty);
+        if !self.claude_money_files.is_empty() {
+            map.serialize_entry(
+                "claude_money_files",
+                &claude_request_money::BoundedSelections(&self.claude_money_files),
+            )?;
+        }
         field!(
             claude_request_census_shadow,
             ClaudeRequestCensusShadowState::is_empty

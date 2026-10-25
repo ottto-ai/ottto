@@ -3727,13 +3727,13 @@ fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
     control.cycle_deferred();
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
     let unavailable =
-        unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Unavailable);
+        unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::DenyAll);
     assert_eq!(
         unknown_recovery::current_literal_guard(
             &control.saved(),
             &unknown_recovery::active_for_test(&control.support)[0]
         ),
-        unknown_recovery::LiteralPermit::Unavailable,
+        unknown_recovery::LiteralPermit::DenyAll,
         "missing dependency is closed"
     );
     drop(unavailable);

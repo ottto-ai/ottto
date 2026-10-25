@@ -2151,3 +2151,56 @@ fn inplace_retry_budget_spans_bootstrap_and_cache_bearing_delivery() {
     assert_eq!(delivery.unwrap(), ResumableUploadResult::Completed);
     assert_eq!(ledger.accepted_cache_heads.len(), 2);
 }
+
+#[test]
+fn money_review_retry_cannot_resend_the_same_body_without_a_new_lease() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for kind in [SnapshotHoldKind::Held, SnapshotHoldKind::Refused] {
+        let originals = items(1);
+        let fp = originals[0].snapshot_fingerprint.clone();
+        let body = snapshot_upload_body_witness(&originals[0]);
+        let mut initial = progress();
+        initial.quarantine_held_body(&fp, &body, kind);
+        let wire = serde_json::to_vec(&initial).unwrap();
+        for mode in ["unchanged", "changed", "authorized"] {
+            let mut restarted: SnapshotUploadProgress = serde_json::from_slice(&wire).unwrap();
+            restarted.active_quarantine_witness = initial.active_quarantine_witness.clone();
+            let mut candidates = originals.clone();
+            if mode == "changed" {
+                candidates[0].tool_usage_truncated = true;
+            }
+            if mode == "authorized" {
+                restarted
+                    .quarantined_fingerprints
+                    .get_mut(&fp)
+                    .unwrap()
+                    .retry_after_unix_seconds = 0;
+                assert!(restarted.prepare_quarantine_retries(&BTreeMap::new()));
+                assert!(restarted.active_quarantine_retries.contains(&fp));
+            } else {
+                assert!(!restarted.prepare_quarantine_retries(&BTreeMap::new()));
+            }
+            let mut sent = 0;
+            let mut accepted = 0;
+            let _ = upload_resumable_batches_with_body_witness(
+                &candidates,
+                "codex",
+                &mut restarted,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |batch| {
+                    sent += 1;
+                    Ok(response(&batch, 0))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+            assert_eq!(sent, usize::from(mode != "unchanged"), "{kind:?}/{mode}");
+            assert_eq!(accepted, u64::from(mode != "unchanged"));
+        }
+    }
+}

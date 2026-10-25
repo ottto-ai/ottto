@@ -907,15 +907,6 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
     )
 }
 
-/// Count-only explicit loss-of-selection recovery transition.
-pub(crate) fn body_witness_revision_reowed() {
-    traversal_point(
-        "body_witness_revision_reowed",
-        "claude_code",
-        &serde_json::json!({"files": 1}),
-    );
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

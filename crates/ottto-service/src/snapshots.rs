@@ -1409,10 +1409,18 @@ fn serialize_snapshot_batch<S: Serializer>(
     // forward-tolerant ingest model and ignore it; capable backends echo it
     // and may return a complete per-entity outcome partition.
     state.serialize_field("entity_ack_contract", SNAPSHOT_ENTITY_ACK_CONTRACT)?;
-    state.serialize_field(
-        "usage_decrease_hold_ack_contract",
-        "usage_decrease_hold_ack:v1",
-    )?;
+    // Only an authorized request-owned body opts into money-decrease holds.
+    // Legacy batches keep their released envelope bytes, including retries.
+    if request
+        .snapshots
+        .iter()
+        .any(ClaudeHistoryEmissionItem::request_owned_literal)
+    {
+        state.serialize_field(
+            "usage_decrease_hold_ack_contract",
+            "usage_decrease_hold_ack:v1",
+        )?;
+    }
     if enforce_head_cas {
         state.serialize_field("head_cas_contract", SNAPSHOT_HEAD_CAS_CONTRACT)?;
     }
@@ -81867,8 +81875,9 @@ mod tests {
     }
 
     #[test]
-    fn every_batch_encoding_declares_the_hold_ack_capability() {
-        let request = valid_v6_batch_request();
+    fn every_literal_batch_encoding_declares_the_hold_ack_capability() {
+        let mut request = valid_v6_batch_request();
+        request.snapshots[0].usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
         for encoded in [
             serde_json::to_vec(&request).unwrap(),
             serde_json::to_vec(&request.wire_with_head_cas()).unwrap(),
@@ -81885,6 +81894,83 @@ mod tests {
                 value["usage_decrease_hold_ack_contract"],
                 "usage_decrease_hold_ack:v1"
             );
+        }
+    }
+
+    #[test]
+    fn legacy_complete_batch_bytes_and_digests_match_released_main() {
+        // Frozen composed-main envelope ordering (6313fb90). Snapshot bytes,
+        // body witnesses and both revision hashes use the released golden.
+        #[derive(Serialize)]
+        struct ReleasedBatch<'a> {
+            schema_version: u16,
+            source: &'a str,
+            machine_id: &'a str,
+            collector_version: &'a Option<String>,
+            entity_ack_contract: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            head_cas_contract: Option<&'static str>,
+            snapshots: Vec<SnapshotItemWire<'a>>,
+            client_report: &'a crate::client_report::ClientReport,
+        }
+        for source in [
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Codex,
+            SnapshotSource::Pi,
+        ] {
+            let mut request = valid_v6_batch_request();
+            request.source = source.api_slug().into();
+            let item = &request.snapshots[0];
+            let body = snapshot_upload_body_witness(item);
+            let revision = snapshot_semantic_envelope(source, item, request.upload_policy);
+            for cas in [false, true] {
+                let expected = serde_json::to_vec(&ReleasedBatch {
+                    schema_version: request.schema_version,
+                    source: &request.source,
+                    machine_id: &request.machine_id,
+                    collector_version: &request.collector_version,
+                    entity_ack_contract: SNAPSHOT_ENTITY_ACK_CONTRACT,
+                    head_cas_contract: cas.then_some(SNAPSHOT_HEAD_CAS_CONTRACT),
+                    snapshots: vec![SnapshotItemWire {
+                        snapshot: item,
+                        semantic_envelope: snapshot_semantic_envelope(
+                            source,
+                            item,
+                            request.upload_policy,
+                        ),
+                    }],
+                    client_report: &request.client_report,
+                })
+                .unwrap();
+                let normal = if cas {
+                    serde_json::to_vec(&request.wire_with_head_cas()).unwrap()
+                } else {
+                    serde_json::to_vec(&request).unwrap()
+                };
+                let retry = if cas {
+                    crate::snapshot_retry::encode_json(
+                        &request.wire_with_head_cas(),
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                    .unwrap()
+                } else {
+                    crate::snapshot_retry::encode_json(
+                        &request,
+                        crate::snapshot_retry::REQUEST_BYTES,
+                    )
+                    .unwrap()
+                };
+                for encoded in [normal, retry] {
+                    assert_eq!(encoded, expected, "complete {source:?} CAS={cas}");
+                    assert_eq!(Sha256::digest(&encoded), Sha256::digest(&expected));
+                    let wire: Value = serde_json::from_slice(&encoded).unwrap();
+                    assert_eq!(
+                        wire["snapshots"][0]["semantic_envelope"],
+                        serde_json::to_value(&revision).unwrap()
+                    );
+                    assert_eq!(body, snapshot_upload_body_witness(item));
+                }
+            }
         }
     }
 

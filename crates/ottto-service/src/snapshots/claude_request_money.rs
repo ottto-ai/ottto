@@ -2130,8 +2130,8 @@ async fn build_page_with_coverage(
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
     let residue_bytes = index
         .claude_request_census
-        .records()
-        .map(|(key, _)| key.len())
+        .retained_file_keys()
+        .map(String::len)
         .sum::<usize>();
     let page_claim_rows = roots
         .keys()
@@ -2143,7 +2143,7 @@ async fn build_page_with_coverage(
         index
             .files
             .len()
-            .saturating_add(index.claude_request_census.records().count()),
+            .saturating_add(index.claude_request_census.retained_file_keys().count()),
         key_bytes.saturating_add(residue_bytes),
     );
     let keys_bytes = key_bytes.saturating_mul(2);
@@ -2483,6 +2483,9 @@ async fn build_page_with_coverage(
                 else {
                     continue;
                 };
+                if !live && keys.len() != 1 {
+                    continue;
+                }
                 let Some(key) = keys
                     .iter()
                     .find(|key| {
@@ -2557,6 +2560,7 @@ async fn build_page_with_coverage(
                 api_report,
                 trace_report,
                 body_deadline,
+                live || collect_entities,
             )
         });
         let state = coverage_view.family(root);
@@ -2876,6 +2880,7 @@ fn family_preflight(
     api: &ClaudeLocalOtelLoadReport,
     trace: &ClaudeTraceOwnershipLoadReport,
     deadline: Instant,
+    needs_body: bool,
 ) -> Result<usize, &'static str> {
     let mut bytes = 0_usize;
     let mut charge = |more: usize| {
@@ -2933,7 +2938,9 @@ fn family_preflight(
         }
     }
     for capture in captures.values() {
-        charge(capture.body_allocation_bound())?;
+        if needs_body {
+            charge(capture.body_allocation_bound())?;
+        }
         charge(
             capture
                 .units()
@@ -3029,9 +3036,13 @@ async fn build_slice(
         member_keys
             .get(&(root.to_owned(), member.to_owned()))
             .and_then(|keys| {
-                keys.iter()
-                    .min_by_key(|key| selection::primary_order(index, key))
-                    .cloned()
+                if live {
+                    keys.iter()
+                        .min_by_key(|key| selection::primary_order(index, key))
+                        .cloned()
+                } else {
+                    (keys.len() == 1).then(|| keys[0].clone())
+                }
             })
     };
     // Rows: the live load's, else the facts the tail just brought current.
@@ -3278,14 +3289,18 @@ async fn build_slice(
             .collect();
         let empty = BTreeSet::new();
         let members = indexed_members.get(root).unwrap_or(&empty);
-        let total = members.len()
-            + items
-                .iter()
-                .map(|item| &item.source_session_id)
-                .collect::<BTreeSet<_>>()
-                .iter()
-                .filter(|member| !members.contains(**member))
-                .count();
+        let total = if live {
+            members.len()
+                + items
+                    .iter()
+                    .map(|item| &item.source_session_id)
+                    .collect::<BTreeSet<_>>()
+                    .iter()
+                    .filter(|member| !members.contains(**member))
+                    .count()
+        } else {
+            members.len().max(items.len())
+        };
         let mut family_captures = BTreeMap::new();
         for item in items {
             if let Some(capture) = captures.remove(&(
@@ -6621,6 +6636,7 @@ pub(crate) fn scheduled_reoffers(index: &ScanIndex, items: &[SnapshotItem]) -> B
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) struct LiveForTest {
+    _policy: super::claude_history_upgrade::MaxGatedForTest,
     support: PathBuf,
     inserted: bool,
     shadow_was_enabled: bool,
@@ -6637,6 +6653,7 @@ impl LiveForTest {
             dirs.push(support.to_path_buf());
         }
         Self {
+            _policy: super::claude_history_upgrade::MaxGatedForTest::new(3),
             support: support.to_path_buf(),
             inserted,
             shadow_was_enabled,
@@ -8137,7 +8154,8 @@ mod round3_tests {
                 &ledger,
                 &api,
                 &trace,
-                Instant::now()
+                Instant::now(),
+                false
             ),
             Err("deadline")
         );
@@ -8151,7 +8169,8 @@ mod round3_tests {
                 &ledger,
                 &api,
                 &trace,
-                Instant::now() + Duration::from_secs(30)
+                Instant::now() + Duration::from_secs(30),
+                false
             ),
             Err("deadline")
         );

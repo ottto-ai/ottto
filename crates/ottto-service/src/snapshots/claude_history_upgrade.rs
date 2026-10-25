@@ -45,10 +45,10 @@ pub(super) const HISTORY_UPGRADE_FILES_PER_PAGE: usize = 2_000;
 /// Bytes of history one page may upgrade (1 GiB), for every revision. No
 /// file is admitted past it, including a page's first file.
 pub(super) const HISTORY_UPGRADE_BYTES_PER_PAGE: u64 = 1024 * 1024 * 1024;
-/// Revision-3 policy infrastructure is composed for request-owned money.
-/// The separate production live gate remains false, so ordinary runtime
-/// activation continues to select revision 2. Unknown revisions fail closed.
-pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 3;
+/// Production policy ends at revision 2 while request-owned money is OFF.
+/// The activation change must explicitly open revision 3; synthetic live tests
+/// scope that future policy independently. Unknown revisions fail closed.
+pub(crate) const MAX_GATED_CLAUDE_REVISION: u64 = 2;
 /// The request-owned usage literal of MONEY P2 (#699's
 /// `REQUEST_OWNED_CONTRACT`). Listed roots never emit it.
 pub(crate) const REQUEST_OWNED_USAGE_CONTRACT: &str = "claude_request_owned_usage:v1";
@@ -118,6 +118,21 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn max_gated_claude_revision() -> u64 {
     MAX_GATED_FOR_TEST.with(std::cell::Cell::get)
+}
+
+#[cfg(test)]
+pub(crate) struct MaxGatedForTest(u64);
+#[cfg(test)]
+impl MaxGatedForTest {
+    pub(crate) fn new(max: u64) -> Self {
+        Self(MAX_GATED_FOR_TEST.with(|value| value.replace(max)))
+    }
+}
+#[cfg(test)]
+impl Drop for MaxGatedForTest {
+    fn drop(&mut self) {
+        MAX_GATED_FOR_TEST.with(|value| value.set(self.0));
+    }
 }
 
 /// Test seam: run `f` as if the policy table ended at `max` (a revision

@@ -898,6 +898,9 @@ impl SnapshotBatchResponse {
         head_cas: bool,
     ) -> Result<()> {
         let entities = entities.into_iter().collect::<Vec<_>>();
+        if entities.iter().any(|(_, _, version, _)| version.is_none()) {
+            return Err(anyhow!("recovery manifest lacks body witness version"));
+        }
         if self.disabled {
             if self.accepted != 0
                 || !self.accepted_entities.is_empty()
@@ -925,9 +928,9 @@ impl SnapshotBatchResponse {
                     *s == reference.source_session_id && *f == reference.snapshot_fingerprint
                 })
                 .ok_or_else(|| anyhow!("foreign recovery ACK"))?;
-            if version.is_some()
-                && (reference.body_witness_version != *version
-                    || reference.body_witness_digest.as_deref() != Some(*witness))
+            if version.is_none()
+                || reference.body_witness_version != *version
+                || reference.body_witness_digest.as_deref() != Some(*witness)
             {
                 return Err(anyhow!("recovery ACK lacks exact body witness"));
             }
@@ -5360,6 +5363,34 @@ pub(crate) fn retention_gzip_probe(body: &[u8]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod request_owned_ack_tests {
     use super::*;
+    #[test]
+    fn recovery_acceptance_requires_a_manifest_version_and_exact_body_witness() {
+        let fp = "a".repeat(64);
+        let digest = "b".repeat(64);
+        let mut response: SnapshotBatchResponse = serde_json::from_value(serde_json::json!({
+            "accepted":1,"sessions_reconciled":1,"session_ids":[],"disabled":false,"disabled_reason":null,
+            "entity_ack_contract":"snapshot_entity_ack:v1",
+            "accepted_entities":[{"source_session_id":"session","snapshot_fingerprint":fp,"occurrence_count":1}]
+        })).unwrap();
+        assert!(response
+            .validate_recovery_ack([("session", fp.as_str(), None, digest.as_str())], false)
+            .is_err());
+        response.accepted_entities[0].body_witness_version = Some(8);
+        response.accepted_entities[0].body_witness_digest = Some(digest.clone());
+        assert!(response
+            .validate_recovery_ack([("session", fp.as_str(), None, digest.as_str())], false)
+            .is_err());
+        assert!(response
+            .validate_recovery_ack([("session", fp.as_str(), Some(8), digest.as_str())], false)
+            .is_ok());
+        assert!(response
+            .validate_recovery_ack([("session", fp.as_str(), Some(7), digest.as_str())], false)
+            .is_err());
+        assert!(response
+            .validate_recovery_ack([("session", fp.as_str(), Some(8), "other")], false)
+            .is_err());
+    }
+
     #[test]
     fn nonpermanent_ack_is_accepted_only_for_the_two_review_reasons() {
         let fingerprint = "a".repeat(64);

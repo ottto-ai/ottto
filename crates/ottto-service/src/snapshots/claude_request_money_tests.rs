@@ -2079,7 +2079,7 @@ fn money_hashes(ids: &[&str]) -> Vec<u64> {
 impl MoneyLedger {
     fn new(a: &[&str], ax: &[&str], b: &[&str]) -> Self {
         let mut index = ScanIndex::default();
-        let mut ledger = super::claude_request_claude_request_money::custody::Custody::default();
+        let mut ledger = super::claude_request_money::custody::Custody::default();
         let keys = [
             ("/m/projects/-repo/A.jsonl", 'a', a),
             ("/m/projects/-repo/A/subagents/agent-x.jsonl", 'b', ax),
@@ -2416,7 +2416,7 @@ fn money_scope_refreshes_a_file_after_its_message_record_lands() {
 fn money_message_only_copies_pick_one_owner() {
     let message = crate::snapshots::claude_request_money::claude_message_hash("msg_shared");
     let mut index = ScanIndex::default();
-    let mut ledger = super::claude_request_claude_request_money::custody::Custody::default();
+    let mut ledger = super::claude_request_money::custody::Custody::default();
     let keys = ["/m/projects/-repo/P.jsonl", "/m/projects/-repo/Q.jsonl"];
     for (key, seed) in keys.iter().zip(['1', '2']) {
         let mut entry = manifest_index_entry(Some("body"));
