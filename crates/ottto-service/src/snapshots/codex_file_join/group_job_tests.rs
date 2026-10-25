@@ -333,9 +333,10 @@ fn fence_filters_watcher_hint_after_attempt() {
 /// G1 (review of #751, P1): a processed group re-hinted through one member
 /// is a re-read group. On every page it would take the whole file allowance
 /// (two files) and evict the waiting census-member singleton `c`, so the
-/// census never closed. It now waits for a page without a waiting member:
-/// `c` is read on the first hinted page and the census closes. Covered for
-/// an ordinary group, a group fenced by its attempt this generation, and an
+/// census never closed. It now waits for a page without a waiting member,
+/// and a group fenced by its attempt this generation is decided at admission
+/// without taking allowance: `c` is read on the first hinted page and the
+/// census closes. Covered for an ordinary group, a fenced group and an
 /// own-page group (more members than the page's file limit).
 #[test]
 fn reread_group_never_starves_a_waiting_census_singleton() {
@@ -417,6 +418,10 @@ fn reread_group_never_starves_a_waiting_census_singleton() {
             counters(&cache)
         );
         assert_eq!(closed, Some(1), "{case}: {:?}", counters(&cache));
+        if case == "fenced" {
+            // Decided at admission: fenced, and no allowance taken from `c`.
+            assert_eq!(counters(&cache).groups_fenced, 1, "{:?}", counters(&cache));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 }

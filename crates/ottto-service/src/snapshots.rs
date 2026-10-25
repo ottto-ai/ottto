@@ -24701,31 +24701,46 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
+                        // G1: a group whose attempt already ended in this
+                        // generation is fenced at its pop (M-5 b) and reads
+                        // nothing. Decide it here, so it takes no file
+                        // allowance a waiting census member needs.
+                        let fenced = sampling.as_ref().is_some_and(|context| {
+                            context.cache.group_fenced(
+                                &context.namespace,
+                                &codex_file_join::job_key(&group),
+                                fence.as_deref(),
+                            )
+                        });
                         // G1: a group whose selected members are all re-reads
                         // never takes file allowance a waiting census-member
-                        // singleton needs (own page or not, fenced or not).
-                        // It waits for a page without one; its members stay
-                        // pending as re-reads.
-                        let rereads_crowd_members = !sampled_scan::codex_cursor::census_member(
-                            &codex_selected_flags,
-                            group.members.iter().map(|member| member.path.as_path()),
-                        ) && {
-                            let waiting = identified_candidates
-                                .iter()
-                                .filter(|candidate| {
-                                    let key = local_index_key(&candidate.path);
-                                    !grouped_paths.contains(&key)
-                                        && sampled_scan::codex_cursor::selected_census_member(
-                                            &codex_selected_flags,
-                                            &candidate.path,
-                                        )
-                                })
-                                .count();
-                            waiting > 0
-                                && (own || used + group.members.len() + waiting > file_limit)
-                        };
+                        // singleton needs (own page or not). It waits for a
+                        // page without one; its members stay pending as
+                        // re-reads.
+                        let rereads_crowd_members = !fenced
+                            && !sampled_scan::codex_cursor::census_member(
+                                &codex_selected_flags,
+                                group.members.iter().map(|member| member.path.as_path()),
+                            )
+                            && {
+                                let waiting = identified_candidates
+                                    .iter()
+                                    .filter(|candidate| {
+                                        let key = local_index_key(&candidate.path);
+                                        !grouped_paths.contains(&key)
+                                            && sampled_scan::codex_cursor::selected_census_member(
+                                                &codex_selected_flags,
+                                                &candidate.path,
+                                            )
+                                    })
+                                    .count();
+                                waiting > 0
+                                    && (own || used + group.members.len() + waiting > file_limit)
+                            };
                         if rereads_crowd_members
-                            || (used > 0 && (own || used + group.members.len() > file_limit))
+                            || (!fenced
+                                && used > 0
+                                && (own || used + group.members.len() > file_limit))
                         {
                             // Keep the existing traversal as the only queue. A whole
                             // group is selected on a subsequent ordinary page.
@@ -24748,10 +24763,12 @@ impl OwnedSourceScan {
                             }
                             continue;
                         }
-                        used += group.members.len();
-                        if own {
-                            // Nothing else joins its page.
-                            used = used.max(file_limit);
+                        if !fenced {
+                            used += group.members.len();
+                            if own {
+                                // Nothing else joins its page.
+                                used = used.max(file_limit);
+                            }
                         }
                         if let Some(traversal) = index.traversal.as_mut() {
                             // R2-L3: one set per group, not a member scan per
@@ -24781,7 +24798,9 @@ impl OwnedSourceScan {
                                 .cache
                                 .record_join_owner(&group.owner, &group.members);
                         }
-                        codex_join_groups.push_back(group);
+                        if !fenced {
+                            codex_join_groups.push_back(group);
+                        }
                     }
                     // F8: the paused group job's owner, in every scan object.
                     if let Some(owner) = sampling
