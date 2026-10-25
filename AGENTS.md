@@ -28,6 +28,14 @@
 - Locally, check and test only the crates you changed (`cargo check|test -p <crate>`).
   Full-workspace `cargo build`/`cargo test` runs only in GitHub CI: push a PR and
   read its result. Coordinate heavy local builds.
+- Iterate on CI, not on the local machine. A local `cargo check -p ottto-service`
+  takes several GB of memory and every core for minutes, and many agents may
+  share one machine. Push the branch and read the free Linux lane
+  (`Rust tests (Linux)` in `linux-tests.yml`) for compile and test feedback;
+  it has no macOS queue. Build locally only when you cannot proceed without it:
+  one changed crate, one build at a time, and not while the machine is already
+  busy. A Linux green is fast feedback, not Mac evidence; the macOS
+  `Rust contracts` job stays the merge gate.
 - CI runs on pull requests. Push to the PR branch; do not also start Public CI by
   hand on a branch whose PR is open and mergeable. GitHub starts no pull-request
   run while a PR has merge conflicts (`gh pr view <n> --json mergeable`): rebase
