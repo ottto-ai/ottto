@@ -1592,27 +1592,39 @@ pub(super) enum SendState {
 }
 
 pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()> {
-    let ticket = match std::mem::take(state) {
-        SendState::Reserving(m, body, funds) => {
-            std::future::poll_fn(
-                |_| match money::recovery_reserve_receipt(support, &m.lineage) {
-                    money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
-                    money::MoneyReceipt::Pending => std::task::Poll::Pending,
-                    money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
-                },
-            )
-            .await
-            .inspect_err(|error| faulted(support, error))?;
-            capture_ticket(support, m, body, funds)?
-        }
-        _ => return Err(fault()),
+    let SendState::Reserving(m, body, funds) = std::mem::take(state) else {
+        return Err(fault());
     };
-    let prepared = wait(ticket).await;
+    let lineage = m.lineage.clone();
+    std::future::poll_fn(
+        |_| match money::recovery_reserve_receipt(support, &lineage) {
+            money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
+            money::MoneyReceipt::Pending => std::task::Poll::Pending,
+            money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
+        },
+    )
+    .await
+    .inspect_err(|error| faulted(support, error))?;
+    let prepared = match capture_ticket(support, m, body, funds) {
+        Ok(ticket) => wait(ticket).await,
+        Err(error) => Err(error),
+    };
     if prepared
         .as_ref()
         .err()
         .is_some_and(|error| error.is::<CapacityFull>())
     {
+        // Capacity refusal precedes every payload/intent write and POST. Return
+        // its unused latch reservation too; never accumulate orphan controls.
+        std::future::poll_fn(|_| {
+            match money::recovery_finish_receipt(support, &lineage, now(support), true) {
+                money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
+                money::MoneyReceipt::Pending => std::task::Poll::Pending,
+                money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
+            }
+        })
+        .await
+        .inspect_err(|error| faulted(support, error))?;
         *state = SendState::Capacity;
         return Ok(());
     }
