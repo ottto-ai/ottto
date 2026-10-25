@@ -2771,3 +2771,128 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
         });
     assert!(!awaits(&scene, &parsed), "an unavailable census");
 }
+
+/// Stage 1 S1-a (§7 exclusion row 31, owner default NO): the proof hook
+/// never spends a continuation page's leftover. On the production
+/// continuation pass (`begin_codex_continuation_side_pass`) with a leftover
+/// that proves the owed child on an ordinary page, nothing is read, no job
+/// starts and the entry is unchanged; the ordinary control spends it.
+#[test]
+fn the_proof_hook_spends_no_continuation_leftover() {
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-continuation-leftover");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    assert_eq!(continuation.kind, CodexPageKind::Continuation);
+    let owed = scene.owed_entry();
+    for _ in 0..3 {
+        let mut page = page_with(leftover);
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            page.singleton_remaining(Limits::current()),
+            leftover,
+            "the leftover is untouched"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None, "no job");
+        assert_eq!(scene.owed_entry(), owed);
+    }
+    let mut page = page_with(leftover);
+    scene.hook(&cache, &mut page);
+    assert!(
+        page.singleton_remaining(Limits::current()) < leftover,
+        "the ordinary page spends it"
+    );
+}
+
+/// Stage 1 S1-a (§7 exclusion row 32): the side sweep never runs on the
+/// production continuation pass, with no held job either: an orphan side
+/// record and the sweep cursor stay as they are until an ordinary page.
+#[test]
+fn the_side_sweep_never_runs_on_a_continuation_pass() {
+    let mut scene = Scene::owed("hook-continuation-sweep");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    let orphan = "/nonexistent/s1a-orphan-rollout.jsonl".to_owned();
+    let record = scene.index.codex_parent_side[&local_index_key(&scene.parent)].clone();
+    scene.index.codex_parent_side.insert(orphan.clone(), record);
+    let side = serde_json::to_value(&scene.index.codex_parent_side).unwrap();
+    let cursor = scene.index.codex_parent_side_cursor.clone();
+    for _ in 0..3 {
+        let mut page = PageBudget::default();
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            serde_json::to_value(&scene.index.codex_parent_side).unwrap(),
+            side,
+            "not swept"
+        );
+        assert_eq!(scene.index.codex_parent_side_cursor, cursor);
+    }
+    scene.hook(&cache, &mut PageBudget::default());
+    assert!(!scene.index.codex_parent_side.contains_key(&orphan));
+}
+
+/// Stage 1 C-1 (a), (b), (d), on the production passes: a continuation
+/// page's C14 (non-EOF, or refused after C14: it charges nothing and never
+/// saves) neither closes nor opens the outage gate. After a saved ordinary
+/// pass the next ordinary pass may charge and due side work; after a failed
+/// ordinary save it stays gated.
+#[test]
+fn a_continuation_pass_neither_closes_nor_opens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    for ordinary_saved in [true, false] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        assert!(
+            begin_codex_side_pass(&cache, index_path, &mut index)
+                .gate
+                .side_allowed
+        );
+        if ordinary_saved {
+            let mark = codex_side_save_mark(&cache, index_path);
+            note_codex_side_pass_saved(&cache, index_path, false, mark);
+        }
+        for _ in 0..3 {
+            let continuation = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+            assert_eq!(continuation.kind, CodexPageKind::Continuation);
+            assert_eq!(continuation.gate.side_allowed, ordinary_saved);
+            assert!(!continuation.side_charge_allowed() && !continuation.side_due_allowed());
+        }
+        let next = begin_codex_side_pass(&cache, index_path, &mut index);
+        assert_eq!(next.gate.side_allowed, ordinary_saved, "the next ordinary");
+        assert_eq!(next.side_charge_allowed(), ordinary_saved);
+        assert_eq!(next.side_due_allowed(), ordinary_saved);
+    }
+}
+
+/// Stage 1 C-1 (c): the EOF continuation page's full save (C15, `full`,
+/// mark read before it) is what reopens a gate a failed ordinary save
+/// closed.
+#[test]
+fn an_eof_continuation_save_reopens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    begin_codex_side_pass(&cache, index_path, &mut index);
+    // That ordinary save failed: no C15.
+    let eof = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+    assert!(!eof.gate.side_allowed);
+    let mark = codex_side_save_mark(&cache, index_path);
+    note_codex_side_pass_saved(&cache, index_path, true, mark);
+    assert!(
+        begin_codex_side_pass(&cache, index_path, &mut index)
+            .gate
+            .side_allowed
+    );
+}

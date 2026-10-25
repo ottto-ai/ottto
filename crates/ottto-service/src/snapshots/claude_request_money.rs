@@ -148,6 +148,9 @@ const UNIT_BYTES: usize = 512;
 const LIVE_ROW_BYTES: usize = 768;
 const GRAIN_BYTES: usize = 2048;
 const FAMILY_BYTES: usize = 8192;
+/// Borrowed root/schedule indexes and one pending acknowledgement per
+/// snapshot. Deferred rows are streamed, never retained as a second batch.
+const SNAPSHOT_INDEX_BYTES: usize = 256 + std::mem::size_of::<PendingMemo>();
 const TRACE_ROW_BYTES: usize = 160;
 /// One page hash in the page's hash list, claim map and collision map.
 const PAGE_HASH_BYTES: usize = 160;
@@ -411,6 +414,7 @@ pub(crate) fn disable_shadow_for_test(support_dir: &Path) {
 fn shadow_enabled(support_dir: &Path) -> bool {
     #[cfg(test)]
     {
+        sleep_for_test(&SHADOW_ENABLED_DELAY_FOR_TEST);
         SHADOW_ENABLED_FOR_TEST
             .lock()
             .expect("shadow control")
@@ -680,16 +684,40 @@ fn faulted(fault: PageFault) -> bool {
 
 static SHADOW_RESERVED: AtomicUsize = AtomicUsize::new(0);
 
+#[cfg(test)]
+thread_local! {
+    static SHADOW_TEST_CEILING: std::cell::Cell<usize> = const { std::cell::Cell::new(SHADOW_MEMORY_CEILING_BYTES) };
+}
+
+/// Lower only this caller's admission ceiling; the atomic process ceiling
+/// still holds, and writer threads never inherit fixture state.
+#[cfg(test)]
+pub(crate) fn with_shadow_ceiling_for_test<T>(bytes: usize, run: impl FnOnce() -> T) -> T {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SHADOW_TEST_CEILING.with(|ceiling| ceiling.set(self.0));
+        }
+    }
+    assert!(bytes <= SHADOW_MEMORY_CEILING_BYTES);
+    let _restore = Restore(SHADOW_TEST_CEILING.with(|ceiling| ceiling.replace(bytes)));
+    run()
+}
+
 /// Transient admission: held while the work runs, released on drop.
 pub(crate) struct ShadowReservation(usize);
 
 impl ShadowReservation {
     pub(crate) fn admit(bytes: usize) -> Option<Self> {
+        #[cfg(test)]
+        let ceiling = SHADOW_TEST_CEILING.with(std::cell::Cell::get);
+        #[cfg(not(test))]
+        let ceiling = SHADOW_MEMORY_CEILING_BYTES;
         SHADOW_RESERVED
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |reserved| {
                 reserved
                     .checked_add(bytes)
-                    .filter(|total| *total <= SHADOW_MEMORY_CEILING_BYTES)
+                    .filter(|total| *total <= ceiling)
             })
             .ok()
             .map(|_| Self(bytes))
@@ -751,8 +779,11 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) families_differ_grains: u64,
     pub(crate) families_union_partial: u64,
     pub(crate) families_unbuilt: u64,
-    /// Unreached families whose pre-admitted deadline rows the writer renders.
+    /// Unreached families whose bounded deadline rows the writer renders.
     pub(crate) families_deadline_deferred: u64,
+    /// The next family's fixed reservation was unavailable: this family
+    /// and the remaining schedule keep their turns for later pages.
+    pub(crate) families_budget_deferred: u64,
     pub(crate) families_coverage_complete: u64,
     /// Includes missing/unbuilt certificates, not only compared mismatches.
     pub(crate) certificate_mismatch: u64,
@@ -835,6 +866,11 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) requests_new: u64,
     pub(crate) holders_compared: u64,
     pub(crate) admission_bytes: u64,
+    pub(crate) admission_snapshot_bytes: u64,
+    pub(crate) admission_scope_bytes: u64,
+    pub(crate) admission_key_bytes: u64,
+    pub(crate) admission_claim_bytes: u64,
+    pub(crate) admission_fixed_bytes: u64,
     /// The page's largest admission held at once (its grown budget and its
     /// batch's rows).
     pub(crate) admitted_peak_bytes: u64,
@@ -1202,6 +1238,8 @@ thread_local! {
 // slow filesystem, a blocked log sink), on the test's own thread.
 #[cfg(test)]
 thread_local! {
+    static SHADOW_ENABLED_DELAY_FOR_TEST: std::cell::Cell<Duration> =
+        const { std::cell::Cell::new(Duration::ZERO) };
     static KILL_SWITCH_DELAY_FOR_TEST: std::cell::Cell<Duration> =
         const { std::cell::Cell::new(Duration::ZERO) };
     static LOG_WRITE_DELAY_FOR_TEST: std::cell::Cell<Duration> =
@@ -1214,6 +1252,11 @@ fn sleep_for_test(delay: &'static std::thread::LocalKey<std::cell::Cell<Duration
     if !delay.is_zero() {
         std::thread::sleep(delay);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn set_shadow_enabled_delay_for_test(delay: Duration) {
+    SHADOW_ENABLED_DELAY_FOR_TEST.with(|current| current.set(delay));
 }
 
 #[cfg(test)]
@@ -1876,8 +1919,12 @@ fn shadow_page_body(
         purge_captures(&scope_key, &mut counts);
         return refuse(&end, None, index, snapshots.len(), counts);
     }
-    let Some(root_funds) = ShadowReservation::admit(snapshots.len().saturating_mul(64)) else {
+    let root_bytes = snapshots.len().saturating_mul(64);
+    counts.admission_snapshot_bytes = root_bytes as u64;
+    counts.admission_bytes = root_bytes as u64;
+    let Some(root_funds) = ShadowReservation::admit(root_bytes) else {
         counts.refused_budget = 1;
+        purge_captures(&scope_key, &mut counts);
         return refuse(&end, None, index, snapshots.len(), counts);
     };
     // Each root's snapshots, grouped in the one admission pass over them.
@@ -1890,8 +1937,8 @@ fn shadow_page_body(
             .push(item);
     }
     let roots = &items_by_root;
-    // Pre-admit metadata, every failure row, memos and writer buffer. No
-    // family-specific scratch is charged until that family's turn.
+    // Admit only page indexes, scope, claims and fixed buffers. Family rows
+    // and scratch wait for their turn; the writer streams deferred rows.
     let key_bytes = index.files.keys().map(String::len).sum::<usize>();
     let residue_bytes = index
         .claude_request_census
@@ -1903,21 +1950,30 @@ fn shadow_page_body(
         .filter_map(|root| api_report.evidence.get(*root))
         .map(Vec::len)
         .sum::<usize>();
-    let admission = snapshots
-        .len()
-        .saturating_mul(FAMILY_BYTES + 256)
-        .saturating_add(claude_request_ledger::scope_bound(
-            index.files.len() + index.claude_request_census.records().count(),
-            key_bytes + residue_bytes,
-        ))
-        .saturating_add(key_bytes.saturating_mul(2))
-        .saturating_add(page_claim_rows.saturating_mul(PAGE_HASH_BYTES))
-        .saturating_add(
-            JSONL_WRITE_BUFFER_BYTES
-                + FAMILY_BYTES // one cached canonical failure template
-                + 1024
-                + tail_fixed_memory(&ClaudeTelemetryTailBudget::default()),
-        );
+    let snapshot_bytes = snapshots.len().saturating_mul(SNAPSHOT_INDEX_BYTES);
+    let scope_bytes = claude_request_ledger::scope_bound(
+        index
+            .files
+            .len()
+            .saturating_add(index.claude_request_census.records().count()),
+        key_bytes.saturating_add(residue_bytes),
+    );
+    let keys_bytes = key_bytes.saturating_mul(2);
+    let claim_bytes = page_claim_rows.saturating_mul(PAGE_HASH_BYTES);
+    let fixed_bytes = JSONL_WRITE_BUFFER_BYTES
+        + 2 * FAMILY_BYTES // cached failure template and one streamed failure row
+        + 1024
+        + tail_fixed_memory(&ClaudeTelemetryTailBudget::default());
+    let admission = snapshot_bytes
+        .saturating_add(scope_bytes)
+        .saturating_add(keys_bytes)
+        .saturating_add(claim_bytes)
+        .saturating_add(fixed_bytes);
+    counts.admission_snapshot_bytes = snapshot_bytes.saturating_add(root_funds.bytes()) as u64;
+    counts.admission_scope_bytes = scope_bytes as u64;
+    counts.admission_key_bytes = keys_bytes as u64;
+    counts.admission_claim_bytes = claim_bytes as u64;
+    counts.admission_fixed_bytes = fixed_bytes as u64;
     counts.admission_bytes = admission.saturating_add(root_funds.bytes()) as u64;
     counts.admission_us = admitting.elapsed().as_micros() as u64;
     let Some(base) = ShadowReservation::admit(admission) else {
@@ -2049,7 +2105,7 @@ fn shadow_page_body(
     }
     // Only scheduled families can be reached. Their body inputs are gathered
     // when the schedule reaches them, in its order: a family the page never
-    // reaches costs only its deadline row.
+    // reaches costs only its small deferred index entry.
     // Captures deposited after this belong to the next parse.
     let purge_at = Instant::now();
     let located = std::cell::OnceCell::<Option<ClaudeScopeFiles<'_>>>::new();
@@ -2061,7 +2117,7 @@ fn shadow_page_body(
     // fallback plan's exclusions.
     let mut reached_turns = Vec::new();
     let holder_view = ClaudeHolderView::of(coverage_view);
-    let mut families = Vec::with_capacity(roots.len());
+    let mut families = Vec::new();
     let mut memos = Vec::with_capacity(roots.len());
     let mut reservations = vec![base, root_funds];
     let mut failed = 0;
@@ -2092,7 +2148,19 @@ fn shadow_page_body(
         }
         let body_deadline = end.deadline;
         let (root, key, turn) = order[position].clone();
-        if !capture_turns.contains(root) || preflight_check(end.deadline).is_err() {
+        let eligible = capture_turns.contains(root) && preflight_check(end.deadline).is_ok();
+        // Reserve the family's fixed storage before taking captures or
+        // allocating its inputs. Keep it through writer handoff if reached.
+        let family_funds = eligible
+            .then(|| ShadowReservation::admit(FAMILY_BYTES))
+            .flatten();
+        let budget_deferred = eligible && family_funds.is_none();
+        if !eligible || budget_deferred {
+            let reason = if budget_deferred {
+                "memory"
+            } else {
+                "deadline"
+            };
             complete_schedule(
                 &mut order,
                 head,
@@ -2143,7 +2211,9 @@ fn shadow_page_body(
                 let unchanged = compare
                     .then(|| published_digest(ledger, key, day, epoch))
                     .flatten()
-                    .is_some_and(|digest| failure_digest.deferred(root, &state, ledger) == digest);
+                    .is_some_and(|digest| {
+                        failure_digest.deferred_reason(root, &state, ledger, reason) == digest
+                    });
                 if unchanged {
                     counts.unchanged += 1;
                     // Nothing was consumed or published. Re-acknowledging an
@@ -2163,7 +2233,7 @@ fn shadow_page_body(
                         attempted: now,
                     },
                     row: true,
-                    deferred: Some((root.to_string(), state)),
+                    deferred: Some((root.to_string(), state, reason)),
                 });
                 before_wrap += usize::from(at >= rotation);
             }
@@ -2171,13 +2241,21 @@ fn shadow_page_body(
             ledger.deferred_compare_cursor = first_uncompared.unwrap_or(0);
             counts.families += deferred;
             counts.families_unbuilt += deferred;
-            counts.families_deadline_deferred += deferred;
+            if budget_deferred {
+                counts.families_budget_deferred += deferred;
+            } else {
+                counts.families_deadline_deferred += deferred;
+            }
             counts.certificate_mismatch += deferred;
             counts.removed_change_unavailable += deferred;
             counts.deferred_close_us = deferred_started.elapsed().as_micros() as u64;
             incomplete += deferred;
             break;
         }
+        reservations.push(family_funds.expect("reached family is funded"));
+        counts.admitted_peak_bytes = counts
+            .admitted_peak_bytes
+            .max(SHADOW_RESERVED.load(Ordering::Acquire) as u64);
         let items = &roots[root];
         // The page's one index walk and its page roots' claims, when the
         // schedule first reaches a family.
@@ -3229,7 +3307,7 @@ fn write_semantic(rows: &mut FamilyRows, writer: &mut impl Write) -> serde_json:
     result
 }
 
-/// Only `failure_rows(..., "deadline", ...)` uses this cache. Such rows
+/// Only bounded deadline/memory failure rows use this cache. Such rows
 /// differ solely in family identity and the census wire fields. Serialize
 /// one exact canonical template per census shape, then reuse its SHA prefix
 /// and suffix bytes. This preserves the digest and unchanged suppression
@@ -3241,18 +3319,33 @@ struct DeadlineDigest {
     misses: usize,
 }
 struct DeadlineTemplate {
+    reason: &'static str,
     census: &'static str,
-    reason: Option<coverage::CensusReason>,
+    census_reason: Option<coverage::CensusReason>,
     statuses: BTreeMap<&'static str, u64>,
     prefix: ring::digest::Context,
     bytes: Vec<u8>,
     suffix: usize,
 }
 impl DeadlineDigest {
+    #[cfg(test)]
     fn deferred(&mut self, root: &str, state: &FamilyCensus, ledger: &ClaudeLedger) -> u64 {
+        self.deferred_reason(root, state, ledger, "deadline")
+    }
+
+    fn deferred_reason(
+        &mut self,
+        root: &str,
+        state: &FamilyCensus,
+        ledger: &ClaudeLedger,
+        deferred_reason: &'static str,
+    ) -> u64 {
         let (census, reason, statuses) = state.wire();
         if self.template.as_ref().is_some_and(|template| {
-            template.census == census && template.reason == reason && template.statuses == statuses
+            template.census == census
+                && template.census_reason == reason
+                && template.statuses == statuses
+                && template.reason == deferred_reason
         }) {
             // The wire identity has its own domain separator; it is not
             // the scheduling key digest. Hash only the admitted root bytes.
@@ -3260,7 +3353,7 @@ impl DeadlineDigest {
         }
         let mut rows = failure_rows(
             root,
-            "deadline",
+            deferred_reason,
             state.clone(),
             0,
             0,
@@ -3284,7 +3377,8 @@ impl DeadlineDigest {
         }
         let matches = self.template.as_ref().is_some_and(|template| {
             template.census == rows.row.census
-                && template.reason == rows.row.census_reason
+                && template.census_reason == rows.row.census_reason
+                && rows.row.p1_reasons.as_slice() == [template.reason]
                 && template.statuses == rows.row.key_statuses
         });
         if !matches {
@@ -3313,7 +3407,8 @@ impl DeadlineDigest {
             prefix.update(&bytes[..start]);
             self.template = Some(DeadlineTemplate {
                 census: rows.row.census,
-                reason: rows.row.census_reason,
+                reason: rows.row.p1_reasons[0],
+                census_reason: rows.row.census_reason,
                 statuses: rows.row.key_statuses.clone(),
                 prefix,
                 bytes,
@@ -4170,6 +4265,29 @@ fn serialized_len<T: Serialize>(value: &T) -> u64 {
     count.0
 }
 
+/// Deferred suffixes retain only their identities and census state. Every
+/// writer pass renders at most one failure at a time, funded by fixed bytes.
+fn deferred_rows<'a>(
+    memos: &'a [PendingMemo],
+    batch: &JsonlBatch,
+) -> impl Iterator<Item = FamilyRows> + 'a {
+    let now = batch.now;
+    let snapshot = batch.coverage.snapshot;
+    let empty = ClaudeLedger::empty(false);
+    memos.iter().filter_map(move |memo| {
+        let (root, state, reason) = memo.deferred.as_ref()?;
+        Some(failure_rows(
+            root,
+            reason,
+            state.clone(),
+            now,
+            snapshot,
+            &empty,
+            &mut Default::default(),
+        ))
+    })
+}
+
 /// Append a batch's rows and its coverage row to the day's capped file
 /// (serialized here, from the batch's families), the false coverage rows
 /// earlier batches owe their days, and drop own files older than the
@@ -4180,7 +4298,11 @@ fn serialized_len<T: Serialize>(value: &T) -> u64 {
 /// `room` takes no more ordinary rows and the file stays under its cap. A
 /// seal or debt that does not reach the file stays owed (Sol R4-1).
 /// Failures are counted, never raised. Runs on the writer thread only.
-fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
+fn write_jsonl(
+    support_dir: &Path,
+    batch: &mut JsonlBatch,
+    memos: &mut [PendingMemo],
+) -> JsonlOutcome {
     let mut outcome = JsonlOutcome::default();
     let now = batch.now;
     if batch.fault == PageFault::WriteFailure {
@@ -4215,7 +4337,17 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
             owe_coverage(support_dir, observed, true);
         }
     }
-    let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>();
+    let deferred_count = memos.iter().filter(|memo| memo.deferred.is_some()).count() as u64;
+    // Refusal/off batches may carry only the small fallback admission.
+    // Do not allocate a scratch ledger when there is no deferred suffix.
+    let deferred_bytes = if deferred_count == 0 {
+        0
+    } else {
+        deferred_rows(memos, batch)
+            .map(|family| serialized_len(&family.row) + 1)
+            .sum::<u64>()
+    };
+    let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>() + deferred_count;
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
     if file.sealed || file.size > room {
@@ -4230,6 +4362,8 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
     // Repeated family versions count just like first publications.
     let mut mandatory = serialized_len(&batch.coverage)
         + 1
+        + deferred_bytes
+        + 64 * deferred_count
         + batch
             .families
             .iter()
@@ -4261,6 +4395,7 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
     }
     mandatory = serialized_len(&batch.coverage)
         + 1
+        + deferred_bytes
         + batch
             .families
             .iter()
@@ -4290,6 +4425,28 @@ fn write_jsonl(support_dir: &Path, batch: &mut JsonlBatch) -> JsonlOutcome {
         kept += u64::from(file.push(&family.row));
         for (key, (old, new)) in &family.grains {
             kept += u64::from(file.push(&grain_row(&family.row, key, old, new)));
+        }
+    }
+    // Families before this suffix are already in schedule order. Compute
+    // each deferred digest before acknowledging it, without expanding the
+    // entire suffix into retained FamilyRows.
+    if deferred_count > 0 {
+        let empty = ClaudeLedger::empty(false);
+        for memo in memos.iter_mut() {
+            if let Some((root, state, reason)) = memo.deferred.take() {
+                let mut family = failure_rows(
+                    &root,
+                    reason,
+                    state,
+                    now,
+                    batch.coverage.snapshot,
+                    &empty,
+                    &mut Default::default(),
+                );
+                memo.published.digest = semantic_digest(&mut family);
+                memo.basis = None;
+                kept += u64::from(file.push(&family.row));
+            }
         }
     }
     let coverage_fits = file.push(&batch.coverage);
@@ -4355,6 +4512,37 @@ pub(crate) fn reserved_for_test() -> usize {
 #[cfg(test)]
 mod bounded_tests {
     use super::*;
+
+    #[test]
+    fn deferred_digest_distinguishes_budget_from_deadline() {
+        let ledger = ClaudeLedger::empty(false);
+        let state = FamilyCensus::Covered;
+        let mut cached = DeadlineDigest::default();
+        let mut digests = Vec::new();
+        for reason in ["memory", "deadline", "memory"] {
+            let mut rows = failure_rows(
+                "deferred-root",
+                reason,
+                state.clone(),
+                123,
+                456,
+                &ledger,
+                &mut Default::default(),
+            );
+            let expected = semantic_digest(&mut rows);
+            assert_eq!(
+                cached.deferred_reason("deferred-root", &state, &ledger, reason),
+                expected
+            );
+            assert_eq!(
+                cached.deferred_reason("deferred-root", &state, &ledger, reason),
+                expected
+            );
+            digests.push(expected);
+        }
+        assert_ne!(digests[0], digests[1]);
+        assert_eq!(digests[0], digests[2]);
+    }
 
     #[test]
     fn interim_seam_never_covers_and_preserves_reason_precedence() {

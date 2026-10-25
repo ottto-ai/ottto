@@ -184,7 +184,7 @@ pub(crate) struct SavePolicy<'a> {
 }
 
 impl ClaudeLedger {
-    fn empty(dirty: bool) -> Self {
+    pub(super) fn empty(dirty: bool) -> Self {
         Self {
             census: ClaudeRequestCensus::default(),
             shard_bytes: vec![0; SHARDS],
@@ -516,9 +516,9 @@ pub(crate) struct PendingMemo {
     pub(crate) published: ClaudeFamilyPublication,
     /// The batch carries a row of the family (else it was unchanged).
     pub(crate) row: bool,
-    /// Pre-admitted unreached family. The writer renders its deadline row
-    /// and computes the full canonical digest before publication/ack.
-    pub(crate) deferred: Option<(String, super::FamilyCensus)>,
+    /// Unreached family and failure reason. The writer streams its row and
+    /// computes the full canonical digest before publication/ack.
+    pub(crate) deferred: Option<(String, super::FamilyCensus, &'static str)>,
 }
 
 /// One page's batch for the writer.
@@ -965,23 +965,6 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         save,
         reservations,
     } = job;
-    if memos.iter().any(|memo| memo.deferred.is_some()) {
-        let empty = ClaudeLedger::empty(false);
-        let mut ignored = super::ClaudeRequestMoneyShadowCounts::default();
-        for memo in &mut memos {
-            if let Some((root, state)) = memo.deferred.take() {
-                jsonl.families.push(super::failure_rows(
-                    &root,
-                    "deadline",
-                    state,
-                    jsonl.now,
-                    jsonl.coverage.snapshot,
-                    &empty,
-                    &mut ignored,
-                ));
-            }
-        }
-    }
     let ready = match failed.run_days {
         Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
         previous => {
@@ -999,7 +982,7 @@ fn write(job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
         }
     };
     let outcome = if ready {
-        super::write_jsonl(&support_dir, &mut jsonl)
+        super::write_jsonl(&support_dir, &mut jsonl, &mut memos)
     } else {
         super::owe_coverage(&support_dir, jsonl.now, true);
         super::JsonlOutcome {
@@ -1627,7 +1610,7 @@ mod bounded_save_tests {
                 attempted: now,
             },
             row: true,
-            deferred: Some((root.to_owned(), state.clone())),
+            deferred: Some((root.to_owned(), state.clone(), "deadline")),
         };
         let reservation = ShadowReservation::admit(super::super::FAMILY_BYTES).unwrap();
         let job = WriteJob {

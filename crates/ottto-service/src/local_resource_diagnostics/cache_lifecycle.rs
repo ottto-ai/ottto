@@ -65,6 +65,9 @@ counters! {
     retention_clone_bound_refused: RetentionCloneBoundRefused,
     retention_finalization_bound_refused: RetentionFinalizationBoundRefused,
     retention_produced: RetentionProduced,
+    // SOURCE (B): fixed content-free totals, never per-file history.
+    prefix_excluded_bodies: PrefixExcludedBody,
+    prefix_tag_clears: PrefixTagCleared,
 }
 
 pub(crate) fn add(event: Event, amount: u64) {
