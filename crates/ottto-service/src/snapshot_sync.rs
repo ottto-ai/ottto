@@ -7541,17 +7541,19 @@ async fn finish_sync_source_resume(
                 &scan_result.snapshots,
             );
         }
-        if source_money_resume(source, support_dir)
-            && recovery_ack_durable
-            && unknown_recovery::resolve_saved(
+        if source_money_resume(source, support_dir) && recovery_ack_durable {
+            if let Err(error) = unknown_recovery::resolve_saved(
                 support_dir,
                 saved,
                 &upload_progress,
                 unknown_recovery::now(support_dir),
-            )
-            .is_err()
-        {
-            eprintln!("claude_request_money recovery_custody_fault=1");
+            ) {
+                if error.is::<unknown_recovery::CapacityFull>() {
+                    eprintln!("claude_request_money recovery_capacity_deferred=1");
+                } else {
+                    eprintln!("claude_request_money recovery_custody_fault=1");
+                }
+            }
         }
     };
     index.log_claude_proof_correction_debt();
