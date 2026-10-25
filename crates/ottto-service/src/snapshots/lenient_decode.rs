@@ -273,6 +273,7 @@ impl Serialize for ScanIndex {
         field!(resume_after_path, Option::is_none);
         field!(resume_upper_bound_path, Option::is_none);
         field!(resume_census_window_end, Option::is_none);
+        field!(held_audit_progress, Option::is_none);
         field!(bounded_sweep_had_unsettled_upload);
         field!(bounded_sweep_unsettled_causes, is_zero_u16);
         field!(traversal, Option::is_none);
@@ -361,6 +362,7 @@ pub(super) const FIELDS: &[&str] = &[
     "resume_after_path",
     "resume_upper_bound_path",
     "resume_census_window_end",
+    "held_audit_progress",
     "bounded_sweep_had_unsettled_upload",
     "bounded_sweep_unsettled_causes",
     "traversal",
@@ -1650,6 +1652,15 @@ impl<R: BufRead + Seek> Decoder<R> {
                             index.bounded_sweep_unsettled_causes = self
                                 .census(value, "bounded_sweep_unsettled_causes")?
                                 .bounded_sweep_unsettled_causes
+                        }
+                        "held_audit_progress" => {
+                            // Scheduling damage cannot erase or verify a census
+                            // hold. Bound the single path before allocating it.
+                            index.held_audit_progress = if value.len <= 8192 {
+                                self.history_scalar(value, None)?
+                            } else {
+                                None
+                            };
                         }
                         "traversal" => index.traversal = self.typed(value)?,
                         "claude_stale_family_carry" => {

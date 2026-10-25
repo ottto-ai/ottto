@@ -294,6 +294,148 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
     keys.len()
 }
 
+/// Saturated sampled slots must not make a plain-v2 hold wait for an
+/// unrelated unavailable/oversized file forever. One durable rotating slot
+/// schedules a native Full after a fresh interval, without allocating a
+/// sampled marker or taking the last sampled slot. It grants no authority.
+/// Failed attempts rotate too; their census holds stay eligible for the next
+/// round. The fixed population therefore cannot starve a readable member.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct HeldAuditProgress {
+    pub(super) key: String,
+    pub(super) due: u64,
+    pub(super) attempted: bool,
+}
+crate::heap_layout_bound::fields!(HeldAuditProgress; key, due, attempted);
+
+pub(super) fn progress_debt(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    let slot = index.held_audit_progress.as_ref()?;
+    (slot.key == key && now >= slot.due && awaits_hold_deadline_restoration(index, key)).then_some(
+        AuditDebt {
+            due_unix_seconds: slot.due,
+        },
+    )
+}
+
+pub(super) fn debt_for_key(index: &ScanIndex, key: &str, now: u64) -> Option<AuditDebt> {
+    index
+        .files
+        .get(key)
+        .and_then(|entry| entry.audit_obligation(now))
+        .or_else(|| progress_debt(index, key, now))
+}
+
+impl OwnedSourceScan {
+    /// At most one additional Full attempt per page. The queue contains only
+    /// a bounded path and deadline; entry/census identity is never rewritten.
+    pub(super) fn prepare_held_audit_progress(&mut self, now: u64) {
+        if self.file_limit == 0 {
+            return;
+        }
+        let previous = self.index.held_audit_progress.as_ref();
+        let keep = previous.is_some_and(|slot| {
+            !slot.attempted
+                && slot.key.len() <= 4096
+                && slot.due > 0
+                && now
+                    .checked_add(AUDIT_INTERVAL_SECONDS)
+                    .is_some_and(|latest| slot.due <= latest)
+                && awaits_hold_deadline_restoration(&self.index, &slot.key)
+        });
+        if !keep {
+            let after = previous.map(|slot| slot.key.as_str());
+            let eligible = |key: &&String| {
+                key.len() <= 4096
+                    && awaits_hold_deadline_restoration(&self.index, key)
+                    && self.index.traversal.as_ref().is_some_and(|traversal| {
+                        traversal
+                            .scan_roots
+                            .iter()
+                            .any(|root| Path::new(key).starts_with(root))
+                    })
+            };
+            // BTreeMap order plus a persisted cursor gives every held path a
+            // turn, including when a prior turn failed its secure open/cap.
+            let key = self
+                .index
+                .claude_request_census
+                .records()
+                .map(|(key, _)| key)
+                .filter(eligible)
+                .find(|key| after.map_or(true, |after| key.as_str() > after))
+                .or_else(|| {
+                    self.index
+                        .claude_request_census
+                        .records()
+                        .map(|(key, _)| key)
+                        .find(eligible)
+                })
+                .cloned();
+            self.index.held_audit_progress =
+                key.zip(now.checked_add(AUDIT_INTERVAL_SECONDS))
+                    .map(|(key, due)| HeldAuditProgress {
+                        key,
+                        due,
+                        attempted: false,
+                    });
+        }
+        let Some(slot) = self.index.held_audit_progress.as_ref() else {
+            return;
+        };
+        if now < slot.due {
+            return;
+        }
+        let path = PathBuf::from(&slot.key);
+        let Some(root) = self.index.traversal.as_ref().and_then(|traversal| {
+            traversal
+                .scan_roots
+                .iter()
+                .find(|root| path.starts_with(root))
+                .cloned()
+        }) else {
+            return;
+        };
+        let key = slot.key.clone();
+        let Some(entry) = self.index.files.get(&key) else {
+            return;
+        };
+        let candidate = CandidateFile {
+            scan_root: root,
+            path,
+            size_bytes: entry.size_bytes,
+            modified_unix_seconds: entry.modified_unix_seconds,
+            modified_unix_nanos: entry.modified_unix_nanos.unwrap_or_default(),
+            source_file_fingerprint: String::new(),
+            legacy_source_file_fingerprint: String::new(),
+            legacy_config_reconciliation_required: false,
+            opened_object_identity: String::new(),
+        };
+        // Mirror candidate conversion's census observation. An old queued
+        // age rejection must not delete a successful recovery at settlement.
+        if !self.census.claude_vanished_index_keys.contains(&key) {
+            self.census.removed_index_keys.remove(&key);
+        }
+        self.census.observed_index_keys.insert(key.clone());
+        self.identified_candidates
+            .retain(|candidate| local_index_key(&candidate.path) != key);
+        self.identified_candidates.push_front(candidate);
+        // Preserve the ordinary page limit and every displaced candidate.
+        while self.identified_candidates.len() > self.file_limit.max(1) {
+            let candidate = self.identified_candidates.pop_back().unwrap();
+            if let Some(traversal) = self.index.traversal.as_mut() {
+                traversal.pending_candidates.push_front(ScanTraversalPath {
+                    scan_root: candidate.scan_root,
+                    path: candidate.path,
+                    census_member: true,
+                    watcher_hint: false,
+                });
+            }
+        }
+        self.index.held_audit_progress.as_mut().unwrap().attempted = true;
+        super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(1);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

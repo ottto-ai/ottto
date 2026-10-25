@@ -2136,6 +2136,239 @@ fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     assert_eq!(restored(), restored_before + 2);
 }
 
+/// A retained member can become old at candidate conversion or after its
+/// stat but before open. Both age rejections settle as ordinary removals,
+/// never as explicit vanished-file retirement.
+#[test]
+fn fe_n1_option_b_age_rejections_keep_deferred_hold_through_settlement_and_reload() {
+    use std::time::{Duration, UNIX_EPOCH};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let due = sampled_scan::now_seconds();
+    for at_open in [false, true] {
+        let hold = erased_hold(due);
+        let key = hold.key.clone();
+        let pending = || ScanTraversalPath {
+            scan_root: hold.fixture.root.clone(),
+            path: hold.fixture.file.0.clone(),
+            census_member: true,
+            watcher_hint: false,
+        };
+        let mut census = ScanCensus::default();
+        let candidate = candidate_from_traversal_path(
+            CLAUDE,
+            pending(),
+            &mut census,
+            Some(due),
+            BACKFILL_WINDOW_DAYS,
+            &hold.index.files,
+        )
+        .expect("retained while recent");
+        File::open(&hold.fixture.file.0)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap();
+        if at_open {
+            assert!(open_and_identify_scan_candidate(
+                CLAUDE,
+                candidate,
+                &mut census,
+                Some(due),
+                BACKFILL_WINDOW_DAYS,
+                &hold.index.files,
+            )
+            .is_none());
+        } else {
+            assert!(candidate_from_traversal_path(
+                CLAUDE,
+                pending(),
+                &mut census,
+                Some(due),
+                BACKFILL_WINDOW_DAYS,
+                &hold.index.files,
+            )
+            .is_none());
+        }
+        assert!(census.removed_index_keys.contains(&key));
+        assert!(!census.claude_vanished_index_keys.contains(&key));
+        let mut index = hold.index;
+        // This earlier hold takes the one restoration, deferring the real
+        // retained member. No deletion or manual freeing of an audit slot.
+        index
+            .files
+            .insert("!earlier-held".into(), index.files[&key].clone());
+        let record = index
+            .claude_request_census_for_test()
+            .get(&key)
+            .unwrap()
+            .clone();
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test("!earlier-held", record);
+        sampled_scan::set_test_now(None);
+        let removed = census.removed_index_keys.clone();
+        let (mut index, _, seen) = page(&hold.fixture, CLAUDE, index, &hold.cache, |scan| {
+            scan.census
+                .removed_index_keys
+                .extend(removed.iter().cloned());
+        });
+        assert_eq!(seen.modes, (0, 0, 0));
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index, &key
+        ));
+        let (mut index, _, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        assert_eq!(seen.modes, (0, 0, 0));
+        assert!(index.files[&key].has_prefix_provenance());
+        // Date this already-restored deadline so the real candidate clock
+        // and deterministic acquisition clock agree, then persist it again.
+        index
+            .files
+            .get_mut(&key)
+            .unwrap()
+            .set_unverified_deadline(due);
+        index.save(&hold.index_path).unwrap();
+        let index = ScanIndex::load(&hold.index_path).unwrap();
+        sampled_scan::set_test_now(Some(due));
+        let (mut index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
+        assert_eq!(seen.modes, (1, 0, 0));
+        assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+        assert_eq!(seen.unreadable, 0);
+        assert!(!index
+            .claude_request_census_for_test()
+            .get(&key)
+            .unwrap()
+            .unverified_or_twin());
+        assert_eq!(index.claude_usage_family_witnesses[SESSION], hold.witness);
+        assert!(mints_v1(&mut index, &result, 0..6));
+    }
+}
+
+/// Saturate the marker pool with debts that cannot drain, then cross the
+/// 255 boundary with readable old downgraded holds. Real pages, saved and
+/// reloaded on every turn, must give every readable member its due Full.
+/// The test never deletes a pending slot. Failed progress turns rotate too.
+#[test]
+fn fe_n1_option_b_saturated_non_draining_debts_do_not_starve_many_readable_holds() {
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
+    use crate::transcript_cache::CACHE_ENTRIES;
+    use std::time::{Duration, UNIX_EPOCH};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _clock = TestClock;
+    let population = CACHE_ENTRIES + 1;
+    let now = sampled_scan::now_seconds();
+    let start = now - (population as u64 * 2 + 8) * INTERVAL;
+    let hold = erased_hold(start);
+    let template = hold.index.files[&hold.key].clone();
+    let record = hold
+        .index
+        .claude_request_census_for_test()
+        .get(&hold.key)
+        .unwrap()
+        .clone();
+    let bytes = String::from_utf8(bytes_of(&hold.fixture.file.0)).unwrap();
+    let mut index = hold.index;
+    let mut readable = BTreeSet::from([hold.key.clone()]);
+    let age = |path: &Path| {
+        File::open(path)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(UNIX_EPOCH + Duration::from_secs(1)))
+            .unwrap()
+    };
+    age(&hold.fixture.file.0);
+    for n in 0..population {
+        let session = format!("held-{n:04}");
+        let path = hold.fixture.root.join(format!("{session}.jsonl"));
+        fs::write(&path, bytes.replace(SESSION, &session)).unwrap();
+        age(&path);
+        let key = local_index_key(&path);
+        index.files.insert(key.clone(), template.clone());
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(&key, record.clone());
+        readable.insert(key);
+    }
+    // Both missing ancestors and files beyond the cap are non-draining.
+    let oversized = hold.fixture.root.join("oversized.jsonl");
+    File::create(&oversized)
+        .unwrap()
+        .set_len(max_jsonl_file_bytes(CLAUDE) + 1)
+        .unwrap();
+    let mut debts = BTreeSet::new();
+    for n in 0..CACHE_ENTRIES - 1 {
+        let key = if n == 0 {
+            local_index_key(&oversized)
+        } else {
+            format!("/unavailable-option-b-root/{n}/session.jsonl")
+        };
+        let mut pending = template.clone();
+        pending.set_unverified_deadline(start);
+        index.files.insert(key.clone(), pending);
+        debts.insert(key);
+    }
+    // An unavailable *hold* selected before the readable set must also
+    // rotate out, without erasing its hold or any ordinary audit marker.
+    let unavailable = hold.fixture.root.join("000-unavailable/held.jsonl");
+    let unavailable_key = local_index_key(&unavailable);
+    index.files.insert(unavailable_key.clone(), template);
+    index
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&unavailable_key, record);
+    let mut completed = BTreeSet::new();
+    let mut fulls = 0;
+    for turn in 0..(readable.len() * 2 + 4) {
+        sampled_scan::set_test_now(Some(start + turn as u64 * INTERVAL));
+        let (next, _, seen) = page(&hold.fixture, CLAUDE, index, &hold.cache, |scan| {
+            let context = scan.sampling.as_ref().unwrap();
+            assert!(context.audit_metadata_supported);
+            assert_eq!(context.audit_slots, 1, "last sampled slot stays free");
+        });
+        index = next;
+        assert!(seen.modes.0 <= 1, "one recovery Full per page");
+        assert_eq!(seen.modes.0, seen.full_reasons[AUDIT_DUE]);
+        fulls += seen.modes.0;
+        for key in &readable {
+            if index
+                .claude_request_census_for_test()
+                .get(key)
+                .is_some_and(|record| !record.unverified_or_twin())
+            {
+                completed.insert(key.clone());
+            }
+        }
+        for key in &debts {
+            assert_eq!(index.files[key].unverified_deadline(), Some(start));
+        }
+        assert!(sampled_audit::awaits_hold_deadline_restoration(
+            &index,
+            &unavailable_key
+        ));
+        index.save(&hold.index_path).unwrap();
+        index = ScanIndex::load(&hold.index_path).unwrap();
+        if completed == readable {
+            break;
+        }
+    }
+    assert_eq!(completed, readable, "every readable hold got its Full");
+    assert_eq!(fulls, readable.len(), "exactly one Full per readable hold");
+    assert_eq!(
+        index
+            .files
+            .values()
+            .filter(|entry| entry.has_unverified_source())
+            .count(),
+        CACHE_ENTRIES - 1
+    );
+}
+
 /// Option B reads nothing extra: a plain-v2 entry without an N1 hold (a
 /// verified Full) gets no deadline and no read, and counts no restoration.
 #[test]
