@@ -24,7 +24,8 @@ fixture ends. Test agents also disable redirects, because the HTTP library only
 runs middleware on the initial request. Production routing and redirect policy
 are unchanged. Tests must provide loopback backend fixtures.
 
-Regression coverage exercises shared suppression across callers and sources,
+Regression coverage exercises shared suppression across callers for one source,
+isolation between sources,
 probe admission, changed credential keys, success reset, transient 429/503
 classification, setup refresh and test-only egress rejection. Broad workspace
 checks remain CI's responsibility.
@@ -36,3 +37,7 @@ including the terminal setup-refresh hold, even for unchanged credentials.
 Doctor sends the additive optional status flag `retry_relay_authorization: true`;
 ordinary status omits its default false value and never resets backoff. Existing
 clients and polling retain their request shape and behavior.
+
+The loopback gate fixture retains response sockets until teardown and switches
+accepted sockets to blocking mode. This avoids response-close/read-timeout races
+on macOS without retries or relaxed assertions in the regressions.

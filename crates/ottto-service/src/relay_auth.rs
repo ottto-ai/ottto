@@ -512,14 +512,21 @@ mod http_tests {
             let (calls, stop) = (count.clone(), done.clone());
             let thread = thread::spawn(move || {
                 let mut statuses = statuses.into_iter();
+                // ureq installs its body-read timeout after parsing headers.
+                // Keep fixture peers open until teardown so that setsockopt
+                // cannot race with an immediate server close on macOS.
+                let mut connections = Vec::new();
                 while !stop.load(Ordering::Relaxed) {
                     match listener.accept() {
                         Ok((mut stream, _)) => {
+                            // macOS inherits the listener's nonblocking flag.
+                            stream.set_nonblocking(false).unwrap();
                             crate::retry_tls::credential_test_support::read_request(&mut stream);
                             let status = statuses.next().unwrap_or(500);
                             calls.fetch_add(1, Ordering::Relaxed);
                             let body = r#"{"token":"synthetic-token"}"#;
                             write!(stream, "HTTP/1.1 {status} Scripted\r\nContent-Type: application/json\r\nContent-Length: {}\r\nRetry-After: 17\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+                            connections.push(stream);
                         }
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                             thread::sleep(Duration::from_millis(1));
