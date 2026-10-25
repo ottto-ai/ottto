@@ -2212,6 +2212,21 @@ fn listed_root_holds_every_subagent_through_the_pipeline_without_the_root_file()
 
 // F2: native scan -> evidence -> finalization -> upload -> settlement -> reload.
 // No accumulator or settlement disposition is supplied by these fixtures.
+// Request-owned literals are intentionally denied below revision 3. These
+// enabled-path tests use the existing future-revision test seam and an empty
+// installed protected list, preserving the production activation guard.
+const E2_HISTORY_UPGRADE: HistoryCycle<'static> = HistoryCycle {
+    revision: 3,
+    ..HISTORY_REVISION_2
+};
+
+fn with_e2_history<T>(fixture: &HistoryFixture, f: impl FnOnce() -> T) -> T {
+    fixture.install_list(&[]);
+    crate::snapshots::with_max_gated_claude_revision(3, || {
+        crate::snapshots::claude_request_money::e2::with_enabled(f)
+    })
+}
+
 fn e2_history_sidecar(support: &Path, root: &str, trace: bool) -> PathBuf {
     support
         .join(if trace {
@@ -2333,13 +2348,13 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
         .cloned()
         .collect::<Vec<_>>();
     assert_eq!(keys.len(), 2);
-    crate::snapshots::claude_request_money::e2::with_enabled(|| {
+    with_e2_history(&fixture, || {
         // Existing identity at the emitter boundary makes it refuse. Both
         // contributions came through the real file parser, not hand-fed folds.
         for hour in [9, 10] {
             let outcome = fixture.cycle_with_scan(
                 &format!("2026-08-02T{hour:02}:00:00Z"),
-                HISTORY_REVISION_2,
+                E2_HISTORY_UPGRADE,
                 |scan, _| {
                     let twins = scan
                         .snapshots
@@ -2366,7 +2381,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
                 let key = HistoryFixture::key(&outcome.index, sibling);
                 assert_eq!(
                     outcome.index.files[&key].effective_upload_body_witness_revision,
-                    2
+                    3
                 );
             }
         }
@@ -2417,8 +2432,8 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
             .is_ok(),
             "{failure}"
         );
-        crate::snapshots::claude_request_money::e2::with_enabled(|| {
-            let failed = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+        with_e2_history(&fixture, || {
+            let failed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
             assert_eq!(
                 failed.uploaded.len(),
                 2,
@@ -2430,7 +2445,7 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
                 std::fs::remove_dir(&broken).unwrap();
             }
             e2_history_reported(&fixture, root, 0);
-            let recovered = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+            let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
             assert_eq!(
                 recovered.uploaded,
                 BTreeSet::from([root.to_owned()]),
@@ -2450,9 +2465,9 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
             );
             assert_eq!(
                 recovered.index.files[&held_key].effective_upload_body_witness_revision,
-                2
+                3
             );
-            let again = fixture.cycle("2026-08-02T11:00:00Z", HISTORY_REVISION_2);
+            let again = fixture.cycle("2026-08-02T11:00:00Z", E2_HISTORY_UPGRADE);
             assert!(again.uploaded.is_empty(), "{failure}: settles exactly once");
             assert_eq!(
                 again.scan.scanned_file_count, 0,
@@ -2466,8 +2481,8 @@ fn e2_ok_unhealthy_root_holds_history_then_healthy_read_settles_reported_once() 
 fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
     let fixture = HistoryFixture::new("e2-history-no-sidecar");
     fixture.baseline();
-    crate::snapshots::claude_request_money::e2::with_enabled(|| {
-        let outcome = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    with_e2_history(&fixture, || {
+        let outcome = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(outcome.uploaded.len(), 3);
         for item in &outcome.scan.snapshots {
             assert_eq!(item.telemetry_owned_complete, Some(false));
@@ -2479,8 +2494,8 @@ fn e2_no_sidecar_old_history_settles_with_incomplete_token_estimates() {
             .index
             .files
             .values()
-            .all(|entry| entry.effective_upload_body_witness_revision == 2));
-        let again = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+            .all(|entry| entry.effective_upload_body_witness_revision == 3));
+        let again = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert!(again.uploaded.is_empty());
         assert_eq!(again.scan.scanned_file_count, 0);
     });
@@ -2495,8 +2510,14 @@ fn e2_live_trace_read_failure_keeps_body_but_never_claims_complete() {
         "{bad\n",
     )
     .unwrap();
-    crate::snapshots::claude_request_money::e2::with_enabled(|| {
-        let outcome = fixture.cycle("2026-08-02T08:00:00Z", HISTORY_BASELINE);
+    with_e2_history(&fixture, || {
+        let outcome = fixture.cycle(
+            "2026-08-02T08:00:00Z",
+            HistoryCycle {
+                revision: 3,
+                ..HISTORY_BASELINE
+            },
+        );
         assert_eq!(outcome.uploaded.len(), 3, "live uploads still proceed");
         let item = outcome
             .scan
@@ -2557,8 +2578,8 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
     }
     let healthy_trace = std::fs::read(&trace_path).unwrap();
     std::fs::write(&trace_path, "{bad\n").unwrap();
-    crate::snapshots::claude_request_money::e2::with_enabled(|| {
-        let failed = fixture.cycle("2026-08-02T09:00:00Z", HISTORY_REVISION_2);
+    with_e2_history(&fixture, || {
+        let failed = fixture.cycle("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(
             failed.uploaded.len(),
             2,
@@ -2568,7 +2589,7 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
             e2_history_assert_prior_tuple(&baseline, &failed.index, key);
         }
         std::fs::write(&trace_path, healthy_trace).unwrap();
-        let recovered = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(
             recovered.uploaded,
             BTreeSet::from([root.to_owned(), format!("{root}_agent-{agent}")])
@@ -2576,7 +2597,7 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
         for key in [&root_key, &agent_key] {
             assert_eq!(
                 recovered.index.files[key].effective_upload_body_witness_revision,
-                2
+                3
             );
         }
         assert!(recovered
@@ -2598,9 +2619,9 @@ fn e2_repaired_between_permissive_and_strict_read_stays_owed_until_next_page() {
     let api_path = e2_history_sidecar(&fixture.support, root, false);
     let healthy = std::fs::read(&api_path).unwrap();
     std::fs::write(&api_path, "{bad\n").unwrap();
-    crate::snapshots::claude_request_money::e2::with_enabled(|| {
+    with_e2_history(&fixture, || {
         let held =
-            fixture.cycle_with_scan("2026-08-02T09:00:00Z", HISTORY_REVISION_2, |scan, index| {
+            fixture.cycle_with_scan("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE, |scan, index| {
                 let prepared =
                     PreparedClaudeLocalEvidence::load(&fixture.support, &scan.snapshots, index);
                 assert!(!prepared.api.session_report(root).unwrap().complete);
@@ -2616,7 +2637,7 @@ fn e2_repaired_between_permissive_and_strict_read_stays_owed_until_next_page() {
             &held.index,
             &HistoryFixture::key(&baseline, root),
         );
-        let recovered = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        let recovered = fixture.cycle("2026-08-02T10:00:00Z", E2_HISTORY_UPGRADE);
         assert_eq!(recovered.uploaded, BTreeSet::from([root.to_owned()]));
         let body = recovered
             .scan
