@@ -1732,6 +1732,127 @@ fn fe_n1_identity_incomplete_record_cannot_bind_recomposed_body() {
     }
 }
 
+/// SOURCE N1, marker-preserving versions: an actual identity-incomplete Tail
+/// cannot reconstruct a saved witness until its persisted hourly Full audit.
+/// Neither a reload nor loss of the optional retained copy cancels the read.
+#[test]
+fn fe_n1_held_tail_save_reload_reaches_due_full_and_reproves() {
+    use crate::snapshots::claude_request_census::{
+        identity_incomplete_hold_totals, ClaudeRequestCensusShape as Shape,
+    };
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    struct Clock;
+    impl Drop for Clock {
+        fn drop(&mut self) {
+            sampled_scan::set_test_now(None);
+        }
+    }
+    let _clock = Clock;
+    // The scanner's candidate clock remains real. Put the initial verified
+    // read one interval back, then complete the Tail just before its due
+    // time; after reload both clocks agree the saved deadline has arrived.
+    let due = sampled_scan::now_seconds();
+    sampled_scan::set_test_now(Some(
+        due - crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS,
+    ));
+    let fixture = ScanFixture::new(CLAUDE);
+    append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..6));
+    let key = local_index_key(&fixture.file.0);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (mut index, first, seen) = plain(&fixture, CLAUDE, ScanIndex::default(), &cache);
+    assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(seen.unreadable, 0);
+    assert!(cache.retained_checkpoint(&key).is_some());
+    let mut proven = index.clone();
+    assert!(mints_v1(&mut proven, &first, 0..6));
+    index.claude_usage_family_witnesses = proven.claude_usage_family_witnesses;
+    let witness = index.claude_usage_family_witnesses[SESSION].clone();
+    let before = identity_incomplete_hold_totals();
+
+    // Keep the six keyed occurrences unchanged and add a real id-less
+    // response. Native finish marks the census IdentityIncomplete; only the
+    // saved witness, not a fresh identity-complete transcript proof, can bind.
+    let mut idless = row(CLAUDE, 6);
+    idless.as_object_mut().unwrap().remove("requestId");
+    fixture.file.append(&idless);
+    sampled_scan::set_test_now(Some(due - 1));
+    let (mut index, tail, seen) = plain(&fixture, CLAUDE, index, &cache);
+    assert_eq!(seen.modes, (0, 1, 0), "real continued Tail");
+    assert_eq!(seen.unreadable, 0);
+    let record = index.claude_request_census_for_test().get(&key).unwrap();
+    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
+    assert!(record.unverified_or_twin());
+    assert!(!record.can_bind_recomposed_body(), "Exact|Empty refusal");
+    assert_eq!(index.files[&key].unverified_deadline(), Some(due));
+    assert!(!index.files[&key].audit_requires_full(due - 1));
+    // Isolate the binding decision from the fold's separate retry/rearm
+    // bookkeeping; save the native scan's actual D1 and audit marker below.
+    assert!(!mints_v1(&mut index.clone(), &tail, 0..6));
+    let mut verified_control = index.clone();
+    let record = verified_control
+        .claude_request_census_for_test()
+        .get(&key)
+        .unwrap()
+        .clone()
+        .with_unverified_for_test(false);
+    verified_control
+        .claude_request_census_mut_for_test()
+        .insert_for_test(&key, record);
+    assert!(
+        mints_v1(&mut verified_control, &tail, 0..6),
+        "the identical body can reconstruct once N1 verification holds"
+    );
+    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
+
+    let path = fixture.dir.join("n1-index.json");
+    index.save(&path).unwrap();
+    drop(index);
+    cache.clear();
+    let loaded = ScanIndex::load(&path).unwrap();
+    assert!(cache.retained_checkpoint(&key).is_none());
+    assert_eq!(loaded.files[&key].unverified_deadline(), Some(due));
+    let record = loaded.claude_request_census_for_test().get(&key).unwrap();
+    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
+    assert!(record.unverified_or_twin());
+    assert!(!record.can_bind_recomposed_body());
+    assert!(!mints_v1(&mut loaded.clone(), &tail, 0..6));
+    assert_eq!(identity_incomplete_hold_totals(), (before.0 + 1, before.1));
+
+    sampled_scan::set_test_now(Some(due));
+    assert!(loaded.files[&key].audit_requires_full(due));
+    let (mut audited, result, seen, read) = page_injecting(
+        &fixture,
+        CLAUDE,
+        loaded,
+        &cache,
+        |mode| mode == ReadMode::Full(FullReason::AuditDue),
+        |_| {},
+    );
+    assert_eq!(read.mode, ReadMode::Full(FullReason::AuditDue));
+    assert_eq!(seen.modes, (1, 0, 0));
+    assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
+    assert_eq!(seen.unreadable, 0);
+    assert!(!audited.files[&key].has_unverified_source());
+    let record = audited.claude_request_census_for_test().get(&key).unwrap();
+    assert_eq!(record.shape_for_test(), Shape::IdentityIncomplete);
+    assert!(!record.unverified_or_twin(), "Full verifies the source");
+    assert!(
+        !record.can_bind_recomposed_body(),
+        "shape gate stays narrow"
+    );
+    assert_eq!(audited.claude_usage_family_witnesses[SESSION], witness);
+    assert!(
+        mints_v1(&mut audited, &result, 0..6),
+        "audit releases N1 hold"
+    );
+    assert_eq!(
+        identity_incomplete_hold_totals(),
+        (before.0 + 1, before.1 + 1)
+    );
+}
+
 /// SOURCE Option 1 condition: historical replay keeps every stem entry and
 /// re-sets its deadline with the prefix flag preserved, so a replay reset
 /// cannot turn an FE prefix into `None` or a clean identity. Before the next
