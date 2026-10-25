@@ -4,7 +4,8 @@ set -euo pipefail
 # Merge a pull request only after the Public CI (ci.yml) pull-request checks
 # passed on the pull-request run for the PR's current head commit: the macOS
 # "Rust contracts" job and the Linux "Public surface checks", "Rust advisory
-# audit" and "Dependency review" jobs.
+# audit" and "Dependency review" jobs. When the base requires a merge queue,
+# enqueue the checked head and wait for GitHub to merge it.
 
 # Job names from .github/workflows/ci.yml; every other check is informational.
 # Only check runs of that workflow count, so a same-named job elsewhere cannot
@@ -41,6 +42,12 @@ its current base branch for the PR's head commit. Other checks (for example
 MERGEABLE it runs:
   gh pr merge <pr> --squash --match-head-commit <head-sha>
 
+If the base branch requires a merge queue, "Rust contracts" may also be skipped
+on the PR run; the three Linux checks must still succeed. The guard instead runs
+  gh pr merge <pr> --match-head-commit <head-sha>
+and waits until merged, removed from the queue, the head changes, or timeout.
+The queue's configured merge method applies; no administrator bypass is used.
+
 Not ready (keeps waiting): a required check run missing, still queued or in
 progress, skipped or neutral; mergeability UNKNOWN. A workflow_dispatch or push
 run on the same commit is not evidence: it tests the branch head, not the merge
@@ -56,10 +63,10 @@ Exit codes:
   0  merged
   2  usage error or missing tool
   3  refused: PR is not open, or has merge conflicts (CONFLICTING)
-  4  a required check finished without success (failure, cancelled, ...)
+  4  a required check finished without success, or PR removed from merge queue
   5  the PR head changed while waiting; rerun for the new head
-  6  timed out before all required checks passed
-  7  a gh command failed (view, ready, or merge)
+  6  timed out waiting for required checks or the merge queue
+  7  a gh command failed (view, rules, ready, or merge)
 USAGE
 }
 
@@ -167,6 +174,7 @@ checks_status() {
     || return 1
   jq -nr \
     --argjson required "$REQUIRED_CHECKS" \
+    --argjson queue_mode "$queue_mode" \
     --arg workflow "$CI_WORKFLOW" \
     --arg sha "$sha" \
     --argjson pr "$pr" \
@@ -194,6 +202,8 @@ checks_status() {
               state: (if . == null then "missing"
                 elif .status != "completed" then "pending"
                 elif .conclusion == "success" then "success"
+                elif $queue_mode and $name == "Rust contracts" and .conclusion == "skipped"
+                  then "success"
                 elif .conclusion == "skipped" or .conclusion == "neutral"
                   then "notready:\(.conclusion)"
                 else "red:\(.conclusion)"
@@ -211,8 +221,87 @@ checks_status() {
         end'
 }
 
+# Best-effort diagnostics: queue heads differ from the PR head, so identify the
+# latest Public CI queue run by GitHub's queue branch prefix, not the PR SHA.
+report_queue_failure() {
+  local runs detail
+  if runs="$(gh api "repos/{owner}/{repo}/actions/runs?event=merge_group&per_page=100")"; then
+    detail="$(printf '%s' "$runs" | jq -r \
+      --arg prefix "gh-readonly-queue/$base/pr-$pr-" --arg workflow "$CI_WORKFLOW" '
+        [.workflow_runs[]?
+         | select(.event == "merge_group" and .path == $workflow)
+         | select((.head_branch // "") | startswith($prefix))]
+        | sort_by(.id) | last
+        | select(.conclusion != null and .conclusion != "success"
+                 and .conclusion != "skipped" and .conclusion != "neutral")
+        | "merge_group run \(.id): \(.conclusion) \(.html_url) (head \(.head_sha))"')" || detail=""
+    if [ -n "$detail" ]; then log "$detail"; fi
+  else
+    log "could not read merge_group runs for queue failure diagnostics"
+  fi
+}
+
+# A single small GraphQL read per queue poll supplies membership, PR state,
+# head-movement protection, and the resulting merge SHA. API errors are retried
+# within the original invocation's timeout, never treated as queue removal.
+wait_for_queue() {
+  local response queued_pr state current_sha entry seen_queue=false
+  while :; do
+    # GraphQL variables must reach GitHub literally.
+    # shellcheck disable=SC2016
+    if response="$(gh api graphql -F owner='{owner}' -F name='{repo}' -F number="$pr" \
+      -f query='query($owner: String!, $name: String!, $number: Int!) {
+        repository(owner: $owner, name: $name) {
+          pullRequest(number: $number) {
+            state headRefOid mergeCommit { oid } mergeQueueEntry { state position }
+            autoMergeRequest { enabledAt }
+          }
+        }
+      }')" && queued_pr="$(printf '%s' "$response" | jq -ce '
+        select((.errors // [] | length) == 0)
+        | .data.repository.pullRequest
+        | select(.state != null and .headRefOid != null)')"; then
+      current_sha="$(printf '%s' "$queued_pr" | jq -r '.headRefOid')"
+      if [ "$current_sha" != "$head_sha" ]; then
+        die "$EXIT_HEAD_MOVED" "PR #$pr head moved from $head_sha to $current_sha; rerun to wait for the new head"
+      fi
+      state="$(printf '%s' "$queued_pr" | jq -r '.state')"
+      if [ "$state" = MERGED ]; then
+        log "merged PR #$pr at merge SHA $(printf '%s' "$queued_pr" | jq -r '.mergeCommit.oid // "unknown"')"
+        exit 0
+      fi
+      entry="$(printf '%s' "$queued_pr" | jq -r '.mergeQueueEntry // empty | "\(.state) (position \(.position))"')"
+      if [ -n "$entry" ]; then
+        seen_queue=true
+        log "PR #$pr in merge queue: $entry"
+      elif [ "$seen_queue" = false ] && [ "$state" = OPEN ] \
+        && [ "$(printf '%s' "$queued_pr" | jq -r '.autoMergeRequest != null')" = true ]; then
+        # gh may enable auto-merge instead of enqueueing when another branch
+        # requirement is pending. Do not report removal before admission.
+        log "PR #$pr awaiting merge queue admission (auto-merge pending)"
+      else
+        report_queue_failure
+        die "$EXIT_RED" "PR #$pr removed from merge queue; not merged"
+      fi
+    else
+      log "GitHub queue API read failed; continuing to wait"
+    fi
+    if [ "$waited" -ge "$timeout" ]; then
+      die "$EXIT_TIMEOUT" "timed out after ${waited}s waiting for PR #$pr in the merge queue"
+    fi
+    sleep "$interval"
+    waited=$((waited + interval))
+  done
+}
+
 read_pr
 refuse_unmergeable
+base="$(pr_field baseRefName)"
+base_path="$(printf '%s' "$base" | jq -sRr @uri)"
+rules="$(gh api "repos/{owner}/{repo}/rules/branches/$base_path")" \
+  || die "$EXIT_GH" "could not read rules for base branch $base"
+queue_mode="$(printf '%s' "$rules" | jq -r 'if type == "array" then any(.[]; .type == "merge_queue") else error("expected rules array") end')" \
+  || die "$EXIT_GH" "invalid rules response for base branch $base"
 head_sha="$(pr_field headRefOid)"
 [ -n "$head_sha" ] || die "$EXIT_GH" "gh pr view $pr returned no headRefOid"
 
@@ -237,6 +326,12 @@ while :; do
       success\|*)
         mergeable="$(pr_field mergeable)"
         if [ "$mergeable" = MERGEABLE ]; then
+          if [ "$queue_mode" = true ]; then
+            log "all required PR checks passed on $head_sha; enqueuing PR #$pr"
+            gh pr merge "$pr" --match-head-commit "$head_sha" \
+              || die "$EXIT_GH" "gh pr merge $pr failed"
+            wait_for_queue
+          fi
           log "all required checks passed on $head_sha; merging PR #$pr"
           gh pr merge "$pr" --squash --match-head-commit "$head_sha" \
             || die "$EXIT_GH" "gh pr merge $pr failed"

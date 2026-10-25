@@ -31,7 +31,11 @@ case "$1 $2" in
   "pr view") reply pr ;;
   "pr ready") exit 0 ;;
   "pr merge") exit "$(cat "$d/merge_exit" 2>/dev/null || echo 0)" ;;
+  api\ *rules/branches*)
+    if [ -f "$d/rules" ]; then cat "$d/rules"; else printf '[]\n'; fi ;;
+  "api graphql") reply queue ;;
   api\ *check-runs*) reply checks ;;
+  api\ *actions/runs*event=merge_group*) reply queue_runs ;;
   api\ *actions/runs*) reply runs ;;
   *) echo "unexpected gh call: $*" >&2; exit 1 ;;
 esac
@@ -428,6 +432,141 @@ mv "$case_dir/checks.next" "$case_dir/checks"
 run_guard 6 --timeout 0 7
 expect_output "more than one page"
 expect_no_log "gh pr merge"
+
+# Queue fixtures remain opt-in so all pre-queue cases exercise the unchanged
+# direct squash-merge path. Queue API replies follow the same numbered scheme.
+queue_case() {
+  new_case "$1"
+  printf '[{"type":"merge_queue"}]' > "$case_dir/rules"
+  pr_json pr OPEN false "$SHA" MERGEABLE
+  workflow_runs "500|pull_request"
+  pr_checks checks 500 "10|Rust contracts|completed|success|500"
+}
+
+# queue_json <file> <state> <sha> <entry-state-or-empty>
+queue_json() {
+  jq -n --arg state "$2" --arg sha "$3" --arg entry "$4" --arg merge "$NEW_SHA" '
+    {data: {repository: {pullRequest: {
+      state: $state, headRefOid: $sha,
+      mergeCommit: (if $state == "MERGED" then {oid: $merge} else null end),
+      mergeQueueEntry: (if $entry == "" then null else {state: $entry, position: 1} end)
+    }}}}' > "$case_dir/$1"
+}
+
+ENQUEUE_CALL="gh pr merge 7 --match-head-commit $SHA"
+
+queue_case queue-happy-path
+pr_json pr OPEN true "$SHA" MERGEABLE
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_log 'gh pr ready 7'
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log --admin
+expect_no_log --auto
+expect_no_log --squash
+expect_count 'rules/branches/main' 1
+expect_count 'gh api graphql' 2
+expect_count 'sleep 60' 1
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+
+queue_case queue-skipped-mac-enqueues
+pr_checks checks 500 "10|Rust contracts|completed|skipped|500"
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_log "$ENQUEUE_CALL"
+
+queue_case queue-red-mac-refuses
+pr_checks checks 500 "10|Rust contracts|completed|failure|500"
+run_guard 4 7
+expect_output '"Rust contracts" concluded failure'
+expect_no_log 'gh pr merge'
+
+queue_case queue-skipped-linux-waits
+check_runs checks "10|Rust contracts|completed|skipped|500" \
+  "11|Public surface checks|completed|success|500" \
+  "12|Rust advisory audit|completed|success|500" \
+  "13|Dependency review|completed|skipped|500"
+run_guard 6 --timeout 0 7
+expect_output '"Dependency review" notready:skipped'
+expect_no_log 'gh pr merge'
+
+queue_case queue-neutral-mac-waits
+pr_checks checks 500 "10|Rust contracts|completed|neutral|500"
+run_guard 6 --timeout 0 7
+expect_no_log 'gh pr merge'
+
+queue_case queue-removed-with-failure
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue OPEN "$SHA" ""
+printf '%s' '{"workflow_runs":[{"id":800,"event":"merge_group","path":".github/workflows/ci.yml","head_branch":"gh-readonly-queue/main/pr-7-abc","head_sha":"queue-sha","conclusion":"failure","html_url":"https://example.invalid/actions/runs/800"}]}' > "$case_dir/queue_runs"
+run_guard 4 7
+expect_log "$ENQUEUE_CALL"
+expect_output 'removed from merge queue'
+expect_output 'merge_group run 800: failure https://example.invalid/actions/runs/800 (head queue-sha)'
+
+queue_case queue-removed-diagnostics-unavailable
+queue_json queue OPEN "$SHA" ""
+run_guard 4 7
+expect_output 'removed from merge queue'
+expect_output 'could not read merge_group runs'
+
+queue_case queue-head-moved
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue OPEN "$NEW_SHA" ""
+run_guard 5 7
+expect_count "$ENQUEUE_CALL" 1
+expect_output "head moved from $SHA to $NEW_SHA"
+
+queue_case queue-timeout
+queue_json queue OPEN "$SHA" QUEUED
+run_guard 6 --timeout 120 7
+expect_count 'sleep 60' 2
+expect_count 'gh api graphql' 3
+expect_count "$ENQUEUE_CALL" 1
+
+queue_case queue-api-error-retried
+printf '%s' '{"data":{"repository":{"pullRequest":null}},"errors":[{"message":"unavailable"}]}' > "$case_dir/queue.1"
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'GitHub queue API read failed'
+expect_count 'sleep 60' 1
+expect_count "$ENQUEUE_CALL" 1
+
+queue_case queue-awaits-initial-admission
+queue_json queue.1 OPEN "$SHA" ""
+jq '.data.repository.pullRequest.autoMergeRequest = {enabledAt: "2026-01-01T00:00:00Z"}' \
+  "$case_dir/queue.1" > "$case_dir/queue.next"
+mv "$case_dir/queue.next" "$case_dir/queue.1"
+queue_json queue.2 OPEN "$SHA" QUEUED
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'awaiting merge queue admission'
+expect_count 'sleep 60' 2
+expect_count "$ENQUEUE_CALL" 1
+expect_no_log --auto
+
+queue_case queue-removed-even-with-auto-merge
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue OPEN "$SHA" ""
+jq '.data.repository.pullRequest.autoMergeRequest = {enabledAt: "2026-01-01T00:00:00Z"}' \
+  "$case_dir/queue" > "$case_dir/queue.next"
+mv "$case_dir/queue.next" "$case_dir/queue"
+run_guard 4 7
+expect_output 'removed from merge queue'
+
+queue_case queue-enqueue-error
+printf '1' > "$case_dir/merge_exit"
+run_guard 7 7
+expect_log "$ENQUEUE_CALL"
+expect_no_log 'gh api graphql'
+
+new_case invalid-rules-refused
+pr_json pr OPEN false "$SHA" MERGEABLE
+# A malformed successful API response must not silently select direct merging.
+printf 'null' > "$case_dir/rules"
+run_guard 7 7
+expect_no_log 'gh pr merge'
 
 new_case short-interval-rejected
 run_guard 2 --interval 30 7
