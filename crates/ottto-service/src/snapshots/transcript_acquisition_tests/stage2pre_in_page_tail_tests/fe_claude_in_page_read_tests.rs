@@ -2031,11 +2031,14 @@ fn fe_n1_option_b_erased_hold_deadline_is_restored_and_audited() {
 }
 
 /// Option B keeps the age-window rescue: an erased hold whose file aged out
-/// of the backfill window leaves discovery, and the restored marker brings it
-/// back for its one due Full.
+/// of the backfill window leaves discovery. While the audit-slot budget
+/// defers its restoration, reconciliation keeps the unobserved entry and its
+/// hold; a later scan restores it without reading, and the restored marker
+/// brings it back for its one due Full.
 #[test]
-fn fe_n1_option_b_aged_out_erased_hold_is_rescued_for_due_full() {
+fn fe_n1_option_b_aged_out_erased_hold_is_kept_then_rescued_for_due_full() {
     use crate::snapshots::claude_request_census::identity_incomplete_hold_deadlines_restored_total as restored;
+    use crate::transcript_acquisition::AUDIT_INTERVAL_SECONDS as INTERVAL;
     use std::time::{Duration, UNIX_EPOCH};
     if !crate::heap_layout_bound::layout_supported() {
         return;
@@ -2055,15 +2058,57 @@ fn fe_n1_option_b_aged_out_erased_hold_is_rescued_for_due_full() {
         !sampled_audit::path_requires_verification(&hold.index.files, &hold.fixture.file.0),
         "the erased marker lost the age-window rescue"
     );
+    let held = |index: &ScanIndex| {
+        index
+            .claude_request_census_for_test()
+            .get(&key)
+            .is_some_and(|record| record.identity_incomplete_hold())
+    };
 
-    let mut restored_index = hold.index.clone();
-    assert_eq!(restore_dated(&mut restored_index, due), 1);
+    // Other pending audits leave only the slot restoration never takes.
+    let mut crowded = hold.index.clone();
+    // Synthetic keys outside the scan root, never walked or opened.
+    let pending = (0..crate::transcript_cache::CACHE_ENTRIES - 1)
+        .map(|slot| format!("/option-b-pending/{slot}"))
+        .collect::<Vec<_>>();
+    for pending_key in &pending {
+        let mut entry = crowded.files[&key].clone();
+        entry.set_unverified_deadline(due);
+        crowded.files.insert(pending_key.clone(), entry);
+    }
+    sampled_scan::set_test_now(None);
+    let (crowded, _, seen) = plain(&hold.fixture, CLAUDE, crowded, &hold.cache);
+    assert_eq!(seen.modes, (0, 0, 0));
+    assert_eq!(restored(), restored_before, "no free slot to restore into");
+    assert_eq!(
+        crowded.files[&key].scan_identity_version.as_deref(),
+        Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION),
+        "the deferred aged entry is kept"
+    );
+    assert!(held(&crowded), "and so is its hold");
+
+    // A freed slot: the next scan restores it, reading nothing.
+    let mut freed = crowded;
+    freed.files.remove(&pending[0]);
+    let start = sampled_scan::now_seconds();
+    let (freed, _, seen) = plain(&hold.fixture, CLAUDE, freed, &hold.cache);
+    let end = sampled_scan::now_seconds();
+    assert_eq!(seen.modes, (0, 0, 0), "restoration is no read");
     assert_eq!(restored(), restored_before + 1);
-    assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
+    let deadline = freed.files[&key].unverified_deadline().unwrap();
+    assert!((start + INTERVAL..=end + INTERVAL).contains(&deadline));
     assert!(sampled_audit::path_requires_verification(
-        &restored_index.files,
+        &freed.files,
         &hold.fixture.file.0
     ));
+    assert!(held(&freed));
+
+    // Dated one interval before `due` (the candidate clock stays real):
+    // save, reload, and the due audit reaches the aged file.
+    let mut restored_index = hold.index.clone();
+    assert_eq!(restore_dated(&mut restored_index, due), 1);
+    assert_eq!(restored(), restored_before + 2);
+    assert_eq!(restored_index.files[&key].unverified_deadline(), Some(due));
     let path = hold.fixture.dir.join("aged-index.json");
     restored_index.save(&path).unwrap();
     drop(restored_index);
@@ -2086,11 +2131,8 @@ fn fe_n1_option_b_aged_out_erased_hold_is_rescued_for_due_full() {
         "every age gate admits the audit"
     );
     assert!(!audited.files[&key].has_unverified_source());
-    assert!(!audited
-        .claude_request_census_for_test()
-        .get(&key)
-        .is_some_and(|record| record.identity_incomplete_hold()));
-    assert_eq!(restored(), restored_before + 1);
+    assert!(!held(&audited));
+    assert_eq!(restored(), restored_before + 2);
 }
 
 /// Option B reads nothing extra: a plain-v2 entry without an N1 hold (a

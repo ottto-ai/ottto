@@ -239,6 +239,19 @@ pub(super) fn normalize_marker_storage(index: &mut ScanIndex) {
 /// restored audit falls due per page.
 const HOLD_DEADLINE_RESTORES_PER_SCAN: usize = 1;
 
+/// A plain-v2 entry whose census record is an N1 hold owes its deadline back
+/// (option B below). Until a scan restores it, reconciliation keeps it as it
+/// keeps a marked entry: an unobserved aged file must not be pruned, with its
+/// hold, while it waits for the per-scan or audit-slot budget.
+pub(super) fn awaits_hold_deadline_restoration(index: &ScanIndex, key: &str) -> bool {
+    index.files.get(key).is_some_and(|entry| {
+        entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
+    }) && index
+        .claude_request_census
+        .get(key)
+        .is_some_and(|record| record.identity_incomplete_hold())
+}
+
 /// Option B (SOURCE rule 3: a hold may delay a re-offer, never cancel it). A
 /// marker-erasing daemon (0.1.189's parse-free migrate) rewrote held entries
 /// to plain v2, dropping their audit deadline; an unchanged file then skips
@@ -260,29 +273,25 @@ pub(super) fn restore_held_audit_deadlines(index: &mut ScanIndex, now: u64) -> u
     let Some(due) = now.checked_add(AUDIT_INTERVAL_SECONDS) else {
         return 0;
     };
-    let files = &mut index.files;
-    let mut restored = 0;
-    for (key, _) in index
+    let keys = index
         .claude_request_census
         .records()
-        .filter(|(_, record)| record.identity_incomplete_hold())
-    {
-        if restored == budget {
-            break;
-        }
-        if let Some(entry) = files.get_mut(key.as_str()).filter(|entry| {
-            entry.scan_identity_version.as_deref() == Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION)
-        }) {
+        .map(|(key, _)| key)
+        .filter(|key| awaits_hold_deadline_restoration(index, key))
+        .take(budget)
+        .cloned()
+        .collect::<Vec<_>>();
+    for key in &keys {
+        if let Some(entry) = index.files.get_mut(key) {
             entry.scan_identity_version = Some(provenance_marker(due, true));
-            restored += 1;
         }
     }
-    if restored > 0 {
+    if !keys.is_empty() {
         super::claude_request_census::note_identity_incomplete_hold_deadlines_restored(
-            restored as u64,
+            keys.len() as u64
         );
     }
-    restored
+    keys.len()
 }
 
 #[cfg(test)]

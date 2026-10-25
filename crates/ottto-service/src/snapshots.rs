@@ -38218,6 +38218,7 @@ fn reconcile_missing_index_entries_with_side(
                 .files
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
+            && !sampled_audit::awaits_hold_deadline_restoration(index, key)
         {
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
