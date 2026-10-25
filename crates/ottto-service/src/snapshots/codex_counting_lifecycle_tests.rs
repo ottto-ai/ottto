@@ -326,6 +326,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
     let path = PathBuf::from("/synthetic/archived_sessions/current.jsonl");
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path: path.clone(),
         size_bytes: 1,
@@ -403,6 +404,7 @@ fn archived_candidate() -> CandidateFile {
         "/synthetic/archived_sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl"
     ));
     CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path,
         size_bytes: 1,
@@ -1059,11 +1061,13 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
         serde_json::to_value(&derived.codex_counting_evicted_legacy).unwrap(),
         json!(expected)
     );
-    assert!(
-        crate::heap_layout_bound::bound(&derived.codex_counting_evicted_legacy, usize::MAX)
-            .unwrap()
-            > limit * 64
-    );
+    if crate::heap_layout_bound::layout_supported() {
+        assert!(
+            crate::heap_layout_bound::bound(&derived.codex_counting_evicted_legacy, usize::MAX)
+                .unwrap()
+                > limit * 64
+        );
+    }
     fs::write(&acked.index_path, serde_json::to_vec(&value).unwrap()).unwrap();
     let loaded = ScanIndex::load(&acked.index_path).unwrap();
     assert_eq!(
@@ -1092,6 +1096,7 @@ fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
     assert!(!index.codex_counting_evicted_legacy.is_empty());
     // Another carrier was later retired successfully, restoring Legacy
     // evidence. A later healthy absence collection is a different loss cause.
+    index.codex_counting_tombstones.pop_first();
     index.codex_counting_tombstones.insert(
         owner.clone(),
         codex_counting_version::CountingTombstone {

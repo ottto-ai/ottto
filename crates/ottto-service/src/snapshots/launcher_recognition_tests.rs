@@ -625,6 +625,7 @@ fn launch_family_reconciliation_preserves_deadline_witness_revision_and_membersh
     let workers = vec![WORKER.to_owned()];
     while !context.prepare_launch_step(&workers).unwrap() {}
     let mut candidate = CandidateFile {
+        physical_identity: None,
         scan_root: home.0.clone(),
         path: home.0.join(format!("{WORKER}.jsonl")),
         size_bytes: 0,

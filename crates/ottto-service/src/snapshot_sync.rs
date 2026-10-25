@@ -338,6 +338,38 @@ fn with_retained_refusal_conflicts(
     with_bootstrap_deferred(result, retained.len())
 }
 
+/// Exercise the real retained-conflict settlement boundary from Codex scan
+/// fixtures, without replacing its cooldown decision with a test predicate.
+#[cfg(test)]
+pub(crate) fn retained_refusal_settles_for_test(
+    index: &ScanIndex,
+    fingerprint: &str,
+    record: SnapshotQuarantineRecord,
+    body: &str,
+    now: u64,
+    deadline: u64,
+) -> bool {
+    let mut progress =
+        SnapshotUploadProgress::new("synthetic-codex-cooldown".into(), record.witness.clone());
+    progress
+        .quarantined_fingerprints
+        .insert(fingerprint.into(), record);
+    progress.permanent_rejections.insert(
+        fingerprint.into(),
+        PermanentSnapshotRejection {
+            body_witness: body.into(),
+            reason: crate::upload_receipts::RejectedUsageReason::Other,
+            reoffer: Some(reason_reoffer::RefusalReoffer::OriginalPair {
+                retry_after_unix_seconds: deadline,
+            }),
+        },
+    );
+    matches!(
+        with_retained_refusal_conflicts(ResumableUploadResult::Completed, index, &progress, now),
+        ResumableUploadResult::Completed
+    )
+}
+
 // Local index projection producer revision; independent of semantic/wire identity.
 // Each indexed file whose stored revision differs is re-read once; the stamp is
 // written only when its upload settles, so an interrupted pass resumes. Claude
@@ -5257,7 +5289,17 @@ impl SourcePreparation {
                 }
                 SourcePreparationStep::Refused(self, reason)
             }
-            Ok(crate::snapshots::OwnedSourceScanStep::Pending(next)) => {
+            Ok(crate::snapshots::OwnedSourceScanStep::Pending(mut next)) => {
+                if next
+                    .persist_reread_reservations(&mut self.committed_index, &self.index_path)
+                    .is_err()
+                {
+                    self.scan = Some(next);
+                    return SourcePreparationStep::Refused(
+                        self,
+                        crate::source_rotation::LocalRefusal("reread reservation save refused"),
+                    );
+                }
                 self.scan = Some(next);
                 SourcePreparationStep::Pending(self)
             }
@@ -5929,6 +5971,7 @@ fn prepare_sync_source(
         context_curve_enabled,
         request_identity_capture,
     )
+    .with_reread_persistence()
     .with_sampled_acquisition(
         daemon.transcript_cache.clone(),
         cycle_sampled_scope(
@@ -6300,6 +6343,7 @@ fn prepare_continuation_source(
         ordinary_equivalent,
     )
     .with_continuation_deadline(deadline)
+    .with_reread_persistence()
     .with_sampled_acquisition(
         std::sync::Arc::clone(cache),
         // K5: the ordinary Codex page's scope; Codex never captures.
@@ -21386,6 +21430,9 @@ mod tests {
             include!("snapshot_sync/proof_rearm_idempotence_pipeline_tests.rs");
             mod stale_family_carry_pipeline_tests {
                 include!("snapshot_sync/stale_family_carry_pipeline_tests.rs");
+                mod structural_reread_guard_tests {
+                    include!("snapshot_sync/structural_reread_guard_tests.rs");
+                }
             }
         }
     }

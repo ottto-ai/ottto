@@ -37,6 +37,7 @@ fn stamp(metadata: &fs::Metadata) -> [u8; 32] {
 
 fn identify(root: &Path, path: &Path) -> Option<String> {
     let mut candidate = CandidateFile {
+        physical_identity: None,
         scan_root: root.to_owned(),
         path: path.to_owned(),
         size_bytes: 0,

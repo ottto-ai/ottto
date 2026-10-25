@@ -176,6 +176,7 @@ fn run_price_source(values: &[Value], active: bool) -> Run {
     let mut file = File::open(&path).unwrap();
     let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: root.clone(),
         path: path.clone(),
         size_bytes: text.len() as u64,
@@ -1013,6 +1014,7 @@ fn codex_counting_ack_bool_survives_twin_alias_and_rekeyed_entries() {
     // their acknowledged fingerprint.
     let path = PathBuf::from("/synthetic/sessions/rollout.jsonl");
     let candidate = || CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/sessions"),
         path: path.clone(),
         size_bytes: 2,
