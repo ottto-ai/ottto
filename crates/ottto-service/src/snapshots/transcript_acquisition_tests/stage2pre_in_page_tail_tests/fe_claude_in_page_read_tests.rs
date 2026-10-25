@@ -1838,3 +1838,141 @@ fn fe_n4_h3c_grown_read_never_retires_a_suspended_proof() {
     );
     assert_eq!(counts.side_proof_drops, 0);
 }
+
+/// #665/#702 second-lander control. The same continued Tail is short of
+/// copy room in both worlds. Without growth it proves and executes a release;
+/// H3c growth keeps every resident and the suspended proof, with no copy,
+/// X_out proof, reserved retention peak or deferred release. Pressure uses
+/// R0's existing test-only insert-term seam; all ranks and releases are real.
+#[test]
+fn fe_second_lander_h3c_release_pressure_keeps_victims_and_suspended_proof() {
+    use crate::local_resource_diagnostics::codex_side_lifecycle::observe as observe_side;
+    use crate::snapshots::sampled_scan::codex_cursor::{bound_for_main, ProofJob, ProofLease};
+    use sampled_scan::test_hooks::{self, Decision};
+
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let state_bytes = crate::snapshots::cache_policy_tests::POLICY_STATE_BYTES;
+    for grow in [false, true] {
+        let mut base = baseline(CLAUDE, 4, 2);
+        let older = (0..2)
+            .map(|_| {
+                let fixture = ScanFixture::new(CLAUDE);
+                append_raw(&fixture.file.0, &row_bytes(CLAUDE, 0..512));
+                OpenOptions::new()
+                    .write(true)
+                    .open(&fixture.file.0)
+                    .unwrap()
+                    .set_modified(SystemTime::now() - std::time::Duration::from_secs(7200))
+                    .unwrap();
+                plain(&fixture, CLAUDE, ScanIndex::default(), &base.cache);
+                assert!(base
+                    .cache
+                    .retained_checkpoint(&local_index_key(&fixture.file.0))
+                    .is_some());
+                fixture
+            })
+            .collect::<Vec<_>>();
+        let before = base
+            .cache
+            .retained()
+            .unwrap()
+            .victims()
+            .into_iter()
+            .filter(|(key, _, _)| key != &base.key)
+            .collect::<Vec<_>>();
+        assert_eq!(before.len(), older.len(), "precondition: older residents");
+        let job = Box::new(ProofJob {
+            namespace: "fe-second-lander-proof".to_owned(),
+            index_path: PathBuf::from("/fe-second-lander/index.json"),
+            incarnation: "fe-second-lander".to_owned(),
+            entries: vec![("k".repeat(1 << 20), 1)],
+            next_row_end: 0,
+            touched_page: 0,
+            readers: None,
+        });
+        assert!(ProofLease::new(&base.cache, job).suspend());
+        let proof = base.cache.proof_suspended_for_test();
+        assert!(proof.is_some(), "precondition: suspended proof");
+        sampled_scan::copy_retire_probe();
+        test_hooks::clear();
+        let mut read = None;
+        let index = std::mem::take(&mut base.index);
+        let (((index, result, seen), counts), side_counts) = observe_side(|| {
+            observe(|| {
+                page(&base.fixture, CLAUDE, index, &base.cache, |scan| {
+                    if read.is_some() {
+                        return;
+                    }
+                    if let Some(opened) = opened(scan) {
+                        assert!(is_tail(opened.mode), "precondition: continued Tail");
+                        let resident = bound_for_main(scan.sampling.as_ref().unwrap(), state_bytes)
+                            .expect("precondition: measured residents");
+                        // Give the insert term exactly the remaining room:
+                        // b_ins = 0. Only a completion-time release can fund
+                        // retention; this never changes the production limit.
+                        test_hooks::set_ins_extra(Some(state_bytes - resident));
+                        if grow {
+                            append_raw(&base.path, &row_bytes(CLAUDE, 6..9));
+                        }
+                        read = Some(opened);
+                    }
+                })
+            })
+        });
+        let read = read.expect("precondition: opened read");
+        let probe = test_hooks::last_probe();
+        assert_eq!(seen.unreadable, 0, "grow={grow}: {:?}", seen.causes);
+        assert_eq!(probe.b_ins, 0, "precondition: no copy room; {probe:?}");
+        assert!(probe.clone.is_some_and(|clone| clone > probe.b_ins));
+        assert!(probe.rank.is_some(), "precondition: release-eligible Tail");
+        if grow {
+            assert_prefix_published(
+                "second-lander",
+                &base,
+                &index,
+                result,
+                &seen,
+                &read,
+                read.frozen,
+            );
+            assert!(index.files[&base.key].has_prefix_provenance());
+            assert_eq!(base.cache.retained().unwrap().victims(), before);
+            assert_eq!(base.cache.proof_suspended_for_test(), proof, "proof kept");
+            assert_eq!(side_counts.side_proof_drops, 0);
+            assert!(sampled_scan::copy_retire_probe().is_none());
+            assert!(
+                test_hooks::decisions().is_empty(),
+                "no retention or deferred release"
+            );
+            assert_eq!(probe.granted_peak, None, "no reserved retention peak");
+            assert_eq!(probe.x_out, None, "no X_out proof");
+            assert_eq!(probe.need_prime, None, "no deferred release proof");
+            assert_eq!(
+                (
+                    counts.copy_refusal_admission_evicted,
+                    counts.copy_refusal_entries_evicted,
+                    counts.clear_entries_released,
+                    counts.insert_entries_evicted,
+                    counts.retention_produced,
+                    counts.insert_admitted,
+                ),
+                (0, 0, 0, 0, 0, 0),
+                "zero victims and no copy: {counts:?}"
+            );
+        } else {
+            assert!(!index.files[&base.key].has_prefix_provenance());
+            assert!(base.cache.retained_checkpoint(&base.key).is_some());
+            assert!(matches!(
+                test_hooks::decisions().as_slice(),
+                [Decision::Deferred { .. }]
+            ));
+            assert!(
+                counts.copy_refusal_admission_evicted > 0,
+                "release-pressure control: {probe:?} {counts:?}"
+            );
+        }
+        test_hooks::clear();
+    }
+}

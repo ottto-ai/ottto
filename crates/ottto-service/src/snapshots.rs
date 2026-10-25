@@ -25801,10 +25801,16 @@ impl OwnedSourceScan {
                     },
                     copy_measure,
                 );
-                let finish_copy_budget = parser
-                    .accumulator
-                    .claude_responses
-                    .finish_copy_budget(copy_budget);
+                // An H3c completion retains nothing: reserve no copy/decode
+                // peak, just as it retires no proof and releases no resident.
+                let finish_copy_budget = if retaining && !h3c_route {
+                    parser
+                        .accumulator
+                        .claude_responses
+                        .finish_copy_budget(copy_budget)
+                } else {
+                    None
+                };
                 let copy_budget = finish_copy_budget.unwrap_or(0);
                 let mut completed_acquisition = if let Some(certificate) = cursor_certificate {
                     certificate.map(|checkpoint| {
@@ -25864,53 +25870,62 @@ impl OwnedSourceScan {
                             census.record_unreadable(cause, 1);
                             pending!();
                         }
-                        // #667: the decode peak is reserved from the budget the
-                        // copy is admitted against: main's `copy_budget` above for
-                        // a granted one. M-a (S-a): only now, after main's proof
-                        // retirement and that reservation, may a shape-F release be
-                        // proven; its `budget_after` is peak-reserved the same way.
-                        // X_out (#665): Claude's finish-output bound, only for a
-                        // proof. The repository identity it measured (U3) is the
-                        // one `finish` takes below; a miss refuses.
-                        let x_out = sampled_scan::x_out_for(source, || {
-                            release_proof.as_ref()?;
-                            measured_repository_identity = parser
-                                .accumulator
-                                .workspace_path
-                                .as_deref()
-                                .and_then(peek_repository_identity);
-                            parser.finish_output_bound(
-                                FinishOutputInput {
-                                    path: &candidate.path,
-                                    collected_at: collected_at.as_str(),
-                                    source_file_fingerprint: &source_file_fingerprint,
-                                    opened_object_identity: &candidate.opened_object_identity,
-                                    title_metadata: Some(&claude_title_metadata),
-                                    attribution: attribution_context.is_some(),
-                                    repository_identity: measured_repository_identity.as_ref(),
+                        // #665 second-lander condition: only a retaining,
+                        // non-H3c completion may measure X_out, reserve a peak,
+                        // or prove a deferred release. Excluded reads keep none.
+                        let retain_budget = if retaining && !h3c_route {
+                            // #667: the decode peak is reserved from the budget the
+                            // copy is admitted against: main's `copy_budget` above for
+                            // a granted one. M-a (S-a): only now, after main's proof
+                            // retirement and that reservation, may a shape-F release be
+                            // proven; its `budget_after` is peak-reserved the same way.
+                            // X_out (#665): Claude's finish-output bound, only for a
+                            // proof. The repository identity it measured (U3) is the
+                            // one `finish` takes below; a miss refuses.
+                            let x_out = sampled_scan::x_out_for(source, || {
+                                release_proof.as_ref()?;
+                                measured_repository_identity = parser
+                                    .accumulator
+                                    .workspace_path
+                                    .as_deref()
+                                    .and_then(peek_repository_identity);
+                                parser.finish_output_bound(
+                                    FinishOutputInput {
+                                        path: &candidate.path,
+                                        collected_at: collected_at.as_str(),
+                                        source_file_fingerprint: &source_file_fingerprint,
+                                        opened_object_identity: &candidate.opened_object_identity,
+                                        title_metadata: Some(&claude_title_metadata),
+                                        attribution: attribution_context.is_some(),
+                                        repository_identity: measured_repository_identity.as_ref(),
+                                    },
+                                    // `proven_release` checks it against `remaining'`.
+                                    usize::MAX,
+                                )
+                            });
+                            sampled_scan::prove_release(
+                                retain_budget.reserve_peak(copy_budget, |budget| {
+                                    parser
+                                        .accumulator
+                                        .claude_responses
+                                        .finish_copy_budget(budget)
+                                }),
+                                release_proof,
+                                sampling.as_ref(),
+                                x_out,
+                                |budget| {
+                                    parser
+                                        .accumulator
+                                        .claude_responses
+                                        .finish_copy_budget(budget)
                                 },
-                                // `proven_release` checks it against `remaining'`.
-                                usize::MAX,
+                                |limit| {
+                                    parser.accumulator.claude_responses.decode_peak_bound(limit)
+                                },
                             )
-                        });
-                        let retain_budget = sampled_scan::prove_release(
-                            retain_budget.reserve_peak(copy_budget, |budget| {
-                                parser
-                                    .accumulator
-                                    .claude_responses
-                                    .finish_copy_budget(budget)
-                            }),
-                            release_proof,
-                            sampling.as_ref(),
-                            x_out,
-                            |budget| {
-                                parser
-                                    .accumulator
-                                    .claude_responses
-                                    .finish_copy_budget(budget)
-                            },
-                            |limit| parser.accumulator.claude_responses.decode_peak_bound(limit),
-                        );
+                        } else {
+                            retain_budget.excluded()
+                        };
                         released_finalization_budget = retain_budget.released_budget();
                         #[cfg(test)]
                         sampled_scan::test_hooks::fire(
