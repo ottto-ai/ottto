@@ -3057,7 +3057,18 @@ fn source_upload_deadlines() -> &'static Mutex<BTreeMap<&'static str, Instant>> 
 
 fn defer_source_uploads(source: SnapshotSource, retry_after: Duration) {
     if let Ok(mut deadlines) = source_upload_deadlines().lock() {
-        deadlines.insert(source.api_slug(), Instant::now() + retry_after);
+        let now = Instant::now();
+        let mut representable = retry_after;
+        // Raw retained Retry-After is untrusted u64 seconds. Preserve it when
+        // representable, otherwise retain a practically indefinite monotonic
+        // deadline rather than panic on overflow. At most 64 halvings.
+        let deadline = loop {
+            if let Some(deadline) = now.checked_add(representable) {
+                break deadline;
+            }
+            representable /= 2;
+        };
+        deadlines.insert(source.api_slug(), deadline);
     }
 }
 
@@ -7603,7 +7614,10 @@ async fn finish_sync_source_resume(
         Ok(ResumableUploadResult::Shed { retry_after }) => {
             let first_shed = Instant::now();
             let named_retry_after = retry_after;
-            let retry_after = note_shed_and_backoff(source, retry_after);
+            let retry_after = note_shed_and_backoff(
+                source,
+                retry_after.map(|delay| delay.min(crate::snapshot_client::MAX_HONOURED_RETRY_AFTER)),
+            );
             // Immutable recovery preserves raw Retry-After, which may exceed
             // the ordinary transport's freshness cap. It must not reopen other
             // live Claude POSTs before that server boundary either.

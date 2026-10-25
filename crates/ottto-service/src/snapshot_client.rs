@@ -291,7 +291,9 @@ fn shed_from_response(status: u16, response: ureq::Response, retained: bool) -> 
     let retry_after = response.header("Retry-After").and_then(|value| {
         let now = OffsetDateTime::now_utc();
         if retained {
-            parse_retry_after_with_cap(value, now, Duration::from_secs(24 * 3600))
+            // Expire custody at its original deadline; never shorten a named
+            // server delay merely because it crosses that deadline.
+            parse_retry_after_with_cap(value, now, Duration::MAX)
         } else {
             parse_retry_after(value, now)
         }
