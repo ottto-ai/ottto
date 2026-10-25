@@ -3445,7 +3445,10 @@ fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry()
         rfc3339_unix_seconds(CARRY_SECOND_RETRY);
     let before = serde_json::to_value(&fixture.index).unwrap();
     for at in [CARRY_RETRY, CARRY_SECOND_RETRY, "2026-08-03T07:31:00Z"] {
-        let (row, allocations) = crate::retry_allocation_probe::measure(|| {
+        // Starting a retry frees old pending payload and retained carry.
+        // Count born-in-scope pointers so those pre-existing frees cannot
+        // hide a peak or make the signed net-allocation probe negative.
+        let (row, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
             carry_start(&mut fixture.index, at, BACKFILL_WINDOW_DAYS)
         });
         assert!(
