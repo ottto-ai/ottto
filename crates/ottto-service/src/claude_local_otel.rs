@@ -213,6 +213,16 @@ fn identity_attribute_evidence(
     }
 }
 
+impl crate::telemetry_attach::ReportedRequest for ClaudeLocalOtelEvidence {
+    fn request_key(&self) -> &str {
+        &self.request_id
+    }
+
+    fn reported_cost_micros(&self) -> Option<u64> {
+        self.cost_usd_micros
+    }
+}
+
 /// Health diagnostics for a strict sidecar read. The legacy loader intentionally
 /// retains its skip-and-continue behavior; completeness-sensitive reconciliation
 /// must use this report and fail closed when `is_complete()` is false.
@@ -654,6 +664,23 @@ fn api_file_generation(metadata: &fs::Metadata) -> Option<ApiFileGeneration> {
 }
 
 impl ClaudeApiEvidenceRead {
+    /// Borrow the existing decode and its full health witness without I/O.
+    /// Missing/capped/malformed reads remain present but incomplete; a root
+    /// outside this reader's cohort has no report. The reader owns the strict
+    /// cap boundary and conflicting-id detection, including empty-row reads.
+    #[allow(dead_code)] // The optional attachment consumer is wired separately.
+    pub(crate) fn session_report(
+        &self,
+        root: &str,
+    ) -> Option<crate::telemetry_attach::SessionReport<'_, ClaudeLocalOtelEvidence>> {
+        let health = &self.reads.get(root)?.health;
+        Some(crate::telemetry_attach::SessionReport {
+            rows: self.evidence.get(root).map(Vec::as_slice).unwrap_or(&[]),
+            complete: health.is_complete(),
+            duplicate_keys: &health.conflicting_request_ids,
+        })
+    }
+
     /// The optional root loader has prepaid destination nodes and keys. Move
     /// one disjoint decoded cohort without BTreeMap::append's merge workspace
     /// or a second row graph. Ordinary evidence consumers are unchanged.
