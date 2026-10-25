@@ -369,7 +369,27 @@ pub(crate) fn attach_page(
     api: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     index: &ScanIndex,
 ) {
-    let mut attached = BTreeSet::<(String, u64)>::new();
+    struct Join<'a> {
+        row: &'a crate::claude_local_otel::ClaudeLocalOtelEvidence,
+        ambiguous: bool,
+        used: bool,
+    }
+    let mut lookups = BTreeMap::new();
+    for (root, rows) in api {
+        let mut lookup = std::collections::HashMap::with_capacity(rows.len());
+        for row in rows
+            .iter()
+            .filter(|row| super::super::validate_claude_api_row(row, root))
+        {
+            let join = lookup.entry(row.request_id.as_str()).or_insert(Join {
+                row,
+                ambiguous: false,
+                used: false,
+            });
+            join.ambiguous |= join.row != row;
+        }
+        lookups.insert(root.as_str(), lookup);
+    }
     for item in items.iter_mut() {
         let root = super::super::claude_snapshot_family_root(item);
         let Some(fold) = item.claude_money.as_mut() else {
@@ -379,33 +399,24 @@ pub(crate) fn attach_page(
             continue;
         }
         fold.joined = true;
-        let rows = api.get(&root);
-        let mut lookup = BTreeMap::new();
-        let mut conflicts = BTreeSet::new();
-        for row in rows
-            .into_iter()
-            .flatten()
-            .filter(|r| super::super::validate_claude_api_row(r, &root))
-        {
-            if let Some(previous) = lookup.insert(row.request_id.as_str(), row) {
-                if previous != row {
-                    conflicts.insert(row.request_id.as_str());
-                }
-            }
-        }
+        let Some(lookup) = lookups.get_mut(root.as_str()) else {
+            fold.entity.telemetry_owned_complete = fold.entity.totals().1 == 0;
+            continue;
+        };
         let mut matched = 0u64;
         for (id, occurrence) in &item.claude_usage_occurrences {
             if fold.skipped.contains(&occurrence.sequence) {
                 continue;
             }
             let hash = super::super::claude_request_census::claude_request_hash(id);
-            if fold.ambiguous.contains(&hash) || conflicts.contains(id.as_str()) {
+            let Some(join) = lookup.get_mut(id.as_str()) else {
+                continue;
+            };
+            if fold.ambiguous.contains(&hash) || join.ambiguous || join.used {
                 fold.disclosed += 1;
                 continue;
             }
-            let Some(row) = lookup.get(id.as_str()) else {
-                continue;
-            };
+            let row = join.row;
             let model = occurrence.model.as_deref().unwrap_or("unknown");
             let tokens = ClaudeMoneyTokens::from_usage(&occurrence.usage);
             let compatible = row.model == model
@@ -418,7 +429,7 @@ pub(crate) fn attach_page(
                         .cache_5m
                         .saturating_add(tokens.cache_1h)
                         .saturating_add(tokens.unattributed);
-            if !compatible || attached.contains(&(root.clone(), hash)) {
+            if !compatible {
                 fold.disclosed += 1;
                 continue;
             }
@@ -456,7 +467,7 @@ pub(crate) fn attach_page(
                 Some(ClaudeRequestUsageOrigin::TelemetryMatched),
                 at,
             );
-            attached.insert((root.clone(), hash));
+            join.used = true;
             matched += occurrence.usage.request_count;
             fold.unmatched_1h = fold.unmatched_1h.saturating_sub(u64::from(
                 at.is_some_and(|at| fold.now_nanos.saturating_sub(at) > 3_600_000_000_000),

@@ -1058,22 +1058,34 @@ pub(super) fn e2_side_calls(
     api: &BTreeMap<String, Vec<crate::claude_local_otel::ClaudeLocalOtelEvidence>>,
     index: &super::super::ScanIndex,
 ) {
-    let mut family_ids = BTreeMap::<String, BTreeSet<u64>>::new();
-    for item in items.iter() {
-        let root = super::super::claude_snapshot_family_root(item);
-        family_ids.entry(root).or_default().extend(
-            item.claude_usage_request_ids
-                .iter()
-                .map(|id| claude_request_hash(id)),
-        );
+    // Borrow the existing exact-id sets: union/subtraction needs no second
+    // corpus-sized request table. Only candidates absent from this page enter
+    // the census holder lookup (normally the small auxiliary-call set).
+    let mut side_rows = BTreeMap::new();
+    let mut candidates = BTreeSet::new();
+    for (root, rows) in api {
+        let mut remaining = BTreeMap::new();
+        let mut conflicts = BTreeSet::new();
+        for row in rows
+            .iter()
+            .filter(|row| super::super::validate_claude_api_row(row, root))
+        {
+            if items.iter().any(|item| {
+                super::super::claude_snapshot_family_root_ref(item) == root
+                    && item.claude_usage_request_ids.contains(&row.request_id)
+            }) {
+                continue;
+            }
+            if let Some(prior) = remaining.insert(row.request_id.as_str(), row) {
+                if prior != row {
+                    conflicts.insert(row.request_id.as_str());
+                }
+            }
+            candidates.insert(claude_request_hash(&row.request_id));
+        }
+        side_rows.insert(root.as_str(), (remaining, conflicts));
     }
-    let hashes = api
-        .values()
-        .flatten()
-        .map(|row| claude_request_hash(&row.request_id))
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let hashes = candidates.into_iter().collect::<Vec<_>>();
     let empty = super::super::claude_request_census::ClaudeRequestCensus::default();
     let holders = super::super::claude_request_ledger::scan_holders(
         &index.claude_request_census,
@@ -1096,25 +1108,12 @@ pub(super) fn e2_side_calls(
             fold.disclosed += 1;
             continue;
         };
-        let mut rows = BTreeMap::new();
-        let mut conflicts = BTreeSet::new();
-        for row in api
-            .get(&root)
-            .into_iter()
-            .flatten()
-            .filter(|row| super::super::validate_claude_api_row(row, &root))
-        {
-            if let Some(prior) = rows.insert(row.request_id.as_str(), row) {
-                if prior != row {
-                    conflicts.insert(row.request_id.as_str());
-                }
-            }
-        }
+        let Some((rows, conflicts)) = side_rows.get(root.as_str()) else {
+            continue;
+        };
         for (id, row) in rows {
             let hash = claude_request_hash(id);
-            if family_ids.get(&root).is_some_and(|ids| ids.contains(&hash))
-                || holders.has_transcript_holder_in(hash, &root)
-            {
+            if holders.has_transcript_holder_in(hash, &root) {
                 continue;
             }
             if conflicts.contains(id) || holders.overflowed(hash) {
