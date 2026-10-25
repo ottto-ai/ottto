@@ -10259,7 +10259,10 @@ where
                         operation: "save local custody admission hold",
                     })?;
                     local_admission_deferred += 1;
-                    eprintln!("claude_request_money recovery_unsent_oversize=1");
+                    eprintln!(
+                        "claude_request_money recovery_unsent_oversize=1 reason={}",
+                        admission.kind
+                    );
                 }
             }
             Err(error) if error.is::<unknown_recovery::Deferred>() => {

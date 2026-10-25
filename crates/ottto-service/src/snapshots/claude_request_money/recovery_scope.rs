@@ -79,8 +79,33 @@ impl std::ops::Deref for Closed {
 
 /// No filesystem work and no evidence-map copy. Both temporary graph memory
 /// and every fixed-point walk have explicit bounds; refusal holds emission.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Refusal {
+    Admission,
+    Evidence,
+    Bounds,
+    Deadline,
+}
+impl Refusal {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::Admission => "closure_admission",
+            Self::Evidence => "closure_evidence",
+            Self::Bounds => "closure_bounds",
+            Self::Deadline => "closure_deadline",
+        }
+    }
+}
 pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Option<Closed> {
-    let funds = ShadowReservation::admit(4 * 64 * 1024)?;
+    close_with_reason(support, index, original).ok()
+}
+pub(crate) fn close_with_reason(
+    support: &Path,
+    index: &ScanIndex,
+    original: &Scope,
+) -> Result<Closed, Refusal> {
+    let funds = ShadowReservation::admit(4 * 64 * 1024).ok_or(Refusal::Admission)?;
+    let refusal = std::cell::Cell::new(Refusal::Bounds);
     let deadline = Instant::now() + Duration::from_millis(2);
     let scope = store::recovery_evidence(support, |ledger| {
         let mut scope = original.clone();
@@ -102,6 +127,7 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             // Seed telemetry-only requests even when this root has no indexed transcript.
             for root in scope.roots.keys() {
                 if Instant::now() >= deadline {
+                    refusal.set(Refusal::Deadline);
                     return None;
                 }
                 if let Some(record) = ledger.get(&telemetry_key(root)) {
@@ -114,16 +140,19 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             }
             for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
                 if Instant::now() >= deadline {
+                    refusal.set(Refusal::Deadline);
                     return None;
                 }
                 if !overlaps(record.request_hashes(), &scope.requests) {
                     continue;
                 }
                 // Telemetry keys are SHA-256(session); only the bounded fact header names the root.
+                refusal.set(Refusal::Evidence);
                 let root = facts::ClaudeFacts::open(record.facts()?)?.header.session;
                 if root.is_empty() || telemetry_key(&root) != key {
                     return None;
                 }
+                refusal.set(Refusal::Bounds);
                 if !scope.roots.contains_key(&root) && scope.roots.len() >= ROOT_MAX {
                     return None;
                 }
@@ -136,6 +165,7 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             }
             for key in index.files.keys() {
                 if Instant::now() >= deadline {
+                    refusal.set(Refusal::Deadline);
                     return None;
                 }
                 let Some((root, _)) = logical_family_member(index, key) else {
@@ -190,8 +220,10 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
                 return Some(scope);
             }
         }
-    })??;
-    Some(Closed {
+    })
+    .ok_or(Refusal::Evidence)?
+    .ok_or(refusal.get())?;
+    Ok(Closed {
         scope,
         _funds: funds,
     })

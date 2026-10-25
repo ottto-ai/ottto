@@ -172,6 +172,7 @@ pub(super) fn now(support: &Path) -> u64 {
 /// again; a pending capture supplies its exact entity partition on resume.
 #[derive(Debug)]
 pub(super) struct UnsentPacking {
+    pub kind: &'static str,
     pub resume: Option<Vec<String>>,
 }
 impl std::fmt::Display for UnsentPacking {
@@ -180,8 +181,8 @@ impl std::fmt::Display for UnsentPacking {
     }
 }
 impl std::error::Error for UnsentPacking {}
-fn unsent_packing() -> anyhow::Error {
-    UnsentPacking { resume: None }.into()
+fn unsent_packing(kind: &'static str) -> anyhow::Error {
+    UnsentPacking { kind, resume: None }.into()
 }
 
 /// Admission pressure is recoverable after checkpointing accepted siblings.
@@ -1528,7 +1529,7 @@ pub(super) fn manifest(
                         .map_or(0, String::len),
                 );
             if files.len() >= 256 || key.len() > 4096 || metadata_bytes > MANIFEST_MAX / 2 {
-                return Err(unsent_packing());
+                return Err(unsent_packing("metadata"));
             }
             files.push(key.clone());
             file_revisions.push(index.files[key].source_file_fingerprint.clone());
@@ -1566,12 +1567,12 @@ pub(super) fn manifest(
                 == Some(money::REQUEST_OWNED_CONTRACT),
         });
     }
-    let scope = money::recovery_scope::close(
+    let scope = money::recovery_scope::close_with_reason(
         support,
         index,
         &money::recovery_scope::Scope::seed(entities.iter().map(|e| e.root.clone())),
     )
-    .ok_or_else(unsent_packing)?;
+    .map_err(|reason| unsent_packing(reason.as_str()))?;
     let now = now(support);
     let lineage = format!("{:x}", lineage.finalize());
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1720,6 +1721,7 @@ pub(super) fn initial_post(
             // change its pending packing; recover the already captured exact
             // partition, without changing or subdividing its retained body.
             return Err(UnsentPacking {
+                kind: "captured_partition",
                 resume: Some(
                     manifest
                         .entities
@@ -1746,7 +1748,7 @@ pub(super) fn initial_post(
             policy,
         )?;
         if !manifest_fits(&m) {
-            return Err(unsent_packing());
+            return Err(unsent_packing("envelope"));
         }
         drop(metadata_scratch);
         if CATALOGS
@@ -1797,7 +1799,7 @@ pub(super) fn initial_post(
 
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
-            let body = encode(request, m.head_cas).map_err(|_| unsent_packing())?;
+            let body = encode(request, m.head_cas).map_err(|_| unsent_packing("wire"))?;
             if !initial_authorized(index, support, &m) {
                 return Err(Deferred {
                     reason: None,
@@ -1809,7 +1811,7 @@ pub(super) fn initial_post(
             }
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
-        let body = encode(request, m.head_cas).map_err(|_| unsent_packing())?;
+        let body = encode(request, m.head_cas).map_err(|_| unsent_packing("wire"))?;
         let full = CATALOGS
             .lock()
             .map_err(|_| fault())?
