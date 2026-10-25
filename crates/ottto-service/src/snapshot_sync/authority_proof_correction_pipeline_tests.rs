@@ -1377,8 +1377,6 @@ impl Drop for ApcFixture {
 #[test]
 #[serial(source_manifests)]
 fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-natural", false);
     let (_, grant) = fixture.reach_grant();
@@ -1412,8 +1410,6 @@ fn changed_proof_after_terminal_authority_owes_one_exact_correction() {
 #[test]
 #[serial(source_manifests)]
 fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-account-held", true);
     let (_, grant) = fixture.reach_grant();
@@ -1478,8 +1474,6 @@ fn account_held_member_stays_owed_while_owed_siblings_drain_across_passes() {
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-shed", false);
     let (_, grant) = fixture.reach_grant();
@@ -1603,8 +1597,6 @@ fn crash_and_shed_before_settlement_keep_the_grant_unchanged() {
 // A shed page records RatelimitBackoff in the shared client_report counters.
 #[serial(client_report)]
 fn superseded_revision_ack_never_drains_the_current_revision() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-superseded", false);
     let (_, grant) = fixture.reach_grant();
@@ -1697,8 +1689,6 @@ fn superseded_revision_ack_never_drains_the_current_revision() {
 #[test]
 #[serial(source_manifests)]
 fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-unhealthy", false);
     let (_, grant) = fixture.reach_grant();
@@ -1753,8 +1743,6 @@ fn unhealthy_evidence_after_the_grant_fails_closed_without_a_fresh_grant() {
 #[test]
 #[serial(source_manifests)]
 fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-churn", false);
     let (established, grant) = fixture.reach_grant();
@@ -1841,8 +1829,6 @@ fn new_request_after_the_grant_fails_then_one_new_proof_regrants_all_members() {
 #[test]
 #[serial(source_manifests)]
 fn natural_owed_members_drain_on_separate_bounded_pages() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-multipage", false);
     let (_, grant) = fixture.reach_grant();
@@ -1951,8 +1937,6 @@ fn natural_owed_members_drain_on_separate_bounded_pages() {
 #[test]
 #[serial(source_manifests)]
 fn controlled_three_owed_members_settle_on_their_own_pages_while_one_is_account_held() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("claude-authority-proof-correction-three-owed", true);
     let (_, natural) = fixture.reach_grant();
@@ -2379,8 +2363,6 @@ fn last_empty_correction_completes_replay_in_its_drain_cycle() {
 // A rejected entity records Poisoned in the shared client_report counters.
 #[serial(client_report)]
 fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-permanent-drain", true);
     let (_, grant) = fixture.reach_grant();
@@ -2434,8 +2416,6 @@ fn exact_permanent_refusal_drains_correction_and_keeps_refusal_witness() {
 #[test]
 #[serial(source_manifests)]
 fn retryable_refusal_keeps_its_member_owed_across_restart() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-retryable-owed", true);
     let (_, grant) = fixture.reach_grant();
@@ -2455,8 +2435,6 @@ fn retryable_refusal_keeps_its_member_owed_across_restart() {
 #[test]
 #[serial(source_manifests)]
 fn complete_cutoff_drains_without_upload_or_repeated_grant_parse() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("apc-cutoff-drain", true);
     let (_, grant) = fixture.reach_grant();
@@ -2647,8 +2625,6 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
 #[test]
 #[serial(source_manifests)]
 fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic proof-correction sequences intentionally revisit unchanged members to test correction, ACK, cutoff and refusal semantics", 16);
     let _manifests = SourceManifestTestGuard::new();
     let fixture = ApcFixture::new("authority-unbound-rearm", false);
     fixture.establish();

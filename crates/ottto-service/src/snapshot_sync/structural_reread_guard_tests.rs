@@ -1,8 +1,10 @@
 // Extends the verifier's e18242c2 real-pipeline fixture with a seven-day,
-// trigger-agnostic read bound. Initial import occurs BEFORE the measured
-// window (NewFile is exempt). No existing acceptance assertion is changed.
+// trigger-agnostic observe-only parity test. Compare the same selection and
+// delivery events with instrumentation disabled/enabled; no read is withheld.
 use super::*;
-use crate::snapshots::reread_guard::{clear_cache_for_test, TestClock};
+use crate::snapshots::reread_guard::{
+    clear_cache_for_test, observe_plan_for_test, TestClock, TestObservations,
+};
 const HEALTHY: [&str; 5] = [
     "e1000000-0000-4000-8000-000000000001",
     "e2000000-0000-4000-8000-000000000002",
@@ -13,11 +15,32 @@ const HEALTHY: [&str; 5] = [
 
 #[test]
 #[serial(source_manifests)]
-fn structural_reread_budget_bounds_healthy_files_across_all_triggers_for_seven_days() {
-    if !c1a_layout_supported("structural-reread-seven-days") {
+fn structural_reread_observe_counts_all_triggers_for_seven_days_without_changing_reads() {
+    if !c1a_layout_supported("structural-reread-seven-days-observe") {
         return;
     }
     let _manifests = SourceManifestTestGuard::new();
+    let (control, _, _) = run_observe_events(false);
+    let (observed, would_refuse, reads) = run_observe_events(true);
+    assert_eq!(
+        observed, control,
+        "observe-only leaves every page's reads and delivery decisions unchanged"
+    );
+    assert!(
+        would_refuse > 0,
+        "repeated unchanged reads are counted, never delayed"
+    );
+    assert!(
+        HEALTHY
+            .iter()
+            .any(|session| reads.get(*session).copied().unwrap_or(0) > 2),
+        "observe mode continues reading beyond the hypothetical per-file budget"
+    );
+    eprintln!("REREAD_OBSERVE_ACCEPTANCE would_refuse={would_refuse} reads={reads:?} unchanged_selection=true tripwire_would_fire=true");
+}
+
+fn run_observe_events(observe: bool) -> (Vec<serde_json::Value>, u64, BTreeMap<String, usize>) {
+    let _observations = TestObservations::enabled(observe);
     let start = time::OffsetDateTime::parse(
         "2026-08-02T08:00:00Z",
         &time::format_description::well_known::Rfc3339,
@@ -63,13 +86,14 @@ fn structural_reread_budget_bounds_healthy_files_across_all_triggers_for_seven_d
     index.save(&fixture.index_path).unwrap();
     RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
     // One actual change explains the held family's first read. Its subsequent
-    // retries have the same bytes; holding never bypasses the shared budget.
+    // retries have the same bytes; observe mode must retain BASE liveness.
     RearmFixture::append(
         &c1b_terminal_path(&fixture),
         &rearm_transcript_line(REARM_TERMINAL, None, "req_guard_held", 1),
     );
     let mut reads = BTreeMap::<String, usize>::new();
-    let mut refusals = 0u64;
+    let mut facts = Vec::new();
+    let mut final_index = None;
     let mut event_counts = [0usize; 9];
     for tick in 0..=28usize {
         let elapsed_hours = tick * 6 + 1;
@@ -126,6 +150,12 @@ fn structural_reread_budget_bounds_healthy_files_across_all_triggers_for_seven_d
                     *reads.entry(session.clone()).or_default() += 1;
                 }
             }
+            facts.push(serde_json::json!({
+                "parsed": page.parsed, "scanned": page.scan.scanned_file_count,
+                "census_complete": page.scan.census_complete,
+                "offered": page.offered.len(), "uploaded": page.uploaded.len(),
+                "held": page.held.len(), "fully_settled": page.fully_settled,
+            }));
             let ended = c1b_traversal_ended(&page.index).0;
             last = Some(page);
             if ended {
@@ -143,42 +173,61 @@ fn structural_reread_budget_bounds_healthy_files_across_all_triggers_for_seven_d
             .expect("held family remains disclosed");
         assert!(
             !held.terminal,
-            "budget refusal never settles a pending authority hold"
+            "observation never settles a pending authority hold"
         );
         assert_eq!(
             c1b_terminal_head(&page.index),
             held_head,
             "held ACK does not advance"
         );
-        for (key, head) in &heads {
-            assert_eq!(&page.index.files[key].last_snapshot_fingerprint, head);
-        }
-        let value = serde_json::to_value(&page.index).unwrap();
-        refusals += value["reread_guard"]["refused"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|n| n.as_u64().unwrap())
-            .sum::<u64>();
-        if refusals > 0 {
-            assert!(
-                !page.scan.census_complete,
-                "withheld debt never becomes a clean census"
-            );
-        }
+        assert!(
+            page.index
+                .files
+                .keys()
+                .filter(|key| HEALTHY.iter().any(|id| key.contains(id)))
+                .count()
+                >= HEALTHY.len()
+        );
+        final_index = Some(page.index);
     }
     assert!(
         event_counts.iter().all(|count| *count > 0),
         "every trigger was exercised"
     );
-    assert!(
-        refusals > 0,
-        "the shared guard refused recurring unchanged work"
-    );
-    for session in HEALTHY {
-        assert!(
-            reads.get(session).copied().unwrap_or(0) <= 2,
-            "{session}: healthy full rereads over 7d: {reads:?}"
-        );
-    }
+    let mut index = final_index.unwrap();
+    let value = serde_json::to_value(&index).unwrap();
+    let would_refuse = if observe {
+        let guard = &value["reread_guard"];
+        let count = guard["over_budget"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|n| n.as_u64().unwrap())
+            .sum::<u64>();
+        let stamps = guard["attempts"]
+            .as_object()
+            .unwrap()
+            .values()
+            .flat_map(|slots| slots.as_array().unwrap())
+            .filter(|n| n.as_u64().unwrap() != 0)
+            .count() as u64;
+        assert_eq!(guard["observed_reads"].as_u64().unwrap(), stamps + count,
+            "within this first window every observation is a first/second stamp or one would-refuse count");
+        // Whole-history metadata plan exceeds the threshold but cannot hold reads.
+        let entry = index.files.values().next().unwrap().clone();
+        for i in 0..301 {
+            index
+                .files
+                .insert(format!("whole-history-{i}"), entry.clone());
+        }
+        index.activate_upload_context("whole-history-observe-policy".into());
+        let (held, planned, alarm) = observe_plan_for_test(&mut index, "2026-08-09T10:00:00Z");
+        assert!(!held);
+        assert!(planned > 300);
+        assert!(alarm > 0);
+        count
+    } else {
+        0
+    };
+    (facts, would_refuse, reads)
 }

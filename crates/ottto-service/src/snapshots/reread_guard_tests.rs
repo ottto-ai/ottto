@@ -69,7 +69,7 @@ impl Drop for Fixture {
 }
 fn admit(state: &mut State, key: &str, wall: u64) -> bool {
     matches!(
-        state.admit(key, Some(CandidateParseReason::Rearmed), wall, 1000, None),
+        state.admit_enforced(key, Some(CandidateParseReason::Rearmed), wall, 1000, None),
         Admission::Admit(_)
     )
 }
@@ -104,16 +104,17 @@ fn reservation_is_saved_once_consumed_once_and_never_reused_after_restart() {
         require_save: true,
         ..State::default()
     };
-    let attempt = state.admit("key", None, WALL, 1000, None);
+    let attempt = state.admit_enforced("key", None, WALL, 1000, None);
     assert!(matches!(
         attempt,
         Admission::Admit(Ticket { durable: false, .. })
     ));
     let slots = state.attempts[&KeyHash::of("key")];
     assert!(state.needs_save());
+    assert!(state.ticket("key").is_none());
     state.saved();
     assert!(matches!(
-        state.admit("key", None, WALL + 1, 1001, None),
+        state.admit_enforced("key", None, WALL + 1, 1001, None),
         Admission::Admit(Ticket { durable: true, .. })
     ));
     assert_eq!(state.attempts[&KeyHash::of("key")], slots);
@@ -136,13 +137,13 @@ fn clock_failure_or_suspend_spends_the_reserved_grant() {
             ..State::default()
         };
         assert!(matches!(
-            state.admit("key", None, WALL, 1000, None),
+            state.admit_enforced("key", None, WALL, 1000, None),
             Admission::Admit(_)
         ));
         state.saved();
         assert!(
             matches!(
-                state.admit("key", None, wall, elapsed, None),
+                state.admit_enforced("key", None, wall, elapsed, None),
                 Admission::Refuse
             ),
             "wall={wall} elapsed={elapsed}"
@@ -218,7 +219,7 @@ fn approved_revision_is_exactly_one_persisted_extra_read() {
 }
 
 #[test]
-fn whole_history_plan_preserves_entries_and_census_debt() {
+fn whole_history_plan_alarms_in_observe_without_holding_the_plan() {
     let f = Fixture::new();
     let (mut index, candidate) = f.indexed();
     let entry = index.files.values().next().unwrap().clone();
@@ -237,19 +238,24 @@ fn whole_history_plan_preserves_entries_and_census_debt() {
     assert!(index.reread_guard.tripwire.plan_held);
     assert!(index.reread_guard.tripwire.last_alarm > 0);
     assert_eq!(serde_json::to_value(&index.files).unwrap(), entries);
-    assert!(index.traversal.as_ref().unwrap().counts.has_errors());
+    assert!(!index.traversal.as_ref().unwrap().counts.has_errors());
     assert!(matches!(
         index.admit_unchanged_reread(
             &local_index_key(&candidate.path),
             Some(CandidateParseReason::UploadContext),
             now()
         ),
-        Admission::Refuse
+        Admission::Admit(Ticket { durable: true, .. })
     ));
     assert!(index
         .reread_guard
         .disclosure()
-        .contains("withheld: reread budget"));
+        .contains("reread_mode=observe"));
+    assert!(!index.reread_guard.disclosure().contains("withheld"));
+    assert_eq!(
+        index.reread_guard.over_budget[cause(Some(CandidateParseReason::UploadContext))],
+        1
+    );
 }
 
 #[test]
@@ -279,7 +285,7 @@ fn runtime_tripwire_catches_an_unplanned_future_override() {
 }
 
 #[test]
-fn refusal_never_restores_a_fingerprint_or_changes_acceptance_or_binding() {
+fn observation_never_restores_a_fingerprint_or_changes_acceptance_or_binding() {
     let f = Fixture::new();
     let (mut index, candidate) = f.indexed();
     let _clock = TestClock::at(WALL);
@@ -302,7 +308,7 @@ fn refusal_never_restores_a_fingerprint_or_changes_acceptance_or_binding() {
     }
     assert!(matches!(
         index.admit_unchanged_reread(&key, None, WALL),
-        Admission::Refuse
+        Admission::Admit(_)
     ));
     assert_eq!(
         serde_json::to_value(&index.files[&key]).unwrap(),
@@ -314,7 +320,7 @@ fn refusal_never_restores_a_fingerprint_or_changes_acceptance_or_binding() {
         bindings
     );
     assert!(index.bounded_sweep_had_unsettled_upload);
-    assert_eq!(index.reread_guard.refused[CAUSES - 1], 1);
+    assert_eq!(index.reread_guard.over_budget[CAUSES - 1], 1);
 }
 
 #[test]
@@ -331,7 +337,7 @@ fn physical_change_is_size_nanoseconds_or_opened_device_inode() {
     assert!(!byte_unchanged(entry, &changed));
     changed = candidate.clone();
     changed.physical_identity = Some([u64::MAX, u64::MAX]);
-    assert!(!byte_unchanged(entry, &changed));
+    assert!(!index.reread_unchanged_candidate(&changed));
 }
 
 #[test]
@@ -349,7 +355,7 @@ fn budget_state_is_registered_sparse_and_pruned_without_identity_carry() {
 }
 
 #[test]
-fn save_failure_keeps_reservation_unsaved_and_no_read_ticket_is_usable() {
+fn observe_never_waits_for_a_reservation_save_even_when_the_path_is_unwritable() {
     let f = Fixture::new();
     let (mut index, candidate) = f.indexed();
     let _clock = TestClock::at(WALL);
@@ -370,33 +376,20 @@ fn save_failure_keeps_reservation_unsaved_and_no_read_ticket_is_usable() {
     )
     .with_reread_persistence();
     let key = local_index_key(&candidate.path);
-    assert!(matches!(
-        scan.index.admit_unchanged_reread(&key, None, WALL),
-        Admission::Admit(Ticket { durable: false, .. })
-    ));
-    let bytes = fs::read(&f.index_path).unwrap();
-    let impossible = f.path.join("not-a-directory");
-    assert!(scan
-        .persist_reread_reservations(&mut committed, &impossible)
-        .is_err());
-    assert!(scan.index.reread_guard.needs_save());
-    assert!(scan.index.reread_guard.ticket(&key).is_none());
-    assert_eq!(fs::read(&f.index_path).unwrap(), bytes);
-    scan.persist_reread_reservations(&mut committed, &f.index_path)
+    for _ in 0..8 {
+        assert!(matches!(
+            scan.index.admit_unchanged_reread(&key, None, WALL),
+            Admission::Admit(Ticket { durable: true, .. })
+        ));
+    }
+    let before = fs::read(&f.index_path).unwrap();
+    let generation = committed.generation;
+    scan.persist_reread_reservations(&mut committed, &f.path.join("not-a-directory"))
         .unwrap();
-    let saved = ScanIndex::load(&f.index_path).unwrap();
-    assert_eq!(
-        saved.reread_guard.attempts[&KeyHash::of(&key)]
-            .iter()
-            .filter(|h| **h != 0)
-            .count(),
-        1
-    );
-    assert!(matches!(
-        scan.index.admit_unchanged_reread(&key, None, WALL),
-        Admission::Admit(Ticket { durable: true, .. })
-    ));
-    assert_eq!(scan.index.generation, committed.generation);
+    assert!(!scan.index.reread_guard.needs_save());
+    assert_eq!(committed.generation, generation);
+    assert_eq!(fs::read(&f.index_path).unwrap(), before);
+    assert_eq!(scan.index.reread_guard.over_budget[CAUSES - 1], 6);
 }
 
 #[test]
@@ -448,7 +441,7 @@ fn replay_removes_delivery_entries_but_cannot_masquerade_as_a_new_file() {
     );
     assert!(matches!(
         index.admit_unchanged_reread(&key, Some(CandidateParseReason::NewFile), WALL),
-        Admission::Refuse
+        Admission::Admit(_)
     ));
     let mut changed = candidate.clone();
     changed.size_bytes += 1;
@@ -462,23 +455,93 @@ fn replay_removes_delivery_entries_but_cannot_masquerade_as_a_new_file() {
         ScanParseOutcome::Snapshot,
     );
     assert!(
-        index.reread_guard.replay_witnesses.is_empty(),
-        "a new record replaces detached negative metadata"
+        index
+            .reread_guard
+            .replay_witnesses
+            .contains_key(&KeyHash::of(&key)),
+        "replacement keeps physical metadata outside the unchanged delivery-entry layout"
     );
 }
 
 #[test]
-fn scoped_test_override_is_bounded_and_restores_strict_admission() {
-    let mut state = State::default();
-    assert!(admit(&mut state, "key", WALL));
-    assert!(admit(&mut state, "key", WALL));
-    assert!(!admit(&mut state, "key", WALL));
-    {
-        let _allowance = TestBudgetOverride::new("test-only allowance itself is bounded", 1);
-        assert!(admit(&mut state, "key", WALL));
-        assert!(!admit(&mut state, "key", WALL));
+fn enforce_false_never_changes_selection_even_over_budget_or_with_bad_clocks() {
+    let f = Fixture::new();
+    let (mut index, candidate) = f.indexed();
+    let _clock = TestClock::at(WALL);
+    assert!(!std::hint::black_box(REREAD_GUARD_ENFORCE));
+    let key = local_index_key(&candidate.path);
+    index
+        .files
+        .get_mut(&key)
+        .unwrap()
+        .source_file_fingerprint
+        .clear();
+    let before = index.candidate_decision_with_reason(&candidate);
+    index.reread_guard.tripwire.plan_held = true;
+    index.reread_guard.tripwire.full_reads = 10_000;
+    for wall in [WALL, WALL, WALL, WALL - 1, 0, u64::MAX] {
+        let Admission::Admit(ticket) = index.admit_unchanged_reread(&key, before.1, wall) else {
+            panic!("observe mode changed selection");
+        };
+        assert!(ticket.valid());
+        assert_eq!(index.candidate_decision_with_reason(&candidate), before);
+        assert!(!index.reread_guard.needs_save());
+        assert!(!index.bounded_sweep_had_unsettled_upload);
     }
-    assert!(!admit(&mut state, "key", WALL));
+    index.reread_guard.closed = true;
+    assert!(matches!(
+        index.admit_unchanged_reread(&key, before.1, WALL),
+        Admission::Admit(_)
+    ));
+    assert_eq!(index.reread_guard.observed_reads, 7);
+    assert_eq!(index.reread_guard.over_budget.iter().sum::<u64>(), 7);
+    assert!(!index.reread_guard.disclosure().contains("withheld"));
+}
+
+#[test]
+fn observe_records_exact_would_refuse_counts_across_restart_and_expiry() {
+    let mut state = State::default();
+    for _ in 0..8 {
+        assert!(matches!(
+            state.admit("key", None, WALL, 1000, None),
+            Admission::Admit(_)
+        ));
+    }
+    assert_eq!(state.over_budget[CAUSES - 1], 6);
+    assert_eq!(state.observed_reads, 8);
+    assert_eq!(state.attempts.len(), 1);
+    state = restart(state, WALL + 3600);
+    assert!(matches!(
+        state.admit("key", None, WALL + 3600, 1000, None),
+        Admission::Admit(_)
+    ));
+    assert_eq!(state.over_budget[CAUSES - 1], 7);
+    state = restart(state, WALL + 184 * 3600);
+    assert!(state.attempts.is_empty());
+    assert!(matches!(
+        state.admit("key", None, WALL + 184 * 3600, 1000, None),
+        Admission::Admit(_)
+    ));
+    assert_eq!(state.over_budget[CAUSES - 1], 7);
+}
+
+#[test]
+fn observe_sparse_maps_are_capped_and_pruned_without_changing_admission() {
+    let _clock = TestClock::at(WALL);
+    let mut state = State::default();
+    for i in 0..=MAX_TRACKED_KEYS {
+        let key = format!("key-{i}");
+        assert!(matches!(
+            state.admit(&key, None, WALL, 1000, None),
+            Admission::Admit(_)
+        ));
+        state.note_growth_full(&key);
+    }
+    assert_eq!(state.attempts.len(), MAX_TRACKED_KEYS);
+    assert_eq!(state.growth_full.len(), MAX_TRACKED_KEYS);
+    state = restart(state, WALL + 184 * 3600);
+    assert!(state.attempts.is_empty());
+    assert!(state.growth_full.is_empty());
 }
 
 #[test]
@@ -490,7 +553,7 @@ fn growth_full_reads_are_counted_without_spending_or_refusing_budget() {
     }
     assert_eq!(state.growth_full[&KeyHash::of("growing-key")][1], 40);
     assert!(state.attempts.is_empty());
-    assert_eq!(state.refused, [0; CAUSES]);
+    assert_eq!(state.over_budget, [0; CAUSES]);
 }
 
 #[test]
@@ -538,7 +601,7 @@ fn partial_save_keeps_the_negative_physical_witness_without_a_delivery_entry() {
     assert!(subset.reread_unchanged_candidate(&candidate));
     assert!(matches!(
         subset.admit_unchanged_reread(&key, Some(CandidateParseReason::NewFile), WALL),
-        Admission::Refuse
+        Admission::Admit(_)
     ));
     subset.reread_guard.prune_on_load(WALL + 183 * 3600);
     assert!(

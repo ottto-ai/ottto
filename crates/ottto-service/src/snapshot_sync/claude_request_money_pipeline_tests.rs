@@ -1407,6 +1407,9 @@ fn money_shadow_late_page_publishes_only_refused_coverage() {
 #[serial(source_manifests)]
 #[serial(claude_request_money_shadow)]
 fn money_armed_cycle_saves_the_baseline_index() {
+    // Exact persisted diagnostics are compared under the same input clock.
+    // Do not normalize the saved bytes after either arm.
+    let _reread_clock = crate::snapshots::reread_guard::TestClock::at(1_785_657_600);
     let _source_manifests = SourceManifestTestGuard::new();
     let fixture = PipelineFixture::new("money-shadow-whole-cycle");
     money_write_corpus(

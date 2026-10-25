@@ -250,8 +250,6 @@ fn no_list_and_paused_list_states_hold_history_selected_for_another_reason() {
 /// births are held.
 #[test]
 fn installed_empty_list_paces_history_and_differs_from_a_missing_list() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic history-list comparison intentionally parses the same files on several emission-budget pages", 16);
     let (home, root, mut index) = families("history-gate-empty-list", 2);
     let empty = support("history-gate-empty");
     fs::write(ReemissionExclusions::path(&empty), "").unwrap();

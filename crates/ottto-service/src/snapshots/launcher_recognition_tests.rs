@@ -290,8 +290,6 @@ fn claude_quarantine_preflight_with_launch_keeps_the_physical_identity_fence() {
 
 #[test]
 fn native_launcher_first_import_then_idle_edit_conflict_and_removal_use_one_path() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic launch evidence changes repeatedly with unchanged transcript bytes; this test owns launch-body semantics", 16);
     for source in [SnapshotSource::ClaudeCode, SnapshotSource::Codex] {
         let home = Home::new();
         let root = match source {

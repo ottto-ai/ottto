@@ -468,8 +468,6 @@ fn quarantined_index_after_bootstrap_holds_all_history_without_a_list() {
 /// re-sent at once (StateMissing N1).
 #[test]
 fn historical_replay_after_bootstrap_paces_history_without_a_list() {
-    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-        "Synthetic replay intentionally drains several history-emission pages independently of the shared reread budget", 16);
     let fixture = HistoryFixture::new("history-upgrade-replay");
     let baseline = fixture.baseline();
     assert!(baseline.generation > 0);

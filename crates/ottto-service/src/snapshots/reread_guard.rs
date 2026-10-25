@@ -3,6 +3,12 @@
 use super::*;
 use serde::{Deserializer, Serializer};
 
+/// Observe-only release. Enabling enforcement requires a separate reviewed PR
+/// with durable debt, protected-read and replay-drip contracts completed.
+pub(crate) const REREAD_GUARD_ENFORCE: bool = false;
+/// Cap each sparse diagnostic map independently; capacity never blocks reads.
+const MAX_TRACKED_KEYS: usize = 10_000;
+
 const WEEK_HOURS: u32 = 7 * 24;
 const GRANT_LIFETIME: u64 = 12 * 3600;
 // Hour stamps round DOWN. Retaining for an additional hour plus the maximum
@@ -85,7 +91,10 @@ crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, repla
 pub(super) struct State {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     replay_witnesses: BTreeMap<KeyHash, PhysicalWitness>,
-    refused: [u64; CAUSES],
+    #[serde(alias = "refused")]
+    over_budget: [u64; CAUSES],
+    observed_reads: u64,
+    tracking_dropped: u64,
     growth_full: BTreeMap<KeyHash, [u32; 2]>,
     source_revision: String,
     // Sparse: no entry until a selected unchanged file spends an attempt.
@@ -94,14 +103,14 @@ pub(super) struct State {
     replayed: BTreeMap<String, BTreeSet<KeyHash>>,
     tripwire: Tripwire,
     last_budget_alarm: u64,
-    /// A malformed budget refuses reads instead of losing negative evidence.
+    /// Malformed diagnostic state is counted; observe mode still admits reads.
     closed: bool,
     #[serde(skip)]
     reservations: BTreeMap<KeyHash, Reservation>,
     #[serde(skip)]
     require_save: bool,
 }
-crate::heap_layout_bound::fields!(State; replay_witnesses, refused, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
+crate::heap_layout_bound::fields!(State; replay_witnesses, over_budget, observed_reads, tracking_dropped, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Ticket {
@@ -142,9 +151,6 @@ pub(super) fn byte_unchanged(entry: &ScanIndexEntry, candidate: &CandidateFile) 
             || entry.modified_unix_seconds == candidate.modified_unix_seconds,
             |mtime| mtime == candidate.modified_unix_nanos,
         )
-        // A legacy entry cannot prove replacement: conservatively budget it.
-        && entry.physical_identity.zip(candidate.physical_identity)
-            .map_or(true, |(old, new)| old == new)
 }
 
 fn cause(reason: Option<CandidateParseReason>) -> usize {
@@ -231,6 +237,15 @@ impl State {
             self.growth_full
                 .retain(|_, record| now_hour.saturating_sub(record[0]) < 24);
         }
+        while self.attempts.len() > MAX_TRACKED_KEYS {
+            self.attempts.pop_last();
+        }
+        while self.replay_witnesses.len() > MAX_TRACKED_KEYS {
+            self.replay_witnesses.pop_last();
+        }
+        while self.growth_full.len() > MAX_TRACKED_KEYS {
+            self.growth_full.pop_last();
+        }
         self.reservations.clear(); // Restart never reuses an unconsumed ticket.
     }
     pub(super) fn observe_clock(&mut self) {
@@ -250,6 +265,90 @@ impl State {
         }
     }
     fn admit(
+        &mut self,
+        key: &str,
+        reason: Option<CandidateParseReason>,
+        now: u64,
+        elapsed: u64,
+        revision: Option<&str>,
+    ) -> Admission {
+        #[cfg(test)]
+        if !TEST_OBSERVATIONS.with(std::cell::Cell::get) {
+            return Admission::Admit(observation_ticket());
+        }
+        if REREAD_GUARD_ENFORCE {
+            self.admit_enforced(key, reason, now, elapsed, revision)
+        } else {
+            self.observe_reread(key, reason, now, elapsed)
+        }
+    }
+    fn observe_reread(
+        &mut self,
+        key: &str,
+        reason: Option<CandidateParseReason>,
+        now: u64,
+        elapsed: u64,
+    ) -> Admission {
+        let id = KeyHash::of(key);
+        let now_hour = hour(now);
+        let clock_invalid =
+            self.closed || now < self.wall_high_water || elapsed == u64::MAX || now_hour.is_none();
+        self.wall_high_water = self.wall_high_water.max(now);
+        let tripwire_exceeded =
+            self.tripwire.plan_held || self.tripwire.full_reads > threshold(self.tripwire.indexed);
+        let mut budget_exceeded = clock_invalid;
+        if let Some(now_hour) = now_hour.filter(|_| !clock_invalid) {
+            if self.attempts.contains_key(&id) || self.attempts.len() < MAX_TRACKED_KEYS {
+                let slots = self.attempts.entry(id).or_insert([0; 2]);
+                for slot in slots.iter_mut() {
+                    if !recent(*slot, now_hour) {
+                        *slot = 0;
+                    }
+                }
+                if let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) {
+                    *slot = now_hour;
+                } else {
+                    budget_exceeded = true;
+                    // Keep the two most recent observations, never grow the payload.
+                    slots.sort_unstable();
+                    slots[0] = now_hour;
+                }
+            } else {
+                // Lost diagnostic capacity must never affect selection.
+                self.tracking_dropped = self.tracking_dropped.saturating_add(1);
+            }
+            if let Some(witness) = self.replay_witnesses.get_mut(&id) {
+                witness.removed_hour = now_hour;
+            }
+        }
+        if budget_exceeded || tripwire_exceeded {
+            self.over_budget[cause(reason)] = self.over_budget[cause(reason)].saturating_add(1);
+        }
+        if budget_exceeded
+            && (self.last_budget_alarm == 0
+                || now.saturating_sub(self.last_budget_alarm) >= ALARM_INTERVAL)
+        {
+            eprintln!(
+                "REREAD_BUDGET_EXHAUSTED mode=observe cause={} would_refuse=1",
+                cause(reason)
+            );
+            self.last_budget_alarm = now;
+        }
+        self.observed_reads = self.observed_reads.saturating_add(1);
+        self.tripwire.full_reads = self.tripwire.full_reads.saturating_add(1);
+        self.tripwire.runtime_cause_counts[cause(reason)] =
+            self.tripwire.runtime_cause_counts[cause(reason)].saturating_add(1);
+        if self.tripwire.plan_held || self.tripwire.full_reads > threshold(self.tripwire.indexed) {
+            self.tripwire.alarm(now);
+        }
+        Admission::Admit(Ticket {
+            durable: true,
+            replay: false,
+            wall: now,
+            born: elapsed,
+        })
+    }
+    fn admit_enforced(
         &mut self,
         key: &str,
         reason: Option<CandidateParseReason>,
@@ -337,11 +436,14 @@ impl State {
             }
             if let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) {
                 *slot = now_hour;
-            } else if !test_extra_attempt(id) {
+            } else {
                 if self.last_budget_alarm == 0
                     || now.saturating_sub(self.last_budget_alarm) >= ALARM_INTERVAL
                 {
-                    eprintln!("REREAD_BUDGET_EXHAUSTED cause={}", cause(reason));
+                    eprintln!(
+                        "REREAD_BUDGET_EXHAUSTED mode=enforce cause={}",
+                        cause(reason)
+                    );
                     self.last_budget_alarm = now;
                 }
                 return Admission::Refuse;
@@ -383,23 +485,18 @@ impl State {
             .iter()
             .copied()
             .chain(["override"])
-            .zip(self.refused)
-            .map(|(cause, count)| format!("unchanged_reread_refused{{{cause}}}={count}"))
+            .zip(self.over_budget)
+            .map(|(cause, count)| format!("unchanged_reread_over_budget{{{cause}}}={count}"))
             .collect::<Vec<_>>()
             .join(" ");
         format!(
-            "{counts} reread_status={} growth_full={}",
-            if self.refused.iter().any(|n| *n > 0) || self.tripwire.plan_held {
-                "\"withheld: reread budget\""
-            } else {
-                "clear"
-            },
-            self.growth_full
-                .values()
-                .map(|v| u64::from(v[1]))
-                .sum::<u64>()
+            "{counts} reread_mode=observe reread_observed={} reread_tracking_dropped={} reread_planned={} reread_indexed={} reread_tripwire_would_fire={} growth_full={}",
+            self.observed_reads, self.tracking_dropped, self.tripwire.planned, self.tripwire.indexed,
+            self.tripwire.plan_held || self.tripwire.full_reads > threshold(self.tripwire.indexed),
+            self.growth_full.values().map(|v| u64::from(v[1])).sum::<u64>()
         )
     }
+
     #[cfg(test)]
     fn ticket(&self, key: &str) -> Option<Ticket> {
         let r = self.reservations.get(&KeyHash::of(key))?;
@@ -414,6 +511,11 @@ impl State {
         let Some(hour) = hour(now()) else {
             return;
         };
+        if !self.growth_full.contains_key(&KeyHash::of(key))
+            && self.growth_full.len() >= MAX_TRACKED_KEYS
+        {
+            return;
+        }
         let record = self
             .growth_full
             .entry(KeyHash::of(key))
@@ -445,7 +547,7 @@ impl Tripwire {
                 .collect::<Vec<_>>()
                 .join(",");
             eprintln!(
-                "REREAD_TRIPWIRE cause_counts={{{cause_counts}}} planned={} indexed={} admitted={}",
+                "REREAD_TRIPWIRE mode=observe cause_counts={{{cause_counts}}} planned={} indexed={} admitted={}",
                 self.planned, self.indexed, self.full_reads
             );
             self.last_alarm = now;
@@ -474,8 +576,11 @@ impl ScanIndex {
         admission
     }
     pub(super) fn note_reread_refusal(&mut self, reason: Option<CandidateParseReason>) {
-        self.reread_guard.refused[cause(reason)] =
-            self.reread_guard.refused[cause(reason)].saturating_add(1);
+        if !REREAD_GUARD_ENFORCE {
+            return;
+        }
+        self.reread_guard.over_budget[cause(reason)] =
+            self.reread_guard.over_budget[cause(reason)].saturating_add(1);
         if let Some(traversal) = self.traversal.as_mut() {
             traversal.counts.reread_budget_refused =
                 traversal.counts.reread_budget_refused.saturating_add(1);
@@ -489,20 +594,30 @@ impl ScanIndex {
         collected_at: &str,
         context: &str,
     ) -> bool {
+        #[cfg(test)]
+        if !TEST_OBSERVATIONS.with(std::cell::Cell::get) {
+            return false;
+        }
         if !matches!(source, SnapshotSource::ClaudeCode | SnapshotSource::Codex) {
             return false;
         }
         let id = sha256_hex(&[context, collected_at]);
         if self.reread_guard.tripwire.traversal == id {
-            return self.reread_guard.tripwire.plan_held;
+            return REREAD_GUARD_ENFORCE && self.reread_guard.tripwire.plan_held;
         }
-        self.reread_guard.refused = [0; CAUSES];
         let version_changed = !self.reread_guard.source_revision.is_empty()
             && self.reread_guard.source_revision != source.scan_identity_version();
         self.reread_guard.source_revision = source.scan_identity_version().to_owned();
+        let mut detached_keys: BTreeSet<_> =
+            self.reread_guard.replay_witnesses.keys().copied().collect();
+        for key in self.files.keys() {
+            detached_keys.remove(&KeyHash::of(key));
+        }
+        let detached = detached_keys.len() as u64;
+        drop(detached_keys);
         let mut tripwire = Tripwire {
             traversal: id,
-            indexed: (self.files.len() + self.reread_guard.replay_witnesses.len()) as u64,
+            indexed: self.files.len() as u64 + detached,
             last_alarm: self.reread_guard.tripwire.last_alarm,
             ..Tripwire::default()
         };
@@ -534,7 +649,7 @@ impl ScanIndex {
                 tripwire.cause_counts[cause(Some(reason))] += 1;
             }
         }
-        let replay_debt = self.reread_guard.replay_witnesses.len() as u64;
+        let replay_debt = detached;
         tripwire.planned = tripwire.planned.saturating_add(replay_debt);
         tripwire.cause_counts[cause(Some(CandidateParseReason::Rearmed))] += replay_debt;
         let approved = approved_revision(self);
@@ -550,13 +665,13 @@ impl ScanIndex {
         }
         let held = tripwire.plan_held;
         self.reread_guard.tripwire = tripwire;
-        held
+        REREAD_GUARD_ENFORCE && held
     }
 }
 
 impl OwnedSourceScan {
     pub(crate) fn with_reread_persistence(mut self) -> Self {
-        self.index.reread_guard.require_save = true;
+        self.index.reread_guard.require_save = REREAD_GUARD_ENFORCE;
         self
     }
     /// Only the negative scheduling evidence is published. Never save working
@@ -611,16 +726,18 @@ impl OwnedJsonlParser {
 impl Ticket {
     fn valid(self) -> bool {
         let now = now();
-        self.durable
-            && now >= self.wall
-            && now - self.wall <= GRANT_LIFETIME
-            && elapsed_valid(self.born, monotonic_millis())
+        !REREAD_GUARD_ENFORCE
+            || (self.durable
+                && now >= self.wall
+                && now - self.wall <= GRANT_LIFETIME
+                && elapsed_valid(self.born, monotonic_millis()))
     }
 }
 
 impl OwnedJsonlParser {
     pub(super) fn reread_read_allowed(&self) -> bool {
-        !self.reread_required
+        !REREAD_GUARD_ENFORCE
+            || !self.reread_required
             || self.reader.acquisition.as_ref().is_some_and(|plan| {
                 !matches!(
                     plan.mode(),
@@ -637,7 +754,10 @@ impl<'de> Deserialize<'de> for State {
         #[serde(default, deny_unknown_fields)]
         struct Stored {
             replay_witnesses: BTreeMap<KeyHash, PhysicalWitness>,
-            refused: [u64; CAUSES],
+            #[serde(alias = "refused")]
+            over_budget: [u64; CAUSES],
+            observed_reads: u64,
+            tracking_dropped: u64,
             growth_full: BTreeMap<KeyHash, [u32; 2]>,
             source_revision: String,
             attempts: BTreeMap<KeyHash, [u32; 2]>,
@@ -659,7 +779,9 @@ impl<'de> Deserialize<'de> for State {
         };
         Ok(Self {
             replay_witnesses: stored.replay_witnesses,
-            refused: stored.refused,
+            over_budget: stored.over_budget,
+            observed_reads: stored.observed_reads,
+            tracking_dropped: stored.tracking_dropped,
             growth_full: stored.growth_full,
             source_revision: stored.source_revision,
             attempts: stored.attempts,
@@ -787,20 +909,29 @@ impl State {
     pub(super) fn is_empty(&self) -> bool {
         self.replay_witnesses.is_empty()
             && self.attempts.is_empty()
+            && self.observed_reads == 0
+            && self.tracking_dropped == 0
             && self.growth_full.is_empty()
             && self.source_revision.is_empty()
             && self.replayed.is_empty()
             && self.tripwire.traversal.is_empty()
             && self.wall_high_water == 0
             && !self.closed
-            && self.refused.iter().all(|n| *n == 0)
+            && self.over_budget.iter().all(|n| *n == 0)
     }
 }
 impl ScanIndex {
     pub(super) fn reread_unchanged_candidate(&self, candidate: &CandidateFile) -> bool {
         let key = local_index_key(&candidate.path);
         if let Some(entry) = self.files.get(&key) {
-            return byte_unchanged(entry, candidate);
+            return byte_unchanged(entry, candidate)
+                && self
+                    .reread_guard
+                    .replay_witnesses
+                    .get(&KeyHash::of(&key))
+                    .and_then(|w| w.object)
+                    .zip(candidate.physical_identity)
+                    .map_or(true, |(old, new)| old == new);
         }
         self.reread_guard
             .replay_witnesses
@@ -821,6 +952,9 @@ impl ScanIndex {
             if entry.retain_history_evidence() {
                 continue;
             }
+            if self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS {
+                break;
+            }
             self.reread_guard.replay_witnesses.insert(
                 KeyHash::of(key),
                 PhysicalWitness {
@@ -828,68 +962,32 @@ impl ScanIndex {
                     size: entry.size_bytes,
                     mtime_ns: entry.modified_unix_nanos,
                     mtime_seconds: entry.modified_unix_seconds,
-                    object: entry.physical_identity,
+                    object: self
+                        .reread_guard
+                        .replay_witnesses
+                        .get(&KeyHash::of(key))
+                        .and_then(|w| w.object),
                 },
             );
         }
     }
-    pub(super) fn retire_replay_read_witness(&mut self, key: &str) {
-        self.reread_guard.replay_witnesses.remove(&KeyHash::of(key));
-    }
-}
-
-#[cfg(not(test))]
-fn test_extra_attempt(_: KeyHash) -> bool {
-    false
-}
-#[cfg(test)]
-#[derive(Default)]
-struct ExtraAttempts {
-    limit: u32,
-    used: BTreeMap<KeyHash, u32>,
-}
-#[cfg(test)]
-thread_local! {
-    static TEST_EXTRA_ATTEMPTS: std::cell::RefCell<Option<ExtraAttempts>> = const { std::cell::RefCell::new(None) };
-}
-#[cfg(test)]
-fn test_extra_attempt(key: KeyHash) -> bool {
-    TEST_EXTRA_ATTEMPTS.with(|cell| {
-        let mut guard = cell.borrow_mut();
-        let Some(extra) = guard.as_mut() else {
-            return false;
-        };
-        let used = extra.used.entry(key).or_default();
-        if *used >= extra.limit {
-            return false;
+    pub(super) fn record_read_witness(&mut self, key: &str, candidate: &CandidateFile) {
+        let id = KeyHash::of(key);
+        if !self.reread_guard.replay_witnesses.contains_key(&id)
+            && self.reread_guard.replay_witnesses.len() >= MAX_TRACKED_KEYS
+        {
+            return;
         }
-        *used += 1;
-        true
-    })
-}
-/// Explicit, bounded allowance for tests of an independent correction contract.
-/// Production and the structural budget/invariant acceptance tests never use it.
-#[cfg(test)]
-pub(crate) struct TestBudgetOverride(Option<ExtraAttempts>);
-#[cfg(test)]
-impl TestBudgetOverride {
-    pub(crate) fn new(reason: &'static str, extra_per_key: u32) -> Self {
-        assert!(!reason.is_empty() && extra_per_key > 0);
-        eprintln!("REREAD_TEST_OVERRIDE extra_per_key={extra_per_key} reason={reason}");
-        Self(TEST_EXTRA_ATTEMPTS.with(|cell| {
-            cell.replace(Some(ExtraAttempts {
-                limit: extra_per_key,
-                ..ExtraAttempts::default()
-            }))
-        }))
-    }
-}
-#[cfg(test)]
-impl Drop for TestBudgetOverride {
-    fn drop(&mut self) {
-        TEST_EXTRA_ATTEMPTS.with(|cell| {
-            cell.replace(self.0.take());
-        });
+        self.reread_guard.replay_witnesses.insert(
+            id,
+            PhysicalWitness {
+                removed_hour: hour(now()).unwrap_or(u32::MAX),
+                size: candidate.size_bytes,
+                mtime_ns: Some(candidate.modified_unix_nanos),
+                mtime_seconds: candidate.modified_unix_seconds,
+                object: candidate.physical_identity,
+            },
+        );
     }
 }
 
@@ -905,6 +1003,11 @@ fn unknown_removal_hour() -> u32 {
 }
 impl State {
     fn remember_entry(&mut self, key: &str, entry: &ScanIndexEntry) {
+        if !self.replay_witnesses.contains_key(&KeyHash::of(key))
+            && self.replay_witnesses.len() >= MAX_TRACKED_KEYS
+        {
+            return;
+        }
         self.replay_witnesses.insert(
             KeyHash::of(key),
             PhysicalWitness {
@@ -912,7 +1015,10 @@ impl State {
                 size: entry.size_bytes,
                 mtime_ns: entry.modified_unix_nanos,
                 mtime_seconds: entry.modified_unix_seconds,
-                object: entry.physical_identity,
+                object: self
+                    .replay_witnesses
+                    .get(&KeyHash::of(key))
+                    .and_then(|w| w.object),
             },
         );
     }
@@ -934,5 +1040,48 @@ impl ScanIndex {
             }
         }
         state
+    }
+}
+
+/// Identity-only PS reads are main Skip selections, outside main accounting.
+pub(super) fn observation_ticket() -> Ticket {
+    Ticket {
+        durable: true,
+        replay: false,
+        wall: now(),
+        born: monotonic_millis(),
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn observe_plan_for_test(index: &mut ScanIndex, collected_at: &str) -> (bool, u64, u64) {
+    let held = index.reread_plan(
+        SnapshotSource::ClaudeCode,
+        collected_at,
+        "whole-history-observe",
+    );
+    (
+        held,
+        index.reread_guard.tripwire.planned,
+        index.reread_guard.tripwire.last_alarm,
+    )
+}
+
+// Counterfactual control for the NEW observe-parity test only. This switches
+// instrumentation, never a read allowance or the compiled enforcement mode.
+#[cfg(test)]
+thread_local! { static TEST_OBSERVATIONS: std::cell::Cell<bool> = const { std::cell::Cell::new(true) }; }
+#[cfg(test)]
+pub(crate) struct TestObservations(bool);
+#[cfg(test)]
+impl TestObservations {
+    pub(crate) fn enabled(enabled: bool) -> Self {
+        Self(TEST_OBSERVATIONS.with(|cell| cell.replace(enabled)))
+    }
+}
+#[cfg(test)]
+impl Drop for TestObservations {
+    fn drop(&mut self) {
+        TEST_OBSERVATIONS.with(|cell| cell.set(self.0));
     }
 }

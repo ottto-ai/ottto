@@ -1,53 +1,51 @@
-# Unchanged transcript reread admission
+# Observe-only unchanged transcript reread guard
 
-Claude and Codex read selection now applies one shared per-file admission
-budget after Parse selection, including forced families, comparison targets and
-Codex joined members. Same size, nanosecond mtime and opened device/inode mean
-unchanged bytes, independent of parser versions, privacy policy and sidecars.
-Legacy entries without an object witness are budgeted conservatively.
+`REREAD_GUARD_ENFORCE` is compiled as `false`. Claude and Codex selection,
+including joined members and priority receipts, always receives Admit. The
+observer never skips, delays or yields a read, changes a census result, holds a
+plan, or waits for a reservation save. Existing read-selection policy continues
+to apply. Enabling enforcement requires a separate reviewed change.
 
-An unchanged file receives at most two attempts per rolling seven days. New
-files and changed transcript bytes remain outside this budget. Full reads caused
-by growth are counted and alarmed at the 25th read in a 24-hour observation
-window, without refusing new bytes. A selected attempt is charged before
-acquisition; failure or a later reusable cache hit can conservatively spend it.
+After Parse selection, unchanged size, nanosecond mtime and opened device/inode
+metadata identify repeated work. Legacy missing object evidence is treated
+conservatively. Device/inode witnesses live in a separate bounded diagnostic
+map, preserving the existing delivery-entry layout and replay-reset removal.
+Identity-only parent side reads retain their main-Skip contract and do not
+mutate main-index observation state; their accounting belongs in the follow-up.
 
-The traversal tripwire refuses unchanged work after more than
-`max(indexed_files / 20, 300)` admissions. Its plan check runs before traversal
-start clears and again after rearming; an oversized plan keeps fingerprints
-and debt instead of starting a whole-history read. A large plan remains
-withheld until an explicit approved replay grant changes that decision.
+The existing local census line reports `unchanged_reread_over_budget{cause}`:
+selected attempts that would exceed the proposed two-read rolling seven-day
+budget or a traversal tripwire. It also reports observed selections, plan and
+indexed counts, whether the tripwire would fire, and diagnostic-capacity losses.
+`REREAD_BUDGET_EXHAUSTED mode=observe` and `REREAD_TRIPWIRE mode=observe` are
+rate-limited local alarms. There is no withheld disclosure or upload field.
+A selection later satisfied by a cache hit is conservatively counted.
 
-A refusal keeps the current file entry, empty fingerprint debt, bindings and
-ACKs. The census remains incomplete with `withheld: reread budget`, and its
-existing local census line includes `unchanged_reread_refused{cause}` counters.
-`REREAD_BUDGET_EXHAUSTED` and `REREAD_TRIPWIRE` are local coded alarms.
+The plan threshold is `max(floor(indexed_files / 20), 300)`. Plans above it alarm
+without suppressing re-arms. Runtime selections continue above the threshold;
+each further selection is counted as one would-refuse event. Plan counting is
+currently conservative for stale families; composition with scoped retry must
+count the actual funded re-arm set before any future enforcement.
 
-The sparse persisted budget uses a 16-byte key digest and two 32-bit hour
-stamps, pruned on load. The wall high-water never moves backward. Transient
-single-use tickets expire after twelve wall-clock hours or suspend-inclusive
-monotonic hours; restart cannot reuse a ticket. An additional hour in the
-retention window covers hour rounding. Ordinary page reservations are saved
-together through the committed index before reads resume. The save publishes
-negative scheduling evidence, never uncommitted scan output or authority.
-A production reader without that committed-index save handoff refuses unchanged
-rereads; volatile in-memory tickets are test-only.
+Each of the three sparse diagnostic maps is capped at 10,000 keys and pruned on
+load: 16-byte key digest plus two 32-bit hour stamps, physical metadata witnesses,
+and growth-read diagnostics. Their combined inline key/value payload is at most
+1,280,000 bytes on the validated layout, plus BTree allocation overhead. The
+stamp map alone is 240,000 bytes of key/value payload, approximately 510,001
+bytes of compact JSON with six-digit hours. Capacity loss increments a local
+counter and never affects selection. Empty default state remains omitted; an
+untouched index is not initialized by load/save.
 
-Replay still removes its ordinary delivery entries. A separate hash-keyed
-negative physical witness keeps those old files subject to selection admission;
-recording a replacement retires that detached witness. No ACK or binding is
-carried in this scheduling metadata. The root budget field is appended to the
-persisted field registry to preserve older positional encodings, and omitted
-when empty.
+Observation keeps the most recent two hour stamps. It conservatively retains
+stamps through 181 hours to cover hour rounding and the enforcement calculator's
+maximum twelve-hour ticket age. Persisted wall high-water and suspend-inclusive
+clock checks still diagnose invalid clocks; observe mode admits even then.
+The dormant enforcement calculator has separate arithmetic/clock unit tests;
+its durable debt, grant and protected-read contracts are not shipped as policy.
 
-The compiled `ReplayGrant { revision }` list is empty. An explicitly approved
-revision can grant one persisted additional read per file, including through a
-tripwire hold. No implicit grant accompanies a parser or contract bump.
-Duplicate-request census rebuild admission should become a sub-budget of this
-selection budget when that separate mechanism is composed; neither may add
-reads on top of the other.
-
-Synthetic contracts cover clock rollback, suspend, restart, failed saves,
-physical replacement, tripwires, grant reuse, and held/healthy families over
-seven days with retry, context, policy, fence, contract, version and cache events.
-Test builds assert that unchanged indexed Full reads have an Admit ticket.
+New synthetic tests check exact would-refuse counts, restart/pruning, map caps,
+clock rules and unconditional Admit. A seven-day multi-event fixture compares
+actual reads and delivery decisions with observation disabled/enabled and checks
+a whole-history alarm without a plan hold. Legacy correction tests need no
+budget allowances. Test builds retain the current-selection Admit-ticket
+invariant, with direct reader drivers explicitly obtaining their tickets.

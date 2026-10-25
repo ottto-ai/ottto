@@ -11009,7 +11009,6 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
-                physical_identity: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),
@@ -12537,10 +12536,6 @@ mod tests {
     // A shed page records RatelimitBackoff in the shared client_report counters.
     #[serial(client_report)]
     fn cache_effective_wire_existing143_context_parse_equal_body_requires_adoption() {
-        let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
-            "Synthetic wire adoption exercises repeated policy/context reads of one unchanged body",
-            16,
-        );
         let root = cache_effective_wire_fixture_root();
         let (mut index, mut progress) = cache_effective_wire_released143_index(&root);
         index.activate_effective_upload_body_witness_revision(
