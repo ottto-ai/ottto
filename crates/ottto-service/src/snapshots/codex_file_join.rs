@@ -146,6 +146,7 @@ pub(super) struct HeaderWitness {
     pub(super) candidate: CandidateFile,
     pub(super) owner: String,
     pub(super) home: PathBuf,
+    pub(super) created_unix_ms: Option<i64>,
     metadata: String,
 }
 pub(super) fn member_home(root: &Path) -> PathBuf {
@@ -182,14 +183,20 @@ fn read_header_bytes(candidate: &CandidateFile) -> Result<(Vec<u8>, String, usiz
     let read_bytes = (MAX_HEADER_BYTES + 1) - reader.get_ref().limit() as usize;
     Ok((bytes, witness, read_bytes))
 }
-fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
+type ReadHeader = (String, Option<i64>, String, usize);
+fn read_header(candidate: &CandidateFile) -> Result<ReadHeader> {
     let (bytes, witness, read_bytes) = read_header_bytes(candidate)?;
     let value: Value = serde_json::from_slice(&bytes)?;
     let meta =
         codex_session_meta_payload(&value).context("Codex first record is not a owning header")?;
     let owner = resolve_codex_identity_option(codex_identity_at(meta, &["id"]))
         .context("Codex header lacks ownership")?;
-    Ok((owner, witness, read_bytes))
+    let created_unix_ms = meta
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(|value| OffsetDateTime::parse(value, &Rfc3339).ok())
+        .and_then(|created| i64::try_from(created.unix_timestamp_nanos() / 1_000_000).ok());
+    Ok((owner, created_unix_ms, witness, read_bytes))
 }
 /// Live rollouts are appended to while the inventory reads them. An append
 /// that lands during the bounded first-record read moves the bracketing
@@ -200,7 +207,7 @@ fn read_header(candidate: &CandidateFile) -> Result<(String, String, usize)> {
 /// repeated; every other refusal is final on its first read.
 const HEADER_READ_ATTEMPTS: usize = 3;
 const HEADER_CHANGED_WHILE_READ: &str = "Codex header changed while read";
-fn read_header_settled(candidate: &CandidateFile) -> (Result<(String, String, usize)>, usize) {
+fn read_header_settled(candidate: &CandidateFile) -> (Result<ReadHeader>, usize) {
     let mut retried = 0;
     loop {
         match read_header(candidate) {
@@ -334,12 +341,13 @@ impl HeaderInventory {
             self.read_bytes = self
                 .read_bytes
                 .saturating_add(retried.saturating_mul(MAX_HEADER_BYTES + 1));
-            let (owner, witness, bytes) = header?;
+            let (owner, created_unix_ms, witness, bytes) = header?;
             self.read_bytes = self.read_bytes.saturating_add(bytes);
             Ok(HeaderWitness {
                 home: member_home(&candidate.scan_root),
                 candidate,
                 owner,
+                created_unix_ms,
                 metadata: witness,
             })
         })();
@@ -406,7 +414,7 @@ impl HeaderInventory {
             if metadata_witness(&stat) == header.metadata {
                 continue;
             }
-            let (current_owner, _, _) = read_header(&header.candidate)?;
+            let (current_owner, _, _, _) = read_header(&header.candidate)?;
             anyhow::ensure!(
                 current_owner == header.owner
                     || (!selected.contains(&current_owner) && !selected.contains(&header.owner)),
@@ -417,7 +425,7 @@ impl HeaderInventory {
     }
 }
 crate::heap_layout_bound::fields!(DirectoryCensus; directories, stable);
-crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, metadata);
+crate::heap_layout_bound::fields!(HeaderWitness; candidate, owner, home, created_unix_ms, metadata);
 crate::heap_layout_bound::fields!(HeaderInventory; roots, pending, headers, directories, complete, read_bytes, refused, bounded_out);
 
 #[derive(Clone, Debug)]
