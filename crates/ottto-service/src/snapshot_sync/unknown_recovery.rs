@@ -121,12 +121,17 @@ struct CheckedManifestView<'a> {
 fn manifest_fits(m: &Manifest) -> bool {
     // A SHA-256 checksum always serializes as the same 64 unescaped bytes.
     const CHECKSUM: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+    // Hash +64, wire length +6, not-before at most +19, terminal reason +16;
+    // counters remain one digit and the receipt slot is no wider than null.
+    // Count the borrowed envelope with room for all later journal updates.
+    // No second metadata graph is copied just to reject an oversized offer.
+    const BOOKKEEPING_ROOM: usize = 128;
     crate::snapshot_retry::json_fits(
         &CheckedManifestView {
             checksum: CHECKSUM,
             manifest: m,
         },
-        MANIFEST_MAX,
+        MANIFEST_MAX - BOOKKEEPING_ROOM,
     )
 }
 
@@ -2271,6 +2276,40 @@ pub(super) fn active_for_test(support: &Path) -> Vec<Manifest> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn metadata_admission_prepays_capture_and_terminal_bookkeeping() {
+        let (mut manifest, _) = specimen(1000);
+        let (mut low, mut high) = (0, MANIFEST_MAX);
+        while low < high {
+            let middle = (low + high).div_ceil(2);
+            manifest.context = "x".repeat(middle);
+            if manifest_fits(&manifest) {
+                low = middle;
+            } else {
+                high = middle - 1;
+            }
+        }
+        manifest.context = "x".repeat(low);
+        assert!(manifest_fits(&manifest));
+        manifest.context.push('x');
+        assert!(!manifest_fits(&manifest));
+        manifest.context.pop();
+        manifest.sha256 = "ab".repeat(32);
+        manifest.length = BODY_MAX;
+        manifest.not_before = u64::MAX;
+        manifest.receipt_slot = Some((RECEIPT_MAX - 1) as u16);
+        manifest.terminal = Some(Reason::RevisionDowngrade);
+        let encoded = serde_json::to_vec(&CheckedManifestView {
+            checksum: &"cd".repeat(32),
+            manifest: &manifest,
+        })
+        .unwrap();
+        assert!(
+            encoded.len() <= MANIFEST_MAX,
+            "admitted metadata must leave room for every durable bookkeeping field"
+        );
+    }
     fn specimen(created: u64) -> (Manifest, Vec<u8>) {
         let bytes = br#"{"schema_version":1,"snapshots":[{"synthetic":true}]}"#.to_vec();
         (
