@@ -3434,6 +3434,17 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
         snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
     )
     .unwrap();
+    // The same bounded carrier also owns sweep/rate controls. Those controls
+    // retain their slots; only the remaining slots may hold new release latches.
+    let available = money::store::with_ledger_for_test(&control.support, |ledger| {
+        16 - ledger.census().records_with_prefix("adopt:entity:").count()
+            - ledger.census().records_with_prefix("sweep:").count()
+    })
+    .unwrap();
+    assert!(
+        (9..=16).contains(&available),
+        "single-context fixture capacity"
+    );
     let mut items = Vec::new();
     for number in 0..17 {
         let mut item = sample.clone();
@@ -3521,19 +3532,24 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     };
     assert_eq!(
         run(&mut progress, &mut index).unwrap(),
-        ResumableUploadResult::Deferred { count: 1 }
+        ResumableUploadResult::Deferred {
+            count: 17 - available
+        }
     );
     money_resume::drive_for_test(unknown_recovery::outcomes(&control.support)).unwrap();
     assert_eq!(
         unknown_recovery::active_for_test(&control.support).len(),
-        16
+        available
     );
     assert!(
         unknown_recovery::offline_startup(&control.support, now).unwrap(),
         "normal capacity pressure must not become a sticky global fault"
     );
     // Original prepared offer plus sixteen independently captured batches.
-    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 17);
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1 + available
+    );
     // Save only real ACKs through the actual selected-index save before retiring custody.
     let selected = items
         .iter()
@@ -3566,7 +3582,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 18);
     assert_eq!(progress.accepted_fingerprints.len(), 17); // seventeen distinct frozen offers
     assert!(unknown_recovery::initialized(&control.support));
-    eprintln!("MONEY_UNKNOWN_CAPACITY real_slots=16 accepted_checkpoint=true global_fault=false next_offer_post=true");
+    eprintln!("MONEY_UNKNOWN_CAPACITY manifest_limit=16 control_slots_available={available} accepted_checkpoint=true global_fault=false next_offer_post=true");
 }
 
 #[test]

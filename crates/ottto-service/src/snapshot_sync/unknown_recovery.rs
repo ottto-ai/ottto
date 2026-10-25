@@ -2722,6 +2722,36 @@ mod tests {
     }
 
     #[test]
+    fn sixteen_active_manifests_are_kept_when_the_seventeenth_is_refused() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-sixteen-manifest-limit");
+        let (template, body) = specimen(1000);
+        for number in 1..=16 {
+            let mut manifest = template.clone();
+            manifest.id = format!("{number:064x}");
+            manifest.lineage = manifest.id.clone();
+            capture(scratch.to_path_buf(), manifest, &body).unwrap();
+        }
+        let mut next = template;
+        next.id = format!("{:064x}", 17);
+        next.lineage = next.id.clone();
+        assert!(capture(scratch.to_path_buf(), next, &body)
+            .unwrap_err()
+            .is::<CapacityFull>());
+        let saved = load(&dir(&scratch)).unwrap();
+        assert_eq!(saved.len(), 16);
+        for manifest in saved {
+            assert_eq!(
+                read_capped(
+                    &path(&dir(&scratch), &manifest.id, "body").unwrap(),
+                    BODY_MAX
+                )
+                .unwrap(),
+                body
+            );
+        }
+    }
+
+    #[test]
     fn custody_caps_include_stale_temps_and_corruption_never_reconstructs() {
         let scratch = crate::test_scratch::ScratchDir::new("money-unknown-caps");
         let root = dir(&scratch);
