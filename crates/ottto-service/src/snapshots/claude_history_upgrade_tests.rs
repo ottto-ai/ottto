@@ -487,6 +487,7 @@ fn family_on_disk(
     with_root: bool,
 ) -> BTreeMap<String, CandidateFile> {
     let candidate = |path: PathBuf| CandidateFile {
+        physical_identity: None,
         scan_root: project.to_path_buf(),
         source_file_fingerprint: path.display().to_string(),
         path,

@@ -2013,10 +2013,14 @@ fn every_persisted_field_serializes_and_crosses_the_lenient_boundary() {
                 serde_json::json!({"/synthetic/0.jsonl":{"v":claude_request_census::CLAUDE_REQUEST_CENSUS_DERIVATION,"fp":"a".repeat(64),"w":7,"s":"exact","b":"AAAAAAAAAAE="}})
             }
             "claude_request_census_shadow" => serde_json::json!({"o":true}),
+            "reread_guard" => serde_json::json!({"closed":true}),
             "claude_retired_family_tombstones" => {
                 serde_json::json!({"a".repeat(64): 1})
             }
             "claude_full_rearm_progress" => serde_json::json!({"structural_rearm_owed":true}),
+            "codex_counting_tombstones" => {
+                serde_json::json!({"a".repeat(64):{"evidence":"legacy_acked","retired_in":"2026-10-22T00:00:00Z"}})
+            }
             "claude_duplicate_request_owners" => {
                 serde_json::json!({"request":[{"root_session_id_hash":"root","source_session_id_hash":"session"}]})
             }
@@ -2187,6 +2191,7 @@ fn actual_transcript_rescans_keep_file_and_family_holds_out_of_publication() {
             // Pins the NewFile decision independently of the scan's earlier
             // candidate guard, including when the held native entry is absent.
             let candidate = CandidateFile {
+                physical_identity: None,
                 scan_root: root.clone(),
                 path: transcript_paths[0].clone(),
                 size_bytes: fs::metadata(&transcript_paths[0]).unwrap().len(),
@@ -4197,5 +4202,76 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
                 allocations.usable_peak
             );
         }
+    }
+}
+
+#[test]
+fn legacy_nested_positional_traversal_counts_keep_their_original_slots() {
+    // The old short sequence meant discovered=7, not a guard admission.
+    // Also exercise the full legacy sequence, including its structured slots.
+    let legacy = [
+        "discovered_file_count",
+        "directory_entry_cap_exceeded_count",
+        "symlink_rejected_count",
+        "unreadable_path_count",
+        "unreadable_causes",
+        "parent_unresolvable",
+        "oversized_file_count",
+        "disappeared_file_count",
+        "malformed_json_line_count",
+        "invalid_utf8_line_count",
+        "over_line_cap_count",
+        "recognized_usage_drop_count",
+        "ownership_incomplete_file_count",
+        "zero_snapshot_usage_evidence_count",
+        "dropped_usage_record_count",
+        "terminal_over_line_cap_count",
+        "terminal_recognized_usage_drop_count",
+        "terminal_dropped_usage_record_count",
+        "terminal_ownership_incomplete_file_count",
+        "terminal_zero_snapshot_usage_evidence_count",
+    ];
+    for full in [false, true] {
+        let scratch = crate::test_scratch::ScratchDir::new("nested-counts-sequence");
+        let path = scratch.join("index.json");
+        let defaults = serde_json::to_value(ScanTraversalCounts::default()).unwrap();
+        let mut expected = defaults.clone();
+        let slots = legacy
+            .iter()
+            .take(if full { legacy.len() } else { 1 })
+            .enumerate()
+            .map(|(n, name)| {
+                let value = if defaults[*name].is_number() {
+                    serde_json::json!(n + 7)
+                } else {
+                    defaults[*name].clone()
+                };
+                expected[*name] = value.clone();
+                value
+            })
+            .collect::<Vec<_>>();
+        let mut root = serde_json::to_value(ScanIndex::default()).unwrap();
+        root["traversal"] = serde_json::json!({
+            "context_fingerprint":"context", "census_window_end":"2026-10-24T23:00:00Z",
+            "scan_roots":[], "pending_directories":[], "pending_candidates":[],
+            "observed_index_keys":[], "reconciliation_upper_bound":null,
+            "reconciliation_after":null, "reconciliation_started":true, "counts":slots
+        });
+        fs::write(&path, serde_json::to_vec(&root).unwrap()).unwrap();
+        let mut loaded = ScanIndex::load(&path).expect("legacy nested sequence loads");
+        let counts = &loaded.traversal.as_ref().unwrap().counts;
+        assert_eq!(serde_json::to_value(counts).unwrap(), expected);
+        assert_eq!(counts.discovered_file_count, 7);
+        assert_eq!(counts.unchanged_reread_admitted, 0);
+        assert_eq!(counts.reread_budget_refused, 0);
+        assert_eq!(counts.has_retryable_problems(), full);
+        loaded
+            .save(&path)
+            .expect("legacy checkpoint can still CAS-save");
+        let reopened = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reopened.traversal.as_ref().unwrap().counts).unwrap(),
+            expected
+        );
     }
 }

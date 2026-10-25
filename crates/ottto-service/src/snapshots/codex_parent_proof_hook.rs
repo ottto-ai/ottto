@@ -492,6 +492,7 @@ fn start_codex_proof_job(
             .cloned()
             .and_then(|scan_root| {
                 open_candidate_beneath_root(&CandidateFile {
+                    physical_identity: None,
                     scan_root,
                     path: path.clone(),
                     size_bytes: 0,

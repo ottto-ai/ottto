@@ -327,6 +327,7 @@ fn native_comparison_paid_capture_population_reports_guard_viability_without_byp
             entry.scan_identity_version = Some(LOCAL_SCAN_INDEX_IDENTITY_VERSION.into());
             index.files.insert(local_index_key(&path), entry);
             CandidateFile {
+                physical_identity: None,
                 scan_root: PathBuf::from("/synthetic/project"),
                 path,
                 size_bytes: 1,
