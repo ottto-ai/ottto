@@ -5,15 +5,16 @@
 //! identity, parser scope or body witness.
 use super::super::claude_context_file_birth::ClaudeFileBirth;
 use super::super::claude_money_birth_store::{location_key, LocationKey};
+use super::super::claude_request_census::claude_request_hash;
 use super::super::{
     claude_api_cache_creation, claude_api_matches_transcript_occurrence,
     claude_index_path_family_member, claude_index_path_member_ref, claude_row_placement,
     claude_snapshot_family_root_ref, claude_trace_evidence_fingerprint_is_valid,
-    claude_trace_owner_session_id, insert_selector_raw, local_index_key, rfc3339_unix_nanos,
-    validate_claude_api_row, ClaudeTranscriptUsageOccurrence, ResolvedClaudeResponse, ScanIndex,
-    SelectorCapture, SnapshotItem, CLAUDE_EFFORT_TIERS,
+    claude_trace_owner_session_id, local_index_key, rfc3339_unix_nanos, validate_claude_api_row,
+    ClaudeTranscriptUsageOccurrence, ResolvedClaudeResponse, ScanIndex, SelectorCapture,
+    SnapshotItem,
 };
-use super::body::{ClaudeGrainSide, ClaudeLiveKey, ClaudeRequestUsageOrigin};
+use super::body::{reported_inputs, ClaudeGrainSide, ClaudeLiveKey, ClaudeRequestUsageOrigin};
 use super::ClaudeMoneyTokens;
 use crate::claude_local_otel::{
     ClaudeApiEvidenceRead, ClaudeLocalOtelEvidence, ClaudeLocalOtelLoadReport,
@@ -22,7 +23,8 @@ use crate::claude_local_otel::{
 use crate::telemetry_attach::{join, Attachment, Holders};
 use serde::Serialize;
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{hash_map::DefaultHasher, BTreeMap, BTreeSet};
+use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -257,8 +259,11 @@ struct FoldTelemetry {
     side_candidates: u64,
     /// The side-call pass finished for this family (or had nothing to do).
     side_calls_done: bool,
+    /// One family view on its first fold only. Hashes accelerate exact request
+    /// lookups; collisions are checked against the existing request sets.
+    membership: FamilyMembership,
 }
-crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done);
+crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done, membership);
 
 #[derive(Debug, Clone)]
 pub(crate) struct FileFold {
@@ -551,32 +556,13 @@ fn reported_key(
     occurrence: Option<&ClaudeTranscriptUsageOccurrence>,
     base: &SelectorCapture,
 ) -> Option<ClaudeLiveKey> {
-    let mut selector = occurrence
-        .map(|occurrence| SelectorCapture::clone(&occurrence.selector))
-        .unwrap_or_default();
-    if !row.speed.trim().is_empty() {
-        insert_selector_raw(
-            &mut selector,
-            "speed_mode",
-            "claude_code.api_request.speed",
-            &serde_json::Value::String(row.speed.clone()),
-        );
-    }
-    let reported_effort = CLAUDE_EFFORT_TIERS
-        .contains(&row.effort.as_str())
-        .then_some(row.effort.as_str());
-    let effort = occurrence
-        .and_then(|occurrence| occurrence.reasoning_effort.as_deref())
-        .or(reported_effort);
-    let model = occurrence
-        .and_then(|occurrence| occurrence.model.as_deref())
-        .unwrap_or(&row.model);
+    let inputs = reported_inputs(&row.model, &row.speed, &row.effort, occurrence);
     grain_key(
-        model,
+        inputs.model,
         base,
-        selector,
-        effort,
-        occurrence.and_then(|occurrence| occurrence.timestamp.as_deref()),
+        inputs.selector,
+        inputs.effort,
+        inputs.timestamp,
         Some(&row.observed_at),
     )
 }
@@ -596,13 +582,77 @@ fn page_families(items: &[SnapshotItem]) -> BTreeMap<String, Vec<usize>> {
     families
 }
 
-/// Who on this page counts `request_id`: one counted holder (path twins of
-/// one session share it: the first), several sessions (ambiguous), only a
-/// skipped copy (held elsewhere, never attached), or nobody.
-fn holders(items: &[SnapshotItem], members: &[usize], request_id: &str) -> Holders<usize> {
+/// Transient acceleration only, never an ownership identity. Every hit is
+/// checked against the exact request id in the existing member map/set.
+fn membership_hash(request_id: &str) -> u64 {
+    let mut hash = DefaultHasher::new();
+    request_id.hash(&mut hash);
+    hash.finish()
+}
+
+/// A transient member index in the low bits, a hash accelerator in the rest.
+/// At 736 members this leaves 54 hash bits. Collisions only add exact lookups;
+/// they never certify membership. Eight bytes per existing request, no strings.
+#[derive(Debug, Clone, Default)]
+struct FamilyMembership {
+    entries: Vec<u64>,
+    member_mask: u64,
+}
+crate::heap_layout_bound::fields!(FamilyMembership; entries, member_mask);
+
+/// Attach and subtraction share this one view, consumed before candidate
+/// hashes and trace owners are allocated. Indices are into the unchanged page.
+fn family_membership(items: &[SnapshotItem], members: &[usize]) -> FamilyMembership {
+    let count = members
+        .iter()
+        .map(|&index| {
+            let item = &items[index];
+            item.claude_usage_request_ids.len()
+                + item
+                    .claude_usage_occurrences
+                    .keys()
+                    .filter(|id| !item.claude_usage_request_ids.contains(*id))
+                    .count()
+        })
+        .sum();
+    let bits = usize::BITS - items.len().saturating_sub(1).leading_zeros();
+    let member_mask = u64::MAX.checked_shr(64 - bits).unwrap_or(0);
+    let mut entries = Vec::with_capacity(count);
+    for &index in members {
+        let item = &items[index];
+        for id in item.claude_usage_request_ids.iter().chain(
+            item.claude_usage_occurrences
+                .keys()
+                .filter(|id| !item.claude_usage_request_ids.contains(*id)),
+        ) {
+            entries.push((membership_hash(id) & !member_mask) | index as u64);
+        }
+    }
+    entries.sort_unstable();
+    FamilyMembership {
+        entries,
+        member_mask,
+    }
+}
+
+fn matching_members<'a>(
+    view: &'a FamilyMembership,
+    request_id: &str,
+) -> impl Iterator<Item = usize> + 'a {
+    let hash_mask = !view.member_mask;
+    let hash = membership_hash(request_id) & hash_mask;
+    let start = view.entries.partition_point(|key| key & hash_mask < hash);
+    view.entries[start..]
+        .iter()
+        .take_while(move |&&key| key & hash_mask == hash)
+        .map(|&key| (key & view.member_mask) as usize)
+}
+
+/// Same-session twins share the first holder; distinct sessions are ambiguous.
+fn holders(items: &[SnapshotItem], view: &FamilyMembership, request_id: &str) -> Holders<usize> {
     let mut found = None::<usize>;
     let mut held = false;
-    for &index in members {
+    for index in matching_members(view, request_id) {
         let item = &items[index];
         let Some(occurrence) = item.claude_usage_occurrences.get(request_id) else {
             continue;
@@ -743,10 +793,11 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
             .first()
             .and_then(|row| super::super::activity_bucket_from_timestamp(&row.observed_at))
             .map(|(bucket, _)| bucket);
+        let membership = family_membership(&items.borrow(), members);
         let mut disclosed = 0u64;
         let counts = join(
             report,
-            |request_id| holders(&**items.borrow(), members, request_id),
+            |request_id| holders(&items.borrow(), &membership, request_id),
             |row, holder| {
                 validate_claude_api_row(row, root)
                     && items.borrow()[*holder]
@@ -776,11 +827,20 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
                     start_bucket: start_bucket.clone(),
                     side_candidates: counts.unheld as u64,
                     side_calls_done: counts.unheld == 0,
+                    membership: FamilyMembership::default(),
                 };
                 if index == first {
                     fold.disclosed += disclosed;
                 }
             }
+        }
+        if counts.unheld > 0 {
+            items[first]
+                .claude_money
+                .as_deref_mut()
+                .unwrap()
+                .telemetry
+                .membership = membership;
         }
     }
 }
@@ -813,13 +873,26 @@ pub(crate) fn side_calls_page(
     let mut wanted = BTreeMap::<&str, Vec<u64>>::new();
     let mut invalid = BTreeMap::<&str, u64>::new();
     for (root, members) in &families {
+        let first = members
+            .iter()
+            .copied()
+            .find(|&i| items[i].claude_money.is_some())
+            .unwrap();
+        let membership = std::mem::take(
+            &mut items[first]
+                .claude_money
+                .as_deref_mut()
+                .unwrap()
+                .telemetry
+                .membership,
+        );
         let Some(rows) = api.evidence.get(root.as_str()) else {
-            continue; // unhealthy sidecar pair: stays undone and disclosed
+            continue; // unhealthy pair: discard the view, stay undone/disclosed
         };
-        let mut family = Vec::new();
+        let mut family = Vec::with_capacity(rows.len());
         for row in rows {
-            if members.iter().any(|index| {
-                items[*index]
+            if matching_members(&membership, &row.request_id).any(|index| {
+                items[index]
                     .claude_usage_request_ids
                     .contains(&row.request_id)
             }) {
@@ -831,6 +904,7 @@ pub(crate) fn side_calls_page(
             }
             family.push(row);
         }
+        drop(membership);
         let mut hashes = family
             .iter()
             .map(|row| super::super::claude_request_census::claude_request_hash(&row.request_id))
@@ -841,16 +915,17 @@ pub(crate) fn side_calls_page(
         wanted.insert(root.as_str(), hashes);
         candidates.insert(root.as_str(), family);
     }
-    let census = index
+    let mut census = index
         .claude_request_census
         .family_transcript_holders(&wanted, Instant::now() + SIDE_CALL_DEADLINE);
+    drop(wanted);
     for (root, members) in &families {
         let first = members
             .iter()
             .copied()
             .find(|index| items[*index].claude_money.is_some());
         let (Some(first), Some(rows), Some(census)) =
-            (first, candidates.get(root.as_str()), census.as_ref())
+            (first, candidates.remove(root.as_str()), census.as_mut())
         else {
             // Unhealthy pair or deadline: counted and disclosed, never dropped
             // silently; the family stays telemetry-incomplete.
@@ -861,24 +936,39 @@ pub(crate) fn side_calls_page(
             }
             continue;
         };
-        let empty = Default::default();
-        let family_census = census.get(root.as_str()).unwrap_or(&empty);
-        let owners = trace_owners(root, rows, trace.evidence.get(root.as_str()));
+        let mut family_census = census.remove(root.as_str()).unwrap_or_default();
+        let mut rows = rows;
+        rows.retain(|row| {
+            !family_census
+                .held
+                .contains(&claude_request_hash(&row.request_id))
+        });
+        // Held candidates never allocate a trace-owner slot. Release the census
+        // intersection before the borrowed owner vector is allocated.
+        family_census.held.clear();
+        let owners = trace_owners(root, &rows, trace.evidence.get(root.as_str()));
+        let targets = members
+            .iter()
+            .filter_map(|&index| {
+                items[index]
+                    .claude_money
+                    .as_ref()
+                    .map(|_| (items[index].source_session_id.clone(), index))
+            })
+            .fold(BTreeMap::new(), |mut targets, (id, index)| {
+                targets.entry(id).or_insert(index); // first path twin, as attach
+                targets
+            });
         let mut disclosed = invalid.get(root.as_str()).copied().unwrap_or(0);
         for (row, owner) in rows.iter().zip(owners) {
-            let hash = super::super::claude_request_census::claude_request_hash(&row.request_id);
-            if family_census.held.contains(&hash) {
-                continue; // an off-page transcript of the family counts it
-            }
             let fallback = owner.is_none();
-            let owner = owner.unwrap_or_else(|| root.clone());
-            let target = members.iter().copied().find(|index| {
-                items[*index].source_session_id == owner && items[*index].claude_money.is_some()
-            });
+            let owner = owner.map(|row| claude_trace_owner_session_id(root, &row.agent_id));
+            let owner = owner.as_deref().unwrap_or(root);
+            let target = targets.get(owner).copied();
             let Some(target) = target else {
                 // Its member counts it when read; a named member with no
                 // transcript anywhere cannot, so that is disclosed.
-                if !fallback && owner != *root && !family_census.members.contains(&owner) {
+                if !fallback && owner != root.as_str() && !family_census.members.contains(owner) {
                     disclosed += 1;
                 }
                 continue;
@@ -936,11 +1026,11 @@ pub(crate) fn side_calls_page(
 /// The trace-named owner of each sorted candidate row (None: no trace row,
 /// or an invalid one, names it). One pass over the trace rows, binary search
 /// into the candidates: no map sized by rows.
-fn trace_owners(
+fn trace_owners<'a>(
     root: &str,
     rows: &[&ClaudeLocalOtelEvidence],
-    trace: Option<&Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
-) -> Vec<Option<String>> {
+    trace: Option<&'a Vec<crate::claude_local_otel::ClaudeTraceOwnershipEvidence>>,
+) -> Vec<Option<&'a crate::claude_local_otel::ClaudeTraceOwnershipEvidence>> {
     let mut owners = vec![None; rows.len()];
     for row in trace.into_iter().flatten() {
         let Ok(at) = rows.binary_search_by(|candidate| {
@@ -952,7 +1042,7 @@ fn trace_owners(
             && row.session_id == root
             && claude_trace_evidence_fingerprint_is_valid(row)
         {
-            owners[at] = Some(claude_trace_owner_session_id(root, &row.agent_id));
+            owners[at] = Some(row);
         }
     }
     owners

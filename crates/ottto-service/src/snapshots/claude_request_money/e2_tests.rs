@@ -837,3 +837,271 @@ fn e2_diagnostic_fields_are_nonzero_only() {
         json!({"fold_us":1,"responses":2,"side_call_root_fallback":3,"dark_unexplained":1})
     );
 }
+
+#[test]
+fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
+    use super::super::body::reported_live_key;
+    use super::super::rows::ClaudeApiRow;
+    let p = root_file("selector-parity");
+    let index = ScanIndex::default();
+    for native_model in [true, false] {
+        for native_clock in [true, false] {
+            for native_effort in [None, Some("low")] {
+                for speed in ["", "fast"] {
+                    for effort in ["high", "unknown", ""] {
+                        let mut value = line("r", &at(1), 10);
+                        if !native_model {
+                            value["message"].as_object_mut().unwrap().remove("model");
+                        }
+                        if !native_clock {
+                            value.as_object_mut().unwrap().remove("timestamp");
+                        }
+                        let item = parse(&p, Some(t0()), &index, &[line("seed", &at(0), 1), value]);
+                        let mut occurrence = item.claude_usage_occurrences["r"].clone();
+                        occurrence.reasoning_effort = native_effort.map(str::to_owned);
+                        let mut api = row("r", 1, 10);
+                        api.speed = speed.to_owned();
+                        api.effort = effort.to_owned();
+                        api.observed_at = at(3601); // fallback clock is another hour
+                        let api_view = ClaudeApiRow {
+                            request_hash: claude_request_hash("r"),
+                            tokens: Default::default(),
+                            cost_micros: api.cost_usd_micros,
+                            clock: u64::try_from((t0() / 1_000_000_000) + 3601).unwrap(),
+                            model: &api.model,
+                            speed: &api.speed,
+                            effort: &api.effort,
+                        };
+                        for occurrence in [Some(&occurrence), None] {
+                            let legacy = reported_live_key(&api_view, occurrence).unwrap();
+                            let mut e2 =
+                                reported_key(&api, occurrence, &SelectorCapture::default())
+                                    .unwrap();
+                            let kept_effort = e2.2.remove("reasoning_effort");
+                            assert_eq!(e2, legacy, "same model, speed, selectors and hour");
+                            let expected_effort = occurrence
+                                .and_then(|o| o.reasoning_effort.as_deref())
+                                .or_else(|| {
+                                    crate::snapshots::CLAUDE_EFFORT_TIERS
+                                        .contains(&effort)
+                                        .then_some(effort)
+                                });
+                            assert_eq!(
+                                kept_effort.as_deref(),
+                                expected_effort,
+                                "E2 intentionally retains effort"
+                            );
+                            assert_eq!(
+                                legacy.0,
+                                if occurrence.is_some() && native_clock {
+                                    HOUR
+                                } else {
+                                    "2026-08-02T08:00:00Z"
+                                }
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_membership_hash_collision_never_substitutes_for_exact_request_identity() {
+    let p = root_file("membership-collision");
+    let index = ScanIndex::default();
+    let items = vec![parse(&p, Some(t0()), &index, &[line("native", &at(1), 10)])];
+    let mut view = family_membership(&items, &[0]);
+    // Force an accelerator collision. The request map/set, not the hash,
+    // decides ownership and side-call subtraction.
+    view.entries[0] = membership_hash("other") & !view.member_mask;
+    assert_eq!(holders(&items, &view, "other"), Holders::None);
+    assert!(!matching_members(&view, "other")
+        .any(|i| items[i].claude_usage_request_ids.contains("other")));
+    cleanup(&[&p]);
+}
+
+#[test]
+fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
+    use crate::snapshots::claude_request_census::{
+        record_claude_request_census, ClaudeRequestCensusParse,
+    };
+    const MEMBERS: usize = 736;
+    const ROWS: usize = 70_000;
+    const OFF_PAGE: usize = 2048;
+    let dir = scratch("large-family");
+    let root = dir.join(format!("{ROOT}.jsonl"));
+    let agents = dir.join(ROOT).join("subagents");
+    fs::create_dir_all(&agents).unwrap();
+    let mut index = ScanIndex::default();
+    let id = |i: usize| format!("req-{i:06}");
+    let mut items = Vec::with_capacity(MEMBERS);
+    for member in 0..MEMBERS {
+        let path = if member == 0 {
+            root.clone()
+        } else {
+            agents.join(format!("agent-{member}.jsonl"))
+        };
+        let lines = (member..ROWS)
+            .step_by(MEMBERS)
+            .map(|i| {
+                let request = if i < MEMBERS {
+                    id(i)
+                } else {
+                    format!("native-{i:06}")
+                };
+                line(&request, &at(1), 10)
+            })
+            .collect::<Vec<_>>();
+        items.push(parse(&path, Some(t0()), &index, &lines));
+    }
+    // An off-page member is parsed through the native resolver and recorded
+    // through the actual census writer, rather than hand-feeding holder sets.
+    let off_page_path = agents.join("agent-off-page.jsonl");
+    let off_page_lines = (MEMBERS..MEMBERS + OFF_PAGE)
+        .map(|i| line(&id(i), &at(1), 10))
+        .collect::<Vec<_>>();
+    let off_page = parse(&off_page_path, Some(t0()), &index, &off_page_lines);
+    record_claude_request_census(
+        &mut index,
+        ClaudeRequestCensusParse {
+            path: &off_page_path,
+            index_key: &local_index_key(&off_page_path),
+            source_file_fingerprint: &"a".repeat(64),
+            census_window_end: "2026-08-02T09:00:00Z",
+            complete: true,
+            lossy: false,
+            source_verified: true,
+            itemless_request_hashes: Vec::new(),
+            opened_birth: None,
+            modified_unix_seconds: 1,
+        },
+        &[off_page],
+    );
+    let rows = (0..ROWS)
+        .map(|i| {
+            let mut api = row(&id(i), i as u64 + 1, 10);
+            api.observed_at = at(1); // sequence is not a seconds field
+            refingerprint(api)
+        })
+        .collect::<Vec<_>>();
+    let read = sidecar(&rows); // canonical permissive reader, including health
+    let api = api_report(&read);
+    let trace = ClaudeTraceOwnershipLoadReport {
+        evidence: BTreeMap::from([(
+            ROOT.to_owned(),
+            (MEMBERS..ROWS)
+                .filter(|i| i % 2 == 0)
+                .map(|i| complete_trace_row(ROOT, &id(i), "735"))
+                .collect(),
+        )]),
+        ..Default::default()
+    };
+    let members = (0..MEMBERS).collect::<Vec<_>>();
+    let start = Instant::now();
+    let view = family_membership(&items, &members);
+    let counts = join(
+        read.session_report(ROOT).unwrap(),
+        |key| holders(&items, &view, key),
+        |_, _| true,
+        |_| {},
+    );
+    let join_time = start.elapsed();
+    assert_eq!(
+        (counts.matched, counts.unheld, counts.disclosed),
+        (MEMBERS, ROWS - MEMBERS, 0)
+    );
+    // The optimized target is 20 ms; portable debug CI gets scheduling and
+    // instrumentation margin. Fingerprints/row placement are timed below.
+    let join_budget = Duration::from_millis(if cfg!(debug_assertions) { 500 } else { 20 });
+    assert!(
+        join_time < join_budget,
+        "family membership/join took {join_time:?}"
+    );
+    assert_eq!(
+        view.entries.capacity() * std::mem::size_of::<u64>(),
+        ROWS * 8
+    );
+    drop(view);
+    let wire = |items: &[SnapshotItem]| {
+        items
+            .iter()
+            .map(|item| {
+                (
+                    crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap())
+                        .unwrap(),
+                    item.snapshot_fingerprint.clone(),
+                )
+            })
+            .collect::<Vec<_>>()
+    };
+    let before = wire(&items);
+    for enabled in [false, true] {
+        let mut page = items.clone();
+        let start = Instant::now();
+        let (_, allocation) = crate::retry_allocation_probe::measure_caller_thread(|| {
+            attach_page(&mut page, &read);
+            side_calls_page(&mut page, &api, &trace, &index);
+        });
+        let enrichment_time = start.elapsed();
+        assert!(page
+            .iter()
+            .all(|item| fold(item).telemetry.membership.entries.is_empty()));
+        assert_eq!(
+            page.iter().map(|item| requests(item, MATCHED)).sum::<u64>(),
+            MEMBERS as u64
+        );
+        assert_eq!(
+            page.iter()
+                .map(|item| requests(item, REPORTED))
+                .sum::<u64>(),
+            (ROWS - MEMBERS - OFF_PAGE) as u64
+        );
+        assert_eq!(
+            fold(&page[MEMBERS - 1]).side_requests,
+            ((ROWS - MEMBERS - OFF_PAGE) / 2) as u64
+        );
+        assert_eq!(
+            page.iter()
+                .map(|item| fold(item).root_fallbacks)
+                .sum::<u64>(),
+            ((ROWS - MEMBERS - OFF_PAGE) / 2) as u64
+        );
+        assert!(
+            allocation.requested_peak_with_overlap <= 2 * 1024 * 1024,
+            "attach+side-call born-in-scope allocation peak: {allocation:?}"
+        );
+        let withheld = if enabled {
+            with_enabled(|| finish_page(&mut page, &index, TelemetryRead::Loaded))
+        } else {
+            finish_page(&mut page, &index, TelemetryRead::Loaded)
+        };
+        assert!(withheld.is_empty());
+        let pipeline_time = start.elapsed();
+        assert!(
+            pipeline_time < Duration::from_secs(30),
+            "real pipeline took {pipeline_time:?}"
+        );
+        if enabled {
+            assert_eq!(page.len(), MEMBERS);
+            assert_eq!(
+                page.iter().map(|item| item.request_count).sum::<u64>(),
+                (2 * ROWS - MEMBERS - OFF_PAGE) as u64
+            );
+            assert!(page
+                .iter()
+                .all(|item| item.telemetry_owned_complete == Some(false)));
+        } else {
+            assert_eq!(
+                wire(&page),
+                before,
+                "dark mode preserves all bytes and fingerprints"
+            );
+        }
+        eprintln!("F3_PERF rows={ROWS} members={MEMBERS} off_page={OFF_PAGE} enabled={enabled} membership_join_us={} attach_side_us={} pipeline_us={} born_peak_bytes={} not_rss=true",
+            join_time.as_micros(), enrichment_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
+    }
+    fs::remove_dir_all(dir).unwrap();
+}
