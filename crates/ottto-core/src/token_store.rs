@@ -21,6 +21,9 @@ pub const OTTTO_PRIOR_RELAY_DEVICE_SECRET_ACCOUNT: &str = "prior-relay-device-se
 pub const OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT: &str = "pending-relay-device-secret";
 pub const OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT: &str = "pending-setup-run-token";
 pub const OTTTO_REVOCATION_RECEIPT_ACCOUNT: &str = "revocation-receipt";
+pub const OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT: &str = "local-release-marker";
+pub const OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT: &str = "local-release-device-proof";
+pub const OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT: &str = "history-browser-claim";
 pub const CONTROL_TOKEN_FILE_NAME: &str = "control-token";
 
 #[derive(Debug, Error)]

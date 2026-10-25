@@ -12,7 +12,11 @@ use crate::{
     SetupRunReadStart, StagedAccountSwitch,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use ottto_core::token_store::OTTTO_REVOCATION_RECEIPT_ACCOUNT;
+use ottto_core::token_store::{
+    OTTTO_HISTORY_BROWSER_CLAIM_ACCOUNT as HISTORY_BROWSER_ACCOUNT,
+    OTTTO_LOCAL_RELEASE_MARKER_ACCOUNT as HISTORY_MARKER_ACCOUNT,
+    OTTTO_LOCAL_RELEASE_PROOF_ACCOUNT as HISTORY_PROOF_ACCOUNT, OTTTO_REVOCATION_RECEIPT_ACCOUNT,
+};
 use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version,
     default_prior_device_path, default_support_dir, execute_local_uninstall,
@@ -5223,8 +5227,15 @@ fn auth_start(
     // through a fresh claim: Verify and `ottto doctor` tell the user to sign
     // in, so refusing here would dead-end them. The claim keeps the bound
     // user, and completing it for that user replaces the dead binding.
+    let history_pending = registration_history_choice_account(&status.account)
+        || history_load::<StoredHistoryBrowserClaim>(history_stores().browser.as_ref())
+            .is_ok_and(|claim| claim.is_some_and(|claim| claim.registration_pending))
+        || FileAccountStore::default()
+            .load()
+            .is_ok_and(|account| registration_history_choice_account(&account));
     if status.account.state == LocalAccountState::Connected
         && status.account.user.is_some()
+        && !history_pending
         && !daemon.connected_setup_run_needs_reconnect()?
     {
         return Err(LocalApiError::InvalidRequest(
@@ -5252,17 +5263,154 @@ fn auth_start(
             });
         }
     }
-    discard_abandoned_unconfirmed_claim_credential()?;
+    if let Some(pending) =
+        resume_history_browser_claim(&status.machine, &validated_api_base_url(None)?)?
+    {
+        return begin_durable_browser_claim(daemon, pending);
+    }
+    if !history_pending {
+        discard_abandoned_unconfirmed_claim_credential()?;
+    }
     let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
     let claim = create_setup_claim(&status.machine, &nonce)?;
+    let nonce = claim.client_nonce.unwrap_or(nonce);
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
-    daemon.begin_auth_with_claim(PendingAuthClaim {
+    begin_durable_browser_claim(
+        daemon,
+        PendingAuthClaim {
+            claim_code: claim.claim_code,
+            claim_token: claim.claim_token,
+            nonce,
+            claim_url,
+            expires_at: claim.expires_at,
+        },
+    )
+}
+
+fn begin_durable_browser_claim(
+    daemon: &LocalDaemon,
+    pending: PendingAuthClaim,
+) -> Result<AuthStartResponse, LocalApiError> {
+    let response = daemon.begin_auth_with_claim(pending)?;
+    FileAccountStore::default()
+        .save(&response.account)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    Ok(response)
+}
+
+fn retire_refused_registration_after_browser_answer(claim_code: &str) -> Result<(), LocalApiError> {
+    let browser: Option<StoredHistoryBrowserClaim> =
+        history_load(history_stores().browser.as_ref())?;
+    if !browser.is_some_and(|browser| {
+        browser.registration_pending && browser.claim.claim_code == claim_code
+    }) {
+        return Ok(());
+    }
+    let pending_store = FilePendingDeviceCredentialStore::default();
+    let Some(pending) = pending_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?
+    else {
+        return Ok(());
+    };
+    if pending.claim_commit.is_some() {
+        return Ok(());
+    }
+    if pending.confirmed_at.is_some() {
+        return Err(LocalApiError::IdentityMutationInProgress);
+    }
+    let secret_store = KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT);
+    let candidate = secret_store
+        .load()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    match inspect_device_credential_preparation(&pending, &candidate) {
+        Ok(status) if matches!(status.status.as_str(), "expired" | "superseded") => {
+            discard_server_inactive_pending_device_credential(&pending_store, &secret_store)
+        }
+        Err(error) if backend_error_has_status(&error, 410) => {
+            discard_server_inactive_pending_device_credential(&pending_store, &secret_store)
+        }
+        Err(error) => Err(error),
+        Ok(_) => Err(LocalApiError::IdentityMutationInProgress),
+    }
+}
+
+fn registration_history_choice_account(account: &LocalAccountBinding) -> bool {
+    account
+        .message
+        .as_ref()
+        .is_some_and(|m| m.code == "history_choice_required")
+}
+
+fn registration_history_choice_required(error: &LocalApiError) -> bool {
+    matches!(error, LocalApiError::Backend(details) if details.status == Some(400)
+        && (details.reason_code.as_deref() == Some("history_choice_required") || auth_complete_error_is_pending(error)))
+}
+
+fn registration_history_choice_message() -> StableMessage {
+    StableMessage {
+        code: "history_choice_required".to_string(),
+        text: "Waiting for browser sign-in to finish.".to_string(),
+    }
+}
+
+fn persist_registration_history_choice() -> Result<(), LocalApiError> {
+    let _lock = lock_setup_run_binding();
+    let store = FileAccountStore::default();
+    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
+    // Preserve the bound identity and all credential journals. This is a
+    // durable user action, not an authority transition or a failed install.
+    account.state = LocalAccountState::ReattachRequired;
+    account.message = Some(registration_history_choice_message());
+    account.can_reconnect = Some(true);
+    store
+        .save(&account)
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+fn registration_history_choice_error(error: LocalApiError) -> LocalApiError {
+    if registration_history_choice_required(&error) {
+        if let Err(error) = persist_registration_history_choice() {
+            return error;
+        }
+    }
+    error
+}
+
+fn reoffer_registration_browser_claim(
+    daemon: &LocalDaemon,
+    machine: &MachineIdentity,
+    base: &str,
+) -> Result<AuthStartResponse, LocalApiError> {
+    daemon.mark_history_choice_required()?;
+    if let Some((claim, _)) = daemon.pending_auth_claim_snapshot()? {
+        if !auth_claim_is_expired(&claim.expires_at) {
+            return begin_durable_browser_claim(daemon, claim);
+        }
+    }
+    if let Some(claim) = resume_history_browser_claim(machine, base)? {
+        return begin_durable_browser_claim(daemon, claim);
+    }
+    let nonce = generate_control_token().map_err(|_| LocalApiError::StatePoisoned)?;
+    let claim = {
+        let _lock = lock_history_recovery()?;
+        create_setup_claim_with_history(
+            &api_url_with_base(base, "/api/v1/setup-claims"),
+            machine,
+            &nonce,
+            &history_stores(),
+            history_now(),
+        )?
+    };
+    let nonce = claim.client_nonce.unwrap_or(nonce);
+    let pending = PendingAuthClaim {
         claim_code: claim.claim_code,
         claim_token: claim.claim_token,
+        claim_url: append_nonce_to_claim_url(&claim.claim_url, &nonce),
         nonce,
-        claim_url,
         expires_at: claim.expires_at,
-    })
+    };
+    begin_durable_browser_claim(daemon, pending)
 }
 
 /// A fresh claim is the explicit cancellation boundary for an older completed
@@ -5363,6 +5511,8 @@ fn complete_pending_auth_claim(
         &completed,
         completion.prior_device_credential.as_ref(),
     )?;
+    retire_refused_registration_after_browser_answer(&pending.claim_code)?;
+    let _ = finish_history_browser_claim(&pending.claim_code);
     let account = LocalAccountBinding {
         state: LocalAccountState::Connected,
         user: Some(LocalAccountUser {
@@ -6663,6 +6813,11 @@ pub fn recover_pending_device_credential_at_startup() -> Result<bool, LocalApiEr
                 &receipt.confirmed_at,
                 &pending_store,
             )?,
+            Err(error) if registration_history_choice_required(&error) => {
+                // The lower-level refusal persisted the browser re-offer. Leave
+                // the same pending candidate and old credential pair intact.
+                return Ok(false);
+            }
             Err(error) if backend_error_has_status(&error, 410) => {
                 discard_server_inactive_pending_device_credential(
                     &pending_store,
@@ -7080,12 +7235,20 @@ fn cloud_logout_requires_connection_error(forget_installation: bool) -> LocalApi
     })
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct SetupClaimCreateResponse {
+    #[serde(default)]
+    client_nonce: Option<String>,
     claim_code: String,
     claim_token: String,
     claim_url: String,
     expires_at: String,
+}
+
+impl std::fmt::Debug for SetupClaimCreateResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SetupClaimCreateResponse([redacted])")
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -7144,22 +7307,62 @@ fn create_setup_claim(
     nonce: &str,
 ) -> Result<SetupClaimCreateResponse, LocalApiError> {
     let url = api_url("/api/v1/setup-claims");
-    // Serialize receipt handoff with releases and other claim creates, without
-    // holding the identity lifecycle mutex over network I/O.
-    let _receipt_lock = REVOCATION_RECEIPT_LOCK
-        .lock()
-        .map_err(|_| LocalApiError::StatePoisoned)?;
-    create_setup_claim_with_receipt(
-        &url,
-        machine,
-        nonce,
-        &KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
-        time::OffsetDateTime::now_utc().unix_timestamp(),
-    )
+    let _receipt_lock = lock_history_recovery()?;
+    create_setup_claim_with_history(&url, machine, nonce, &history_stores(), history_now())
 }
 
 const REVOCATION_RECEIPT_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
 static REVOCATION_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
+
+fn history_now() -> i64 {
+    time::OffsetDateTime::now_utc().unix_timestamp()
+}
+fn lock_history_recovery() -> Result<MutexGuard<'static, ()>, LocalApiError> {
+    REVOCATION_RECEIPT_LOCK
+        .lock()
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+struct HistoryStores {
+    receipt: Box<dyn ControlTokenStore>,
+    marker: Box<dyn ControlTokenStore>,
+    proof: Box<dyn ControlTokenStore>,
+    browser: Box<dyn ControlTokenStore>,
+}
+
+fn history_stores() -> HistoryStores {
+    HistoryStores {
+        receipt: history_secret_store(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
+        marker: history_secret_store(HISTORY_MARKER_ACCOUNT),
+        proof: history_secret_store(HISTORY_PROOF_ACCOUNT),
+        browser: history_secret_store(HISTORY_BROWSER_ACCOUNT),
+    }
+}
+
+fn history_secret_store(account: &'static str) -> Box<dyn ControlTokenStore> {
+    #[cfg(not(test))]
+    {
+        Box::new(KeychainSecretStore::keychain_only(account))
+    }
+    #[cfg(test)]
+    {
+        // Synthetic stores survive a daemon reload, without ever touching the
+        // host Keychain or writing a receipt/device proof to a fixture file.
+        use ottto_core::token_store::MemoryTokenStore;
+        type TestHistoryStores = Mutex<BTreeMap<(PathBuf, &'static str), MemoryTokenStore>>;
+        static STORES: std::sync::OnceLock<TestHistoryStores> = std::sync::OnceLock::new();
+        let mut stores = STORES
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .unwrap();
+        Box::new(
+            stores
+                .entry((default_support_dir(), account))
+                .or_default()
+                .clone(),
+        )
+    }
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct StoredRevocationReceipt {
@@ -7167,85 +7370,436 @@ struct StoredRevocationReceipt {
     received_at: i64,
 }
 
-fn store_revocation_receipt(
-    store: &impl ControlTokenStore,
-    receipt: Option<SecretString>,
-    received_at: i64,
-) {
-    // A confirmed release supersedes any older receipt, even on a server
-    // which omits the additive field. Storage errors fail toward fresh setup;
-    // never fall back to a plain file or include the receipt in an error.
-    let _ = store.delete();
-    if let Some(receipt) = receipt.filter(|value| !value.expose_secret().trim().is_empty()) {
-        let stored = StoredRevocationReceipt {
-            revocation_receipt: receipt,
-            received_at,
-        };
-        if let Ok(encoded) = serde_json::to_string(&stored) {
-            let _ = store.save(&encoded);
-        }
-    }
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalReleaseMarker {
+    device_id: String,
+    api_base_url: String,
+    released_at: i64,
+    #[serde(default)]
+    cleanup_required: bool,
 }
 
-fn remember_revocation_receipt(device_released: bool, receipt: Option<SecretString>) {
+#[derive(Debug, Serialize, Deserialize)]
+struct LocalReleaseProof {
+    device_id: String,
+    device_secret: SecretString,
+}
+
+// This contains claim credentials and a nonce. Never derive Debug or put it in
+// account.json; only the non-secret re-offer message belongs in that file.
+#[derive(Serialize, Deserialize)]
+struct StoredHistoryBrowserClaim {
+    installation_id: String,
+    account_scope: Option<String>,
+    api_base_url: String,
+    setup_run_id: Option<String>,
+    #[serde(default)]
+    registration_pending: bool,
+    nonce: SecretString,
+    claim: SetupClaimCreateResponse,
+}
+
+fn history_load<T: DeserializeOwned>(
+    store: &dyn ControlTokenStore,
+) -> Result<Option<T>, LocalApiError> {
+    match store.load() {
+        Ok(encoded) => serde_json::from_str(&encoded)
+            .map(Some)
+            .map_err(|_| LocalApiError::StatePoisoned),
+        Err(TokenStoreError::Missing) => Ok(None),
+        Err(_) => Err(LocalApiError::StatePoisoned),
+    }
+}
+fn history_save<T: Serialize>(
+    store: &dyn ControlTokenStore,
+    value: &T,
+) -> Result<(), LocalApiError> {
+    let encoded = serde_json::to_string(value).map_err(|_| LocalApiError::StatePoisoned)?;
+    store
+        .save(&encoded)
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    if store.load().map_err(|_| LocalApiError::StatePoisoned)? != encoded {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    Ok(())
+}
+
+fn stage_local_release(
+    api_base_url: &str,
+    release: &DeviceReleaseProof,
+    stores: &HistoryStores,
+    now: i64,
+) -> Result<(), LocalApiError> {
+    let api_base_url = validated_api_base_url(Some(api_base_url))?;
+    let existing: Option<LocalReleaseMarker> = history_load(stores.marker.as_ref())?;
+    // Preserve the original boundary across a refresh/retry of the release.
+    let same_release = existing
+        .as_ref()
+        .is_some_and(|m| m.device_id == release.device_id && m.api_base_url == api_base_url);
+    if !same_release {
+        stores
+            .receipt
+            .delete()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+        stores
+            .browser
+            .delete()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
+    let released_at = existing
+        .filter(|_| same_release)
+        .map_or(now, |m| m.released_at);
+    history_save(
+        stores.proof.as_ref(),
+        &LocalReleaseProof {
+            device_id: release.device_id.clone(),
+            device_secret: SecretString::new(&release.device_secret),
+        },
+    )?;
+    history_save(
+        stores.marker.as_ref(),
+        &LocalReleaseMarker {
+            device_id: release.device_id.clone(),
+            api_base_url,
+            released_at,
+            cleanup_required: false,
+        },
+    )
+}
+
+fn remember_revocation_receipt(
+    device_released: bool,
+    receipt: Option<SecretString>,
+    stores: &HistoryStores,
+    now: i64,
+) {
     if device_released {
-        if let Ok(_receipt_lock) = REVOCATION_RECEIPT_LOCK.lock() {
-            store_revocation_receipt(
-                &KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
-                receipt,
-                time::OffsetDateTime::now_utc().unix_timestamp(),
+        // The marker and own-device proof were durably staged BEFORE release.
+        // A missing receipt or failed write is recovered by the re-issue API.
+        if let Some(receipt) = receipt.filter(|s| !s.expose_secret().trim().is_empty()) {
+            let _ = history_save(
+                stores.receipt.as_ref(),
+                &StoredRevocationReceipt {
+                    revocation_receipt: receipt,
+                    received_at: now,
+                },
             );
         }
     }
 }
 
-fn create_setup_claim_with_receipt(
+fn clear_local_release(stores: &HistoryStores) -> Result<(), LocalApiError> {
+    // Marker is last: any partial cleanup remains a recoverable pending action.
+    if let Some(mut marker) = history_load::<LocalReleaseMarker>(stores.marker.as_ref())? {
+        marker.cleanup_required = true;
+        history_save(stores.marker.as_ref(), &marker)?;
+    }
+    stores
+        .receipt
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    stores
+        .proof
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    stores
+        .marker
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)
+}
+
+#[derive(Debug, Deserialize)]
+struct RevocationReceiptRecoveryResponse {
+    outcome: String,
+    #[serde(default)]
+    revocation_receipt: Option<SecretString>,
+    #[serde(default)]
+    claim_code: Option<SecretString>,
+    #[serde(default)]
+    claim_token: Option<SecretString>,
+    #[serde(default)]
+    client_nonce: Option<SecretString>,
+}
+
+enum ReceiptRecovery {
+    Receipt(SecretString),
+    Claim(SetupClaimCreateResponse),
+    Refused,
+}
+
+fn reissue_revocation_receipt(
+    marker: &LocalReleaseMarker,
+    proof: &LocalReleaseProof,
+) -> Result<ReceiptRecovery, LocalApiError> {
+    let base = validated_api_base_url(Some(&marker.api_base_url))?;
+    if marker.device_id != proof.device_id
+        || marker.device_id.is_empty()
+        || !marker
+            .device_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    let url = api_url_with_base(
+        &base,
+        &format!(
+            "/api/v1/telemetry/devices/{}/revocation-receipt",
+            marker.device_id
+        ),
+    );
+    let response: RevocationReceiptRecoveryResponse = match backend_post_json(
+        &url,
+        &json!({}),
+        &[("X-Ottto-Device-Secret", proof.device_secret.expose_secret())],
+    ) {
+        Ok(response) => response,
+        Err(LocalApiError::Backend(ref details))
+            if matches!(details.status, Some(401 | 409))
+                && details.reason_code.as_deref().is_some_and(|code| {
+                    matches!(
+                        code,
+                        "device_secret_invalid"
+                            | "device_reactivated"
+                            | "origin_not_local_switch"
+                            | "release_window_expired"
+                            | "ceremony_closed"
+                    )
+                }) =>
+        {
+            eprintln!(
+                "ottto-service: local history recovery outcome={}",
+                details.reason_code.as_deref().unwrap()
+            );
+            return Ok(ReceiptRecovery::Refused);
+        }
+        // Daemon-first rollout: old servers do not expose this endpoint yet.
+        Err(LocalApiError::Backend(ref details)) if matches!(details.status, Some(404 | 405)) => {
+            eprintln!("ottto-service: local history recovery outcome=receipt_reissue_unavailable");
+            return Ok(ReceiptRecovery::Refused);
+        }
+        Err(error) => return Err(error),
+    };
+    match response.outcome.as_str() {
+        "receipt_issued" => {
+            let receipt = response
+                .revocation_receipt
+                .filter(|s| !s.expose_secret().trim().is_empty())
+                .ok_or(LocalApiError::StatePoisoned)?;
+            eprintln!("ottto-service: local history recovery outcome=receipt_issued");
+            Ok(ReceiptRecovery::Receipt(receipt))
+        }
+        "claim_recovered" => {
+            let code = response.claim_code.ok_or(LocalApiError::StatePoisoned)?;
+            let token = response.claim_token.ok_or(LocalApiError::StatePoisoned)?;
+            let nonce = response.client_nonce.ok_or(LocalApiError::StatePoisoned)?;
+            if !code
+                .expose_secret()
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                return Err(LocalApiError::StatePoisoned);
+            }
+            #[derive(Deserialize)]
+            struct ClaimStatus {
+                claim_url: String,
+                expires_at: String,
+            }
+            let status: ClaimStatus = backend_get_json(
+                &api_url_with_base(
+                    &base,
+                    &format!("/api/v1/setup-claims/{}", code.expose_secret()),
+                ),
+                &[],
+            )?;
+            eprintln!("ottto-service: local history recovery outcome=claim_recovered");
+            Ok(ReceiptRecovery::Claim(SetupClaimCreateResponse {
+                claim_code: code.expose_secret().to_string(),
+                claim_token: token.expose_secret().to_string(),
+                client_nonce: Some(nonce.expose_secret().to_string()),
+                claim_url: status.claim_url,
+                expires_at: status.expires_at,
+            }))
+        }
+        _ => Err(LocalApiError::StatePoisoned),
+    }
+}
+
+fn persist_history_browser_claim(
+    claim: &SetupClaimCreateResponse,
+    nonce: &str,
+    machine: &MachineIdentity,
+    base: &str,
+    stores: &HistoryStores,
+) -> Result<(), LocalApiError> {
+    history_save(
+        stores.browser.as_ref(),
+        &StoredHistoryBrowserClaim {
+            installation_id: machine.installation_id.clone(),
+            account_scope: machine.account_scope.clone(),
+            api_base_url: base.to_string(),
+            setup_run_id: FileConnectionStore::default()
+                .load()
+                .map_err(|_| LocalApiError::StatePoisoned)?
+                .filter(|c| c.api_base_url == base)
+                .map(|c| c.setup_run_id),
+            registration_pending: FileAccountStore::default()
+                .load()
+                .is_ok_and(|account| registration_history_choice_account(&account)),
+            nonce: SecretString::new(claim.client_nonce.as_deref().unwrap_or(nonce)),
+            claim: claim.clone(),
+        },
+    )
+}
+
+fn create_setup_claim_with_history(
     url: &str,
     machine: &MachineIdentity,
     nonce: &str,
-    store: &impl ControlTokenStore,
+    stores: &HistoryStores,
     now: i64,
 ) -> Result<SetupClaimCreateResponse, LocalApiError> {
-    let encoded = store.load().ok();
-    let stored = encoded
-        .as_deref()
-        .and_then(|encoded| serde_json::from_str::<StoredRevocationReceipt>(encoded).ok());
-    // Take before sending. If deletion fails, do not send the receipt. A crash
-    // or failed cleanup after a 2xx must never cause a second claim to reuse it.
-    let receipt = if encoded.is_some() && store.delete().is_ok() {
-        stored.filter(|value| {
-            now.checked_sub(value.received_at)
-                .is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age))
-        })
-    } else {
-        None
-    };
+    let base = validated_api_base_url(Some(
+        url.strip_suffix("/api/v1/setup-claims")
+            .ok_or(LocalApiError::StatePoisoned)?,
+    ))?;
+    let mut marker: Option<LocalReleaseMarker> = history_load(stores.marker.as_ref())?;
+    if marker.as_ref().is_some_and(|m| {
+        now.checked_sub(m.released_at)
+            .is_some_and(|age| age >= REVOCATION_RECEIPT_MAX_AGE_SECONDS)
+    }) {
+        clear_local_release(stores)?;
+        marker = None;
+    }
+    let stored = history_load::<StoredRevocationReceipt>(stores.receipt.as_ref());
+    let mut receipt = stored.ok().flatten().filter(|r| {
+        now.checked_sub(r.received_at)
+            .is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age))
+    });
+    if let Some(marker) = &marker {
+        if marker.api_base_url != base {
+            return Err(LocalApiError::StatePoisoned);
+        }
+        if receipt.is_none() || marker.cleanup_required {
+            let proof = history_load::<LocalReleaseProof>(stores.proof.as_ref())?
+                .ok_or(LocalApiError::StatePoisoned)?;
+            match reissue_revocation_receipt(marker, &proof)? {
+                ReceiptRecovery::Receipt(value) => {
+                    history_save(
+                        stores.receipt.as_ref(),
+                        &StoredRevocationReceipt {
+                            revocation_receipt: value.clone(),
+                            received_at: now,
+                        },
+                    )?;
+                    receipt = Some(StoredRevocationReceipt {
+                        revocation_receipt: value,
+                        received_at: now,
+                    });
+                }
+                ReceiptRecovery::Claim(claim) => {
+                    persist_history_browser_claim(&claim, nonce, machine, &base, stores)?;
+                    return Ok(claim);
+                }
+                ReceiptRecovery::Refused => {
+                    receipt = None;
+                }
+            }
+        }
+    } else if receipt.is_none() {
+        // No released-local marker means an ordinary first/same-device claim.
+        // A corrupt orphan receipt is purged, never logged or sent.
+        stores
+            .receipt
+            .delete()
+            .map_err(|_| LocalApiError::StatePoisoned)?;
+    }
     let mut body = setup_claim_create_body(machine, nonce);
     if let Some(receipt) = &receipt {
         body["revocation_receipt"] = json!(receipt.revocation_receipt.expose_secret());
     }
-    let result = crate::retry_tls::credential_agent()
+    let response = crate::retry_tls::credential_agent()
         .post(url)
         .set("Accept", "application/json")
         .timeout(BACKEND_REQUEST_TIMEOUT)
         .send_json(&body);
-    let status = match &result {
-        Ok(response) => Some(response.status()),
-        Err(ureq::Error::Status(status, _)) => Some(*status),
-        Err(ureq::Error::Transport(_)) => None,
-    };
-    // Decide from HTTP status BEFORE decoding: even a malformed 2xx spends it.
-    if !status.is_some_and(|status| (200..300).contains(&status) || (400..500).contains(&status)) {
-        if let Some(receipt) = receipt {
-            if let Ok(encoded) = serde_json::to_string(&receipt) {
-                let _ = store.save(&encoded);
+    match response {
+        Ok(response) => {
+            let response = backend_success(url, response)?;
+            let claim: SetupClaimCreateResponse = response
+                .into_json()
+                .map_err(|error| backend_response_unexpected(url, error.to_string()))?;
+            if claim.claim_code.trim().is_empty()
+                || claim.claim_token.trim().is_empty()
+                || claim.claim_url.trim().is_empty()
+            {
+                return Err(LocalApiError::StatePoisoned);
             }
+            // Durable browser handoff precedes secret cleanup. Even a lost local
+            // reply/restart returns this exact ceremony and its original nonce.
+            persist_history_browser_claim(&claim, nonce, machine, &base, stores)?;
+            if stores.receipt.delete().is_err() {
+                if let Some(mut marker) = marker {
+                    marker.cleanup_required = true;
+                    history_save(stores.marker.as_ref(), &marker)?;
+                }
+            }
+            Ok(claim)
+        }
+        Err(error) => {
+            if matches!(&error, ureq::Error::Status(status, _) if (400..500).contains(status)) {
+                clear_local_release(stores)?;
+            }
+            Err(backend_error_from_ureq(url, error))
         }
     }
-    let response = result.map_err(|error| backend_error_from_ureq(url, error))?;
-    backend_success(url, response)?
-        .into_json()
-        .map_err(|error| backend_response_unexpected(url, error.to_string()))
+}
+
+fn resume_history_browser_claim(
+    machine: &MachineIdentity,
+    base: &str,
+) -> Result<Option<PendingAuthClaim>, LocalApiError> {
+    let _lock = lock_history_recovery()?;
+    let stores = history_stores();
+    let Some(stored) = history_load::<StoredHistoryBrowserClaim>(stores.browser.as_ref())? else {
+        return Ok(None);
+    };
+    if stored.installation_id != machine.installation_id
+        || stored.account_scope != machine.account_scope
+        || stored.api_base_url != base
+    {
+        return Err(LocalApiError::StatePoisoned);
+    }
+    if auth_claim_is_expired(&stored.claim.expires_at) {
+        return Ok(None);
+    }
+    Ok(Some(PendingAuthClaim {
+        claim_code: stored.claim.claim_code,
+        claim_token: stored.claim.claim_token,
+        nonce: stored.nonce.expose_secret().to_string(),
+        claim_url: append_nonce_to_claim_url(&stored.claim.claim_url, stored.nonce.expose_secret()),
+        expires_at: stored.claim.expires_at,
+    }))
+}
+
+fn finish_history_browser_claim(claim_code: &str) -> Result<(), LocalApiError> {
+    let _lock = lock_history_recovery()?;
+    finish_history_browser_claim_with_stores(claim_code, &history_stores())
+}
+
+fn finish_history_browser_claim_with_stores(
+    claim_code: &str,
+    stores: &HistoryStores,
+) -> Result<(), LocalApiError> {
+    let stored: Option<StoredHistoryBrowserClaim> = history_load(stores.browser.as_ref())?;
+    if !stored.is_some_and(|stored| stored.claim.claim_code == claim_code) {
+        return Ok(());
+    }
+    clear_local_release(stores)?;
+    stores
+        .browser
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)
 }
 
 fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json::Value {
@@ -8821,6 +9375,17 @@ fn setup_result_from_detail(
         })
         .collect::<Vec<_>>();
 
+    let local_claim: Option<StoredHistoryBrowserClaim> =
+        history_load(history_stores().browser.as_ref())?;
+    let local_claim_url = local_claim
+        .filter(|claim| {
+            claim.setup_run_id.as_deref() == Some(connection.setup_run_id.as_str())
+                && claim.api_base_url == connection.api_base_url
+                && !auth_claim_is_expired(&claim.claim.expires_at)
+        })
+        .map(|claim| {
+            append_nonce_to_claim_url(&claim.claim.claim_url, claim.nonce.expose_secret())
+        });
     Ok(json!({
         "status": detail.run.status,
         "setup_run_id": connection.setup_run_id,
@@ -8829,7 +9394,7 @@ fn setup_result_from_detail(
         "detected_sources": detected_sources,
         "next_question": detail.next_question,
         "next_action": detail.next_action,
-        "setup_claim_url": detail.setup_claim_url,
+        "setup_claim_url": local_claim_url.or(detail.setup_claim_url),
         "actions": action_results,
     }))
 }
@@ -8972,6 +9537,13 @@ fn release_device_without_setup_run(api_base_url: &str, release: &DeviceReleaseP
         &api_base_url,
         &format!("/api/v1/telemetry/devices/{}/release", release.device_id),
     );
+    let Ok(_history_lock) = lock_history_recovery() else {
+        return false;
+    };
+    let stores = history_stores();
+    if stage_local_release(&api_base_url, release, &stores, history_now()).is_err() {
+        return false;
+    }
     crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
@@ -8982,7 +9554,12 @@ fn release_device_without_setup_run(api_base_url: &str, release: &DeviceReleaseP
         .filter(|response| response.status() == 200)
         .and_then(|response| response.into_json::<DeviceSelfReleaseResponse>().ok())
         .is_some_and(|response| {
-            remember_revocation_receipt(response.device_released, response.revocation_receipt);
+            remember_revocation_receipt(
+                response.device_released,
+                response.revocation_receipt,
+                &stores,
+                history_now(),
+            );
             response.device_released
         })
 }
@@ -9360,10 +9937,20 @@ fn disconnect_setup_run_local_client(
             connection.setup_run_id
         ),
     );
+    let _history_lock = lock_history_recovery()?;
+    let stores = history_stores();
+    if let Some(release) = release {
+        stage_local_release(&api_base_url, release, &stores, history_now())?;
+    }
     let body = setup_run_disconnect_body(release);
     let mut response: SetupRunDisconnectResponse =
         backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])?;
-    remember_revocation_receipt(response.device_released, response.revocation_receipt.take());
+    remember_revocation_receipt(
+        response.device_released,
+        response.revocation_receipt.take(),
+        &stores,
+        history_now(),
+    );
     Ok(response)
 }
 
@@ -9621,6 +10208,18 @@ fn process_setup_actions(
         };
         let (status, message, result, verification) = match action_outcome {
             Ok(outcome) => outcome,
+            Err(error) if registration_history_choice_required(&error) => {
+                reoffer_registration_browser_claim(daemon, machine, api_base_url)?;
+                results.push(SetupActionResult {
+                    action_id: action.id,
+                    action_type: action.action_type,
+                    source: source_slug,
+                    status: "running".to_string(),
+                    detail: None,
+                    verification: None,
+                });
+                break;
+            }
             Err(error) => {
                 let (status, message, result) =
                     setup_action_execution_error_result(&action, source.as_ref(), &error);
@@ -9948,6 +10547,19 @@ fn run_install_source_action(
     // beginning another identity mutation. Uncertain pending state fails
     // closed; it is never overwritten by a modern-to-legacy fallback.
     recover_pending_device_credential_at_startup()?;
+    if FileAccountStore::default()
+        .load()
+        .is_ok_and(|account| registration_history_choice_account(&account))
+    {
+        reoffer_registration_browser_claim(daemon, machine, api_base_url)?;
+        return Err(LocalApiError::Backend(BackendErrorDetails {
+            kind: BackendErrorKind::Rejected,
+            endpoint: "/api/v1/telemetry/devices/registration-preparations".to_string(),
+            status: Some(400),
+            body_excerpt: Some("Setup claim session is pending".to_string()),
+            reason_code: Some("history_choice_required".to_string()),
+        }));
+    }
     // Preparation is server-side non-authoritative. Hold a panic-safe local
     // reservation across prepare, local durable staging, confirm, and exact
     // promotion while leaving the lifecycle mutex free during network I/O.
@@ -10758,7 +11370,8 @@ fn prepare_telemetry_device_registration(
     body["credential_preparation_idempotency_key"] = json!(request_authority
         .credential_preparation_idempotency_key
         .clone());
-    let prepared = backend_post_json(&url, &body, &[])?;
+    let prepared =
+        backend_post_json(&url, &body, &[]).map_err(registration_history_choice_error)?;
     validate_device_credential_preparation(&url, &prepared, prior.as_ref())?;
     Ok((prepared, prior, request_authority))
 }
@@ -10795,7 +11408,8 @@ fn confirm_device_credential_preparation(
             DEVICE_CREDENTIAL_PREPARATION_SECRET_HEADER,
             candidate_secret,
         )],
-    )?;
+    )
+    .map_err(registration_history_choice_error)?;
     validate_device_credential_confirmation(&url, pending, &confirmed)?;
     Ok(confirmed)
 }
@@ -23951,188 +24565,581 @@ for line in sys.stdin:
         }
     }
 
-    fn revocation_receipt_claim_http(
-        store: &impl ControlTokenStore,
-        now: i64,
-        status: &str,
-        body: &str,
-    ) -> (
-        Result<SetupClaimCreateResponse, LocalApiError>,
-        serde_json::Value,
-    ) {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://{}/api/v1/setup-claims",
-            listener.local_addr().unwrap()
-        );
-        let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let request = read_complete_http_request(&mut stream);
-            stream.write_all(response.as_bytes()).unwrap();
-            request
-        });
-        let result =
-            create_setup_claim_with_receipt(&url, &test_machine(), "synthetic-nonce", store, now);
-        let request = server.join().unwrap();
-        assert!(request.starts_with("POST /api/v1/setup-claims "));
-        (
-            result,
-            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap(),
-        )
+    struct HistoryChoiceTestEnv {
+        root: PathBuf,
+        _support: EnvVarGuard,
     }
-
-    const RECEIPT_CLAIM_SUCCESS: &str = r#"{"claim_code":"claim","claim_token":"token","claim_url":"https://ottto.net/connect","expires_at":"2030-01-01T00:00:00Z"}"#;
-
-    #[test]
-    #[serial]
-    fn revocation_receipt_persists_then_is_sent_once_without_logging() {
-        use crate::retry_tls::credential_test_support::{assert_never_logged, install_host_logger};
-        use ottto_core::token_store::MemoryTokenStore;
-        let _lock = lock_backend_test_env();
-        install_host_logger();
-        let store = MemoryTokenStore::new();
-        let receipt = "otrr_synthetic_sent_once";
-        store_revocation_receipt(&store, Some(SecretString::new(receipt)), 100);
-        let persisted: StoredRevocationReceipt =
-            serde_json::from_str(&store.load().unwrap()).unwrap();
-        assert_eq!(persisted.received_at, 100);
-        assert!(!format!("{persisted:?}").contains(receipt));
-        let (result, body) =
-            revocation_receipt_claim_http(&store, 101, "201 Created", RECEIPT_CLAIM_SUCCESS);
-        assert!(result.is_ok());
-        assert_eq!(body["revocation_receipt"], receipt);
-        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
-        let (result, body) =
-            revocation_receipt_claim_http(&store, 102, "200 OK", RECEIPT_CLAIM_SUCCESS);
-        assert!(result.is_ok());
-        assert!(body.get("revocation_receipt").is_none());
-        assert_never_logged(receipt);
+    impl Drop for HistoryChoiceTestEnv {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
-
-    #[test]
-    #[serial]
-    fn revocation_receipt_is_dropped_on_any_definitive_answer_before_decode() {
-        use ottto_core::token_store::MemoryTokenStore;
-        let _lock = lock_backend_test_env();
-        for status in [
-            "200 OK",
-            "204 No Content",
-            "400 Bad Request",
-            "401 Unauthorized",
-            "404 Not Found",
-            "422 Unprocessable Entity",
-            "429 Too Many Requests",
-        ] {
-            let store = MemoryTokenStore::new();
-            let receipt = "otrr_synthetic_definitive";
-            store_revocation_receipt(&store, Some(SecretString::new(receipt)), 100);
-            let (result, body) = revocation_receipt_claim_http(&store, 101, status, "{}");
-            assert!(result.is_err());
-            assert_eq!(body["revocation_receipt"], receipt);
-            assert!(
-                matches!(store.load(), Err(TokenStoreError::Missing)),
-                "{status}"
-            );
+    fn history_choice_test_env() -> HistoryChoiceTestEnv {
+        let root = control_test_root("history-recovery");
+        let guard = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        HistoryChoiceTestEnv {
+            root,
+            _support: guard,
         }
     }
 
+    fn history_choice_test_stores() -> HistoryStores {
+        use ottto_core::token_store::MemoryTokenStore;
+        HistoryStores {
+            receipt: Box::new(MemoryTokenStore::new()),
+            marker: Box::new(MemoryTokenStore::new()),
+            proof: Box::new(MemoryTokenStore::new()),
+            browser: Box::new(MemoryTokenStore::new()),
+        }
+    }
+
+    fn history_choice_stage_test_release(stores: &HistoryStores, base: &str, now: i64) {
+        stage_local_release(
+            base,
+            &DeviceReleaseProof {
+                device_id: "released-device".into(),
+                device_secret: "synthetic-own-secret".into(),
+            },
+            stores,
+            now,
+        )
+        .unwrap();
+    }
+
+    fn history_choice_store_test_receipt(stores: &HistoryStores, now: i64) {
+        history_save(
+            stores.receipt.as_ref(),
+            &StoredRevocationReceipt {
+                revocation_receipt: SecretString::new("otrr_synthetic_history_receipt"),
+                received_at: now,
+            },
+        )
+        .unwrap();
+    }
+
+    fn history_choice_create(
+        base: &str,
+        stores: &HistoryStores,
+        now: i64,
+    ) -> Result<SetupClaimCreateResponse, LocalApiError> {
+        create_setup_claim_with_history(
+            &api_url_with_base(base, "/api/v1/setup-claims"),
+            &test_machine(),
+            "synthetic-original-nonce",
+            stores,
+            now,
+        )
+    }
+
+    fn history_choice_request_body(request: &str) -> serde_json::Value {
+        serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap()
+    }
+
+    const RECEIPT_CLAIM_SUCCESS: &str = r#"{"claim_code":"claim","claim_token":"token","client_nonce":"synthetic-original-nonce","claim_url":"https://ottto.net/setup/claim?code=claim","expires_at":"2030-01-01T00:00:00Z"}"#;
+
     #[test]
     #[serial]
-    fn revocation_receipt_expires_at_24_hours_and_rejects_clock_rollback() {
-        use ottto_core::token_store::MemoryTokenStore;
+    fn history_choice_receipt_malformed_2xx_and_5xx_retry_keep_one_ceremony() {
+        use crate::retry_tls::credential_test_support::{assert_never_logged, install_host_logger};
         let _lock = lock_backend_test_env();
-        for age in [
-            -1,
-            REVOCATION_RECEIPT_MAX_AGE_SECONDS - 1,
-            REVOCATION_RECEIPT_MAX_AGE_SECONDS,
-            REVOCATION_RECEIPT_MAX_AGE_SECONDS + 1,
-        ] {
-            let store = MemoryTokenStore::new();
-            store_revocation_receipt(
-                &store,
-                Some(SecretString::new("otrr_synthetic_expiry")),
-                100,
-            );
-            let (result, body) =
-                revocation_receipt_claim_http(&store, 100 + age, "200 OK", RECEIPT_CLAIM_SUCCESS);
-            assert!(result.is_ok());
+        let _env = history_choice_test_env();
+        install_host_logger();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let ceremonies = Arc::new(AtomicUsize::new(0));
+        let server_count = ceremonies.clone();
+        let server = thread::spawn(move || {
+            let mut seen = BTreeSet::new();
+            let mut requests = Vec::new();
+            for (status, body) in [(503, "{}"), (200, "{"), (200, RECEIPT_CLAIM_SUCCESS)] {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_complete_http_request(&mut stream);
+                let body_receipt = history_choice_request_body(&request)["revocation_receipt"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                if seen.insert(body_receipt) {
+                    server_count.fetch_add(1, Ordering::SeqCst);
+                }
+                requests.push(request);
+                write_json_response(&mut stream, status, "Fixture", body);
+            }
+            requests
+        });
+        let stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        history_choice_store_test_receipt(&stores, 100);
+        let encoded = stores.receipt.load().unwrap();
+        for now in [101, 102] {
+            assert!(history_choice_create(&base, &stores, now).is_err());
+            assert_eq!(stores.receipt.load().unwrap(), encoded);
+            assert!(stores.marker.load().is_ok());
+        }
+        let claim = history_choice_create(&base, &stores, 103).unwrap();
+        assert_eq!(claim.claim_code, "claim");
+        assert_eq!(
+            ceremonies.load(Ordering::SeqCst),
+            1,
+            "retries must not create a second ceremony"
+        );
+        assert!(matches!(
+            stores.receipt.load(),
+            Err(TokenStoreError::Missing)
+        ));
+        // The question is still unanswered; marker/proof survive until actual
+        // completion, so an expired or lost local claim can be recovered too.
+        assert!(stores.marker.load().is_ok());
+        assert!(stores.proof.load().is_ok());
+        assert!(!format!("{claim:?}").contains("token"));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
             assert_eq!(
-                body.get("revocation_receipt").is_some(),
-                age == REVOCATION_RECEIPT_MAX_AGE_SECONDS - 1
+                history_choice_request_body(&request)["revocation_receipt"],
+                "otrr_synthetic_history_receipt"
             );
+        }
+        finish_history_browser_claim_with_stores("claim", &stores).unwrap();
+        for store in [
+            &stores.receipt,
+            &stores.marker,
+            &stores.proof,
+            &stores.browser,
+        ] {
             assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         }
+        assert_never_logged("otrr_synthetic_history_receipt");
+        assert_never_logged("synthetic-own-secret");
     }
 
     #[test]
     #[serial]
-    fn revocation_receipt_survives_retryable_answers_and_transport_failure() {
-        use ottto_core::token_store::MemoryTokenStore;
+    fn history_choice_receipt_transport_failure_keeps_proof_and_marker() {
         let _lock = lock_backend_test_env();
-        let store = MemoryTokenStore::new();
-        store_revocation_receipt(&store, Some(SecretString::new("otrr_synthetic_retry")), 100);
-        let before = store.load().unwrap();
-        for status in ["503 Service Unavailable", "302 Found"] {
-            let (result, _) = revocation_receipt_claim_http(&store, 101, status, "{}");
-            assert!(result.is_err());
-            assert_eq!(store.load().unwrap(), before);
-        }
+        let _env = history_choice_test_env();
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let url = format!(
-            "http://{}/api/v1/setup-claims",
-            listener.local_addr().unwrap()
-        );
+        let base = format!("http://{}", listener.local_addr().unwrap());
         drop(listener);
-        assert!(create_setup_claim_with_receipt(
-            &url,
-            &test_machine(),
-            "synthetic-nonce",
-            &store,
-            102
-        )
-        .is_err());
-        assert_eq!(store.load().unwrap(), before);
+        let stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        history_choice_store_test_receipt(&stores, 100);
+        let before = stores.receipt.load().unwrap();
+        assert!(history_choice_create(&base, &stores, 101).is_err());
+        assert_eq!(stores.receipt.load().unwrap(), before);
+        assert!(stores.marker.load().is_ok());
+        assert!(stores.proof.load().is_ok());
     }
 
-    #[test]
-    fn revocation_receipt_absent_on_a_later_release_clears_old_receipt() {
-        use ottto_core::token_store::MemoryTokenStore;
-        let store = MemoryTokenStore::new();
-        store_revocation_receipt(&store, Some(SecretString::new("otrr_synthetic_old")), 100);
-        store_revocation_receipt(&store, None, 101);
-        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+    struct HistoryChoiceFaultStore {
+        inner: ottto_core::token_store::MemoryTokenStore,
+        fail_load: std::sync::atomic::AtomicBool,
+        fail_delete: std::sync::atomic::AtomicBool,
+    }
+    impl ControlTokenStore for HistoryChoiceFaultStore {
+        fn load(&self) -> Result<String, TokenStoreError> {
+            if self.fail_load.swap(false, Ordering::SeqCst) {
+                return Err(TokenStoreError::Store("synthetic read failure".into()));
+            }
+            self.inner.load()
+        }
+        fn save(&self, value: &str) -> Result<(), TokenStoreError> {
+            self.inner.save(value)
+        }
+        fn delete(&self) -> Result<(), TokenStoreError> {
+            if self.fail_delete.swap(false, Ordering::SeqCst) {
+                return Err(TokenStoreError::Store("synthetic delete failure".into()));
+            }
+            self.inner.delete()
+        }
     }
 
     #[test]
     #[serial]
-    fn revocation_receipt_delete_failure_never_sends_the_receipt() {
+    fn history_choice_receipt_missing_read_or_parse_failure_reissues_before_claim() {
         use ottto_core::token_store::MemoryTokenStore;
-        struct Undeletable(MemoryTokenStore);
-        impl ControlTokenStore for Undeletable {
-            fn load(&self) -> Result<String, TokenStoreError> {
-                self.0.load()
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for fault in ["missing", "read", "parse"] {
+            let (base, server) = scripted_json_backend(vec![
+                (
+                    200,
+                    r#"{"outcome":"receipt_issued","revocation_receipt":"otrr_reissued"}"#,
+                ),
+                (200, RECEIPT_CLAIM_SUCCESS),
+            ]);
+            let inner = MemoryTokenStore::new();
+            if fault == "parse" {
+                inner.save("{").unwrap();
             }
-            fn save(&self, value: &str) -> Result<(), TokenStoreError> {
-                self.0.save(value)
-            }
-            fn delete(&self) -> Result<(), TokenStoreError> {
-                Err(TokenStoreError::Store(
-                    "synthetic deletion failure".to_string(),
-                ))
+            let mut stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            stores.receipt = Box::new(HistoryChoiceFaultStore {
+                inner,
+                fail_load: (fault == "read").into(),
+                fail_delete: false.into(),
+            });
+            assert_eq!(
+                history_choice_create(&base, &stores, 101)
+                    .unwrap()
+                    .claim_code,
+                "claim"
+            );
+            let requests = server.join().unwrap();
+            assert!(requests[0]
+                .starts_with("POST /api/v1/telemetry/devices/released-device/revocation-receipt "));
+            assert!(requests[0].contains("X-Ottto-Device-Secret: synthetic-own-secret"));
+            assert!(requests[1].starts_with("POST /api/v1/setup-claims "));
+            assert_eq!(
+                history_choice_request_body(&requests[1])["revocation_receipt"],
+                "otrr_reissued"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_failed_delete_recovers_same_claim_and_original_nonce() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, RECEIPT_CLAIM_SUCCESS),
+            (
+                200,
+                r#"{"outcome":"claim_recovered","claim_code":"claim","claim_token":"token","client_nonce":"synthetic-original-nonce"}"#,
+            ),
+            (
+                200,
+                r#"{"claim_url":"https://ottto.net/setup/claim?code=claim","expires_at":"2030-01-01T00:00:00Z"}"#,
+            ),
+        ]);
+        let mut stores = history_choice_test_stores();
+        let inner = MemoryTokenStore::new();
+        inner
+            .save(
+                &serde_json::to_string(&StoredRevocationReceipt {
+                    revocation_receipt: SecretString::new("otrr_original"),
+                    received_at: 100,
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        history_choice_stage_test_release(&stores, &base, 100);
+        stores.receipt = Box::new(HistoryChoiceFaultStore {
+            inner,
+            fail_load: false.into(),
+            fail_delete: true.into(),
+        });
+        let first = history_choice_create(&base, &stores, 101).unwrap();
+        let marker: LocalReleaseMarker = history_load(stores.marker.as_ref()).unwrap().unwrap();
+        assert!(marker.cleanup_required);
+        let second = create_setup_claim_with_history(
+            &api_url_with_base(&base, "/api/v1/setup-claims"),
+            &test_machine(),
+            "a-new-nonce-must-not-rebind",
+            &stores,
+            102,
+        )
+        .unwrap();
+        assert_eq!(first.claim_code, second.claim_code);
+        assert_eq!(
+            second.client_nonce.as_deref(),
+            Some("synthetic-original-nonce")
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|r| r.starts_with("POST /api/v1/setup-claims "))
+                .count(),
+            1
+        );
+        assert!(requests[1].contains("/revocation-receipt "));
+        assert!(requests[2].starts_with("GET /api/v1/setup-claims/claim "));
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_reissue_unavailable_or_rate_limited_never_silently_creates() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for (status, body) in [
+            (503, "{}"),
+            (429, r#"{"detail":"rate limited"}"#),
+            (200, "{"),
+        ] {
+            let (base, server) = scripted_json_backend(vec![(status, body)]);
+            let stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            assert!(history_choice_create(&base, &stores, 101).is_err());
+            let requests = server.join().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert!(requests[0].contains("/revocation-receipt "));
+            assert!(stores.marker.load().is_ok());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_definitive_reissue_refusal_allows_unconfirmed_claim() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for (status, body) in [
+            (401, r#"{"detail":{"code":"device_secret_invalid"}}"#),
+            (409, r#"{"detail":{"code":"ceremony_closed"}}"#),
+            (404, r#"{"detail":"Not Found"}"#),
+        ] {
+            let (base, server) =
+                scripted_json_backend(vec![(status, body), (200, RECEIPT_CLAIM_SUCCESS)]);
+            let stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            assert!(history_choice_create(&base, &stores, 101).is_ok());
+            let requests = server.join().unwrap();
+            assert!(requests[0].contains("/revocation-receipt "));
+            assert!(history_choice_request_body(&requests[1])
+                .get("revocation_receipt")
+                .is_none());
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_marker_survives_reload_and_expires_at_24h() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let root = control_test_root("history-marker-reload");
+        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root);
+        let (base, server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
+        {
+            let stores = history_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            history_choice_store_test_receipt(&stores, 100);
+        }
+        let reloaded = history_stores();
+        let marker: LocalReleaseMarker = history_load(reloaded.marker.as_ref()).unwrap().unwrap();
+        assert_eq!(marker.device_id, "released-device");
+        assert_eq!(marker.released_at, 100);
+        assert!(
+            history_choice_create(&base, &reloaded, 100 + REVOCATION_RECEIPT_MAX_AGE_SECONDS)
+                .is_ok()
+        );
+        assert!(history_choice_request_body(&server.join().unwrap()[0])
+            .get("revocation_receipt")
+            .is_none());
+        for store in [&reloaded.receipt, &reloaded.marker, &reloaded.proof] {
+            assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_definitive_4xx_closes_local_marker() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        for status in [400, 401, 404, 422, 429] {
+            let (base, server) = scripted_json_backend(vec![(status, "{}")]);
+            let stores = history_choice_test_stores();
+            history_choice_stage_test_release(&stores, &base, 100);
+            history_choice_store_test_receipt(&stores, 100);
+            assert!(history_choice_create(&base, &stores, 101).is_err());
+            assert_eq!(server.join().unwrap().len(), 1);
+            for store in [&stores.receipt, &stores.marker, &stores.proof] {
+                assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
             }
         }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_registration_prepare_400_preserves_old_binding() {
         let _lock = lock_backend_test_env();
-        let store = Undeletable(MemoryTokenStore::new());
-        store_revocation_receipt(
-            &store,
-            Some(SecretString::new("otrr_synthetic_undeletable")),
-            100,
+        let (base, server) = scripted_json_backend(vec![(
+            400,
+            r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
+        )]);
+        let (root, _guards, _, old_device) =
+            connected_binding_fixture("history-prepare-refusal", base.clone());
+        let session = InstallSessionApiResponse {
+            install_session_id: "install-existing".into(),
+            install_session_token: "synthetic-install-token".into(),
+        };
+        let error = prepare_telemetry_device_registration(&base, &session, &test_machine())
+            .err()
+            .expect("history refusal");
+        assert!(registration_history_choice_required(&error));
+        assert!(registration_history_choice_account(
+            &FileAccountStore::default().load().unwrap()
+        ));
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
+        assert!(FilePendingDeviceCredentialStore::default()
+            .load()
+            .unwrap()
+            .is_none());
+        assert_eq!(server.join().unwrap().len(), 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_registration_action_reoffers_browser_without_failed_completion() {
+        let _lock = lock_backend_test_env();
+        let (base, server) = scripted_json_backend(vec![
+            (200, "{}"), // heartbeat before polling the next setup action
+            (
+                200,
+                r#"{"action":{"id":"action-history","action_type":"install_source","source":"codex"}}"#,
+            ),
+            (200, "{}"),
+            (
+                200,
+                r#"{"install_session_id":"install-history","install_session_token":"synthetic-install"}"#,
+            ),
+            (200, "{}"),
+            (
+                400,
+                r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
+            ),
+            (200, RECEIPT_CLAIM_SUCCESS),
+        ]);
+        let (root, _guards, daemon, old_device) =
+            connected_binding_fixture("history-action", base.clone());
+        let connection = FileConnectionStore::default().load().unwrap().unwrap();
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let mut pending = test_pending_device_credential("old-running-candidate", true);
+        pending.api_base_url = base.clone();
+        pending.expires_at = "2099-01-01T00:00:00Z".into();
+        stage_pending_device_credential(&pending, &candidate).unwrap();
+        let mut credentials = SetupRunCredentials {
+            setup_run_token: "synthetic-setup-token".into(),
+            connection: connection.clone(),
+        };
+        let results =
+            process_setup_actions(&daemon, &base, &mut credentials, &test_machine()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].status, "running");
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 7);
+        assert!(requests.iter().all(|r| !r.contains("/complete ")));
+        assert_eq!(
+            daemon
+                .pending_auth_claim_snapshot()
+                .unwrap()
+                .unwrap()
+                .0
+                .claim_code,
+            "claim"
         );
-        let (result, body) =
-            revocation_receipt_claim_http(&store, 101, "200 OK", RECEIPT_CLAIM_SUCCESS);
-        assert!(result.is_ok());
-        assert!(body.get("revocation_receipt").is_none());
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default().load().unwrap(),
+            Some(pending)
+        );
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
+        assert_eq!(
+            FileConnectionStore::default().load().unwrap(),
+            Some(connection)
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_receipt_lost_own_proof_blocks_ordinary_claim() {
+        let _lock = lock_backend_test_env();
+        let _env = history_choice_test_env();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let stores = history_choice_test_stores();
+        history_choice_stage_test_release(&stores, &base, 100);
+        stores.proof.delete().unwrap();
+        assert!(history_choice_create(&base, &stores, 101).is_err());
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert!(stores.marker.load().is_ok());
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_registration_old_candidate_reoffers_browser_after_reload() {
+        let _lock = lock_backend_test_env();
+        let (api, server) = scripted_json_backend(vec![(
+            400,
+            r#"{"code":"history_choice_required","detail":"Setup claim session is pending: answer in the browser"}"#,
+        )]);
+        let (root, _guards, _, old_device) =
+            connected_binding_fixture("history-choice-old-candidate", api.clone());
+        let candidate = format!("candidate-{}", "value".repeat(4));
+        let mut pending = test_pending_device_credential("prepared-by-shipped-daemon", true);
+        pending.api_base_url = api;
+        pending.expires_at = "2099-01-01T00:00:00Z".to_string();
+        stage_pending_device_credential(&pending, &candidate).unwrap();
+        let before = FilePendingDeviceCredentialStore::default().load().unwrap();
+        let old_secret = KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+            .load()
+            .unwrap();
+        let old_connection = FileConnectionStore::default().load().unwrap();
+        let recovered = recover_pending_device_credential_at_startup();
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            recovered,
+            Ok(false),
+            "history refusal must become a durable browser re-offer"
+        );
+        let saved = FileAccountStore::default().load().unwrap();
+        assert_eq!(
+            saved.message.as_ref().unwrap().code,
+            "history_choice_required"
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default().load().unwrap(),
+            before
+        );
+        assert_eq!(FileDeviceStore::default().load().unwrap(), Some(old_device));
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap(),
+            old_secret
+        );
+        assert_eq!(
+            KeychainSecretStore::new(OTTTO_PENDING_RELAY_DEVICE_SECRET_ACCOUNT)
+                .load()
+                .unwrap(),
+            candidate
+        );
+
+        let (claim_api, claim_server) = scripted_json_backend(vec![(200, RECEIPT_CLAIM_SUCCESS)]);
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &claim_api);
+        let daemon = daemon()
+            .with_account(saved)
+            .with_connection(old_connection.clone());
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let first = auth_start(&daemon, &authorization).expect("browser claim offered");
+        assert_eq!(first.claim_code, "claim");
+        assert_eq!(claim_server.join().unwrap().len(), 1);
+        assert_eq!(
+            auth_start(&daemon, &authorization).unwrap().claim_code,
+            first.claim_code
+        );
+        let restarted = self::daemon()
+            .with_account(FileAccountStore::default().load().unwrap())
+            .with_connection(old_connection.clone());
+        assert_eq!(
+            auth_start(&restarted, &authorization).unwrap().claim_code,
+            first.claim_code
+        );
+        assert_eq!(
+            FileConnectionStore::default().load().unwrap(),
+            old_connection
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default().load().unwrap(),
+            before
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
