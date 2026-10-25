@@ -58,7 +58,9 @@ use super::{
     PARSER_VERSION, REPAIR_BYTES_PER_DAY, RUN_WALL_CAP, STATE_DIR, STATE_SCHEMA, WAKE_INTERVAL,
 };
 use crate::composition_kinds::{GitRootCache, KindsVersion};
-use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
+use crate::snapshot_client::{
+    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
+};
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -559,7 +561,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
             .issue_relay_token(&device, &device_secret, snapshot_source)
             .ok();
         let marker = org_disabled_marker_path(support_dir, snapshot_source);
-        let mut labels_enabled = true;
+        let mut labels_enabled = workspace_labels_allowed(None);
         if let Some(token) = relay_token.as_deref() {
             match client.get_activity_hint(token) {
                 Ok(hint) if !hint.context_footprint_harvest_enabled => {
@@ -569,7 +571,7 @@ fn run_if_due(home: &Path, support_dir: &Path, worktrees: &mut WorktreeCache) ->
                 }
                 Ok(hint) => {
                     let _ = fs::remove_file(&marker);
-                    labels_enabled = hint.workspace_labels_enabled;
+                    labels_enabled = workspace_labels_allowed(Some(&hint));
                 }
                 Err(_) if read_marker(&marker).as_deref() == Some(destination.as_str()) => {
                     health.remove(agent_source_label(snapshot_source));

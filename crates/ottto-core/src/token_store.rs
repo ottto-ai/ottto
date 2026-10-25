@@ -788,8 +788,20 @@ fn secret_file_name(account: &str) -> String {
 mod tests {
     use super::*;
 
+    /// Serializes the tests that resolve the env-driven secret fallback dir:
+    /// one of them points `OTTTO_SECRET_FALLBACK_DIR_ENV` at its own directory
+    /// and removes it, which would pull files from under the other.
+    static SECRET_FALLBACK_DIR_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_secret_fallback_dir_env() -> std::sync::MutexGuard<'static, ()> {
+        SECRET_FALLBACK_DIR_ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn revocation_receipt_keychain_only_never_uses_file_store() {
+        let _env = lock_secret_fallback_dir_env();
         // cfg(test) isolates all Keychain access. Even an existing fallback
         // must not be read, replaced, or removed by the Keychain-only store.
         let mirrored = KeychainSecretStore::new(OTTTO_REVOCATION_RECEIPT_ACCOUNT);
@@ -880,6 +892,7 @@ mod tests {
 
     #[test]
     fn file_secret_store_round_trips_with_sanitized_names_and_user_only_permissions() {
+        let _env = lock_secret_fallback_dir_env();
         let dir =
             std::env::temp_dir().join(format!("ottto-secret-fallback-test-{}", std::process::id()));
         let previous = std::env::var_os(OTTTO_SECRET_FALLBACK_DIR_ENV);

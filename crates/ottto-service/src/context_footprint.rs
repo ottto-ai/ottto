@@ -12,7 +12,8 @@ use crate::instruction_inventory::{
     build_instruction_inventory, default_login_claude_mode, InstructionInventory, InventoryPaths,
 };
 use crate::snapshot_client::{
-    load_snapshot_device_credentials, ActivityHintResponse, SnapshotApiClient,
+    load_snapshot_device_credentials, workspace_labels_allowed, ActivityHintResponse,
+    SnapshotApiClient,
 };
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
@@ -301,7 +302,7 @@ fn harvest_source(
     let marker = org_disabled_marker_path(support_dir);
     match client.get_activity_hint(&relay_token) {
         Ok(hint) => {
-            let workspace_labels_enabled = hint.workspace_labels_enabled;
+            let workspace_labels_enabled = workspace_labels_allowed(Some(&hint));
             if !hint.context_footprint_harvest_enabled {
                 write_marker(&marker, &identity);
                 return Ok(ContextHarvestOutcome::default());
@@ -331,7 +332,7 @@ fn harvest_source(
         &identity,
         home,
         machine_id,
-        true,
+        workspace_labels_allowed(None),
         inventory_paths(None),
     )
 }
@@ -2427,6 +2428,37 @@ mod tests {
         assert!(identity.repository_label.is_none());
         assert!(identity.repository_label_source.is_none());
         assert_eq!(identity.workspace_kind.as_deref(), Some("repository_root"));
+        let _ = fs::remove_dir_all(&repo);
+    }
+
+    #[test]
+    fn repository_identity_withholds_labels_unless_a_hint_allows_them() {
+        let repo = init_git_repo("repo-identity-hint-policy");
+        let hint = |labels: bool| {
+            crate::snapshot_client::decode_activity_hint(serde_json::json!({
+                "source": "claude_code", "server_time": "2026-10-25T10:00:00Z",
+                "record_count_15m": 0, "record_count_24h": 0,
+                "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
+                "workspace_labels_enabled": labels,
+                "recommended_scan_after": "2026-10-25T10:05:00Z",
+            }))
+            .unwrap()
+        };
+        let identity = |hint: Option<&ActivityHintResponse>| {
+            resolve_repository_identity(&repo, workspace_labels_allowed(hint))
+        };
+
+        // Policy ON keeps today's labelled identity.
+        let on = identity(Some(&hint(true)));
+        assert_eq!(on, resolve_repository_identity(&repo, true));
+        assert!(on.repository_label.is_some());
+        // Policy OFF and a failed hint fetch both withhold the labels.
+        let withheld = resolve_repository_identity(&repo, false);
+        assert_eq!(identity(Some(&hint(false))), withheld);
+        assert_eq!(identity(None), withheld);
+        assert!(withheld.repository_label.is_none());
+        assert!(withheld.repository_label_source.is_none());
+        assert_eq!(withheld.repository_hash, on.repository_hash);
         let _ = fs::remove_dir_all(&repo);
     }
 

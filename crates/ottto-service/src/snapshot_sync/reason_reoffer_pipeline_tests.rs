@@ -545,7 +545,7 @@ fn strip_reoffer_extension(path: &Path, fingerprint: &str) {
 /// stays red, and the clock restarts on each refusal.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
     if !supported("original_pair_refusal_is_reoffered_once_a_day_until_accepted") {
@@ -670,7 +670,7 @@ fn original_pair_refusal_is_reoffered_once_a_day_until_accepted() {
 /// `other` again is final; the exact reason joins the daily cycle.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn legacy_other_refusal_is_reclassified_by_one_offer() {
     if !supported("legacy_other_refusal_is_reclassified_by_one_offer") {
@@ -742,7 +742,7 @@ fn legacy_other_refusal_is_reclassified_by_one_offer() {
 /// and records no stored body.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold() {
     if !supported("unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold") {
@@ -798,7 +798,7 @@ fn unstored_unchanged_reoffer_retires_the_refusal_and_keeps_the_hold() {
 /// RetryPending state cannot let the refused body escape the 24 h gate.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
     if !supported("conflicting_reoffer_keeps_refusal_cooldown_and_follow_up") {
@@ -884,7 +884,7 @@ fn conflicting_reoffer_keeps_refusal_cooldown_and_follow_up() {
 /// body is never re-offered and no re-admission raises the session's usage.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn superseded_refused_body_is_never_reoffered_after_the_head_moved() {
     if !supported("superseded_refused_body_is_never_reoffered_after_the_head_moved") {
@@ -1024,7 +1024,7 @@ fn capture_late_identity_rows(pipeline: &ReofferPipeline, login: &str, org: &str
 /// is never sent again.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
     if !supported("late_api_row_tags_the_reoffered_body_once_the_pair_is_proven") {
@@ -1136,7 +1136,7 @@ fn late_api_row_tags_the_reoffered_body_once_the_pair_is_proven() {
 /// refusal belongs to the stripped probe, not the cache-enriched scan item.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cache_head_probe_refusal_reoffers_its_own_exact_body() {
     if !supported("cache_head_probe_refusal_reoffers_its_own_exact_body") {
@@ -1296,7 +1296,7 @@ fn reoffer_fast_503_resend_keeps_one_claim_until_validated_final_answer() {
 /// (tombstone cleared, no record) or stays held with nothing offered.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn protected_returning_root_emits_no_literal_v1_or_revision_3() {
     if !supported("protected_returning_root_emits_no_literal_v1_or_revision_3") {
@@ -1405,7 +1405,7 @@ fn refused_then_conflicted(name: &str) -> (ReofferPipeline, String, u64, serde_j
 /// settles. At the due time: one re-read and one offer.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
     if !supported("cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer") {
@@ -1491,7 +1491,7 @@ fn cooldown_conflict_quiet_cycles_skip_the_reparse_until_the_daily_offer() {
 /// reservation and still re-reads nothing for the unchanged file.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
     if !supported("cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback") {
@@ -1548,7 +1548,7 @@ fn cooldown_conflict_still_rereads_a_changed_file_and_survives_rollback() {
 /// durable reservation is lost. The retained conflict blocks immediately.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_conflict_broken_bound_blocks_again() {
     if !supported("cooldown_conflict_broken_bound_blocks_again") {
@@ -1637,7 +1637,7 @@ fn cooldown_conflict_broken_bound_blocks_again() {
 /// only after the ordinary conflict timer would have selected the file.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn cooldown_conflict_before_ordinary_retry_is_counted_and_settles() {
     if !supported("cooldown_conflict_before_ordinary_retry_is_counted_and_settles") {
@@ -1732,7 +1732,7 @@ fn reemission_list_path(support: &Path) -> PathBuf {
 /// delivers the exact refused body, so the hold is what blocked it.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
     if !supported("history_held_file_is_not_reoffered_and_its_lease_is_not_delivered") {
@@ -1817,7 +1817,7 @@ fn history_held_file_is_not_reoffered_and_its_lease_is_not_delivered() {
 /// the history gate clears the marker.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
     if !supported("unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census") {
@@ -1874,7 +1874,7 @@ fn unreadable_backfill_state_arms_no_replay_and_clears_after_a_gated_census() {
 /// is not held, and no history cutoff is recorded.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
     if !supported("ledger_claim_alone_after_a_killed_first_cycle_uploads_history") {
@@ -1935,7 +1935,7 @@ fn ledger_claim_alone_after_a_killed_first_cycle_uploads_history() {
 /// bootstrap completion and N2 clearing), after BOTH list and .seen are lost.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn durable_list_intent_holds_quarantined_history_without_list_or_seen() {
     if !supported("durable_list_intent_holds_quarantined_history_without_list_or_seen") {
@@ -1946,7 +1946,7 @@ fn durable_list_intent_holds_quarantined_history_without_list_or_seen() {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn absent_list_intent_paces_quarantined_history() {
     if !supported("absent_list_intent_paces_quarantined_history") {
@@ -1957,7 +1957,7 @@ fn absent_list_intent_paces_quarantined_history() {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn malformed_list_intent_holds_quarantined_history_without_list_or_seen() {
     if !supported("malformed_list_intent_holds_quarantined_history_without_list_or_seen") {
@@ -2060,7 +2060,7 @@ fn lost_list_intent_pipeline(name: &str, set: bool, malformed: bool) {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
     if !supported("first_nonempty_list_read_records_durable_intent_through_prepare_finish") {
@@ -2092,7 +2092,7 @@ fn first_nonempty_list_read_records_durable_intent_through_prepare_finish() {
 /// pre-cutoff history belongs to a move without an explicit full claim.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn tombstoned_returning_history_obeys_the_move_hold() {
     if !supported("tombstoned_returning_history_obeys_the_move_hold") {
@@ -2198,7 +2198,7 @@ fn tombstoned_returning_history_obeys_the_move_hold() {
 /// `tombstoned_returning_history_obeys_the_move_hold` above.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
     if !supported("returning_tombstoned_family_is_held_until_proof_then_reoffered_once") {
@@ -2318,7 +2318,7 @@ fn returning_tombstoned_family_is_held_until_proof_then_reoffered_once() {
 /// A returning family that grew needs one cumulative replacement body.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn returning_tombstoned_family_that_grew_reproves_in_a_fresh_window() {
     if !supported("returning_tombstoned_family_that_grew_reproves_in_a_fresh_window") {

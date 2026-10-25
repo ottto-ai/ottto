@@ -33,10 +33,10 @@ fn cutover_unix_ms() -> Option<i64> {
 
 /// Activates a cutover for scan-level tests on this thread until dropped.
 #[cfg(test)]
-pub(super) struct TestCutover;
+pub(crate) struct TestCutover;
 #[cfg(test)]
 impl TestCutover {
-    pub(super) fn set(cutover_unix_ms: i64) -> Self {
+    pub(crate) fn set(cutover_unix_ms: i64) -> Self {
         TEST_CUTOVER_UNIX_MS.with(|cell| cell.set(Some(cutover_unix_ms)));
         Self
     }
@@ -66,6 +66,13 @@ pub(super) enum AckEvidence {
 }
 
 impl AckEvidence {
+    fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::LegacyAcked, _) | (_, Self::LegacyAcked) => Self::LegacyAcked,
+            (Self::V2Marked, _) | (_, Self::V2Marked) => Self::V2Marked,
+            _ => Self::None,
+        }
+    }
     fn view_name(self) -> &'static str {
         match self {
             Self::None => "none",
@@ -99,6 +106,76 @@ impl AckEvidence {
             Self::None
         }
     }
+}
+
+/// Reuse the inventory's decoded header owners, without another file read.
+/// Index traversal happens once per inventory, with temporary state bounded by
+/// that inventory's existing population cap. An old unbound filename is only a
+/// conservative Legacy hint, never proof that a V2 mark belongs to this owner.
+pub(super) fn prepare_moved_evidence(index: &mut ScanIndex, owners: &BTreeMap<String, String>) {
+    index.codex_counting_moved_evidence.clear();
+    if cutover_unix_ms().is_none() {
+        return;
+    }
+    let mut by_owner = owners
+        .values()
+        .map(|owner| (owner.clone(), AckEvidence::None))
+        .collect::<BTreeMap<_, _>>();
+    for (path, entry) in &index.files {
+        let evidence = group_evidence(Some(entry));
+        if evidence == AckEvidence::None {
+            continue;
+        }
+        let binding = entry
+            .codex_counting_owner
+            .as_ref()
+            .or(entry.codex_protected_owner.as_ref())
+            .or_else(|| owners.get(path))
+            .filter(|owner| valid_codex_protected_owner(owner));
+        if let Some(owner) = binding {
+            if let Some(previous) = by_owner.get_mut(owner) {
+                *previous = previous.combine(evidence);
+            }
+        } else {
+            for id in codex_session_id_candidates_from_path(Path::new(path)) {
+                if let Some(previous) = by_owner.get_mut(&codex_protected_owner(&id)) {
+                    *previous = AckEvidence::LegacyAcked;
+                }
+            }
+        }
+    }
+    index.codex_counting_moved_evidence = owners
+        .iter()
+        .filter_map(|(path, owner)| {
+            let evidence = by_owner[owner];
+            (evidence != AckEvidence::None).then(|| (path.clone(), evidence))
+        })
+        .collect();
+}
+
+fn candidate_evidence(candidate: &CandidateFile, index: &ScanIndex) -> AckEvidence {
+    let key = local_index_key(&candidate.path);
+    AckEvidence::of_view(index.files.get(&key)).combine(
+        index
+            .codex_counting_moved_evidence
+            .get(&key)
+            .copied()
+            .unwrap_or(AckEvidence::None),
+    )
+}
+
+pub(super) fn members_evidence<'a>(
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+    index: &ScanIndex,
+) -> AckEvidence {
+    if cutover_unix_ms().is_none() {
+        return AckEvidence::None;
+    }
+    members
+        .into_iter()
+        .fold(AckEvidence::None, |evidence, member| {
+            evidence.combine(candidate_evidence(member, index))
+        })
 }
 
 fn entry_has_ack_evidence(entry: &ScanIndexEntry) -> bool {
@@ -165,7 +242,7 @@ pub(super) fn configure_singleton(
     let Some(cutover) = cutover_unix_ms() else {
         return;
     };
-    let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
+    let evidence = candidate_evidence(candidate, index);
     configure(&mut parser.accumulator, evidence, Some(cutover));
 }
 
@@ -178,17 +255,20 @@ pub(super) fn singleton_view(candidate: &CandidateFile, index: &ScanIndex) -> St
     let Some(cutover) = cutover_unix_ms() else {
         return INACTIVE_VIEW.to_owned();
     };
-    let evidence = AckEvidence::of_view(index.files.get(&local_index_key(&candidate.path)));
+    let evidence = candidate_evidence(candidate, index);
     view(evidence, cutover)
 }
 
 /// The counting view of a joined group (cursor K8): what
 /// `configure_group_once` would configure now from every member entry.
-pub(super) fn group_view<'a>(entries: impl IntoIterator<Item = &'a ScanIndexEntry>) -> String {
+pub(super) fn group_view<'a>(
+    members: impl IntoIterator<Item = &'a CandidateFile>,
+    index: &ScanIndex,
+) -> String {
     let Some(cutover) = cutover_unix_ms() else {
         return INACTIVE_VIEW.to_owned();
     };
-    view(AckEvidence::of_view(entries), cutover)
+    view(members_evidence(members, index), cutover)
 }
 
 /// The recorded form of an active configuration.

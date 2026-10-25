@@ -211,6 +211,19 @@ fn sampled_in(
     collected_at: &str,
     scope: &str,
 ) -> (ScanIndex, SourceScanResult) {
+    sampled_hinted(root, index, limit, cache, collected_at, scope, &[])
+}
+
+/// `sampled_in` with watcher `hints`.
+fn sampled_hinted(
+    root: &Path,
+    index: ScanIndex,
+    limit: usize,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    scope: &str,
+    hints: &[PathBuf],
+) -> (ScanIndex, SourceScanResult) {
     let mut owned = OwnedSourceScan::new(
         SnapshotSource::Codex,
         &[root.join("sessions")],
@@ -220,7 +233,7 @@ fn sampled_in(
         limit,
         false,
         None,
-        &[],
+        hints,
         false,
         false,
     )
@@ -315,6 +328,102 @@ fn fence_filters_watcher_hint_after_attempt() {
         .iter()
         .all(|snapshot| snapshot.source_session_id == OTHER));
     fs::remove_dir_all(root).unwrap();
+}
+
+/// G1 (review of #751, P1): a processed group re-hinted through one member
+/// is a re-read group. On every page it would take the whole file allowance
+/// (two files) and evict the waiting census-member singleton `c`, so the
+/// census never closed. It now waits for a page without a waiting member,
+/// and a group fenced by its attempt this generation is decided at admission
+/// without taking allowance: `c` is read on the first hinted page and the
+/// census closes. Covered for an ordinary group, a fenced group and an
+/// own-page group (more members than the page's file limit).
+#[test]
+fn reread_group_never_starves_a_waiting_census_singleton() {
+    let ordinary = || fixture().0;
+    let own_page = || {
+        let (root, _) = fixture();
+        write_rows(
+            &root.join("sessions/d.jsonl"),
+            &member(OWNER, "r-d", 300, 600),
+        );
+        root
+    };
+    let cases: [(&str, &dyn Fn() -> PathBuf); 3] = [
+        ("ordinary", &ordinary),
+        ("fenced", &refused_fixture),
+        ("own-page", &own_page),
+    ];
+    for (case, make) in cases {
+        let root = make();
+        write_rows(
+            &root.join("sessions/c.jsonl"),
+            &member(OTHER, "healthy", 100, 100),
+        );
+        let cache = Arc::new(SharedCache::default());
+        let at = |page: u64| format!("2026-10-06T23:{page:02}:00Z");
+        // Page 0, two files: the group (a, b) is attempted; `c` waits.
+        let (mut index, first) = sampled_hinted(
+            &root,
+            ScanIndex::default(),
+            2,
+            &cache,
+            &at(0),
+            "group-fixture",
+            &[],
+        );
+        assert!(
+            first
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.source_session_id != OTHER),
+            "{case}"
+        );
+        let traversal = index.traversal.as_ref().expect("the generation continues");
+        assert!(
+            traversal
+                .pending_candidates
+                .iter()
+                .any(|pending| pending.path.ends_with("c.jsonl") && pending.census_member),
+            "{case}: c waits as a census member"
+        );
+        let hinted = traversal.scan_roots[0].join("b.jsonl");
+        let mut published = 0;
+        let mut closed = None;
+        for page in 1..=3_u64 {
+            let (next, scan) = sampled_hinted(
+                &root,
+                index,
+                2,
+                &cache,
+                &at(page),
+                "group-fixture",
+                std::slice::from_ref(&hinted),
+            );
+            index = next;
+            published += scan
+                .snapshots
+                .iter()
+                .filter(|snapshot| snapshot.source_session_id == OTHER)
+                .count();
+            if scan.census_complete {
+                closed = Some(page);
+                break;
+            }
+        }
+        assert_eq!(
+            published,
+            1,
+            "{case}: c is read once: {:?}",
+            counters(&cache)
+        );
+        assert_eq!(closed, Some(1), "{case}: {:?}", counters(&cache));
+        if case == "fenced" {
+            // Decided at admission: fenced, and no allowance taken from `c`.
+            assert_eq!(counters(&cache).groups_fenced, 1, "{:?}", counters(&cache));
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 }
 
 /// `count` native/UI pairs continuing the counter from `start`.

@@ -245,12 +245,7 @@ impl GroupBoot {
                 previous_receipts.insert(key, receipt_state(Some(entry)));
             }
         }
-        let evidence = codex_counting_version::group_evidence(
-            group
-                .members
-                .iter()
-                .filter_map(|member| index.files.get(&local_index_key(&member.path))),
-        );
+        let evidence = codex_counting_version::members_evidence(&group.members, index);
         Self {
             key: job_key(&group),
             group,

@@ -203,7 +203,7 @@ fn identity_pipeline_cycle(
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 fn native_comparison_real_source_preparation_stays_base_without_paired_evidence() {
     let fixture = IdentityPipelineHome::new();
     let _scope = crate::snapshots::claude_native_comparison::enable_for_test();
@@ -233,7 +233,7 @@ fn native_comparison_real_source_preparation_stays_base_without_paired_evidence(
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 fn master_on_emits_contract5_only_under_the_cycles_exact_hint_token() {
     use crate::snapshots::claude_request_identity as identity;
     let fixture = IdentityPipelineHome::new();
@@ -495,7 +495,7 @@ fn write_native_bootstrap_sidecars(fixture: &IdentityPipelineHome, support: &Pat
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 // finish_sync_source leases and commits the shared client_report counters.
 #[serial(client_report)]
 fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save() {
