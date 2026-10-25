@@ -51,6 +51,12 @@ evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
 manually started (`workflow_dispatch`) run tests the branch head, not the merge
 with `main`.
 
+Authors with write access merge their own pull request once its review is
+complete, the four checks passed on the final head and it is mergeable. No
+separate merge window, merge slot or extra approval is required. Wait only for a
+real dependency or conflict with other open work, an explicit dated hold, or an
+announced release freeze.
+
 ## Credential Store Tests
 
 Service and CLI dev-dependencies enable core's `test-secret-store` feature.
