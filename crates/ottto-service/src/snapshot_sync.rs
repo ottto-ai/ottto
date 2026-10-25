@@ -19735,6 +19735,12 @@ mod tests {
         // Only the first scan executed configured counting.
         let receipts = codex_scan_diagnostics::CountingV2Receipts {
             v2_sessions: 1,
+            tombstone_evictions_v2_only: 2,
+            tombstone_evictions_pre_cutover_legacy: 3,
+            tombstone_evictions_not_provably_pre_cutover_legacy: 4,
+            legacy_to_v2_after_tombstone_eviction: 5,
+            tombstone_count: 1024,
+            tombstone_cap: 1024,
             ..Default::default()
         };
         for generation in [1, 2] {
@@ -19767,7 +19773,10 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
             assert_eq!(journal["local_codex_diagnostics"]["generation"], generation);
             if generation == 1 {
-                assert_eq!(journal["local_codex_counting_v2"]["v2_sessions"], 1);
+                assert_eq!(
+                    journal["local_codex_counting_v2"],
+                    serde_json::to_value(receipts).unwrap()
+                );
             } else {
                 assert!(
                     journal.get("local_codex_counting_v2").is_none(),
