@@ -21012,6 +21012,7 @@ for line in sys.stdin:
         for command in [
             LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
             LocalControlCommand::AuthStatus,
         ] {
