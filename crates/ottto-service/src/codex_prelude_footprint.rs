@@ -39,7 +39,9 @@ use crate::context_footprint::{
     safe_text, sha256_hex, workspace_label, ContextFootprintCategoryInput,
     ContextFootprintIngestRequest, ContextFootprintItemInput, RepositoryIdentity,
 };
-use crate::snapshot_client::{load_snapshot_device_credentials, SnapshotApiClient};
+use crate::snapshot_client::{
+    load_snapshot_device_credentials, workspace_labels_allowed, SnapshotApiClient,
+};
 use crate::snapshot_roots::registered_scan_roots;
 use crate::snapshots::SnapshotSource;
 use anyhow::{anyhow, Result};
@@ -1120,10 +1122,10 @@ pub(crate) fn harvest_once(home: &Path, support_dir: &Path) -> Result<()> {
                 return Ok(());
             }
             let _ = fs::remove_file(&marker);
-            hint.workspace_labels_enabled
+            workspace_labels_allowed(Some(&hint))
         }
         Err(_) if marker_matches(&marker, &identity) => return Ok(()),
-        Err(_) => true,
+        Err(_) => workspace_labels_allowed(None),
     };
 
     let roots = registered_scan_roots(SnapshotSource::Codex, home)?;

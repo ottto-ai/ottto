@@ -718,6 +718,13 @@ pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse>
     Ok(hint)
 }
 
+/// Whether the context harvesters may upload workspace and repository labels.
+/// `None` is a failed hint fetch: the policy is unknown, so labels are
+/// withheld. A fetched hint keeps its `workspace_labels_enabled` as sent.
+pub(crate) fn workspace_labels_allowed(hint: Option<&ActivityHintResponse>) -> bool {
+    hint.is_some_and(|hint| hint.workspace_labels_enabled)
+}
+
 fn default_true() -> bool {
     true
 }
@@ -3492,6 +3499,25 @@ mod tests {
             "\"backfill_window_days\":-1",
         );
         assert!(serde_json::from_str::<ActivityHintResponse>(&negative).is_err());
+    }
+
+    #[test]
+    fn harvester_labels_need_a_fetched_hint_that_allows_them() {
+        let hint =
+            |json: String| decode_activity_hint(serde_json::from_str(&json).unwrap()).unwrap();
+        let on = hint(activity_hint_json(""));
+        let off = hint(activity_hint_json("").replace(
+            "\"workspace_labels_enabled\":true",
+            "\"workspace_labels_enabled\":false",
+        ));
+        let omitted =
+            hint(activity_hint_json("").replace("\"workspace_labels_enabled\":true,", ""));
+        assert!(workspace_labels_allowed(Some(&on)));
+        assert!(!workspace_labels_allowed(Some(&off)));
+        // A fetched hint from an older backend keeps the legacy default.
+        assert!(workspace_labels_allowed(Some(&omitted)));
+        // A failed fetch leaves the policy unknown: labels stay on the machine.
+        assert!(!workspace_labels_allowed(None));
     }
 
     #[test]

@@ -520,6 +520,76 @@ fn request_carries_sizes_and_no_text() {
 }
 
 #[test]
+fn request_labels_need_a_fetched_hint_that_allows_them() {
+    let workspace = ScratchDir::new("codex-session-start-label-policy");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&*workspace)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    let codex_home = ScratchDir::new("codex-session-start-label-policy-home");
+    let prelude = CodexPrelude {
+        cwd: Some(workspace.to_string_lossy().into_owned()),
+        complete: true,
+        model: Some("gpt-6.1-sol".to_string()),
+        context_window: Some(200_000),
+        first_input_tokens: Some(25_000),
+        started_at: Some(1_792_310_400),
+        ..CodexPrelude::default()
+    };
+    let request = |labels_enabled: bool| {
+        serde_json::to_value(
+            build_request(RequestInputs {
+                prelude: &prelude,
+                workspace: &workspace,
+                identity: resolve_repository_identity(&workspace, labels_enabled),
+                machine_id: "otm_test",
+                labels_enabled,
+                codex_home: &codex_home,
+                home: Path::new("/home/u"),
+                salt: None,
+            })
+            .unwrap(),
+        )
+        .unwrap()
+    };
+    let hint = |labels: bool| {
+        crate::snapshot_client::decode_activity_hint(json!({
+            "source": "codex", "server_time": "2026-10-25T10:00:00Z",
+            "record_count_15m": 0, "record_count_24h": 0,
+            "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
+            "workspace_labels_enabled": labels,
+            "recommended_scan_after": "2026-10-25T10:05:00Z",
+        }))
+        .unwrap()
+    };
+
+    // Policy ON keeps today's labelled request.
+    let on = request(workspace_labels_allowed(Some(&hint(true))));
+    assert_eq!(on, request(true));
+    assert!(on["workspace_label"].is_string());
+    assert!(on["repository_label"].is_string());
+    // Policy OFF and a failed hint fetch both withhold every label.
+    let withheld = request(false);
+    assert_eq!(
+        request(workspace_labels_allowed(Some(&hint(false)))),
+        withheld
+    );
+    assert_eq!(request(workspace_labels_allowed(None)), withheld);
+    for field in [
+        "workspace_label",
+        "workspace_label_source",
+        "repository_label",
+        "repository_label_source",
+    ] {
+        assert!(withheld[field].is_null(), "{field} must be withheld");
+    }
+    assert_eq!(withheld["repository_hash"], on["repository_hash"]);
+}
+
+#[test]
 fn request_needs_a_context_window() {
     let prelude = CodexPrelude {
         complete: true,
