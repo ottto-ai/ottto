@@ -32890,31 +32890,29 @@ fn claude_native_delay_for_test(path: &Path) {
 /// Prepare synthetic native input before a timing/fairness probe. The
 /// returned closure runs the real finalizers/capture hooks, with no fixture
 /// file I/O between them. Production scanning is unchanged.
+///
+/// It prepares exactly the files the product's own capture eligibility
+/// admits now: every file before the scope's first page, then only what the
+/// plan the last page installed allows (complete or fallback). A scope paged
+/// without a plan (a page refused before planning, or a closed plan) fails
+/// the probe instead of being modelled.
 #[cfg(test)]
 pub(crate) fn prepare_money_finalizers_for_test(
     support: &Path,
     index: &ScanIndex,
 ) -> impl FnOnce() {
-    let selected = claude_request_money::capture::planned_families_for_test(support)
-        .unwrap_or_else(|| {
-            index
-                .files
-                .keys()
-                .filter_map(|key| claude_index_path_member_ref(Path::new(key)))
-                .map(|member| claude_request_census::family_key(member.root))
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .take(claude_request_money::capture::NEXT_PAGE_FAMILIES)
-                .collect()
-        });
+    match claude_request_money::capture::plan_allows_capture_for_test(support) {
+        // Never paged: every file is eligible.
+        None => {}
+        Some(true) => {}
+        Some(false) => panic!(
+            "the scope has paged without a capture plan (complete or fallback): the next parse captures nothing optional"
+        ),
+    }
     let prepared = index
         .files
         .iter()
-        .filter(|(key, _)| {
-            claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
-                selected.contains(&claude_request_census::family_key(member.root))
-            })
-        })
+        .filter(|(key, _)| claude_request_money::capture::capture_eligible_for_test(Path::new(key)))
         .map(|(key, entry)| {
             let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
             let input = BufReader::new(std::fs::File::open(key).expect("synthetic transcript"));

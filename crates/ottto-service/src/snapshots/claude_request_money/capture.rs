@@ -20,7 +20,7 @@
 
 use super::super::{rfc3339_unix_seconds, ClaudeTranscriptUsageOccurrence, UsageTotals};
 use super::ClaudeMoneyTokens;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
@@ -69,80 +69,370 @@ static WORK: Mutex<BTreeMap<PathBuf, Work>> = Mutex::new(BTreeMap::new());
 /// turns. Gating optional capture leaves native file/finalizer order alone.
 /// All members of a chosen family remain eligible, within the original caps.
 pub(crate) const NEXT_PAGE_FAMILIES: usize = 64;
+/// One plan entry's admission: its key bytes, a map entry, the `String`
+/// and the entry. A fallback-set entry is charged the same.
+fn plan_key_bytes(key: &str) -> usize {
+    key.len() + MAP_ENTRY_BYTES + std::mem::size_of::<String>() + std::mem::size_of::<PlanEntry>()
+}
+
+/// A family some page of the scope listed.
+struct PlanEntry {
+    /// Its scheduling turn, possibly a consumed turn not yet acknowledged.
+    turn: u64,
+    /// The plan build that last listed it.
+    build: u64,
+    /// When a page last listed it; once `CAPTURE_TTL` old the entry has
+    /// expired, as if no page had listed it.
+    listed: Instant,
+    /// Among the oldest 64 of the page that last listed it, as of that
+    /// page's complete plan, and not consumed since.
+    eligible: bool,
+}
+
+/// What the scope's pages decided for the next parse's optional captures.
+/// It is scope-wide: each page updates the entries of the families it
+/// lists in place, and other pages' entries (their turns and exclusions)
+/// stay until they expire, so a family built on any page is not eligible
+/// again before its turn comes. Once a scope has had a page it always has
+/// a plan (MONEY decision: fail closed, never stale).
 struct Plan {
-    keys: BTreeMap<String, (u64, bool)>,
-    _funds: Funds,
+    entries: BTreeMap<String, PlanEntry>,
+    entry_funds: Funds,
+    /// After a page's complete plan failed: only these families (at most
+    /// 64) are eligible. Empty: nothing optional is captured.
+    fallback: Option<BTreeSet<String>>,
+    fallback_funds: Funds,
+    /// When entries that had not expired were dropped (ceiling pressure, or
+    /// a consumed turn the plan could not fund). Until that is
+    /// `CAPTURE_TTL` old, a family without an entry may be one of them and
+    /// is not eligible.
+    lost: Option<Instant>,
+    build: u64,
     created: Instant,
 }
+
+impl Plan {
+    /// Nothing optional is captured.
+    fn closed() -> Self {
+        Self {
+            entries: BTreeMap::new(),
+            entry_funds: Funds::default(),
+            fallback: Some(BTreeSet::new()),
+            fallback_funds: Funds::default(),
+            lost: None,
+            build: 0,
+            created: Instant::now(),
+        }
+    }
+
+    fn live(&self, key: &str) -> Option<&PlanEntry> {
+        self.entries
+            .get(key)
+            .filter(|entry| entry.listed.elapsed() < CAPTURE_TTL)
+    }
+
+    /// Whether the next parse may capture the family `key` optionally. A
+    /// family no live entry lists (another native page's, never planned)
+    /// is, unless entries were lost recently.
+    fn allows(&self, key: &str) -> bool {
+        if self.created.elapsed() >= CAPTURE_TTL {
+            return false;
+        }
+        if let Some(fallback) = &self.fallback {
+            return fallback.contains(key);
+        }
+        match self.live(key) {
+            Some(entry) => entry.eligible,
+            None => !matches!(self.lost, Some(lost) if lost.elapsed() < CAPTURE_TTL),
+        }
+    }
+}
+
+/// Every holder keeps this lock for one map operation (microseconds:
+/// `begin` and `scheduling_turn` do one lookup; installing or forgetting a
+/// plan swaps it and drops the replaced one after unlocking), so planning
+/// takes it blocking rather than failing on contention.
 static PLANS: Mutex<BTreeMap<PathBuf, Plan>> = Mutex::new(BTreeMap::new());
 
+/// Why a page's complete plan was not installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanFailure {
+    /// The close budget ran out during the walk.
+    Deadline,
+    /// The capture ceiling refused the plan's keys.
+    Funds,
+    /// The plan lock was poisoned.
+    Lock,
+}
+
+/// What a page installed for the next parse's optional captures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PlanInstall {
+    Complete,
+    /// Only the oldest 64 not consumed this page are eligible; nothing
+    /// else is captured.
+    Fallback(PlanFailure),
+    /// Not even the fallback could be funded or installed: nothing optional
+    /// is captured.
+    Closed(PlanFailure),
+}
+
+impl PlanInstall {
+    pub(super) fn failure(self) -> Option<PlanFailure> {
+        match self {
+            Self::Complete => None,
+            Self::Fallback(failure) | Self::Closed(failure) => Some(failure),
+        }
+    }
+}
+
+/// Update the scope's plan for the next parse. `keys` is every page family
+/// with its turn after this page's updates; `fallback` lists the oldest 64
+/// not consumed this page (eligible) and this page's consumed families
+/// (with their new turns, not eligible). The walk over `keys` is bounded
+/// by its funds (the capture ceiling) and stops at `deadline`; then only
+/// the fallback becomes eligible, which is O(64) work, never the old plan's
+/// eligible families.
 pub(super) fn plan_next_page<'a>(
     scope: &Path,
     keys: impl Iterator<Item = (&'a str, u64)>,
+    fallback: impl Iterator<Item = (&'a str, u64, bool)>,
     deadline: Instant,
-) -> bool {
-    plan_next_page_while(scope, keys, || Instant::now() < deadline)
+) -> PlanInstall {
+    plan_next_page_while(scope, keys, fallback, || {
+        #[cfg(test)]
+        if PLAN_DEADLINE_FOR_TEST.with(std::cell::Cell::get) {
+            return false;
+        }
+        Instant::now() < deadline
+    })
 }
 
 fn plan_next_page_while<'a>(
     scope: &Path,
     keys: impl Iterator<Item = (&'a str, u64)>,
+    fallback: impl Iterator<Item = (&'a str, u64, bool)>,
+    within_deadline: impl FnMut() -> bool,
+) -> PlanInstall {
+    // Take the scope's plan out, leaving it closed: until the update is
+    // installed, the next parse captures nothing optional. The update
+    // reuses the plan's funds and live entries.
+    let Some(taken) = swap_plan(scope, Plan::closed()) else {
+        return PlanInstall::Closed(PlanFailure::Lock);
+    };
+    let mut plan = taken.unwrap_or_else(Plan::closed);
+    drop_expired(&mut plan);
+    let installed = match complete_plan(&mut plan, keys, within_deadline) {
+        Ok(()) => PlanInstall::Complete,
+        Err(failure) => {
+            if fallback_plan(&mut plan, fallback) {
+                PlanInstall::Fallback(failure)
+            } else {
+                PlanInstall::Closed(failure)
+            }
+        }
+    };
+    plan.created = Instant::now();
+    match swap_plan(scope, plan) {
+        Some(_) => installed,
+        None => PlanInstall::Closed(PlanFailure::Lock),
+    }
+}
+
+/// Drop expired entries, refunding their funds (ceiling-bounded work).
+fn drop_expired(plan: &mut Plan) {
+    let mut freed = 0;
+    plan.entries.retain(|key, entry| {
+        let keep = entry.listed.elapsed() < CAPTURE_TTL;
+        if !keep {
+            freed += plan_key_bytes(key);
+        }
+        keep
+    });
+    plan.entry_funds.refund(freed);
+}
+
+/// Update every page family's entry in place and make the oldest 64
+/// eligible. On failure the page's entries updated so far keep their new
+/// turns (each no older than before) and are not eligible; the fallback
+/// then decides.
+fn complete_plan<'a>(
+    plan: &mut Plan,
+    keys: impl Iterator<Item = (&'a str, u64)>,
     mut within_deadline: impl FnMut() -> bool,
-) -> bool {
+) -> Result<(), PlanFailure> {
     if !within_deadline() {
-        return false;
+        return Err(PlanFailure::Deadline);
     }
-    // Keep the funded old plan, including unacknowledged consumed turns,
-    // until the replacement is complete and can be installed atomically.
-    let mut funds = Funds::default();
-    if !funds
-        .spend(NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>()))
-    {
-        return false;
+    plan.build += 1;
+    let build = plan.build;
+    let listed = Instant::now();
+    // Under ceiling pressure, room comes from families this build has not
+    // listed (yet): other pages' entries never outlast a page whose own
+    // families fit.
+    let oldest_bytes =
+        NEXT_PAGE_FAMILIES * (MAP_ENTRY_BYTES + std::mem::size_of::<((u64, &str), &str)>());
+    let mut oldest_funds = Funds::default();
+    if !oldest_funds.spend(oldest_bytes) {
+        prune_unlisted(plan, build);
+        if !oldest_funds.spend(oldest_bytes) {
+            return Err(PlanFailure::Funds);
+        }
     }
-    let mut selected = BTreeMap::new();
     // Oldest-64 selection with the producer's same (turn, family key)
     // total order, without an uninterruptible whole-page sort.
     let mut oldest = BTreeMap::new();
     for (key, turn) in keys {
-        if !within_deadline()
-            || !funds.spend(
-                key.len()
-                    + MAP_ENTRY_BYTES
-                    + std::mem::size_of::<String>()
-                    + std::mem::size_of::<(u64, bool)>(),
-            )
-        {
-            return false;
+        if !within_deadline() {
+            return Err(PlanFailure::Deadline);
         }
-        selected.insert(key.to_owned(), (turn, false));
+        let entry = PlanEntry {
+            turn,
+            build,
+            listed,
+            eligible: false,
+        };
+        if let Some(old) = plan.entries.get_mut(key) {
+            *old = entry;
+        } else {
+            // A page family still ahead in the walk that the pruning drops
+            // comes back with the page's own turn, which already includes
+            // the plan's (`scheduling_turn`).
+            if !plan.entry_funds.spend(plan_key_bytes(key)) {
+                prune_unlisted(plan, build);
+                if !plan.entry_funds.spend(plan_key_bytes(key)) {
+                    return Err(PlanFailure::Funds);
+                }
+            }
+            plan.entries.insert(key.to_owned(), entry);
+        }
         oldest.insert((turn, key), key);
         if oldest.len() > NEXT_PAGE_FAMILIES {
             let _ = oldest.pop_last();
         }
     }
-    for key in oldest.values() {
-        if !within_deadline() {
-            return false;
-        }
-        selected.get_mut(*key).expect("admitted plan key").1 = true;
-    }
     if !within_deadline() {
-        return false;
+        return Err(PlanFailure::Deadline);
     }
-    if let Ok(mut plans) = PLANS.try_lock() {
-        plans.retain(|_, plan| plan.created.elapsed() < CAPTURE_TTL);
-        plans.insert(
-            scope.to_path_buf(),
-            Plan {
-                keys: selected,
-                _funds: funds,
-                created: Instant::now(),
-            },
-        );
-        true
-    } else {
-        false
+    for key in oldest.values() {
+        // Pruning drops only entries other builds listed.
+        plan.entries
+            .get_mut(*key)
+            .expect("listed by this build")
+            .eligible = true;
+    }
+    plan.fallback = None;
+    plan.fallback_funds = Funds::default();
+    Ok(())
+}
+
+/// Drop the entries `build` has not listed, refunding their funds; a family
+/// without an entry is not eligible until this loss expires.
+fn prune_unlisted(plan: &mut Plan, build: u64) {
+    let mut freed = 0;
+    plan.entries.retain(|key, entry| {
+        let keep = entry.build == build;
+        if !keep {
+            freed += plan_key_bytes(key);
+        }
+        keep
+    });
+    if freed > 0 {
+        plan.entry_funds.refund(freed);
+        plan.lost = Some(Instant::now());
+    }
+}
+
+/// Make the fallback's families (at most 64) the only eligible ones and
+/// record this page's consumed turns, which are never eligible again before
+/// a complete plan selects them. The funded selection is also kept in the
+/// families' entries, so it outlasts another page's complete plan. False
+/// (nothing eligible) when funds refuse the fallback set.
+fn fallback_plan<'a>(plan: &mut Plan, entries: impl Iterator<Item = (&'a str, u64, bool)>) -> bool {
+    plan.fallback = Some(BTreeSet::new());
+    plan.fallback_funds = Funds::default();
+    let listed = Instant::now();
+    let mut fallback_funds = Funds::default();
+    let mut fallback = BTreeSet::new();
+    let mut funded = true;
+    for (key, turn, allowed) in entries {
+        if allowed && (!funded || fallback.len() == NEXT_PAGE_FAMILIES) {
+            continue;
+        }
+        if let Some(entry) = plan.entries.get_mut(key) {
+            entry.turn = turn;
+            entry.listed = listed;
+            entry.eligible &= allowed;
+        } else if plan.entry_funds.spend(plan_key_bytes(key)) {
+            plan.entries.insert(
+                key.to_owned(),
+                PlanEntry {
+                    turn,
+                    build: plan.build,
+                    listed,
+                    eligible: false,
+                },
+            );
+        } else if !allowed {
+            plan.lost = Some(listed);
+        }
+        if allowed {
+            if fallback_funds.spend(plan_key_bytes(key)) {
+                fallback.insert(key.to_owned());
+            } else {
+                funded = false;
+            }
+        }
+    }
+    if funded {
+        for key in &fallback {
+            if let Some(entry) = plan.entries.get_mut(key) {
+                entry.eligible = true;
+            }
+        }
+        plan.fallback = Some(fallback);
+        plan.fallback_funds = fallback_funds;
+    }
+    funded
+}
+
+/// Install `plan` for `scope`, returning the plan it replaced (to be dropped
+/// by the caller, after unlocking); None when the lock is poisoned. Plans of
+/// other scopes past their TTL are closed, never removed: a scope that has
+/// had a page keeps failing closed.
+fn swap_plan(scope: &Path, plan: Plan) -> Option<Option<Plan>> {
+    let mut expired = Vec::new();
+    let replaced = {
+        let mut plans = PLANS.lock().ok()?;
+        for (other, old) in plans.iter_mut() {
+            if other != scope
+                && old.created.elapsed() >= CAPTURE_TTL
+                && old.entry_funds.held + old.fallback_funds.held > 0
+            {
+                let created = old.created;
+                expired.push(std::mem::replace(
+                    old,
+                    Plan {
+                        created,
+                        ..Plan::closed()
+                    },
+                ));
+            }
+        }
+        plans.insert(scope.to_path_buf(), plan)
+    };
+    drop(expired);
+    Some(replaced)
+}
+
+/// A page of the scope has started: from now on the scope is never treated
+/// as before its first page, even when this page refuses before it plans.
+/// A plan already installed stays.
+pub(super) fn mark_paged(scope: &Path) {
+    if let Ok(mut plans) = PLANS.lock() {
+        plans
+            .entry(scope.to_path_buf())
+            .or_insert_with(Plan::closed);
     }
 }
 
@@ -156,18 +446,42 @@ pub(super) fn scheduling_turn(scope: &Path, key: &str, published: u64) -> u64 {
         .and_then(|plans| {
             plans
                 .get(scope)
-                .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
-                .and_then(|plan| plan.keys.get(key))
-                .map(|(turn, _)| *turn)
+                .and_then(|plan| plan.live(key))
+                .map(|entry| entry.turn)
         })
         .unwrap_or(0)
         .max(published)
 }
 
+/// The shadow is off (or a test ends): the scope starts over, as before its
+/// first page.
 pub(super) fn forget_plan(scope: &Path) {
-    if let Ok(mut plans) = PLANS.lock() {
-        plans.remove(scope);
-    }
+    let removed = PLANS.lock().ok().and_then(|mut plans| plans.remove(scope));
+    drop(removed);
+}
+
+/// Whether the parse of `path` may capture optionally: always before the
+/// scope's first page; after it only what its live plan allows (a paged
+/// scope without a plan, or with an expired one, allows nothing).
+fn capture_eligible(scope: &Path, path: &Path) -> bool {
+    PLANS.lock().is_ok_and(|plans| {
+        let Some(plan) = plans.get(scope) else {
+            return true;
+        };
+        super::super::claude_index_path_member_ref(path)
+            .is_some_and(|member| plan.allows(&super::family_key(member.root)))
+    })
+}
+
+#[cfg(test)]
+thread_local! {
+    static PLAN_DEADLINE_FOR_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make this thread's next plans run out of their close budget at once.
+#[cfg(test)]
+pub(crate) fn set_plan_deadline_for_test(expired: bool) {
+    PLAN_DEADLINE_FOR_TEST.with(|current| current.set(expired));
 }
 
 pub(crate) fn begin_page(scope: &Path) {
@@ -331,6 +645,19 @@ impl Funds {
     }
 }
 
+impl Funds {
+    /// `bytes` admitted earlier are no longer used: whole chunks no longer
+    /// needed go back to the ceiling.
+    fn refund(&mut self, bytes: usize) {
+        self.used = self.used.saturating_sub(bytes);
+        let surplus = (self.held - self.used) / FUNDS_CHUNK_BYTES * FUNDS_CHUNK_BYTES;
+        if surplus > 0 {
+            CAPTURE_RESERVED.fetch_sub(surplus, Ordering::AcqRel);
+            self.held -= surplus;
+        }
+    }
+}
+
 /// Holds the whole capture ceiling until dropped (no capture or plan funds).
 #[cfg(test)]
 pub(crate) struct CeilingHoldForTest(#[allow(dead_code)] Funds);
@@ -423,19 +750,7 @@ impl ClaudeResponseCapture {
         if !spend_work(&scope, 0, 0) {
             return None;
         }
-        let eligible = PLANS.lock().is_ok_and(|plans| {
-            plans
-                .get(&scope)
-                .filter(|plan| plan.created.elapsed() < CAPTURE_TTL)
-                .map_or(true, |plan| {
-                    super::super::claude_index_path_member_ref(path).is_some_and(|member| {
-                        plan.keys
-                            .get(&super::family_key(member.root))
-                            .map(|(_, eligible)| *eligible)
-                            .unwrap_or(true)
-                    })
-                })
-        });
+        let eligible = capture_eligible(&scope, path);
         eligible.then(|| Self {
             scope: scope.clone(),
             ..Self::default()
@@ -908,17 +1223,73 @@ pub(crate) fn capture_reserved() -> usize {
     CAPTURE_RESERVED.load(Ordering::Acquire)
 }
 
+/// The families the scope's plan makes eligible by name: the fallback's,
+/// or every live entry a complete plan selected (any page's).
 #[cfg(test)]
 pub(crate) fn planned_families_for_test(
     scope: &Path,
 ) -> Option<std::collections::BTreeSet<String>> {
+    PLANS
+        .lock()
+        .unwrap()
+        .get(scope)
+        .map(|plan| match &plan.fallback {
+            Some(fallback) => fallback.clone(),
+            None => plan
+                .entries
+                .keys()
+                .filter(|key| plan.live(key).is_some_and(|entry| entry.eligible))
+                .cloned()
+                .collect(),
+        })
+}
+
+/// Whether `begin` would capture `path` now (its scope armed and its plan
+/// allowing the family), without spending capture work.
+#[cfg(test)]
+pub(crate) fn capture_eligible_for_test(path: &Path) -> bool {
+    super::capture_armed(path).is_some_and(|scope| capture_eligible(&scope, path))
+}
+
+/// None before the scope's first page (never paged); after it, whether its
+/// live plan allows any optional capture at all (false: paged without a
+/// plan, closed, or expired).
+#[cfg(test)]
+pub(crate) fn plan_allows_capture_for_test(scope: &Path) -> Option<bool> {
     PLANS.lock().unwrap().get(scope).map(|plan| {
-        plan.keys
-            .iter()
-            .filter(|(_, (_, eligible))| *eligible)
-            .map(|(key, _)| key.clone())
-            .collect()
+        plan.created.elapsed() < CAPTURE_TTL
+            && match &plan.fallback {
+                Some(fallback) => !fallback.is_empty(),
+                None => {
+                    !matches!(plan.lost, Some(lost) if lost.elapsed() < CAPTURE_TTL)
+                        || plan
+                            .entries
+                            .values()
+                            .any(|entry| entry.eligible && entry.listed.elapsed() < CAPTURE_TTL)
+                }
+            }
     })
+}
+
+/// Capture funds the scope's plan holds.
+#[cfg(test)]
+pub(crate) fn plan_funds_for_test(scope: &Path) -> usize {
+    PLANS
+        .lock()
+        .unwrap()
+        .get(scope)
+        .map_or(0, |plan| plan.entry_funds.held + plan.fallback_funds.held)
+}
+
+/// The family's live scheduling turn in the scope's plan.
+#[cfg(test)]
+pub(crate) fn plan_turn_for_test(scope: &Path, key: &str) -> Option<u64> {
+    PLANS
+        .lock()
+        .unwrap()
+        .get(scope)
+        .and_then(|plan| plan.live(key))
+        .map(|entry| entry.turn)
 }
 
 /// Accepted cumulative work, including work whose resident capture was dropped.
@@ -1030,12 +1401,16 @@ mod bounded_tests {
         let keys = (0..NEXT_PAGE_FAMILIES + 1)
             .map(|at| super::super::family_key(&format!("root-{at}")))
             .collect::<Vec<_>>();
-        plan_next_page(
-            &support,
-            keys.iter()
-                .enumerate()
-                .map(|(at, key)| (key.as_str(), at as u64)),
-            Instant::now() + Duration::from_secs(1),
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
         );
         assert!(ClaudeResponseCapture::begin(&scratch.join("root-0.jsonl")).is_some());
         assert!(
@@ -1051,13 +1426,17 @@ mod bounded_tests {
         );
         // Rotate eligibility to the formerly skipped root, without parsing
         // files or changing a native candidate's ordering or identity.
-        plan_next_page(
-            &support,
-            keys.iter()
-                .rev()
-                .enumerate()
-                .map(|(at, key)| (key.as_str(), at as u64)),
-            Instant::now() + Duration::from_secs(1),
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .rev()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
         );
         assert!(ClaudeResponseCapture::begin(
             &scratch.join(format!("root-{NEXT_PAGE_FAMILIES}.jsonl"))
@@ -1066,9 +1445,19 @@ mod bounded_tests {
         super::super::disable_shadow_for_test(&support);
     }
 
+    fn eligible_families(support: &Path) -> std::collections::BTreeSet<String> {
+        planned_families_for_test(support).expect("a page installs a plan")
+    }
+
+    /// MONEY decision (fail closed, never stale; supersedes "keep the old
+    /// plan until a complete replacement installs"): a page whose complete
+    /// plan cannot be built makes only the oldest-64 fallback eligible,
+    /// never a partial selection and never the old plan's eligible
+    /// families. The update reuses the old plan's funds and keeps earlier
+    /// pages' unacknowledged turns.
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
-    fn capture_plan_stops_at_expiry_and_never_installs_a_partial_plan() {
+    fn capture_plan_stops_at_expiry_and_installs_only_the_fallback() {
         let scratch = crate::test_scratch::ScratchDir::new("money-capture-plan-deadline");
         let support = scratch.join("support");
         let before = capture_reserved();
@@ -1077,82 +1466,520 @@ mod bounded_tests {
             .collect::<Vec<_>>();
         let started = Instant::now();
         let visited = std::cell::Cell::new(0_usize);
-        assert!(!plan_next_page(
-            &support,
-            keys.iter().map(|key| {
-                visited.set(visited.get() + 1);
-                (key.as_str(), 0)
-            }),
-            started
-        ));
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter().map(|key| {
+                    visited.set(visited.get() + 1);
+                    (key.as_str(), 0)
+                }),
+                std::iter::empty(),
+                started
+            ),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
         // Iteration can fetch the next element before its deadline check,
         // but no walk/sort of the remaining 4095 entries is allowed.
         assert!(visited.get() <= 1);
         assert!(started.elapsed() <= super::super::PAGE_MAX_ELAPSED + Duration::from_millis(25));
-        assert!(!PLANS.lock().unwrap().contains_key(&support));
+        assert_eq!(
+            plan_allows_capture_for_test(&support),
+            Some(false),
+            "an empty fallback allows nothing: never a partial plan"
+        );
         assert_eq!(capture_reserved(), before);
+        let fallback = |turn: u64| {
+            keys[100..100 + NEXT_PAGE_FAMILIES]
+                .iter()
+                .map(move |key| (key.as_str(), turn, true))
+                .chain(std::iter::once((keys[0].as_str(), turn + 1, false)))
+        };
         let checks = std::cell::Cell::new(0);
-        assert!(!plan_next_page_while(
-            &support,
-            keys.iter().map(|key| (key.as_str(), 0)),
-            || {
-                checks.set(checks.get() + 1);
-                checks.get() <= 7
-            }
-        ));
-        assert!(!PLANS.lock().unwrap().contains_key(&support));
+        assert_eq!(
+            plan_next_page_while(
+                &support,
+                keys.iter().map(|key| (key.as_str(), 0)),
+                fallback(0),
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() <= 7
+                }
+            ),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
         assert_eq!(
             capture_reserved(),
-            before,
-            "interrupted plan refunds all admitted metadata"
+            before + plan_funds_for_test(&support),
+            "an interrupted plan holds only its installed funds: no admission leaks"
         );
-        assert!(plan_next_page(
-            &support,
-            keys.iter()
-                .enumerate()
-                .map(|(at, key)| (key.as_str(), at as u64)),
-            Instant::now() + Duration::from_secs(1)
-        ));
-        let plans = PLANS.lock().unwrap();
-        let plan = &plans[&support];
         assert_eq!(
-            plan.keys.values().filter(|(_, eligible)| *eligible).count(),
-            NEXT_PAGE_FAMILIES
+            eligible_families(&support),
+            keys[100..100 + NEXT_PAGE_FAMILIES]
+                .iter()
+                .cloned()
+                .collect()
         );
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1)
+            ),
+            PlanInstall::Complete
+        );
+        let complete = eligible_families(&support);
+        assert_eq!(complete.len(), NEXT_PAGE_FAMILIES);
         assert!(keys[..NEXT_PAGE_FAMILIES]
             .iter()
-            .all(|key| plan.keys[key].1));
-        drop(plans);
+            .all(|key| complete.contains(key)));
         let funded = capture_reserved();
         let checks = std::cell::Cell::new(0);
-        assert!(!plan_next_page_while(
-            &support,
-            keys.iter().map(|key| (key.as_str(), 9000)),
-            || {
-                checks.set(checks.get() + 1);
-                checks.get() <= 7
-            }
-        ));
+        assert_eq!(
+            plan_next_page_while(
+                &support,
+                keys.iter().map(|key| (key.as_str(), 9000)),
+                fallback(9000),
+                || {
+                    checks.set(checks.get() + 1);
+                    checks.get() <= 7
+                }
+            ),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
         assert_eq!(
             capture_reserved(),
-            funded,
-            "old plan stays funded; partial replacement refunds"
+            funded
+                + keys[100..100 + NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| plan_key_bytes(key))
+                    .sum::<usize>()
+                    .div_ceil(FUNDS_CHUNK_BYTES)
+                    * FUNDS_CHUNK_BYTES,
+            "the update reuses the old plan's funds; the partial walk adds none, only the fallback's 64 are funded"
         );
+        assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         assert_eq!(
-            scheduling_turn(&support, &keys[100], 0),
-            100,
+            scheduling_turn(&support, &keys[300], 0),
+            300,
             "mid-walk expiry must preserve unacknowledged consumed turns"
         );
-        let plans = PLANS.lock().unwrap();
-        assert!(plans[&support].keys[&keys[0]].1);
+        assert_eq!(
+            scheduling_turn(&support, &keys[0], 0),
+            9001,
+            "this page's consumed turn survives in the fallback"
+        );
+        assert_eq!(scheduling_turn(&support, &keys[100], 0), 9000);
+        let fallback_families = eligible_families(&support);
+        assert_eq!(
+            fallback_families,
+            keys[100..100 + NEXT_PAGE_FAMILIES]
+                .iter()
+                .cloned()
+                .collect(),
+            "the fallback lists the oldest 64 not consumed this page"
+        );
         assert!(
-            !plans[&support].keys[&keys[100]].1,
+            fallback_families.is_disjoint(&complete),
+            "never the stale plan's eligibility"
+        );
+        let plans = PLANS.lock().unwrap();
+        assert!(!plans[&support].allows(&keys[0]));
+        assert!(
+            !plans[&support].allows(&keys[200])
+                && !plans[&support].allows(&super::super::family_key("unlisted")),
             "interruption never changes the next Full to all-eligible"
         );
         drop(plans);
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
-        println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES}", visited.get(), checks.get());
+        println!("MONEY_P1B_PLAN entries=4096 expired_visited={} interrupted_checks={} eligible={NEXT_PAGE_FAMILIES} fallback_eligible={} plan_funds={funded} stale_plan_installed=0 carried_turn=300", visited.get(), checks.get(), fallback_families.len());
+    }
+
+    /// The next parse's captures follow the fallback: a family the page
+    /// consumed (built) and a family the fallback does not list capture
+    /// nothing, while the fallback's families do.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn fallback_plan_captures_only_prior_incomplete_families() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-fallback");
+        let support = scratch.join("support");
+        super::super::enable_shadow_for_test(&support);
+        let roots = (0..3 * NEXT_PAGE_FAMILIES)
+            .map(|at| format!("root-{at}"))
+            .collect::<Vec<_>>();
+        let keys = roots
+            .iter()
+            .map(|root| super::super::family_key(root))
+            .collect::<Vec<_>>();
+        // The previous page planned roots 0..64 (now consumed and built).
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
+        );
+        let consumed = 0..NEXT_PAGE_FAMILIES;
+        let pending = NEXT_PAGE_FAMILIES..2 * NEXT_PAGE_FAMILIES;
+        set_plan_deadline_for_test(true);
+        let installed = plan_next_page(
+            &support,
+            keys.iter().map(|key| (key.as_str(), 0)),
+            pending
+                .clone()
+                .map(|at| (keys[at].as_str(), at as u64, true))
+                .chain(consumed.clone().map(|at| (keys[at].as_str(), 9000, false))),
+            Instant::now() + Duration::from_secs(1),
+        );
+        set_plan_deadline_for_test(false);
+        assert_eq!(installed, PlanInstall::Fallback(PlanFailure::Deadline));
+        let path = |at: usize| scratch.join(format!("{}.jsonl", roots[at]));
+        assert!(consumed
+            .clone()
+            .all(|at| ClaudeResponseCapture::begin(&path(at)).is_none()));
+        assert!(pending
+            .clone()
+            .all(|at| ClaudeResponseCapture::begin(&path(at)).is_some()));
+        assert!(ClaudeResponseCapture::begin(&path(2 * NEXT_PAGE_FAMILIES)).is_none());
+        assert!(
+            ClaudeResponseCapture::begin(&scratch.join("different-native-page.jsonl")).is_none(),
+            "a fallback lists everything it allows"
+        );
+        super::super::disable_shadow_for_test(&support);
+    }
+
+    /// A scope that has had a page and has no live plan captures nothing
+    /// optional (MONEY decision); only a scope before its first page (or
+    /// after the shadow turned off) captures every file. A page's start
+    /// marks the scope paged, so a page refused before it plans leaves the
+    /// scope closed, and a page of at most 64 families expires like any
+    /// other plan.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn a_paged_scope_without_a_plan_captures_nothing_optional() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-closed");
+        let support = scratch.join("support");
+        super::super::enable_shadow_for_test(&support);
+        let file = scratch.join("root-0.jsonl");
+        let other = scratch.join("different-native-page.jsonl");
+        assert_eq!(plan_allows_capture_for_test(&support), None);
+        assert!(ClaudeResponseCapture::begin(&file).is_some(), "first page");
+        assert!(ClaudeResponseCapture::begin(&other).is_some(), "first page");
+        let keys = (0..2 * NEXT_PAGE_FAMILIES)
+            .map(|at| super::super::family_key(&format!("root-{at}")))
+            .collect::<Vec<_>>();
+        // Neither the complete plan nor its fallback can be funded.
+        let mut full = Funds::default();
+        assert!(full.spend(CAPTURE_CEILING_BYTES - capture_reserved()));
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter().map(|key| (key.as_str(), 0)),
+                keys[..NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| (key.as_str(), 0, true)),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Closed(PlanFailure::Funds)
+        );
+        drop(full);
+        assert_eq!(plan_allows_capture_for_test(&support), Some(false));
+        assert!(ClaudeResponseCapture::begin(&file).is_none());
+        assert!(ClaudeResponseCapture::begin(&other).is_none());
+        assert!(!capture_eligible_for_test(&file));
+        // A page of at most 64 families makes them all eligible, and another
+        // native page's families too.
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys[..NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| (key.as_str(), 0)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
+        );
+        assert!(
+            ClaudeResponseCapture::begin(&file).is_some(),
+            "a page of at most 64"
+        );
+        assert!(
+            ClaudeResponseCapture::begin(&other).is_some(),
+            "a page of at most 64"
+        );
+        // An expired plan allows nothing, the small page's included.
+        // (A fresh runner's monotonic clock may not reach back 15 minutes.)
+        let expired = Instant::now().checked_sub(CAPTURE_TTL);
+        if let Some(created) = expired {
+            PLANS.lock().unwrap().get_mut(&support).unwrap().created = created;
+            assert_eq!(plan_allows_capture_for_test(&support), Some(false));
+            assert!(
+                ClaudeResponseCapture::begin(&file).is_none(),
+                "expired small-page plan"
+            );
+            assert!(
+                ClaudeResponseCapture::begin(&other).is_none(),
+                "expired small-page plan"
+            );
+        }
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
+        );
+        assert!(
+            ClaudeResponseCapture::begin(&file).is_some(),
+            "planned family"
+        );
+        if let Some(created) = expired {
+            PLANS.lock().unwrap().get_mut(&support).unwrap().created = created;
+            assert!(
+                ClaudeResponseCapture::begin(&file).is_none(),
+                "expired plan"
+            );
+            assert!(
+                ClaudeResponseCapture::begin(&other).is_none(),
+                "expired plan"
+            );
+        }
+        // The shadow turning off starts the scope over.
+        forget_plan(&support);
+        assert_eq!(plan_allows_capture_for_test(&support), None);
+        assert!(ClaudeResponseCapture::begin(&file).is_some());
+        // A page that starts and refuses before planning leaves the scope
+        // paged without a plan: nothing optional, never back to all.
+        mark_paged(&support);
+        assert_eq!(plan_allows_capture_for_test(&support), Some(false));
+        assert!(ClaudeResponseCapture::begin(&file).is_none());
+        assert!(ClaudeResponseCapture::begin(&other).is_none());
+        // A following page start keeps the plan its predecessor installed.
+        assert_eq!(
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), at as u64)),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Complete
+        );
+        mark_paged(&support);
+        assert!(ClaudeResponseCapture::begin(&file).is_some());
+        super::super::disable_shadow_for_test(&support);
+        println!("MONEY_P1B_PLAN_CLOSED first_page_eligible=1 closed_eligible=0 refused_first_page_eligible=0 expired_checked={} expired_eligible=0 small_page_expired_eligible=0 funds_refused=1", u8::from(expired.is_some()));
+    }
+
+    /// Plan state is scope-wide (MONEY round 2): a page that lists other
+    /// families keeps the turns and exclusions of the families an earlier
+    /// page listed, so after A -> B the next parse of A captures only A's
+    /// planned families, never what A built, and A's unacknowledged
+    /// consumed turns still order A.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn another_pages_plan_keeps_earlier_pages_turns_and_exclusions() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-scope-wide");
+        let support = scratch.join("support");
+        super::super::enable_shadow_for_test(&support);
+        let before = capture_reserved();
+        let page = |name: &str| {
+            (0..3 * NEXT_PAGE_FAMILIES)
+                .map(|at| format!("{name}-{at}"))
+                .collect::<Vec<_>>()
+        };
+        let (a, b) = (page("a"), page("b"));
+        let key = |root: &str| super::super::family_key(root);
+        let begins = |root: &str| {
+            ClaudeResponseCapture::begin(&scratch.join(format!("{root}.jsonl"))).is_some()
+        };
+        let plan = |roots: &[String], turn: &dyn Fn(usize) -> u64| {
+            let keys = roots.iter().map(|root| key(root)).collect::<Vec<_>>();
+            plan_next_page(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), turn(at))),
+                std::iter::empty(),
+                Instant::now() + Duration::from_secs(1),
+            )
+        };
+        // Page A consumed (built) a-0..64 at turn 9000, acknowledgement not
+        // (yet) arrived: its plan selects a-64..128.
+        let a_turn = |at: usize| {
+            if at < NEXT_PAGE_FAMILIES {
+                9000 + at as u64
+            } else {
+                at as u64
+            }
+        };
+        assert_eq!(plan(&a, &a_turn), PlanInstall::Complete);
+        // Page B, a different native page, plans its own families.
+        assert_eq!(plan(&b, &|at: usize| at as u64), PlanInstall::Complete);
+        for at in 0..3 * NEXT_PAGE_FAMILIES {
+            let planned = (NEXT_PAGE_FAMILIES..2 * NEXT_PAGE_FAMILIES).contains(&at);
+            assert_eq!(begins(&a[at]), planned, "A's plan survives B's: a-{at}");
+            assert_eq!(begins(&b[at]), at < NEXT_PAGE_FAMILIES, "b-{at}");
+        }
+        assert_eq!(
+            scheduling_turn(&support, &key(&a[0]), 0),
+            9000,
+            "A's unacknowledged consumed turn survives B's plan"
+        );
+        // A again (A -> B -> A): it builds a-64..128 and plans a-128..192,
+        // never a-0..64, which it built first.
+        let a_turn = |at: usize| {
+            if at < 2 * NEXT_PAGE_FAMILIES {
+                9000 + at as u64
+            } else {
+                at as u64
+            }
+        };
+        assert_eq!(plan(&a, &a_turn), PlanInstall::Complete);
+        assert_eq!(plan(&b, &|at: usize| at as u64), PlanInstall::Complete);
+        for (at, root) in a.iter().enumerate() {
+            assert_eq!(begins(root), at >= 2 * NEXT_PAGE_FAMILIES, "a-{at}");
+        }
+        // A fallback on B leaves A's selection to A's own next page.
+        set_plan_deadline_for_test(true);
+        let b_keys = b.iter().map(|root| key(root)).collect::<Vec<_>>();
+        assert_eq!(
+            plan_next_page(
+                &support,
+                b_keys.iter().map(|key| (key.as_str(), 0)),
+                b_keys[NEXT_PAGE_FAMILIES..2 * NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| (key.as_str(), 0, true))
+                    .chain(b_keys[..NEXT_PAGE_FAMILIES].iter().map(|key| (
+                        key.as_str(),
+                        9100,
+                        false
+                    ))),
+                Instant::now() + Duration::from_secs(1),
+            ),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
+        set_plan_deadline_for_test(false);
+        assert!(
+            !begins(&a[2 * NEXT_PAGE_FAMILIES]),
+            "a fallback lists everything it allows"
+        );
+        assert_eq!(plan(&a, &a_turn), PlanInstall::Complete);
+        assert!(
+            (0..NEXT_PAGE_FAMILIES).all(|at| !begins(&b[at])),
+            "B's consumed families stay excluded after A's complete plan"
+        );
+        assert!(
+            (NEXT_PAGE_FAMILIES..2 * NEXT_PAGE_FAMILIES).all(|at| begins(&b[at])),
+            "B's fallback selection outlasts A's complete plan"
+        );
+        assert_eq!(scheduling_turn(&support, &key(&b[0]), 0), 9100);
+        assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
+        forget_plan(&support);
+        assert_eq!(capture_reserved(), before);
+        super::super::disable_shadow_for_test(&support);
+        println!("MONEY_P1B_PLAN_SCOPE_WIDE pages=A,B,A,B,fallback(B),A families_per_page=192 a_rebuilt=0 b_consumed_eligible_after_a=0 b_fallback_eligible_after_a=64");
+    }
+
+    /// Each page updates the plan in place and reuses its funds, so a family
+    /// count whose two plans exceed the capture ceiling still installs every
+    /// page. Changing family sets near the ceiling, after an interrupted
+    /// build kept the union of two pages, still install: families the page
+    /// does not list make room first.
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn replacing_a_large_plan_reuses_the_old_plans_funds() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-capture-large-plan");
+        let support = scratch.join("support");
+        let before = capture_reserved();
+        let set = |name: &str| {
+            (0..30_000)
+                .map(|at| super::super::family_key(&format!("{name}-{at}")))
+                .collect::<Vec<_>>()
+        };
+        let keys = set("root");
+        let one_plan = keys.iter().map(|key| plan_key_bytes(key)).sum::<usize>();
+        assert!(
+            2 * one_plan > CAPTURE_CEILING_BYTES - before
+                && one_plan < CAPTURE_CEILING_BYTES - before,
+            "two plans exceed the ceiling, one fits: {one_plan}"
+        );
+        let page = |keys: &[String], offset: u64, checks: usize| {
+            let walked = std::cell::Cell::new(0);
+            plan_next_page_while(
+                &support,
+                keys.iter()
+                    .enumerate()
+                    .map(|(at, key)| (key.as_str(), (at as u64 + offset) % 30_000)),
+                keys[..NEXT_PAGE_FAMILIES]
+                    .iter()
+                    .map(|key| (key.as_str(), 0, true)),
+                || {
+                    walked.set(walked.get() + 1);
+                    walked.get() <= checks
+                },
+            )
+        };
+        for offset in 0..3_u64 {
+            assert_eq!(
+                page(&keys, offset * 7, usize::MAX),
+                PlanInstall::Complete,
+                "page {offset}"
+            );
+            assert!(capture_reserved() - before < 2 * one_plan);
+        }
+        let held = capture_reserved() - before;
+        // Another native page's families: an interrupted build keeps the
+        // union (with half the room left under the ceiling) ...
+        let other = set("other");
+        let room = CAPTURE_CEILING_BYTES - capture_reserved();
+        let interrupted = room / 2 / plan_key_bytes(&other[0]);
+        assert!(
+            interrupted >= 1_000,
+            "room for an interrupted build: {room}"
+        );
+        assert_eq!(
+            page(&other, 0, interrupted + 1),
+            PlanInstall::Fallback(PlanFailure::Deadline)
+        );
+        let union = capture_reserved() - before;
+        assert!(union > held, "{union} {held}");
+        // ... and a third page set, whose own 30,000 families fit but the
+        // union with them does not, still installs completely.
+        let third = set("third");
+        assert_eq!(page(&third, 0, usize::MAX), PlanInstall::Complete);
+        assert!(capture_reserved() - before < 2 * one_plan);
+        let eligible = planned_families_for_test(&support).unwrap();
+        assert_eq!(eligible.len(), NEXT_PAGE_FAMILIES);
+        assert!(eligible.iter().all(|key| third.contains(key)));
+        assert_eq!(
+            PLANS.lock().unwrap()[&support].entries.len(),
+            third.len(),
+            "only the page's own families stay"
+        );
+        let plans = PLANS.lock().unwrap();
+        assert!(
+            !plans[&support].allows(&keys[0]) && !plans[&support].allows(&other[0]),
+            "a family whose entry made room is not eligible again before the loss expires"
+        );
+        drop(plans);
+        assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
+        forget_plan(&support);
+        assert_eq!(capture_reserved(), before);
+        println!("MONEY_P1B_PLAN_FUNDS keys=30000 one_plan_bytes={one_plan} held_bytes={held} interrupted_entries={interrupted} interrupted_union_bytes={union} ceiling={CAPTURE_CEILING_BYTES} same_set_pages=3 changed_set_installed=1");
     }
 
     /// Admission inside a running money section charges its time already;

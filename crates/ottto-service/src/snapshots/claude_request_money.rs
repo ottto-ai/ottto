@@ -866,10 +866,18 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) batch_dropped: u64,
     pub(crate) captures_taken: u64,
     pub(crate) captures_purged: u64,
-    /// The next Full parse's capture plan was not installed (plan lock
-    /// busy, capture funds or the plan slice ran out): any earlier plan
-    /// still selects that parse's captures.
+    /// The next Full parse's complete capture plan was not installed; the
+    /// reason is one of the three below. The page then installed the
+    /// oldest-64 fallback (`fallback_plan_installed`) or, failing that,
+    /// closed optional capture: never the old plan.
     pub(crate) plan_install_failed: u64,
+    /// The close budget ran out during the plan's walk.
+    pub(crate) plan_install_failed_deadline: u64,
+    /// The capture ceiling refused the plan's keys.
+    pub(crate) plan_install_failed_funds: u64,
+    /// The plan lock was poisoned.
+    pub(crate) plan_install_failed_lock: u64,
+    pub(crate) fallback_plan_installed: u64,
     /// A page with fresh captures built no family: no coverage progress.
     pub(crate) full_page_zero_built: u64,
     /// Roots keyed after family zero: scheduling reached the setup stop.
@@ -1823,6 +1831,10 @@ fn shadow_page_body(
     #[cfg(test)]
     PAGE_SCHEDULE.with(|schedule| schedule.borrow_mut().clear());
     let scope_key = shadow_scope(support_dir);
+    // From this page on the scope is paged: a refusal before the plan
+    // leaves the scope failing closed, never back to its first-page
+    // all-eligible capture (MONEY decision).
+    capture::mark_paged(&scope_key);
     // `clock.deadline` is `started` plus the money budget capture left, so
     // these are the same offsets in money time: optional work stops at
     // 150 ms, closing at 240 ms, 10 ms for the handoff.
@@ -2044,6 +2056,9 @@ fn shadow_page_body(
     let claim_keys = std::cell::OnceCell::new();
     let claims = std::cell::OnceCell::<Option<PageClaims<'_>>>::new();
     let mut scope = ClaudeLedgerScope::default();
+    // Positions whose capture this page consumed, ascending (only the
+    // scheduled head can be): their turns move to `now`, and they are the
+    // fallback plan's exclusions.
     let mut reached_turns = Vec::new();
     let holder_view = ClaudeHolderView::of(coverage_view);
     let mut families = Vec::with_capacity(roots.len());
@@ -2099,8 +2114,9 @@ fn shadow_page_body(
             // Identity/day/epoch suppression is a producer decision, before
             // the writer can consume the day cap on identical deadline rows.
             let deferred = (order.len() - position) as u64;
-            // Reserve retention (10ms), plan (10ms), and save (10ms)
-            // separately; none can consume the following slice.
+            // Reserve retention (10ms), plan (at least 10ms: up to the
+            // save's slice), and save (10ms) separately; none can consume
+            // the following slice.
             let compare_until = end.close_deadline - Duration::from_millis(30);
             let suffix = &order[position..];
             let mut first_uncompared = None;
@@ -2421,7 +2437,7 @@ fn shadow_page_body(
     // Captures of families the page did not reach.
     counts.captures_purged += capture::purge_before(&scope_key, purge_at);
     end.scope = scope.debt;
-    for position in reached_turns {
+    for &position in &reached_turns {
         order[position].2 = now;
     }
     if faulted(PageFault::LateAtHandOff) || faulted(PageFault::BatchRefused) {
@@ -2444,19 +2460,47 @@ fn shadow_page_body(
     // This only selects optional captures; it grants no publication or
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
-    if order.len() > capture::NEXT_PAGE_FAMILIES {
-        let installed = capture::plan_next_page(
-            &scope_key,
-            order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
-            end.close_deadline
-                .checked_sub(Duration::from_millis(10))
-                .expect("closing reserve")
-                .min(Instant::now() + Duration::from_millis(10)),
-        );
-        counts.plan_install_failed = u64::from(!installed);
-    } else {
-        capture::forget_plan(&scope_key);
+    // A page of at most 64 families makes them all eligible.
+    // The fallback's O(64) selection, the oldest 64 entries this page did
+    // not consume: only the scheduled head can be consumed and the rest of
+    // `order` is sorted, so they are among the head's unconsumed entries
+    // and the rest's first 64.
+    let mut oldest = order[..head]
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| reached_turns.binary_search(position).is_err())
+        .map(|(_, entry)| entry)
+        .chain(order[head..].iter().take(capture::NEXT_PAGE_FAMILIES))
+        .collect::<Vec<_>>();
+    oldest.sort_by(|left, right| schedule_order(left, right));
+    let fallback = oldest
+        .into_iter()
+        .take(capture::NEXT_PAGE_FAMILIES)
+        .map(|(_, key, turn)| (key.as_str(), *turn, true))
+        .chain(reached_turns.iter().map(|&position| {
+            let (_, key, turn) = &order[position];
+            (key.as_str(), *turn, false)
+        }));
+    // The plan may use the closing budget up to the save's slice; its
+    // walk is bounded by its funds (the capture ceiling).
+    let installed = capture::plan_next_page(
+        &scope_key,
+        order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
+        fallback,
+        end.close_deadline
+            .checked_sub(Duration::from_millis(10))
+            .expect("closing reserve"),
+    );
+    if let Some(failure) = installed.failure() {
+        counts.plan_install_failed = 1;
+        *match failure {
+            capture::PlanFailure::Deadline => &mut counts.plan_install_failed_deadline,
+            capture::PlanFailure::Funds => &mut counts.plan_install_failed_funds,
+            capture::PlanFailure::Lock => &mut counts.plan_install_failed_lock,
+        } = 1;
     }
+    counts.fallback_plan_installed =
+        u64::from(matches!(installed, capture::PlanInstall::Fallback(_)));
     counts.full_page_zero_built = u64::from(
         counts.captures_taken + counts.captures_purged > 0
             && counts.families > 0
@@ -4679,6 +4723,9 @@ mod digest_deadline_tests {
     }
 
     #[test]
+    // Its scratch admission (`PER_PAGE * 256`, 64 KiB) is process-wide
+    // shadow memory, which other money tests assert exactly.
+    #[serial_test::serial(claude_request_money_shadow)]
     fn family_retention_cursor_reaches_stale_records_beyond_a_fresh_prefix() {
         let mut ledger = ClaudeLedger::new_for_test();
         let now = FAMILY_MEMO_RETENTION_SECONDS + 100;
