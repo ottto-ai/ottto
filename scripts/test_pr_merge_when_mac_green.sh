@@ -511,6 +511,15 @@ run_guard 4 7
 expect_output 'removed from merge queue'
 expect_output 'could not read merge_group runs'
 
+queue_case queue-left-then-merged
+queue_json queue.1 OPEN "$SHA" QUEUED
+queue_json queue.2 OPEN "$SHA" ""
+queue_json queue MERGED "$SHA" ""
+run_guard 0 7
+expect_output 'rechecking before reporting removal'
+expect_output "merged PR #7 at merge SHA $NEW_SHA"
+expect_no_log 'merge_group&per_page'
+
 queue_case queue-head-moved
 queue_json queue.1 OPEN "$SHA" QUEUED
 queue_json queue OPEN "$NEW_SHA" ""

@@ -245,7 +245,7 @@ report_queue_failure() {
 # head-movement protection, and the resulting merge SHA. API errors are retried
 # within the original invocation's timeout, never treated as queue removal.
 wait_for_queue() {
-  local response queued_pr state current_sha entry seen_queue=false
+  local response queued_pr state current_sha entry seen_queue=false absent=0
   while :; do
     # GraphQL variables must reach GitHub literally.
     # shellcheck disable=SC2016
@@ -273,6 +273,7 @@ wait_for_queue() {
       entry="$(printf '%s' "$queued_pr" | jq -r '.mergeQueueEntry // empty | "\(.state) (position \(.position))"')"
       if [ -n "$entry" ]; then
         seen_queue=true
+        absent=0
         log "PR #$pr in merge queue: $entry"
       elif [ "$seen_queue" = false ] && [ "$state" = OPEN ] \
         && [ "$(printf '%s' "$queued_pr" | jq -r '.autoMergeRequest != null')" = true ]; then
@@ -280,8 +281,15 @@ wait_for_queue() {
         # requirement is pending. Do not report removal before admission.
         log "PR #$pr awaiting merge queue admission (auto-merge pending)"
       else
-        report_queue_failure
-        die "$EXIT_RED" "PR #$pr removed from merge queue; not merged"
+        # GitHub can drop the queue entry a moment before the PR reads as
+        # MERGED; only a second consecutive open-and-unqueued read is removal.
+        absent=$((absent + 1))
+        if [ "$absent" -lt 2 ]; then
+          log "PR #$pr not visible in the merge queue; rechecking before reporting removal"
+        else
+          report_queue_failure
+          die "$EXIT_RED" "PR #$pr removed from merge queue; not merged"
+        fi
       fi
     else
       log "GitHub queue API read failed; continuing to wait"
