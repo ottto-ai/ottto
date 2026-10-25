@@ -8493,6 +8493,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         .into_iter()
         .collect::<Vec<_>>();
     stats.candidate_root_count = usage_roots.len();
+    let request_owned_enabled = crate::snapshots::claude_request_money::e2::enabled();
     let mut identity_unhealthy_roots = BTreeSet::new();
     let usage_roots = usage_roots
         .into_iter()
@@ -8511,7 +8512,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
                 full_rearm_evidence_complete = false;
-                if emission_permitted {
+                if emission_permitted || request_owned_enabled {
                     identity_unhealthy_roots.insert(session_id.clone());
                 }
             }
@@ -8564,7 +8565,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
-            if emission_permitted {
+            if emission_permitted || request_owned_enabled {
                 identity_unhealthy_roots.insert(root_session_id);
             }
             continue;
@@ -8609,6 +8610,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         &trace_report,
         index,
     );
+    if request_owned_enabled {
+        // Reuse the per-root read verdict before identity consumes it. Missing
+        // sidecars are ordinary absence; partial pairs and failed strict reads
+        // hold only that root's permitted owed history through the existing seam.
+        index.hold_claude_history_for_unhealthy_telemetry_roots(&identity_unhealthy_roots);
+    }
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -8664,6 +8671,21 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         },
     );
     disposition.hold_request_owned(withheld);
+    if request_owned_enabled {
+        for item in &mut scan_result.snapshots {
+            if let Some(root) =
+                crate::snapshots::claude_request_money::request_owned_family_root(item)
+            {
+                // API attachment alone cannot certify side-call coverage. The
+                // aggregate admits a root only after BOTH strict reads succeed.
+                if !api_report.evidence.contains_key(root)
+                    || !trace_report.evidence.contains_key(root)
+                {
+                    item.telemetry_owned_complete = Some(false);
+                }
+            }
+        }
+    }
     if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
         // No owed history file settles on estimates because this page could
         // not read telemetry: the emission seam drops its bodies, keeps its
