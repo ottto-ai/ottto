@@ -4927,7 +4927,7 @@ fn claude_fence_closed_retry_carry(
         // is not required as an affirmative OTEL/request witness for a body.
         status.1 |= index
             .claude_request_census
-            .get(index_key)
+            .retry_carry_record(index_key)
             .is_some_and(|record| {
                 !(record.current_for(&entry.source_file_fingerprint)
                     || idless && record.idless_native_for(&entry.source_file_fingerprint))

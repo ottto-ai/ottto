@@ -784,6 +784,14 @@ impl ClaudeRequestCensus {
             .filter(|record| !record.is_birth_stub())
     }
 
+    /// Retry carry must see retained invalidation stubs as negative evidence.
+    /// An absent census is allowed for an accepted upload body, but a stub
+    /// left by selected restore or failed finish must not look absent. This
+    /// exposes no positive proof and leaves ordinary census readers unchanged.
+    pub(super) fn retry_carry_record(&self, key: &str) -> Option<&ClaudeRequestCensusRecord> {
+        self.records.get(key)
+    }
+
     /// Every record; birth stubs are skipped.
     pub(crate) fn records(&self) -> impl Iterator<Item = (&String, &ClaudeRequestCensusRecord)> {
         self.records

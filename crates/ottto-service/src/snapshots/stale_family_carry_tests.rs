@@ -2261,6 +2261,11 @@ fn scoped_retry_accept_member(index: &mut ScanIndex, key: &str) -> CandidateFile
             "fp": entry.source_file_fingerprint,
             "w": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
             "s": "exact", "h": "0000000000000001",
+            // Native opened-file records retain birth through invalidation.
+            // Without birth the existing invalidator removes the record, so
+            // that fixture would test allowed absence instead of damage.
+            "bi": rfc3339_unix_seconds(CARRY_FAILED).unwrap(),
+            "bd": 1, "bn": 1,
         }),
     );
     index.claude_request_census.insert(key.to_string(), record);
@@ -2722,6 +2727,7 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
         "mismatched_ack",
         "missing_record",
         "damaged_record",
+        "damaged_record_after_reload",
         "old_version",
         "record_revision",
         "identity_incomplete",
@@ -2769,10 +2775,25 @@ fn scoped_unhealthy_retry_refuses_missing_mismatched_or_incomplete_family_eviden
                     .last_snapshot_fingerprint = Some("other-head".into())
             }
             "missing_record" => fixture.index.claude_request_census.remove(&key),
-            "damaged_record" => fixture
-                .index
-                .claude_request_census
-                .invalidate_keeping_birth(&key),
+            "damaged_record" | "damaged_record_after_reload" => {
+                fixture
+                    .index
+                    .claude_request_census
+                    .invalidate_keeping_birth(&key);
+                assert!(fixture.index.claude_request_census.get(&key).is_none());
+                assert!(fixture
+                    .index
+                    .claude_request_census
+                    .retry_carry_record(&key)
+                    .unwrap()
+                    .is_birth_stub());
+                if case == "damaged_record_after_reload" {
+                    fixture.index.claude_request_census = serde_json::from_slice(
+                        &serde_json::to_vec(&fixture.index.claude_request_census).unwrap(),
+                    )
+                    .unwrap();
+                }
+            }
             "scan_version" => {
                 fixture
                     .index
