@@ -449,19 +449,12 @@ pub(crate) fn capture_armed(path: &Path) -> Option<PathBuf> {
     if SHADOW_PANICKED.load(Ordering::Acquire) {
         return None;
     }
-    // Production has one scope. Refuse before the off-map mutex or any
-    // scope construction; tests check their borrowed scope before cloning it.
-    #[cfg(not(test))]
-    if capture::page_exhausted(Path::new("")) {
-        return None;
-    }
     #[cfg(test)]
     let scope = SHADOW_ENABLED_FOR_TEST
         .lock()
         .expect("shadow control")
         .iter()
         .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
-        .filter(|dir| !capture::page_exhausted(dir))
         .cloned();
     #[cfg(not(test))]
     let scope = {

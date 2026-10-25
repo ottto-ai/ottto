@@ -87,6 +87,28 @@ pub(super) fn page_exhausted(scope: &Path) -> bool {
     }
 }
 
+/// Check before arming (which locks and, in tests, clones the scope).
+/// Arming and plan eligibility stay independent of the current page's work:
+/// the next-page finalizer probe selects its inputs before resetting Work.
+fn page_exhausted_for_file(path: &Path) -> bool {
+    #[cfg(not(test))]
+    {
+        let _ = path;
+        PAGE_EXHAUSTED.load(Ordering::Acquire)
+    }
+    #[cfg(test)]
+    {
+        super::SHADOW_ENABLED_FOR_TEST
+            .lock()
+            .map_or(true, |scopes| {
+                scopes
+                    .iter()
+                    .find(|dir| dir.parent().is_some_and(|base| path.starts_with(base)))
+                    .is_some_and(|scope| page_exhausted(scope))
+            })
+    }
+}
+
 /// After a cold page, focus the next Full parse on the oldest 64 family
 /// turns. Gating optional capture leaves native file/finalizer order alone.
 /// All members of a chosen family remain eligible, within the original caps.
@@ -770,6 +792,9 @@ impl ClaudeResponseCapture {
     /// A capture for the Claude file at `path`, or None when the shadow is
     /// not armed for it.
     pub(crate) fn begin(path: &Path) -> Option<Self> {
+        if page_exhausted_for_file(path) {
+            return None;
+        }
         let started = Instant::now();
         let mut scope = None;
         super::guarded(|| scope = super::capture_armed(path));
@@ -1283,8 +1308,8 @@ pub(crate) fn planned_families_for_test(
         })
 }
 
-/// Whether `begin` would capture `path` now (its scope armed and its plan
-/// allowing the family), without spending capture work.
+/// Whether the scope is armed and its plan allows `path` on the next native
+/// page, independent of the current page's spent capture work.
 #[cfg(test)]
 pub(crate) fn capture_eligible_for_test(path: &Path) -> bool {
     super::capture_armed(path).is_some_and(|scope| capture_eligible(&scope, path))
@@ -2071,6 +2096,10 @@ mod bounded_tests {
         assert_eq!(capture.request_hash("exhaust"), None);
         assert!(capture.is_refused());
         assert!(page_exhausted(&scope));
+        assert!(
+            capture_eligible_for_test(&path),
+            "next-page plan eligibility ignores the current page's spent work"
+        );
         let timers = TIMER_CONSTRUCTIONS.with(std::cell::Cell::get);
         let work = work_for_test(&scope);
         let (_, allocations) = crate::retry_allocation_probe::measure_caller_thread(|| {
