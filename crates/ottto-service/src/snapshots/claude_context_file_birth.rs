@@ -277,10 +277,12 @@ impl ClaudeFileBirth {
         timestamp: Option<&str>,
     ) {
         self.all_response_writers.observe(version);
-        let own = self
-            .physical_birth_nanos()
-            .zip(timestamp.and_then(rfc3339_unix_nanos))
-            .is_some_and(|(birth, at)| at >= birth - super::claude_request_money::e2::SLACK);
+        // An untimed response cannot prove it belongs to the copied prefix;
+        // include its writer conservatively among possible own responses.
+        let at = timestamp.and_then(rfc3339_unix_nanos);
+        let own = self.physical_birth_nanos().is_some_and(|birth| {
+            at.is_none_or(|at| at >= birth - super::claude_request_money::e2::SLACK)
+        });
         if own {
             self.writer.observe(version);
         }

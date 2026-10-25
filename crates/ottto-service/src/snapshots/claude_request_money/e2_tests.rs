@@ -1057,14 +1057,24 @@ fn without_version(mut value: Value) -> Value {
 fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
     let path = root_file("missing-writer");
     let index = ScanIndex::default();
-    for order in [0, 1, 2] {
+    for order in [0, 1, 2, 3, 4] {
         let prefix = line("prefix", &at(-100), 10);
         let a = line("a", &at(1), 20);
         let b = line("b", &at(2), 30);
         let lines = match order {
             0 => vec![prefix, without_version(a)],
             1 => vec![prefix, without_version(a), b],
-            _ => vec![prefix, a, without_version(b)],
+            2 => vec![prefix, a, without_version(b)],
+            3 => {
+                let mut missing = without_version(a);
+                missing.as_object_mut().unwrap().remove("timestamp");
+                vec![prefix, missing, b]
+            }
+            _ => {
+                let mut missing = without_version(b);
+                missing.as_object_mut().unwrap().remove("timestamp");
+                vec![prefix, a, missing]
+            }
         };
         let item = parse(&path, Some(t0()), &index, &lines);
         assert_eq!(fold(&item).entity.removed_requests, 0);
