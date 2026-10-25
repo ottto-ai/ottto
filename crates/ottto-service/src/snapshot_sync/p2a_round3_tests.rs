@@ -3587,7 +3587,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     for _ in 0..items.len() {
         // Save only real ACKs through the selected-index barrier before reusing
         // either manifest or shared-control admission in another source turn.
-        let selected = items
+        let mut selected = items
             .iter()
             .filter(|item| {
                 progress
@@ -3597,7 +3597,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
             })
             .cloned()
             .collect::<Vec<_>>();
-        money::finalize_synthetic(&mut index, &selected);
+        money::finalize_synthetic(&mut index, &mut selected);
         index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         index.save(&control.index_path).unwrap();
         unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
