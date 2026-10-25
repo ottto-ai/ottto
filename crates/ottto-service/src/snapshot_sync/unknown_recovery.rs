@@ -1353,6 +1353,12 @@ pub(super) fn resolve_saved(
     let Some(catalog) = catalogs.get_mut(support) else {
         return Ok(());
     };
+    if catalog.loading.is_some() {
+        return Err(capacity_full());
+    }
+    let _staging =
+        money::ShadowReservation::admit(4 * ACTIVE_MAX * MANIFEST_MAX).ok_or_else(capacity_full)?;
+    let mut resolved = Vec::new();
     for m in &mut catalog.entries {
         let selected_outcomes = m.entities.iter().all(|entity| {
             selected.accepted_snapshot_fingerprint_recorded(&entity.fingerprint)
@@ -1409,16 +1415,24 @@ pub(super) fn resolve_saved(
         if m.terminal.is_none() && m.ack_saved && (selected_outcomes || superseded_body_selected) {
             // This mark follows ACK/selected saves and the original matching
             // money debt handoff. Known outcomes need no unresolved receipt.
-            m.terminal = Some(Reason::Resolved);
-            m.not_before = now;
-            let ticket = outcome_ticket(support, m.clone(), Some(Reason::Resolved), now)?;
-            OUTCOMES
-                .lock()
-                .map_err(|_| fault())?
-                .entry(support.to_path_buf())
-                .or_default()
-                .push(ticket);
+            let mut marked = m.clone();
+            marked.terminal = Some(Reason::Resolved);
+            marked.not_before = now;
+            resolved.push(marked);
         }
+    }
+    if !resolved.is_empty() {
+        // One bounded writer operation for the whole selected-save barrier.
+        // Reserving a full I/O scratch budget for every tiny marker at once
+        // could exhaust memory before a full catalog could retire. No mark is
+        // published in memory until the admitted writer result is consumed.
+        let root = dir(support);
+        catalog.loading = Some(catalog_job(move || {
+            for manifest in resolved {
+                write_manifest(&root, &manifest)?;
+            }
+            load(&root)
+        })?);
     }
     Ok(())
 }
