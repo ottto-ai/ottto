@@ -361,11 +361,7 @@ impl HeaderInventory {
     pub(super) fn groups(&self) -> BTreeMap<String, Group> {
         let mut groups = BTreeMap::<String, Group>::new();
         for header in &self.headers {
-            let key = sha256_hex(&[
-                "codex_file_group:v1",
-                &local_index_key(&header.home),
-                &header.owner,
-            ]);
+            let key = sha256_hex(&["codex_file_group:v1", &header.owner]);
             groups
                 .entry(key)
                 .or_insert_with(|| Group {
@@ -448,10 +444,12 @@ impl Validation {
         let mut homes = BTreeMap::<PathBuf, BTreeSet<String>>::new();
         for group in &self.groups {
             if owners.contains(&group.owner) {
-                homes
-                    .entry(group.home.clone())
-                    .or_default()
-                    .insert(group.owner.clone());
+                for member in &group.members {
+                    homes
+                        .entry(member_home(&member.scan_root))
+                        .or_default()
+                        .insert(group.owner.clone());
+                }
             }
         }
         // One fresh roster check per home/boundary, independent of group count.
