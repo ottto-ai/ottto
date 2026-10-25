@@ -765,7 +765,7 @@ fn decoded_request_body(request: &HttpRequest) -> Option<std::borrow::Cow<'_, [u
         None | Some("") | Some("identity") => Some(std::borrow::Cow::Borrowed(&request.body)),
         Some("gzip") => {
             let mut inflated = Vec::new();
-            flate2::read::GzDecoder::new(request.body.as_slice())
+            flate2::read::MultiGzDecoder::new(request.body.as_slice())
                 .take(MAX_OTLP_BODY_BYTES as u64 + 1)
                 .read_to_end(&mut inflated)
                 .ok()?;
