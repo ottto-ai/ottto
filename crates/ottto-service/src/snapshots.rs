@@ -5365,7 +5365,13 @@ pub(crate) fn claude_stale_family_carry_refund_uncarries_for_test() -> usize {
 /// leaves the carry. That is BASE exactly while the walk has passed none of
 /// its members. Returns false when the walk had passed one, so the caller
 /// starts the traversal again and the uncarry precedes every pass.
-fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
+fn refund_claude_stale_family_carry(
+    index: &mut ScanIndex,
+    source: SnapshotSource,
+    plan_clock: &str,
+    context_fingerprint: &str,
+    version_changed: bool,
+) -> bool {
     let carry = &index.claude_stale_family_carry;
     if carry.roots.is_empty() && carry.capped_roots.is_empty() {
         return true;
@@ -5404,6 +5410,21 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
         })
     });
     let roots_count = carry.roots.union(&carry.capped_roots).count();
+    // Refused funding expands the actual re-arm set on a resumed page too.
+    // Refresh before clearing, retaining runtime observations for this window.
+    // Move the existing carry briefly instead of allocating another root set;
+    // restore its replay and provenance unchanged after the existing uncarry.
+    let mut carry = std::mem::take(&mut index.claude_stale_family_carry);
+    index.reread_plan_for_rearms(
+        source,
+        plan_clock,
+        context_fingerprint,
+        version_changed,
+        |key| {
+            claude_index_path_member_ref(Path::new(key))
+                .is_some_and(|member| carry.contains(member.root))
+        },
+    );
     let mut rearmed = 0_usize;
     for (index_key, entry) in &mut index.files {
         if claude_index_path_member_ref(Path::new(index_key))
@@ -5414,8 +5435,9 @@ fn refund_claude_stale_family_carry(index: &mut ScanIndex) -> bool {
             rearmed += 1;
         }
     }
-    index.claude_stale_family_carry.capped_roots.clear();
-    index.claude_stale_family_carry.roots.clear();
+    carry.capped_roots.clear();
+    carry.roots.clear();
+    index.claude_stale_family_carry = carry;
     CLAUDE_STALE_FAMILY_CARRY_REFUND_UNCARRIES
         .fetch_add(roots_count, std::sync::atomic::Ordering::Relaxed);
     #[cfg(test)]
@@ -37869,7 +37891,13 @@ fn ensure_bounded_traversal(
         // carry's replay buffer is funded again; a carry that cannot be is
         // uncarried, and if the walk already passed one of its members the
         // traversal starts again so the uncarry precedes every pass.
-        if !refund_claude_stale_family_carry(index) {
+        if !refund_claude_stale_family_carry(
+            index,
+            source,
+            &plan_clock,
+            &context_fingerprint,
+            plan_revision_changed,
+        ) {
             index.traversal = None;
             ensure_bounded_traversal(source, roots, index, collected_at, backfill_window_days);
         }

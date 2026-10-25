@@ -1206,6 +1206,56 @@ fn carry_resumed_index(base: bool, passed: bool) -> ScanIndex {
     carry_reload(index)
 }
 
+/// Exercise the refund observer even where native carry funding is unavailable.
+#[test]
+fn unfunded_replay_refreshes_the_plan_before_clearing_on_every_platform() {
+    let mut fix = carry_index();
+    fix.claude_stale_family_carry
+        .roots
+        .insert(CARRY_ROOT.to_owned());
+    let context = fix.traversal.as_ref().unwrap().context_fingerprint.clone();
+    fix.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        CARRY_FAILED,
+        &context,
+        false,
+        |_| false,
+    );
+    let mut base = fix.clone();
+    for key in carry_family_keys() {
+        base.files
+            .get_mut(&key)
+            .unwrap()
+            .source_file_fingerprint
+            .clear();
+    }
+    base.claude_stale_family_carry.roots.clear();
+    base.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        CARRY_FAILED,
+        &context,
+        false,
+        |_| false,
+    );
+    {
+        let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+        assert!(refund_claude_stale_family_carry(
+            &mut fix,
+            SnapshotSource::ClaudeCode,
+            CARRY_FAILED,
+            &context,
+            false,
+        ));
+    }
+    let fix_value = serde_json::to_value(&fix).unwrap();
+    assert_eq!(
+        fix_value["reread_guard"]["tripwire"]["cause_counts"]
+            [CandidateParseReason::Rearmed as usize],
+        2
+    );
+    assert_eq!(fix_value, serde_json::to_value(&base).unwrap());
+}
+
 /// R1, re-funding refused at a reload before the walk passed any member: the
 /// family is uncarried in place, every member's revision cleared, and the
 /// index equals a real BASE arm resumed the same way, apart from the carried

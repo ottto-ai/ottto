@@ -11,3 +11,5 @@ Validation includes the unchanged independent pipeline acceptance test, no-OTEL 
 Retry carry inspects retained census invalidation stubs as negative evidence, even though ordinary census readers hide them. Accepted bodies with no census record remain eligible; selected-restore and failed-finish stubs refuse carry before and after reload. The stub lookup changes no decoder, persisted field, ACK, binding or proof behavior.
 
 The observe-only re-read guard plans stale-request work from the final funded re-arm set, excluding carried and capped families. It refreshes a preliminary same-window plan before fingerprint clears, preserving independent context, witness and version obligations and runtime counters. Invalid-origin carry disposal plans its actual roots and replay-only keys; instrumentation does not change selection or enable enforcement.
+
+When replay funding fails on a resumed page, the observer refreshes the plan before the existing uncarry clears fingerprints. This keeps the planned causes aligned with the expanded re-arm set and with BASE, without changing cancellation, replay or selection.
