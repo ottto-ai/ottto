@@ -7595,7 +7595,16 @@ async fn finish_sync_source_resume(
         }
         Ok(ResumableUploadResult::Shed { retry_after }) => {
             let first_shed = Instant::now();
+            let named_retry_after = retry_after;
             let retry_after = note_shed_and_backoff(source, retry_after);
+            // Immutable recovery preserves raw Retry-After, which may exceed
+            // the ordinary transport's freshness cap. It must not reopen other
+            // live Claude POSTs before that server boundary either.
+            let retry_after = if recovery_binding.is_some() {
+                retry_after.max(named_retry_after.unwrap_or_default())
+            } else {
+                retry_after
+            };
             defer_source_uploads(source, retry_after);
             let mut checkpoint_succeeded = true;
             let side_mark = codex_side_save_mark(daemon, source, &index_path);

@@ -1625,15 +1625,21 @@ pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()
         return Err(fault());
     };
     let lineage = m.lineage.clone();
-    std::future::poll_fn(
-        |_| match money::recovery_reserve_receipt(support, &lineage) {
-            money::MoneyReceipt::Ready => std::task::Poll::Ready(Ok(())),
-            money::MoneyReceipt::Pending => std::task::Poll::Pending,
-            money::MoneyReceipt::Refused => std::task::Poll::Ready(Err(fault())),
-        },
-    )
-    .await
-    .inspect_err(|error| faulted(support, error))?;
+    let reserved =
+        std::future::poll_fn(
+            |_| match money::recovery_reserve_receipt(support, &lineage) {
+                money::RecoveryAdmission::Ready => std::task::Poll::Ready(Ok(true)),
+                money::RecoveryAdmission::Full => std::task::Poll::Ready(Ok(false)),
+                money::RecoveryAdmission::Pending => std::task::Poll::Pending,
+                money::RecoveryAdmission::Refused => std::task::Poll::Ready(Err(fault())),
+            },
+        )
+        .await
+        .inspect_err(|error| faulted(support, error))?;
+    if !reserved {
+        *state = SendState::Capacity;
+        return Ok(());
+    }
     let prepared = match capture_ticket(support, m, body, funds) {
         Ok(ticket) => wait(ticket).await,
         Err(error) => Err(error),

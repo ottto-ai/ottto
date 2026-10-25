@@ -4270,8 +4270,35 @@ pub(crate) fn recovery_finish_receipt(
     store::checkpoint_receipt(support, &mut ledger)
 }
 
-pub(crate) fn recovery_reserve_receipt(support: &Path, lineage: &str) -> MoneyReceipt {
-    recovery_latch_receipt(support, lineage, None)
+pub(crate) enum RecoveryAdmission {
+    Ready,
+    Pending,
+    Full,
+    Refused,
+}
+
+pub(crate) fn recovery_reserve_receipt(support: &Path, lineage: &str) -> RecoveryAdmission {
+    let mut ledger = match store::acquire(support) {
+        ClaudeLedgerAcquire::Ready(ledger) => ledger,
+        ClaudeLedgerAcquire::Loading => return RecoveryAdmission::Pending,
+        ClaudeLedgerAcquire::Unavailable => return RecoveryAdmission::Refused,
+    };
+    let key = format!("adopt:entity:recovery-release:{lineage}");
+    if ledger.get(&key).is_none()
+        && !ledger.put_money(
+            key,
+            ClaudeRequestCensusRecord::money_debt(Sha256::digest(lineage.as_bytes()).into(), 0),
+        )
+    {
+        // No field was changed: ordinary bounded control admission, not a
+        // failed durable latch commit. Other source controls keep their slots.
+        return RecoveryAdmission::Full;
+    }
+    match store::checkpoint_receipt(support, &mut ledger) {
+        MoneyReceipt::Ready => RecoveryAdmission::Ready,
+        MoneyReceipt::Pending => RecoveryAdmission::Pending,
+        MoneyReceipt::Refused => RecoveryAdmission::Refused,
+    }
 }
 
 fn recovery_latch_receipt(support: &Path, lineage: &str, released: Option<u64>) -> MoneyReceipt {
