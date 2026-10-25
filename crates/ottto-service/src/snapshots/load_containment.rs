@@ -968,7 +968,7 @@ impl ScanIndex {
             .sum::<usize>()
             .saturating_add(self.claude_history_emission.skipped_carried_entries);
         emit_scan_index_containment_line(format!(
-            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} carried_ack_pending_age_seconds={age} {}",
+            "local snapshot census: source={} census_complete={} retained_carried_entries={retained_carried} history_held_carried_entries={history_held_carried} {} carried_ack_pending_age_seconds={age}",
             source.api_slug(), census_complete, self.reread_guard.disclosure()
         ));
     }

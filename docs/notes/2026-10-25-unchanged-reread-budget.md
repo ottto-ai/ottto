@@ -30,6 +30,15 @@ monotonic hours; restart cannot reuse a ticket. An additional hour in the
 retention window covers hour rounding. Ordinary page reservations are saved
 together through the committed index before reads resume. The save publishes
 negative scheduling evidence, never uncommitted scan output or authority.
+A production reader without that committed-index save handoff refuses unchanged
+rereads; volatile in-memory tickets are test-only.
+
+Replay still removes its ordinary delivery entries. A separate hash-keyed
+negative physical witness keeps those old files subject to selection admission;
+recording a replacement retires that detached witness. No ACK or binding is
+carried in this scheduling metadata. The root budget field is appended to the
+persisted field registry to preserve older positional encodings, and omitted
+when empty.
 
 The compiled `ReplayGrant { revision }` list is empty. An explicitly approved
 revision can grant one persisted additional read per file, including through a

@@ -76,13 +76,25 @@ thread_local! {
         const { RefCell::new((None, Vec::new())) };
 }
 pub(crate) fn rotation_budget() -> usize {
-    ROTATION.with(|state| state.borrow().0.unwrap_or(crate::source_rotation::PARKED_BUDGET))
+    ROTATION.with(|state| {
+        state
+            .borrow()
+            .0
+            .unwrap_or(crate::source_rotation::PARKED_BUDGET)
+    })
 }
-pub(crate) fn note_native_allowance(remaining: Option<usize>, needed: Option<usize>, granted: bool) {
+pub(crate) fn note_native_allowance(
+    remaining: Option<usize>,
+    needed: Option<usize>,
+    granted: bool,
+) {
     ROTATION.with(|state| state.borrow_mut().1.push((remaining, needed, granted)));
 }
 /// Run `collect` under `budget`; what the native allowance saw.
-fn with_rotation_budget<T>(budget: usize, collect: impl FnOnce() -> T) -> (T, Vec<NativeAllowance>) {
+fn with_rotation_budget<T>(
+    budget: usize,
+    collect: impl FnOnce() -> T,
+) -> (T, Vec<NativeAllowance>) {
     ROTATION.with(|state| *state.borrow_mut() = (Some(budget), Vec::new()));
     let collected = collect();
     let seen = ROTATION.with(|state| std::mem::take(&mut *state.borrow_mut()).1);
@@ -152,6 +164,7 @@ struct Finished {
 }
 
 fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) -> [Finished; 2] {
+    let _budget_clock = crate::snapshots::reread_guard::TestClock::at(current_unix_seconds());
     let fixture = IdentityPipelineHome::new();
     let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
     let cadence = IdentityPipelineCadence::new();
@@ -534,8 +547,9 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         })
         .unwrap()
         .expect("actual due preparation");
-        let ((mut preparation, index, scan), allowance) =
-            with_rotation_budget(budget, || collect_native_preparation_with_rotation(frame, false));
+        let ((mut preparation, index, scan), allowance) = with_rotation_budget(budget, || {
+            collect_native_preparation_with_rotation(frame, false)
+        });
         let (index, scan) = if shared {
             let (index, scan, started) = common
                 .entry((budget, conflict))
@@ -556,7 +570,11 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
         if arm == MoneyArm::BatchRefused {
             money::set_page_fault_for_test(money::PageFault::BatchRefused);
         }
-        let guard = Guard::new(false, conflict.then(|| index_path.clone()), Some(retry_clock));
+        let guard = Guard::new(
+            false,
+            conflict.then(|| index_path.clone()),
+            Some(retry_clock),
+        );
         let result = crate::agent_status_refresh::with_test_collection(collection(), || {
             finish_sync_source(
                 preparation,
@@ -617,7 +635,10 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
     assert!(populated.ok, "{populated:?}");
     money::store::flush();
     money::store::forget_for_test(&support);
-    assert!(support.join(money::store::LEDGER_DIR).join("meta.json").is_file());
+    assert!(support
+        .join(money::store::LEDGER_DIR)
+        .join("meta.json")
+        .is_file());
     let transcript = fixture
         .home
         .join(".claude/projects/-synthetic-repo")
@@ -681,7 +702,11 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             MoneyArm::Unarmed => assert!(lines.is_empty()),
             MoneyArm::Armed => {
                 assert!(count("families") > 0, "{lines:?}");
-                assert_eq!(count("ledger_loading") + count("refused_budget"), 0, "{lines:?}");
+                assert_eq!(
+                    count("ledger_loading") + count("refused_budget"),
+                    0,
+                    "{lines:?}"
+                );
                 assert!(lines
                     .iter()
                     .all(|line| line["ledger"]["telemetry_records"].as_u64() > Some(0)));
@@ -697,13 +722,21 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
                 assert_eq!(count("coverage_complete"), 0, "{lines:?}");
             }
         }
-        assert_eq!(money::reserved_for_test(), 0, "{arm:?}: admission is released");
+        assert_eq!(
+            money::reserved_for_test(),
+            0,
+            "{arm:?}: admission is released"
+        );
         output
     };
 
     // The native comparison's exact need at the full budget, then a budget
     // that leaves exactly that, and one byte less.
-    let full = run(crate::source_rotation::PARKED_BUDGET, false, MoneyArm::Unarmed);
+    let full = run(
+        crate::source_rotation::PARKED_BUDGET,
+        false,
+        MoneyArm::Unarmed,
+    );
     let [(Some(remaining), Some(needed), true)] = full.allowance[..] else {
         panic!("one granted native allowance: {:?}", full.allowance);
     };
@@ -719,7 +752,11 @@ fn money_shadow_real_caller_parity_at_tight_allowances() {
             );
             assert_eq!(baseline.ok, !conflict, "{baseline:?}");
             let arms: &[MoneyArm] = if granted && !conflict {
-                &[MoneyArm::Armed, MoneyArm::ShadowRefused, MoneyArm::BatchRefused]
+                &[
+                    MoneyArm::Armed,
+                    MoneyArm::ShadowRefused,
+                    MoneyArm::BatchRefused,
+                ]
             } else {
                 &[MoneyArm::Armed]
             };

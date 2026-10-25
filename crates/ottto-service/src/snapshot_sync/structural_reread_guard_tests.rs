@@ -71,7 +71,7 @@ fn structural_reread_budget_bounds_healthy_files_across_all_triggers_for_seven_d
     let mut reads = BTreeMap::<String, usize>::new();
     let mut refusals = 0u64;
     let mut event_counts = [0usize; 9];
-    for tick in 0..28usize {
+    for tick in 0..=28usize {
         let elapsed_hours = tick * 6 + 1;
         clock.set(start + elapsed_hours as u64 * 3600);
         let day = 2 + (8 + elapsed_hours) / 24;

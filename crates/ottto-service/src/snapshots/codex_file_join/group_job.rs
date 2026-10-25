@@ -193,6 +193,7 @@ pub(in crate::snapshots) enum Boot {
 /// Pre-job group state; one unit of work per scan step.
 pub(in crate::snapshots) struct GroupBoot {
     reread_members_admitted: BTreeSet<String>,
+    reread_tickets: BTreeMap<String, reread_guard::Ticket>,
     pub(in crate::snapshots) group: Group,
     pub(in crate::snapshots) key: String,
     identified: usize,
@@ -219,7 +220,7 @@ pub(in crate::snapshots) struct GroupBoot {
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
 }
-crate::heap_layout_bound::fields!(GroupBoot; reread_members_admitted, group, key, identified, stamps, headers, plan,
+crate::heap_layout_bound::fields!(GroupBoot; reread_tickets, reread_members_admitted, group, key, identified, stamps, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
     charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
@@ -249,6 +250,7 @@ impl GroupBoot {
         let evidence = codex_counting_version::members_evidence(&group.members, index);
         Self {
             reread_members_admitted: BTreeSet::new(),
+            reread_tickets: BTreeMap::new(),
             key: job_key(&group),
             group,
             identified: 0,
@@ -533,6 +535,7 @@ impl GroupBoot {
         let memo_digest = self.memo_digest(inputs.index, inputs.metadata);
         let dependencies = self.dependencies(inputs.metadata);
         let Self {
+            reread_tickets,
             group,
             key,
             stamps,
@@ -600,6 +603,7 @@ impl GroupBoot {
         )
         .map_err(|_| GroupEnd::Strict)?;
         parser.bind_reread(inputs.index, &first);
+        parser.reread_ticket = reread_tickets.get(&local_index_key(&first.path)).copied();
         let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
         join.begin_member(0);
@@ -632,6 +636,7 @@ impl GroupBoot {
             // U1a-2a: a group job is never a side read.
             side_origin: None,
             group: Some(Box::new(GroupJob {
+                reread_tickets,
                 key,
                 owner: group.owner,
                 home: group.home,
@@ -715,6 +720,7 @@ fn legacy_tee(
 
 /// The running group job, carried by its `OwnedActiveFile`.
 pub(in crate::snapshots) struct GroupJob {
+    reread_tickets: BTreeMap<String, reread_guard::Ticket>,
     pub(in crate::snapshots) key: String,
     pub(in crate::snapshots) owner: String,
     pub(in crate::snapshots) home: PathBuf,
@@ -750,7 +756,7 @@ pub(in crate::snapshots) struct GroupJob {
     /// input cumulatively, so a member swap needs no walk (R2-L3).
     pub(in crate::snapshots) consumed_before: u64,
 }
-crate::heap_layout_bound::fields!(GroupJob; key, owner, home, members, stamps, digests, current,
+crate::heap_layout_bound::fields!(GroupJob; reread_tickets, key, owner, home, members, stamps, digests, current,
     finished, previous_receipts, receipt_scope, legacy_expected, tee, legacy_baselines, lines,
     charge, probe_bound, probe_limit_bound, own_page, dependencies, memo_digest, scope, walked,
     consumed_before);
@@ -1164,6 +1170,10 @@ fn open_member(
     let parser = &mut active.parser;
     parser.reader = BoundedJsonlReader::new(OpenedInput::plain(file), jsonl_line_cap(), true);
     parser.bind_reread(inputs.index, &member);
+    parser.reread_ticket = group
+        .reread_tickets
+        .get(&local_index_key(&member.path))
+        .copied();
     // Context inferred in one physical file must not price an unrelated
     // record at the beginning of another file.
     parser.accumulator.current_selector = SelectorCapture::default();
@@ -1357,11 +1367,7 @@ impl GroupBoot {
             if self.reread_members_admitted.contains(&key) {
                 continue;
             }
-            if index
-                .files
-                .get(&key)
-                .is_some_and(|entry| reread_guard::byte_unchanged(entry, member))
-            {
+            if index.reread_unchanged_candidate(member) {
                 let reason = index.candidate_decision_with_reason(member).1;
                 match index.admit_unchanged_reread(&key, reason, reread_guard::now()) {
                     reread_guard::Admission::Refuse => return reread_guard::GroupAdmission::Refuse,
@@ -1369,7 +1375,9 @@ impl GroupBoot {
                         awaiting_save = true;
                         continue;
                     }
-                    reread_guard::Admission::Admit(_) => {}
+                    reread_guard::Admission::Admit(ticket) => {
+                        self.reread_tickets.insert(key.clone(), ticket);
+                    }
                 }
             } else if index
                 .files
@@ -1385,5 +1393,20 @@ impl GroupBoot {
         } else {
             reread_guard::GroupAdmission::Ready
         }
+    }
+}
+
+#[cfg(test)]
+impl GroupBoot {
+    pub(in crate::snapshots) fn admit_for_test(&mut self, index: &ScanIndex) {
+        let mut selection = index.clone();
+        selection.reread_guard.require_test_memory_tickets();
+        assert!(
+            matches!(
+                self.admit_rereads(&mut selection),
+                reread_guard::GroupAdmission::Ready
+            ),
+            "unit group driver needs ordinary Admit tickets"
+        );
     }
 }

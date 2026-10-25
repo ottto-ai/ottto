@@ -424,3 +424,125 @@ fn indexed_full_read_without_an_admit_ticket_panics() {
         .unwrap();
     assert!(matches!(mode, ReadMode::Full(_)));
 }
+
+#[test]
+fn replay_removes_delivery_entries_but_cannot_masquerade_as_a_new_file() {
+    let f = Fixture::new();
+    let _clock = TestClock::at(WALL);
+    let (mut index, candidate) = f.indexed();
+    let key = local_index_key(&candidate.path);
+    for _ in 0..2 {
+        assert!(matches!(
+            index.admit_unchanged_reread(&key, None, WALL),
+            Admission::Admit(_)
+        ));
+    }
+    index.prepare_historical_replay("unapproved-fixture-replay".into());
+    assert!(
+        !index.files.contains_key(&key),
+        "delivery reset preserves its existing membership contract"
+    );
+    assert!(
+        index.reread_unchanged_candidate(&candidate),
+        "the last proven physical read remains known"
+    );
+    assert!(matches!(
+        index.admit_unchanged_reread(&key, Some(CandidateParseReason::NewFile), WALL),
+        Admission::Refuse
+    ));
+    let mut changed = candidate.clone();
+    changed.size_bytes += 1;
+    assert!(
+        !index.reread_unchanged_candidate(&changed),
+        "new bytes remain exempt"
+    );
+    index.record(
+        candidate,
+        Some("accepted-next-body".into()),
+        ScanParseOutcome::Snapshot,
+    );
+    assert!(
+        index.reread_guard.replay_witnesses.is_empty(),
+        "a new record replaces detached negative metadata"
+    );
+}
+
+#[test]
+fn scoped_test_override_is_bounded_and_restores_strict_admission() {
+    let mut state = State::default();
+    assert!(admit(&mut state, "key", WALL));
+    assert!(admit(&mut state, "key", WALL));
+    assert!(!admit(&mut state, "key", WALL));
+    {
+        let _allowance = TestBudgetOverride::new("test-only allowance itself is bounded", 1);
+        assert!(admit(&mut state, "key", WALL));
+        assert!(!admit(&mut state, "key", WALL));
+    }
+    assert!(!admit(&mut state, "key", WALL));
+}
+
+#[test]
+fn growth_full_reads_are_counted_without_spending_or_refusing_budget() {
+    let _clock = TestClock::at(WALL);
+    let mut state = State::default();
+    for _ in 0..40 {
+        state.note_growth_full("growing-key");
+    }
+    assert_eq!(state.growth_full[&KeyHash::of("growing-key")][1], 40);
+    assert!(state.attempts.is_empty());
+    assert_eq!(state.refused, [0; CAUSES]);
+}
+
+#[test]
+#[should_panic(expected = "byte-unchanged indexed Full read requires an Admit ticket")]
+fn indexed_full_reader_cannot_recover_an_earlier_claimed_ticket() {
+    let f = Fixture::new();
+    let _clock = TestClock::at(WALL);
+    let (mut index, candidate) = f.indexed();
+    let key = local_index_key(&candidate.path);
+    assert!(matches!(
+        index.admit_unchanged_reread(&key, None, WALL),
+        Admission::Admit(_)
+    ));
+    let mut parser = sampled_scan::new_source_parser(
+        File::open(&f.path).unwrap(),
+        &candidate,
+        SnapshotSource::ClaudeCode,
+        &CodexTitleMetadata::default(),
+        None,
+        None,
+        false,
+        false,
+        false,
+        &index,
+    )
+    .unwrap();
+    let _ = parser.prepare_acquisition(None, &Scope("new-reader".into()), None, WALL);
+}
+
+#[test]
+fn partial_save_keeps_the_negative_physical_witness_without_a_delivery_entry() {
+    let f = Fixture::new();
+    let _clock = TestClock::at(WALL);
+    let (mut index, candidate) = f.indexed();
+    let key = local_index_key(&candidate.path);
+    for _ in 0..2 {
+        assert!(matches!(
+            index.admit_unchanged_reread(&key, None, WALL),
+            Admission::Admit(_)
+        ));
+    }
+    let mut subset =
+        index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
+    assert!(!subset.files.contains_key(&key));
+    assert!(subset.reread_unchanged_candidate(&candidate));
+    assert!(matches!(
+        subset.admit_unchanged_reread(&key, Some(CandidateParseReason::NewFile), WALL),
+        Admission::Refuse
+    ));
+    subset.reread_guard.prune_on_load(WALL + 183 * 3600);
+    assert!(
+        subset.reread_guard.replay_witnesses.is_empty(),
+        "detached metadata remains bounded by the read window"
+    );
+}

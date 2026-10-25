@@ -1591,6 +1591,7 @@ pub(super) mod tests {
             }
         }
         let metadata = CodexTitleMetadata::default();
+        boot.admit_for_test(index);
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
@@ -2099,6 +2100,8 @@ pub(super) mod tests {
     }
     #[test]
     fn applied_priority_survives_trace_expiry_without_pricing_appended_same_turn() {
+        let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
+        "Synthetic joined-priority receipt history deliberately replays unchanged members while trace evidence changes", 16);
         let (root, inventory) = fixture();
         let owner = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
         let turn = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
@@ -3737,6 +3740,7 @@ pub(super) mod tests {
             )
             .unwrap();
         }
+        boot.admit_for_test(&previous);
         let mut job = boot
             .into_job(JobInputs {
                 metadata: &metadata,

@@ -3083,8 +3083,6 @@ pub struct ScanIndex {
     pub schema_version: u16,
     #[serde(default)]
     pub generation: u64,
-    #[serde(default)]
-    reread_guard: reread_guard::State,
     /// The exact privacy/attribution context under which every settled entity
     /// fingerprint in this index was produced. A policy transition keeps the
     /// policy-neutral entity identity but must force one complete correction
@@ -3585,6 +3583,8 @@ pub struct ScanIndex {
         deserialize_with = "deserialize_lenient_default"
     )]
     accepted_rebuild_last_alarm_unix_seconds: Option<u64>,
+    #[serde(default)]
+    reread_guard: reread_guard::State,
     /// Runtime-only, Claude only: what owed history does this cycle where no
     /// list is intended, set with the cutoff before scanning.
     #[serde(skip)]
@@ -23861,6 +23861,7 @@ impl OwnedSourceScan {
         let continuation = continuation.filter(|_| source == SnapshotSource::Codex);
         let resource_probe = crate::local_resource_diagnostics::Probe::start();
         let index = &mut owned_index;
+        index.reread_guard.begin_selection();
         index.activate_quarantine_witness(source);
         let backfill_window_days = effective_backfill_window_days(requested_backfill_window_days);
         let codex_title_metadata = if source == SnapshotSource::Codex {
@@ -25735,6 +25736,7 @@ impl OwnedSourceScan {
                         .files
                         .get(&acquisition.key)
                         .and_then(|entry| entry.audit_obligation(sampled_scan::now_seconds()));
+                    parser.reread_ticket = active.parser.reread_ticket;
                     let Ok(mode) = parser.prepare_acquisition(
                         None,
                         &acquisition.scope,
@@ -25745,6 +25747,14 @@ impl OwnedSourceScan {
                         pending!();
                     };
                     acquisition.mode = mode;
+                    if index
+                        .files
+                        .get(&acquisition.key)
+                        .is_some_and(|entry| active.candidate.size_bytes > entry.size_bytes)
+                    {
+                        index.reread_guard.note_growth_full(&acquisition.key);
+                    }
+
                     if let Some(context) = sampling.as_mut() {
                         context.priority_replays += 1;
                         context.record_mode(mode, acquisition.audit_due);
@@ -28705,10 +28715,7 @@ impl OwnedSourceScan {
                         decision,
                         CandidateDecision::Parse | CandidateDecision::ReconcileLegacy
                     )
-                    && index
-                        .files
-                        .get(&local_index_key(&candidate.path))
-                        .is_some_and(|entry| reread_guard::byte_unchanged(entry, &candidate))
+                    && index.reread_unchanged_candidate(&candidate)
                 {
                     match index.admit_unchanged_reread(
                         &local_index_key(&candidate.path),
@@ -37551,13 +37558,13 @@ fn ensure_bounded_traversal(
         // stale-pending re-arm below; only an active walk needs rewinding.
         if !retained.is_empty() && index.traversal.is_some() {
             for (key, entry) in &mut index.files {
-                if claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
-                    retained.roots.contains(member.root)
-                        || retained.capped_roots.contains(member.root)
-                }) {
-                    if !plan_held {
-                        entry.source_file_fingerprint.clear();
-                    }
+                if !plan_held
+                    && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                        retained.roots.contains(member.root)
+                            || retained.capped_roots.contains(member.root)
+                    })
+                {
+                    entry.source_file_fingerprint.clear();
                 }
             }
             for candidate in &retained.replay {
@@ -38695,6 +38702,7 @@ fn reconcile_missing_index_entries_with_side(
                 .get(key)
                 .is_some_and(ScanIndexEntry::retain_history_evidence)
         {
+            index.remember_removed_read_witness(key);
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -41644,9 +41652,9 @@ impl ScanIndex {
         // Replay resets delivery authority, not file-owned recovery evidence.
         // Otherwise a missing member or expired trace can silently shrink or
         // reprice a previously joined contribution during ordinary replay.
-        // Retain physical read evidence across replay. Delivery authority is
-        // reset below; a parser revision is never a new physical file.
-
+        self.remember_replay_read_witnesses();
+        self.files
+            .retain(|_, entry| entry.retain_history_evidence());
         let active = self.active_effective_upload_body_witness_revision;
         for entry in self.files.values_mut() {
             if entry.has_unverified_source() {
@@ -43056,6 +43064,7 @@ impl ScanIndex {
                     result.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
                 None => {
+                    result.remember_removed_read_witness(key);
                     result.files.remove(key);
                 }
             }
@@ -43177,6 +43186,7 @@ impl ScanIndex {
                     self.re_owe_effective_upload_body_witness_revision(key, 0);
                 }
                 None => {
+                    self.remember_removed_read_witness(key);
                     self.files.remove(key);
                 }
             }
@@ -43447,8 +43457,8 @@ impl ScanIndex {
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,
             upload_context_fingerprint: previous.upload_context_fingerprint.clone(),
+            reread_guard: self.reread_state_for_subset(&files),
             files,
-            reread_guard: self.reread_guard.clone(),
             session_account_bindings: self.session_account_bindings.clone(),
             terminal_jsonl_dispositions: previous.terminal_jsonl_dispositions.clone(),
             known_configured_scan_roots: self.known_configured_scan_roots.clone(),
@@ -43710,6 +43720,7 @@ impl ScanIndex {
         for session_id in codex_session_id_candidates_from_path(Path::new(key)) {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
+        self.remember_removed_read_witness(key);
         self.files.remove(key);
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
@@ -44290,6 +44301,7 @@ impl ScanIndex {
 
     fn migrate(&mut self, candidate: CandidateFile) {
         let key = local_index_key(&candidate.path);
+        self.retire_replay_read_witness(&key);
         let last_snapshot_fingerprint = self
             .files
             .get(&key)
@@ -44342,6 +44354,7 @@ impl ScanIndex {
         parse_outcome: ScanParseOutcome,
     ) {
         let key = local_index_key(&candidate.path);
+        self.retire_replay_read_witness(&key);
         let last_upload_body_witness = self
             .files
             .get(&key)
@@ -49757,6 +49770,8 @@ mod tests {
     }
 
     fn exercise_claude_partial_census_recovery(duplicate: bool, future_quarantine: bool) {
+        let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
+        "Synthetic partial-conflict and duplicate-fence recovery needs repeated family observations to test recovery semantics", 16);
         let root = temp_dir("claude-stable-owned-start-conflict-census");
         let stable = root.join("a-stable.jsonl");
         fs::write(&stable, concat!(

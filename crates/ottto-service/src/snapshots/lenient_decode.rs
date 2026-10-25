@@ -204,7 +204,6 @@ impl Serialize for ScanIndex {
         }
         field!(schema_version);
         field!(generation);
-        field!(reread_guard);
         field!(upload_context_fingerprint, Option::is_none);
         map.serialize_entry(
             "files",
@@ -301,6 +300,7 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
+        field!(reread_guard, reread_guard::State::is_empty);
         map.end()
     }
 }
@@ -308,7 +308,6 @@ impl Serialize for ScanIndex {
 pub(super) const FIELDS: &[&str] = &[
     "schema_version",
     "generation",
-    "reread_guard",
     "upload_context_fingerprint",
     "files",
     "session_account_bindings",
@@ -387,6 +386,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_incidence",
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
+    "reread_guard",
 ];
 
 #[derive(Debug, thiserror::Error)]

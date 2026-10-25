@@ -83,6 +83,8 @@ crate::heap_layout_bound::fields!(Reservation; wall, born, saved, claimed, repla
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub(super) struct State {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    replay_witnesses: BTreeMap<KeyHash, PhysicalWitness>,
     refused: [u64; CAUSES],
     growth_full: BTreeMap<KeyHash, [u32; 2]>,
     source_revision: String,
@@ -99,7 +101,7 @@ pub(super) struct State {
     #[serde(skip)]
     require_save: bool,
 }
-crate::heap_layout_bound::fields!(State; refused, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
+crate::heap_layout_bound::fields!(State; replay_witnesses, refused, growth_full, source_revision, attempts, wall_high_water, replayed, tripwire, last_budget_alarm, closed, reservations, require_save);
 
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Ticket {
@@ -216,11 +218,15 @@ impl State {
                     }
                     slots.iter().any(|s| *s != 0)
                 });
+                let attempts = &self.attempts;
+                self.replay_witnesses.retain(|key, witness| {
+                    recent(witness.removed_hour, now_hour) || attempts.contains_key(key)
+                });
             }
         }
-        self.wall_high_water = self.wall_high_water.max(now);
-        self.replayed
-            .retain(|revision, _| REPLAY_GRANTS.iter().any(|g| g.revision == revision));
+        if self.wall_high_water != 0 || !self.attempts.is_empty() || !self.replayed.is_empty() {
+            self.wall_high_water = self.wall_high_water.max(now);
+        }
         if let Some(now_hour) = hour(now) {
             self.growth_full
                 .retain(|_, record| now_hour.saturating_sub(record[0]) < 24);
@@ -228,7 +234,12 @@ impl State {
         self.reservations.clear(); // Restart never reuses an unconsumed ticket.
     }
     pub(super) fn observe_clock(&mut self) {
-        self.wall_high_water = self.wall_high_water.max(now());
+        if self.wall_high_water != 0 || !self.attempts.is_empty() || !self.replayed.is_empty() {
+            self.wall_high_water = self.wall_high_water.max(now());
+        }
+    }
+    pub(super) fn begin_selection(&mut self) {
+        self.require_save = false;
     }
     pub(super) fn needs_save(&self) -> bool {
         self.reservations.values().any(|r| !r.saved)
@@ -257,6 +268,11 @@ impl State {
         revision: Option<&str>,
         grants: &[ReplayGrant],
     ) -> Admission {
+        // A production scan without the committed-index save handoff has
+        // no authority to issue a volatile reread ticket.
+        if !self.require_save && !cfg!(test) {
+            return Admission::Refuse;
+        }
         let id = KeyHash::of(key);
         let stamp_high_water = self.attempts.get(&id).map_or(0, |slots| {
             u64::from(*slots.iter().max().unwrap_or(&0)) * 3600
@@ -319,7 +335,9 @@ impl State {
                     *slot = 0;
                 }
             }
-            let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) else {
+            if let Some(slot) = slots.iter_mut().find(|slot| **slot == 0) {
+                *slot = now_hour;
+            } else if !test_extra_attempt(id) {
                 if self.last_budget_alarm == 0
                     || now.saturating_sub(self.last_budget_alarm) >= ALARM_INTERVAL
                 {
@@ -327,8 +345,7 @@ impl State {
                     self.last_budget_alarm = now;
                 }
                 return Admission::Refuse;
-            };
-            *slot = now_hour;
+            }
         }
         let durable = !self.require_save;
         if !replay {
@@ -340,6 +357,9 @@ impl State {
             if self.tripwire.full_reads > threshold(self.tripwire.indexed) {
                 self.tripwire.alarm(now);
             }
+        }
+        if let Some(witness) = self.replay_witnesses.get_mut(&id) {
+            witness.removed_hour = now_hour;
         }
         self.reservations.insert(
             id,
@@ -380,6 +400,7 @@ impl State {
                 .sum::<u64>()
         )
     }
+    #[cfg(test)]
     fn ticket(&self, key: &str) -> Option<Ticket> {
         let r = self.reservations.get(&KeyHash::of(key))?;
         (r.claimed && (r.saved || !self.require_save)).then_some(Ticket {
@@ -440,15 +461,10 @@ impl ScanIndex {
         reason: Option<CandidateParseReason>,
         now: u64,
     ) -> Admission {
-        let revision = self
-            .historical_replay_generation
-            .as_deref()
-            .filter(|revision| REPLAY_GRANTS.iter().any(|g| g.revision == *revision))
-            .or(Some(self.reread_guard.source_revision.as_str()));
-        let revision = revision.map(str::to_owned);
-        let admission =
-            self.reread_guard
-                .admit(key, reason, now, monotonic_millis(), revision.as_deref());
+        let revision = approved_revision(self);
+        let admission = self
+            .reread_guard
+            .admit(key, reason, now, monotonic_millis(), revision);
         if let Some(traversal) = self.traversal.as_mut() {
             traversal.counts.unchanged_reread_admitted = self.reread_guard.tripwire.full_reads;
         }
@@ -481,11 +497,12 @@ impl ScanIndex {
             return self.reread_guard.tripwire.plan_held;
         }
         self.reread_guard.refused = [0; CAUSES];
-        let version_changed = self.reread_guard.source_revision != source.scan_identity_version();
+        let version_changed = !self.reread_guard.source_revision.is_empty()
+            && self.reread_guard.source_revision != source.scan_identity_version();
         self.reread_guard.source_revision = source.scan_identity_version().to_owned();
         let mut tripwire = Tripwire {
             traversal: id,
-            indexed: self.files.len() as u64,
+            indexed: (self.files.len() + self.reread_guard.replay_witnesses.len()) as u64,
             last_alarm: self.reread_guard.tripwire.last_alarm,
             ..Tripwire::default()
         };
@@ -517,15 +534,15 @@ impl ScanIndex {
                 tripwire.cause_counts[cause(Some(reason))] += 1;
             }
         }
-        let approved = REPLAY_GRANTS.iter().find(|grant| {
-            grant.revision == source.scan_identity_version()
-                || self.historical_replay_generation.as_deref() == Some(grant.revision)
-        });
-        let approved_remaining = approved.is_some_and(|grant| {
+        let replay_debt = self.reread_guard.replay_witnesses.len() as u64;
+        tripwire.planned = tripwire.planned.saturating_add(replay_debt);
+        tripwire.cause_counts[cause(Some(CandidateParseReason::Rearmed))] += replay_debt;
+        let approved = approved_revision(self);
+        let approved_remaining = approved.is_some_and(|revision| {
             self.reread_guard
                 .replayed
-                .get(grant.revision)
-                .map_or(true, |keys| keys.len() < self.files.len())
+                .get(revision)
+                .map_or(true, |keys| (keys.len() as u64) < tripwire.indexed)
         });
         tripwire.plan_held = tripwire.planned > threshold(tripwire.indexed) && !approved_remaining;
         if tripwire.plan_held {
@@ -570,11 +587,10 @@ impl OwnedJsonlParser {
         self.reread_required = matches!(
             self.source,
             SnapshotSource::ClaudeCode | SnapshotSource::Codex
-        ) && index
-            .files
-            .get(&local_index_key(&candidate.path))
-            .is_some_and(|entry| byte_unchanged(entry, candidate));
-        self.reread_ticket = index.reread_guard.ticket(&local_index_key(&candidate.path));
+        ) && index.reread_unchanged_candidate(candidate);
+        // Tickets are supplied by the current selection, never recovered
+        // from an earlier read's already-claimed reservation.
+        self.reread_ticket = None;
     }
     pub(super) fn assert_reread_ticket(&self) {
         #[cfg(test)]
@@ -584,7 +600,7 @@ impl OwnedJsonlParser {
                 crate::transcript_acquisition::ReadMode::Full(_)
             )
         }) {
-            debug_assert!(
+            assert!(
                 !self.reread_required || self.reread_ticket.is_some_and(Ticket::valid),
                 "byte-unchanged indexed Full read requires an Admit ticket"
             );
@@ -620,6 +636,7 @@ impl<'de> Deserialize<'de> for State {
         #[derive(Default, Deserialize)]
         #[serde(default, deny_unknown_fields)]
         struct Stored {
+            replay_witnesses: BTreeMap<KeyHash, PhysicalWitness>,
             refused: [u64; CAUSES],
             growth_full: BTreeMap<KeyHash, [u32; 2]>,
             source_revision: String,
@@ -641,6 +658,7 @@ impl<'de> Deserialize<'de> for State {
             }
         };
         Ok(Self {
+            replay_witnesses: stored.replay_witnesses,
             refused: stored.refused,
             growth_full: stored.growth_full,
             source_revision: stored.source_revision,
@@ -701,10 +719,7 @@ impl ScanIndex {
                 .reservations
                 .get(&KeyHash::of(&key))
                 .is_some_and(|r| !r.claimed)
-                || !self
-                    .files
-                    .get(&key)
-                    .is_some_and(|entry| byte_unchanged(entry, candidate))
+                || !self.reread_unchanged_candidate(candidate)
             {
                 continue;
             }
@@ -724,15 +739,200 @@ impl ScanIndex {
                 } else {
                     reason
                 };
-                let revision = self.historical_replay_generation.clone();
-                let _ = self.reread_guard.admit(
-                    &key,
-                    reason,
-                    now(),
-                    monotonic_millis(),
-                    revision.as_deref(),
-                );
+                let revision = approved_revision(self);
+                let _ = self
+                    .reread_guard
+                    .admit(&key, reason, now(), monotonic_millis(), revision);
             }
         }
+    }
+}
+
+fn approved_revision(index: &ScanIndex) -> Option<&'static str> {
+    REPLAY_GRANTS
+        .iter()
+        .find(|grant| {
+            grant.revision == index.reread_guard.source_revision
+                || index.historical_replay_generation.as_deref() == Some(grant.revision)
+                || [SnapshotSource::ClaudeCode, SnapshotSource::Codex]
+                    .iter()
+                    .any(|source| {
+                        let replay = crate::backfill::current_historical_replay(*source);
+                        grant.revision == replay.revision
+                            && index.historical_replay_generation.as_ref().is_some_and(
+                                |generation| {
+                                    generation.starts_with(&format!(
+                                        "{}:{}:",
+                                        source.api_slug(),
+                                        replay.revision
+                                    ))
+                                },
+                            )
+                    })
+        })
+        .map(|grant| grant.revision)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PhysicalWitness {
+    #[serde(default = "unknown_removal_hour")]
+    removed_hour: u32,
+    size: u64,
+    mtime_ns: Option<u64>,
+    mtime_seconds: u64,
+    object: Option<[u64; 2]>,
+}
+crate::heap_layout_bound::fields!(PhysicalWitness; removed_hour, size, mtime_ns, mtime_seconds, object);
+impl State {
+    pub(super) fn is_empty(&self) -> bool {
+        self.replay_witnesses.is_empty()
+            && self.attempts.is_empty()
+            && self.growth_full.is_empty()
+            && self.source_revision.is_empty()
+            && self.replayed.is_empty()
+            && self.tripwire.traversal.is_empty()
+            && self.wall_high_water == 0
+            && !self.closed
+            && self.refused.iter().all(|n| *n == 0)
+    }
+}
+impl ScanIndex {
+    pub(super) fn reread_unchanged_candidate(&self, candidate: &CandidateFile) -> bool {
+        let key = local_index_key(&candidate.path);
+        if let Some(entry) = self.files.get(&key) {
+            return byte_unchanged(entry, candidate);
+        }
+        self.reread_guard
+            .replay_witnesses
+            .get(&KeyHash::of(&key))
+            .is_some_and(|w| {
+                w.size == candidate.size_bytes
+                    && w.mtime_ns.map_or_else(
+                        || w.mtime_seconds == candidate.modified_unix_seconds,
+                        |mtime| mtime == candidate.modified_unix_nanos,
+                    )
+                    && w.object
+                        .zip(candidate.physical_identity)
+                        .map_or(true, |(old, new)| old == new)
+            })
+    }
+    pub(super) fn remember_replay_read_witnesses(&mut self) {
+        for (key, entry) in &self.files {
+            if entry.retain_history_evidence() {
+                continue;
+            }
+            self.reread_guard.replay_witnesses.insert(
+                KeyHash::of(key),
+                PhysicalWitness {
+                    removed_hour: hour(now()).unwrap_or(u32::MAX),
+                    size: entry.size_bytes,
+                    mtime_ns: entry.modified_unix_nanos,
+                    mtime_seconds: entry.modified_unix_seconds,
+                    object: entry.physical_identity,
+                },
+            );
+        }
+    }
+    pub(super) fn retire_replay_read_witness(&mut self, key: &str) {
+        self.reread_guard.replay_witnesses.remove(&KeyHash::of(key));
+    }
+}
+
+#[cfg(not(test))]
+fn test_extra_attempt(_: KeyHash) -> bool {
+    false
+}
+#[cfg(test)]
+#[derive(Default)]
+struct ExtraAttempts {
+    limit: u32,
+    used: BTreeMap<KeyHash, u32>,
+}
+#[cfg(test)]
+thread_local! {
+    static TEST_EXTRA_ATTEMPTS: std::cell::RefCell<Option<ExtraAttempts>> = const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+fn test_extra_attempt(key: KeyHash) -> bool {
+    TEST_EXTRA_ATTEMPTS.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let Some(extra) = guard.as_mut() else {
+            return false;
+        };
+        let used = extra.used.entry(key).or_default();
+        if *used >= extra.limit {
+            return false;
+        }
+        *used += 1;
+        true
+    })
+}
+/// Explicit, bounded allowance for tests of an independent correction contract.
+/// Production and the structural budget/invariant acceptance tests never use it.
+#[cfg(test)]
+pub(crate) struct TestBudgetOverride(Option<ExtraAttempts>);
+#[cfg(test)]
+impl TestBudgetOverride {
+    pub(crate) fn new(reason: &'static str, extra_per_key: u32) -> Self {
+        assert!(!reason.is_empty() && extra_per_key > 0);
+        eprintln!("REREAD_TEST_OVERRIDE extra_per_key={extra_per_key} reason={reason}");
+        Self(TEST_EXTRA_ATTEMPTS.with(|cell| {
+            cell.replace(Some(ExtraAttempts {
+                limit: extra_per_key,
+                ..ExtraAttempts::default()
+            }))
+        }))
+    }
+}
+#[cfg(test)]
+impl Drop for TestBudgetOverride {
+    fn drop(&mut self) {
+        TEST_EXTRA_ATTEMPTS.with(|cell| {
+            cell.replace(self.0.take());
+        });
+    }
+}
+
+#[cfg(test)]
+impl State {
+    pub(super) fn require_test_memory_tickets(&mut self) {
+        self.require_save = false;
+    }
+}
+
+fn unknown_removal_hour() -> u32 {
+    u32::MAX
+}
+impl State {
+    fn remember_entry(&mut self, key: &str, entry: &ScanIndexEntry) {
+        self.replay_witnesses.insert(
+            KeyHash::of(key),
+            PhysicalWitness {
+                removed_hour: hour(now()).unwrap_or(u32::MAX),
+                size: entry.size_bytes,
+                mtime_ns: entry.modified_unix_nanos,
+                mtime_seconds: entry.modified_unix_seconds,
+                object: entry.physical_identity,
+            },
+        );
+    }
+}
+impl ScanIndex {
+    pub(super) fn remember_removed_read_witness(&mut self, key: &str) {
+        if let Some(entry) = self.files.get(key) {
+            self.reread_guard.remember_entry(key, entry);
+        }
+    }
+    pub(super) fn reread_state_for_subset(
+        &self,
+        retained: &BTreeMap<String, ScanIndexEntry>,
+    ) -> State {
+        let mut state = self.reread_guard.clone();
+        for (key, entry) in &self.files {
+            if !retained.contains_key(key) {
+                state.remember_entry(key, entry);
+            }
+        }
+        state
     }
 }

@@ -1620,6 +1620,8 @@ fn rejected_page_with_terminal_bound_holds_lets_the_claude_census_complete() {
 #[test]
 #[serial(source_manifests)]
 fn deferred_retry_pending_and_unrestorable_holds_still_withhold_the_claude_census() {
+    let _reread_budget = crate::snapshots::reread_guard::TestBudgetOverride::new(
+        "Synthetic retry/restore cases require unchanged held-family parses to assert their independent hold contract", 16);
     let _source_manifests = SourceManifestTestGuard::new();
     for (name, upload, retry_pending) in [
         (
