@@ -319,6 +319,10 @@ impl Serialize for ScanIndex {
         field!(codex_counting_tombstones, BTreeMap::is_empty);
         field!(reread_guard, reread_guard::State::is_empty);
         field!(
+            codex_counting_evicted_legacy,
+            codex_counting_version::EvictedLegacyOwners::is_empty
+        );
+        field!(
             claude_money_birth_store,
             claude_money_birth_store::BirthStore::is_empty
         );
@@ -409,6 +413,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
     "reread_guard",
+    "codex_counting_evicted_legacy",
     "claude_money_birth_store",
 ];
 
@@ -1699,6 +1704,10 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
+                        }
+                        "codex_counting_evicted_legacy" => {
+                            index.codex_counting_evicted_legacy =
+                                self.history_scalar(value, Default::default())?
                         }
                         "codex_counting_tombstones" => {
                             // Counting-only memory: damage loses it like a

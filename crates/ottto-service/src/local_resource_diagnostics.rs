@@ -216,11 +216,22 @@ impl Probe {
             process_sample(),
         )
     }
+    #[cfg(test)]
     pub(crate) fn collection(&self, source: &str, counts: CollectionCounts) {
+        self.collection_with_account_pending(source, counts, None);
+    }
+    pub(crate) fn collection_with_account_pending(
+        &self,
+        source: &str,
+        counts: CollectionCounts,
+        pending: Option<ClaudeAccountRetainedPending>,
+    ) {
         #[derive(Serialize)]
-        struct WithMoney {
+        struct Counts {
             #[serde(flatten)]
             collection: CollectionCounts,
+            #[serde(flatten)]
+            pending: Option<ClaudeAccountRetainedPending>,
             #[serde(flatten)]
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
@@ -228,19 +239,21 @@ impl Probe {
             #[serde(flatten)]
             identity: crate::snapshots::claude_request_identity::IdentityCounts,
         }
-        let counts = WithMoney {
+        let claude = source == "claude_code";
+        let counts = Counts {
             collection: counts,
-            identity: if source == "claude_code" {
+            pending,
+            identity: if claude {
                 crate::snapshots::claude_request_identity::take_identity_counts()
             } else {
                 Default::default()
             },
-            caps: if source == "claude_code" {
+            caps: if claude {
                 take_claude_record_caps()
             } else {
                 Default::default()
             },
-            money: if source == "claude_code" {
+            money: if claude {
                 crate::snapshots::claude_request_money::e2::take_counts()
             } else {
                 Default::default()
@@ -255,6 +268,15 @@ impl Probe {
             counts,
         });
     }
+}
+
+/// All retained account-pending families, including held/incomplete families;
+/// a conservative local-only gauge, never an authority or eviction decision.
+#[derive(Debug, Serialize)]
+pub(crate) struct ClaudeAccountRetainedPending {
+    pub(crate) claude_account_retained_pending_families: usize,
+    /// Pretty JSON bytes of the retained field, including its field wrapper.
+    pub(crate) claude_account_retained_pending_bytes: u64,
 }
 impl crate::heap_layout_bound::HeapLayoutBound for Probe {
     const INLINE_ONLY: bool = true;
