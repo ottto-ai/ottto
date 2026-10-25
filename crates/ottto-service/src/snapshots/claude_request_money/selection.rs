@@ -851,6 +851,25 @@ mod integration_selection_regressions {
     }
 
     #[test]
+    fn oversized_raw_selection_field_persists_a_capacity_refusal() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-selection-raw-cap");
+        let path = scratch.join("index.json");
+        let ordinary = serde_json::to_string(&ScanIndex::default()).unwrap();
+        let bytes = format!(
+            "{},\"claude_money_files\":{{{}}}}}",
+            &ordinary[..ordinary.len() - 1],
+            " ".repeat(MAX_SELECTION_BYTES)
+        );
+        std::fs::write(&path, bytes).unwrap();
+        let mut loaded = ScanIndex::load(&path).unwrap();
+        assert!(selections_capped(&loaded.claude_money_files));
+        loaded.save(&path).unwrap();
+        let restored = ScanIndex::load(&path).unwrap();
+        assert!(selections_capped(&restored.claude_money_files));
+        assert!(std::fs::metadata(path).unwrap().len() < MAX_SELECTION_BYTES as u64);
+    }
+
+    #[test]
     fn assembled_lenient_decode_rearms_lost_claude_selection_without_touching_codex() {
         crate::snapshots::claude_history_upgrade::with_max_gated_claude_revision(3, || {
             let scratch = crate::test_scratch::ScratchDir::new("money-selection-assembled");

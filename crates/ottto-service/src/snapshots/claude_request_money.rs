@@ -58,10 +58,10 @@ mod emit;
 mod selection;
 pub(in crate::snapshots) use selection::select_union_candidates;
 pub(crate) use selection::{
-    bind_union_checkpoints, decode_selections, finalize_synthetic, logical_family_member,
-    logical_family_root_ref, record_logical_member, selected_money_files,
-    stage_selection_fingerprints, synthetic_fingerprints, union_items_by_source, union_reparse,
-    MoneyFileSelection,
+    bind_union_checkpoints, capped_selection_json, decode_selections, finalize_synthetic,
+    logical_family_member, logical_family_root_ref, record_logical_member, selected_money_files,
+    selections_capped, stage_selection_fingerprints, synthetic_fingerprints, union_items_by_source,
+    union_reparse, BoundedSelections, MoneyFileSelection, SELECTION_CAPACITY_KEY,
 };
 pub(crate) mod coverage;
 pub(crate) mod custody;
