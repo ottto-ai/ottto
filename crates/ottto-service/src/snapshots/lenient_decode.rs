@@ -1195,18 +1195,28 @@ impl<R: BufRead + Seek> Decoder<R> {
     // admitted raw hold as every other undecodable negative record.
     fn admit_idless_marker(&mut self, record: Span) -> std::result::Result<(), Error> {
         self.reader.seek(SeekFrom::Start(record.start))?;
-        if self.ws()? != Some(b'{') {
-            return Ok(());
-        }
-        self.eat(b'{')?;
-        while self.ws()? != Some(b'}') {
-            let key = self.span()?;
-            let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
-                self.typed::<String>(key)? == "idless_revision"
+        let close = match self.ws()? {
+            Some(b'{') => b'}',
+            Some(b'[') => b']',
+            _ => return Ok(()),
+        };
+        self.eat(if close == b'}' { b'{' } else { b'[' })?;
+        let mut position = 0usize;
+        while self.ws()? != Some(close) {
+            let marker = if close == b']' {
+                // Derive accepts the struct's positional representation too.
+                position == 4
             } else {
-                false
+                let key = self.span()?;
+                let marker = if key.len <= ("idless_revision".len() * 6 + 2) as u64 {
+                    self.typed::<String>(key)? == "idless_revision"
+                } else {
+                    false
+                };
+                self.eat(b':')?;
+                marker
             };
-            self.eat(b':')?;
+            position = position.saturating_add(1);
             let value = self.span()?;
             // Includes ample space for our pretty-printed fixed array. Wider
             // spellings are damage, never permission to allocate a token.
@@ -1219,7 +1229,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                 break;
             }
         }
-        self.eat(b'}')
+        self.eat(close)
     }
     fn records<T: serde::de::DeserializeOwned>(
         &mut self,

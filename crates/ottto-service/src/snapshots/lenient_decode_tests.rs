@@ -4154,32 +4154,48 @@ fn oversized_idless_marker_strings_refuse_before_reader_token_allocation() {
         loaded.claude_usage_family_pending["family"].idless_revision,
         Some([7; 32])
     );
-    let mut value = serde_json::to_value(&seed).unwrap();
-    value["claude_usage_family_pending"]["family"]["idless_revision"] =
-        Value::String("MARKER_PAYLOAD".into());
-    let template = serde_json::to_string(&value).unwrap();
-    let payload = "x".repeat(16 * 1024 * 1024);
-    for malformed in [
-        format!("\"{payload}\""),
-        format!("[\"{payload}\"]"),
-        format!("{{\"{payload}\":0}}"),
-    ] {
-        let bytes = template
-            .replace("\"MARKER_PAYLOAD\"", &malformed)
-            .into_bytes();
-        let (result, allocations) = crate::retry_allocation_probe::measure(|| {
-            lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
-        });
-        assert!(matches!(result, Err(lenient_decode::Error::HoldBudget)));
-        assert!(
-            allocations.requested_peak < 256 * 1024,
-            "{}",
-            allocations.requested_peak
-        );
-        assert!(
-            allocations.usable_peak < 512 * 1024,
-            "{}",
-            allocations.usable_peak
-        );
+    for positional in [false, true] {
+        let mut value = serde_json::to_value(&seed).unwrap();
+        if positional {
+            value["claude_usage_family_pending"]["family"] =
+                serde_json::json!(["2026-10-25T00:00:00Z", {}, {}, true, vec![7; 32],]);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let loaded =
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code").unwrap();
+            assert_eq!(
+                loaded.claude_usage_family_pending["family"].idless_revision,
+                Some([7; 32])
+            );
+            value["claude_usage_family_pending"]["family"][4] =
+                Value::String("MARKER_PAYLOAD".into());
+        } else {
+            value["claude_usage_family_pending"]["family"]["idless_revision"] =
+                Value::String("MARKER_PAYLOAD".into());
+        }
+        let template = serde_json::to_string(&value).unwrap();
+        let payload = "x".repeat(16 * 1024 * 1024);
+        for malformed in [
+            format!("\"{payload}\""),
+            format!("[\"{payload}\"]"),
+            format!("{{\"{payload}\":0}}"),
+        ] {
+            let bytes = template
+                .replace("\"MARKER_PAYLOAD\"", &malformed)
+                .into_bytes();
+            let (result, allocations) = crate::retry_allocation_probe::measure(|| {
+                lenient_decode::read(std::io::Cursor::new(&bytes), "load", "claude_code")
+            });
+            assert!(matches!(result, Err(lenient_decode::Error::HoldBudget)));
+            assert!(
+                allocations.requested_peak < 256 * 1024,
+                "{}",
+                allocations.requested_peak
+            );
+            assert!(
+                allocations.usable_peak < 512 * 1024,
+                "{}",
+                allocations.usable_peak
+            );
+        }
     }
 }
