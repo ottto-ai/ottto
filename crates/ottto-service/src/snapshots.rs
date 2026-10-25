@@ -1238,6 +1238,36 @@ fn rebuild_claude_context_posture(
 pub const MAX_JSONL_FILE_BYTES: u64 = 256 * 1024 * 1024;
 pub const MAX_CODEX_JSONL_FILE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 pub const MAX_JSONL_LINE_BYTES: usize = 16 * 1024 * 1024;
+
+/// The line cap a transcript reader is built with: `MAX_JSONL_LINE_BYTES`,
+/// or a test's scaled cap on its own thread. Memory charges keep the constant.
+fn jsonl_line_cap() -> usize {
+    #[cfg(test)]
+    if let Some(cap) = TEST_LINE_CAP.with(std::cell::Cell::get) {
+        return cap;
+    }
+    MAX_JSONL_LINE_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_LINE_CAP: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scaled line cap for tests only; the production constant is never changed.
+#[cfg(test)]
+fn with_test_line_cap<T>(cap: usize, run: impl FnOnce() -> T) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_LINE_CAP.with(|line_cap| line_cap.set(None));
+        }
+    }
+    TEST_LINE_CAP.with(|line_cap| line_cap.set(Some(cap)));
+    let _reset = Reset;
+    run()
+}
+
 // Legacy ordinary forks have no provider-native boundary. Persist only the
 // content-free ordered turn/usage proof required by a referenced parent, and
 // fail closed when either bound is exceeded.
@@ -30174,7 +30204,7 @@ impl OwnedJsonlParser {
         Ok(Self {
             reader: BoundedJsonlReader::new(
                 reader,
-                MAX_JSONL_LINE_BYTES,
+                jsonl_line_cap(),
                 source == SnapshotSource::Codex,
             ),
             accumulator,
@@ -51949,9 +51979,14 @@ mod tests {
 
         // Comfortably over the 256 records the removed cap allowed.
         const FILES: usize = 300;
+        // Readers run under a scaled line cap so each over-cap file is 64 KiB,
+        // not 16 MiB; both stay under the cursor/singleton threshold, so
+        // routing is unchanged. If the override did not apply, a `LINE_CAP + 1`
+        // line would not be over the cap and `over_line_cap_count` would fail.
+        const LINE_CAP: usize = 64 * 1024;
 
         // The oversized payload is written as a file hole. `read_bounded_jsonl_
-        // lines_impl` copies at most `MAX_JSONL_LINE_BYTES` of the line, marks
+        // lines_impl` copies at most the reader's line cap of the line, marks
         // it over-cap and then clears the buffer without inspecting the skipped
         // bytes, so a zero-filled hole is byte-equivalent input for this path
         // and keeps a 300-file over-cap corpus off disk.
@@ -51960,111 +51995,120 @@ mod tests {
             file.write_all(head.as_bytes()).expect("write healthy head");
             file.write_all(prefix.as_bytes())
                 .expect("write oversized line prefix");
-            file.seek(SeekFrom::Current((MAX_JSONL_LINE_BYTES + 1) as i64))
+            file.seek(SeekFrom::Current((LINE_CAP + 1) as i64))
                 .expect("skip the oversized payload hole");
             file.write_all(suffix.as_bytes())
                 .expect("close the oversized line");
         };
 
-        for (source, name) in [
-            (SnapshotSource::Codex, "terminal-disposition-scale-codex"),
-            (
-                SnapshotSource::ClaudeCode,
-                "terminal-disposition-scale-claude",
-            ),
-        ] {
-            let root = temp_dir(name);
-            for slot in 0..FILES {
-                let session_id = format!("019e2701-{slot:04x}-7000-9000-{slot:012x}");
-                match source {
-                    SnapshotSource::Codex => {
-                        let head = format!(
+        with_test_line_cap(LINE_CAP, || {
+            for (source, name) in [
+                (SnapshotSource::Codex, "terminal-disposition-scale-codex"),
+                (
+                    SnapshotSource::ClaudeCode,
+                    "terminal-disposition-scale-claude",
+                ),
+            ] {
+                let root = temp_dir(name);
+                for slot in 0..FILES {
+                    let session_id = format!("019e2701-{slot:04x}-7000-9000-{slot:012x}");
+                    match source {
+                        SnapshotSource::Codex => {
+                            let head = format!(
                             "{{\"timestamp\":\"2026-07-22T08:00:00Z\",\"type\":\"session_meta\",\"ordinal\":0,\"payload\":{{\"id\":\"{session_id}\",\"session_id\":\"{session_id}\"}}}}\n"
                         );
-                        // The Codex envelope salvage reads `ordinal` and
-                        // `timestamp` out of the prefix, so the ordinal chain
-                        // stays gap-free and the file parses complete.
-                        let prefix = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"";
-                        let suffix = format!(
-                            "\"}}]}}}}\n{}\n",
-                            codex_test_token_line(
-                                "2026-07-22T08:00:02Z",
-                                Some(2),
-                                (40, 0, 8, 0),
-                                Some((40, 0, 8, 0)),
-                            )
-                        );
-                        write_over_cap_file(
-                            &root.join(format!("rollout-2026-07-22T08-00-00-{session_id}.jsonl")),
-                            &head,
-                            prefix,
-                            &suffix,
-                        );
-                    }
-                    _ => {
-                        let head = format!(
+                            // The Codex envelope salvage reads `ordinal` and
+                            // `timestamp` out of the prefix, so the ordinal chain
+                            // stays gap-free and the file parses complete.
+                            let prefix = "{\"timestamp\":\"2026-07-22T08:00:01Z\",\"type\":\"response_item\",\"ordinal\":1,\"payload\":{\"type\":\"message\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"";
+                            let suffix = format!(
+                                "\"}}]}}}}\n{}\n",
+                                codex_test_token_line(
+                                    "2026-07-22T08:00:02Z",
+                                    Some(2),
+                                    (40, 0, 8, 0),
+                                    Some((40, 0, 8, 0)),
+                                )
+                            );
+                            write_over_cap_file(
+                                &root.join(format!(
+                                    "rollout-2026-07-22T08-00-00-{session_id}.jsonl"
+                                )),
+                                &head,
+                                prefix,
+                                &suffix,
+                            );
+                        }
+                        _ => {
+                            let head = format!(
                             "{{\"type\":\"assistant\",\"sessionId\":\"{session_id}\",\"uuid\":\"019e2702-{slot:04x}-7000-9000-{slot:012x}\",\"timestamp\":\"2026-07-22T08:00:01Z\",\"cwd\":\"/tmp/ottto\",\"message\":{{\"id\":\"msg_{slot}\",\"model\":\"claude-sonnet-4-6\",\"usage\":{{\"input_tokens\":12,\"output_tokens\":4,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0}}}}}}\n"
                         );
-                        write_over_cap_file(
-                            &root.join(format!("{session_id}.jsonl")),
-                            &head,
-                            "{\"type\":\"assistant\",\"ignored\":\"",
-                            "\"}\n",
-                        );
+                            write_over_cap_file(
+                                &root.join(format!("{session_id}.jsonl")),
+                                &head,
+                                "{\"type\":\"assistant\",\"ignored\":\"",
+                                "\"}\n",
+                            );
+                        }
                     }
                 }
-            }
 
-            let mut index = ScanIndex::default();
-            let mut observed = Vec::new();
-            for cycle in 0..4 {
-                let mut scan = scan_source_roots_with_limit(
-                    source,
-                    std::slice::from_ref(&root),
-                    &mut index,
-                    "2026-07-22T09:00:00Z",
-                    BACKFILL_WINDOW_DAYS,
-                    MAX_BACKFILL_FILES_PER_SOURCE,
-                    true,
-                )
-                .unwrap_or_else(|error| panic!("{name} cycle {cycle} traversal: {error}"));
-                assert!(scan.census_complete, "{name} cycle {cycle} census");
-                assert!(!scan.scan_cap_hit, "{name} cycle {cycle} cap hit");
+                let mut index = ScanIndex::default();
+                let mut observed = Vec::new();
+                for cycle in 0..4 {
+                    let mut scan = scan_source_roots_with_limit(
+                        source,
+                        std::slice::from_ref(&root),
+                        &mut index,
+                        "2026-07-22T09:00:00Z",
+                        BACKFILL_WINDOW_DAYS,
+                        MAX_BACKFILL_FILES_PER_SOURCE,
+                        true,
+                    )
+                    .unwrap_or_else(|error| panic!("{name} cycle {cycle} traversal: {error}"));
+                    assert!(scan.census_complete, "{name} cycle {cycle} census");
+                    assert!(!scan.scan_cap_hit, "{name} cycle {cycle} cap hit");
+                    assert_eq!(
+                        scan.ownership_incomplete_file_count, 0,
+                        "{name} cycle {cycle} ownership"
+                    );
+                    // Disclosed loss is recomputed from the dispositions on the
+                    // cycles that read nothing. One evicted record would show up
+                    // here as a silently smaller number.
+                    assert_eq!(
+                        scan.over_line_cap_count, FILES,
+                        "{name} cycle {cycle} over cap"
+                    );
+                    assert_eq!(
+                        scan.recognized_usage_drop_count, FILES,
+                        "{name} cycle {cycle} recognized drop"
+                    );
+                    assert_eq!(
+                        scan.dropped_usage_record_count, FILES as u64,
+                        "{name} cycle {cycle} dropped usage"
+                    );
+                    observed.push((scan.scanned_file_count, scan.snapshots.len()));
+                    finalize_scan_after_policy(source, &mut scan, &mut index);
+                    assert_eq!(
+                        index.terminal_jsonl_dispositions.len(),
+                        FILES,
+                        "{name} cycle {cycle} retains one disposition per live file"
+                    );
+                    assert_eq!(index.files.len(), FILES, "{name} cycle {cycle} files");
+                }
                 assert_eq!(
-                    scan.ownership_incomplete_file_count, 0,
-                    "{name} cycle {cycle} ownership"
+                    observed,
+                    vec![(FILES, FILES), (0, 0), (0, 0), (0, 0)],
+                    "{name}: an over-cap corpus is read once, not once per cycle"
                 );
-                // Disclosed loss is recomputed from the dispositions on the
-                // cycles that read nothing. One evicted record would show up
-                // here as a silently smaller number.
-                assert_eq!(
-                    scan.over_line_cap_count, FILES,
-                    "{name} cycle {cycle} over cap"
-                );
-                assert_eq!(
-                    scan.recognized_usage_drop_count, FILES,
-                    "{name} cycle {cycle} recognized drop"
-                );
-                assert_eq!(
-                    scan.dropped_usage_record_count, FILES as u64,
-                    "{name} cycle {cycle} dropped usage"
-                );
-                observed.push((scan.scanned_file_count, scan.snapshots.len()));
-                finalize_scan_after_policy(source, &mut scan, &mut index);
-                assert_eq!(
-                    index.terminal_jsonl_dispositions.len(),
-                    FILES,
-                    "{name} cycle {cycle} retains one disposition per live file"
-                );
-                assert_eq!(index.files.len(), FILES, "{name} cycle {cycle} files");
+                let _ = fs::remove_dir_all(root);
             }
-            assert_eq!(
-                observed,
-                vec![(FILES, FILES), (0, 0), (0, 0), (0, 0)],
-                "{name}: an over-cap corpus is read once, not once per cycle"
-            );
-            let _ = fs::remove_dir_all(root);
-        }
+        });
+        assert_eq!(
+            jsonl_line_cap(),
+            MAX_JSONL_LINE_BYTES,
+            "scaled cap is reset"
+        );
     }
 
     #[test]
