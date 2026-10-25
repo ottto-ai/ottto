@@ -234,7 +234,7 @@ fn unhealthy_retries_reread_only_unsettled_files() {
         };
         let witnessed = reread(&|session| family.contains(session));
         let invalid = reread(&|session| session == C1A_INVALID);
-        let unwitnessed = reread(&|session| AT_HEALTHY.iter().any(|name| *name == session));
+        let unwitnessed = reread(&|session| AT_HEALTHY.contains(&session));
         if !(witnessed.is_empty() && invalid.is_empty() && unwitnessed.is_empty()) {
             violations.push(format!(
                 "{}: an unhealthy retry re-read healthy unchanged files: witnessed family \
