@@ -42513,7 +42513,7 @@ impl ScanIndex {
                 continue;
             }
             // All members are in the admitted progress map. Price scratch at
-            // one borrowed pointer per member, before allocating; no body clone.
+            // one borrowed string slice (two words) per member; no body clone.
             let mut witnesses = Vec::with_capacity(members.len());
             witnesses.extend(members.iter().map(|fp| bodies[fp].as_str()));
             witnesses.sort_unstable();
