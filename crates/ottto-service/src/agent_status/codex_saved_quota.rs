@@ -1680,6 +1680,7 @@ fn scan_running_homes_if_due(now: u64) {
 
 /// One scheduler pass: read every due home. Returns how many were read.
 /// With background limit refresh off it reads nothing and scans nothing.
+#[cfg(test)]
 pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
     scheduled_round_due(support_dir, now).read
 }
