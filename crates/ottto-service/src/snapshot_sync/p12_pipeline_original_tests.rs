@@ -318,7 +318,12 @@ impl RearmFixture {
         collected_at: &str,
     ) -> (SourcePreparation, ScanIndex, SourceScanResult) {
         let frame = self.native_preparation(index, collected_at);
-        collect_native_preparation_with_rotation(frame, true)
+        // The cached observe fixture exercises the serial baseline too: the
+        // process-owned cache can make an active frame unparkable. Rotation
+        // keeps that same frame serial when its requested bound is unknown.
+        // Existing fixtures still require the strict per-step parked bound.
+        let require_frame_bound = self.reread_guard_cache.is_none();
+        collect_native_preparation_with_rotation(frame, require_frame_bound)
     }
 
     fn native_preparation(&self, index: ScanIndex, collected_at: &str) -> SourcePreparation {
