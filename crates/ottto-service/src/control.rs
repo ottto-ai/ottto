@@ -933,6 +933,18 @@ fn handle_command(
             }
             to_value(refresh_agent_status_for(daemon, &authorization, source)?)
         }
+        LocalControlCommand::AgentStatusCached { source } => {
+            // The usual authorization helper builds general status (disk IO).
+            // This command authenticates directly against the in-memory token.
+            match &authorization {
+                RequestAuthorization::Token(token) => daemon.control_token.authorize(token)?,
+                RequestAuthorization::TrustedCompanionApp => {}
+                RequestAuthorization::Untrusted => {
+                    return Err(LocalApiError::LocalClientNotTrusted)
+                }
+            }
+            to_value(crate::agent_status_refresh::cached(source.as_ref()))
+        }
         LocalControlCommand::PersonalMeterLocalSnapshot { source } => {
             let status = status_for(daemon, &authorization)?;
             to_value(crate::personal_meter_local_snapshot_from_status(
