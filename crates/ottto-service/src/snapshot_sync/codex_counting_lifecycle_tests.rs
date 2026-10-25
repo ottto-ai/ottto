@@ -60,6 +60,12 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     let mut extra_body = String::new();
     for line in extra_rows.lines() {
         let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+        if row["type"] == "session_meta" {
+            // Equal header bytes and size intentionally mean CandidateCopy.
+            // This is a new physical member starting after the 500-token prefix.
+            row["timestamp"] = serde_json::json!("2026-10-01T10:05:00Z");
+            row["payload"]["timestamp"] = serde_json::json!("2026-10-01T10:05:00Z");
+        }
         if row["type"] == "token_usage_record" {
             row["payload"]["thread_token_usage"]["input_tokens"] = serde_json::json!(600);
             row["payload"]["thread_token_usage"]["total_tokens"] = serde_json::json!(600);
@@ -73,7 +79,7 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     std::fs::write(&extra, extra_body).unwrap();
     let mut working = committed.clone();
     let mut result = prepare(&root, &mut working);
-    assert_eq!(result.snapshots.len(), 4);
+    assert_eq!(result.snapshots.len(), 4, "{result:?}");
     for key in keys.iter().chain(std::iter::once(&control_key)) {
         assert!(!working.files[key].codex_counting_v2, "inactive complete parse clears the mark");
     }

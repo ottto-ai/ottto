@@ -22,7 +22,7 @@ fn rows(input: u64) -> Vec<Value> {
             "payload":{"turn_id":"turn","model":"gpt-5.2"}}),
         json!({"type":"event_msg","timestamp":POST,"payload":{"type":"token_count",
             "info":{"last_token_usage":usage,"total_token_usage":usage}}}),
-        json!({"type":"event_msg","timestamp":POST,"payload":{"type":"token_count",
+        json!({"type":"event_msg","timestamp":"2026-10-01T10:00:01Z","payload":{"type":"token_count",
             "info":{"last_token_usage":usage,"total_token_usage":usage}}}),
         json!({"type":"event_msg","timestamp":POST,
             "payload":{"type":"task_complete","turn_id":"turn"}}),
