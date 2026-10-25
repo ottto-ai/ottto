@@ -506,6 +506,39 @@ struct Span {
     resource: bool,
 }
 
+/// Replace one optional provenance token with null without retaining its
+/// bytes. The lexical pass already checked the original grammar and depth.
+struct AbsentMarkerReader<'a, R> {
+    reader: &'a mut R,
+    prefix: u64,
+    marker_end: u64,
+    suffix: u64,
+    replacement: &'static [u8],
+    skipped: bool,
+}
+impl<R: Read + Seek> Read for AbsentMarkerReader<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        if self.prefix > 0 {
+            let n = self.reader.by_ref().take(self.prefix).read(buf)?;
+            self.prefix -= n as u64;
+            return Ok(n);
+        }
+        if !self.skipped {
+            self.reader.seek(SeekFrom::Start(self.marker_end))?;
+            self.skipped = true;
+        }
+        if !self.replacement.is_empty() {
+            return self.replacement.read(buf);
+        }
+        let n = self.reader.by_ref().take(self.suffix).read(buf)?;
+        self.suffix -= n as u64;
+        Ok(n)
+    }
+}
+
 // Constant-space gate over ORIGINAL bytes. No nesting tags/parent stack are
 // retained. Serde grammar checks run only after this gate caps their depth;
 // optional resource evidence is drained before it can reach a Serde scanner.
@@ -1203,15 +1236,16 @@ impl<R: BufRead + Seek> Decoder<R> {
     }
     // The revision marker has a fixed 32-byte payload. Inspect its lexical
     // span before Serde sees it: from_reader buffers malformed strings and map
-    // keys even when a visitor discards them. Oversize damage enters the same
-    // admitted raw hold as every other undecodable negative record.
-    fn admit_idless_marker(&mut self, record: Span) -> std::result::Result<(), Error> {
+    // keys even when a visitor discards them. Damage to this optional field
+    // removes only carry eligibility, never the surrounding negative record.
+    fn damaged_idless_marker(&mut self, record: Span) -> std::result::Result<Option<Span>, Error> {
         self.reader.seek(SeekFrom::Start(record.start))?;
         let close = match self.ws()? {
             Some(b'{') => b'}',
             Some(b'[') => b']',
-            _ => return Ok(()),
+            _ => return Ok(None),
         };
+        let mut damaged = None;
         self.eat(if close == b'}' { b'{' } else { b'[' })?;
         let mut position = 0usize;
         while self.ws()? != Some(close) {
@@ -1232,16 +1266,41 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Includes ample space for our pretty-printed fixed array. Wider
             // spellings are damage, never permission to allocate a token.
-            if marker && value.len > 4096 {
-                return Err(Error::Refused("idless marker size"));
+            if marker && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err()) {
+                if damaged.replace(value).is_some() {
+                    return Err(Error::Refused("duplicate idless marker"));
+                }
             }
+            self.reader.seek(SeekFrom::Start(value.start + value.len))?;
             if self.ws()? == Some(b',') {
                 self.eat(b',')?;
             } else {
                 break;
             }
         }
-        self.eat(close)
+        self.eat(close)?;
+        Ok(damaged)
+    }
+    fn pending_typed<T: serde::de::DeserializeOwned>(
+        &mut self,
+        record: Span,
+    ) -> std::result::Result<T, Error> {
+        let Some(marker) = self.damaged_idless_marker(record)? else {
+            return self.typed(record);
+        };
+        self.reader.seek(SeekFrom::Start(record.start))?;
+        let masked = AbsentMarkerReader {
+            reader: &mut self.reader,
+            prefix: marker.start - record.start,
+            marker_end: marker.start + marker.len,
+            suffix: record.start + record.len - marker.start - marker.len,
+            replacement: b"null",
+            skipped: false,
+        };
+        let result = serde_json::from_reader(masked).map_err(|_| Error::Refused("record type"));
+        self.reader
+            .seek(SeekFrom::Start(record.start + record.len))?;
+        result
     }
     fn records<T: serde::de::DeserializeOwned>(
         &mut self,
@@ -1275,8 +1334,7 @@ impl<R: BufRead + Seek> Decoder<R> {
             // Decode the value first: only actual opaque debt spends hold
             // admission. Its full charge is checked before allocating the key.
             let decoded = if field == "claude_usage_family_pending" {
-                self.admit_idless_marker(value)
-                    .and_then(|()| self.typed(value))
+                self.pending_typed(value)
             } else {
                 self.typed(value)
             };

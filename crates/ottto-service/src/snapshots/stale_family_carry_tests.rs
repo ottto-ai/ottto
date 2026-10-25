@@ -3409,3 +3409,246 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
         0
     );
 }
+
+#[test]
+fn scaled_accepted_history_carries_6356_families_through_retry_deadline_expiry() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const HEALTHY: usize = 6356;
+    let mut fixture = scoped_retry_fixture(1, HEALTHY, false);
+    let held = fixture.roots[0].clone();
+    fixture
+        .index
+        .claude_usage_family_witnesses
+        .retain(|root, _| root == &held);
+    let healthy = fixture
+        .candidates
+        .iter()
+        .filter(|candidate| claude_index_path_member_ref(&candidate.path).unwrap().root != held)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(healthy.len(), HEALTHY);
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(
+        !claude_stale_family_carry_scratch_admitted(&fixture.index, &stale, 0),
+        "the former whole-graph gate actually refuses this scale"
+    );
+    fixture
+        .index
+        .claude_duplicate_fence_next_full_rearm_unix_seconds =
+        rfc3339_unix_seconds(CARRY_SECOND_RETRY);
+    let before = serde_json::to_value(&fixture.index).unwrap();
+    for at in [CARRY_RETRY, CARRY_SECOND_RETRY, "2026-08-03T07:31:00Z"] {
+        let (row, allocations) = crate::retry_allocation_probe::measure(|| {
+            carry_start(&mut fixture.index, at, BACKFILL_WINDOW_DAYS)
+        });
+        assert!(
+            allocations.requested_peak <= crate::source_rotation::PARKED_BUDGET,
+            "bounded start scratch: {}",
+            allocations.requested_peak
+        );
+        assert_eq!(row["reason"], "terminal_unhealthy_retry");
+        assert_eq!(row["carried_pending_families"], HEALTHY);
+        assert_eq!(row["rearmed_index_files"], 0);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &healthy),
+            0,
+            "cold acquisition state, including after the fence deadline"
+        );
+        assert!(fixture
+            .index
+            .claude_full_rearm_progress
+            .full_rearm_window
+            .is_none());
+        assert_eq!(fixture.index.claude_usage_authority_pending_count(), 1);
+        assert!(fixture.index.claude_duplicate_request_witness_overflowed);
+        for field in [
+            "session_account_bindings",
+            "accepted_snapshot_fingerprints",
+            "file_snapshot_fingerprints",
+            "claude_usage_authority_quarantine",
+        ] {
+            assert_eq!(
+                serde_json::to_value(&fixture.index).unwrap()[field],
+                before[field],
+                "{field}"
+            );
+        }
+        // A red terminal persists between unhealthy retries; local process
+        // acquisition cache is never populated for these healthy files.
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_directories
+            .clear();
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .clear();
+        carry_red(&mut fixture.index, at, 7);
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .unhealthy_retry_not_before_unix_seconds = rfc3339_unix_seconds(at);
+        let exclusions = fixture.index.claude_reemission_exclusions.clone();
+        fixture.index = carry_reload(fixture.index);
+        fixture.index.claude_reemission_exclusions = exclusions;
+    }
+    // The unrelated held debt still retries when due, without charging any
+    // healthy history a read. Authority custody and the fence stay intact.
+    fixture
+        .index
+        .claude_usage_authority_quarantine
+        .get_mut(&held)
+        .unwrap()
+        .retry_after_unix_seconds = 0;
+    let held_candidates = fixture
+        .candidates
+        .iter()
+        .filter(|c| claude_index_path_member_ref(&c.path).unwrap().root == held)
+        .cloned()
+        .collect::<Vec<_>>();
+    assert_eq!(scoped_retry_full_reads(&fixture.index, &held_candidates), 1);
+}
+
+#[test]
+fn streaming_accepted_carry_matches_the_existing_family_refusals() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for damage in [
+        "none",
+        "duplicate_path",
+        "missing_ack",
+        "account_hold",
+        "retained_stub",
+        "missing_root",
+        "foreign_member",
+        "invalid_pending",
+    ] {
+        let mut fixture = scoped_retry_fixture(1, 4, false);
+        let root = fixture.roots[1].clone();
+        let key = local_index_key(&fixture._scratch.join(format!("{root}.jsonl")));
+        match damage {
+            "duplicate_path" => {
+                let duplicate = format!("/another-project/{root}.jsonl");
+                fixture
+                    .index
+                    .files
+                    .insert(duplicate.clone(), fixture.index.files[&key].clone());
+                fixture.index.file_snapshot_fingerprints.insert(
+                    duplicate,
+                    fixture.index.file_snapshot_fingerprints[&key].clone(),
+                );
+            }
+            "missing_ack" => {
+                let body = fixture.index.file_snapshot_fingerprints[&key]
+                    .iter()
+                    .next()
+                    .unwrap()
+                    .clone();
+                fixture.index.accepted_snapshot_fingerprints.remove(&body);
+            }
+            "account_hold" => {
+                fixture
+                    .index
+                    .claude_account_deferred_holds
+                    .insert(key.clone(), "held".into());
+            }
+            "retained_stub" => {
+                fixture
+                    .index
+                    .claude_request_census
+                    .invalidate_keeping_birth(&key);
+            }
+            "missing_root" => {
+                fixture.index.files.remove(&key);
+            }
+            "foreign_member" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .member_request_id_hashes
+                    .insert("foreign".into(), BTreeSet::new());
+            }
+            "invalid_pending" => {
+                fixture
+                    .index
+                    .claude_usage_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .invalid = true;
+            }
+            _ => {}
+        }
+        let stale = fixture
+            .index
+            .claude_usage_family_pending
+            .keys()
+            .cloned()
+            .collect();
+        let legacy = claude_fence_closed_retry_carry(&fixture.index, &stale, true, true, true);
+        let streaming = claude_stream_accepted_retry_carry(&fixture.index, &stale).unwrap();
+        assert_eq!(streaming.roots, legacy.roots, "{damage}");
+        assert_eq!(
+            streaming.roots.len(),
+            if damage == "none" { 4 } else { 3 },
+            "{damage}"
+        );
+    }
+}
+
+#[test]
+fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(1, 512, false);
+    let files = serde_json::to_value(&fixture.index.files).unwrap();
+    let pending = fixture.index.claude_usage_family_pending.clone();
+    let bindings = fixture.index.session_account_bindings.clone();
+    let old_window = fixture
+        .index
+        .traversal
+        .as_ref()
+        .unwrap()
+        .census_window_end
+        .clone();
+    let _budget = ClaudeStaleFamilyCarryFundingBudgetForTest::new(0);
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        )
+    });
+    assert!(!rows.iter().any(|r| r["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index.files).unwrap(), files);
+    assert_eq!(fixture.index.claude_usage_family_pending, pending);
+    assert_eq!(fixture.index.session_account_bindings, bindings);
+    assert_eq!(
+        fixture.index.traversal.as_ref().unwrap().census_window_end,
+        old_window
+    );
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}

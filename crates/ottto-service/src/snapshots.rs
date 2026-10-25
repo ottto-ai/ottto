@@ -4879,6 +4879,143 @@ fn claude_stale_member_independently_accepted(
             )
 }
 
+fn claude_stale_member_accepted_retry_evidence(
+    index: &ScanIndex,
+    key: &str,
+    entry: &ScanIndexEntry,
+    pending: &ClaudeUsageFamilyPending,
+) -> bool {
+    let idless = pending.invalid
+        && pending.idless_revision == Some(claude_idless_revision(&entry.source_file_fingerprint));
+    claude_stale_member_independently_accepted(index, key, entry)
+        && !entry.source_file_fingerprint.is_empty()
+        && !index.claude_account_deferred_holds.contains_key(key)
+        && index
+            .claude_request_census
+            .retry_carry_record(key)
+            .map_or(true, |record| {
+                record.current_for(&entry.source_file_fingerprint)
+                    || idless && record.idless_native_for(&entry.source_file_fingerprint)
+            })
+        && (!pending.invalid
+            || idless
+                && index
+                    .claude_request_census
+                    .get(key)
+                    .is_some_and(|record| record.idless_native_for(&entry.source_file_fingerprint)))
+}
+
+/// Large accepted histories need no request-owner graph. Borrow paths, sort
+/// their canonical identities in place and decide one complete family at a
+/// time. Duplicate paths across projects remain visible. Price the returned
+/// root set, this one vector and the entire worst-case cancellation reserve
+/// together under the unchanged parked budget before allocating any of them.
+/// Refusal defers the start without clearing uncovered pending families.
+fn claude_stream_accepted_retry_carry(
+    index: &ScanIndex,
+    stale: &BTreeSet<String>,
+) -> Result<ClaudeStaleFamilyCarry, ()> {
+    use crate::heap_layout_bound::{tree_nodes, Counter};
+    if !crate::heap_layout_bound::layout_supported() {
+        return Err(());
+    }
+    let mut paths = 0usize;
+    let mut path_bytes = 0usize;
+    for key in index.files.keys() {
+        if claude_index_path_member_ref(Path::new(key)).is_some_and(|m| stale.contains(m.root)) {
+            paths = paths.checked_add(1).ok_or(())?;
+            path_bytes = path_bytes
+                .checked_add(key.len().checked_mul(2).ok_or(())?)
+                .ok_or(())?;
+        }
+    }
+    let root_bytes = stale
+        .iter()
+        .try_fold(0usize, |sum, root| sum.checked_add(root.len()))
+        .ok_or(())?;
+    let mut cost = Counter::new(crate::source_rotation::PARKED_BUDGET);
+    tree_nodes::<String, ()>(stale.len(), &mut cost).ok_or(())?;
+    cost.add(root_bytes).ok_or(())?;
+    cost.add(
+        paths
+            .checked_mul(std::mem::size_of::<(ClaudeIndexPathMemberRef<'_>, &str)>())
+            .ok_or(())?,
+    )
+    .ok_or(())?;
+    cost.add(
+        paths
+            .checked_mul(2 * std::mem::size_of::<ScanTraversalPath>())
+            .ok_or(())?,
+    )
+    .ok_or(())?;
+    cost.add(path_bytes).ok_or(())?;
+    if !claude_family_carry_cancellation_admitted(0, 0, paths.checked_mul(2).ok_or(())?, path_bytes)
+    {
+        return Err(());
+    }
+    let mut members = Vec::new();
+    members.try_reserve_exact(paths).map_err(|_| ())?;
+    for key in index.files.keys() {
+        if let Some(member) =
+            claude_index_path_member_ref(Path::new(key)).filter(|m| stale.contains(m.root))
+        {
+            members.push((member, key.as_str()));
+        }
+    }
+    members.sort_unstable_by_key(|(member, _)| *member);
+    let mut carried = BTreeSet::new();
+    let mut requeues = 0usize;
+    let mut after = 0;
+    while after < members.len() {
+        let root = members[after].0.root;
+        let end = after + members[after..].partition_point(|(m, _)| m.root == root);
+        let family = &members[after..end];
+        after = end;
+        let Some(pending) = index.claude_usage_family_pending.get(root) else {
+            continue;
+        };
+        if index.claude_usage_authority_quarantine.contains_key(root)
+            || family[0].0.subagent_stem.is_some()
+            || family.windows(2).any(|pair| pair[0].0 == pair[1].0)
+            || pending.invalid && (family.len() != 1 || pending.idless_revision.is_none())
+            || !pending
+                .member_request_id_hashes
+                .keys()
+                .chain(pending.member_occurrences.keys())
+                .all(|member| {
+                    let suffix = if member == root {
+                        None
+                    } else if let Some(stem) = member
+                        .strip_prefix(root)
+                        .and_then(|tail| tail.strip_prefix('_'))
+                    {
+                        Some(stem)
+                    } else {
+                        return false;
+                    };
+                    family
+                        .binary_search_by(|(identity, _)| identity.subagent_stem.cmp(&suffix))
+                        .is_ok()
+                })
+            || !family.iter().all(|(_, key)| {
+                claude_stale_member_accepted_retry_evidence(index, key, &index.files[*key], pending)
+            })
+        {
+            continue;
+        }
+        carried.insert(root.to_owned());
+        requeues = requeues.checked_add(family.len()).ok_or(())?;
+    }
+    let mut replay = Vec::new();
+    replay.try_reserve_exact(requeues).map_err(|_| ())?;
+    Ok(ClaudeStaleFamilyCarry {
+        origin: None,
+        roots: carried,
+        capped_roots: BTreeSet::new(),
+        replay,
+    })
+}
+
 /// Same-context unhealthy retries retain complete independently accepted
 /// families without a fence/census/deadline dependency. Other starts keep
 /// C1b/Fix 2's legacy gates. Every carry is scratch-priced and cancellation
@@ -37923,6 +38060,7 @@ fn ensure_bounded_traversal(
     // follow-up (or another explicit fresh generation) is now starting. Any
     // new partial settlement stamps the marker again before persistence.
     let prior_unsettled_upload = index.bounded_sweep_had_unsettled_upload;
+    let prior_unsettled_causes = index.bounded_sweep_unsettled_causes;
     index.bounded_sweep_had_unsettled_upload = plan_held && prior_unsettled_upload;
     index.bounded_sweep_unsettled_causes = 0;
     // A carry belongs to the traversal that started it; this start replaces it.
@@ -37988,7 +38126,32 @@ fn ensure_bounded_traversal(
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-        let carry = if !window_scratch_admitted {
+        // Use the graph-free accepted path for large non-window retries. Its
+        // refusal leaves the old red checkpoint and all pending/fingerprints
+        // intact; uncovered history must never turn a memory limit into reads.
+        let streaming_carry = stale_pending_roots.len() >= 512
+            && scoped_retry_allowed
+            && full_rearm_window_roots.is_empty()
+            && index.claude_full_rearm_progress.full_rearm_window.is_none()
+            && !index.claude_request_identity_contract_changed
+            && index.claude_request_identity_contract.is_some()
+            && claude_accepted_ledger_is_current(index)
+            && index.upload_context_fingerprint == index.active_upload_context_fingerprint;
+        #[cfg(test)]
+        let streaming_carry = streaming_carry
+            && !KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get)
+            && !REFUSE_CLAUDE_STALE_FAMILY_CARRY_BUDGET_FOR_TEST.with(std::cell::Cell::get);
+        let carry = if streaming_carry {
+            match claude_stream_accepted_retry_carry(index, &stale_pending_roots) {
+                Ok(carry) => carry,
+                Err(()) => {
+                    index.bounded_sweep_had_unsettled_upload = prior_unsettled_upload;
+                    index.bounded_sweep_unsettled_causes = prior_unsettled_causes;
+                    eprintln!("local snapshot census deferred a stale Claude retry: {} pending families exceed bounded carry/cancellation scratch; no fingerprints cleared", stale_pending_roots.len());
+                    return;
+                }
+            }
+        } else if !window_scratch_admitted {
             ClaudeStaleFamilyCarry::default()
         } else if scoped_retry_allowed || full_rearm_window_roots.is_empty() {
             claude_fence_closed_retry_carry(
@@ -38003,8 +38166,17 @@ fn ensure_bounded_traversal(
         } else {
             claude_fence_closed_retry_carry(index, &full_rearm_window_roots, true, false, false)
         };
-        let mut carried_roots = carry.roots.clone();
-        drop(carry); // Release its first funded buffer before cap/digest scratch.
+        let ClaudeStaleFamilyCarry {
+            roots: mut carried_roots,
+            replay: initial_replay,
+            ..
+        } = carry;
+        let streamed_replay = if streaming_carry {
+            Some(initial_replay)
+        } else {
+            drop(initial_replay); // Release first reserve before cap/digest scratch.
+            None
+        };
         let mut capped_roots = if window_scratch_admitted && !retry_can_reopen {
             claude_full_rearm_window_capped(index, &full_rearm_window_roots, &carried_roots)
         } else {
@@ -38012,11 +38184,16 @@ fn ensure_bounded_traversal(
         };
         // Capped pending credits no evidence either, but must still cancel
         // when M1 selects a changed member. Fund both sets under C1b's budget.
-        let mut retained_roots = carried_roots.union(&capped_roots).cloned().collect();
-        let replay = fund_claude_family_carry_cancellations(index, &mut retained_roots);
-        carried_roots.retain(|root| retained_roots.contains(root));
-        capped_roots.retain(|root| retained_roots.contains(root));
-        for root_session_id in &retained_roots {
+        let replay = if let Some(replay) = streamed_replay {
+            replay
+        } else {
+            let mut retained_roots = carried_roots.union(&capped_roots).cloned().collect();
+            let replay = fund_claude_family_carry_cancellations(index, &mut retained_roots);
+            carried_roots.retain(|root| retained_roots.contains(root));
+            capped_roots.retain(|root| retained_roots.contains(root));
+            replay
+        };
+        for root_session_id in carried_roots.iter().chain(&capped_roots) {
             if let Some(pending) = index.claude_usage_family_pending.get_mut(root_session_id) {
                 pending.member_occurrences.clear();
                 pending
@@ -38041,7 +38218,8 @@ fn ensure_bounded_traversal(
             |key| {
                 claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     stale_pending_roots.contains(member.root)
-                        && !retained_roots.contains(member.root)
+                        && !carried_roots.contains(member.root)
+                        && !capped_roots.contains(member.root)
                 })
             },
         );
@@ -38086,8 +38264,10 @@ fn ensure_bounded_traversal(
         transition.rearm_window_carried_families =
             carried_roots.intersection(&full_rearm_window_roots).count();
         transition.rearm_window_rearmed_files = window_rearmed_file_count;
-        transition.rearm_window_rearmed_families =
-            full_rearm_window_roots.difference(&retained_roots).count();
+        transition.rearm_window_rearmed_families = full_rearm_window_roots
+            .iter()
+            .filter(|root| !carried_roots.contains(*root) && !capped_roots.contains(*root))
+            .count();
         transition.stale_rearm_capped_families = capped_roots.len();
         transition.stale_rearm_capped_files = capped_file_count;
         if rearmed_file_count > 0 || !carried_roots.is_empty() {
@@ -38098,7 +38278,10 @@ fn ensure_bounded_traversal(
                 stale_pending_roots.len(),
                 rearmed_file_count,
                 carried_roots.len(),
-                stale_pending_roots.difference(&retained_roots).count(),
+                stale_pending_roots
+                    .iter()
+                    .filter(|root| !carried_roots.contains(*root) && !capped_roots.contains(*root))
+                    .count(),
             );
         }
         if !carried_roots.is_empty() {
