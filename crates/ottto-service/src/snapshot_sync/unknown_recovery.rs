@@ -2036,7 +2036,6 @@ fn encode(request: &SnapshotBatchRequest, head_cas: bool) -> Result<Vec<u8>> {
 pub(super) enum LiteralPermit {
     Permit,
     DenyAll,
-    Unavailable,
 }
 pub(super) fn current_literal_guard(index: &ScanIndex, m: &Manifest) -> LiteralPermit {
     #[cfg(test)]

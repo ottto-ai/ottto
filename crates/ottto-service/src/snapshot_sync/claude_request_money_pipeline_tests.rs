@@ -1810,7 +1810,7 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
     money::store::reload_for_test(&fixture.support);
     // The normal page builds from actual multi-file membership, not a test
     // supplied union key. This intentionally pins the unfinished P2 union seam.
-    let held = money::live_page(
+    let held = money::live_page_with_coverage_for_test(
         &fixture.support,
         &mut scan.snapshots,
         &index,
@@ -1819,6 +1819,7 @@ fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids()
         true,
         None,
         &mut BTreeMap::new(),
+        &money::coverage::CoveredForTest,
     );
     money::store::flush();
     money::disable_shadow_for_test(&fixture.support);

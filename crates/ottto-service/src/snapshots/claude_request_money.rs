@@ -1929,6 +1929,7 @@ async fn build_page_at(
         now,
         Instant::now(),
         live,
+        true,
         output,
     )
     .await
@@ -1991,6 +1992,7 @@ fn shadow_page_with_coverage(
         now,
         entered,
         false,
+        false,
         &mut output,
     ))
     .unwrap_or_default();
@@ -2018,6 +2020,7 @@ async fn build_page_with_coverage(
     now: u64,
     started: Instant,
     live: bool,
+    collect_entities: bool,
     output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
     let live = live && request_owned_live(support_dir);
@@ -2450,7 +2453,7 @@ async fn build_page_with_coverage(
                     family_captures.insert(
                         (
                             root.to_owned(),
-                            if live {
+                            if collect_entities {
                                 item.source_file_fingerprint.clone().unwrap_or_default()
                             } else {
                                 item.source_session_id.clone()
@@ -2520,6 +2523,7 @@ async fn build_page_with_coverage(
                     &mut scope,
                     holder_view,
                     live,
+                    collect_entities,
                     &mut budget,
                     &mut end,
                     &mut counts,
@@ -2535,7 +2539,7 @@ async fn build_page_with_coverage(
                     .max(SHADOW_RESERVED.load(Ordering::Acquire) as u64);
                 match result {
                     Ok((mut body, union, absent, unknown)) => {
-                        if live {
+                        if collect_entities {
                             for item in items {
                                 let key = family
                                     .member_keys
@@ -2582,7 +2586,7 @@ async fn build_page_with_coverage(
                             failure_rows(root, reason, state, now, snapshot, ledger, &mut counts);
                     }
                 }
-                if live {
+                if collect_entities {
                     output._reservations.push(budget);
                 }
             }
@@ -2942,6 +2946,7 @@ async fn build_slice(
     scope: &mut ClaudeLedgerScope,
     holder_view: ClaudeHolderView,
     live: bool,
+    owned_body: bool,
     budget: &mut ShadowBudget,
     end: &mut PageEnd<'_>,
     counts: &mut ClaudeRequestMoneyShadowCounts,
@@ -3117,7 +3122,7 @@ async fn build_slice(
     counts.holders_compared += holders.compared;
 
     let mut aliases = BTreeMap::<String, String>::new();
-    if live {
+    if owned_body {
         let mut primary = BTreeMap::<(Option<&str>, String, String), &str>::new();
         for key in index.files.keys() {
             if Instant::now() >= deadline {
@@ -3215,14 +3220,14 @@ async fn build_slice(
         for item in items {
             if let Some(capture) = captures.remove(&(
                 root.to_owned(),
-                if live {
+                if owned_body {
                     item.source_file_fingerprint.clone().unwrap_or_default()
                 } else {
                     item.source_session_id.clone()
                 },
             )) {
                 family_captures.insert(
-                    if live {
+                    if owned_body {
                         item.source_file_fingerprint
                             .as_deref()
                             .unwrap_or(&item.source_session_id)
@@ -3574,6 +3579,39 @@ pub(crate) fn live_page_for_test(
     live_page(
         support, snapshots, index, api, trace, complete, identity, groupings,
     )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn live_page_with_coverage_for_test(
+    support_dir: &Path,
+    snapshots: &mut Vec<SnapshotItem>,
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    identity: Option<&super::claude_request_identity::ScanEvidence<'_>>,
+    groupings: &mut BTreeMap<String, super::claude_request_identity::Grouping>,
+    coverage: &dyn FamilyCoverage,
+) -> BTreeSet<String> {
+    let mut output = PageBodies::default();
+    let _ = crate::snapshot_sync::money_resume::drive_for_test(guarded_resume(
+        build_page_with_coverage(
+            support_dir,
+            snapshots,
+            index,
+            api,
+            trace,
+            coverage,
+            census_complete,
+            page_now(support_dir),
+            Instant::now(),
+            true,
+            true,
+            &mut output,
+        ),
+    ));
+    apply_live_page(snapshots, index, &output, identity, groupings)
 }
 
 #[allow(clippy::too_many_arguments)]
