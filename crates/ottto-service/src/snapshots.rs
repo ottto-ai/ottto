@@ -28799,12 +28799,17 @@ impl OwnedSourceScan {
                         source.api_slug(),
                     );
                 }
-                resource_probe.collection(
+                resource_probe.collection_with_account_pending(
                     source.api_slug(),
                     crate::local_resource_diagnostics::CollectionCounts {
                         scanned_files: scanned_file_count,
                         semantic_noops: semantic_noop_count,
                         sampled_acquisition,
+                    },
+                    if source == SnapshotSource::ClaudeCode {
+                        index.claude_account_retained_pending_resources()
+                    } else {
+                        None
                     },
                 );
                 return Ok(OwnedSourceScanStep::Complete {
@@ -42797,6 +42802,44 @@ impl ScanIndex {
                 .is_none_or(BTreeSet::is_empty)
     }
 
+    fn claude_account_retained_pending_resources(
+        &self,
+    ) -> Option<crate::local_resource_diagnostics::ClaudeAccountRetainedPending> {
+        if self.claude_account_family_pending.is_empty() {
+            return None;
+        }
+        // Stream only retained metadata to a counter: no transcript/disk read,
+        // second buffer of the field, new log, timer, or authority decision.
+        struct ByteCount(u64);
+        impl std::io::Write for ByteCount {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len() as u64);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        #[derive(Serialize)]
+        struct Field<'a> {
+            claude_account_family_pending: &'a BTreeMap<String, ClaudeAccountFamilyPending>,
+        }
+        let mut bytes = ByteCount(0);
+        serde_json::to_writer_pretty(
+            &mut bytes,
+            &Field {
+                claude_account_family_pending: &self.claude_account_family_pending,
+            },
+        )
+        .ok()?;
+        Some(
+            crate::local_resource_diagnostics::ClaudeAccountRetainedPending {
+                claude_account_retained_pending_families: self.claude_account_family_pending.len(),
+                claude_account_retained_pending_bytes: bytes.0,
+            },
+        )
+    }
+
     fn retire_committed_claude_account_pending_windows(&mut self) {
         if !claude_accepted_ledger_is_current(self) || self.decode_has_opaque_file_incidence() {
             return;
@@ -42833,6 +42876,8 @@ impl ScanIndex {
             .collect::<BTreeSet<_>>();
         let mut candidates = BTreeMap::new();
         for (root, pending) in &self.claude_account_family_pending {
+            // Current-window holds/incomplete identity always win over older
+            // accepted evidence. Superseded windows need not have completed.
             if pending.invalid
                 || !pending.census_complete
                 || self.decode_holds_family(root)
@@ -62300,6 +62345,177 @@ mod tests {
             retained_other
         );
         assert!(!reloaded.claude_account_family_pending.contains_key(&root));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    fn d2_assert_current_window_blocks_older_unfinished_retirement(blocker: &str) {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        let pending = &index.claude_account_family_pending[&root];
+        assert!(pending.census_complete);
+        assert_eq!(pending.previous_windows.len(), 1);
+        assert!(!pending.previous_windows[0].census_complete);
+        // Positive O1 control: old completion is unnecessary once every newest
+        // exact identity is committed and the current census completed.
+        let mut committed = index.clone();
+        committed.retire_committed_claude_account_pending_windows();
+        assert!(!committed.claude_account_family_pending.contains_key(&root));
+        let key = index.files.keys().next().unwrap().clone();
+        match blocker {
+            "held" => {
+                index
+                    .claude_account_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .invalid = true
+            }
+            "withheld" => {
+                index
+                    .claude_account_deferred_holds
+                    .insert(key, "fixture".into());
+            }
+            "retry_pending" => index.insert_claude_authority_for_test(
+                &root,
+                &"f".repeat(64),
+                ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+            ),
+            "identity_incomplete" => {
+                index
+                    .claude_account_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .member_requests
+                    .values_mut()
+                    .next()
+                    .unwrap()
+                    .identity_revision = None;
+            }
+            "census_incomplete" => {
+                index
+                    .claude_account_family_pending
+                    .get_mut(&root)
+                    .unwrap()
+                    .census_complete = false;
+            }
+            _ => unreachable!(),
+        }
+        let retained = index.claude_account_family_pending[&root].clone();
+        let path = dir.join("current-window-blocker.json");
+        index.save(&path).unwrap();
+        let mut loaded =
+            lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code").unwrap();
+        assert_eq!(
+            loaded.claude_account_family_pending[&root], retained,
+            "{blocker}"
+        );
+        loaded.retire_committed_claude_account_pending_windows();
+        assert_eq!(
+            loaded.claude_account_family_pending[&root], retained,
+            "{blocker}"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_current_held_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("held");
+    }
+
+    #[test]
+    fn claude_account_pending_current_withheld_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("withheld");
+    }
+
+    #[test]
+    fn claude_account_pending_current_retry_pending_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("retry_pending");
+    }
+
+    #[test]
+    fn claude_account_pending_current_identity_incomplete_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("identity_incomplete");
+    }
+
+    #[test]
+    fn claude_account_pending_current_census_incomplete_keeps_older_unfinished_window() {
+        d2_assert_current_window_blocks_older_unfinished_retirement("census_incomplete");
+    }
+
+    #[test]
+    fn claude_account_pending_local_resources_count_retained_bytes_and_omit_zero() {
+        use crate::local_resource_diagnostics::{CollectionCounts, Probe};
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        for window in ["2026-08-02T07:10:00Z", "2026-08-02T07:11:00Z"] {
+            apply_claude_effort_evidence_with_index(
+                &mut items.clone(),
+                &evidence,
+                &mut index,
+                false,
+                window,
+            );
+        }
+        index
+            .claude_account_family_pending
+            .get_mut(&root)
+            .unwrap()
+            .invalid = true;
+        let expected = serde_json::to_vec_pretty(&serde_json::json!({
+            "claude_account_family_pending": &index.claude_account_family_pending,
+        }))
+        .unwrap()
+        .len() as u64;
+        let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+            for empty in [false, true] {
+                if empty {
+                    index.claude_account_family_pending.clear();
+                }
+                Probe::start().collection_with_account_pending(
+                    "claude_code",
+                    CollectionCounts {
+                        scanned_files: 0,
+                        semantic_noops: 0,
+                        sampled_acquisition: None,
+                    },
+                    index.claude_account_retained_pending_resources(),
+                );
+            }
+        });
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["stage"], "native_collection_page");
+        assert_eq!(
+            rows[0]["counts"]["claude_account_retained_pending_families"],
+            1
+        );
+        assert_eq!(
+            rows[0]["counts"]["claude_account_retained_pending_bytes"],
+            expected
+        );
+        assert!(expected > 0);
+        assert!(rows[1]["counts"]
+            .get("claude_account_retained_pending_families")
+            .is_none());
+        assert!(rows[1]["counts"]
+            .get("claude_account_retained_pending_bytes")
+            .is_none());
+        assert!(!serde_json::to_string(&rows).unwrap().contains(&root));
         fs::remove_dir_all(dir).unwrap();
     }
 
