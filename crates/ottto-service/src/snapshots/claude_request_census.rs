@@ -172,9 +172,9 @@ pub(crate) struct ClaudeLedgerFields {
     /// (`claude_request_money::facts`).
     facts: Option<Box<[u8]>>,
     /// `sweep:` records: a persisted resumable sweep position.
-    sweep: Option<ClaudeLedgerSweep>,
+    sweep: Option<Box<ClaudeLedgerSweep>>,
     /// `fam:` records: the family's last complete published shadow body.
-    family: Option<ClaudeFamilyMemo>,
+    family: Option<Box<ClaudeFamilyMemo>>,
 }
 
 /// A resumable sweep of the ledger (the telemetry tail, the missing-sidecar
@@ -263,9 +263,12 @@ pub(crate) struct ClaudeTelemetryTailState {
 /// Resident bytes of one record beyond its payload (key, hashes, facts):
 /// its map node share, its ledger fields' box and its hash buffer's `Arc`
 /// counts (the terms `resident_bytes` charges).
-pub(crate) const RECORD_RESIDENT_OVERHEAD_BYTES: usize =
-    (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3 / 2
+pub(crate) const RECORD_RESIDENT_OVERHEAD_BYTES: usize = (std::mem::size_of::<String>() + std::mem::size_of::<ClaudeRequestCensusRecord>()) * 3 / 2
         + std::mem::size_of::<ClaudeLedgerFields>()
+        // Retain the conservative maximum when both rare boxed fields exist;
+        // ordinary telemetry records no longer reserve these payloads inline.
+        + std::mem::size_of::<ClaudeLedgerSweep>()
+        + std::mem::size_of::<ClaudeFamilyMemo>()
         + 2 * std::mem::size_of::<usize>();
 
 /// The smallest serialized entry, `"":{"v":0,"fp":"<64 hex>","w":0,"s":"exact"}`
@@ -305,7 +308,11 @@ impl crate::heap_layout_bound::HeapLayoutBound for ClaudeRequestCensusRecord {
         match ledger {
             Some(fields) => c.add(
                 std::mem::size_of::<ClaudeLedgerFields>()
-                    + fields.facts.as_ref().map_or(0, |facts| facts.len()),
+                    + fields.facts.as_ref().map_or(0, |facts| facts.len())
+                    + usize::from(fields.sweep.is_some())
+                        * std::mem::size_of::<ClaudeLedgerSweep>()
+                    + usize::from(fields.family.is_some())
+                        * std::mem::size_of::<ClaudeFamilyMemo>(),
             ),
             None => Some(()),
         }
@@ -364,12 +371,12 @@ impl ClaudeRequestCensusRecord {
     }
 
     pub(crate) fn sweep(&self) -> Option<(&[u8; 32], u64, ClaudeLedgerSweep)> {
-        let sweep = self.ledger.as_ref()?.sweep?;
+        let sweep = *self.ledger.as_ref()?.sweep.as_deref()?;
         Some((&self.source_file_fingerprint, self.window, sweep))
     }
 
     pub(crate) fn family_memo(&self) -> Option<(&[u8; 32], ClaudeFamilyMemo)> {
-        let memo = self.ledger.as_ref()?.family?;
+        let memo = *self.ledger.as_ref()?.family.as_deref()?;
         Some((&self.source_file_fingerprint, memo))
     }
 
@@ -497,7 +504,7 @@ impl ClaudeRequestCensusRecord {
     ) -> Self {
         Self {
             ledger: Some(Box::new(ClaudeLedgerFields {
-                sweep: Some(sweep),
+                sweep: Some(Box::new(sweep)),
                 ..ClaudeLedgerFields::default()
             })),
             ..Self::bookkeeping(cursor, start_unix)
@@ -512,7 +519,7 @@ impl ClaudeRequestCensusRecord {
     ) -> Self {
         Self {
             ledger: Some(Box::new(ClaudeLedgerFields {
-                family: Some(memo),
+                family: Some(Box::new(memo)),
                 ..ClaudeLedgerFields::default()
             })),
             ..Self::bookkeeping(revision, observed_unix)
@@ -1885,8 +1892,8 @@ impl<'de> Visitor<'de> for RecordVisitor {
                 Box::new(ClaudeLedgerFields {
                     tail,
                     facts,
-                    sweep,
-                    family,
+                    sweep: sweep.map(Box::new),
+                    family: family.map(Box::new),
                 })
             });
         Ok(
