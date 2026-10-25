@@ -1528,7 +1528,7 @@ fn fe_claude_prefix_then_complete_tail_at_eof_is_positive_again() {
         .cache
         .retained()
         .unwrap()
-        .insert(base.key.clone(), complete));
+        .insert(base.key.clone(), complete.retained));
     let ((mut index, result, seen), counts) =
         observe(|| plain(&base.fixture, CLAUDE, base.index, &base.cache));
     assert_eq!(counts.prefix_tag_clears, 1);
@@ -1574,7 +1574,7 @@ fn fe_claude_prefix_then_grown_tail_does_not_clear_provenance() {
         .cache
         .retained()
         .unwrap()
-        .insert(base.key.clone(), complete));
+        .insert(base.key.clone(), complete.retained));
     let ((mut index, result, seen, _), counts) = observe(|| {
         page_injecting(
             &base.fixture,
