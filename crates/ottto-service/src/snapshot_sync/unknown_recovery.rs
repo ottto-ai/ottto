@@ -1528,6 +1528,22 @@ pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()
     Ok(())
 }
 
+// A retained intent proves original authorization only after the original
+// literal/history guard passes. Repeat the same check after custody yields.
+fn initial_authorized(index: &mut ScanIndex, support: &Path, m: &Manifest) -> bool {
+    if !m.entities.iter().any(|entity| entity.literal) {
+        return true;
+    }
+    let roots = m
+        .scope
+        .roots
+        .iter()
+        .map(|(root, files)| (root.as_str(), files.as_slice()))
+        .collect::<Vec<_>>();
+    index.initial_recovery_history_permitted(support, &roots)
+        && current_literal_guard(index, m) == LiteralPermit::Permit
+}
+
 /// Return Pending to the async owner instead of waiting on disk under its lock.
 /// Once ready, send the retained wire bytes directly. Ordinary uploader retry,
 /// auth fallback, bisection and gzip are never entered for this episode.
@@ -1584,24 +1600,15 @@ pub(super) fn initial_post(
             }
             .into());
         }
-        if money::recovery_released(support, &m.lineage) {
-            let roots = m
-                .scope
-                .roots
-                .iter()
-                .map(|(root, files)| (root.as_str(), files.as_slice()))
-                .collect::<Vec<_>>();
-            if m.entities.iter().any(|e| e.literal)
-                && (!index.initial_recovery_history_permitted(support, &roots)
-                    || current_literal_guard(index, &m) != LiteralPermit::Permit)
-            {
-                return Err(Deferred {
-                    reason: None,
-                    not_before: now(support),
-                    route_unavailable: false,
-                }
-                .into());
+        if !initial_authorized(index, support, &m) {
+            return Err(Deferred {
+                reason: None,
+                not_before: now(support),
+                route_unavailable: false,
             }
+            .into());
+        }
+        if money::recovery_released(support, &m.lineage) {
             let mut permitted = request.snapshots.clone();
             index.retain_claude_history_emission_permitted(&mut permitted);
             if permitted.len() != request.snapshots.len() {
@@ -1616,6 +1623,14 @@ pub(super) fn initial_post(
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
             let body = encode(request, m.head_cas)?;
+            if !initial_authorized(index, support, &m) {
+                return Err(Deferred {
+                    reason: None,
+                    not_before: now(support),
+                    route_unavailable: false,
+                }
+                .into());
+            }
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
         let body = encode(request, m.head_cas)?;
@@ -1640,16 +1655,7 @@ pub(super) fn initial_post(
         }
         .into());
     }
-    let roots = m
-        .scope
-        .roots
-        .iter()
-        .map(|(root, files)| (root.as_str(), files.as_slice()))
-        .collect::<Vec<_>>();
-    if m.entities.iter().any(|e| e.literal)
-        && (!index.initial_recovery_history_permitted(support, &roots)
-            || current_literal_guard(index, &m) != LiteralPermit::Permit)
-    {
+    if !initial_authorized(index, support, &m) {
         return Err(Deferred {
             reason: None,
             not_before: now(support),

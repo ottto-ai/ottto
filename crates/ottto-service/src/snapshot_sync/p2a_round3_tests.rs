@@ -3239,6 +3239,51 @@ fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_denied_original_literal_cannot_create_an_authorized_replay_intent() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let denied = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::DenyAll);
+    control.cycle_deferred();
+    assert!(control.server.raw_batches.lock().unwrap().is_empty());
+    assert!(
+        unknown_recovery::active_for_test(&control.support).is_empty(),
+        "a never-authorized body cannot acquire the UNKNOWN replay exception"
+    );
+    money::store::with_ledger_for_test(&control.support, |ledger| {
+        assert_eq!(
+            ledger
+                .census()
+                .records_with_prefix("adopt:entity:recovery-release:")
+                .count(),
+            0,
+            "guard denial happens before custody reservation"
+        );
+    })
+    .unwrap();
+    assert!(money::money_due(
+        &control.support,
+        &control.transcript().to_string_lossy(),
+        u64::MAX
+    ));
+    drop(denied);
+    control.cycle();
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "later authorization is a normal first offer, with no prior replay intent"
+    );
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_credentials() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
