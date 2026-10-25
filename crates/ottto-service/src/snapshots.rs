@@ -105,12 +105,12 @@ mod launcher_recognition_tests;
 mod local_context_points;
 pub(crate) use local_context_points::LocalContextPoint;
 use local_context_points::{local_context_points_recent, LocalContextPoints};
+#[cfg(test)]
+pub(crate) mod e2_pipeline_scan_fixture;
 #[path = "pi_retry_inputs.rs"]
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
-#[cfg(test)]
-pub(crate) mod e2_pipeline_scan_fixture;
 pub(crate) mod sampled_scan;
 #[cfg(test)]
 mod transcript_acquisition_tests;
