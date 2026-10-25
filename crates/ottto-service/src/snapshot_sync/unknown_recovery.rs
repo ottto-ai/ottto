@@ -1355,24 +1355,28 @@ pub(super) fn resolve_saved(
                                 == Some(record)
                     })
         });
-        // A later exact selected ACK can supersede a bootstrap's cache-less
-        // body. Its original money offer must already be retired by the normal
-        // ACK/selected-save/debt barrier; a newer outstanding offer is not lent
-        // this old ACK. No-offer entities still require their exact tuple above.
-        let original_offers_finished = m.entities.iter().all(|entity| {
-            !entity.file_selections.is_empty()
-                && entity
-                    .files
-                    .iter()
-                    .zip(&entity.file_selections)
-                    .all(|(key, selection)| {
-                        selection.offer.is_some_and(|offer| {
-                            money::recovery_offer_debt_retired(support, key, offer)
-                                && !money::money_due(support, key, u64::MAX)
-                        })
+        // A later exact selected cache projection may replace a known probe.
+        // It must have its own real ACK and selected tuple, and cannot borrow
+        // the probe's old offer while any contributing money debt remains.
+        let superseded_body_selected = m.entities.iter().all(|entity| {
+            selected.selected_current_recovery_body_recorded(
+                &entity.session,
+                &entity.fingerprint,
+                &entity.files,
+                if entity.literal { 3 } else { 2 },
+                &progress.accepted_body_witnesses,
+            ) && entity
+                .files
+                .iter()
+                .zip(&entity.file_selections)
+                .all(|(key, selection)| {
+                    selection.offer.map_or(true, |offer| {
+                        money::recovery_offer_debt_retired(support, key, offer)
+                            && !money::money_due(support, key, u64::MAX)
                     })
+                })
         });
-        if m.terminal.is_none() && m.ack_saved && (selected_outcomes || original_offers_finished) {
+        if m.terminal.is_none() && m.ack_saved && (selected_outcomes || superseded_body_selected) {
             // This mark follows ACK/selected saves and the original matching
             // money debt handoff. Known outcomes need no unresolved receipt.
             m.terminal = Some(Reason::Resolved);

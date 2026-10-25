@@ -36571,6 +36571,70 @@ impl ScanIndex {
     /// A saved accepted entity can coexist with a held file's older upload
     /// tuple. Recovery custody remains needed until the selected file carries
     /// the original aggregate witnesses and the requested covering revision.
+    /// A later cache projection can supersede a known bootstrap ACK. Verify
+    /// its actual selected body instead of retaining the old payload forever.
+    /// This grants no ACK, stamp or debt settlement.
+    pub(crate) fn selected_current_recovery_body_recorded(
+        &self,
+        session: &str,
+        fingerprint: &str,
+        files: &[String],
+        revision: u64,
+        bodies: &BTreeMap<String, String>,
+    ) -> bool {
+        if !self.accepted_snapshot_fingerprint_recorded(fingerprint) {
+            return false;
+        }
+        if files.is_empty() {
+            return bodies.get(fingerprint).is_some_and(|body| {
+                self.claude_money_files.values().any(|selection| {
+                    selection.member == session
+                        && selection.revision == fingerprint
+                        && selection.synthetic_body.as_ref() == Some(body)
+                })
+            });
+        }
+        if !files.iter().any(|key| {
+            self.file_snapshot_fingerprints
+                .get(key)
+                .is_some_and(|members| members.contains(fingerprint))
+        }) {
+            return false;
+        }
+        files.iter().all(|key| {
+            let Some(entry) = self.files.get(key) else {
+                return false;
+            };
+            let Some(members) = self
+                .file_snapshot_fingerprints
+                .get(key)
+                .filter(|members| !members.is_empty())
+            else {
+                return false;
+            };
+            let Some(_funds) =
+                claude_request_money::ShadowReservation::admit(members.len().saturating_mul(128))
+            else {
+                return false;
+            };
+            let mut witnesses = BTreeSet::new();
+            for member in members {
+                let Some(body) = bodies.get(member) else {
+                    return false;
+                };
+                witnesses.insert(body.as_str());
+            }
+            let mut digest = Sha256::new();
+            update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
+            for body in witnesses {
+                update_length_prefixed(&mut digest, body.as_bytes());
+            }
+            entry.effective_upload_body_witness_revision >= revision
+                && entry.last_upload_body_witness.as_deref()
+                    == Some(format!("{:x}", digest.finalize()).as_str())
+        })
+    }
+
     pub(crate) fn selected_upload_tuple_recorded(
         &self,
         key: &str,

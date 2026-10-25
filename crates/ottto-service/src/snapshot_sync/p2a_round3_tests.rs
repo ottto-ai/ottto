@@ -3423,6 +3423,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
             format!("{:08x}-7777-4777-8777-777777777777", 0x60000000u32 + number);
         // Synthetic telemetry-only entities have no physical selected file.
         item.source_file_fingerprint = None;
+        item.provenance.collector = "claude_api_synthetic".into();
         item.snapshot_fingerprint =
             crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
         items.push(item);
@@ -3516,6 +3517,17 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     // Original prepared offer plus sixteen independently captured batches.
     assert_eq!(control.server.raw_batches.lock().unwrap().len(), 17);
     // Save only real ACKs through the actual selected-index save before retiring custody.
+    let selected = items
+        .iter()
+        .filter(|item| {
+            progress
+                .accepted_body_witnesses
+                .get(&item.snapshot_fingerprint)
+                == Some(&snapshot_upload_body_witness(item))
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    money::finalize_synthetic(&mut index, &selected);
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     index.save(&control.index_path).unwrap();
     unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
