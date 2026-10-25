@@ -15,8 +15,10 @@ source fingerprint so a later generation reparses them. Even backend-dominated
 refusals still report an error while such a hold persists.
 
 `Deferred` pages retain their existing behavior: their retryable server conflict
-keeps the traversal unsettled, with or without local holds. RetryPending
-families, unbound authority holds, and unrestorable holds also keep blocking.
+keeps the traversal unsettled, with or without local holds. Unbound authority
+holds, RetryPending holds with a correction grant, and unrestorable holds also
+keep blocking. A bound RetryPending hold without a correction grant settles like
+a terminal-bound hold (see `session-2026-10-22-patha-authority-hold-bridge.md`).
 Settling an eligible later page never clears earlier traversal debt.
 
 ## Counter scope
