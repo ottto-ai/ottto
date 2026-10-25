@@ -23573,6 +23573,9 @@ pub(crate) struct OwnedSourceScan {
     pending_finalization: Vec<PendingIndexFinalization>,
     claude_authority_preflight: bool,
     forced_claude_family_reparses: BTreeSet<String>,
+    /// E2: forced roots selected only for path-twin co-scheduling. Their
+    /// owed adoption-only members keep the history gate (both or neither).
+    claude_twin_only_family_reparses: BTreeSet<String>,
     identified_candidates: VecDeque<CandidateFile>,
     /// The active file and, while it is a paged cursor job, its slot lease.
     /// A dropped frame returns an intact job to the slot.
@@ -24462,13 +24465,18 @@ impl OwnedSourceScan {
                 }
             }
         }
+        let mut claude_twin_only_family_reparses = BTreeSet::new();
         if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
-            forced_claude_family_reparses.extend(claude_request_money::e2::selected_twin_roots(
+            for root in claude_request_money::e2::selected_twin_roots(
                 identified_candidates
                     .iter()
                     .map(|candidate| candidate.path.as_path()),
                 &index,
-            ));
+            ) {
+                if forced_claude_family_reparses.insert(root.clone()) {
+                    claude_twin_only_family_reparses.insert(root);
+                }
+            }
         }
         if !forced_claude_family_reparses.is_empty() {
             let already_identified = identified_candidates
@@ -24600,6 +24608,7 @@ impl OwnedSourceScan {
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
+            claude_twin_only_family_reparses,
             identified_candidates: identified_candidates.into(),
             active_file: Default::default(),
             codex_join_inventory,
@@ -24762,6 +24771,7 @@ impl OwnedSourceScan {
             mut pending_finalization,
             claude_authority_preflight,
             mut forced_claude_family_reparses,
+            claude_twin_only_family_reparses,
             mut identified_candidates,
             active_file: active_frame,
             mut codex_join_inventory,
@@ -28785,17 +28795,31 @@ impl OwnedSourceScan {
                 index.mark_bounded_sweep_unsettled();
                 pending!();
             }
-            let (mut decision, parse_reason) = claude_index_path_family_member(&candidate.path)
-                .filter(|(root_session_id, _)| {
-                    forced_claude_family_reparses.contains(root_session_id)
-                })
-                .map(|_| {
-                    (
+            let (mut decision, parse_reason) =
+                match claude_index_path_family_member(&candidate.path).filter(
+                    |(root_session_id, _)| forced_claude_family_reparses.contains(root_session_id),
+                ) {
+                    // A twin-only forced member that owes only adoption keeps that
+                    // reason, so the history gate can hold the whole twin group.
+                    Some((root_session_id, _))
+                        if claude_twin_only_family_reparses.contains(&root_session_id)
+                            && index.candidate_decision_with_reason(&candidate)
+                                == (
+                                    CandidateDecision::Parse,
+                                    Some(CandidateParseReason::BodyWitnessAdoption),
+                                ) =>
+                    {
+                        (
+                            CandidateDecision::Parse,
+                            Some(CandidateParseReason::BodyWitnessAdoption),
+                        )
+                    }
+                    Some(_) => (
                         CandidateDecision::Parse,
                         Some(CandidateParseReason::ForcedFamily),
-                    )
-                })
-                .unwrap_or_else(|| index.candidate_decision_with_reason(&candidate));
+                    ),
+                    None => index.candidate_decision_with_reason(&candidate),
+                };
             let target_match = native_comparison
                 .as_ref()
                 .and_then(|phase| phase.target_revision_matches(&candidate));
@@ -29991,6 +30015,7 @@ impl OwnedSourceScan {
             pending_finalization,
             claude_authority_preflight,
             forced_claude_family_reparses,
+            claude_twin_only_family_reparses,
             identified_candidates,
             active_file: sampled_scan::codex_cursor::ActiveFrame::new(
                 active_file,
@@ -83161,7 +83186,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reread_required, reread_ticket, reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, claude_twin_only_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);
