@@ -772,6 +772,22 @@ impl SnapshotAccumulator {
                 self.latest_turn_id.as_deref(),
             )
         });
+        // Match the UI price stamp after tier replay, on this row only. Codex
+        // input already includes cached input; price the original request's
+        // prompt, even when coverage admits only part of its usage.
+        if !usage_selector.context.contains_key("context_bucket") {
+            if let Some(bucket) = model
+                .as_deref()
+                .or(self.latest_model.as_deref())
+                .and_then(|model| provider_context_bucket(model, native.usage[0], timestamp))
+            {
+                usage_selector.insert(
+                    "context_bucket",
+                    bucket.to_string(),
+                    "derived_from_native_usage",
+                );
+            }
+        }
         let effort = self.latest_reasoning_effort.clone();
         self.add_usage_with_selector(
             model,

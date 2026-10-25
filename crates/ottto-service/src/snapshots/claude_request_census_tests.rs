@@ -1593,18 +1593,19 @@ fn census_records_past_the_budget_become_inert_tombstones() {
     assert_eq!(census.hash_total_for_test(), 0);
 }
 
-/// Layout: both new `ScanIndex` fields are charged through `fields!`, and the
-/// per-entry layout `#588` restore pricing reads is unchanged by D1.
+/// Layout: census fields are charged through `fields!` without adding per-entry
+/// data. Keep the exact current entry-size pin used by restore pricing.
 #[test]
 fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    // Measured on the tests-first head (CI layout), before D1 changed anything.
-    const SCAN_INDEX_ENTRY_BYTES_BEFORE_D1: usize = 440;
+    // CI layout: the hash-only Codex counting-owner Option<String> adds 24
+    // inline bytes to the previous 440-byte entry. Census still adds none.
+    const SCAN_INDEX_ENTRY_BYTES: usize = 464;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),
-        SCAN_INDEX_ENTRY_BYTES_BEFORE_D1
+        SCAN_INDEX_ENTRY_BYTES
     );
     let mut index = ScanIndex::default();
     let before = crate::heap_layout_bound::completed_bound(&index, usize::MAX).expect("bound");

@@ -27,6 +27,7 @@ pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
 pub mod control_plane_health;
+mod desktop_recent;
 pub mod detected_uses;
 mod external_scheduler_attribution;
 #[cfg(unix)]
@@ -916,6 +917,19 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// Registration requested browser consent. Preserve the bound account and
+    /// candidate; expose the existing sign-in action instead of a failed setup.
+    pub(crate) fn mark_history_choice_required(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        state.account.state = LocalAccountState::ReattachRequired;
+        state.account.message = Some(StableMessage {
+            code: "history_choice_required".to_string(),
+            text: "Waiting for browser sign-in to finish.".to_string(),
+        });
+        state.account.can_reconnect = Some(true);
+        Ok(())
+    }
+
     /// Keep the pending browser claim resumable while exposing an actionable,
     /// typed device-authority conflict instead of an endless claim-pending loop.
     pub fn mark_reattach_required(
@@ -1310,7 +1324,15 @@ impl LocalDaemon {
             .collect::<Result<Vec<_>, _>>()?;
         let snapshots = collections
             .iter()
-            .flat_map(|collection| collection.snapshots.iter().cloned())
+            .flat_map(|collection| {
+                let mut snapshots = collection.snapshots.clone();
+                desktop_recent::overlay(
+                    &mut snapshots,
+                    &collection.source_health_snapshot,
+                    time::OffsetDateTime::now_utc(),
+                );
+                snapshots
+            })
             .collect::<Vec<_>>();
         let mut state = self.state()?;
         for collection in collections {
@@ -5164,9 +5186,12 @@ mod tests {
             (OTTTO_KEYCHAIN_ACCOUNT, synthetic_control_token),
             (OTTTO_RELAY_DEVICE_SECRET_ACCOUNT, synthetic_relay_secret),
         ] {
-            ottto_core::token_store::FileControlTokenStore::new(secrets.join(account))
-                .save(value)
-                .expect("save synthetic diagnostic secret");
+            // Fully qualified: the trait import above is macOS-only.
+            ottto_core::ControlTokenStore::save(
+                &ottto_core::token_store::FileControlTokenStore::new(secrets.join(account)),
+                value,
+            )
+            .expect("save synthetic diagnostic secret");
         }
         let daemon = daemon();
         let bundle = daemon
@@ -6537,7 +6562,7 @@ mod tests {
     fn snapshot_sync_stall_never_masks_a_blocking_failure() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         daemon
-            .record_snapshot_sync_stalled(45, Some("otlp_relay"))
+            .record_snapshot_sync_stalled(45, Some("agent_status"))
             .expect("record sync stall");
         daemon
             .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
@@ -9269,6 +9294,7 @@ mod tests {
             },
         ];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
             evidence_method: Some("local_status".to_string()),
             source_session_id: None,

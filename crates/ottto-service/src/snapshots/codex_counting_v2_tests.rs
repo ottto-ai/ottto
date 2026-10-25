@@ -160,6 +160,327 @@ fn legacy(values: &[Value]) -> Run {
     run
 }
 
+/// Exercise the production source factory and physical JSONL reader, with the
+/// compiled cutover unchanged. Legacy uses the same factory without a test cutover.
+fn run_price_source(values: &[Value], active: bool) -> Run {
+    let _cutover = active.then(|| codex_counting_version::TestCutover::set(0));
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("ottto-v2-price-{unique}"));
+    fs::create_dir_all(&root).unwrap();
+    let path = root.join(format!("rollout-2026-08-31T23-00-00-{SESSION}.jsonl"));
+    let text: String = values.iter().map(|value| format!("{value}\n")).collect();
+    fs::write(&path, &text).unwrap();
+    let mut file = File::open(&path).unwrap();
+    let identity = opened_object_identity(SnapshotSource::Codex, &mut file).unwrap();
+    let candidate = CandidateFile {
+        scan_root: root.clone(),
+        path: path.clone(),
+        size_bytes: text.len() as u64,
+        modified_unix_seconds: 1,
+        modified_unix_nanos: 1,
+        source_file_fingerprint: "synthetic-price".into(),
+        legacy_source_file_fingerprint: "synthetic-price".into(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: identity.clone(),
+    };
+    let metadata = CodexTitleMetadata::default();
+    let mut parser = sampled_scan::new_source_parser(
+        file,
+        &candidate,
+        SnapshotSource::Codex,
+        &metadata,
+        None,
+        None,
+        false,
+        false,
+        false,
+        &ScanIndex::default(),
+    )
+    .unwrap();
+    while !parser.step().unwrap() {}
+    let v2 = parser.accumulator.codex_counting_v2();
+    assert_eq!(
+        v2, active,
+        "source factory selects the intended counting version"
+    );
+    let counting = parser.accumulator.codex_counting.as_deref();
+    let counters = counting.and_then(|counting| counting.counters().cloned());
+    let pending = counting.and_then(|counting| counting.open_turn_ui_pending());
+    let mut parsed = parser
+        .finish(
+            &identity,
+            &path,
+            "2026-10-21T00:00:00Z",
+            "synthetic-price".into(),
+            Some(&metadata),
+            None,
+            None,
+        )
+        .unwrap();
+    // Legacy's native-only control has positive usage evidence but no
+    // supported money rows; its existing empty-file diagnostic is expected.
+    if !parsed.snapshots.is_empty() {
+        assert_eq!(parsed.recognized_usage_drop_count, 0);
+    }
+    assert_eq!(parsed.ownership_incomplete_file_count, 0);
+    assert!(parsed.snapshots.len() <= 1);
+    fs::remove_dir_all(root).unwrap();
+    Run {
+        item: parsed.snapshots.pop(),
+        v2,
+        counters,
+        pending,
+    }
+}
+
+type PriceRows = BTreeMap<(String, String, Option<String>), [u64; 6]>;
+
+/// Five money dimensions plus request_count, grouped independently of selector
+/// provenance (native and UI correctly name different sources).
+fn price_rows(run: &Run) -> PriceRows {
+    let mut rows = PriceRows::new();
+    for bucket in &run.item.as_ref().expect("snapshot").usage_buckets {
+        for row in &bucket.model_usage {
+            let key = (
+                bucket.bucket_start.clone(),
+                row.model.clone(),
+                row.selector_context.get("context_bucket").cloned(),
+            );
+            let totals = rows.entry(key).or_default();
+            for (slot, value) in totals.iter_mut().zip([
+                row.input_tokens,
+                row.cache_read_tokens,
+                row.cache_creation_5m_tokens,
+                row.output_tokens,
+                row.reasoning_output_tokens,
+                row.request_count,
+            ]) {
+                *slot += value;
+            }
+        }
+    }
+    rows
+}
+
+fn assert_price_rows(run: &Run, expected: &PriceRows) {
+    let rows = price_rows(run);
+    assert_eq!(&rows, expected);
+    let mut summed = [0; 6];
+    for row in rows.values() {
+        for (slot, value) in summed.iter_mut().zip(row) {
+            *slot += value;
+        }
+    }
+    let item = run.item.as_ref().unwrap();
+    let money = run.money();
+    assert_eq!(
+        summed,
+        [
+            money[0],
+            money[1],
+            money[2],
+            money[3],
+            money[4],
+            item.request_count
+        ],
+        "sum across price buckets equals the unsplit session total"
+    );
+}
+
+#[test]
+fn codex_v2_native_price_buckets_match_legacy_per_hour_model_and_dimension() {
+    let model = "gpt-6.1-sol";
+    let cases = [
+        // Own request time, immediately before and exactly at the effective date.
+        (
+            "2026-08-31T23:59:59Z",
+            model,
+            [400_000, 0, 0, 10, 1, 400_010],
+            None,
+        ),
+        (
+            "2026-09-01T00:00:00Z",
+            model,
+            [272_001, 0, 0, 11, 2, 272_012],
+            Some("long"),
+        ),
+        // Inclusive prompt at the line stays short even when almost all cached.
+        (
+            "2026-10-18T10:01:00Z",
+            model,
+            [272_000, 270_000, 1_000, 12, 3, 272_012],
+            Some("short"),
+        ),
+        (
+            "2026-10-18T10:02:00Z",
+            model,
+            [272_001, 0, 123, 13, 4, 272_014],
+            Some("long"),
+        ),
+        (
+            "2026-10-18T10:03:00Z",
+            model,
+            [300_000, 290_000, 1_000, 14, 5, 300_014],
+            Some("long"),
+        ),
+        // No catalog line, and no leakage from a preceding derived long bucket.
+        (
+            "2026-10-18T11:00:00Z",
+            "gpt-5.4-mini",
+            [300_000, 20, 30, 15, 6, 300_015],
+            None,
+        ),
+        (
+            "2026-10-18T12:00:00Z",
+            "unknown",
+            [300_000, 40, 50, 16, 7, 300_016],
+            None,
+        ),
+        ("2026-10-18T13:00:00Z", model, [0, 0, 0, 17, 8, 17], None),
+    ];
+    let mut values = vec![header("2026-08-31T23:00:00Z")];
+    let mut total = [0; 6];
+    let mut expected = PriceRows::new();
+    for (index, (timestamp, model, usage, bucket)) in cases.into_iter().enumerate() {
+        let turn = format!("turn-price-{index}");
+        let mut ctx = context(timestamp, &turn);
+        ctx["payload"]["model"] = json!(model);
+        total = sum(total, usage);
+        let mut ui = ui(timestamp, usage, total);
+        ui["payload"]["info"]["model"] = json!(model);
+        values.extend([
+            started(timestamp, &turn),
+            ctx,
+            native(timestamp, &turn, &format!("resp-{index}"), usage, total),
+            ui,
+            completed(timestamp, &turn),
+        ]);
+        let hour = activity_bucket_from_timestamp(timestamp).unwrap().0;
+        let row = expected
+            .entry((hour, model.into(), bucket.map(str::to_string)))
+            .or_default();
+        for (slot, value) in row
+            .iter_mut()
+            .zip([usage[0], usage[1], usage[2], usage[3], usage[4], 1])
+        {
+            *slot += value;
+        }
+    }
+    let legacy = run_price_source(&values, false);
+    let counted = run_price_source(&values, true);
+    assert_price_rows(&legacy, &expected);
+    assert_price_rows(&counted, &expected);
+    assert_eq!(counted.counters().native_counted, cases.len() as u64);
+    for row in &counted.item.as_ref().unwrap().model_usage {
+        if row.selector_context.contains_key("context_bucket") {
+            assert_eq!(
+                row.selector_sources
+                    .get("context_bucket")
+                    .map(String::as_str),
+                Some("derived_from_native_usage")
+            );
+        }
+    }
+}
+
+#[test]
+fn codex_v2_native_price_bucket_requires_own_time_and_preserves_explicit_line_bucket() {
+    for (own_time, explicit, bucket) in [(false, false, None), (true, true, Some("short"))] {
+        let usage = [300_000, 290_000, 1_000, 10, 2, 300_010];
+        let mut ctx = context(POST, "turn-price");
+        ctx["payload"]["model"] = json!("gpt-6.1-sol");
+        let mut native = native(POST, "turn-price", "resp-price", usage, usage);
+        let mut ui = ui(POST, usage, usage);
+        ui["payload"]["info"]["model"] = json!("gpt-6.1-sol");
+        for line in [&mut native, &mut ui] {
+            if !own_time {
+                line.as_object_mut().unwrap().remove("timestamp");
+            }
+            if explicit {
+                line["payload"]["context_bucket"] = json!("short");
+            }
+        }
+        let values = [
+            header(POST),
+            started(POST, "turn-price"),
+            ctx,
+            native,
+            ui,
+            completed(POST, "turn-price"),
+        ];
+        let expected = PriceRows::from([(
+            (
+                "2026-10-18T10:00:00Z".into(),
+                "gpt-6.1-sol".into(),
+                bucket.map(str::to_string),
+            ),
+            [300_000, 290_000, 1_000, 10, 2, 1],
+        )]);
+        for active in [false, true] {
+            assert_price_rows(&run_price_source(&values, active), &expected);
+        }
+    }
+}
+
+#[test]
+fn codex_v2_native_only_compaction_and_overlap_price_the_original_prompt() {
+    let first = [200_000, 100_000, 1_000, 20, 4, 200_020];
+    let long = [300_000, 200_000, 2_000, 30, 6, 300_030];
+    for overlap in [false, true] {
+        let mut ctx = context(POST, "turn-price");
+        ctx["payload"]["model"] = json!("gpt-6.1-sol");
+        let mut values = vec![header(POST), started(POST, "turn-price"), ctx];
+        if overlap {
+            values.push(native(POST, "turn-price", "resp-first", first, first));
+        }
+        let after = if overlap {
+            [400_000, 250_000, 2_500, 40, 8, 400_040]
+        } else {
+            long
+        };
+        let mut compaction = native(POST, "turn-price", "resp-compaction", long, after);
+        compaction["payload"]["response_kind"] = json!("compaction");
+        // Duplicate compaction restatement must not add another request.
+        values.extend([
+            compaction.clone(),
+            compaction,
+            completed(POST, "turn-price"),
+        ]);
+        let key = |bucket: &str| {
+            (
+                "2026-10-18T10:00:00Z".into(),
+                "gpt-6.1-sol".into(),
+                Some(bucket.into()),
+            )
+        };
+        let expected = if overlap {
+            // Only 200K of this 300K prompt is uncovered, but ALL admitted money
+            // still belongs to its original request's long price bucket.
+            PriceRows::from([
+                (key("short"), [200_000, 100_000, 1_000, 20, 4, 1]),
+                (key("long"), [200_000, 150_000, 1_500, 20, 4, 1]),
+            ])
+        } else {
+            PriceRows::from([(key("long"), [300_000, 200_000, 2_000, 30, 6, 1])])
+        };
+        let counted = run_price_source(&values, true);
+        assert_price_rows(&counted, &expected);
+        assert_eq!(counted.counters().native_chain_overlap, u64::from(overlap));
+        assert_eq!(
+            counted.counters().native_inside_holed_coverage,
+            u64::from(overlap)
+        );
+        assert_eq!(counted.counters().native_restated, u64::from(!overlap));
+        assert!(
+            run_price_source(&values, false).item.is_none(),
+            "Legacy has no UI money to count"
+        );
+    }
+}
+
 #[test]
 fn codex_v2_equal_total_repeat_is_dropped_and_legacy_is_unchanged() {
     let values = [

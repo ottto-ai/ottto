@@ -195,6 +195,7 @@ fn ledger_entry(
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_due_singleton_side_read_writes_only_ps_side_state() {
     let fixture = Root::new(3, b"");
     let len = fixture.at().size;
@@ -252,6 +253,7 @@ fn a_due_singleton_side_read_writes_only_ps_side_state() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn an_unsealed_settled_read_tombstones_and_writes_no_record() {
     // An unterminated final row: the native EOF applies it, so the
     // certificate's sealed offset is short of the held length.
@@ -379,6 +381,7 @@ fn a_full_ledger_refuses_the_charge_and_nothing_is_written() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -444,6 +447,7 @@ fn the_charge_paces_creates_the_entry_and_counts_a_first_start() {
 /// due check (no write, no count) and a due one is not charged (no ledger
 /// entry). The same request on an ordinary page is the control.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_continuation_page_is_never_due_and_charges_nothing() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -511,6 +515,7 @@ fn a_continuation_page_is_never_due_and_charges_nothing() {
 }
 
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -556,6 +561,7 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
 /// (`begin_codex_continuation_side_pass`) never charges a side read: no
 /// ledger entry, no request write. An ordinary pass charges the same one.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn the_continuation_pass_charges_no_g7() {
     let fixture = Root::new(1, b"");
     let at = fixture.at();
@@ -577,8 +583,11 @@ fn the_continuation_pass_charges_no_g7() {
     assert_eq!(cache.side_ledger().len(), 0, "nothing charged");
     assert_eq!(
         index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
-        Some(1),
-        "the ordinary control"
+        // Side-ledger admission requires the validated native heap layout.
+        // The continuation assertions above apply on every platform; Linux
+        // must also keep the ordinary read uncharged when layout is unsupported.
+        crate::heap_layout_bound::layout_supported().then_some(1),
+        "the ordinary control follows native heap-layout support"
     );
 }
 
