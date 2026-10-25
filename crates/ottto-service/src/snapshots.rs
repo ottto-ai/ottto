@@ -42478,6 +42478,62 @@ impl ScanIndex {
         })
     }
 
+    /// Upload-progress retention uses committed and carried incidence, never
+    /// the subset emitted by a scan. This borrowed view allocates no census.
+    pub(crate) fn upload_progress_ack_incidence(&self) -> impl Iterator<Item = &str> {
+        self.current_snapshot_fingerprint_refs().chain(
+            self.accepted_rebuild_incidence
+                .values()
+                .flat_map(|members| members.iter().map(String::as_str)),
+        )
+    }
+
+    /// Transfer an exact progress ACK only when a saved file body-set witness
+    /// adopts it. Semantic acceptance alone may still describe an older curve
+    /// under the same fingerprint. Incomplete/legacy groups remain resume debt.
+    pub(crate) fn adopted_upload_progress_acks(
+        &self,
+        bodies: &BTreeMap<String, String>,
+    ) -> BTreeSet<String> {
+        let mut adopted = BTreeSet::new();
+        for (key, members) in &self.file_snapshot_fingerprints {
+            if members.is_empty() || self.decode_holds_file(key) {
+                continue;
+            }
+            let Some(expected) = self
+                .files
+                .get(key)
+                .and_then(|entry| entry.last_upload_body_witness.as_deref())
+            else {
+                continue;
+            };
+            if !members.iter().all(|fp| {
+                bodies.contains_key(fp) && self.accepted_snapshot_fingerprint_recorded(fp)
+            }) {
+                continue;
+            }
+            // All members are in the admitted progress map. Price scratch at
+            // one borrowed pointer per member, before allocating; no body clone.
+            let mut witnesses = Vec::with_capacity(members.len());
+            witnesses.extend(members.iter().map(|fp| bodies[fp].as_str()));
+            witnesses.sort_unstable();
+            witnesses.dedup();
+            let mut digest = Sha256::new();
+            update_length_prefixed(&mut digest, b"snapshot_file_upload_body_set:v1");
+            for witness in witnesses {
+                update_length_prefixed(&mut digest, witness.as_bytes());
+            }
+            if format!("{:x}", digest.finalize()) == expected {
+                adopted.extend(members.iter().cloned());
+            }
+        }
+        adopted
+    }
+
+    pub(crate) fn upload_progress_ack_incidence_unknown(&self) -> bool {
+        self.decode_has_opaque_file_incidence()
+    }
+
     pub(crate) fn current_snapshot_fingerprints(&self) -> BTreeSet<String> {
         self.current_snapshot_fingerprint_refs()
             .map(str::to_owned)
