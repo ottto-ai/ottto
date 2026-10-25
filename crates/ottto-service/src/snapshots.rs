@@ -42777,10 +42777,36 @@ impl ScanIndex {
         }
     }
 
+    fn claude_account_pending_file_is_empty(&self, key: &str, entry: &ScanIndexEntry) -> bool {
+        self.confirmed_empty_files.contains(key)
+            && entry.last_snapshot_fingerprint.is_none()
+            && self
+                .file_snapshot_fingerprints
+                .get(key)
+                .is_none_or(BTreeSet::is_empty)
+    }
+
     fn retire_committed_claude_account_pending_windows(&mut self) {
-        if !claude_accepted_ledger_is_current(self) {
+        if !claude_accepted_ledger_is_current(self) || self.decode_has_opaque_file_incidence() {
             return;
         }
+        // The selected checkpoint already carries old files through partial
+        // deletion/empty transitions. Only its completed absence is usable.
+        let mut live_members: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        for (key, entry) in &self.files {
+            if !self.claude_account_pending_file_is_empty(key, entry) {
+                if let Some((root, member)) = claude_index_path_family_member(Path::new(key)) {
+                    live_members.entry(root).or_default().insert(member);
+                }
+            }
+        }
+        let history_held = self
+            .claude_history_emission
+            .files
+            .values()
+            .filter(|file| file.held.is_some())
+            .map(|file| file.index_key.as_str())
+            .collect::<BTreeSet<_>>();
         let mut candidates = BTreeMap::new();
         for (root, pending) in &self.claude_account_family_pending {
             if pending.invalid
@@ -42818,6 +42844,12 @@ impl ScanIndex {
                     break;
                 }
                 for member in window.members.keys() {
+                    if !live_members
+                        .get(root)
+                        .is_some_and(|members| members.contains(member))
+                    {
+                        continue;
+                    }
                     if latest
                         .get(member)
                         .is_none_or(|(previous, _, _)| time > *previous)
@@ -42859,13 +42891,12 @@ impl ScanIndex {
             let Some(revisions) = candidates.get(&root) else {
                 continue;
             };
-            if self.confirmed_empty_files.contains(key) {
-                continue;
-            }
+            let empty = self.claude_account_pending_file_is_empty(key, entry);
             let fingerprints = self.file_snapshot_fingerprints.get(key);
             if entry.source_file_fingerprint.is_empty()
                 || self.decode_holds_file(key)
                 || self.claude_account_deferred_holds.contains_key(key)
+                || history_held.contains(key.as_str())
                 || self
                     .claude_owned_start_census
                     .get(&member)
@@ -42874,16 +42905,20 @@ impl ScanIndex {
                             || owned.verified_source_file_fingerprint
                                 != owned.emitted_source_file_fingerprint
                     })
-                || !fingerprints.is_some_and(|fps| {
-                    !fps.is_empty()
-                        && fps.iter().all(|fp| {
-                            !self.decode_holds_entity(fp)
-                                && self.accepted_snapshot_fingerprints.contains(fp)
-                                && !self.quarantined_snapshot_fingerprints.contains_key(fp)
-                        })
-                })
+                || (!empty
+                    && !fingerprints.is_some_and(|fps| {
+                        !fps.is_empty()
+                            && fps.iter().all(|fp| {
+                                !self.decode_holds_entity(fp)
+                                    && self.accepted_snapshot_fingerprints.contains(fp)
+                                    && !self.quarantined_snapshot_fingerprints.contains_key(fp)
+                            })
+                    }))
             {
                 held.insert(root);
+                continue;
+            }
+            if empty {
                 continue;
             }
             let Some(expected) = revisions.get(&member) else {
@@ -62426,6 +62461,85 @@ mod tests {
         index.save(&path).unwrap();
         assert!(index.claude_account_family_pending.is_empty());
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
+        for empty in [false, true] {
+            let (dir, root, items) = claude_account_family_fixture();
+            let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+            let mut previous = d2_family_index(&dir, &root);
+            apply_claude_effort_evidence_with_index(
+                &mut items.clone(),
+                &evidence,
+                &mut previous,
+                true,
+                "2026-08-02T07:10:00Z",
+            );
+            d2_finalize_identity_revisions(&mut previous);
+            previous
+                .claude_account_family_pending
+                .get_mut(&root)
+                .unwrap()
+                .member_requests
+                .get_mut(&items[1].source_session_id)
+                .unwrap()
+                .identity_revision = None;
+            let path = dir.join("vanished-index.json");
+            previous.save(&path).unwrap();
+            let mut working = previous.clone();
+            apply_claude_effort_evidence_with_index(
+                &mut vec![items[0].clone()],
+                &evidence,
+                &mut working,
+                true,
+                "2026-08-02T07:11:00Z",
+            );
+            d2_finalize_identity_revisions(&mut working);
+            let child_key = working
+                .files
+                .keys()
+                .find(|key| {
+                    claude_index_path_family_member(Path::new(key))
+                        .is_some_and(|(_, member)| member == items[1].source_session_id)
+                })
+                .unwrap()
+                .clone();
+            if empty {
+                working.confirmed_empty_files.insert(child_key.clone());
+                working
+                    .file_snapshot_fingerprints
+                    .insert(child_key.clone(), BTreeSet::new());
+                working
+                    .files
+                    .get_mut(&child_key)
+                    .unwrap()
+                    .last_snapshot_fingerprint = None;
+                let mut held = working.clone();
+                held.claude_account_deferred_holds
+                    .insert(child_key.clone(), "held".into());
+                held.retire_committed_claude_account_pending_windows();
+                assert!(held.claude_account_family_pending.contains_key(&root));
+            } else {
+                working.remove_file_entry(&child_key);
+            }
+            let accepted = working
+                .file_snapshot_fingerprints
+                .values()
+                .flatten()
+                .cloned()
+                .collect();
+            let mut partial = working.committable_subset(&previous, &accepted, &BTreeMap::new());
+            partial.generation = 0;
+            partial.save(&dir.join("partial-index.json")).unwrap();
+            assert!(partial.claude_account_family_pending.contains_key(&root));
+            working.save(&path).unwrap();
+            let loaded =
+                lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert!(!loaded.claude_account_family_pending.contains_key(&root));
+            fs::remove_dir_all(dir).unwrap();
+        }
     }
 
     #[test]
