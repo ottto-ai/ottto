@@ -61782,6 +61782,84 @@ mod tests {
     }
 
     #[test]
+    fn claude_account_pending_v2_old_fingerprint_is_unknown_and_collision_revokes_family_proof() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut old_version = index.clone();
+        for fingerprint in old_version
+            .claude_account_family_witnesses
+            .get_mut(&root)
+            .unwrap()
+            .member_request_id_fingerprints
+            .values_mut()
+        {
+            *fingerprint = "b".repeat(64);
+        }
+        let acks = old_version.accepted_snapshot_fingerprints.clone();
+        let bindings = old_version.session_account_bindings.clone();
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut old_version,
+            false,
+            "2026-08-02T07:11:00Z",
+        );
+        assert!(!old_version
+            .claude_account_family_witnesses
+            .contains_key(&root));
+        assert!(old_version
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert_eq!(old_version.accepted_snapshot_fingerprints, acks);
+        assert_eq!(old_version.session_account_bindings, bindings);
+        let pending = index.claude_account_family_pending.get_mut(&root).unwrap();
+        let first = pending.member_requests[&items[0].source_session_id]
+            .unpack()
+            .unwrap()[..8]
+            .to_vec();
+        use base64::Engine as _;
+        pending
+            .member_requests
+            .get_mut(&items[1].source_session_id)
+            .unwrap()
+            .prefixes = base64::engine::general_purpose::STANDARD_NO_PAD.encode(first);
+        // A collision arriving from an old index or an earlier page invalidates
+        // the old family witness as well, never allowing its reuse on a child.
+        let mut restarted: ScanIndex =
+            serde_json::from_slice(&serde_json::to_vec(&index).unwrap()).unwrap();
+        assert!(restarted.claude_account_family_pending[&root].invalid);
+        apply_claude_effort_evidence_with_index(
+            &mut [],
+            &evidence,
+            &mut restarted,
+            true,
+            "2026-08-02T07:10:00Z",
+        );
+        assert!(!restarted
+            .claude_account_family_witnesses
+            .contains_key(&root));
+        let mut child = vec![items[1].clone()];
+        apply_claude_effort_evidence_with_index(
+            &mut child,
+            &evidence,
+            &mut restarted,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        assert_eq!(exact_session_account_hash(&child[0]), None);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn claude_account_pending_old_windows_survive_held_incomplete_and_retry_save() {
         let (dir, root, items) = claude_account_family_fixture();
         let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
@@ -61865,7 +61943,19 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
-            held.retire_committed_claude_account_pending_windows();
+            let partial = held.committable_subset(&reloaded, &BTreeSet::new(), &BTreeMap::new());
+            assert_eq!(
+                partial.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1
+            );
+            held.generation = 0;
+            let held_path = dir.join(format!("held-{blocker}.json"));
+            held.save(&held_path).unwrap();
+            let held =
+                lenient_decode::read_file(File::open(held_path).unwrap(), "test", "claude_code")
+                    .unwrap();
             assert_eq!(
                 held.claude_account_family_pending[&root]
                     .previous_windows
@@ -61878,7 +61968,18 @@ mod tests {
         for entry in reloaded.files.values_mut() {
             entry.source_file_fingerprint = "read".into();
         }
-        reloaded.retire_committed_claude_account_pending_windows();
+        let retained_other = reloaded.claude_account_family_pending[&root].clone();
+        reloaded.claude_account_family_pending.insert(
+            "identity-incomplete-other-family".into(),
+            retained_other.clone(),
+        );
+        reloaded.save(&path).unwrap();
+        let reloaded =
+            lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code").unwrap();
+        assert_eq!(
+            reloaded.claude_account_family_pending["identity-incomplete-other-family"],
+            retained_other
+        );
         assert!(reloaded.claude_account_family_pending[&root]
             .previous_windows
             .is_empty());
