@@ -197,6 +197,10 @@ fn incompatible_copies_stay_scoped_and_cannot_be_resurrected_by_a_third_root() {
         "UPDATE threads SET model = 'different-model'",
         "UPDATE threads SET rollout_path = replace(rollout_path, '/sessions/', '/sessions/other/')",
         "UPDATE threads SET tokens_used = 9999", // An older copy claiming more usage.
+        "UPDATE threads SET updated_at_ms = 1790849040000", // Equal update, unequal tokens.
+        "UPDATE threads SET created_at_ms = NULL",
+        "UPDATE threads SET title = 'different-title'",
+        "UPDATE threads SET archived = 1",
     ] {
         let fixture = Fixture::new(1);
         fixture.update(2, sql);
@@ -361,4 +365,64 @@ fn dominant_projection_does_not_hide_incompatible_older_copies_in_any_order() {
         );
         assert!(!metadata.rollout_extents.contains_key("thread"));
     }
+}
+
+#[test]
+fn equal_token_state_ties_follow_parsed_time_not_timestamp_text() {
+    let fixture = Fixture::new(1);
+    let loaded = fixture.metadata();
+    let mut metadata = CodexTitleMetadata::default();
+    for (root_index, updated) in [
+        (1, "2026-10-01T11:04:00+01:00"),
+        (2, "2026-10-01T10:04:00.900Z"),
+        (3, "2026-10-01T10:04:00.100Z"),
+        (4, "2026-10-01T10:04:00.200Z"),
+    ] {
+        let root = fixture.roots[root_index].parent().unwrap();
+        let mut row = loaded.root_sidecars[root].threads[&fixture.ids[0]].clone();
+        row.tokens_used = 400;
+        row.updated_at = Some(updated.to_string());
+        let threads = BTreeMap::from([(fixture.ids[0].clone(), row)]);
+        merge_threads(&mut metadata, root, &threads);
+        metadata.root_sidecars.insert(
+            root.to_path_buf(),
+            RootSidecar {
+                threads,
+                extents: BTreeMap::new(),
+            },
+        );
+    }
+    assert!(metadata.identity_conflicts.is_empty());
+    let selected = &metadata.state_threads[&fixture.ids[0]];
+    let latest =
+        &metadata.root_sidecars[fixture.roots[2].parent().unwrap()].threads[&fixture.ids[0]];
+    assert_eq!(
+        selected, latest,
+        "900 ms is later despite the first row's text sorting last"
+    );
+}
+
+#[test]
+fn parsed_state_evidence_comes_from_the_physical_home_even_if_a_stale_home_claims_more() {
+    let fixture = Fixture::new(1);
+    let (_, before) = fixture.scan(ScanIndex::default());
+    assert_eq!(before.snapshots[0].provenance.state_total_tokens, Some(400));
+    // A later watermark survives in a home whose rollout is missing. It stays
+    // available to state-only fallback, not the parsed physical file's evidence.
+    fixture.update(
+        2,
+        "UPDATE threads SET tokens_used=500, updated_at_ms=1790849100000",
+    );
+    let metadata = fixture.metadata();
+    assert!(metadata.identity_conflicts.is_empty());
+    assert_eq!(metadata.state_threads[&fixture.ids[0]].tokens_used, 500);
+    let (_, scan) = fixture.scan(ScanIndex::default());
+    assert!(scan.census_complete, "{scan:?}");
+    assert_eq!(scan.snapshots.len(), 1);
+    assert_eq!(scan.snapshots[0].input_tokens, 400);
+    assert_eq!(scan.snapshots[0].provenance.state_total_tokens, Some(400));
+    assert_eq!(
+        scan.snapshots[0].snapshot_fingerprint,
+        before.snapshots[0].snapshot_fingerprint
+    );
 }

@@ -14025,7 +14025,10 @@ fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTota
 struct CodexTitleMetadata {
     local_diagnostics: CodexScanDiagnostics,
     titles: BTreeMap<String, CodexTitleCandidate>,
+    /// Merged maximum for state-only fallback; never use for file binding.
+    /// Registered files must use `thread_extent_for_path` and their own home.
     state_threads: BTreeMap<String, CodexStateThread>,
+    /// Merged maximum for metadata summaries; never use for file binding.
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
     /// File-binding evidence stays with the home that supplied it. A merged
     /// usage high-water mark must never seed another copy's creation proof.
@@ -26614,7 +26617,11 @@ impl OwnedSourceScan {
                 }
                 if source == SnapshotSource::Codex {
                     for snapshot in parsed.iter_mut() {
-                        apply_codex_state_evidence(snapshot, &codex_title_metadata);
+                        apply_codex_state_evidence(
+                            snapshot,
+                            &codex_title_metadata,
+                            &candidate.path,
+                        );
                     }
                     for snapshot in &parsed {
                         if snapshot.usage_accounting_contract.as_deref()
@@ -28975,9 +28982,20 @@ fn claude_authority_preflight_fingerprint(
         .then(|| candidate.source_file_fingerprint.clone())
 }
 
-fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
+fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata, path: &Path) {
     let source_session_id = resolve_codex_identity(item.source_session_id.as_str());
-    let Some(thread) = metadata.state_threads.get(source_session_id.as_str()) else {
+    if metadata
+        .identity_conflicts
+        .contains(source_session_id.as_str())
+    {
+        return;
+    }
+    // Parsed usage and its recorded state total must describe the same home.
+    // A missing file in a stale home cannot inflate the parsed file's evidence.
+    let Some(thread) = metadata
+        .thread_extent_for_path(source_session_id.as_str(), path)
+        .0
+    else {
         return;
     };
     if thread.tokens_used == 0 {
@@ -45070,6 +45088,16 @@ mod tests {
             .state_threads
             .get_mut(all_local_child)
             .expect("all-local child state row")
+            .created_at = Some("2026-08-26T15:02:00Z".to_string());
+        // File binding reads the home's row; keep this fixture override in sync
+        // with its merged row without changing the expected ownership proof.
+        metadata
+            .root_sidecars
+            .get_mut(&codex_dir)
+            .expect("loaded Codex home")
+            .threads
+            .get_mut(all_local_child)
+            .expect("all-local child home row")
             .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert!(metadata.state_created_threads.contains(child));

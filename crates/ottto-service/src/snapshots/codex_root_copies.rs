@@ -107,8 +107,15 @@ pub(super) fn merge_threads(
             continue;
         }
         let replace = metadata.state_threads.get(id).map_or(true, |prior| {
-            (row.tokens_used, &row.updated_at, &row.rollout_path)
-                > (prior.tokens_used, &prior.updated_at, &prior.rollout_path)
+            (
+                row.tokens_used,
+                row.updated_at.as_deref().and_then(rfc3339_unix_nanos),
+                &row.rollout_path,
+            ) > (
+                prior.tokens_used,
+                prior.updated_at.as_deref().and_then(rfc3339_unix_nanos),
+                &prior.rollout_path,
+            )
         });
         if replace {
             metadata.state_threads.insert(id.clone(), row.clone());

@@ -26,3 +26,12 @@ Synthetic crate regressions cover five homes, 46 threads with copied progress,
 acknowledgement and a clean follow-up census. Validation receipts are recorded
 in the pull request. No installed-runtime or production convergence is claimed
 by this source change.
+
+Parsed snapshots record the state total from the home containing their file,
+even when stale metadata elsewhere claims a larger total. The merged maximum
+remains the state-only fallback. Equal-token row selection compares parsed update
+times, so fractional-second formatting cannot select an older row. Regressions
+also retain refusal for equal update times with unequal usage, missing creation
+evidence, and differing title or archive state. The delegation-lineage fixture
+sets its synthetic creation clock in both the merged row and its home-local row;
+its ownership assertions remain unchanged.
