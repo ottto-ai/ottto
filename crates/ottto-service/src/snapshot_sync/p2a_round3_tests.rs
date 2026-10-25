@@ -3771,6 +3771,9 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
             "early dependency scope; message_only={message_only}"
         );
         let saved = control.saved();
+        // Completing or cancelling the finish owner invalidates its cache.
+        // Reconcile the durable manifests before inspecting their current scope.
+        control.recovery_startup(now + 299);
         let current_scope = unknown_recovery::held_roots(&control.support, &saved)
             .expect("current dependency evidence must admit this three-file control");
         assert!(current_scope.roots.contains(dependent));
