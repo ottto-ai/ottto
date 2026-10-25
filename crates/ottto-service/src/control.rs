@@ -6469,21 +6469,35 @@ fn probe_pruned_device_credential_authority(
         .first()
         .ok_or(LocalApiError::StatePoisoned)?;
     let body = relay_token_request_payload(&pending.device, source);
+    let mut probe =
+        crate::relay_auth::Probe::begin(&api_base_url, &pending.device, candidate_secret)
+            .map_err(|held| relay_auth_local_error(&url, held.status))?;
     match backend_post_json::<serde_json::Value>(
         &url,
         &body,
         &[("X-Ottto-Device-Secret", candidate_secret)],
     ) {
-        Ok(_) => Ok(PrunedDeviceCredentialProbe::Confirmed),
+        Ok(_) => {
+            probe.success();
+            Ok(PrunedDeviceCredentialProbe::Confirmed)
+        }
         Err(error)
             if matches!(
                 &error,
                 LocalApiError::Backend(details) if details.status == Some(401)
             ) && pending_device_credential_is_past_expiry(pending) =>
         {
+            probe.reject(401);
             Ok(PrunedDeviceCredentialProbe::Inactive)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            if let LocalApiError::Backend(details) = &error {
+                if let Some(status @ (401 | 403)) = details.status {
+                    probe.reject(status);
+                }
+            }
+            Err(error)
+        }
     }
 }
 
@@ -13113,7 +13127,7 @@ fn issue_source_relay_token(
     request_source_relay_token(api_base_url, &device, &device_secret, source)
 }
 
-fn request_source_relay_token(
+pub(crate) fn request_source_relay_token(
     api_base_url: &str,
     device: &LocalDeviceBinding,
     device_secret: &str,
@@ -13123,17 +13137,35 @@ fn request_source_relay_token(
         api_base_url,
         &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
     );
+    let mut probe = crate::relay_auth::Probe::begin(api_base_url, device, device_secret)
+        .map_err(|held| relay_auth_local_error(&url, held.status))?;
     let response = crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", device_secret)
         .timeout(BACKEND_REQUEST_TIMEOUT)
         .send_json(relay_token_request_payload(device, source_slug(source)))
-        .map_err(|error| backend_error_from_ureq(&url, error))?;
+        .map_err(|error| {
+            if let ureq::Error::Status(status @ (401 | 403), _) = &error {
+                probe.reject(*status);
+            }
+            backend_error_from_ureq(&url, error)
+        })?;
     let response: RelayTokenApiResponse = backend_success(&url, response)?
         .into_json()
         .map_err(|error| backend_response_unexpected(&url, error.to_string()))?;
+    probe.success();
     Ok(response.token)
+}
+
+fn relay_auth_local_error(url: &str, status: u16) -> LocalApiError {
+    LocalApiError::Backend(BackendErrorDetails {
+        kind: BackendErrorKind::Rejected,
+        endpoint: safe_backend_endpoint(url),
+        status: Some(status),
+        body_excerpt: None,
+        reason_code: None,
+    })
 }
 
 fn emit_api_key_verification_marker(

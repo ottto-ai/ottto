@@ -4543,6 +4543,7 @@ fn upload_local_health_projection_reporting(
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
     let binding = setup_run_refresh_binding(device, device_secret);
+    let relay_binding = client.relay_auth_binding(device, device_secret);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
@@ -4561,7 +4562,13 @@ fn upload_local_health_projection_reporting(
             let _ = daemon.record_local_health_upload_succeeded();
             Ok(())
         }
-        Err(error) if local_health_upload_should_refresh_setup_run(&error) => {
+        Err(error)
+            if local_health_upload_should_refresh_setup_run(&error)
+                && !error
+                    .downcast_ref::<RelayTokenAuthorizationRejected>()
+                    .is_some_and(|held| held.suppressed)
+                && crate::relay_auth::take_setup_refresh(relay_binding) =>
+        {
             if let Err(refresh_error) =
                 crate::control::refresh_setup_run_token_for_persisted_connection()
             {
@@ -4583,6 +4590,7 @@ fn upload_local_health_projection_reporting(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
                 )));
             }
+            crate::relay_auth::retry_after_setup_refresh(relay_binding);
             match upload_local_health_projection_with(
                 client,
                 device,
@@ -4672,6 +4680,11 @@ fn setup_run_refresh_binding(device: &LocalDeviceBinding, device_secret: &str) -
     digest.update(device.device_id.as_bytes());
     digest.update(b"\0");
     digest.update(device_secret.as_bytes());
+    digest.update(crate::relay_auth::binding_key(
+        &snapshot_api_base_url(),
+        device,
+        device_secret,
+    ));
     if let Some(connection) = FileConnectionStore::default().load().ok().flatten() {
         digest.update(b"\0");
         digest.update(connection.setup_run_id.as_bytes());
@@ -4779,6 +4792,12 @@ fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadF
 }
 
 fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<RelayTokenAuthorizationRejected>()
+        .is_some_and(|held| held.suppressed)
+    {
+        return true;
+    }
     if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
         return true;
     }

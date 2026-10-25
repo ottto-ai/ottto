@@ -1224,12 +1224,13 @@ fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<Strin
     request_relay_token(api_base_url, &device, &device_secret, source)
 }
 
-fn request_relay_token(
+pub(crate) fn request_relay_token(
     api_base_url: &str,
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
 ) -> Result<String> {
+    let mut probe = crate::relay_auth::Probe::begin(api_base_url, device, device_secret)?;
     let url = format!(
         "{}/api/v1/telemetry/devices/{}/relay-token",
         api_base_url.trim_end_matches('/'),
@@ -1248,7 +1249,16 @@ fn request_relay_token(
         .set("Accept", "application/json")
         .set("X-Ottto-Device-Secret", device_secret)
         .send_json(relay_token_request_payload(device, source.api_slug()))
-        .map_err(|error| anyhow!("issue relay token failed: {error}"))?;
+        .map_err(|error| match error {
+            ureq::Error::Status(status @ (401 | 403), _) => {
+                probe.reject(status);
+                anyhow::Error::new(crate::snapshot_client::RelayTokenAuthorizationRejected {
+                    status,
+                    suppressed: false,
+                })
+            }
+            other => anyhow!("issue relay token failed: {other}"),
+        })?;
     // With redirects off a 3xx arrives as `Ok`; only a 2xx carries a token.
     if !(200..300).contains(&response.status()) {
         return Err(anyhow!(
@@ -1259,6 +1269,7 @@ fn request_relay_token(
     let response: RelayTokenResponse = response
         .into_json()
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+    probe.success();
     Ok(response.token)
 }
 

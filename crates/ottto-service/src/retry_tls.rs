@@ -49,8 +49,41 @@ fn default_connector() -> Arc<WebPkiTls> {
 /// `ureq::get` or `AgentBuilder::new()` refuses HTTPS. The inventory test
 /// below keeps production code off those.
 pub(crate) fn agent_builder() -> ureq::AgentBuilder {
-    ureq::AgentBuilder::new().tls_connector(default_connector())
+    let builder = ureq::AgentBuilder::new().tls_connector(default_connector());
+    guard_unit_test_egress(builder)
 }
+
+/// Also applied to the bounded agent, which installs a deadline TLS connector.
+/// Production builds preserve their existing routing policy.
+pub(crate) fn guard_unit_test_egress(builder: ureq::AgentBuilder) -> ureq::AgentBuilder {
+    #[cfg(test)]
+    let builder = builder.redirects(0).middleware(unit_test_loopback_only);
+    builder
+}
+/// Test binaries have no external HTTP egress, even from background threads
+/// after an environment fixture has dropped. Redirects are disabled above in
+/// tests too: ureq invokes middleware only for the initial request.
+#[cfg(test)]
+fn unit_test_loopback_only(
+    request: ureq::Request,
+    next: ureq::MiddlewareNext<'_>,
+) -> Result<ureq::Response, ureq::Error> {
+    let url = request.request_url()?;
+    let host = url.host().trim_start_matches('[').trim_end_matches(']');
+    let local = host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback());
+    if !local {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unit tests may only send HTTP requests to loopback fixtures",
+        )
+        .into());
+    }
+    next.handle(request)
+}
+
 /// A fresh agent per call, like the `ureq::get` shortcuts it replaces.
 pub(crate) fn agent() -> ureq::Agent {
     agent_builder().build()
@@ -964,7 +997,7 @@ mod tests {
         // snapshot agent's deadline connector.
         Allowed {
             file: "src/retry_tls.rs",
-            line: "{u}AgentBuilder::new().tls_connector(default_connector())",
+            line: "let builder = {u}AgentBuilder::new().tls_connector(default_connector());",
             scope: Scope::Production,
             count: 1,
             chain: None,
@@ -1417,7 +1450,7 @@ pub(crate) mod credential_test_support {
         }
     }
 
-    fn read_request(stream: &mut TcpStream) -> String {
+    pub(crate) fn read_request(stream: &mut TcpStream) -> String {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut request = Vec::new();
         let mut buffer = [0_u8; 1024];
@@ -1439,5 +1472,41 @@ pub(crate) mod credential_test_support {
             }
         }
         String::from_utf8_lossy(&request).into_owned()
+    }
+}
+
+#[cfg(test)]
+mod unit_test_egress_tests {
+    use super::*;
+
+    #[test]
+    fn unit_tests_refuse_external_base_urls_before_any_resolution() {
+        for base in [
+            "https://api.ottto.net",
+            "http://api.ottto.net",
+            "https://ottto.net/backend",
+            "http://localhost.attacker.invalid",
+            "http://127.0.0.1.attacker.invalid",
+            "http://localhost@api.ottto.net",
+        ] {
+            std::thread::spawn(move || {
+                let error = agent().get(base).call().unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("unit tests may only send HTTP requests to loopback fixtures"),
+                    "{error}"
+                );
+            })
+            .join()
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn unit_tests_still_reach_loopback_fixtures() {
+        let backend = credential_test_support::RedirectingBackend::start("200 OK");
+        assert_eq!(agent().get(&backend.base_url).call().unwrap().status(), 200);
+        assert!(backend.finish().starts_with("GET / HTTP/1.1"));
     }
 }
