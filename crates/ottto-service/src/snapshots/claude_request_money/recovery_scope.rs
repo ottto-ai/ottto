@@ -168,13 +168,22 @@ pub(crate) fn close_with_reason(
                     refusal.set(Refusal::Deadline);
                     return None;
                 }
-                let Some((root, _)) = logical_family_member(index, key) else {
+                let Some(root) = logical_family_root_ref(index, key) else {
                     continue;
                 };
                 let requests = index
                     .claude_request_census
                     .get(key)
                     .map_or(&[][..], |r| r.request_hashes());
+                let connected = scope.roots.contains_key(root)
+                    || frozen_files.contains(key.as_str())
+                    || overlaps(requests, &scope.requests);
+                // Empty message targets cannot discover a new edge. A newly
+                // connected file may seed messages below; changed hash/root
+                // counts force the next pass to revisit every earlier file.
+                if !connected && scope.messages.is_empty() {
+                    continue;
+                }
                 let message = ledger.get(&message_key(key)).filter(|record| {
                     !record.over_budget()
                         && index
@@ -183,17 +192,13 @@ pub(crate) fn close_with_reason(
                             .is_some_and(|file| file.money_revision() == record.money_revision())
                 });
                 let messages = message.map_or(&[][..], |r| r.request_hashes());
-                if !scope.roots.contains_key(&root)
-                    && !frozen_files.contains(key.as_str())
-                    && !overlaps(requests, &scope.requests)
-                    && !overlaps(messages, &scope.messages)
-                {
+                if !connected && !overlaps(messages, &scope.messages) {
                     continue;
                 }
-                if !scope.roots.contains_key(&root) && scope.roots.len() >= ROOT_MAX {
+                if !scope.roots.contains_key(root) && scope.roots.len() >= ROOT_MAX {
                     return None;
                 }
-                let files = scope.roots.entry(root).or_default();
+                let files = scope.roots.entry(root.to_owned()).or_default();
                 if !files.contains(key) {
                     files.push(key.clone());
                 }

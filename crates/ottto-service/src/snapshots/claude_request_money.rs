@@ -59,8 +59,9 @@ mod selection;
 pub(in crate::snapshots) use selection::select_union_candidates;
 pub(crate) use selection::{
     bind_union_checkpoints, decode_selections, finalize_synthetic, logical_family_member,
-    record_logical_member, selected_money_files, stage_selection_fingerprints,
-    synthetic_fingerprints, union_items_by_source, union_reparse, MoneyFileSelection,
+    logical_family_root_ref, record_logical_member, selected_money_files,
+    stage_selection_fingerprints, synthetic_fingerprints, union_items_by_source, union_reparse,
+    MoneyFileSelection,
 };
 pub(crate) mod custody;
 #[cfg(test)]

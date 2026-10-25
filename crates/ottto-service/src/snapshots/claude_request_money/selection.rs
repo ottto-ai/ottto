@@ -43,6 +43,22 @@ pub(crate) fn record_logical_member(
     );
 }
 
+/// Borrow the root for bounded dependency walks; do not allocate both names
+/// for every unrelated indexed file on every fixed-point pass.
+pub(crate) fn logical_family_root_ref<'a>(index: &'a ScanIndex, key: &'a str) -> Option<&'a str> {
+    if let Some(state) = index.claude_money_files.get(key).filter(|state| {
+        state.root.len() <= 128
+            && state.member.len() <= 128
+            && index
+                .files
+                .get(key)
+                .is_some_and(|entry| entry.source_file_fingerprint == state.revision)
+    }) {
+        return Some(&state.root);
+    }
+    Some(super::super::claude_index_path_member_ref(Path::new(key))?.root)
+}
+
 pub(crate) fn logical_family_member(index: &ScanIndex, key: &str) -> Option<(String, String)> {
     if let Some(state) = index.claude_money_files.get(key).filter(|state| {
         state.root.len() <= 128
