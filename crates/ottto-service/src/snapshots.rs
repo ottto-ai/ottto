@@ -17316,33 +17316,21 @@ impl SnapshotAccumulator {
             money_context.as_ref(),
             self.current_selector.clone(),
         );
-        let responses = responses
-            .into_iter()
-            .filter_map(|response| match response.resolve_with(&selectors) {
-                Some(response) => {
-                    let at = response
-                        .terminal_timestamp
-                        .as_deref()
-                        .and_then(rfc3339_unix_nanos);
-                    Some((response, at))
-                }
-                None => {
-                    money.disclosed += 1;
-                    self.note_dropped_usage();
-                    None
-                }
-            })
-            .collect::<Vec<_>>();
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
-            money.disclosed += 1; // record-cap pressure alarm on the existing page line
+            money.disclosed += 1;
         }
-        money.prepare(
-            &responses,
-            self.session_start.client_version(),
-            money_context.as_ref(),
-        );
+        money.prepare(self.session_start.client_version());
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
-        for (mut response, at) in responses {
+        for response in responses {
+            let Some(mut response) = response.resolve_with(&selectors) else {
+                money.disclosed += 1;
+                self.note_dropped_usage();
+                continue;
+            };
+            let at = response
+                .terminal_timestamp
+                .as_deref()
+                .and_then(rfc3339_unix_nanos);
             if !response.cache_slot.request_ref.is_empty() {
                 self.cache_requests.push(OwnedRequest {
                     slot: response.cache_slot.clone(),
@@ -17504,6 +17492,7 @@ impl SnapshotAccumulator {
                     .map(|capture| (capture, response.sequence)),
             );
         }
+        money.finish_native(money_context.as_ref());
         money.fold_us = money_started.elapsed().as_micros() as u64;
         self.claude_money = Some(Box::new(money));
     }

@@ -221,6 +221,9 @@ pub(crate) struct FileFold {
     money_birth: ClaudeFileBirth,
     base_selector: SelectorCapture,
     skipped: BTreeSet<u64>,
+    copy_grains: BTreeMap<ClaudeLiveKey, ClaudeGrainSide>,
+    prebirth: u64,
+    prebirth_old: u64,
     pub(in crate::snapshots) ambiguous: BTreeSet<u64>,
     skip_allowed: bool,
     uncertain: bool,
@@ -231,7 +234,7 @@ pub(crate) struct FileFold {
     now_nanos: i128,
     joined: bool,
 }
-crate::heap_layout_bound::fields!(FileFold; entity, birth, rule_version, money_birth, base_selector, skipped, ambiguous, skip_allowed, uncertain, disclosed, fold_us, responses, unmatched_1h, now_nanos, joined);
+crate::heap_layout_bound::fields!(FileFold; entity, birth, rule_version, money_birth, base_selector, skipped, copy_grains, prebirth, prebirth_old, ambiguous, skip_allowed, uncertain, disclosed, fold_us, responses, unmatched_1h, now_nanos, joined);
 impl FileFold {
     pub(in crate::snapshots) fn new(
         birth: ClaudeFileBirth,
@@ -246,6 +249,9 @@ impl FileFold {
             money_birth,
             base_selector,
             skipped: Default::default(),
+            copy_grains: Default::default(),
+            prebirth: 0,
+            prebirth_old: 0,
             ambiguous: Default::default(),
             skip_allowed: false,
             uncertain: false,
@@ -259,21 +265,29 @@ impl FileFold {
             joined: false,
         }
     }
-    pub(in crate::snapshots) fn prepare(
-        &mut self,
-        responses: &[(ResolvedClaudeResponse, Option<i128>)],
-        version: Option<&str>,
-        context: Option<&ReadContext<'_>>,
-    ) {
-        let root = self.money_birth.birth_nanos().is_some() || self.money_birth.uncertain_root();
+    pub(in crate::snapshots) fn prepare(&mut self, version: Option<&str>) {
+        let root = self.birth.is_some() || self.money_birth.uncertain_root();
         let known = version.is_some_and(|v| KNOWN_COPY_WRITERS.contains(&v));
-        let all_pre_birth = !responses.is_empty()
-            && responses
-                .iter()
-                .all(|(_, at)| self.money_birth.copied_with_slack(*at, SLACK) == Some(true));
-        let orphan_copy = all_pre_birth && !context.is_some_and(ReadContext::live_twin);
-        self.skip_allowed = known && !orphan_copy;
-        self.uncertain = root && (!known || self.money_birth.uncertain_root() || orphan_copy);
+        self.skip_allowed = known;
+        self.uncertain = root && (!known || self.money_birth.uncertain_root());
+    }
+    pub(in crate::snapshots) fn finish_native(&mut self, context: Option<&ReadContext<'_>>) {
+        if self.responses > 0
+            && self.prebirth == self.responses
+            && !context.is_some_and(ReadContext::live_twin)
+            && self.entity.removed_requests > 0
+        {
+            for (key, grain) in std::mem::take(&mut self.copy_grains) {
+                self.entity
+                    .add(key, &grain.tokens, grain.requests, None, None, None);
+            }
+            self.disclosed += self.responses;
+            self.entity.removed = Default::default();
+            self.entity.removed_requests = 0;
+            self.skipped.clear();
+            self.unmatched_1h += self.prebirth_old;
+        }
+        self.copy_grains.clear();
     }
     pub(in crate::snapshots) fn observe(
         &mut self,
@@ -285,15 +299,8 @@ impl FileFold {
         self.responses += 1;
         let tokens = ClaudeMoneyTokens::from_usage(&response.usage);
         let copied = self.money_birth.copied_with_slack(at, SLACK);
-        if self.skip_allowed && copied == Some(true) {
-            self.entity.removed.add(&tokens);
-            self.entity.removed_requests += response.usage.request_count;
-            self.skipped.insert(response.sequence);
-            return;
-        }
-        if self.uncertain || (self.birth.is_some() && at.is_none()) {
-            self.disclosed += 1;
-        }
+        self.prebirth += u64::from(copied == Some(true));
+        let old = at.is_some_and(|at| self.now_nanos.saturating_sub(at) > 3_600_000_000_000);
         let model = response
             .model
             .as_deref()
@@ -310,11 +317,24 @@ impl FileFold {
             self.disclosed += 1;
             return;
         };
+        if self.skip_allowed && copied == Some(true) {
+            self.entity.removed.add(&tokens);
+            self.entity.removed_requests += response.usage.request_count;
+            self.skipped.insert(response.sequence);
+            self.prebirth_old += u64::from(old);
+            self.copy_grains.entry(key).or_default().add(
+                &tokens,
+                response.usage.request_count,
+                None,
+            );
+            return;
+        }
+        if self.uncertain || (self.birth.is_some() && at.is_none()) {
+            self.disclosed += 1;
+        }
         self.entity
             .add(key, &tokens, response.usage.request_count, None, None, at);
-        // OTEL is joined below through the live reader; idless responses stay estimated.
-        self.unmatched_1h +=
-            u64::from(at.is_some_and(|at| self.now_nanos.saturating_sub(at) > 3_600_000_000_000));
+        self.unmatched_1h += u64::from(old);
     }
 }
 
@@ -564,3 +584,7 @@ impl Serialize for Counts {
 }
 
 crate::heap_layout_bound::fields!(ClaudeMoneyTokens; input, output, cache_read, cache_5m, cache_1h, unattributed, reasoning);
+
+#[cfg(test)]
+#[path = "e2_tests.rs"]
+mod tests;
