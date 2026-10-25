@@ -641,11 +641,10 @@ mod integration_selection_regressions {
         std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
         let loaded = ScanIndex::load(&path).unwrap();
         assert_eq!(loaded.files[key].effective_upload_body_witness_revision, 2);
-        assert!(!loaded
-            .claude_request_census
-            .get(key)
-            .unwrap()
-            .current_for(&"a".repeat(64)));
+        assert!(
+            loaded.claude_request_census.get(key).is_none(),
+            "selection loss invalidates evidence even without a birth stub"
+        );
         assert_eq!(
             loaded.files[codex].effective_upload_body_witness_revision,
             24
