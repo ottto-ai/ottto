@@ -551,3 +551,63 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
     assert_eq!(index.codex_parent_side_requests[&fixture.key()], before);
     assert!(index.codex_parent_side.is_empty());
 }
+
+/// Stage 1 S1-a (§7 exclusion G7): the production continuation pass
+/// (`begin_codex_continuation_side_pass`) never charges a side read: no
+/// ledger entry, no request write. An ordinary pass charges the same one.
+#[test]
+fn the_continuation_pass_charges_no_g7() {
+    let fixture = Root::new(1, b"");
+    let at = fixture.at();
+    let cache = sampled_scan::SharedCache::default();
+    let mut index = ScanIndex::default();
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(INDEX_PATH), &mut index);
+    assert_eq!(continuation.kind, CodexPageKind::Continuation);
+    assert_eq!(continuation.index_path, PathBuf::from(INDEX_PATH));
+    let request = request_for(&fixture, at.size);
+    index
+        .codex_parent_side_requests
+        .insert(fixture.key(), request);
+    assert_eq!(
+        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &continuation),
+        None
+    );
+    assert_eq!(index.codex_parent_side_requests[&fixture.key()], request);
+    assert_eq!(cache.side_ledger().len(), 0, "nothing charged");
+    assert_eq!(
+        index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
+        Some(1),
+        "the ordinary control"
+    );
+}
+
+/// Stage 1 S1-a (§7 exclusion: side due): the production continuation pass
+/// is never side-due; its due check reads no terms and writes or counts
+/// nothing, even for a worn request an ordinary pass tombstones.
+#[test]
+fn the_continuation_pass_is_never_side_due() {
+    let fixture = Root::new(1, b"");
+    let at = fixture.at();
+    let cache = sampled_scan::SharedCache::default();
+    let mut index = ScanIndex::default();
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(INDEX_PATH), &mut index);
+    let mut worn = request_for(&fixture, at.size);
+    worn.attempts = SIDE_REQUEST_EVICT_ATTEMPTS;
+    index.codex_parent_side_requests.insert(fixture.key(), worn);
+    let (due, counts) = observe(|| {
+        index.codex_parent_side_request_due(
+            &fixture.key(),
+            at,
+            1_000,
+            &cache,
+            &continuation,
+            || -> SideDueTerms { unreachable!("a continuation reads no due terms") },
+        )
+    });
+    assert!(!due);
+    assert_eq!(counts, Counts::default(), "nothing counted");
+    assert_eq!(index.codex_parent_side_requests[&fixture.key()], worn);
+    assert_eq!(cache.side_ledger().len(), 0);
+}
