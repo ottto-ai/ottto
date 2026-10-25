@@ -2253,7 +2253,13 @@ pub(super) fn checkpoint_receipt_until(
         })
     };
     let Some((save, reservation)) = saved else {
-        return MoneyReceipt::Refused;
+        // Credit is prepaid asynchronously on this same writer. Waiting for
+        // its durable ticket is pending work, not a custody failure.
+        return if ledger.save_held == Some(SaveHeld::CreditPending) {
+            MoneyReceipt::Pending
+        } else {
+            MoneyReceipt::Refused
+        };
     };
     let shards = save
         .shards
@@ -2953,6 +2959,37 @@ mod refused_intent_tests {
                 .unwrap()
                 .money_revision(),
             [2; 32]
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn checkpoint_credit_pending_is_not_a_custody_refusal() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-checkpoint-credit");
+        let support = scratch.join("support");
+        let mut ledger = ClaudeLedger::new_for_test();
+        assert!(ledger.put_money(
+            "dirty:credit-fixture".into(),
+            ClaudeRequestCensusRecord::money_debt([1; 32], 0)
+        ));
+        let stalled = stall_writer_for_test();
+        assert_eq!(
+            checkpoint_receipt(&support, &mut ledger),
+            MoneyReceipt::Pending
+        );
+        assert_eq!(
+            checkpoint_receipt(&support, &mut ledger),
+            MoneyReceipt::Pending
+        );
+        assert!(!support.join(LEDGER_DIR).exists());
+        drop(stalled);
+        assert!(checkpoint_for_test(&support, &mut ledger));
+        assert_eq!(
+            load_for_test(&support)
+                .get("dirty:credit-fixture")
+                .unwrap()
+                .money_revision(),
+            [1; 32]
         );
     }
 

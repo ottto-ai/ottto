@@ -2859,6 +2859,7 @@ fn family_preflight(
         }
     }
     for capture in captures.values() {
+        charge(capture.body_allocation_bound())?;
         charge(
             capture
                 .units()
@@ -3281,7 +3282,6 @@ async fn build_slice(
         }
         counts.undecided_unbuilt_older += ctx.unbuilt_older.get();
         let blocking = scope.blocking_files();
-        drop(ctx);
         drop(holders);
         if live {
             counts.unbuilt_older_released +=
