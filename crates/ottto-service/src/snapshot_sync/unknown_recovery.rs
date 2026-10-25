@@ -23,38 +23,6 @@ const REPLAY_AT: [u64; 3] = [300, 3600, 21600];
 const IO_FUNDS: usize = 2 * BODY_MAX + 8 * MANIFEST_MAX;
 const BODY_FUNDS: usize = BODY_MAX + 4 * MANIFEST_MAX;
 
-#[cfg(test)]
-thread_local! {
-    static SCOPE_TRACE: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
-}
-#[cfg(test)]
-pub(super) struct ScopeTrace(Option<Vec<String>>);
-#[cfg(test)]
-pub(super) fn scope_trace_for_test() -> ScopeTrace {
-    ScopeTrace(SCOPE_TRACE.with(|trace| trace.replace(Some(Vec::new()))))
-}
-#[cfg(test)]
-impl Drop for ScopeTrace {
-    fn drop(&mut self) {
-        SCOPE_TRACE.with(|trace| trace.replace(self.0.take()));
-    }
-}
-#[cfg(test)]
-pub(crate) fn trace_scope_for_test(event: impl FnOnce() -> String) {
-    SCOPE_TRACE.with(|trace| {
-        if let Some(events) = trace.borrow_mut().as_mut() {
-            if events.len() == 32 {
-                events.remove(0);
-            }
-            events.push(event());
-        }
-    });
-}
-#[cfg(test)]
-pub(super) fn scope_events_for_test() -> Vec<String> {
-    SCOPE_TRACE.with(|trace| trace.borrow().clone().unwrap_or_default())
-}
-
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct FileSelection {
@@ -1589,8 +1557,6 @@ pub(super) fn initial_post(
             head_cas,
             policy,
         )?;
-        #[cfg(test)]
-        trace_scope_for_test(|| format!("initial_manifest roots={:?}", m.scope.roots.keys()));
         if !manifest_fits(&m) {
             return Err(fault());
         }
@@ -1611,8 +1577,6 @@ pub(super) fn initial_post(
                 })
             })
         {
-            #[cfg(test)]
-            trace_scope_for_test(|| "initial_dependency_intersection".into());
             return Err(Deferred {
                 reason: None,
                 not_before: now(support),
@@ -1686,15 +1650,6 @@ pub(super) fn initial_post(
         && (!index.initial_recovery_history_permitted(support, &roots)
             || current_literal_guard(index, &m) != LiteralPermit::Permit)
     {
-        #[cfg(test)]
-        trace_scope_for_test(|| {
-            format!(
-                "initial_authority_denied roots={:?} cached_pause={} current_pause={}",
-                m.scope.roots.keys(),
-                index.request_money_adoption_paused(),
-                money::adoption_paused(support, index)
-            )
-        });
         return Err(Deferred {
             reason: None,
             not_before: now(support),
@@ -1705,8 +1660,6 @@ pub(super) fn initial_post(
     let mut permitted = request.snapshots.clone();
     index.retain_claude_history_emission_permitted(&mut permitted);
     if permitted.len() != request.snapshots.len() {
-        #[cfg(test)]
-        trace_scope_for_test(|| "initial_emission_veto".into());
         return Err(Deferred {
             reason: None,
             not_before: now(support),
@@ -1714,8 +1667,6 @@ pub(super) fn initial_post(
         }
         .into());
     }
-    #[cfg(test)]
-    trace_scope_for_test(|| format!("initial_post roots={:?}", m.scope.roots.keys()));
     let result = client
         .upload_recovery_bytes(token, request, head_cas, &body)
         .and_then(|response| {

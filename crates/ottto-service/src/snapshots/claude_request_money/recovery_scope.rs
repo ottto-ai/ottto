@@ -3,21 +3,6 @@
 //! and close it over current evidence before ordinary emission or replay.
 use super::*;
 
-#[cfg(test)]
-thread_local! { static CLOSE_STAGE: std::cell::Cell<&'static str> = const { std::cell::Cell::new("unentered") }; }
-#[cfg(test)]
-pub(crate) fn last_stage_for_test() -> &'static str {
-    CLOSE_STAGE.with(std::cell::Cell::get)
-}
-#[cfg(test)]
-pub(crate) fn evidence_ready_for_test(support: &Path) -> bool {
-    store::recovery_evidence(support, |_| ()).is_some()
-}
-#[cfg(test)]
-fn stage_for_test(stage: &'static str) {
-    CLOSE_STAGE.with(|value| value.set(stage));
-}
-
 const HASH_MAX: usize = 1024;
 const FILE_MAX: usize = 256;
 const ROOT_MAX: usize = 128;
@@ -95,15 +80,9 @@ impl std::ops::Deref for Closed {
 /// No filesystem work and no evidence-map copy. Both temporary graph memory
 /// and every fixed-point walk have explicit bounds; refusal holds emission.
 pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Option<Closed> {
-    #[cfg(test)]
-    stage_for_test("admission");
     let funds = ShadowReservation::admit(4 * 64 * 1024)?;
-    #[cfg(test)]
-    stage_for_test("ledger");
     let deadline = Instant::now() + Duration::from_millis(2);
     let scope = store::recovery_evidence(support, |ledger| {
-        #[cfg(test)]
-        stage_for_test("bounds_or_evidence");
         let mut scope = original.clone();
         let frozen_files = original
             .roots
@@ -123,8 +102,6 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             // Seed telemetry-only requests even when this root has no indexed transcript.
             for root in scope.roots.keys() {
                 if Instant::now() >= deadline {
-                    #[cfg(test)]
-                    stage_for_test("deadline");
                     return None;
                 }
                 if let Some(record) = ledger.get(&telemetry_key(root)) {
@@ -137,8 +114,6 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             }
             for (key, record) in ledger.census().records_with_prefix(TELEMETRY_KEY_PREFIX) {
                 if Instant::now() >= deadline {
-                    #[cfg(test)]
-                    stage_for_test("deadline");
                     return None;
                 }
                 if !overlaps(record.request_hashes(), &scope.requests) {
@@ -161,8 +136,6 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             }
             for key in index.files.keys() {
                 if Instant::now() >= deadline {
-                    #[cfg(test)]
-                    stage_for_test("deadline");
                     return None;
                 }
                 let Some((root, _)) = logical_family_member(index, key) else {
@@ -218,8 +191,6 @@ pub(crate) fn close(support: &Path, index: &ScanIndex, original: &Scope) -> Opti
             }
         }
     })??;
-    #[cfg(test)]
-    stage_for_test("closed");
     Some(Closed {
         scope,
         _funds: funds,

@@ -3787,6 +3787,43 @@ fn p2a_unknown_new_filename_alias_cannot_escape_family_custody() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unknown_root_hold_survives_a_body_without_a_physical_fingerprint() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
+    let _live = money::LiveForTest::new(&control.support);
+    let now = current_unix_seconds();
+    let _clock = money::PageClockForTest::new(&control.support, now);
+    control.cycle_deferred();
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 1);
+    control.recovery_startup(now);
+    let mut index = control.saved();
+    index.load_claude_reemission_exclusions(&control.support);
+    let mut body: SnapshotItem = serde_json::from_value(control.offers()[0].clone()).unwrap();
+    body.source_file_fingerprint = None;
+    let key = control.transcript().to_string_lossy().into_owned();
+    let fingerprint = index.files[&key].source_file_fingerprint.clone();
+    let mut bodies = vec![body];
+    assert_eq!(
+        index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut bodies),
+        1
+    );
+    assert!(
+        bodies.is_empty(),
+        "a known family hold never depends on a wire file fingerprint"
+    );
+    assert!(!index.stamp_effective_upload_body_witness_revision(&key, &fingerprint, 3));
+    assert!(money::money_due(&control.support, &key, u64::MAX));
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_restart() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
@@ -3794,7 +3831,6 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for message_only in [false, true] {
-        let _trace = unknown_recovery::scope_trace_for_test();
         let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
@@ -3857,11 +3893,7 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         control.recovery_startup(now + 299);
         let current_scope = unknown_recovery::held_roots(&control.support, &saved)
             .expect("current dependency evidence must admit this three-file control");
-        assert!(
-            current_scope.roots.contains(dependent),
-            "actual scopes: {:?}",
-            unknown_recovery::scope_events_for_test()
-        );
+        assert!(current_scope.roots.contains(dependent));
         assert!(
             !current_scope.roots.contains(unrelated),
             "renamed request and message identities must be independent; message_only={message_only}"
@@ -3871,8 +3903,7 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
         assert_eq!(
             posts.len(),
             2,
-            "only unrelated fresh work may POST; message_only={message_only}; actual scopes={:?}; retained scopes={:?}",
-            unknown_recovery::scope_events_for_test(),
+            "only unrelated fresh work may POST; message_only={message_only}; retained scopes={:?}",
             active
                 .iter()
                 .map(|m| (&m.scope.roots, m.posts, m.ack_saved))
