@@ -1266,10 +1266,11 @@ impl<R: BufRead + Seek> Decoder<R> {
             let value = self.span()?;
             // Includes ample space for our pretty-printed fixed array. Wider
             // spellings are damage, never permission to allocate a token.
-            if marker && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err()) {
-                if damaged.replace(value).is_some() {
-                    return Err(Error::Refused("duplicate idless marker"));
-                }
+            if marker
+                && (value.len > 4096 || self.typed::<Option<[u8; 32]>>(value).is_err())
+                && damaged.replace(value).is_some()
+            {
+                return Err(Error::Refused("duplicate idless marker"));
             }
             self.reader.seek(SeekFrom::Start(value.start + value.len))?;
             if self.ws()? == Some(b',') {
