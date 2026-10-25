@@ -798,7 +798,7 @@ fn native_comparison_real_source_finish_bootstraps_only_after_exact_ack_and_save
 fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
     use crate::snapshots::claude_request_money as money;
     let mut receipts = Vec::new();
-    for (case, units, copied) in [("large-family", 7_000, false), ("copied-member", 1, true)] {
+    for (case, units, copied) in [("large-family", 9_000, false), ("copied-member", 1, true)] {
         let root = base.join(format!("shadow-regression-{case}"));
         if root.exists() { std::fs::remove_dir_all(&root).unwrap(); }
         let support = root.join("support");

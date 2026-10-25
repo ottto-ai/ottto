@@ -503,11 +503,9 @@ impl Grouping {
     }
 
     fn get(&self, bucket_start: &str, row_key: &RowKey) -> Option<&RowGroup> {
-        let found = self
-            .groups
+        self.groups
             .get(bucket_start)
-            .and_then(|rows| rows.get(row_key));
-        found
+            .and_then(|rows| rows.get(row_key))
     }
 
     /// Drops every tag that rests on transcript markers: the org-only and

@@ -19,7 +19,7 @@ crate::heap_layout_bound::fields!(MoneyFileSelection; revision, root, member, co
 // A reserved local entry distinguishes capacity refusal from lost evidence.
 // A capped index pauses live adoption; it never re-arms intentionally omitted
 // selections or re-offers an untracked synthetic body after restart.
-const CAPACITY_KEY: &str = "!selection-capacity";
+pub(crate) const SELECTION_CAPACITY_KEY: &str = "!selection-capacity";
 const MAX_SELECTIONS: usize = 65_536;
 const MAX_SELECTION_KEY: usize = 4096;
 const MAX_SELECTION_RECORD: usize = 8192;
@@ -36,13 +36,17 @@ fn capacity_marker() -> MoneyFileSelection {
     }
 }
 fn mark_capacity(states: &mut BTreeMap<String, MoneyFileSelection>) {
-    states.insert(CAPACITY_KEY.into(), capacity_marker());
+    states.insert(SELECTION_CAPACITY_KEY.into(), capacity_marker());
 }
 pub(crate) fn selections_capped(states: &BTreeMap<String, MoneyFileSelection>) -> bool {
-    states.contains_key(CAPACITY_KEY)
+    states.contains_key(SELECTION_CAPACITY_KEY)
 }
 pub(crate) fn capped_selection_json() -> Vec<u8> {
-    serde_json::to_vec(&BTreeMap::from([(CAPACITY_KEY, capacity_marker())])).unwrap()
+    serde_json::to_vec(&BTreeMap::from([(
+        SELECTION_CAPACITY_KEY,
+        capacity_marker(),
+    )]))
+    .unwrap()
 }
 fn valid_state(state: &MoneyFileSelection) -> bool {
     let digest = |v: &str| v.len() == 64 && v.bytes().all(|b| b.is_ascii_hexdigit());
@@ -55,41 +59,68 @@ fn valid_state(state: &MoneyFileSelection) -> bool {
 
 /// Compact raw JSON keeps pretty index saves inside the same raw-field cap
 /// as the decoder. Existing valid entries retain deterministic key order.
+fn selection_entry_json(key: &str, state: &MoneyFileSelection) -> Option<(String, String)> {
+    if key.len() > MAX_SELECTION_KEY || !valid_state(state) {
+        return None;
+    }
+    let value = serde_json::to_string(state).expect("selection JSON");
+    (value.len() <= MAX_SELECTION_RECORD).then(|| {
+        (
+            serde_json::to_string(key).expect("selection key JSON"),
+            value,
+        )
+    })
+}
+fn selection_capacity_exceeded(states: &BTreeMap<String, MoneyFileSelection>) -> bool {
+    if selections_capped(states) || states.len() > MAX_SELECTIONS {
+        return true;
+    }
+    let mut bytes = 2;
+    for (key, state) in states {
+        let Some((key, value)) = selection_entry_json(key, state) else {
+            return true;
+        };
+        bytes += key.len() + value.len() + 2;
+        if bytes > MAX_SELECTION_BYTES {
+            return true;
+        }
+    }
+    false
+}
 fn bounded_selection_json(states: &BTreeMap<String, MoneyFileSelection>) -> (String, bool) {
+    let capped = selection_capacity_exceeded(states);
     let marker = format!(
         "{}:{}",
-        serde_json::to_string(CAPACITY_KEY).unwrap(),
+        serde_json::to_string(SELECTION_CAPACITY_KEY).unwrap(),
         serde_json::to_string(&capacity_marker()).unwrap()
     );
-    let mut rows = Vec::new();
-    let mut bytes = 2;
-    let mut capped = selections_capped(states);
-    for (key, state) in states {
-        if key == CAPACITY_KEY {
-            continue;
-        }
-        let value = serde_json::to_string(state).expect("selection JSON");
-        let key_json = serde_json::to_string(key).expect("selection key JSON");
-        let charge = key_json.len() + 1 + value.len() + usize::from(!rows.is_empty());
-        if key.len() > MAX_SELECTION_KEY
-            || value.len() > MAX_SELECTION_RECORD
-            || !valid_state(state)
-            || rows.len() >= MAX_SELECTIONS
-            || bytes + charge + marker.len() + 1 > MAX_SELECTION_BYTES
-        {
-            capped = true;
-            continue;
-        }
-        bytes += charge;
-        rows.push(format!("{key_json}:{value}"));
-    }
+    let mut json = String::from("{");
+    let mut count = 0;
     if capped {
-        if rows.len() == MAX_SELECTIONS {
-            rows.pop();
-        }
-        rows.insert(0, marker);
+        json.push_str(&marker);
+        count = 1;
     }
-    (format!("{{{}}}", rows.join(",")), capped)
+    for (key, state) in states {
+        if key == SELECTION_CAPACITY_KEY {
+            continue;
+        }
+        let Some((key, value)) = selection_entry_json(key, state) else {
+            continue;
+        };
+        let charge = key.len() + 1 + value.len() + usize::from(count > 0);
+        if count == MAX_SELECTIONS || json.len() + charge + 1 > MAX_SELECTION_BYTES {
+            continue;
+        }
+        if count > 0 {
+            json.push(',');
+        }
+        json.push_str(&key);
+        json.push(':');
+        json.push_str(&value);
+        count += 1;
+    }
+    json.push('}');
+    (json, capped)
 }
 pub(crate) struct BoundedSelections<'a>(pub(crate) &'a BTreeMap<String, MoneyFileSelection>);
 impl Serialize for BoundedSelections<'_> {
@@ -300,9 +331,11 @@ pub(crate) fn stage_selection_fingerprints(
             .consumed = Some(consumed.clone());
     }
     index.claude_money_files.retain(|key, state| {
-        key == CAPACITY_KEY || state.synthetic_body.is_some() || index.files.contains_key(key)
+        key == SELECTION_CAPACITY_KEY
+            || state.synthetic_body.is_some()
+            || index.files.contains_key(key)
     });
-    if bounded_selection_json(&index.claude_money_files).1 {
+    if selection_capacity_exceeded(&index.claude_money_files) {
         mark_capacity(&mut index.claude_money_files);
         return false;
     }
@@ -541,7 +574,7 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
             let mut result = BTreeMap::new();
             let mut seen = BTreeSet::new();
             while let Some(key) = map.next_key::<String>()? {
-                if seen.len() >= MAX_SELECTIONS || key.len() > MAX_SELECTION_KEY {
+                if seen.len() >= MAX_SELECTIONS {
                     map.next_value::<IgnoredAny>()?;
                     mark_capacity(&mut result);
                     continue;
@@ -552,12 +585,20 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
                     continue;
                 }
                 if raw.get().len() > MAX_SELECTION_RECORD {
-                    mark_capacity(&mut result);
+                    // An oversized key plus an oversized malformed record is
+                    // damaged evidence, as before; it is not a valid capped entry.
+                    if key.len() <= MAX_SELECTION_KEY {
+                        mark_capacity(&mut result);
+                    }
                     continue;
                 }
                 if let Ok(state) = serde_json::from_str::<MoneyFileSelection>(raw.get()) {
                     if valid_state(&state) {
-                        result.insert(key, state);
+                        if key.len() > MAX_SELECTION_KEY {
+                            mark_capacity(&mut result);
+                        } else {
+                            result.insert(key, state);
+                        }
                     }
                 }
             }
@@ -566,7 +607,10 @@ pub(crate) fn decode_selections<'de, D: serde::Deserializer<'de>>(
     }
     let raw = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
     if raw.get().len() > MAX_SELECTION_BYTES {
-        return Ok(BTreeMap::from([(CAPACITY_KEY.into(), capacity_marker())]));
+        return Ok(BTreeMap::from([(
+            SELECTION_CAPACITY_KEY.into(),
+            capacity_marker(),
+        )]));
     }
     let mut isolated = serde_json::Deserializer::from_str(raw.get());
     Ok(serde::de::Deserializer::deserialize_map(&mut isolated, Selections).unwrap_or_default())
@@ -621,7 +665,7 @@ pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &mut Vec<Snapshot
                     reparse_union: None,
                 },
             );
-            if bounded_selection_json(&index.claude_money_files).1 {
+            if selection_capacity_exceeded(&index.claude_money_files) {
                 mark_capacity(&mut index.claude_money_files);
                 return false;
             }
@@ -645,7 +689,7 @@ pub(crate) fn selected_money_files(
         .claude_money_files
         .iter()
         .filter(|(key, state)| {
-            key.as_str() == CAPACITY_KEY
+            key.as_str() == SELECTION_CAPACITY_KEY
                 || state.synthetic_body.is_some()
                 || index.files.contains_key(*key)
                 || previous.files.contains_key(*key)

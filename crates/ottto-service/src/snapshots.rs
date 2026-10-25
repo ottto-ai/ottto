@@ -43648,8 +43648,11 @@ impl ScanIndex {
     /// without one.
     fn prune_terminal_jsonl_dispositions(&mut self) {
         let files = &self.files;
-        self.claude_money_files
-            .retain(|key, state| state.synthetic_body.is_some() || files.contains_key(key));
+        self.claude_money_files.retain(|key, state| {
+            key == claude_request_money::SELECTION_CAPACITY_KEY
+                || state.synthetic_body.is_some()
+                || files.contains_key(key)
+        });
         let holds = &self.decode_holds;
         self.terminal_jsonl_dispositions
             .retain(|key, _| files.contains_key(key) || holds.contains("files", key));

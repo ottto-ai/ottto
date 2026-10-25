@@ -2170,7 +2170,8 @@ fn money_review_retry_cannot_resend_the_same_body_without_a_new_lease() {
             restarted.active_quarantine_witness = initial.active_quarantine_witness.clone();
             let mut candidates = originals.clone();
             if mode == "changed" {
-                candidates[0].tool_usage_truncated = true;
+                candidates[0].tool_usage_truncated = !candidates[0].tool_usage_truncated;
+                assert_ne!(snapshot_upload_body_witness(&candidates[0]), body);
             }
             if mode == "authorized" {
                 restarted
