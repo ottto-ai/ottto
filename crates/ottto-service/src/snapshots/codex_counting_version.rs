@@ -199,6 +199,8 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             .filter(|(_, tombstone)| tombstone.evidence != AckEvidence::LegacyAcked)
             .map(|(owner, _)| owner.as_str())
             .chain(earlier.into_iter().map(|(_, owner)| owner))
+            // Never an owner this retirement is about to (re)write.
+            .filter(|owner| !retired.iter().any(|(rewritten, _)| rewritten == owner))
             .take(short)
             .map(str::to_owned)
             .collect::<Vec<_>>();

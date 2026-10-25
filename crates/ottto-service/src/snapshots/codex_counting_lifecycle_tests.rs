@@ -607,3 +607,36 @@ fn invalid_counting_binding_never_masks_a_valid_owner() {
         AckEvidence::LegacyAcked
     );
 }
+
+#[test]
+fn full_map_never_evicts_an_owner_the_retirement_rewrites() {
+    let key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
+    let ids = codex_session_id_candidates_from_path(Path::new(&key));
+    assert_eq!(ids.len(), 2, "legacy and modern filename identities");
+    let rewritten = codex_protected_owner(&ids[0]);
+    let tombstone = |evidence| codex_counting_version::CountingTombstone {
+        evidence,
+        retired_in: String::new(),
+    };
+    let mut index = ScanIndex {
+        codex_counting_tombstones: (1..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            .map(|n| (format!("{n:064x}"), tombstone(AckEvidence::LegacyAcked)))
+            .chain([(rewritten.clone(), tombstone(AckEvidence::V2Marked))])
+            .collect(),
+        ..ScanIndex::default()
+    };
+    // Unbound: both identities become Legacy hints and one needs a slot. The
+    // only V2-only slot belongs to an identity being rewritten, so none frees.
+    index.files.insert(key.clone(), acked_entry(false, None));
+    assert!(!codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES
+    );
+    assert_eq!(
+        index.codex_counting_tombstones[&rewritten].evidence,
+        AckEvidence::V2Marked
+    );
+}
