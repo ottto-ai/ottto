@@ -2360,6 +2360,24 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn catalog_handoff_pressure_keeps_the_completed_writer_result() {
+        money::store::flush();
+        let ticket = catalog_job(|| Ok(Vec::new())).unwrap();
+        money::store::flush();
+        let mut blockers = Vec::new();
+        while let Some(funds) = money::ShadowReservation::admit(1024 * 1024) {
+            blockers.push(funds);
+        }
+        assert!(matches!(catalog_result(&ticket), Err(error) if error.is::<CapacityFull>()));
+        drop(blockers);
+        let (entries, _funds) = catalog_result(&ticket)
+            .unwrap()
+            .expect("admission refusal must leave the completed result owned by its ticket");
+        assert!(entries.is_empty());
+    }
+
+    #[test]
     fn metadata_admission_prepays_capture_and_terminal_bookkeeping() {
         let (mut manifest, _) = specimen(1000);
         let (mut low, mut high) = (0, MANIFEST_MAX);
