@@ -3372,6 +3372,158 @@ fn p2a_unsent_metadata_admission_splits_then_resumes_exact_captures() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let sample = control
+        .cycle()
+        .1
+        .pop()
+        .expect("actual prepared Claude body");
+    let now = current_unix_seconds();
+    control.recovery_startup(now);
+    let mut index = control.saved();
+    index.activate_effective_upload_body_witness_revision(3);
+    index.load_claude_reemission_exclusions(&control.support);
+    let namespace = snapshot_upload_destination_namespace(&control.device, "device-secret");
+    let binding = unknown_recovery::binding(
+        &namespace,
+        control.client.recovery_origin(),
+        "otm_test",
+        &control.daemon.snapshot_scan_account_witness().unwrap(),
+    );
+    let path = snapshot_upload_progress_path(&control.index_path);
+    let mut progress = SnapshotUploadProgress::load(
+        &path,
+        &namespace,
+        snapshot_quarantine_witness(SnapshotSource::ClaudeCode),
+    )
+    .unwrap();
+    let mut items = Vec::new();
+    for number in 0..17 {
+        let mut item = sample.clone();
+        item.source_session_id =
+            format!("{:08x}-7777-4777-8777-777777777777", 0x60000000u32 + number);
+        // Synthetic telemetry-only entities have no physical selected file.
+        item.source_file_fingerprint = None;
+        item.snapshot_fingerprint =
+            crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &item);
+        items.push(item);
+    }
+    // Exercise the existing class boundary with seventeen physical batches,
+    // without changing either the 50-item packer or the real 16-slot limit.
+    let classes = items
+        .iter()
+        .map(|item| item.snapshot_fingerprint.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .enumerate()
+        .map(|(rank, fp)| (fp, rank % 2 == 0))
+        .collect::<BTreeMap<_, _>>();
+    let token = control
+        .client
+        .issue_relay_token(&control.device, "device-secret", SnapshotSource::ClaudeCode)
+        .unwrap();
+    let mut send = unknown_recovery::SendState::default();
+    let mut accepted = 0;
+    let mut run = |progress: &mut SnapshotUploadProgress, index: &mut ScanIndex| {
+        for _ in 0..64 {
+            let result = upload_resumable_batches_with_body_witness_partitioned(
+                &items,
+                "claude_code",
+                progress,
+                &mut accepted,
+                |item| item.snapshot_fingerprint.as_str(),
+                snapshot_upload_body_witness,
+                |item| Some(item.source_session_id.as_str()),
+                |item| classes[&item.snapshot_fingerprint],
+                &mut InplaceRetryBudget::default(),
+                None,
+                |batch| {
+                    let request = SnapshotBatchRequest {
+                        schema_version: SNAPSHOT_SCHEMA_VERSION,
+                        source: "claude_code".into(),
+                        machine_id: "otm_test".into(),
+                        collector_version: Some(collector_version()),
+                        snapshots: batch,
+                        upload_policy: SnapshotUploadPolicy::default(),
+                        client_report: crate::client_report::ClientReport::empty(),
+                    };
+                    unknown_recovery::initial_post(
+                        &control.support,
+                        index,
+                        &control.client,
+                        &token,
+                        &request,
+                        &binding,
+                        false,
+                        false,
+                        [0; 32],
+                        &mut send,
+                    )
+                },
+                |progress| {
+                    progress.save(&path)?;
+                    unknown_recovery::ack_saved(&control.support, progress)
+                },
+            );
+            if result
+                .as_ref()
+                .err()
+                .is_some_and(|error| error.is::<unknown_recovery::Pending>())
+            {
+                money_resume::drive_for_test(unknown_recovery::captured(
+                    &control.support,
+                    &mut send,
+                ))
+                .unwrap();
+                continue;
+            }
+            return result;
+        }
+        panic!("seventeen bounded capture handoffs did not converge")
+    };
+    assert_eq!(
+        run(&mut progress, &mut index).unwrap(),
+        ResumableUploadResult::Deferred { count: 1 }
+    );
+    money_resume::drive_for_test(unknown_recovery::outcomes(&control.support)).unwrap();
+    assert_eq!(
+        unknown_recovery::active_for_test(&control.support).len(),
+        16
+    );
+    assert!(
+        unknown_recovery::offline_startup(&control.support, now).unwrap(),
+        "normal capacity pressure must not become a sticky global fault"
+    );
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 17); // original + sixteen
+                                                                      // Save only real ACKs through the actual selected-index save before retiring custody.
+    index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
+    index.save(&control.index_path).unwrap();
+    unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();
+    control.recovery_startup(now);
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    progress.prepare_quarantine_retries(&BTreeMap::new());
+    assert_eq!(
+        run(&mut progress, &mut index).unwrap(),
+        ResumableUploadResult::Completed
+    );
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 18);
+    assert_eq!(progress.accepted_fingerprints.len(), 17); // seventeen distinct frozen offers
+    assert!(unknown_recovery::initialized(&control.support));
+    eprintln!("MONEY_UNKNOWN_CAPACITY real_slots=16 accepted_checkpoint=true global_fault=false next_offer_post=true");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_credentials() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {

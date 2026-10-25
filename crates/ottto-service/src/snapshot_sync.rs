@@ -6956,6 +6956,7 @@ async fn finish_sync_source_resume(
                             &request,
                             binding,
                             enforce_head_cas,
+                            true,
                             money_policy.expect("prepared recovery policy"),
                             &mut recovery_send,
                         )
@@ -7100,6 +7101,7 @@ async fn finish_sync_source_resume(
                         &request,
                         binding,
                         reconcile_class,
+                        false,
                         money_policy.expect("prepared recovery policy"),
                         &mut recovery_send,
                     )
@@ -10145,6 +10147,25 @@ where
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
         match attempt {
+            Err(error) if error.is::<unknown_recovery::CapacityFull>() => {
+                let mut held = 0;
+                for item in items {
+                    let witness = body_witness(item);
+                    if !progress.contains_body(fingerprint(item), &witness) {
+                        progress.quarantine_transient_body(
+                            fingerprint(item),
+                            &witness,
+                            current_unix_seconds(),
+                        );
+                        held += 1;
+                    }
+                }
+                persist(progress).map_err(|_| SnapshotLocalStateRejected {
+                    operation: "save local custody capacity hold",
+                })?;
+                eprintln!("claude_request_money recovery_capacity_deferred=1");
+                return Ok(ResumableUploadResult::Deferred { count: held.max(1) });
+            }
             Err(error) if error.is::<unknown_recovery::UnsentPacking>() => {
                 let admission = error
                     .downcast_ref::<unknown_recovery::UnsentPacking>()

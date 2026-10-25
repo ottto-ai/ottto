@@ -162,6 +162,20 @@ fn unsent_packing() -> anyhow::Error {
     UnsentPacking { resume: None }.into()
 }
 
+/// Admission pressure is recoverable after checkpointing accepted siblings.
+/// It must never poison an otherwise healthy durable catalog.
+#[derive(Debug)]
+pub(super) struct CapacityFull;
+impl std::fmt::Display for CapacityFull {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money recovery admission is full")
+    }
+}
+impl std::error::Error for CapacityFull {}
+fn capacity_full() -> anyhow::Error {
+    CapacityFull.into()
+}
+
 #[derive(Debug)]
 struct CustodyFault;
 impl std::fmt::Display for CustodyFault {
@@ -537,7 +551,7 @@ fn prune_receipts(root: &Path, now: u64, active: &[Manifest], extra: usize) -> R
     }
     // Reserve a receipt for every admitted active batch, even at full custody.
     if count + reserved > RECEIPT_MAX || bytes + reserved as u64 * 1024 > RECEIPT_BYTES_MAX {
-        return Err(fault());
+        return Err(if extra > 0 { capacity_full() } else { fault() });
     }
     Ok(())
 }
@@ -555,7 +569,10 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     sync_dir(&support)?;
     let active = load(&root)?;
     prune_receipts(&root, m.created, &active, 1)?;
-    if active.len() >= ACTIVE_MAX || body.len() > BODY_MAX {
+    if active.len() >= ACTIVE_MAX {
+        return Err(capacity_full());
+    }
+    if body.len() > BODY_MAX {
         return Err(fault());
     }
     m.length = body.len();
@@ -564,7 +581,7 @@ fn capture(support: PathBuf, mut m: Manifest, body: &[u8]) -> Result<Manifest> {
     // Includes payload temp, manifest replacement temp and terminal receipt.
     let reserve = body.len() as u64 + 2 * MANIFEST_MAX as u64 + 2048;
     if footprint(&root)?.saturating_add(reserve) > TOTAL_MAX {
-        return Err(fault());
+        return Err(capacity_full());
     }
     let payload = path(&root, &m.id, "body")?;
     if payload.exists() || path(&root, &m.id, "json")?.exists() {
@@ -717,14 +734,14 @@ fn job_with_result_funds<T: Send + 'static>(
                 Err(_) => return Err(fault()),
             };
             result.map_err(|error| {
-                if error.is::<CorruptBody>() {
+                if error.is::<CorruptBody>() || error.is::<CapacityFull>() {
                     error
                 } else {
                     fault()
                 }
             })
         })
-        .ok_or_else(fault)?,
+        .ok_or_else(capacity_full)?,
     })
 }
 pub(super) async fn wait<T>(ticket: Ticket<T>) -> Result<T> {
@@ -1321,7 +1338,23 @@ pub(super) fn resolve_saved(
                                 == Some(record)
                     })
         });
-        if m.terminal.is_none() && m.ack_saved && selected_outcomes {
+        // A later exact selected ACK can supersede a bootstrap's cache-less
+        // body. Its original money offer must already be retired by the normal
+        // ACK/selected-save/debt barrier; a newer outstanding offer is not lent
+        // this old ACK. No-offer entities still require their exact tuple above.
+        let original_offers_finished = m.entities.iter().all(|entity| {
+            !entity.file_selections.is_empty()
+                && entity
+                    .files
+                    .iter()
+                    .zip(&entity.file_selections)
+                    .all(|(key, selection)| {
+                        selection.offer.is_some_and(|offer| {
+                            money::recovery_offer_debt_retired(support, key, offer)
+                        })
+                    })
+        });
+        if m.terminal.is_none() && m.ack_saved && (selected_outcomes || original_offers_finished) {
             // This mark follows ACK/selected saves and the original matching
             // money debt handoff. Known outcomes need no unresolved receipt.
             m.terminal = Some(Reason::Resolved);
@@ -1530,6 +1563,7 @@ pub(super) fn manifest(
 pub(super) enum SendState {
     #[default]
     Empty,
+    Capacity,
     Reserving(Manifest, Vec<u8>, money::ShadowReservation),
     Ready(Manifest, Vec<u8>, money::ShadowReservation),
 }
@@ -1550,9 +1584,16 @@ pub(super) async fn captured(support: &Path, state: &mut SendState) -> Result<()
         }
         _ => return Err(fault()),
     };
-    let (m, bytes, funds) = wait(ticket)
-        .await
-        .inspect_err(|error| faulted(support, error))?;
+    let prepared = wait(ticket).await;
+    if prepared
+        .as_ref()
+        .err()
+        .is_some_and(|error| error.is::<CapacityFull>())
+    {
+        *state = SendState::Capacity;
+        return Ok(());
+    }
+    let (m, bytes, funds) = prepared.inspect_err(|error| faulted(support, error))?;
     add(support, m.clone())?;
     *state = SendState::Ready(m, bytes, funds);
     Ok(())
@@ -1586,9 +1627,13 @@ pub(super) fn initial_post(
     request: &SnapshotBatchRequest,
     binding: &str,
     head_cas: bool,
+    bootstrap: bool,
     policy: [u8; 32],
     state: &mut SendState,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    if matches!(state, SendState::Capacity) {
+        return Err(capacity_full());
+    }
     if let SendState::Ready(manifest, _, _) = state {
         let matches = manifest.entities.len() == request.snapshots.len()
             && manifest
@@ -1691,6 +1736,30 @@ pub(super) fn initial_post(
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
         let body = encode(request, m.head_cas).map_err(|_| unsent_packing())?;
+        let full = CATALOGS
+            .lock()
+            .map_err(|_| fault())?
+            .get(support)
+            .is_some_and(|catalog| {
+                let (slots, bytes) = if bootstrap {
+                    (ACTIVE_MAX / 2, TOTAL_MAX / 2)
+                } else {
+                    (ACTIVE_MAX, TOTAL_MAX)
+                };
+                // Conservatively reserve every receipt slot and replacement temp.
+                // This check precedes the durable latch admission and capture.
+                let retained = catalog
+                    .entries
+                    .iter()
+                    .fold(RECEIPT_BYTES_MAX + 4096, |n, entry| {
+                        n.saturating_add(entry.length as u64 + 2 * MANIFEST_MAX as u64)
+                    });
+                catalog.entries.len() >= slots
+                    || retained.saturating_add(body.len() as u64 + 2 * MANIFEST_MAX as u64) > bytes
+            });
+        if full {
+            return Err(capacity_full());
+        }
         *state = SendState::Reserving(m, body, funds);
         return Err(Pending.into());
     }
@@ -2550,7 +2619,9 @@ mod tests {
             .set_len(TOTAL_MAX - 1024)
             .unwrap();
         let (m, body) = specimen(1000);
-        assert!(capture(scratch.to_path_buf(), m.clone(), &body).is_err());
+        assert!(capture(scratch.to_path_buf(), m.clone(), &body)
+            .unwrap_err()
+            .is::<CapacityFull>());
         assert!(
             !path(&root, &m.id, "body").unwrap().exists(),
             "reserve before an eligible POST"
