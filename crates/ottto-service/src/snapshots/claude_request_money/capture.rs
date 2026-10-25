@@ -1813,8 +1813,8 @@ mod bounded_tests {
         };
         assert_eq!(plan(&a, &a_turn), PlanInstall::Complete);
         assert_eq!(plan(&b, &|at: usize| at as u64), PlanInstall::Complete);
-        for at in 0..3 * NEXT_PAGE_FAMILIES {
-            assert_eq!(begins(&a[at]), at >= 2 * NEXT_PAGE_FAMILIES, "a-{at}");
+        for (at, root) in a.iter().enumerate() {
+            assert_eq!(begins(root), at >= 2 * NEXT_PAGE_FAMILIES, "a-{at}");
         }
         // A fallback on B leaves A's selection to A's own next page.
         set_plan_deadline_for_test(true);
