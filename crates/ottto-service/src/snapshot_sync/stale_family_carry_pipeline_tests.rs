@@ -255,6 +255,28 @@ struct C1bRun {
     family_pending_after: bool,
 }
 
+/// Older C1b controls distinguish the witnessed target from unrelated
+/// sessions whose local upload-body witness is unavailable. ACK ledger entries
+/// and committed heads remain intact. The accepted-body tests and independent
+/// acceptance fixture retain every witness and exercise the widened path.
+fn c1b_without_unrelated_upload_witnesses(fixture: &RearmFixture) {
+    let index = ScanIndex::load(&fixture.index_path).unwrap();
+    let family = RearmFixture::family_keys(&index)
+        .into_iter()
+        .map(|(_, key)| key)
+        .collect::<BTreeSet<_>>();
+    c1a_edit_index(fixture, |saved| {
+        for (key, entry) in saved["files"].as_object_mut().unwrap() {
+            if !family.contains(key) {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("last_upload_body_witness");
+            }
+        }
+    });
+}
+
 fn c1b_red_chain(case: &'static str, arm: &str, between: impl FnOnce(&RearmFixture)) -> C1bRun {
     c1b_red_chain_with(c1a_fixture(case), arm, between)
 }
@@ -288,6 +310,7 @@ fn c1b_red_chain_with(
     let heads_after_red = RearmFixture::family_heads(&saved);
     let witness_after_red = saved.claude_usage_family_witness_digest_for_test(REARM_ROOT);
     between(&fixture);
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let retry = c1b_generation(&fixture, arm, (8, 20));
     std::fs::write(
         c1b_sibling_path(&fixture),
@@ -295,6 +318,7 @@ fn c1b_red_chain_with(
             + &rearm_transcript_line(REARM_SIBLING, None, "req_sibling_2", 1),
     )
     .expect("repair the unrelated transcript");
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let repaired = c1b_generation(&fixture, arm, (8, 30));
     let quiet = c1b_generation(&fixture, arm, (8, 40));
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
@@ -666,6 +690,7 @@ fn c1b_member_removed_after_carry_keeps_the_carry_in_the_window() {
         assert!(red.red, "{arm}: the window is red");
         std::fs::remove_file(fixture.member_path(Some(REARM_AGENTS[1])))
             .expect("remove the second subagent");
+        c1b_without_unrelated_upload_witnesses(&fixture);
         let retry = c1b_generation(&fixture, arm, (8, 20));
         std::fs::write(
             c1b_sibling_path(&fixture),
@@ -786,6 +811,7 @@ fn c1b_held_retry_chain(
     let marked_after_red = saved.bounded_sweep_had_unsettled_upload();
     let record_after_red = saved.claude_authority_record_for_test(REARM_TERMINAL);
     before_retry(&fixture);
+    c1b_without_unrelated_upload_witnesses(&fixture);
     let retry = c1b_generation(&fixture, arm, (8, 20));
     let saved = ScanIndex::load(&fixture.index_path).unwrap();
     C1bHeldRun {
@@ -923,6 +949,16 @@ fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
             // original no-carry/read/hold assertions. A companion below keeps
             // the evidence and verifies the newly approved carry instead.
             saved.remove("claude_request_census");
+            // Absence of census/OTEL evidence is now allowed when the exact
+            // upload-body witness is retained. This negative control lacks
+            // that durable witness too; its original refusal assertions stay.
+            for entry in saved["files"].as_object_mut().unwrap().values_mut() {
+                entry
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("last_upload_body_witness");
+            }
+
             // Select the ordinary C1b retry, outside Fix 2's window.
             let progress = saved
                 .get_mut("claude_full_rearm_progress")
@@ -1255,6 +1291,7 @@ fn scoped_unhealthy_retry_late_identity_rows_reselect_and_emit_tagged_bodies() {
     assert!(red.red && red.proven);
     let unsettled = || {
         c1b_without_full_rearm_window(&fixture);
+        c1b_without_unrelated_upload_witnesses(&fixture);
         let mut index = ScanIndex::load(&fixture.index_path).unwrap();
         index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
         index.save(&fixture.index_path).unwrap();
