@@ -46,6 +46,14 @@ impl Corpus {
         let support = base.join("support");
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&support).unwrap();
+        if e2::enabled() {
+            std::fs::create_dir_all(support.join("snapshots")).unwrap();
+            std::fs::write(
+                support.join("snapshots/claude_code-reemission-exclusions.txt"),
+                "# installed synthetic list, no protected sessions\n",
+            )
+            .unwrap();
+        }
         Self {
             base,
             root,
@@ -125,6 +133,7 @@ impl Corpus {
             effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
         });
         index.adopt_effective_upload_body_witness_revision_monotonically();
+        index.load_claude_reemission_exclusions(&self.support);
         let (index, scan, modes) = scanner.scan(
             std::slice::from_ref(&self.root),
             &self.support,
