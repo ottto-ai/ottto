@@ -1689,6 +1689,11 @@ pub(super) fn initial_post(
             .ok_or_else(fault)?
             .awaiting_ack
             .insert(m.id.clone());
+        // The send intent is already durable. The caller saves ACK progress
+        // next, then ack_saved persists that transition. Failure before that
+        // save leaves the existing intent UNKNOWN without an intermediate
+        // unchanged-manifest write or another writer turn.
+        return result;
     }
     // Outcome writes are awaited by the async owner, including Retry-After.
     // Keep no second copy of the retained payload after the one physical POST.
