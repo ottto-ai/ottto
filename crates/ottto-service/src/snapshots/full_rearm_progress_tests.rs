@@ -253,6 +253,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
             ClaudeFullRearmSuppressionCounts {
                 full_rearm_suppressed: true,
                 full_rearm_skipped_invalid_unchanged: skipped as u64,
+                full_rearm_post_rebuild_skipped: 0,
                 structural_invalid_family_count: 1,
                 suppressed_since_unix_seconds: Some(CENSUS_CLOCK),
             }
@@ -299,6 +300,7 @@ fn unchanged_structural_set_skips_repeated_full_rearms() {
     let encoded = serde_json::to_string(&ClaudeFullRearmSuppressionCounts {
         full_rearm_suppressed: true,
         full_rearm_skipped_invalid_unchanged: u64::MAX,
+        full_rearm_post_rebuild_skipped: 0,
         structural_invalid_family_count: usize::MAX,
         suppressed_since_unix_seconds: Some(u64::MAX),
     })
@@ -1325,10 +1327,9 @@ fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
             (CandidateDecision::Skip, None),
             "shadow={enabled}: the hold skips it before identity work"
         );
-        // The cycle's committed checkpoint, as saved.
+        // The cycle's committed state; its first save creates the checkpoint.
         let scratch = crate::test_scratch::ScratchDir::new("contract-rearm-revokes-n3-hold");
         let path = scratch.join("index.json");
-        std::fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
         let mut committed = index.clone();
 
         // The real terminal contract-5 re-arm.
@@ -1395,5 +1396,353 @@ fn contract_rearm_revokes_an_earlier_checkpoint_n3_hold_once() {
                 index.save(&path).unwrap();
             }
         }
+    }
+}
+
+/// A previously loaded rebuild checkpoint can prove a new complete read; a
+/// fresh load itself cannot. This is the same non-fresh rule used by #712.
+fn rebuild_candidate(rearm: &Rearm, origin: ScanIndexLoadOrigin) -> ScanIndex {
+    let mut index = rearm.index();
+    index.generation = 1;
+    index.claude_duplicate_request_witness_overflowed = false;
+    index.claude_duplicate_fence_rearm_attempt = CLAUDE_DUPLICATE_FENCE_REARM_MAX_ATTEMPT;
+    index.settle_claude_index_load(&rearm.root.join("index.json"), origin);
+    index.claude_full_rearm_progress.rebuild_read_full = index.claude_rebuild_read_load_eligible;
+    index.claude_full_rearm_progress.traversal_origin = Some(ClaudeFullRearmWindow {
+        context_fingerprint: "rebuild-context".to_string(),
+        process: claude_full_rearm_process(),
+        window_ends: BTreeSet::from([WINDOW.to_string()]),
+        member_digests: BTreeMap::new(),
+    });
+    index
+}
+
+fn rebuild_reads(index: &ScanIndex) -> Vec<PendingIndexFinalization> {
+    index
+        .files
+        .iter()
+        .map(|(key, entry)| PendingIndexFinalization {
+            sampled_audit_verified: false,
+            codex_pending_recovery: false,
+            index_key: key.clone(),
+            source_file_fingerprint: entry.source_file_fingerprint.clone(),
+            previous_snapshot_fingerprint: None,
+            previous_upload_body_witness: None,
+            parse_complete: true,
+            diagnostic_reason: FileReason::Complete,
+            parsed_snapshot_count: 1,
+            effective_upload_body_witness_revision: 0,
+        })
+        .collect()
+}
+
+#[test]
+fn complete_rebuild_read_skips_only_the_first_close_and_discloses_it() {
+    let rearm = Rearm::new();
+    let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
+    seal_claude_complete_rebuild_read(&mut index, &rebuild_reads(&rearm.index()), true);
+    assert!(index
+        .claude_full_rearm_progress
+        .complete_rebuild_read
+        .is_some());
+    let run = rearm.terminal(&mut index, &rearm.items);
+    assert!(!run.counts.fence_before && run.counts.fence_after);
+    assert!(!run.counts.full_rearm, "{run:?}");
+    assert_eq!(run.rearmed_files, 0);
+    assert_eq!(run.suppression.full_rearm_post_rebuild_skipped, 1);
+    assert_eq!(
+        run.counts.full_rearm_deferred_until,
+        Some(CENSUS_CLOCK + CLAUDE_DUPLICATE_FENCE_REARM_MAX_SECONDS)
+    );
+    let disclosed = serde_json::to_value(crate::snapshot_sync::ClaudeLocalEvidenceStats {
+        full_rearm_suppression: run.suppression,
+        ..Default::default()
+    })
+    .unwrap();
+    assert_eq!(
+        disclosed["full_rearm_suppression"]["full_rearm_post_rebuild_skipped"],
+        1
+    );
+    assert!(index
+        .claude_full_rearm_progress
+        .complete_rebuild_read
+        .is_none());
+    let due = rearm.terminal(&mut index, &rearm.items);
+    assert!(due.counts.full_rearm, "proof is single-use: {due:?}");
+}
+
+#[test]
+fn incomplete_rebuild_read_keeps_rearm_for_every_refusal() {
+    let rearm = Rearm::new();
+    for cause in [
+        "partial",
+        "failed",
+        "cap",
+        "tail",
+        "withheld",
+        "excluded-source",
+        "revision",
+        "membership",
+        "origin",
+        "restart",
+        "identity-contract",
+        "occurrence-cap",
+    ] {
+        let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
+        let mut reads = rebuild_reads(&index);
+        match cause {
+            "partial" => {
+                reads.pop();
+            }
+            "failed" => reads[0].parse_complete = false,
+            "cap" => index.claude_full_rearm_progress.rebuild_read_full = false,
+            "tail" => index.claude_full_rearm_progress.rebuild_read_full = false,
+            _ => {}
+        }
+        seal_claude_complete_rebuild_read(&mut index, &reads, true);
+        match cause {
+            "withheld" => index.mark_bounded_sweep_unsettled(),
+            "excluded-source" => {
+                index
+                    .effective_upload_body_witness_revision_excluded_source_files
+                    .insert("held-source".to_string());
+            }
+            "revision" => index
+                .files
+                .values_mut()
+                .next()
+                .unwrap()
+                .source_file_fingerprint
+                .push('x'),
+            "membership" => {
+                index.files.pop_first();
+            }
+            "origin" => index
+                .claude_full_rearm_progress
+                .traversal_origin
+                .as_mut()
+                .unwrap()
+                .context_fingerprint
+                .push('x'),
+            "restart" => {
+                let value = serde_json::to_vec(&index).unwrap();
+                let path = rearm.root.join("restart-index.json");
+                fs::write(&path, value).unwrap();
+                index = ScanIndex::load(&path).unwrap();
+                assert!(index
+                    .claude_full_rearm_progress
+                    .complete_rebuild_read
+                    .is_none());
+            }
+            "identity-contract" => index.claude_request_identity_contract_changed = true,
+            _ => {}
+        }
+        let disposition = rearm.fold(
+            &mut index,
+            &rearm.items,
+            true,
+            if cause == "occurrence-cap" {
+                0
+            } else {
+                MAX_CLAUDE_PENDING_USAGE_OCCURRENCES
+            },
+        );
+        assert!(
+            disposition.duplicate_census.full_rearm,
+            "{cause}: {disposition:?}"
+        );
+        assert_eq!(
+            disposition
+                .full_rearm_suppression
+                .full_rearm_post_rebuild_skipped,
+            0,
+            "{cause}"
+        );
+    }
+}
+
+#[test]
+fn fresh_load_origins_never_prove_a_complete_rebuild_even_after_replay_fills_files() {
+    let rearm = Rearm::new();
+    for origin in [
+        ScanIndexLoadOrigin::Missing,
+        ScanIndexLoadOrigin::Quarantined,
+    ] {
+        let mut index = rebuild_candidate(&rearm, origin);
+        assert!(!index.claude_rebuild_read_load_eligible);
+        seal_claude_complete_rebuild_read(&mut index, &rebuild_reads(&rearm.index()), true);
+        assert!(index
+            .claude_full_rearm_progress
+            .complete_rebuild_read
+            .is_none());
+        let run = rearm.terminal(&mut index, &rearm.items);
+        assert!(run.counts.full_rearm, "{origin:?}: {run:?}");
+        assert_eq!(run.suppression.full_rearm_post_rebuild_skipped, 0);
+    }
+    let mut empty = ScanIndex::default();
+    empty.settle_claude_index_load(&rearm.root.join("empty.json"), ScanIndexLoadOrigin::Loaded);
+    assert!(!empty.claude_rebuild_read_load_eligible);
+}
+
+/// Real discovery/parser wiring, plus fail-closed reuse of unchanged files.
+#[test]
+fn scanner_seals_only_actual_complete_rebuild_reads() {
+    let rearm = Rearm::new();
+    let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
+    for entry in index.files.values_mut() {
+        entry.source_file_fingerprint.clear();
+    }
+    let mut scan = scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&rearm.root),
+        &mut index,
+        WINDOW,
+        0,
+        100,
+        false,
+    )
+    .unwrap();
+    assert!(scan.census_complete, "{scan:?}");
+    assert_eq!(scan.scanned_file_count, rearm.sources.len());
+    assert!(index
+        .claude_full_rearm_progress
+        .complete_rebuild_read
+        .is_some());
+    assert!(take_claude_complete_rebuild_read(&mut index, WINDOW));
+    // This raw scan entry leaves policy finalization to its caller. Without
+    // it, missing activity/incidence metadata legitimately selects unchanged
+    // files for LegacyActivity reparsing and seals another complete read.
+    finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut scan, &mut index);
+    assert_eq!(index.file_snapshot_fingerprints.len(), rearm.sources.len());
+    assert!(index
+        .file_snapshot_fingerprints
+        .values()
+        .all(|fingerprints| {
+            !fingerprints.is_empty()
+                && fingerprints.iter().all(|fingerprint| {
+                    index
+                        .snapshot_activity_at
+                        .get(fingerprint)
+                        .is_some_and(valid_snapshot_activity)
+                })
+        }));
+    let scan = scan_source_roots_with_test_limit(
+        SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&rearm.root),
+        &mut index,
+        "2026-08-02T08:10:00Z",
+        0,
+        100,
+        false,
+    )
+    .unwrap();
+    assert!(scan.census_complete);
+    assert_eq!(
+        scan.scanned_file_count, 0,
+        "unchanged files must be skipped"
+    );
+    assert!(scan.pending_finalization.is_empty());
+    assert!(
+        index
+            .claude_full_rearm_progress
+            .complete_rebuild_read
+            .is_none(),
+        "unchanged files were not read again"
+    );
+}
+
+#[test]
+fn structural_family_masks_valid_cross_file_duplicate_with_or_without_full_rearm() {
+    const THIRD_ROOT: &str = "d6666666-6666-4666-8666-666666666666";
+    let mut rearm = Rearm::new();
+    let mut fix = rearm.index();
+    rearm.add_other_family(&mut fix);
+    let first = rearm.other_family(false);
+    let mut second = first.clone();
+    second.source_session_id = THIRD_ROOT.to_string();
+    for fact in &mut second.attribution_facts {
+        if fact.value == OTHER_ROOT {
+            fact.value = THIRD_ROOT.to_string();
+        }
+    }
+    second.snapshot_fingerprint.push_str("-third");
+    assert_eq!(claude_snapshot_family_root(&second), THIRD_ROOT);
+    assert_eq!(
+        first.claude_usage_request_ids,
+        second.claude_usage_request_ids
+    );
+    let third_key = local_index_key(&rearm.root.join(format!("{THIRD_ROOT}.jsonl")));
+    rearm
+        .sources
+        .insert(third_key.clone(), "rev-third".to_string());
+    insert_file(&mut fix, &third_key, "rev-third", 512);
+    let mut items = rearm.items.clone();
+    items.extend([first.clone(), second.clone()]);
+    rearm.establish(&mut fix, &items);
+    let mut base = fix.clone();
+    let skipped = rearm.terminal(&mut fix, &items);
+    let paid = rearm.base_terminal(&mut base, &items);
+    assert!(!skipped.counts.full_rearm);
+    assert!(paid.counts.full_rearm);
+    for index in [&fix, &base] {
+        assert!(index.claude_duplicate_request_witness_overflowed);
+        assert!(
+            index.claude_duplicate_request_owners.is_empty(),
+            "the structural family masks even valid cross-file duplicates"
+        );
+    }
+    assert!(skipped.counts.census_invalid && paid.counts.census_invalid);
+    // The traversal retires the structural family, leaving both valid owners.
+    rearm.sources.retain(|key, _| {
+        claude_index_path_member_ref(Path::new(key)).is_some_and(|m| m.root != rearm.parent)
+    });
+    for index in [&mut fix, &mut base] {
+        index.files.retain(|key, _| rearm.sources.contains_key(key));
+        index.claude_usage_family_pending.remove(&rearm.parent);
+        let run = rearm.terminal(index, &[first.clone(), second.clone()]);
+        assert!(!run.counts.census_invalid);
+        assert!(!run.counts.fence_after);
+        assert!(!index.claude_duplicate_request_owners.is_empty());
+        assert!(index
+            .claude_duplicate_request_owners
+            .values()
+            .all(|owners| owners.len() == 2));
+    }
+    assert_eq!(
+        fix.claude_duplicate_request_owners,
+        base.claude_duplicate_request_owners
+    );
+}
+
+#[test]
+fn scanner_does_not_seal_capped_or_failed_rebuild_reads() {
+    for failed in [false, true] {
+        let rearm = Rearm::new();
+        let mut index = rebuild_candidate(&rearm, ScanIndexLoadOrigin::Loaded);
+        for entry in index.files.values_mut() {
+            entry.source_file_fingerprint.clear();
+        }
+        if failed {
+            let path = rearm.sources.keys().next().unwrap();
+            let mut contents = fs::read(path).unwrap();
+            contents.extend_from_slice(b"\nnot json\n");
+            fs::write(path, contents).unwrap();
+        }
+        let scan = scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode,
+            std::slice::from_ref(&rearm.root),
+            &mut index,
+            WINDOW,
+            0,
+            if failed { 100 } else { 1 },
+            false,
+        )
+        .unwrap();
+        assert!(!scan.census_complete, "{failed}: {scan:?}");
+        assert!(index
+            .claude_full_rearm_progress
+            .complete_rebuild_read
+            .is_none());
+        assert!(!take_claude_complete_rebuild_read(&mut index, WINDOW));
     }
 }

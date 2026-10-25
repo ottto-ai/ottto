@@ -1387,11 +1387,22 @@ pub(crate) fn forget_for_test(support_dir: &Path) {
     }
 }
 
-/// A new process for `support_dir`: its ledger and the writer's memory of
-/// it are forgotten (the next write checks the run marker again).
+/// A new process for `support_dir`: its ledger, results, latched coverage
+/// debt, granted credit and the writer's memory of it are forgotten (the
+/// next write checks the run marker again). Once it returns the writer has
+/// nothing left to write into `support_dir`, so a fixture may replace it.
 #[cfg(test)]
 pub(crate) fn restart_for_test(support_dir: &Path) {
     forget_for_test(support_dir);
+    {
+        // Parked, the writer runs no idle pass that could re-latch the debt
+        // (or heal its marker) between the snapshot and this removal.
+        let _paused = pause_for_test();
+        super::forget_owed_coverage_for_test(support_dir);
+        if let Ok(mut credits) = CREDITS.lock() {
+            credits.remove(support_dir);
+        }
+    }
     if let Some(sender) = writer() {
         if let Ok(sender) = sender.lock() {
             let _ = sender.send(Job::Restart(support_dir.to_path_buf()));

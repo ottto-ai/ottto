@@ -241,6 +241,9 @@ impl Serialize for ScanIndex {
             ClaudeRequestCensusShadowState::is_empty
         );
         field!(held claude_usage_authority_quarantine);
+        field!(claude_retired_family_tombstones);
+        field!(claude_retired_family_tombstones_initialized);
+        field!(claude_retired_family_tombstones_uncertain, is_false);
         field!(claude_duplicate_request_owners, BTreeMap::is_empty);
         field!(claude_duplicate_request_witness_overflowed);
         field!(claude_owned_start_census, BTreeMap::is_empty);
@@ -337,6 +340,9 @@ pub(super) const FIELDS: &[&str] = &[
     "claude_request_census",
     "claude_request_census_shadow",
     "claude_usage_authority_quarantine",
+    "claude_retired_family_tombstones",
+    "claude_retired_family_tombstones_initialized",
+    "claude_retired_family_tombstones_uncertain",
     "claude_duplicate_request_owners",
     "claude_duplicate_request_witness_overflowed",
     "claude_owned_start_census",
@@ -437,9 +443,15 @@ fn header_field(name: &str) -> bool {
 /// carries from the damaged index (`ScanIndex::carry_identity_from`), and the
 /// replay generations without which the rebuild would arm a replay the
 /// damaged index had completed (that replay clears carried state). Each uses
-/// the load's own strict decoder; the accepted ledger keeps the load's rule
+/// the load's own field decoder; tombstone loss fences without refusing
+/// identity carry, and the accepted ledger keeps the load's rule
 /// that a malformed fingerprint vouched for nothing.
 pub(super) const IDENTITY_CARRY_FIELDS: &[&str] = &[
+    // These gate authority re-entry. Carry their own lenient, fail-closed
+    // decoding policy, including uncertainty after lost retirement evidence.
+    "claude_retired_family_tombstones",
+    "claude_retired_family_tombstones_initialized",
+    "claude_retired_family_tombstones_uncertain",
     "session_account_bindings",
     "claude_account_deferred_holds",
     "claude_request_identity_contract",
@@ -466,6 +478,8 @@ struct Counts {
     files: usize,
     families: usize,
     authority_repairs: usize,
+    // Decode-only provenance, never persisted or copied from an index.
+    tombstone_marker_intact: bool,
 }
 struct Decoder<R> {
     reader: R,
@@ -899,6 +913,7 @@ fn read_inner<R: BufRead + Seek>(
     );
     index.retain_decodable_codex_parent_state();
     index.drop_unbound_claude_authority_records(stage);
+    settle_retired_family_decode(&mut index);
     Ok(index)
 }
 
@@ -944,8 +959,17 @@ pub(super) fn read_identity_carry(
         census_resources,
         census: claude_request_census::CensusDecodeState::default(),
     };
-    let carry = decoder.index(Pass::IdentityCarry)?;
+    let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
+    // Repair drops the family witnesses, so its later downgrade check cannot
+    // recover evidence lost by a pre-bridge or damaged tombstone source.
+    // Loss never refuses Repair or withholds unrelated identity bindings.
+    let intact = decoder.counts.tombstone_marker_intact
+        && carry.claude_retired_family_tombstones.decoded
+        && !carry.claude_retired_family_tombstones.damaged;
+    carry.claude_retired_family_tombstones_uncertain |= !intact;
+    carry.decode_holds = decoder.holds;
+    settle_retired_family_decode(&mut carry);
     if sampled_scan::codex_cursor::OpenStamp::capture(decoder.reader.get_ref())? != before {
         return Err(Error::Refused("input changed during decode"));
     }
@@ -972,6 +996,24 @@ pub(super) fn controls(index: &ScanIndex, source: &'static str) -> std::result::
         return Err(Error::Refused("accepted-ledger version"));
     }
     Ok(())
+}
+fn settle_retired_family_decode(index: &mut ScanIndex) {
+    let initialized = index.claude_retired_family_tombstones_initialized;
+    if index.claude_retired_family_tombstones_initialized
+        && !index.claude_retired_family_tombstones.decoded
+    {
+        // Missing evidence under the marker must also make a stale CAS
+        // writer reload, just as a damaged-present map does below.
+        index
+            .decode_holds
+            .1
+            .add("claude_retired_family_tombstones", "", [0; 32]);
+    }
+    index.settle_claude_retired_family_tombstone_decode();
+    // Preserve a valid legacy marker at the raw codec boundary. Public load
+    // settlement and every save own initialization; repair here still raises
+    // uncertainty for damaged or missing retirement evidence.
+    index.claude_retired_family_tombstones_initialized = initialized;
 }
 impl<R: BufRead + Seek> Decoder<R> {
     fn ws(&mut self) -> std::result::Result<Option<u8>, Error> {
@@ -1515,6 +1557,56 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "claude_usage_authority_quarantine" => {
                             index.claude_usage_authority_quarantine = self.authorities(value)?
+                        }
+                        "claude_retired_family_tombstones" => {
+                            index.claude_retired_family_tombstones = self
+                                .history_scalar(value, None::<ClaudeRetiredFamilyTombstones>)?
+                                .unwrap_or_else(|| {
+                                    with_claude_absence_counters(|counts| {
+                                        counts.tombstone_decode_drops =
+                                            counts.tombstone_decode_drops.saturating_add(1);
+                                    });
+                                    ClaudeRetiredFamilyTombstones {
+                                        decoded: true,
+                                        damaged: true,
+                                        ..Default::default()
+                                    }
+                                });
+                            if index.claude_retired_family_tombstones.damaged {
+                                let hash = self.hash_span(value)?;
+                                self.holds.1.add(name, "", hash);
+                            }
+                        }
+                        "claude_retired_family_tombstones_initialized"
+                        | "claude_retired_family_tombstones_uncertain" => {
+                            self.reader.seek(SeekFrom::Start(value.start))?;
+                            let boolean = matches!(self.ws()?, Some(b't' | b'f'));
+                            // Reuse #705's flag codec, including its drop count.
+                            #[derive(Deserialize)]
+                            #[serde(transparent)]
+                            struct Flag(
+                                #[serde(deserialize_with = "deserialize_fail_closed_flag")] bool,
+                            );
+                            let flag = self
+                                .history_scalar(value, None::<Flag>)?
+                                .map(|flag| flag.0)
+                                .unwrap_or_else(|| {
+                                    with_claude_absence_counters(|counts| {
+                                        counts.tombstone_decode_drops =
+                                            counts.tombstone_decode_drops.saturating_add(1);
+                                    });
+                                    true
+                                });
+                            if !boolean {
+                                let hash = self.hash_span(value)?;
+                                self.holds.1.add(name, "", hash);
+                            }
+                            if name == "claude_retired_family_tombstones_initialized" {
+                                self.counts.tombstone_marker_intact = boolean && flag;
+                                index.claude_retired_family_tombstones_initialized = flag;
+                            } else {
+                                index.claude_retired_family_tombstones_uncertain = flag;
+                            }
                         }
                         "claude_duplicate_request_owners" => {
                             index.claude_duplicate_request_owners = self.typed(value)?

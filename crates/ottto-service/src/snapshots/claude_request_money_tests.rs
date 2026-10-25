@@ -17,7 +17,7 @@ use crate::snapshots::claude_request_census::{
 };
 use crate::snapshots::claude_request_ledger::{
     ClaudeClassifyContext, ClaudeCountedBy, ClaudeLedgerScope, ClaudeRemovedBy,
-    ClaudeRequestVerdict, ClaudeUndecidedBy,
+    ClaudeRequestVerdict, ClaudeScopeFiles, ClaudeUndecidedBy,
 };
 use crate::snapshots::claude_request_money::facts::{self, ClaudeFact, ClaudeFactsHeader};
 use crate::snapshots::claude_request_money::rows::ClaudeRootRows;
@@ -2364,6 +2364,77 @@ fn money_scope_debt_blocks_negative_membership_claims() {
     );
 }
 
+/// MONEY round 3 (AutoReview): a page reaches its families one by one, so a
+/// later family's capture can write its message record after an earlier
+/// family scoped the group. Refreshing that file keeps the scoped group, the
+/// family sums and the page total current.
+#[test]
+fn money_scope_refreshes_a_file_after_its_message_record_lands() {
+    let mut index = ScanIndex::default();
+    let mut ledger = ClaudeRequestCensus::default();
+    let keys = [
+        "/m/projects/-repo/A.jsonl",
+        "/m/projects/-repo/B.jsonl",
+        "/m/projects/-repo/C.jsonl",
+    ];
+    let mut records = Vec::new();
+    for (key, seed) in keys.iter().zip(['1', '2', '3']) {
+        let mut entry = manifest_index_entry(Some("body"));
+        entry.source_file_fingerprint = money_fingerprint(seed);
+        index.files.insert((*key).to_owned(), entry);
+        let record = ClaudeRequestCensusRecord::synthetic_for_test(
+            &money_fingerprint(seed),
+            7,
+            ClaudeRequestCensusShape::Exact,
+            vec![1],
+        );
+        index
+            .claude_request_census_mut_for_test()
+            .insert_for_test(key, record.clone());
+        records.push(record);
+    }
+    // A's message record is current; B's and C's are not written yet.
+    ledger.insert_for_test(
+        &message_key(keys[0]),
+        ClaudeRequestCensusRecord::message_record(&records[0], vec![]),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let files =
+        ClaudeScopeFiles::walk(&index, &BTreeSet::from(["A", "B", "C"]), deadline).expect("walk");
+    let mut scope = ClaudeLedgerScope::default();
+    scope
+        .add_group(&index, &ledger, "-repo", &files.groups["-repo"], deadline)
+        .expect("group");
+    scope
+        .add_family(&index, &ledger, "B", &files.roots["B"], deadline)
+        .expect("family");
+    assert_eq!(scope.debt.message_unknown, 2);
+    assert_eq!(
+        scope.group_blocks_for_test(keys[2], true),
+        Some(ClaudeUndecidedBy::MessageUnknown)
+    );
+    // B is reached: its capture writes its message record.
+    ledger.insert_for_test(
+        &message_key(keys[1]),
+        ClaudeRequestCensusRecord::message_record(&records[1], vec![]),
+    );
+    scope.refresh_file(&index, &ledger, keys[1]);
+    assert_eq!(scope.debt.message_unknown, 1, "only C is still unknown");
+    assert_eq!(
+        scope.group_blocks_for_test(keys[2], true),
+        None,
+        "C's own file aside, every group file is known"
+    );
+    assert_eq!(
+        scope.group_blocks_for_test(keys[0], true),
+        Some(ClaudeUndecidedBy::MessageUnknown),
+        "C stays unknown for A"
+    );
+    // A file the scope never added is not added by a refresh.
+    scope.refresh_file(&index, &ledger, "/m/projects/-other/D.jsonl");
+    assert_eq!(scope.debt.message_unknown, 1);
+}
+
 /// AutoReview 1: two loss-free identity-incomplete records holding one
 /// message-only id go through ownership policy (one owner, one copy), never
 /// both held as stale.
@@ -2411,7 +2482,7 @@ fn money_message_only_copies_pick_one_owner() {
     .expect("scope");
     let empty_claims = BTreeMap::new();
     let empty_events = BTreeMap::new();
-    let empty_sessions = BTreeMap::new();
+    let empty_sessions = BTreeMap::<String, String>::new();
     let empty_traces = BTreeMap::new();
     let ctx = ClaudeClassifyContext {
         index: &index,

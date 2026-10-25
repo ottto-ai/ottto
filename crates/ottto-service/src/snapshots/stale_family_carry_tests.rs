@@ -2145,3 +2145,52 @@ fn c1b_identity_rearm_wins_over_the_census_rebuild_bound() {
         }
     }
 }
+
+#[test]
+fn new_carry_writer_exposes_only_c1b_roots_to_old_shape_reader() {
+    #[derive(serde::Deserialize)]
+    struct OldCarry {
+        #[serde(default)]
+        roots: BTreeSet<String>,
+    }
+    let mut index = window_index();
+    let revision = index.files[&carry_key(CARRY_UNWITNESSED, None)]
+        .source_file_fingerprint
+        .clone();
+    carry_start(&mut index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    index
+        .files
+        .get_mut(&carry_key(CARRY_UNWITNESSED, None))
+        .unwrap()
+        .source_file_fingerprint = revision;
+    index
+        .claude_usage_family_pending
+        .get_mut(CARRY_UNWITNESSED)
+        .unwrap()
+        .census_window_end = CARRY_RETRY.to_string();
+    window_needs_clean_followup(&mut index);
+    let row = carry_start(&mut index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["stale_rearm_capped_files"], 1);
+    assert!(index
+        .claude_stale_family_carry
+        .capped_roots
+        .contains(CARRY_UNWITNESSED));
+    assert!(!index
+        .claude_stale_family_carry
+        .roots
+        .contains(CARRY_UNWITNESSED));
+    let bytes = serde_json::to_vec(&index.claude_stale_family_carry).unwrap();
+    let old: OldCarry = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(old.roots, BTreeSet::from([CARRY_ROOT.to_string()]));
+    let decoded: ClaudeStaleFamilyCarry = serde_json::from_slice(&bytes).unwrap();
+    assert!(decoded.contains(CARRY_ROOT));
+    assert!(decoded.contains(CARRY_UNWITNESSED));
+    // Decode an actual #720 shape (union in roots), then rewrite it safely.
+    let mut legacy = serde_json::from_slice::<serde_json::Value>(&bytes).unwrap();
+    legacy["roots"] = serde_json::json!([CARRY_ROOT, CARRY_UNWITNESSED]);
+    let decoded: ClaudeStaleFamilyCarry = serde_json::from_value(legacy).unwrap();
+    assert!(decoded.roots.contains(CARRY_UNWITNESSED));
+    assert!(decoded.contains(CARRY_UNWITNESSED));
+    let old: OldCarry = serde_json::from_slice(&serde_json::to_vec(&decoded).unwrap()).unwrap();
+    assert_eq!(old.roots, BTreeSet::from([CARRY_ROOT.to_string()]));
+}
