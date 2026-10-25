@@ -625,3 +625,78 @@ fn partial_save_keeps_the_negative_physical_witness_without_a_delivery_entry() {
         "detached metadata remains bounded by the read window"
     );
 }
+
+#[test]
+fn scoped_plan_replaces_the_same_window_baseline_without_counting_retained_keys() {
+    let f = Fixture::new();
+    let (mut index, _) = f.indexed();
+    let entry = index.files.values().next().unwrap().clone();
+    for number in 0..320 {
+        index
+            .files
+            .insert(format!("healthy-{number}"), entry.clone());
+    }
+    for number in 0..3 {
+        index.files.insert(format!("owed-{number}"), entry.clone());
+    }
+    let before = serde_json::to_value(&index.files).unwrap();
+    let at = "2026-10-07T12:00:00Z";
+    assert!(!index.reread_plan(SnapshotSource::ClaudeCode, at, "scoped"));
+    assert_eq!(index.reread_guard.tripwire.planned, 0);
+    index.reread_guard.tripwire.full_reads = 7;
+    index.reread_guard.tripwire.runtime_cause_counts[cause(Some(CandidateParseReason::Rearmed))] =
+        7;
+    assert!(!index.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        at,
+        "scoped",
+        false,
+        |key| key.starts_with("owed-"),
+    ));
+    assert_eq!(index.reread_guard.tripwire.planned, 3);
+    assert!(!index.reread_guard.tripwire.plan_held);
+    assert_eq!(index.reread_guard.tripwire.full_reads, 7);
+    assert_eq!(
+        index.reread_guard.tripwire.runtime_cause_counts
+            [cause(Some(CandidateParseReason::Rearmed))],
+        7
+    );
+    assert_eq!(serde_json::to_value(&index.files).unwrap(), before);
+
+    // Independent obligations still count on retained keys, exactly once.
+    index
+        .files
+        .get_mut("healthy-0")
+        .unwrap()
+        .scan_identity_version = None;
+    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
+        key.starts_with("owed-")
+    });
+    assert_eq!(index.reread_guard.tripwire.planned, 4);
+    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", true, |key| {
+        key.starts_with("owed-")
+    });
+    assert_eq!(
+        index.reread_guard.tripwire.planned,
+        index.files.len() as u64
+    );
+    index.active_effective_upload_body_witness_revision = entry
+        .effective_upload_body_witness_revision
+        .saturating_add(1);
+    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
+        key.starts_with("owed-")
+    });
+    assert_eq!(
+        index.reread_guard.tripwire.planned,
+        index.files.len() as u64
+    );
+    index.active_upload_context_fingerprint = Some("new-context".into());
+    index.reread_plan_for_rearms(SnapshotSource::ClaudeCode, at, "scoped", false, |key| {
+        key.starts_with("owed-")
+    });
+    assert_eq!(
+        index.reread_guard.tripwire.planned,
+        index.files.len() as u64
+    );
+    assert!(!REREAD_GUARD_ENFORCE);
+}

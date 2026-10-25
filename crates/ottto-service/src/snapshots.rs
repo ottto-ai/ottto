@@ -37689,6 +37689,9 @@ fn ensure_bounded_traversal(
         .filter(|t| t.context_fingerprint == context_fingerprint)
         .map(|t| t.census_window_end.clone())
         .unwrap_or_else(|| collected_at.to_owned());
+    // The preliminary plan updates the observer revision. Retain the
+    // original change obligation when the final scoped plan refreshes it.
+    let plan_revision_changed = index.reread_revision_changed(source);
     let mut plan_held = index.reread_plan(source, &plan_clock, &context_fingerprint);
     let carry = &index.claude_stale_family_carry;
     let carry_origin_valid = carry.origin.as_ref().is_some_and(|origin| {
@@ -37746,10 +37749,33 @@ fn ensure_bounded_traversal(
         index.claude_full_rearm_progress.full_rearm_window_next = false;
         // Validate retained provenance before refund or candidate selection.
         // Old decoders omit it; corrupt progress cannot keep a Fix 2 carry.
-        let retained = std::mem::take(&mut index.claude_stale_family_carry);
+        let mut retained = std::mem::take(&mut index.claude_stale_family_carry);
         // A completed checkpoint already takes the ordinary fresh-start
         // stale-pending re-arm below; only an active walk needs rewinding.
         if !recompute_terminal_carry && !retained.is_empty() && index.traversal.is_some() {
+            // This consumed buffer is used only for fingerprint clears below.
+            // Sort it in place for bounded key lookup, without changing any
+            // live selection/replay order or allocating another key set.
+            retained
+                .replay
+                .sort_unstable_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
+            plan_held |= index.reread_plan_for_rearms(
+                source,
+                &plan_clock,
+                &context_fingerprint,
+                plan_revision_changed,
+                |key| {
+                    claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                        retained.roots.contains(member.root)
+                            || retained.capped_roots.contains(member.root)
+                    }) || retained
+                        .replay
+                        .binary_search_by(|candidate| {
+                            candidate.path.to_string_lossy().as_ref().cmp(key)
+                        })
+                        .is_ok()
+                },
+            );
             for (key, entry) in &mut index.files {
                 if !plan_held
                     && claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
@@ -37974,6 +38000,21 @@ fn ensure_bounded_traversal(
             .map(|root| claude_full_rearm_root_digest(root))
             .collect();
         let window_member_digests = claude_full_rearm_member_digests(index, &window_root_digests);
+        // Only the final funded set is a re-arm plan. Refresh the earlier
+        // same-traversal baseline before any fingerprint clear; retained
+        // carried/capped families spend no stale-request tripwire count.
+        plan_held |= index.reread_plan_for_rearms(
+            source,
+            collected_at,
+            &context_fingerprint,
+            plan_revision_changed,
+            |key| {
+                claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
+                    stale_pending_roots.contains(member.root)
+                        && !retained_roots.contains(member.root)
+                })
+            },
+        );
         let mut rearmed_file_count = 0_usize;
         let mut carried_file_count = 0_usize;
         let mut capped_file_count = 0_usize;

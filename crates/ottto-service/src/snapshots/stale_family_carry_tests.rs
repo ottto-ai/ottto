@@ -3238,3 +3238,115 @@ fn scoped_unhealthy_retry_preserves_member_protection_and_scratch_refusal() {
         }
     }
 }
+
+#[test]
+fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
+    // Portable CI exercises BASE fallback too; macOS exercises the funded
+    // carry and proves 320 healthy families spend no planned re-arm count.
+    let supported = crate::heap_layout_bound::layout_supported();
+    let mut fixture = scoped_retry_fixture(3, 320, true);
+    for root in fixture.roots.iter().take(3) {
+        fixture
+            .index
+            .claude_usage_authority_quarantine
+            .get_mut(root)
+            .unwrap()
+            .proven_witness_fingerprint = "stale-binding".into();
+    }
+    let before = serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap();
+    let mut unobserved = fixture.index.clone();
+    {
+        let _off = reread_guard::TestObservations::enabled(false);
+        carry_start(&mut unobserved, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    }
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    let actual = fixture
+        .index
+        .files
+        .iter()
+        .filter(|(_, entry)| entry.source_file_fingerprint.is_empty())
+        .map(|(key, _)| key.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        reread_guard::planned_for_test(&fixture.index),
+        actual.len() as u64
+    );
+    assert_eq!(
+        row["rearmed_index_files"].as_u64(),
+        Some(actual.len() as u64)
+    );
+    if supported {
+        let held = fixture
+            .roots
+            .iter()
+            .take(3)
+            .map(|root| local_index_key(&fixture._scratch.join(format!("{root}.jsonl"))))
+            .collect::<BTreeSet<_>>();
+        assert_eq!(actual, held);
+        assert_eq!(row["carried_pending_families"], 320);
+    } else {
+        assert_eq!(actual.len(), 323);
+        assert_eq!(row["carried_pending_families"], 0);
+    }
+    assert_eq!(
+        serde_json::to_value(&fixture.index.files).unwrap(),
+        serde_json::to_value(&unobserved.files).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&fixture.index.claude_usage_authority_quarantine).unwrap(),
+        before
+    );
+
+    if supported {
+        // Invalid carry provenance re-arms its actual roots plus a replay-only
+        // key outside them. The consumed replay ordering cannot affect reads.
+        let extra = fixture
+            .candidates
+            .iter()
+            .find(|candidate| {
+                claude_index_path_member_ref(&candidate.path).unwrap().root == CARRY_OTHER
+            })
+            .unwrap();
+        fixture
+            .index
+            .claude_stale_family_carry
+            .replay
+            .push(carry_replayed(&local_index_key(&extra.path)));
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .unwrap()
+            .process = claude_full_rearm_process().wrapping_add(1);
+        fixture
+            .index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_candidates
+            .push_back(carry_replayed(&local_index_key(
+                &fixture.candidates[0].path,
+            )));
+        let mut unobserved = fixture.index.clone();
+        {
+            let _off = reread_guard::TestObservations::enabled(false);
+            carry_start(&mut unobserved, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        }
+        carry_start(&mut fixture.index, CARRY_SECOND_RETRY, BACKFILL_WINDOW_DAYS);
+        assert!(fixture
+            .index
+            .files
+            .values()
+            .all(|entry| entry.source_file_fingerprint.is_empty()));
+        assert_eq!(
+            reread_guard::planned_for_test(&fixture.index),
+            fixture.index.files.len() as u64
+        );
+        assert_eq!(
+            serde_json::to_value(&fixture.index.files).unwrap(),
+            serde_json::to_value(&unobserved.files).unwrap()
+        );
+    }
+    assert!(!reread_guard::REREAD_GUARD_ENFORCE);
+}
