@@ -8508,6 +8508,18 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                     session_id,
                 )
                 .is_empty();
+            // Attachment already consumed the permissive read. A later strict
+            // reread may recover, but this page must not settle the earlier
+            // incomplete attachment as final history.
+            if request_owned_enabled
+                && paired
+                && api_read
+                    .session_report(session_id)
+                    .is_some_and(|read| !read.complete)
+            {
+                full_rearm_evidence_complete = false;
+                identity_unhealthy_roots.insert(session_id.clone());
+            }
             // Contract 5 must tell absent evidence from failed evidence.
             if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {

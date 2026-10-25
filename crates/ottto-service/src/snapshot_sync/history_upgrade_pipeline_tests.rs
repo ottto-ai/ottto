@@ -172,14 +172,17 @@ impl HistoryFixture {
     }
 
     fn cycle(&self, collected_at: &str, cycle: HistoryCycle<'_>) -> HistoryOutcome {
-        self.cycle_with_scan(collected_at, cycle, |_| {})
+        self.cycle_with_scan(collected_at, cycle, |_, _| None)
     }
 
     fn cycle_with_scan(
         &self,
         collected_at: &str,
         cycle: HistoryCycle<'_>,
-        before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
+        before_evidence: impl FnOnce(
+            &mut crate::snapshots::SourceScanResult,
+            &ScanIndex,
+        ) -> Option<PreparedClaudeLocalEvidence>,
     ) -> HistoryOutcome {
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
@@ -245,9 +248,14 @@ impl HistoryFixture {
             true,
         )
         .expect("scan Claude page");
-        before_evidence(&mut scan);
-        let (mut disposition, _, _) =
-            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        let prepared = before_evidence(&mut scan, &index);
+        let (mut disposition, _, _) = apply_claude_local_evidence_to_scan_with_prepared(
+            &self.support,
+            &mut scan,
+            &mut index,
+            None,
+            prepared,
+        );
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -2214,10 +2222,61 @@ fn e2_history_sidecar(support: &Path, root: &str, trace: bool) -> PathBuf {
         .join(format!("{}.jsonl", history_digest(root)))
 }
 
+fn e2_history_api(
+    root: &str,
+    request: &str,
+    sequence: u64,
+) -> crate::claude_local_otel::ClaudeLocalOtelEvidence {
+    let mut row = crate::claude_local_otel::ClaudeLocalOtelEvidence {
+        capture_revision: "claude_api_request:v2".into(),
+        session_id: root.into(),
+        request_id: request.into(),
+        client_request_id: format!("client-{request}"),
+        observed_at: format!("2026-08-02T07:00:{sequence:02}Z"),
+        model: "claude-haiku-4-5".into(),
+        effort: "high".into(),
+        query_source: "user".into(),
+        speed: "fast".into(),
+        app_version: "2.1.226".into(),
+        cost_usd_micros: Some(100),
+        event_sequence: Some(sequence),
+        input_tokens: 10,
+        output_tokens: 10,
+        request_count: 1,
+        ..Default::default()
+    };
+    row.fingerprint = format!(
+        "sha256:{}",
+        history_digest(&serde_json::to_string(&row).unwrap())
+    );
+    row
+}
+
+fn e2_history_trace(
+    root: &str,
+    request: &str,
+    agent: &str,
+) -> crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+    let mut row = crate::claude_local_otel::ClaudeTraceOwnershipEvidence {
+        capture_revision: "claude_llm_request_ownership:v1".into(),
+        session_id: root.into(),
+        request_id: request.into(),
+        client_request_id: format!("client-{request}"),
+        agent_id: agent.into(),
+        observed_at: "2026-08-02T07:00:30Z".into(),
+        ..Default::default()
+    };
+    row.fingerprint = format!(
+        "sha256:{}",
+        history_digest(&serde_json::to_string(&row).unwrap())
+    );
+    row
+}
+
 fn e2_history_reported(fixture: &HistoryFixture, root: &str, number: usize) {
     let request = format!("req_{number}_1");
-    let api = crate::snapshots::tests::complete_api_row(root, &request, 0, 10, 10, 0);
-    let trace = crate::snapshots::tests::complete_trace_row(root, &request, "");
+    let api = e2_history_api(root, &request, 0);
+    let trace = e2_history_trace(root, &request, "");
     for (path, line) in [
         (
             e2_history_sidecar(&fixture.support, root, false),
@@ -2281,7 +2340,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
             let outcome = fixture.cycle_with_scan(
                 &format!("2026-08-02T{hour:02}:00:00Z"),
                 HISTORY_REVISION_2,
-                |scan| {
+                |scan, _| {
                     let twins = scan
                         .snapshots
                         .iter_mut()
@@ -2294,6 +2353,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
                             .expect("parsed native row")
                             .evidence_ref = Some(0);
                     }
+                    None
                 },
             );
             assert!(!outcome.uploaded.contains(refused));
@@ -2483,8 +2543,8 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
     }
     let api_path = e2_history_sidecar(&fixture.support, root, false);
     let trace_path = e2_history_sidecar(&fixture.support, root, true);
-    let api = crate::snapshots::tests::complete_api_row(root, "req_child", 1, 10, 10, 0);
-    let trace = crate::snapshots::tests::complete_trace_row(root, "req_child", agent);
+    let api = e2_history_api(root, "req_child", 1);
+    let trace = e2_history_trace(root, "req_child", agent);
     for (path, row) in [
         (&api_path, serde_json::to_string(&api).unwrap()),
         (&trace_path, serde_json::to_string(&trace).unwrap()),
@@ -2524,5 +2584,50 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
             .snapshots
             .iter()
             .all(|item| item.telemetry_owned_complete == Some(true)));
+    });
+}
+
+#[test]
+fn e2_repaired_between_permissive_and_strict_read_stays_owed_until_next_page() {
+    let fixture = HistoryFixture::new("e2-history-repair-during-read");
+    let baseline = fixture.baseline();
+    let root = HISTORY_SESSIONS[0];
+    for (number, session) in HISTORY_SESSIONS.iter().enumerate() {
+        e2_history_reported(&fixture, session, number);
+    }
+    let api_path = e2_history_sidecar(&fixture.support, root, false);
+    let healthy = std::fs::read(&api_path).unwrap();
+    std::fs::write(&api_path, "{bad\n").unwrap();
+    crate::snapshots::claude_request_money::e2::with_enabled(|| {
+        let held =
+            fixture.cycle_with_scan("2026-08-02T09:00:00Z", HISTORY_REVISION_2, |scan, index| {
+                let prepared =
+                    PreparedClaudeLocalEvidence::load(&fixture.support, &scan.snapshots, index);
+                assert!(!prepared.api.session_report(root).unwrap().complete);
+                // Production's prepared reader retains the failed initial health;
+                // strict validation rereads this repaired generation afterwards.
+                std::fs::write(&api_path, healthy).unwrap();
+                Some(prepared)
+            });
+        assert_eq!(held.uploaded.len(), 2);
+        assert!(!held.uploaded.contains(root));
+        e2_history_assert_prior_tuple(
+            &baseline,
+            &held.index,
+            &HistoryFixture::key(&baseline, root),
+        );
+        let recovered = fixture.cycle("2026-08-02T10:00:00Z", HISTORY_REVISION_2);
+        assert_eq!(recovered.uploaded, BTreeSet::from([root.to_owned()]));
+        let body = recovered
+            .scan
+            .snapshots
+            .iter()
+            .find(|item| item.source_session_id == root)
+            .unwrap();
+        assert_eq!(
+            body.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0001")
+        );
+        assert_eq!(body.telemetry_owned_complete, Some(true));
     });
 }
