@@ -3501,9 +3501,12 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
         .client
         .issue_relay_token(&control.device, "device-secret", SnapshotSource::ClaudeCode)
         .unwrap();
-    let mut send = unknown_recovery::SendState::default();
     let mut accepted = 0;
     let mut run = |progress: &mut SnapshotUploadProgress, index: &mut ScanIndex| {
+        // Each invocation is a new source finish, after the previous turn's
+        // real ACK/index barrier and retirement. Capture resumes within this
+        // turn share the same state, exactly as the production async owner.
+        let mut send = unknown_recovery::SendState::default();
         for _ in 0..64 {
             let result = upload_resumable_batches_with_body_witness_partitioned(
                 &items,
