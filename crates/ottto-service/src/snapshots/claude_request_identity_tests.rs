@@ -4196,3 +4196,89 @@ fn zero_usage_record_keeps_a_foreign_owned_request_refused() {
     assert_eq!(bodies[0], bodies[1]);
     let _ = fs::remove_dir_all(dir);
 }
+
+// Recent activity is independent of session-first origin and billing identity.
+#[test]
+fn desktop_recent_follows_each_request_entrypoint_and_governing_org() {
+    let dir = temp_dir("desktop-recent-transitions");
+    let mut lines = vec![marker(ORG_1)];
+    for (n, entrypoint) in ["claude-desktop", "cli", "claude-desktop", "cli"].iter().enumerate() {
+        if n == 2 { lines.push(marker(ORG_2)); }
+        lines.push(json!({"type": "assistant", "sessionId": ROOT,
+            "timestamp": format!("2026-08-02T07:00:{:02}Z", 10 + n),
+            "entrypoint": entrypoint, "requestId": format!("req_{n}"),
+            "message": {"id": format!("msg_{n}"), "model": "claude-haiku-4-5",
+                "usage": {"input_tokens": 10, "output_tokens": 1}}
+        }));
+    }
+    let mut item = parse_session(&dir, &lines).remove(0);
+    assert_eq!(item.origin.as_ref().unwrap().entrypoint.as_deref(), Some("claude-desktop"));
+    item.session_account_evidence = Some(SessionAccountEvidence {
+        provider: "anthropic", account_identifier_hash: Some(LOGIN_A.into()),
+        provider_workspace_hash: Some(org_hash(ORG_1)),
+        identity_hash_scheme: "provider-sha256:v1", evidence_source: "claude_desktop_original:v1",
+        identity_disposition: Some("complete"), source_created_at: Some("2026-08-02T07:00:00Z".into()),
+    });
+    let (api, trace) = reports(Vec::new(), Vec::new());
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let collect = |item: &SnapshotItem| {
+        let mut sink = identity::RequestSink::for_item(&evidence, item, usize::MAX).unwrap();
+        for (request_id, occurrence) in &item.claude_usage_occurrences {
+            let (row_key, _, _) = build_row_identity(
+                occurrence.model.as_deref().unwrap(), &occurrence.selector,
+                occurrence.reasoning_effort.as_deref());
+            sink.add(item, identity::Request {
+                request_id, occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp: occurrence.timestamp.as_deref().unwrap(),
+                bucket_start: "2026-08-02T07:00:00Z", row_key: &row_key, usage: &occurrence.usage,
+            });
+        }
+        sink.finish()
+    };
+    let at = |seconds| OffsetDateTime::parse(&format!("2026-08-02T07:00:{seconds:02}Z"), &Rfc3339).ok();
+    let grouping = collect(&item);
+    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), at(10));
+    assert_eq!(grouping.desktop_recent().at(LOGIN_A, &org_hash(ORG_2)), at(12));
+    // No native account, ambiguous/imported ownership, or old/future clocks cannot qualify.
+    for disposition in ["missing", "conflict"] {
+        let mut refused = item.clone();
+        refused.session_account_evidence.as_mut().unwrap().identity_disposition = Some(disposition);
+        assert_eq!(collect(&refused).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    }
+    let mut no_owner = item.clone();
+    no_owner.session_account_evidence = None;
+    assert_eq!(collect(&no_owner).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    let mut expired = item.clone();
+    expired.collected_at = "2026-08-02T07:16:00Z".into();
+    assert_eq!(collect(&expired).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    let mut future = item.clone();
+    future.collected_at = "2026-08-02T07:00:00Z".into();
+    assert_eq!(collect(&future).desktop_recent(), &crate::desktop_recent::RecentActivity::default());
+    // The account binding is copied exactly, never inferred from the org.
+    let mut other = item.clone();
+    other.session_account_evidence.as_mut().unwrap().account_identifier_hash = Some(D64.into());
+    assert_eq!(collect(&other).desktop_recent().at(LOGIN_A, &org_hash(ORG_1)), None);
+    assert_eq!(collect(&other).desktop_recent().at(D64, &org_hash(ORG_1)), at(10));
+    // Local bookkeeping cannot change serialized telemetry or diagnostics.
+    let wire = serde_json::to_string(&item).unwrap();
+    assert!(!wire.contains("desktop_request") && !wire.contains("desktop_recent"));
+    fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn desktop_recent_cli_to_desktop_and_missing_entrypoint_fail_closed() {
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+    for (n, entrypoint) in [Some("cli"), Some("claude-desktop"), None].iter().enumerate() {
+        let mut line = json!({"type": "assistant", "sessionId": ROOT,
+            "timestamp": format!("2026-08-02T07:00:{n:02}Z"),
+            "requestId": format!("req_{n}"), "message": {"id": format!("msg_{n}"),
+            "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}});
+        if let Some(entrypoint) = entrypoint { line["entrypoint"] = json!(entrypoint); }
+        apply_claude_code_line(&line, &mut accumulator);
+    }
+    accumulator.finalize_claude_responses();
+    assert!(!accumulator.claude_usage_occurrences["req_0"].desktop_request);
+    assert!(accumulator.claude_usage_occurrences["req_1"].desktop_request);
+    assert!(!accumulator.claude_usage_occurrences["req_2"].desktop_request);
+    assert_eq!(accumulator.origin.entrypoint.as_deref(), Some("cli"));
+}

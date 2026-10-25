@@ -13852,6 +13852,7 @@ struct ClaudeResponseObservation {
     preceding_user_timestamp: Option<String>,
     records: crate::owned_heap::OwnedVec<CompactClaudeResponseRecord>,
     record_limit_exceeded: bool,
+    desktop_request: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -13866,6 +13867,7 @@ struct ResolvedClaudeResponse {
     first_timestamp: Option<String>,
     terminal_timestamp: Option<String>,
     event_clock_complete: bool,
+    desktop_request: bool,
     preceding_user_timestamp: Option<String>,
     computed_effective_input_context: Option<u64>,
     tool_uses: BTreeMap<String, String>,
@@ -13883,6 +13885,7 @@ pub(crate) struct ClaudeTranscriptUsageOccurrence {
     timestamp: Option<String>,
     // Evaluated before response folding can retain a stamped partial. Local only.
     event_clock_complete: bool,
+    desktop_request: bool,
     effective_input_context: u64,
 }
 
@@ -13919,6 +13922,7 @@ impl ClaudeResponseObservation {
             )]
             .into(),
             record_limit_exceeded: false,
+            desktop_request: false,
         }
     }
 
@@ -14023,6 +14027,7 @@ impl ClaudeResponseObservation {
             first_timestamp,
             terminal_timestamp: aggregate.timestamp,
             event_clock_complete,
+            desktop_request: self.desktop_request,
             preceding_user_timestamp: self.preceding_user_timestamp,
             computed_effective_input_context: aggregate.computed_effective_input_context,
             tool_uses: aggregate.tool_uses,
@@ -17165,7 +17170,12 @@ impl SnapshotAccumulator {
             return;
         }
         let selector = self.claude_responses.selectors.intern(selector);
+        // The request's own usage records carry entrypoint. Missing or mixed
+        // records fail closed; session-first origin is deliberately irrelevant.
+        let desktop_request =
+            value.get("entrypoint").and_then(Value::as_str) == Some("claude-desktop");
         if let Some(mut existing) = self.claude_responses.get_mut(&key) {
+            existing.desktop_request &= desktop_request;
             if existing.push(
                 usage,
                 model,
@@ -17185,22 +17195,21 @@ impl SnapshotAccumulator {
         let sequence = self.claude_response_sequence;
         self.claude_response_sequence = self.claude_response_sequence.saturating_add(1);
         self.claude_response_record_count = self.claude_response_record_count.saturating_add(1);
-        let inserted = self.claude_responses.insert(
-            key,
-            ClaudeResponseObservation::new(
-                sequence,
-                usage,
-                model,
-                selector,
-                reasoning_effort,
-                request_id,
-                timestamp,
-                self.claude_last_user_ts.clone(),
-                computed_effective_input_context,
-                tool_uses,
-                cache_slot,
-            ),
+        let mut response = ClaudeResponseObservation::new(
+            sequence,
+            usage,
+            model,
+            selector,
+            reasoning_effort,
+            request_id,
+            timestamp,
+            self.claude_last_user_ts.clone(),
+            computed_effective_input_context,
+            tool_uses,
+            cache_slot,
         );
+        response.desktop_request = desktop_request;
+        let inserted = self.claude_responses.insert(key, response);
         if !inserted {
             self.note_dropped_usage();
         }
@@ -17289,6 +17298,7 @@ impl SnapshotAccumulator {
                         reasoning_effort: response.reasoning_effort.clone(),
                         timestamp: response.terminal_timestamp.clone(),
                         event_clock_complete: response.event_clock_complete,
+                        desktop_request: response.desktop_request,
                         effective_input_context,
                     },
                 );
@@ -82336,10 +82346,10 @@ crate::heap_layout_bound::fields!(ClaudeDesktopTitleIndexEntry; cli_session_id, 
 crate::heap_layout_bound::fields!(ClaudeDuplicateRequestOwner; root_session_id_hash, source_session_id_hash);
 crate::heap_layout_bound::fields!(ClaudeOwnedStartCensusWitness; marker_source_file_fingerprint, verified_source_file_fingerprint, emitted_source_file_fingerprint);
 crate::heap_layout_bound::fields!(ClaudeResponseRecord; cache_slot, physical_sequence, usage, model, selector, reasoning_effort, request_id, timestamp, computed_effective_input_context, tool_uses);
-crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded);
+crate::heap_layout_bound::fields!(ClaudeResponseObservation; sequence, preceding_user_timestamp, records, record_limit_exceeded, desktop_request);
 crate::heap_layout_bound::fields!(ClaudeTitleCandidate; title, user_set);
 crate::heap_layout_bound::fields!(ClaudeTitleMetadata; titles, account_identifier_hashes, original_identity_evidence, spawn_lineage, legacy_sidecar_fingerprint, sidecar_census_incomplete, original_identity_census_incomplete);
-crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, effective_input_context);
+crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrence; sequence, usage, model, selector, reasoning_effort, timestamp, event_clock_complete, desktop_request, effective_input_context);
 crate::heap_layout_bound::fields!(ClaudeTranscriptUsageOccurrenceWitness; sequence, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, model, speed_mode, reasoning_effort);
 crate::heap_layout_bound::fields!(ClaudeUsageAuthorityQuarantineRecord; contract, proven_witness_fingerprint, member_source_file_fingerprints, failed_reconstruction_count, disposition, retry_after_unix_seconds, proof_correction);
 crate::heap_layout_bound::fields!(ClaudeEmptyMapAdvance; root, member, key, revision, previous);

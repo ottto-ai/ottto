@@ -2785,6 +2785,7 @@ mod tests {
         confidence: AgentStatusConfidence,
     ) -> AgentStatusPlanObservation {
         AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some("2026-07-19T10:04:00Z".to_string()),
             evidence_method: Some("claude_desktop_session_bucket".to_string()),
             source_session_id: Some(session_id.to_string()),

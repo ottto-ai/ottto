@@ -175,6 +175,18 @@ impl StatusLane {
         state.stopped = true;
         self.changed.notify_all();
     }
+    /// A pure peek: never wait for a pass, notify a worker, or acquire evidence.
+    fn cached(&self) -> Option<Arc<AgentStatusCollection>> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.stopped {
+            None
+        } else {
+            state.collection.clone()
+        }
+    }
     fn collection(&self, manual: bool) -> Result<Arc<AgentStatusCollection>, LocalApiError> {
         self.collection_at(self.origin.elapsed(), manual)
     }
@@ -529,6 +541,29 @@ fn run(lane: Arc<StatusLane>, source: SourceKind, daemon: LocalDaemon) {
         }
     }
 }
+/// Process memory only. In particular, do not call `collection`: its no-owner
+/// path acquires from disk, and a running owner may schedule a manual pass.
+pub(crate) fn cached(source: Option<&SourceKind>) -> Vec<ottto_protocol::AgentStatusSnapshot> {
+    cached_from_owner(owner().as_deref(), source)
+}
+
+fn cached_from_owner(
+    owner: Option<&Owner>,
+    source: Option<&SourceKind>,
+) -> Vec<ottto_protocol::AgentStatusSnapshot> {
+    let Some(owner) = owner else {
+        return Vec::new();
+    };
+    let mut snapshots = [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
+        .iter()
+        .filter(|candidate| source.map_or(true, |source| source == *candidate))
+        .filter_map(|source| owner.lanes[index(source)].cached())
+        .flat_map(|collection| collection.snapshots.clone())
+        .collect::<Vec<_>>();
+    crate::desktop_recent::overlay(&mut snapshots, OffsetDateTime::now_utc());
+    snapshots
+}
+
 /// Use the existing scan's full collection (including all account/home bindings)
 /// without starting an additional acquisition path. Standalone native callers
 /// without daemon workers keep their original, upload-free collection behavior.
@@ -650,7 +685,7 @@ mod tests {
     use ottto_protocol::{AgentStatusCollectionMethod, AgentStatusSnapshot, AgentStatusState};
     use std::sync::mpsc;
 
-    fn specimen(source: SourceKind) -> AgentStatusCollection {
+    pub(super) fn specimen(source: SourceKind) -> AgentStatusCollection {
         let snapshot = AgentStatusSnapshot {
             source,
             status: AgentStatusState::Available,
@@ -1348,5 +1383,45 @@ mod tests {
         waiter.join().unwrap();
         assert!(result.unwrap().is_ok());
         assert_eq!(lane.state.lock().unwrap().generation, 2);
+    }
+}
+
+#[cfg(test)]
+mod cached_tests {
+    use super::*;
+
+    #[test]
+    fn cached_status_never_refreshes_waits_or_falls_back() {
+        assert!(cached_from_owner(None, Some(&SourceKind::ClaudeCode)).is_empty());
+        let owner = Owner {
+            lanes: std::array::from_fn(|_| Arc::new(StatusLane::new())),
+        };
+        let lane = &owner.lanes[index(&SourceKind::ClaudeCode)];
+        assert!(cached_from_owner(Some(&owner), None).is_empty());
+        assert!(!lane.state.lock().unwrap().manual);
+        let collection = super::tests::specimen(SourceKind::ClaudeCode);
+        {
+            let mut state = lane.state.lock().unwrap();
+            state.collection = Some(Arc::new(collection));
+            state.collecting = true; // a refresh waiter would block indefinitely
+            state.collection_failed = true;
+            state.generation = 12;
+        }
+        for _ in 0..2 {
+            assert_eq!(
+                cached_from_owner(Some(&owner), Some(&SourceKind::ClaudeCode)).len(),
+                1
+            );
+            assert!(cached_from_owner(Some(&owner), Some(&SourceKind::Codex)).is_empty());
+        }
+        let mut state = lane.state.lock().unwrap();
+        assert!(!state.manual);
+        assert!(!state.schedule.pending);
+        assert_eq!(state.schedule.last_started, None);
+        assert_eq!(state.generation, 12);
+        assert!(state.collecting && state.collection_failed);
+        state.stopped = true;
+        drop(state);
+        assert!(cached_from_owner(Some(&owner), None).is_empty());
     }
 }

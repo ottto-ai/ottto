@@ -409,9 +409,15 @@ pub(crate) struct Grouping {
     /// An admitted request was excluded, or its transcript membership
     /// disagrees with its occurrence: such a grouping is never tagged.
     unowned_request: bool,
+    desktop_recent: crate::desktop_recent::RecentActivity,
 }
 
 impl Grouping {
+    #[cfg(test)]
+    pub(super) fn desktop_recent(&self) -> &crate::desktop_recent::RecentActivity {
+        &self.desktop_recent
+    }
+
     pub(crate) fn new(max_groups: usize) -> Self {
         Self {
             groups: BTreeMap::new(),
@@ -424,6 +430,7 @@ impl Grouping {
             telemetry_only_requests: 0,
             excluded_requests: Some(0),
             unowned_request: false,
+            desktop_recent: crate::desktop_recent::RecentActivity::default(),
         }
     }
 
@@ -1938,6 +1945,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                     sha2::Sha256::digest(request.request_id.as_bytes())
                 ))
         });
+        // Enrichment uses this request's own entrypoint, event clock and
+        // governing marker. It never changes the existing billing classifier.
+        if !self.grouping.unowned_request && !duplicated_elsewhere {
+            self.note_desktop_activity(item, &request);
+        }
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -1971,6 +1983,42 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             request.usage,
             identity,
         );
+    }
+
+    fn note_desktop_activity(&mut self, item: &SnapshotItem, request: &Request<'_>) {
+        let Some(occurrence) = item.claude_usage_occurrences.get(request.request_id) else {
+            return;
+        };
+        if !occurrence.desktop_request || !occurrence.event_clock_complete {
+            return;
+        }
+        let Some(owner) = item.session_account_evidence.as_ref() else {
+            return;
+        };
+        if owner.evidence_source != "claude_desktop_original:v1"
+            || owner.identity_disposition != Some("complete")
+        {
+            return;
+        }
+        let Some(account) = owner.account_identifier_hash.as_deref() else {
+            return;
+        };
+        let Some((sequence, _)) = request.occurrence else {
+            return;
+        };
+        let Some(markers) = item.claude_org_markers.as_deref() else {
+            return;
+        };
+        let MarkerVerdict::Trusted(org) = markers.verdict(sequence, true) else {
+            return;
+        };
+        let (Ok(at), Ok(now)) = (
+            OffsetDateTime::parse(request.timestamp, &Rfc3339),
+            OffsetDateTime::parse(&item.collected_at, &Rfc3339),
+        ) else {
+            return;
+        };
+        self.grouping.desktop_recent.note(account, org, at, now);
     }
 
     pub(crate) fn finish(self) -> Grouping {
@@ -2217,7 +2265,12 @@ fn tag_item(
         item.source_last_activity_at.clone(),
     );
     normalize_activity(item);
+    let desktop_recent = std::mem::take(&mut grouping.desktop_recent);
+    let owned = !grouping.unowned_request;
     let tagged = apply_grouped(item, grouping);
+    if tagged.is_ok() && owned {
+        crate::desktop_recent::publish(desktop_recent);
+    }
     if tagged.is_err() {
         (
             item.source_started_at,

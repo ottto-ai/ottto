@@ -27,6 +27,7 @@ pub mod context_footprint;
 pub mod context_posture;
 pub mod control;
 pub mod control_plane_health;
+mod desktop_recent;
 pub mod detected_uses;
 mod external_scheduler_attribution;
 #[cfg(unix)]
@@ -1321,7 +1322,7 @@ impl LocalDaemon {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let snapshots = collections
+        let mut snapshots = collections
             .iter()
             .flat_map(|collection| collection.snapshots.iter().cloned())
             .collect::<Vec<_>>();
@@ -1329,6 +1330,7 @@ impl LocalDaemon {
         for collection in collections {
             upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot.clone());
         }
+        desktop_recent::overlay(&mut snapshots, time::OffsetDateTime::now_utc());
         Ok(snapshots)
     }
 
@@ -9285,6 +9287,7 @@ mod tests {
             },
         ];
         snapshot.plan_observations = vec![ottto_protocol::AgentStatusPlanObservation {
+            desktop_recent_at: None,
             observed_at: Some("2026-05-05T10:20:00Z".to_string()),
             evidence_method: Some("local_status".to_string()),
             source_session_id: None,
