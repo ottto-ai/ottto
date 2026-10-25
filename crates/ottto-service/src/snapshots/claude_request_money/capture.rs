@@ -2252,7 +2252,6 @@ mod bounded_tests {
             let job = super::super::store::WriteJob {
                 support_dir: scratch.to_path_buf(),
                 jsonl: super::super::JsonlBatch {
-                    telemetry_only: false,
                     now,
                     fault: super::super::PageFault::None,
                     families: Vec::new(),

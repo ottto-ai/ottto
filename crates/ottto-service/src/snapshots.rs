@@ -4336,6 +4336,15 @@ impl ClaudeUsageAuthorityDisposition {
 }
 
 impl ClaudeUsageAuthorityDisposition {
+    /// E2 (gate on): request-owned entities `e2::finish_page` withheld (held
+    /// twin, uncertified body, unread telemetry). Their items stay on the
+    /// page but never upload; the hold is not bound to an authority record,
+    /// so it blocks progress and the files are read again: delayed, never
+    /// settled without their body. Not an account deferral.
+    pub(crate) fn hold_request_owned(&mut self, session_ids: BTreeSet<String>) {
+        self.quarantined_source_session_ids.extend(session_ids);
+    }
+
     pub(crate) fn defer_sessions(&mut self, session_ids: BTreeSet<String>) {
         self.account_deferred_source_session_ids
             .extend(session_ids.iter().cloned());
@@ -8257,7 +8266,12 @@ fn apply_claude_reported_usage_with_index_limits_and_current_files(
                 .context_file_birth
                 .record_contractless(item, witness_roots_before.contains(&root_session_id));
         }
-        if witness_roots_before.contains(&root_session_id) && contractless {
+        // E2 (gate on): a request-owned body replaces the family's exclusive
+        // reported body as a contract of its own (its literal is installed by
+        // `e2::finish_page` after this fold), so it is not a demotion. Account,
+        // security and E2 twin holds are separate and still apply.
+        let request_owned = claude_request_money::e2::enabled() && item.claude_money.is_some();
+        if witness_roots_before.contains(&root_session_id) && contractless && !request_owned {
             demoting_members_by_root
                 .entry(root_session_id)
                 .or_default()
@@ -40125,6 +40139,10 @@ impl ScanIndex {
             self.claude_history_cutoff_unix_seconds,
             birth_unix_seconds,
         );
+        if kind == claude_history_upgrade::HistoryKind::Owed && claude_request_money::e2::enabled()
+        {
+            self.stage_claude_history_twins(&key, page);
+        }
         let decision = claude_history_upgrade::decide(
             kind,
             &claude_history_upgrade::PolicyInputs {
@@ -45588,6 +45606,9 @@ mod tests {
     }
     mod claude_request_money_tests {
         include!("snapshots/claude_request_money_tests.rs");
+    }
+    mod e2_disposition_tests {
+        include!("snapshots/e2_disposition_tests.rs");
     }
     use super::*;
     use base64::Engine as _;
