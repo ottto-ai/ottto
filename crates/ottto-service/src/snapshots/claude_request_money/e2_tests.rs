@@ -2408,3 +2408,59 @@ fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
         cleanup(&[&path]);
     });
 }
+
+#[test]
+fn e2_identity_marker_overflow_preserves_start_when_copy_prefix_is_excluded() {
+    with_enabled(|| {
+        for bound in [None, Some("c".repeat(64))] {
+            let path = root_file("identity-copy-marker-overflow");
+            let index = ScanIndex::default();
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
+            accumulator
+                .claude_file_birth
+                .set_birth_for_test(t0() + 100_000_000_000);
+            accumulator.account_identifier_hash = bound;
+            let mut lines = vec![
+                org_marker(ORG_A),
+                line("copied", &at(1), 10),
+                line("own", &at(101), 20),
+            ];
+            for _ in 0..64 {
+                lines.push(org_marker(ORG_A));
+            }
+            for value in &lines {
+                apply_claude_code_line(value, &mut accumulator);
+            }
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                }),
+            );
+            let item = accumulator
+                .into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None)
+                .remove(0);
+            let item = tag_owned(vec![item], &index).remove(0);
+            assert_eq!(
+                (
+                    item.request_count,
+                    item.input_tokens,
+                    item.removed_request_count
+                ),
+                (1, 20, Some(1))
+            );
+            assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+            assert_eq!(item.request_evidence.len(), 1);
+            assert_eq!(
+                item.request_evidence[0].provider_workspace_hash.as_deref(),
+                Some(org_hash(ORG_A).as_str())
+            );
+            assert!(rows_of(&item)
+                .all(|row| row.evidence_ref == Some(0) && row.identity_parts.is_none()));
+            assert_evidence_referenced(&item);
+            cleanup(&[&path]);
+        }
+    });
+}

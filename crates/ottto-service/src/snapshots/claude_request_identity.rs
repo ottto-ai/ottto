@@ -1395,7 +1395,9 @@ impl RequestAccounts {
     /// Called only after the existing money owner has confirmed/restored
     /// copies. Excluded prefix requests cannot choose the session's start.
     pub(crate) fn finish_native(&mut self, prefix_excluded: bool) {
-        if prefix_excluded && !self.subagent {
+        // Overflow keeps a starting-marker witness but discards all runs.
+        // There is no stronger retained-run start to replace that witness.
+        if prefix_excluded && !self.subagent && !self.runs.is_empty() {
             if let Some(first) = self.first_retained {
                 self.starting = self
                     .runs
