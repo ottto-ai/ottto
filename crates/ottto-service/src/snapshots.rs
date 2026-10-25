@@ -62198,7 +62198,7 @@ mod tests {
         assert!(!restarted
             .claude_account_family_witnesses
             .contains_key(&root));
-        let mut child = vec![items[1].clone()];
+        let mut child = [items[1].clone()];
         apply_claude_effort_evidence_with_index(
             &mut child,
             &evidence,
@@ -62594,7 +62594,7 @@ mod tests {
         let path = dir.join("singleton.json");
         for window in 0..5 {
             apply_claude_effort_evidence_with_index(
-                &mut vec![items[0].clone()],
+                &mut [items[0].clone()],
                 &evidence,
                 &mut index,
                 true,
@@ -62617,7 +62617,7 @@ mod tests {
         let mut index = ScanIndex::default();
         let mut result = scan_source_roots_with_limit(
             SnapshotSource::ClaudeCode,
-            &[dir.clone()],
+            std::slice::from_ref(&dir),
             &mut index,
             "2026-08-02T07:01:00Z",
             BACKFILL_WINDOW_DAYS,
@@ -62673,7 +62673,7 @@ mod tests {
         assert!(index.claude_account_family_pending.is_empty());
         for window in 1..5 {
             apply_claude_effort_evidence_with_index(
-                &mut vec![items[0].clone()],
+                &mut [items[0].clone()],
                 &evidence,
                 &mut index,
                 true,
@@ -62707,7 +62707,7 @@ mod tests {
         index.save(&path).unwrap();
         assert!(index.claude_account_family_pending.contains_key(&root));
         apply_claude_effort_evidence_with_index(
-            &mut vec![items[0].clone()],
+            &mut [items[0].clone()],
             &evidence,
             &mut index,
             true,
@@ -62722,7 +62722,7 @@ mod tests {
             1
         );
         apply_claude_effort_evidence_with_index(
-            &mut vec![items[1].clone()],
+            &mut [items[1].clone()],
             &evidence,
             &mut index,
             true,
@@ -62761,7 +62761,7 @@ mod tests {
             previous.save(&path).unwrap();
             let mut working = previous.clone();
             apply_claude_effort_evidence_with_index(
-                &mut vec![items[0].clone()],
+                &mut [items[0].clone()],
                 &evidence,
                 &mut working,
                 true,
@@ -62864,7 +62864,7 @@ mod tests {
         );
         d2_finalize_identity_revisions(&mut index);
         apply_claude_effort_evidence_with_index(
-            &mut vec![items[0].clone()],
+            &mut [items[0].clone()],
             &evidence,
             &mut index,
             true,
@@ -62908,7 +62908,7 @@ mod tests {
         let mut previous = full.clone();
         previous.remove_file_entry(&child_key);
         apply_claude_effort_evidence_with_index(
-            &mut vec![items[0].clone()],
+            &mut [items[0].clone()],
             &evidence,
             &mut previous,
             false,
