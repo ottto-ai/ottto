@@ -22684,6 +22684,58 @@ for line in sys.stdin:
         );
     }
 
+    #[test]
+    fn auth_rejected_upload_lets_sign_in_reconnect_the_connected_mac() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("auth-rejected-sign-in");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(LocalConnectionBinding {
+                setup_run_id: "setup_current".to_string(),
+                setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            }));
+        let authorization = RequestAuthorization::Token("token".to_string());
+
+        let error = auth_start(&daemon, &authorization)
+            .expect_err("healthy connected Mac refuses a new claim");
+        assert!(matches!(
+            error,
+            LocalApiError::InvalidRequest(message) if message.contains("already connected")
+        ));
+
+        // Ottto rejects the relay credentials: the answer says reconnect, and
+        // the sign-in it points to is admitted over the bound account.
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reconnect".to_string(),
+                claim_token: "token_reconnect".to_string(),
+                nonce: "nonce_reconnect".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+        let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
+        assert_eq!(response.claim_code, "claim_reconnect");
+        assert_eq!(
+            response.account.user.as_ref().map(|user| user.id.as_str()),
+            connected_account()
+                .user
+                .as_ref()
+                .map(|user| user.id.as_str()),
+            "the reconnect claim keeps the bound user"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
     /// A connected Mac with a device credential and a setup run bound to
     /// `api_base_url`, inside hermetic support/secret directories.
     fn connected_binding_fixture(

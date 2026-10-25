@@ -1555,16 +1555,24 @@ impl LocalDaemon {
     }
 
     /// True when this Mac is bound to an account but has no usable setup run:
-    /// no setup-run binding is left, or Ottto's latest authoritative answer
+    /// no setup-run binding is left, Ottto's latest authoritative answer
     /// for the binding was terminal (an ended run or a refused device
-    /// credential). Sign-in may then start a fresh claim over the bound
-    /// account; completing it for the same user replaces the binding.
+    /// credential), or Ottto rejected this Mac's credentials on the latest
+    /// local-health upload (the status then answers `reconnect_required`).
+    /// Sign-in may then start a fresh claim over the bound account;
+    /// completing it for the same user replaces the binding.
     pub(crate) fn connected_setup_run_needs_reconnect(&self) -> Result<bool, LocalApiError> {
         if self.connection_for_authorized_client()?.is_none() {
             return Ok(true);
         }
         let state = self.state()?;
-        Ok(latest_setup_run_read_rejection(&state.local_health_events).is_some())
+        Ok(
+            latest_setup_run_read_rejection(&state.local_health_events).is_some()
+                || matches!(
+                    latest_local_health_upload_in(&state.local_health_events),
+                    Some(LatestLocalHealthUpload::AuthRejected { .. })
+                ),
+        )
     }
 
     /// Clear a recorded setup-run read rejection after a successful read
@@ -2493,8 +2501,11 @@ enum LatestLocalHealthUpload {
 }
 
 fn latest_local_health_upload(status: &DaemonStatus) -> Option<LatestLocalHealthUpload> {
-    status
-        .local_health_events
+    latest_local_health_upload_in(&status.local_health_events)
+}
+
+fn latest_local_health_upload_in(events: &[LocalHealthEventV1]) -> Option<LatestLocalHealthUpload> {
+    events
         .iter()
         .filter(|event| {
             event.event_type == "LocalHealthUploadFailed"
