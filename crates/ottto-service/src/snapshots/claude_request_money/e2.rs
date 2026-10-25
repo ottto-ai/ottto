@@ -60,6 +60,27 @@ pub(crate) fn with_enabled<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
+/// Benchmark seam (snapshot_sync money_e2_bench_tests). Test builds only.
+#[cfg(test)]
+pub(crate) mod bench_seam {
+    /// Run `run` with the E2 upload gate forced on (`true`) or at its
+    /// shipped default (`false`, dark) for every page `run` drives on this
+    /// thread (the benchmark is single-threaded).
+    pub(crate) fn with_gate<T>(on: bool, run: impl FnOnce() -> T) -> T {
+        if on {
+            super::with_enabled(run)
+        } else {
+            assert!(!super::enabled(), "dark means the shipped gate is off");
+            run()
+        }
+    }
+    /// E2 counter deltas not yet written to a native_collection_page line,
+    /// then zeroed: the same nonzero-only keys as that line.
+    pub(crate) fn drain_counts() -> serde_json::Value {
+        serde_json::to_value(super::take_counts()).expect("E2 counts serialize")
+    }
+}
+
 /// The parse-time view of the durable birth table (T1's `BirthStore`).
 pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) index: &'a ScanIndex,
