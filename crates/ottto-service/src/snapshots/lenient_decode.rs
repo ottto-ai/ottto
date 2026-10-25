@@ -9,7 +9,7 @@ use std::sync::Arc;
 // No parser-copy/census credit is consumed. Check before allocating raw bytes.
 const HOLD_BYTES_MAX: u64 = 8 * 1024 * 1024;
 const HOLD_BYTES_MIN: u64 = 1024 * 1024;
-fn hold_bytes_limit(input_len: u64) -> u64 {
+pub(super) fn hold_bytes_limit(input_len: u64) -> u64 {
     (input_len / 8).clamp(HOLD_BYTES_MIN, HOLD_BYTES_MAX)
 }
 const HOLD_COUNT_MAX: usize = 4096;
@@ -123,6 +123,14 @@ impl Holds {
     }
     pub(super) fn contains(&self, field: &str, key: &str) -> bool {
         self.0.get(field).is_some_and(|map| map.contains_key(key))
+    }
+    // Admitted key/value/bookkeeping charge of every held slot.
+    pub(super) fn held_bytes(&self) -> u64 {
+        self.0
+            .values()
+            .flat_map(|slots| slots.values())
+            .map(|raw| raw.2)
+            .sum()
     }
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
@@ -2389,13 +2397,24 @@ fn held_file_owner(raw: &RawValue) -> Option<std::ops::Range<usize>> {
     None
 }
 
-// Dropped optional/unknown input can make the next wire document much smaller.
-// Refuse before writing if that would turn an admitted hold into excess damage
-// on restart. This streams to a counter, never another encoded byte buffer.
-pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
+// The one scan-index file layout, used by the save and by the restart
+// admission check below. Compact JSON, except while decode holds exist: then
+// the earlier pretty layout stays, so a hold that an older pretty file's
+// whitespace funded is still funded by the bytes rewritten on every save.
+pub(super) fn write_index<W: std::io::Write>(
+    writer: W,
+    index: &ScanIndex,
+) -> serde_json::Result<()> {
     if index.decode_holds.is_empty() {
-        return Ok(());
+        serde_json::to_writer(writer, index)
+    } else {
+        serde_json::to_writer_pretty(writer, index)
     }
+}
+
+// Exactly the bytes write_index emits. This streams to a counter, never
+// another encoded byte buffer.
+pub(super) fn written_len(index: &ScanIndex) -> serde_json::Result<u64> {
     struct Count(u64);
     impl std::io::Write for Count {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -2409,16 +2428,19 @@ pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
             Ok(())
         }
     }
-    let held = index
-        .decode_holds
-        .0
-        .values()
-        .flat_map(|slots| slots.values())
-        .map(|raw| raw.2)
-        .sum::<u64>();
     let mut output = Count(0);
-    serde_json::to_writer_pretty(&mut output, index)?;
-    if held > hold_bytes_limit(output.0) {
+    write_index(&mut output, index)?;
+    Ok(output.0)
+}
+
+// Dropped optional/unknown input can make the next wire document much smaller.
+// Refuse before writing if that would turn an admitted hold into excess damage
+// on restart.
+pub(super) fn check_held_output(index: &ScanIndex) -> anyhow::Result<()> {
+    if index.decode_holds.is_empty() {
+        return Ok(());
+    }
+    if index.decode_holds.held_bytes() > hold_bytes_limit(written_len(index)?) {
         emit_scan_index_containment_line(
             "local snapshot scan index save: source=unattributed lenient_hold_budget_exceeded=1"
                 .into(),
