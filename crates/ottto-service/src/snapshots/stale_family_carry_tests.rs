@@ -3348,5 +3348,14 @@ fn scoped_retry_observer_counts_actual_rearms_and_preserves_selection() {
             serde_json::to_value(&unobserved.files).unwrap()
         );
     }
-    assert!(!reread_guard::REREAD_GUARD_ENFORCE);
+    assert_eq!(
+        fixture
+            .index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .counts
+            .reread_budget_refused,
+        0
+    );
 }

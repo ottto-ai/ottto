@@ -698,5 +698,11 @@ fn scoped_plan_replaces_the_same_window_baseline_without_counting_retained_keys(
         index.reread_guard.tripwire.planned,
         index.files.len() as u64
     );
-    assert!(!REREAD_GUARD_ENFORCE);
+    assert!(!index.reread_plan_for_rearms(
+        SnapshotSource::ClaudeCode,
+        at,
+        "scoped",
+        false,
+        |key| key.starts_with("owed-"),
+    ));
 }
