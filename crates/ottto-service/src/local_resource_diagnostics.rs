@@ -225,9 +225,16 @@ impl Probe {
             money: crate::snapshots::claude_request_money::e2::Counts,
             #[serde(flatten)]
             caps: ClaudeRecordCaps,
+            #[serde(flatten)]
+            identity: crate::snapshots::claude_request_identity::IdentityCounts,
         }
         let counts = WithMoney {
             collection: counts,
+            identity: if source == "claude_code" {
+                crate::snapshots::claude_request_identity::take_identity_counts()
+            } else {
+                Default::default()
+            },
             caps: if source == "claude_code" {
                 take_claude_record_caps()
             } else {

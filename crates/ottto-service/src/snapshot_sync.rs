@@ -8456,6 +8456,10 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 .map(|original| (item.source_session_id.clone(), original))
         })
         .collect();
+    let request_owned_originals =
+        crate::snapshots::claude_request_identity::capture_request_owned_originals(
+            &scan_result.snapshots,
+        );
     let mut session_ids = claude_evidence_session_ids(&scan_result.snapshots)
         .into_iter()
         .collect::<BTreeSet<_>>();
@@ -8683,6 +8687,27 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
+    if crate::snapshots::claude_request_money::e2::enabled() {
+        if let Some(evidence) = &identity_evidence {
+            crate::snapshots::claude_request_identity::reconcile_request_accounts(
+                &mut scan_result.snapshots,
+                evidence,
+            );
+        }
+    }
+    let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
+        let ownership =
+            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
+                index,
+                &disposition,
+            );
+        crate::snapshots::claude_request_identity::stage_request_owned_activity(
+            &scan_result.snapshots,
+            evidence,
+            &ownership,
+            &request_owned_originals,
+        )
+    });
     // E2 bodies are final before any identity owner runs: contract 5, D1 and
     // the account hash then tag the rows that upload (donor #699 order).
     // Gate off this only counts, so the page is unchanged.
@@ -8733,6 +8758,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 std::mem::take(&mut disposition.request_groupings),
                 &ownership,
             );
+        if let Some(activity) = request_owned_activity {
+            crate::snapshots::claude_request_identity::publish_request_owned_activity(
+                &scan_result.snapshots,
+                activity,
+            );
+        }
     }
     let qualification = match &identity_evidence {
         Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(

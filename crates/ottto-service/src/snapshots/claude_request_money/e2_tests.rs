@@ -93,7 +93,7 @@ fn requests(item: &SnapshotItem, origin: Option<ClaudeRequestUsageOrigin>) -> u6
         .entity
         .grains
         .iter()
-        .filter(|((_, o), _)| *o == origin)
+        .filter(|((_, o, _), _)| *o == origin)
         .map(|(_, grain)| grain.requests)
         .sum()
 }
@@ -269,7 +269,7 @@ fn e2_hour_boundary_keeps_the_transcript_hour() {
         .entity
         .grains
         .keys()
-        .map(|(key, origin)| (key.0.as_str(), *origin))
+        .map(|(key, origin, _)| (key.0.as_str(), *origin))
         .collect::<Vec<_>>();
     assert_eq!(buckets, vec![(HOUR, MATCHED)]);
     cleanup(&[&p]);
@@ -291,7 +291,7 @@ fn e2_otel_only_fast_speed_and_effort_join_the_reported_key() {
     assert!(!estimated.2.contains_key("speed_mode"));
     let mut items = items;
     attach_page(&mut items, &sidecar(&[row("r", 1, 10)]));
-    let ((key, origin), _) = fold(&items[0]).entity.grains.iter().next().unwrap();
+    let ((key, origin, _), _) = fold(&items[0]).entity.grains.iter().next().unwrap();
     assert_eq!(*origin, MATCHED);
     assert!(key.2.contains_key("speed_mode"), "OTEL speed joins the key");
     assert_eq!(
@@ -1400,4 +1400,1041 @@ fn e2_all_prebirth_twins_require_known_response_writers() {
         assert_eq!((got[0].request_count, got[0].input_tokens), (2, 20));
         cleanup(&[&early, &later]);
     }
+}
+
+const ORG_A: &str = "11111111-1111-4111-8111-111111111111";
+const ORG_B: &str = "22222222-2222-4222-8222-222222222222";
+fn org_marker(org: &str) -> Value {
+    json!({"type":"attachment","sessionId":ROOT,
+        "attachment":{"type":"credential_org","organizationUuid":org}})
+}
+fn switch_context() -> Value {
+    json!({"type":"attachment","sessionId":ROOT,
+        "attachment":{"type":"session_context","context":{"userEmail":"synthetic@example.invalid"}}})
+}
+fn org_hash(org: &str) -> String {
+    ottto_core::billing_identity_hash("anthropic", "organization", org).unwrap()
+}
+fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotItem> {
+    let api = ClaudeLocalOtelLoadReport::default();
+    let trace = ClaudeTraceOwnershipLoadReport::default();
+    let per_file_originals = claude_request_identity::capture_request_owned_originals(&items);
+    // Production's legacy map collapses twins; E2 activity must not use it.
+    let originals = items
+        .iter()
+        .filter_map(|item| {
+            item.session_account_evidence
+                .clone()
+                .map(|original| (item.source_session_id.clone(), original))
+        })
+        .collect();
+    let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None)
+        .with_native_originals(&originals);
+    claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+    let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    let ownership = claude_request_identity::TranscriptOwnership::after_census(index, &disposition);
+    let activity = claude_request_identity::stage_request_owned_activity(
+        &items,
+        &evidence,
+        &ownership,
+        &per_file_originals,
+    );
+    let withheld = finish_page(&mut items, index, TelemetryRead::Loaded);
+    assert!(
+        withheld.is_empty(),
+        "identity doubt must never withhold money"
+    );
+    let outcome = claude_request_identity::apply_scan_with_ownership(
+        &mut items,
+        &evidence,
+        BTreeMap::new(),
+        &ownership,
+    );
+    claude_request_identity::publish_request_owned_activity(&items, activity);
+    assert_eq!(outcome.sent, items.len());
+    assert_eq!(outcome.ineligible, 0);
+    items
+}
+fn assert_evidence_referenced(item: &SnapshotItem) {
+    let referenced = rows_of(item)
+        .flat_map(|row| {
+            row.evidence_ref.into_iter().chain(
+                row.identity_parts
+                    .iter()
+                    .flatten()
+                    .filter_map(|part| part.evidence_ref),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        referenced,
+        (0..item.request_evidence.len() as u16).collect()
+    );
+}
+
+#[test]
+fn e2_identity_mixed_login_inherits_earlier_native_request_and_rereads_identically() {
+    with_enabled(|| {
+        let path = root_file("identity-mixed");
+        let index = ScanIndex::default();
+        // Lexical request-id order is deliberately unrelated to native order.
+        let lines = vec![
+            org_marker(ORG_A),
+            line("z", &at(1), 10),
+            line("y", &at(2), 20),
+            switch_context(),
+            org_marker(ORG_B),
+            line("b", &at(3), 30),
+            line("a", &at(4), 40),
+        ];
+        let run = || tag_owned(vec![parse(&path, Some(t0()), &index, &lines)], &index).remove(0);
+        let item = run();
+        assert_eq!((item.request_count, item.input_tokens), (4, 100));
+        assert_eq!(item.usage_buckets.len(), 1);
+        assert_eq!(
+            item.usage_buckets[0].model_usage.len(),
+            1,
+            "wire selector rows remain unique"
+        );
+        let parts = item.model_usage[0].identity_parts.as_ref().unwrap();
+        let amounts = parts
+            .iter()
+            .map(|part| {
+                let evidence = &item.request_evidence[usize::from(part.evidence_ref.unwrap())];
+                (
+                    evidence.provider_workspace_hash.clone().unwrap(),
+                    (part.input_tokens, part.request_count),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(amounts[&org_hash(ORG_A)], (30, 2));
+        assert_eq!(amounts[&org_hash(ORG_B)], (70, 2));
+        assert_evidence_referenced(&item);
+        assert_eq!(
+            serde_json::to_vec(&item).unwrap(),
+            serde_json::to_vec(&run()).unwrap()
+        );
+        assert!(fold(&item).accounts.as_ref().unwrap().mixed);
+        assert_eq!(fold(&item).accounts.as_ref().unwrap().inherited, 2);
+        let mut admissions = crate::snapshots::claude_request_accounts::MixedUploads::default();
+        admissions.admit_request_identity(&item);
+        assert!(
+            admissions.permits_request_identity(&item),
+            "formerly refused mixed body reaches upload admission"
+        );
+        let mut bound_index = ScanIndex::default();
+        bound_index.session_account_bindings.insert(
+            crate::snapshots::sha256_hex(&["session_owner:v1", "synthetic-machine", ROOT]),
+            crate::snapshots::SessionAccountBinding {
+                account_identifier_hash: "b".repeat(64),
+                workspace_identifier_hash: None,
+            },
+        );
+        let mut upload_items = vec![item.clone()];
+        assert!(
+            bound_index
+                .bind_session_accounts_with_mixed(
+                    SnapshotSource::ClaudeCode,
+                    "synthetic-machine",
+                    &mut upload_items,
+                    &[],
+                    &admissions,
+                )
+                .is_empty(),
+            "existing binding admits exact mixed contract-5 body"
+        );
+        assert_eq!(
+            serde_json::to_vec(&item).unwrap(),
+            serde_json::to_vec(&upload_items[0]).unwrap()
+        );
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_conflict_counts_whole_session_under_starting_account() {
+    with_enabled(|| {
+        let path = root_file("identity-conflict");
+        let index = ScanIndex::default();
+        let lines = vec![
+            org_marker(ORG_A),
+            line("a", &at(1), 10),
+            switch_context(),
+            org_marker(ORG_B),
+            line("b", &at(2), 20),
+            org_marker("invalid"),
+            line("c", &at(3), 30),
+        ];
+        let item = tag_owned(vec![parse(&path, Some(t0()), &index, &lines)], &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (3, 60));
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str())
+        );
+        assert!(
+            rows_of(&item).all(|row| row.identity_parts.is_none() && row.evidence_ref == Some(0))
+        );
+        assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_subagent_inherits_root_and_unknown_root_stays_unknown() {
+    with_enabled(|| {
+        for known in [true, false] {
+            let path = root_file("identity-agent");
+            let agent = path
+                .parent()
+                .unwrap()
+                .join(ROOT)
+                .join("subagents/agent-abc.jsonl");
+            fs::create_dir_all(agent.parent().unwrap()).unwrap();
+            fs::write(&agent, b"fixture\n").unwrap();
+            let index = ScanIndex::default();
+            let mut root_lines = if known {
+                vec![org_marker(ORG_A)]
+            } else {
+                Vec::new()
+            };
+            root_lines.push(line("root", &at(1), 10));
+            let mut sub = line("child", &at(2), 20);
+            sub["agentId"] = json!("abc");
+            sub["isSidechain"] = json!(true);
+            let items = tag_owned(
+                vec![
+                    parse(&agent, Some(t0()), &index, &[org_marker(ORG_B), sub]),
+                    parse(&path, Some(t0()), &index, &root_lines),
+                ],
+                &index,
+            );
+            let item = items
+                .iter()
+                .find(|item| item.source_session_id.contains("_agent-"))
+                .unwrap();
+            assert_eq!((item.request_count, item.input_tokens), (1, 20));
+            if known {
+                assert_eq!(item.request_evidence.len(), 1);
+                assert_eq!(
+                    item.request_evidence[0].provider_workspace_hash.as_deref(),
+                    Some(org_hash(ORG_A).as_str())
+                );
+                assert_evidence_referenced(item);
+            } else {
+                assert!(item.request_evidence.is_empty());
+                assert!(rows_of(item).all(|row| row.evidence_ref.is_none()
+                    && row.account_identifier_hash.is_none()
+                    && row.identity_parts.is_none()));
+            }
+            cleanup(&[&path]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_single_account_bytes_unchanged_by_repeated_same_org_evidence() {
+    with_enabled(|| {
+        let path = root_file("identity-single");
+        let index = ScanIndex::default();
+        let first = line("a", &at(1), 10);
+        let second = line("b", &at(2), 20);
+        let one = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), first.clone(), second.clone()],
+            )],
+            &index,
+        )
+        .remove(0);
+        let repeated = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), first, org_marker(ORG_A), second],
+            )],
+            &index,
+        )
+        .remove(0);
+        assert_eq!(
+            serde_json::to_vec(&one).unwrap(),
+            serde_json::to_vec(&repeated).unwrap()
+        );
+        assert!(!fold(&one).accounts.as_ref().unwrap().mixed);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_later_org_cannot_claim_unknown_start_or_other_session() {
+    with_enabled(|| {
+        let path = root_file("identity-no-lookahead");
+        let index = ScanIndex::default();
+        let item = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0()),
+                &index,
+                &[
+                    line("first", &at(1), 10),
+                    org_marker(ORG_B),
+                    line("later", &at(2), 20),
+                ],
+            )],
+            &index,
+        )
+        .remove(0);
+        assert_eq!(item.request_count, 2);
+        assert!(item.request_evidence.is_empty());
+        assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_conflicting_markers_on_one_request_fall_back_without_splitting() {
+    with_enabled(|| {
+        let path = root_file("identity-same-request-conflict");
+        let index = ScanIndex::default();
+        let item = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0()),
+                &index,
+                &[
+                    org_marker(ORG_A),
+                    switch_context(),
+                    org_marker(ORG_B),
+                    line("one", &at(1), 10),
+                ],
+            )],
+            &index,
+        )
+        .remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (1, 10));
+        assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str())
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_attach_unpriced_and_side_calls_keep_account_partition() {
+    with_enabled(|| {
+        let path = root_file("identity-attached");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("a", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                line("b", &at(2), 20),
+                line("c", &at(3), 30),
+            ],
+        )];
+        let mut unpriced = row("c", 3, 30);
+        unpriced.cost_usd_micros = None;
+        let read = sidecar(&[
+            row("a", 1, 10),
+            row("b", 2, 20),
+            refingerprint(unpriced),
+            row("side", 4, 40),
+        ]);
+        attach_page(&mut items, &read);
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &index,
+        );
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (4, 100));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0003")
+        );
+        let reported = item
+            .model_usage
+            .iter()
+            .find(|row| {
+                row.selector_context
+                    .get("request_usage_origin")
+                    .map(String::as_str)
+                    == Some("telemetry_reported")
+            })
+            .unwrap();
+        let evidence = &item.request_evidence[usize::from(reported.evidence_ref.unwrap())];
+        assert_eq!(
+            evidence.provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str()),
+            "side call has target starting account"
+        );
+        let unpriced = item
+            .model_usage
+            .iter()
+            .find(|row| {
+                row.selector_context
+                    .get("request_usage_origin")
+                    .map(String::as_str)
+                    == Some("telemetry_unpriced")
+            })
+            .unwrap();
+        let evidence = &item.request_evidence[usize::from(unpriced.evidence_ref.unwrap())];
+        assert_eq!(
+            evidence.provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_B).as_str())
+        );
+        assert!(unpriced.cost_usd.is_none());
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_telemetry_contradiction_falls_back_whole_session() {
+    with_enabled(|| {
+        use crate::claude_local_otel::{
+            ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin,
+            ClaudeIdentityDisposition, ClaudeRequestIdentityEvidence,
+        };
+        let path = root_file("identity-telemetry-conflict");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("a", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                line("b", &at(2), 20),
+            ],
+        )];
+        let mut conflicting = row("b", 2, 20);
+        let attribute = |hash| ClaudeIdentityAttributeEvidence {
+            origin: ClaudeIdentityAttributeOrigin::LogRecord,
+            disposition: ClaudeIdentityDisposition::Complete,
+            resource_hash: None,
+            log_record_hash: Some(hash),
+        };
+        conflicting.request_identity = Some(ClaudeRequestIdentityEvidence {
+            identity_hash_scheme: "provider-sha256:v1".into(),
+            account: attribute("a".repeat(64)),
+            organization: attribute(org_hash(ORG_A)),
+            disposition: ClaudeIdentityDisposition::Complete,
+        });
+        let read = sidecar(&[row("a", 1, 10), refingerprint(conflicting)]);
+        attach_page(&mut items, &read);
+        let api = api_report(&read);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        let evidence =
+            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (2, 30));
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str())
+        );
+        assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_copied_requests_leave_only_referenced_new_account_evidence() {
+    with_enabled(|| {
+        let path = root_file("identity-copy");
+        let index = ScanIndex::default();
+        let item = tag_owned(
+            vec![parse(
+                &path,
+                Some(t0() + 100_000_000_000),
+                &index,
+                &[
+                    org_marker(ORG_A),
+                    line("copied", &at(1), 10),
+                    switch_context(),
+                    org_marker(ORG_B),
+                    line("own", &at(101), 20),
+                ],
+            )],
+            &index,
+        )
+        .remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (1, 20));
+        assert_eq!(item.removed_request_count, Some(1));
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_B).as_str())
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_final_grouping_includes_disjoint_path_twins_in_either_order() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let path_a = root_file("identity-twin-a");
+            let path_b = root_file("identity-twin-b");
+            let index = ScanIndex::default();
+            let a = parse(
+                &path_a,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("a", &at(1), 10)],
+            );
+            let b = parse(
+                &path_b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            let items = if reverse { vec![b, a] } else { vec![a, b] };
+            let items = tag_owned(items, &index);
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(items[0].request_evidence.len(), 2);
+            let parts = items[0].model_usage[0].identity_parts.as_ref().unwrap();
+            assert_eq!(parts.iter().map(|part| part.request_count).sum::<u64>(), 2);
+            assert_evidence_referenced(&items[0]);
+            cleanup(&[&path_a, &path_b]);
+        }
+    });
+}
+
+fn identity_api_row(id: &str, sequence: u64, input: u64, org: &str) -> ClaudeLocalOtelEvidence {
+    use crate::claude_local_otel::{
+        ClaudeIdentityAttributeEvidence, ClaudeIdentityAttributeOrigin, ClaudeIdentityDisposition,
+        ClaudeRequestIdentityEvidence,
+    };
+    let mut row = row(id, sequence, input);
+    let attribute = |hash| ClaudeIdentityAttributeEvidence {
+        origin: ClaudeIdentityAttributeOrigin::LogRecord,
+        disposition: ClaudeIdentityDisposition::Complete,
+        resource_hash: None,
+        log_record_hash: Some(hash),
+    };
+    row.request_identity = Some(ClaudeRequestIdentityEvidence {
+        identity_hash_scheme: "provider-sha256:v1".into(),
+        account: attribute("a".repeat(64)),
+        organization: attribute(org_hash(org)),
+        disposition: ClaudeIdentityDisposition::Complete,
+    });
+    refingerprint(row)
+}
+
+#[test]
+fn e2_identity_twin_native_mapping_survives_side_pass_before_reconciliation() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let a = root_file("identity-native-a");
+            let b = root_file("identity-native-b");
+            let index = ScanIndex::default();
+            let first = parse(
+                &a,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("a", &at(1), 10)],
+            );
+            let second = parse(
+                &b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            let mut items = if reverse {
+                vec![second, first]
+            } else {
+                vec![first, second]
+            };
+            let read = sidecar(&[
+                identity_api_row("a", 1, 10, ORG_A),
+                identity_api_row("b", 2, 20, ORG_B),
+            ]);
+            attach_page(&mut items, &read);
+            let api = api_report(&read);
+            let trace = ClaudeTraceOwnershipLoadReport::default();
+            side_calls_page(&mut items, &api, &trace, &index);
+            let evidence =
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+            assert!(items
+                .iter()
+                .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
+            let items = tag_owned(items, &index);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(items[0].request_evidence.len(), 2);
+            assert_evidence_referenced(&items[0]);
+            cleanup(&[&a, &b]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_marker_cap_keeps_starting_org_with_or_without_different_binding() {
+    with_enabled(|| {
+        for count in [64, 65] {
+            for bound in [None, Some("b".repeat(64))] {
+                let path = root_file("identity-marker-cap");
+                let index = ScanIndex::default();
+                let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+                accumulator.account_identifier_hash = bound;
+                accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
+                accumulator.claude_file_birth.set_birth_for_test(t0());
+                for i in 0..count {
+                    apply_claude_code_line(&org_marker(ORG_A), &mut accumulator);
+                    apply_claude_code_line(
+                        &line(&format!("r-{i}"), &at(i + 1), 1),
+                        &mut accumulator,
+                    );
+                }
+                accumulator.finalize_claude_responses_e2(
+                    None,
+                    Some(ReadContext {
+                        index: &index,
+                        path: &path,
+                    }),
+                );
+                let item = accumulator
+                    .into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None)
+                    .remove(0);
+                let item = tag_owned(vec![item], &index).remove(0);
+                assert_eq!(item.request_count, count as u64);
+                assert_eq!(item.request_evidence.len(), 1);
+                assert_eq!(
+                    item.request_evidence[0].provider_workspace_hash.as_deref(),
+                    Some(org_hash(ORG_A).as_str())
+                );
+                assert_eq!(fold(&item).accounts.as_ref().unwrap().conflict, count == 65);
+                assert_evidence_referenced(&item);
+                cleanup(&[&path]);
+            }
+        }
+    });
+}
+
+#[test]
+fn e2_identity_conflicting_account_attributes_with_complete_org_use_starting_account() {
+    with_enabled(|| {
+        use crate::claude_local_otel::ClaudeIdentityDisposition;
+        let path = root_file("identity-account-conflict");
+        let index = ScanIndex::default();
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("a", &at(1), 10),
+                switch_context(),
+                org_marker(ORG_B),
+                line("b", &at(2), 20),
+            ],
+        )];
+        let mut conflict = identity_api_row("b", 2, 20, ORG_B);
+        let identity = conflict.request_identity.as_mut().unwrap();
+        identity.account.resource_hash = Some("c".repeat(64));
+        identity.account.disposition = ClaudeIdentityDisposition::Conflict;
+        identity.disposition = ClaudeIdentityDisposition::Conflict;
+        let read = sidecar(&[identity_api_row("a", 1, 10, ORG_A), refingerprint(conflict)]);
+        attach_page(&mut items, &read);
+        let api = api_report(&read);
+        let trace = ClaudeTraceOwnershipLoadReport::default();
+        side_calls_page(&mut items, &api, &trace, &index);
+        let evidence =
+            claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+        claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (2, 30));
+        assert_eq!(
+            item.cost.as_ref().unwrap().total_cost_usd.as_deref(),
+            Some("0.0002")
+        );
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str())
+        );
+        assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_final_twin_union_over_authority_cap_falls_back_to_starting_org() {
+    with_enabled(|| {
+        let a = root_file("identity-cap-a");
+        let b = root_file("identity-cap-b");
+        let index = ScanIndex::default();
+        let lines = |offset| {
+            let mut lines = vec![
+                org_marker(ORG_A),
+                line(&format!("first-{offset}"), &at(1), 1),
+            ];
+            for i in 1..10 {
+                let ordinal = offset + i;
+                lines.push(json!({"type":"attachment","sessionId":ROOT,"attachment":{"type":"session_context","context":{"userEmail":format!("synthetic-{ordinal}@example.invalid")}}}));
+                lines.push(org_marker(&format!(
+                    "33333333-3333-4333-8333-{ordinal:012x}"
+                )));
+                lines.push(line(&format!("r-{ordinal}"), &at(i + 1), 1));
+            }
+            lines
+        };
+        let items = vec![
+            parse(&a, Some(t0()), &index, &lines(0)),
+            parse(&b, Some(t0()), &index, &lines(9)),
+        ];
+        assert!(items
+            .iter()
+            .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
+        let item = tag_owned(items, &index).remove(0);
+        assert_eq!((item.request_count, item.input_tokens), (20, 20));
+        assert_eq!(item.request_evidence.len(), 1);
+        assert_eq!(
+            item.request_evidence[0].provider_workspace_hash.as_deref(),
+            Some(org_hash(ORG_A).as_str())
+        );
+        assert!(
+            rows_of(&item).all(|row| row.identity_parts.is_none() && row.evidence_ref == Some(0))
+        );
+        assert_evidence_referenced(&item);
+        cleanup(&[&a, &b]);
+    });
+}
+
+#[test]
+fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
+    with_enabled(|| {
+        let a = root_file("identity-count-a");
+        let b = root_file("identity-count-b");
+        let index = ScanIndex::default();
+        let one = parse(
+            &a,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first", &at(1), 1),
+                line("shared", &at(2), 1),
+            ],
+        );
+        let two = parse(
+            &b,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first", &at(1), 1),
+                line("shared", &at(2), 1),
+                line("new", &at(3), 1),
+            ],
+        );
+        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
+            let counts =
+                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
+                    .unwrap();
+            assert_eq!(counts, json!({"claude_inherited_org_requests":2}));
+        }
+        cleanup(&[&a, &b]);
+    });
+}
+
+#[test]
+fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
+    with_enabled(|| {
+        let a = root_file("identity-count-disjoint-a");
+        let b = root_file("identity-count-disjoint-b");
+        let index = ScanIndex::default();
+        let one = parse(
+            &a,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first-a", &at(1), 1),
+                line("a-one", &at(2), 1),
+                line("a-two", &at(3), 1),
+            ],
+        );
+        let two = parse(
+            &b,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first-b", &at(1), 1),
+                line("b-one", &at(2), 1),
+                line("b-two", &at(3), 1),
+            ],
+        );
+        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
+            assert_eq!(
+                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
+                    .unwrap(),
+                json!({"claude_inherited_org_requests":4})
+            );
+        }
+        cleanup(&[&a, &b]);
+    });
+}
+
+#[test]
+fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
+    with_enabled(|| {
+        let path = root_file("identity-count-copy");
+        let index = ScanIndex::default();
+        for restore in [false, true] {
+            let version = if restore { "unknown" } else { "2.1.309" };
+            let item = parse(
+                &path,
+                Some(t0() + 100_000_000_000),
+                &index,
+                &[
+                    org_marker(ORG_A),
+                    versioned(line("prefix", &at(1), 1), version),
+                    versioned(line("inherited-copy", &at(2), 1), version),
+                    versioned(line("own", &at(101), 1), version),
+                ],
+            );
+            assert_eq!(
+                fold(&item).entity.removed_requests,
+                if restore { 0 } else { 2 }
+            );
+            let counts =
+                serde_json::to_value(claude_request_identity::page_identity_counts(&[item]))
+                    .unwrap();
+            assert_eq!(
+                counts,
+                json!({"claude_inherited_org_requests":if restore { 2 } else { 1 }})
+            );
+        }
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
+    with_enabled(|| {
+        for (field, value) in [("auth_mode", "api_key"), ("billing_provider", "bedrock")] {
+            let path = root_file("identity-external");
+            let index = ScanIndex::default();
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
+            accumulator.claude_file_birth.set_birth_for_test(t0());
+            accumulator
+                .current_selector
+                .insert(field, value.into(), "synthetic_native_route");
+            for line in [org_marker(ORG_A), line("one", &at(1), 10)] {
+                apply_claude_code_line(&line, &mut accumulator);
+            }
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                }),
+            );
+            let mut items =
+                accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+            assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+            assert!(rows_of(&items[0])
+                .any(|row| !crate::snapshots::claude_request_accounts::local_subscription(row)));
+            let api = ClaudeLocalOtelLoadReport::default();
+            let trace = ClaudeTraceOwnershipLoadReport::default();
+            let evidence =
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            let outcome =
+                claude_request_identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+            assert_eq!(outcome.ineligible, 1);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (1, 10));
+            assert!(items[0].request_evidence.is_empty());
+            assert!(rows_of(&items[0])
+                .all(|row| row.evidence_ref.is_none() && row.identity_parts.is_none()));
+            cleanup(&[&path]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let a = root_file("identity-retained-a");
+            let b = root_file("identity-retained-b");
+            let index = ScanIndex::default();
+            let mut first = parse(&a, Some(t0()), &index, &[line("a", &at(1), 10)]);
+            // Native Desktop metadata/account owner installs this after the finalizer.
+            crate::snapshots::set_session_account_hash(&mut first, Some(&"a".repeat(64)));
+            let second = parse(
+                &b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            let mut items = if reverse {
+                vec![second, first]
+            } else {
+                vec![first, second]
+            };
+            let read = sidecar(&[row("a", 1, 10), identity_api_row("b", 2, 20, ORG_B)]);
+            attach_page(&mut items, &read);
+            let api = api_report(&read);
+            let trace = ClaudeTraceOwnershipLoadReport::default();
+            side_calls_page(&mut items, &api, &trace, &index);
+            let evidence =
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+            assert!(items
+                .iter()
+                .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
+            let items = tag_owned(items, &index);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(items[0].request_evidence.len(), 2);
+            assert!(items[0]
+                .request_evidence
+                .iter()
+                .any(|entry| entry.provider_workspace_hash.as_deref()
+                    == Some(org_hash(ORG_B).as_str())));
+            assert_evidence_referenced(&items[0]);
+            cleanup(&[&a, &b]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
+    with_enabled(|| {
+        let path = root_file("identity-desktop-activity");
+        let index = ScanIndex::default();
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap();
+        let event = now - time::Duration::seconds(2);
+        let clock = event
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut desktop = line("desktop-recent", &clock, 10);
+        desktop["entrypoint"] = json!("claude-desktop");
+        let mut item = parse(&path, Some(t0()), &index, &[org_marker(ORG_A), desktop]);
+        item.collected_at = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let account = "d".repeat(64);
+        item.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+            provider: "anthropic",
+            account_identifier_hash: Some(account.clone()),
+            provider_workspace_hash: Some(org_hash(ORG_A)),
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "claude_desktop_original:v1",
+            identity_disposition: Some("complete"),
+            source_created_at: Some(clock),
+        });
+        let item = tag_owned(vec![item], &index).remove(0);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(
+            crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+            Some(event)
+        );
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let cli = root_file("identity-activity-cli-twin");
+            let desktop_path = root_file("identity-activity-desktop-twin");
+            let index = ScanIndex::default();
+            let mut older = parse(
+                &cli,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("old-cli", &at(1), 10)],
+            );
+            let now = time::OffsetDateTime::now_utc()
+                .replace_nanosecond(0)
+                .unwrap();
+            let event = now - time::Duration::seconds(2);
+            let clock = event
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let mut desktop = line("recent-twin", &clock, 20);
+            desktop["entrypoint"] = json!("claude-desktop");
+            let mut recent = parse(
+                &desktop_path,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), desktop],
+            );
+            let collected = now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            recent.collected_at = collected.clone();
+            let account = if reverse { "17" } else { "18" }.repeat(32);
+            assert_eq!(
+                crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+                None,
+                "each ordering must publish its own activity, not reuse process-global state"
+            );
+            recent.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: Some(account.clone()),
+                provider_workspace_hash: Some(org_hash(ORG_A)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("complete"),
+                source_created_at: Some(clock),
+            });
+            older.source_file_fingerprint = Some("synthetic-cli-physical-source".into());
+            recent.source_file_fingerprint = Some("synthetic-desktop-physical-source".into());
+            older.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: None,
+                provider_workspace_hash: None,
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("missing"),
+                source_created_at: None,
+            });
+            let mut items = if reverse {
+                vec![recent, older]
+            } else {
+                vec![older, recent]
+            };
+            for item in &mut items {
+                item.collected_at = collected.clone();
+            }
+            let items = tag_owned(items, &index);
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(
+                crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+                Some(event)
+            );
+            cleanup(&[&cli, &desktop_path]);
+        }
+    });
 }

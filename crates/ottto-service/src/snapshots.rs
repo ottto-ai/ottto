@@ -17442,6 +17442,13 @@ impl SnapshotAccumulator {
             self.current_selector.clone(),
             self.fallback_bucket_timestamp(None),
         );
+        money.set_identity(
+            self.claude_org_markers.as_deref(),
+            self.account_identifier_hash.as_deref(),
+            self.source_session_id.as_deref(),
+            money_context.as_ref(),
+            responses.first().map(|response| response.sequence),
+        );
         if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
             crate::local_resource_diagnostics::claude_record_cap_half_file();
         }
