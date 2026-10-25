@@ -739,6 +739,7 @@ mod tests {
             removed_request_count: None,
             removed_usage: None,
             telemetry_owned_complete: None,
+            resolver_conflict_count: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: std::collections::BTreeSet::new(),

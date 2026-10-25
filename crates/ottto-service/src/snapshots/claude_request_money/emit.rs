@@ -1,11 +1,11 @@
 //! Literal emitter. Callers stage a complete body before changing the item.
 use super::super::{
-    ClaudeRemovedUsage, SnapshotCost, SnapshotItem, SnapshotModelUsage, SnapshotSource,
-    SnapshotUsageBucket,
+    exact_session_account_hash, ClaudeRemovedUsage, SnapshotCost, SnapshotItem,
+    SnapshotModelUsage, SnapshotSource, SnapshotUsageBucket, REQUEST_OWNED_USAGE_CONTRACT,
 };
 use super::body::ClaudeRequestUsageOrigin;
 use super::e2::ClaudeEntityBody;
-use super::{ClaudeMoneyTokens, REQUEST_OWNED_CONTRACT};
+use super::ClaudeMoneyTokens;
 use std::collections::BTreeMap;
 
 // Contract-5 reproduction compares the literal row against the canonical
@@ -29,6 +29,21 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
     if entity.held || !entity.certificate_ok {
         return false;
     }
+    // Identity belongs to its existing owners, which tag the final rows after
+    // emission (T4 order). Rows tagged BEFORE emission cannot be regrouped
+    // without orphaning their evidence refs: refuse rather than wipe them.
+    if !item.request_evidence.is_empty()
+        || item
+            .model_usage
+            .iter()
+            .chain(item.usage_buckets.iter().flat_map(|b| &b.model_usage))
+            .any(|row| row.evidence_ref.is_some() || row.identity_parts.is_some())
+    {
+        return false;
+    }
+    // The uniform session account the account owner already set on every
+    // row carries to the final rows; D1 re-derives it on them afterwards.
+    let account = exact_session_account_hash(item);
     const MAX: u64 = (1_u64 << 53) - 1;
     let mut tokens = ClaudeMoneyTokens::default();
     let mut requests = 0_u64;
@@ -77,7 +92,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
             subscription_product: selector_context.remove("subscription_product"),
             selector_context,
             selector_sources,
-            account_identifier_hash: None,
+            account_identifier_hash: account.clone(),
             evidence_ref: None,
             identity_parts: None,
             cost_usd: grain.cost().map(dollars),
@@ -123,6 +138,7 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         r.unattributed_total_tokens,
         r.reasoning_output_tokens,
         entity.removed_requests,
+        entity.resolver_conflicts,
     ]
     .iter()
     .any(|n| *n > MAX)
@@ -179,10 +195,12 @@ pub(super) fn apply(item: &mut SnapshotItem, entity: &ClaudeEntityBody) -> bool 
         cache_creation_cost_usd: None,
         evidence_source: "claude_code_api_request".into(),
     });
-    item.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+    item.usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
     item.removed_request_count = Some(entity.removed_requests);
     item.removed_usage = Some(r);
     item.telemetry_owned_complete = Some(entity.telemetry_owned_complete);
+    item.resolver_conflict_count =
+        (entity.resolver_conflicts > 0).then_some(entity.resolver_conflicts);
     let latest = entity
         .activity_nanos
         .max(i128::from(entity.activity_unix) * 1_000_000_000);
@@ -264,7 +282,7 @@ mod tests {
         assert!(apply(&mut item, &entity));
         assert_eq!(
             item.usage_accounting_contract.as_deref(),
-            Some(REQUEST_OWNED_CONTRACT)
+            Some(REQUEST_OWNED_USAGE_CONTRACT)
         );
         assert_eq!(item.request_count, 4);
         assert_eq!(item.input_tokens, 100);

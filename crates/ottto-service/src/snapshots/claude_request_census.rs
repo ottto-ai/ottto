@@ -723,6 +723,15 @@ pub(crate) struct ClaudeRequestCensus {
 }
 crate::heap_layout_bound::fields!(ClaudeRequestCensus; records, hash_total, serialized_total);
 
+/// One family's answer from [`ClaudeRequestCensus::family_transcript_holders`].
+#[derive(Debug, Default)]
+pub(crate) struct ClaudeFamilyHolders {
+    /// Candidate request hashes some transcript record of the family holds.
+    pub(crate) held: BTreeSet<u64>,
+    /// Family members (`root` or `root_agent-*`) that have a record.
+    pub(crate) members: BTreeSet<String>,
+}
+
 /// Why an insert did not store the record as given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ClaudeRequestCensusInsert {
@@ -823,6 +832,48 @@ impl ClaudeRequestCensus {
             ))
             .take_while(move |(key, _)| key.starts_with(prefix))
             .filter(|(_, record)| !record.is_birth_stub())
+    }
+
+    /// E2 side calls: which of each wanted family's sorted unique candidate
+    /// hashes a transcript record of THAT family holds, and which members
+    /// have a record. One walk of the keys (a borrowed path parse, no hash
+    /// read outside a wanted family); only the wanted families' records are
+    /// intersected. Families never cross. None when `deadline` passes
+    /// (checked every 256 records): the caller counts and discloses it.
+    pub(crate) fn family_transcript_holders(
+        &self,
+        wanted: &BTreeMap<&str, Vec<u64>>,
+        deadline: std::time::Instant,
+    ) -> Option<BTreeMap<String, ClaudeFamilyHolders>> {
+        let mut found = BTreeMap::<String, ClaudeFamilyHolders>::new();
+        if wanted.is_empty() {
+            return Some(found);
+        }
+        for (position, (key, record)) in self.records().enumerate() {
+            if position % 256 == 255 && std::time::Instant::now() >= deadline {
+                return None;
+            }
+            let Some(member) = super::claude_index_path_member_ref(Path::new(key)) else {
+                continue;
+            };
+            let Some(candidates) = wanted.get(member.root) else {
+                continue;
+            };
+            if !found.contains_key(member.root) {
+                found.insert(member.root.to_owned(), ClaudeFamilyHolders::default());
+            }
+            let Some(family) = found.get_mut(member.root) else {
+                continue;
+            };
+            family.held.extend(
+                record
+                    .request_hashes()
+                    .iter()
+                    .filter(|hash| candidates.binary_search(hash).is_ok()),
+            );
+            family.members.insert(member.into_owned().1);
+        }
+        Some(found)
     }
 
     /// Heap this census holds, measured: its shared buffers, boxed ledger

@@ -1640,6 +1640,12 @@ pub struct SnapshotItem {
     pub removed_usage: Option<ClaudeRemovedUsage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub telemetry_owned_complete: Option<bool>,
+    /// Native resolver conflicts (two incompatible records of one response,
+    /// the loser dropped) in this request-owned body. Present only when >0,
+    /// so legacy and conflict-free bodies are byte-identical. COST marks the
+    /// session's money partial from it; the daemon ships no deltas or prices.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resolver_conflict_count: Option<u64>,
     #[serde(skip)]
     pub(crate) claude_money: Option<Box<claude_request_money::e2::FileFold>>,
     /// Local-only identities of the Claude API responses whose transcript
@@ -13021,6 +13027,9 @@ pub(crate) fn snapshot_semantic_component_hashes(
     if let Some(value) = item.telemetry_owned_complete {
         ownership.insert("telemetry_owned_complete".into(), json!(value));
     }
+    if let Some(value) = item.resolver_conflict_count {
+        ownership.insert("resolver_conflict_count".into(), json!(value));
+    }
     if !ownership.is_empty() {
         usage_accounting["request_ownership"] = Value::Object(ownership);
     }
@@ -17311,15 +17320,12 @@ impl SnapshotAccumulator {
             self.claude_file_birth,
             money_context.as_ref(),
             self.current_selector.clone(),
+            self.fallback_bucket_timestamp(None),
         );
-        if self.claude_response_record_count >= MAX_CLAUDE_RESPONSE_RECORDS_PER_FILE / 2 {
-            money.disclosed += 1;
-        }
-        money.prepare(self.session_start.client_version());
         let mut shared_selectors = BTreeSet::<Arc<SelectorCapture>>::new();
         for response in responses {
             let Some(mut response) = response.resolve_with(&selectors) else {
-                money.disclosed += 1;
+                money.note_resolver_conflict();
                 self.note_dropped_usage();
                 continue;
             };
@@ -17366,12 +17372,7 @@ impl SnapshotAccumulator {
                     );
                 }
             }
-            money.observe(
-                &response,
-                at,
-                self.latest_model.as_deref(),
-                self.fallback_bucket_timestamp(None).as_deref(),
-            );
+            money.observe(&response, at, self.latest_model.as_deref());
             if let Some(request_id) = response.request_id.take() {
                 let selector = match shared_selectors.get(&response.selector) {
                     Some(shared) => Arc::clone(shared),
@@ -17402,14 +17403,16 @@ impl SnapshotAccumulator {
                     (Some(capture), Some(_)) => capture.request_hash(&request_id),
                     _ => None,
                 };
-                let money_request_hash = claude_request_census::claude_request_hash(&request_id);
+                if self.claude_usage_request_ids.contains(&request_id) || prior_occurrence.is_some()
+                {
+                    money.note_ambiguous(&request_id);
+                }
                 let request_id_was_new = self.claude_usage_request_ids.insert(request_id);
                 // Progressive rows for one response were merged by response
                 // key above. Reaching this point twice for one provider request
                 // id therefore means two distinct responses claim the same
                 // request identity; their request index is not trustworthy.
                 if !request_id_was_new || prior_occurrence.is_some() {
-                    money.ambiguous.insert(money_request_hash);
                     self.claude_context_curve_identity_complete = false;
                 }
                 if let Some((capture, (prior, request_hash))) = capture
@@ -18700,6 +18703,7 @@ impl SnapshotAccumulator {
             removed_request_count: None,
             removed_usage: None,
             telemetry_owned_complete: None,
+            resolver_conflict_count: None,
             claude_money: self.claude_money,
             claude_usage_request_ids: self.claude_usage_request_ids,
             claude_usage_occurrences: self.claude_usage_occurrences,
@@ -26607,7 +26611,7 @@ impl OwnedSourceScan {
                                 claude_request_money::e2::remember_birth(
                                     index,
                                     &candidate.path,
-                                    fold.birth,
+                                    fold,
                                 );
                             }
                         }
@@ -27553,7 +27557,7 @@ impl OwnedSourceScan {
                                 claude_request_money::e2::remember_birth(
                                     index,
                                     Path::new(&index_key),
-                                    fold.birth,
+                                    fold,
                                 );
                             }
                         }
@@ -30081,6 +30085,7 @@ fn codex_state_only_snapshot(
         removed_request_count: None,
         removed_usage: None,
         telemetry_owned_complete: None,
+        resolver_conflict_count: None,
         claude_money: None,
         session_account_evidence: None,
         claude_usage_request_ids: BTreeSet::new(),
@@ -34073,6 +34078,11 @@ fn apply_claude_code_line(value: &Value, accumulator: &mut SnapshotAccumulator) 
     accumulator
         .claude_file_birth
         .observe_line(timestamp.as_deref(), accumulator.claude_response_sequence);
+    // E2 writer certificate: the version of each line, borrowed.
+    accumulator.claude_file_birth.observe_writer(
+        value.get("version").and_then(Value::as_str),
+        accumulator.claude_response_sequence,
+    );
     note_claude_capability_calls(value, timestamp.as_deref(), accumulator);
     // Current Claude transcripts write both of these shapes for one compaction.
     // Keep the raw observations here; `claude_compaction_summary` pairs a
@@ -55604,6 +55614,7 @@ mod tests {
             removed_request_count: None,
             removed_usage: None,
             telemetry_owned_complete: None,
+            resolver_conflict_count: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
@@ -78917,6 +78928,7 @@ mod tests {
             removed_request_count: None,
             removed_usage: None,
             telemetry_owned_complete: None,
+            resolver_conflict_count: None,
             claude_money: None,
             session_account_evidence: None,
             claude_usage_request_ids: BTreeSet::new(),
@@ -80401,6 +80413,7 @@ mod tests {
                 removed_request_count: None,
                 removed_usage: None,
                 telemetry_owned_complete: None,
+                resolver_conflict_count: None,
                 claude_money: None,
                 session_account_evidence: None,
                 claude_usage_request_ids: BTreeSet::new(),
@@ -82861,7 +82874,7 @@ crate::heap_layout_bound::fields!(SnapshotActivitySummary; capability_collection
 crate::heap_layout_bound::fields!(SnapshotCapabilityBucket; bucket_start, capability_id, raw_origin, call_count);
 crate::heap_layout_bound::fields!(SnapshotCapabilityCount; capability_id, raw_origin, count);
 crate::heap_layout_bound::fields!(SnapshotCost; total_cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd, evidence_source);
-crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_file_birth_verdict, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
+crate::heap_layout_bound::fields!(SnapshotItem; session_account_evidence, source_session_id, snapshot_fingerprint, status, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, usage_accounting_contract, removed_request_count, removed_usage, telemetry_owned_complete, resolver_conflict_count, claude_money, claude_usage_request_ids, claude_usage_occurrences, cache_observations, cache_observations_state, cache_base_head_etag, cache_requests, cache_requests_complete, avg_duration_ms, avg_time_to_first_token_ms, max_duration_ms, max_time_to_first_token_ms, peak_context_fill_tokens, first_turn_context_tokens, last_turn_context_tokens, first_turn_context_window_tokens, peak_context_fill_window_tokens, last_turn_context_window_tokens, compaction_count, compaction_timestamps, compaction_events, first_own_request_at, local_context_points, compaction_total_pre_tokens, compaction_total_post_tokens, compaction_total_cumulative_dropped_tokens, compaction_total_duration_ms, context_curve, claude_context_curve_boundaries, claude_context_curve_identity_complete, claude_context_curve_request_index_complete, claude_context_curve_owned_start_proven, claude_file_birth, claude_file_birth_verdict, activity_summary, tool_usage, tool_usage_truncated, session_start, model_usage, usage_buckets, cost, session_display_name, session_display_name_source, source_started_at, source_ended_at, source_last_activity_at, collected_at, workspace_hash, workspace_display_label, workspace_label_source, repository_hash, repository_label, repository_label_source, repository_identity_source, workspace_kind, source_file_fingerprint, session_artifacts, provenance, origin, originator, attribution_facts, request_evidence, request_identity_refusals, claude_org_markers, claude_account_withheld_reason);
 crate::heap_layout_bound::fields!(SnapshotModelUsage; model, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, reasoning_effort, unattributed_total_tokens, request_count, selector_context, selector_sources, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product, account_identifier_hash, evidence_ref, identity_parts, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotIdentityPart; account_identifier_hash, evidence_ref, input_tokens, output_tokens, cache_read_tokens, cache_creation_5m_tokens, cache_creation_1h_tokens, reasoning_output_tokens, unattributed_total_tokens, request_count, cost_usd, input_cost_usd, output_cost_usd, cache_read_cost_usd, cache_creation_cost_usd);
 crate::heap_layout_bound::fields!(SnapshotRequestEvidence; identity_basis, provider_workspace_hash);

@@ -40,6 +40,27 @@ const MAX_TELEMETRY_PARTITION_DOUBLINGS: usize = 4;
 const MAX_CONTEXT_BASIS_VERSION_KEYS: usize = 16;
 const MAX_CONTEXT_BASIS_VERSION_KEY_BYTES: usize = 24;
 
+/// Claude Code versions verified to keep every copied record's original
+/// timestamp when they write a copy (`/branch`, `/resume` copy, fork). Only
+/// such a writer lets the money birth rule skip pre-birth records; any other
+/// or mixed writer counts and discloses them.
+pub(in crate::snapshots) const KNOWN_COPY_WRITERS: &[&str] = &["2.1.309", "2.1.310"];
+
+/// The writer version run in force: (writer id, the response sequence that
+/// started it). Id 0 is any version outside [`KNOWN_COPY_WRITERS`]; id i is
+/// its (i-1)th entry. Inline: a copy is written once, so one run suffices to
+/// tell "one known writer since the first own response" from anything else.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ClaudeWriterRun(Option<(u8, u64)>);
+
+impl crate::heap_layout_bound::HeapLayoutBound for ClaudeWriterRun {
+    const INLINE_ONLY: bool = true;
+    const STABLE_HEAP: bool = true;
+    fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {
+        c.add(0)
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ClaudeBirthScope {
     /// Not read through the Claude transcript parser (synthetic items, other
@@ -85,10 +106,12 @@ pub(crate) struct ClaudeFileBirth {
     own_last_context: Option<u64>,
     /// A tagged response came before the first own response.
     tagged_before_first_own: bool,
+    /// Money only: the writer version of the file's own lines.
+    writer: ClaudeWriterRun,
 }
 crate::heap_layout_bound::fields!(ClaudeFileBirth; scope, path_key_hash, tagged_in_opening,
     tagged_responses, own_responses, untimed_records, first_own_sequence, own_first_context,
-    own_peak_context, own_last_context, tagged_before_first_own);
+    own_peak_context, own_last_context, tagged_before_first_own, writer);
 
 /// A reported birth at or before the floor is no evidence (F5).
 fn root_birth_scope(created_unix_nanos: Option<i128>) -> ClaudeBirthScope {
@@ -173,6 +196,31 @@ impl ClaudeFileBirth {
 
     pub(in crate::snapshots) fn uncertain_root(&self) -> bool {
         self.scope == ClaudeBirthScope::RootUnknownBirth
+    }
+
+    /// One line's `version`, before its response (if any) is observed. A
+    /// line without a version is no writer evidence. Borrowed; no allocation.
+    pub(in crate::snapshots) fn observe_writer(&mut self, version: Option<&str>, responses_before: u64) {
+        let Some(version) = version else {
+            return;
+        };
+        let id = KNOWN_COPY_WRITERS
+            .iter()
+            .position(|known| *known == version)
+            .map_or(0, |index| index as u8 + 1);
+        if self.writer.0.map(|(current, _)| current) != Some(id) {
+            self.writer = ClaudeWriterRun(Some((id, responses_before)));
+        }
+    }
+
+    /// The writer certificate: every versioned line from the file's first own
+    /// (post-birth) response on was written by ONE known copy writer. Unknown,
+    /// absent or mixed writer evidence (either order) refuses.
+    pub(in crate::snapshots) fn writer_certified(&self, first_own_sequence: Option<u64>) -> bool {
+        match (self.writer.0, first_own_sequence) {
+            (Some((id, started)), Some(first_own)) => id != 0 && first_own >= started,
+            _ => false,
+        }
     }
 
     /// Read through the Claude transcript parser.

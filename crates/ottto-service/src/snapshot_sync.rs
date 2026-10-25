@@ -4233,6 +4233,7 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         removed_request_count: item.removed_request_count,
         removed_usage: item.removed_usage,
         telemetry_owned_complete: item.telemetry_owned_complete,
+        resolver_conflict_count: item.resolver_conflict_count,
         claude_money: None,
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
@@ -8422,8 +8423,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         Ok(evidence) => {
             crate::snapshots::claude_request_money::e2::attach_page(
                 &mut scan_result.snapshots,
-                &evidence.evidence,
-                index,
+                &evidence,
             );
             let census_window_end = scan_result.census_window_end.clone();
             crate::snapshots::apply_claude_effort_evidence_with_index(
@@ -8556,6 +8556,13 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             trace_report.evidence.insert(root_session_id, rows);
         }
     }
+    // E2 side calls need the trace-named owner, so they follow the trace read.
+    crate::snapshots::claude_request_money::e2::side_calls_page(
+        &mut scan_result.snapshots,
+        &api_report,
+        &trace_report,
+        index,
+    );
     // Contract-5 evidence exists only under this cycle's permit; the reported
     // rebuild then classifies and groups each request as it places it.
     let identity_evidence = emission_permitted.then(|| {
@@ -8692,7 +8699,15 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    crate::snapshots::claude_request_money::e2::finish_page(&mut scan_result.snapshots, index);
+    crate::snapshots::claude_request_money::e2::finish_page(
+        &mut scan_result.snapshots,
+        index,
+        if stats.effort_evidence_load_failed {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Failed
+        } else {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
+        },
+    );
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
