@@ -42819,6 +42819,16 @@ impl ScanIndex {
             let Some(current_window) = rfc3339_unix_seconds(&pending.census_window_end) else {
                 continue;
             };
+            // Retiring old windows requires an identity committed for this
+            // newer window, not only unchanged survivors from an older one.
+            if !pending.member_requests.iter().any(|(member, requests)| {
+                requests.identity_revision.is_some()
+                    && live_members
+                        .get(root)
+                        .is_some_and(|members| members.contains(member))
+            }) {
+                continue;
+            }
             let mut latest: BTreeMap<
                 String,
                 (
@@ -62540,6 +62550,47 @@ mod tests {
             assert!(!loaded.claude_account_family_pending.contains_key(&root));
             fs::remove_dir_all(dir).unwrap();
         }
+    }
+
+    #[test]
+    fn claude_account_pending_disappearance_without_newer_live_identity_retains_old_window() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut index = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut index,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        apply_claude_effort_evidence_with_index(
+            &mut vec![items[0].clone()],
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        d2_finalize_identity_revisions(&mut index);
+        let root_key = index
+            .files
+            .keys()
+            .find(|key| {
+                claude_index_path_family_member(Path::new(key))
+                    .is_some_and(|(_, member)| member == root)
+            })
+            .unwrap()
+            .clone();
+        index.remove_file_entry(&root_key);
+        index.save(&dir.join("old-survivor.json")).unwrap();
+        assert_eq!(
+            index.claude_account_family_pending[&root]
+                .previous_windows
+                .len(),
+            1
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
