@@ -27027,7 +27027,7 @@ impl OwnedSourceScan {
                             index,
                             &candidate.path,
                         );
-                    } else if !held_progress_audit || source_verified {
+                    } else if !held_progress_audit || (source_verified && parse_complete) {
                         // An unsuccessful virtual audit keeps its old hold:
                         // it has no sampled marker carrying the obligation.
                         claude_request_census::record_claude_request_census(

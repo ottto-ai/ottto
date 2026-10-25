@@ -2535,7 +2535,9 @@ pub(crate) fn record_claude_request_census(
 
 /// A parse that reaches no record (a failed finish, or a native comparison
 /// target whose record allocation is not prepaid) leaves the key without
-/// one, never with an older revision's.
+/// one, never with an older revision's. A virtual recovery audit retains its
+/// old unverified hold solely as an exclusion/retry obligation until a fully
+/// finalized, verified Full replaces it.
 pub(crate) fn invalidate_claude_request_census(index: &mut ScanIndex, path: &Path) {
     let key = super::local_index_key(path);
     // A recovery Full has no sampled marker to retain its obligation. Its

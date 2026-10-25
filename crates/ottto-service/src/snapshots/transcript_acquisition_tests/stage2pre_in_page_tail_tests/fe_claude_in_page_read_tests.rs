@@ -2402,7 +2402,7 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
     }
     let _clock = TestClock;
     let due = sampled_scan::now_seconds();
-    for terminal_loss in [false, true] {
+    for failure in 0..3 {
         let hold = erased_hold(due - 4 * INTERVAL);
         let key = hold.key.clone();
         let mut index = hold.index;
@@ -2415,10 +2415,18 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         }
         let path = hold.fixture.file.0.clone();
         let bytes = bytes_of(&path);
-        if terminal_loss {
+        if failure == 1 {
             hold.fixture.file.append(&json!({
                 "type":"ignored", "padding":"x".repeat(MAX_JSONL_LINE_BYTES + 1024)
             }));
+        }
+        if failure == 2 {
+            // As the existing finalizer-only response-loss fixture: neither
+            // row loses at read time; their usages conflict only at finish.
+            let mut conflict = row(CLAUDE, 5);
+            conflict["message"]["usage"]["input_tokens"] = json!(999);
+            conflict["message"]["usage"]["output_tokens"] = json!(0);
+            hold.fixture.file.append(&conflict);
         }
         File::open(&path)
             .unwrap()
@@ -2430,10 +2438,18 @@ fn fe_n1_option_b_failed_virtual_audits_keep_hold_and_reserved_slot_then_reprove
         index.save(&hold.index_path).unwrap();
         let index = ScanIndex::load(&hold.index_path).unwrap();
         sampled_scan::set_test_now(Some(due - 3 * INTERVAL));
-        let mut index = if terminal_loss {
+        let mut index = if failure != 0 {
             let (index, result, seen) = plain(&hold.fixture, CLAUDE, index, &hold.cache);
             assert_eq!(seen.full_reasons[AUDIT_DUE], 1);
-            assert!(result.over_line_cap_count > 0);
+            if failure == 1 {
+                assert!(result.over_line_cap_count > 0);
+            } else {
+                assert!(
+                    result.dropped_usage_record_count > 0,
+                    "loss found by finalization"
+                );
+            }
+            assert!(!mints_v1(&mut index.clone(), &result, 0..6));
             index
         } else {
             let parked = path.with_extension("parked");
