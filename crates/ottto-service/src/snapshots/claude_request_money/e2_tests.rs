@@ -856,7 +856,7 @@ fn e2_reported_selector_inputs_match_p1_with_legacy_output_kept() {
                         if !native_clock {
                             value.as_object_mut().unwrap().remove("timestamp");
                         }
-                        let item = parse(&p, Some(t0()), &index, &[value]);
+                        let item = parse(&p, Some(t0()), &index, &[line("seed", &at(0), 1), value]);
                         let mut occurrence = item.claude_usage_occurrences["r"].clone();
                         occurrence.reasoning_effort = native_effort.map(str::to_owned);
                         let mut api = row("r", 1, 10);
