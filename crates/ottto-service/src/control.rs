@@ -3060,10 +3060,14 @@ fn set_codex_quota_refresh_consent(
     schema_version: u16,
     consent: bool,
 ) -> Result<ottto_protocol::CodexAccountsStatusV1, LocalApiError> {
-    FileCodexAccountSlotSettingsStore::default()
+    let status = FileCodexAccountSlotSettingsStore::default()
         .set_quota_refresh_consent(schema_version, consent)
-        .map_err(codex_account_slot_settings_error)
-        .map(crate::agent_status::annotate_codex_accounts_status)
+        .map_err(codex_account_slot_settings_error)?;
+    // Switched on: the schedule's next round runs now, not at its next wake.
+    if consent {
+        crate::agent_status::wake_codex_quota_scheduler();
+    }
+    Ok(crate::agent_status::annotate_codex_accounts_status(status))
 }
 
 fn remove_codex_account(

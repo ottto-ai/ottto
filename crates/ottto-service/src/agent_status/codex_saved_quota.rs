@@ -32,6 +32,17 @@
 //! Every home is scheduled whether or not the device uploads Codex status:
 //! the companion shows these readings locally.
 //!
+//! The scheduler sleeps until the earliest home is due, and at most a minute,
+//! whether or not any app is in front: a login switched outside the daemon,
+//! a new session or Codex process, or a changed setting is seen at its next
+//! wake, so a switched login is read within a minute (and at least a minute
+//! after the read before). A status read that finds a home not read yet, and
+//! switching background refresh on, wake it at once; rounds stay at least
+//! 15 s apart. To decide what is due it keeps what it derived from the
+//! settings, each credential and each saved file while those files are
+//! unchanged (same identity, size, times, owner and mode); the read and
+//! save of a reading, and every status read, read the files themselves.
+//!
 //! "Background limit refresh" (the Codex accounts settings, on until the
 //! owner chooses) gates the schedule for every home at once: while it is off
 //! a round reads nothing, scans no processes and runs no `codex app-server`,
@@ -51,7 +62,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::thread;
-use std::time::{Duration, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ottto_core::{
     default_support_dir, CodexHomeTrust, FileCodexAccountSlotSettingsStore,
@@ -66,8 +77,9 @@ use sha2::{Digest, Sha256};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 
 use super::{
-    chatgpt_subscription_product, codex_credential_claimed_binding, codex_credit_grants,
-    codex_home_slots, codex_last_known, current_unix_seconds, empty_codex_accounts_status,
+    chatgpt_subscription_product, codex_credential_claim_lapses_at,
+    codex_credential_claimed_binding, codex_credit_grants, codex_home_slots_checked,
+    codex_last_known, current_unix_seconds, default_codex_home, empty_codex_accounts_status,
     mark_quota_meters_stale, read_codex_auth_credentials_at, read_codex_usage_from_provider,
     unsupported_account, CodexHomeSlot, CodexIdentityHashes, CodexUsageProbe,
 };
@@ -89,8 +101,19 @@ const LOGIN_CHANGED_MIN_GAP_SECONDS: u64 = 60;
 /// failed read within a day instead of hiding behind the other home's
 /// readings.
 const SAME_LOGIN_KEEPALIVE_SECONDS: u64 = 24 * 60 * 60;
-/// How often the scheduler looks for due homes. Reads start at most this late.
-const SCHEDULER_TICK: Duration = Duration::from_secs(15);
+/// The longest the scheduler sleeps, however late the next home is due: the
+/// bound on seeing a login switched outside the daemon, a new session or
+/// process, or a changed setting.
+const SCHEDULER_MAX_SLEEP: Duration = Duration::from_secs(60);
+/// The scheduler's sleep after a round that left a home due (its read was
+/// refused at the last moment, or the round failed), and the least time
+/// between two rounds when something wakes it early.
+const SCHEDULER_RETRY: Duration = Duration::from_secs(15);
+/// A file changed this recently is not kept: a rewrite within the same tick
+/// of a coarse file-system clock could leave its stamp unchanged.
+const RACY_STAMP_SECONDS: u64 = 2;
+/// Kept planning entries per cache (homes, saved files, settings files).
+const PLANNED_ENTRIES_MAX: usize = 64;
 /// A served reading older than this (two unused intervals: the schedule
 /// failed to run) is labelled stale.
 const SERVED_FRESH_MAX_AGE_SECONDS: u64 = 2 * UNUSED_REFRESH_SECONDS;
@@ -221,14 +244,212 @@ impl LoginMark {
 }
 
 pub(super) fn login_mark(home: &Path, home_trust: CodexHomeTrust) -> LoginMark {
-    LoginMark {
-        binding: read_codex_auth_credentials_at(home, home_trust)
-            .ok()
-            .flatten()
-            .as_ref()
-            .and_then(codex_credential_claimed_binding),
+    login_mark_lasting(home, home_trust).0
+}
+
+/// [`login_mark`], and how long it holds while `auth.json` is unchanged: a
+/// claimed binding lapses when the earliest of its tokens expires, a missing
+/// one stays missing. `None`: it may change without the file changing (the
+/// credential could not be read, or its tokens' expiry is unknown).
+fn login_mark_lasting(home: &Path, home_trust: CodexHomeTrust) -> (LoginMark, Option<Lasts>) {
+    let credentials = read_codex_auth_credentials_at(home, home_trust);
+    let claimed = credentials.as_ref().ok().and_then(Option::as_ref);
+    let binding = claimed.and_then(codex_credential_claimed_binding);
+    let lasts = match (&credentials, &binding) {
+        (Err(_), _) => None,
+        (Ok(_), None) => Some(Lasts::WhileUnchanged),
+        (Ok(_), Some(_)) => claimed
+            .and_then(codex_credential_claim_lapses_at)
+            .map(Lasts::Until),
+    };
+    let mark = LoginMark {
+        binding,
         auth: auth_witness(home),
+    };
+    (mark, lasts)
+}
+
+/// How long a value derived from local files holds while they are unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Lasts {
+    WhileUnchanged,
+    /// Until this local unix second (exclusive).
+    Until(u64),
+}
+
+/// What a path's contents and permissions are compared by between rounds:
+/// its identity, owner and mode, and for a file its size and modification
+/// and status-change times. Codex and the daemon replace files by rename (a
+/// new inode); any write moves the modification time and any permission or
+/// owner change shows in the mode or owner. A directory's times change with
+/// its entries, so only its identity, owner and mode count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PathStamp {
+    dev: u64,
+    ino: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+    len: u64,
+    modified_ns: i128,
+    changed_ns: i128,
+}
+
+/// `None` for a path that does not exist (or cannot be looked at). Never
+/// follows a final symlink.
+fn path_stamp(path: &Path) -> Option<PathStamp> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    let file = !metadata.is_dir();
+    let at = |secs: i64, nanos: i64| i128::from(secs) * 1_000_000_000 + i128::from(nanos);
+    Some(PathStamp {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        uid: metadata.uid(),
+        gid: metadata.gid(),
+        mode: metadata.mode(),
+        len: if file { metadata.len() } else { 0 },
+        modified_ns: if file {
+            at(metadata.mtime(), metadata.mtime_nsec())
+        } else {
+            0
+        },
+        changed_ns: if file {
+            at(metadata.ctime(), metadata.ctime_nsec())
+        } else {
+            0
+        },
+    })
+}
+
+impl PathStamp {
+    /// Last written long enough ago that a rewrite now gets another
+    /// modification time, however coarse the file-system clock (Git's
+    /// "racily clean" rule).
+    fn settled(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |now| now.as_nanos() as i128);
+        self.modified_ns < now - i128::from(RACY_STAMP_SECONDS) * 1_000_000_000
     }
+}
+
+/// A value derived from local files, with the stamps those files had before
+/// it was derived.
+#[derive(Debug, Clone)]
+struct Planned<V> {
+    stamps: Vec<(PathBuf, Option<PathStamp>)>,
+    lasts: Lasts,
+    value: V,
+}
+
+impl<V> Planned<V> {
+    /// Stamp `paths` (before deriving the value from them).
+    fn stamps(paths: impl IntoIterator<Item = PathBuf>) -> Vec<(PathBuf, Option<PathStamp>)> {
+        paths
+            .into_iter()
+            .map(|path| {
+                let stamp = path_stamp(&path);
+                (path, stamp)
+            })
+            .collect()
+    }
+
+    /// The entry to keep, if any: every stamped file settled and the value
+    /// known to hold.
+    fn keep(
+        stamps: Vec<(PathBuf, Option<PathStamp>)>,
+        lasts: Option<Lasts>,
+        value: V,
+    ) -> Option<Self> {
+        let lasts = lasts?;
+        stamps
+            .iter()
+            .all(|(_, stamp)| stamp.map_or(true, |stamp| stamp.settled()))
+            .then_some(Self {
+                stamps,
+                lasts,
+                value,
+            })
+    }
+
+    /// Still holds at `now`: every path has the stamp it had.
+    fn holds(&self, now: u64) -> bool {
+        (match self.lasts {
+            Lasts::WhileUnchanged => true,
+            Lasts::Until(until) => now < until,
+        }) && self
+            .stamps
+            .iter()
+            .all(|(path, stamp)| path_stamp(path) == *stamp)
+    }
+}
+
+type PlannedCache<K, V> = Mutex<BTreeMap<K, Planned<V>>>;
+
+fn planned_cache<K, V>(
+    cache: &'static OnceLock<PlannedCache<K, V>>,
+) -> MutexGuard<'static, BTreeMap<K, Planned<V>>>
+where
+    K: Ord,
+{
+    cache
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+}
+
+/// The kept value for `key` while it holds at `now`, else `derive`'s, kept
+/// for next time when it may be. `derive` gets the paths' stamps taken before
+/// it runs, and returns the value, how long it lasts, and the paths stamped.
+fn planned<K, V>(
+    cache: &'static OnceLock<PlannedCache<K, V>>,
+    key: &K,
+    now: u64,
+    derive: impl FnOnce() -> (V, Option<Lasts>, Vec<(PathBuf, Option<PathStamp>)>),
+) -> V
+where
+    K: Ord + Clone,
+    V: Clone,
+{
+    if let Some(kept) = planned_cache(cache).get(key) {
+        if kept.holds(now) {
+            return kept.value.clone();
+        }
+    }
+    #[cfg(test)]
+    tests::note_planned_derive();
+    let (value, lasts, stamps) = derive();
+    let kept = Planned::keep(stamps, lasts, value.clone());
+    let mut entries = planned_cache(cache);
+    match kept {
+        Some(kept) => {
+            if !entries.contains_key(key) && entries.len() >= PLANNED_ENTRIES_MAX {
+                entries.clear();
+            }
+            entries.insert(key.clone(), kept);
+        }
+        None => {
+            entries.remove(key);
+        }
+    }
+    value
+}
+
+/// [`login_mark`] for deciding what the schedule reads: kept while the home
+/// directory and its `auth.json` keep their stamps and no claimed token has
+/// expired. Binding a reading to its login and serving one read the file.
+fn planned_login_mark(home: &Path, home_trust: CodexHomeTrust, now: u64) -> LoginMark {
+    static MARKS: OnceLock<PlannedCache<(PathBuf, bool), LoginMark>> = OnceLock::new();
+    let key = (
+        home.to_path_buf(),
+        home_trust == CodexHomeTrust::ProviderDefault,
+    );
+    planned(&MARKS, &key, now, || {
+        let stamps = Planned::<LoginMark>::stamps([home.to_path_buf(), home.join("auth.json")]);
+        let (mark, lasts) = login_mark_lasting(home, home_trust);
+        (mark, lasts, stamps)
+    })
 }
 
 /// One home's saved quota and read history.
@@ -444,6 +665,21 @@ fn read_saved_at(support_dir: &Path, home: &Path) -> Option<SavedCodexQuota> {
         .then_some(saved)
 }
 
+/// Saved files kept for deciding what the schedule reads.
+static PLANNED_SAVED: OnceLock<PlannedCache<PathBuf, Option<SavedCodexQuota>>> = OnceLock::new();
+
+/// [`read_saved_at`] for deciding what the schedule reads: kept while the file
+/// keeps its stamp, and dropped by every write here. A read and save under
+/// the home's lock, and every status read, read the file.
+fn planned_saved(support_dir: &Path, home: &Path, now: u64) -> Option<SavedCodexQuota> {
+    let path = saved_path(support_dir, home);
+    planned(&PLANNED_SAVED, &path, now, || {
+        let stamps = Planned::<Option<SavedCodexQuota>>::stamps([path.clone()]);
+        let saved = read_saved_at(support_dir, home);
+        (saved, Some(Lasts::WhileUnchanged), stamps)
+    })
+}
+
 /// The state directories above the per-home ones, owner-only like the leaf.
 fn restrict_state_dirs(support_dir: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -464,6 +700,7 @@ fn write_saved_at(support_dir: &Path, home: &Path, saved: &SavedCodexQuota) {
     let written = restrict_state_dirs(support_dir).and_then(|()| {
         ottto_core::write_owner_only_cache_file_atomic(&saved_path(support_dir, home), &body)
     });
+    planned_cache(&PLANNED_SAVED).remove(&saved_path(support_dir, home));
     match written {
         Ok(()) => {
             GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -508,7 +745,23 @@ fn note_attempt(support_dir: &Path, home: &Path, attempt: Attempt) {
 /// The saved state with the in-memory attempt applied when it is newer than
 /// the one on disk.
 fn saved_with_attempt(support_dir: &Path, home: &Path) -> Option<SavedCodexQuota> {
-    let saved = read_saved_at(support_dir, home);
+    with_attempt(support_dir, home, read_saved_at(support_dir, home))
+}
+
+/// [`saved_with_attempt`] from [`planned_saved`].
+fn planned_saved_with_attempt(
+    support_dir: &Path,
+    home: &Path,
+    now: u64,
+) -> Option<SavedCodexQuota> {
+    with_attempt(support_dir, home, planned_saved(support_dir, home, now))
+}
+
+fn with_attempt(
+    support_dir: &Path,
+    home: &Path,
+    saved: Option<SavedCodexQuota>,
+) -> Option<SavedCodexQuota> {
     let Some(attempt) = attempts().get(&saved_path(support_dir, home)).cloned() else {
         return saved;
     };
@@ -556,14 +809,17 @@ pub(super) fn serve_saved(
     now: u64,
 ) -> Result<CodexUsageProbe, CodexQuotaFailure> {
     serve_saved_at(&saved_quota_support_dir(), home, home_trust, now).map_err(|failure| {
-        if failure.message == CODEX_QUOTA_NOT_READ_YET
-            && !quota_refresh_settings().background_quota_refresh_allowed()
-        {
+        if failure.message != CODEX_QUOTA_NOT_READ_YET {
+            failure
+        } else if !quota_refresh_settings().background_quota_refresh_allowed() {
             CodexQuotaFailure {
                 message: CODEX_QUOTA_BACKGROUND_REFRESH_OFF.to_string(),
                 ..failure
             }
         } else {
+            // A new login or home is read as soon as its schedule allows,
+            // without waiting for the scheduler's next wake.
+            wake_codex_quota_scheduler();
             failure
         }
     })
@@ -885,20 +1141,29 @@ fn scheduled_read_due_every(
     interval_seconds: u64,
     now: u64,
 ) -> bool {
+    scheduled_read_due_at(saved, current_login, interval_seconds, now) <= now
+}
+
+/// When [`scheduled_read_due_every`] turns true while the home keeps
+/// `current_login`: `now` when it is due already.
+fn scheduled_read_due_at(
+    saved: Option<&SavedCodexQuota>,
+    current_login: &LoginMark,
+    interval_seconds: u64,
+    now: u64,
+) -> u64 {
     let Some(saved) = saved else {
-        return true;
+        return now;
     };
     let last = saved.last_attempt_at_epoch_seconds;
     if last == 0 || last > now.saturating_add(CLOCK_SKEW_SECONDS) {
-        return true;
+        return now;
     }
-    let elapsed = now.saturating_sub(last);
-    if saved.last_attempt_login.is_new_login(current_login)
-        && elapsed >= LOGIN_CHANGED_MIN_GAP_SECONDS
-    {
-        return true;
+    let mut due_at = last.saturating_add(interval_seconds);
+    if saved.last_attempt_login.is_new_login(current_login) {
+        due_at = due_at.min(last.saturating_add(LOGIN_CHANGED_MIN_GAP_SECONDS));
     }
-    elapsed >= interval_seconds
+    due_at
 }
 
 /// Whether an explicit refresh may read the home now: at most once a minute
@@ -1040,21 +1305,58 @@ pub(super) fn homes_in_use(
 /// the explicit refresh alike: every read rewrites `auth.json`, and the
 /// sign-in decides by that file.
 fn scheduled_homes(support_dir: &Path, now: u64) -> Vec<ScheduledHome> {
-    let store = FileCodexAccountSlotSettingsStore::default();
-    let status = store
-        .load()
-        .unwrap_or_else(|_| empty_codex_accounts_status());
-    let signing_in = store
-        .active_sign_in()
-        .ok()
-        .flatten()
-        .map(|active| home_key(&active.home));
+    let PlannedSlots { slots, signing_in } = planned_slots(now);
     let running = running_homes().clone();
-    let mut homes = scheduled_homes_from(support_dir, codex_home_slots(&status), &running, now);
+    let mut homes = scheduled_homes_from(support_dir, slots, &running, now);
     if let Some(signing_in) = signing_in {
         homes.retain(|home| home_key(&home.home) != signing_in);
     }
     homes
+}
+
+/// The slots the stored settings schedule, and the [`home_key`] of a running
+/// daemon sign-in's home.
+#[derive(Clone)]
+struct PlannedSlots {
+    slots: Vec<CodexHomeSlot>,
+    signing_in: Option<String>,
+}
+
+/// The stored settings' slots, kept while the settings file and every
+/// managed slot's directories (the home and the slot directory above it,
+/// whose privacy the settings check) keep their stamps, and the default home
+/// is the same. Settings that could not be read in full are not kept.
+fn planned_slots(now: u64) -> PlannedSlots {
+    static SLOTS: OnceLock<PlannedCache<(PathBuf, PathBuf), PlannedSlots>> = OnceLock::new();
+    let settings = default_support_dir().join(CODEX_ACCOUNT_SLOT_SETTINGS_FILE_NAME);
+    let key = (settings.clone(), default_codex_home());
+    planned(&SLOTS, &key, now, || {
+        let mut stamps = Planned::<PlannedSlots>::stamps([settings]);
+        let store = FileCodexAccountSlotSettingsStore::default();
+        let status = store.load();
+        let signing_in = store.active_sign_in();
+        let (slots, complete) =
+            codex_home_slots_checked(status.as_ref().unwrap_or(&empty_codex_accounts_status()));
+        let complete = complete && status.is_ok() && signing_in.is_ok();
+        let signing_in = signing_in
+            .ok()
+            .flatten()
+            .map(|active| home_key(&active.home));
+        stamps.extend(Planned::<PlannedSlots>::stamps(
+            slots
+                .iter()
+                .filter(|slot| slot.ownership == CodexAccountSlotOwnershipV1::Managed)
+                .flat_map(|slot| {
+                    [
+                        Some(slot.home.clone()),
+                        slot.home.parent().map(Path::to_path_buf),
+                    ]
+                })
+                .flatten(),
+        ));
+        let lasts = complete.then_some(Lasts::WhileUnchanged);
+        (PlannedSlots { slots, signing_in }, lasts, stamps)
+    })
 }
 
 fn scheduled_homes_from(
@@ -1065,7 +1367,7 @@ fn scheduled_homes_from(
 ) -> Vec<ScheduledHome> {
     let mut homes = slots
         .into_iter()
-        .map(|slot| scheduled_home(support_dir, running, slot))
+        .map(|slot| scheduled_home(support_dir, running, slot, now))
         .collect::<Vec<_>>();
     for (home, seen_at) in running {
         if recent(*seen_at, now) && !homes.iter().any(|known| &known.home == home) {
@@ -1078,6 +1380,7 @@ fn scheduled_homes_from(
                     home: home.clone(),
                     registered_binding: None,
                 },
+                now,
             ));
         }
     }
@@ -1088,13 +1391,14 @@ fn scheduled_home(
     support_dir: &Path,
     running: &BTreeMap<PathBuf, u64>,
     slot: CodexHomeSlot,
+    now: u64,
 ) -> ScheduledHome {
     let trust = match slot.ownership {
         CodexAccountSlotOwnershipV1::Default => CodexHomeTrust::ProviderDefault,
         CodexAccountSlotOwnershipV1::Managed => CodexHomeTrust::Managed,
     };
     ScheduledHome {
-        binding: read_saved_at(support_dir, &slot.home)
+        binding: planned_saved(support_dir, &slot.home, now)
             .as_ref()
             .and_then(SavedCodexQuota::binding),
         process_seen_at: running.get(&slot.home).copied(),
@@ -1107,24 +1411,26 @@ fn scheduled_home(
 /// The login a home may share with another home: its saved reading's account
 /// and workspace, while it still holds them ([`held_binding`]) and its latest
 /// read did not fail. `None`: the home is read on its own.
-fn shareable_binding(support_dir: &Path, home: &ScheduledHome) -> Option<String> {
-    let saved = read_saved_at(support_dir, &home.home)?;
+/// From the kept planning copies: a status read confirms the shared login on
+/// both current credentials before it serves another home's reading.
+fn shareable_binding(support_dir: &Path, home: &ScheduledHome, now: u64) -> Option<String> {
+    let saved = planned_saved(support_dir, &home.home, now)?;
     if !latest_read_succeeded(&saved) {
         return None;
     }
     let binding = saved.binding()?;
-    (held_binding(Some(&saved), &login_mark(&home.home, home.trust)).as_ref() == Some(&binding))
-        .then_some(binding)
+    let current = planned_login_mark(&home.home, home.trust, now);
+    (held_binding(Some(&saved), &current).as_ref() == Some(&binding)).then_some(binding)
 }
 
 /// For each home, the index of the home that reads for it: itself, or, for
 /// homes that hold the same login right now, one of them for all. That one is
 /// the default home when it is among them, else the lowest home key, so it
 /// stays the same from round to round.
-fn same_login_readers(support_dir: &Path, homes: &[ScheduledHome]) -> Vec<usize> {
+fn same_login_readers(support_dir: &Path, homes: &[ScheduledHome], now: u64) -> Vec<usize> {
     let mut groups = BTreeMap::<String, Vec<usize>>::new();
     for (index, home) in homes.iter().enumerate() {
-        if let Some(binding) = shareable_binding(support_dir, home) {
+        if let Some(binding) = shareable_binding(support_dir, home, now) {
             groups.entry(binding).or_default().push(index);
         }
     }
@@ -1230,8 +1536,56 @@ fn read_homes(
     })
 }
 
-/// One scheduler pass over `homes`: read every due one. Returns how many were
-/// read.
+/// What a scheduler round did.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct ScheduledRound {
+    /// Homes read from the provider.
+    read: usize,
+    /// When the round after it has something to do, while nothing changes:
+    /// the earliest home due, or the next process scan. `None`: nothing is
+    /// scheduled (background limit refresh is off).
+    next_due_at: Option<u64>,
+}
+
+/// Each home's interval this round: its own 5 or 15 minutes, the in-use one
+/// for a home that reads for others when any of them is in use, and the
+/// keep-alive for the homes it reads for. With the grouping.
+fn round_intervals(
+    support_dir: &Path,
+    homes: &[ScheduledHome],
+    sessions: &[ActiveSession],
+    now: u64,
+) -> (Vec<usize>, Vec<u64>) {
+    let in_use = homes_in_use(homes, sessions, now);
+    let readers = same_login_readers(support_dir, homes, now);
+    let mut group_in_use = vec![false; homes.len()];
+    for (index, reader) in readers.iter().enumerate() {
+        group_in_use[*reader] |= in_use[index];
+    }
+    let intervals = (0..homes.len())
+        .map(|index| {
+            if readers[index] == index {
+                refresh_interval_seconds(group_in_use[index])
+            } else {
+                SAME_LOGIN_KEEPALIVE_SECONDS
+            }
+        })
+        .collect();
+    (readers, intervals)
+}
+
+/// When the schedule reads `home` next, from the kept planning copies.
+fn planned_due_at(support_dir: &Path, home: &ScheduledHome, interval: u64, now: u64) -> u64 {
+    scheduled_read_due_at(
+        planned_saved_with_attempt(support_dir, &home.home, now).as_ref(),
+        &planned_login_mark(&home.home, home.trust, now),
+        interval,
+        now,
+    )
+}
+
+/// One scheduler pass over `homes`: read every due one, and tell when the
+/// next one is due.
 /// `background_allowed` is asked right before each due read, under that
 /// home's lock; `false` skips the read.
 fn scheduled_round_for(
@@ -1241,31 +1595,25 @@ fn scheduled_round_for(
     now: u64,
     background_allowed: impl Fn() -> bool + Sync,
     read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
-) -> usize {
-    let in_use = homes_in_use(&homes, sessions, now);
-    let readers = same_login_readers(support_dir, &homes);
+) -> ScheduledRound {
+    let (readers, intervals) = round_intervals(support_dir, &homes, sessions, now);
     publish_same_login_readers(support_dir, &homes, &readers);
-    // A home that reads for others uses the in-use interval when any of them
-    // is in use; the others are read by themselves only for the keep-alive.
-    let mut group_in_use = vec![false; homes.len()];
-    for (index, reader) in readers.iter().enumerate() {
-        group_in_use[*reader] |= in_use[index];
-    }
     let interval_by_home = homes
         .iter()
-        .enumerate()
-        .map(|(index, home)| {
-            let interval = if readers[index] == index {
-                refresh_interval_seconds(group_in_use[index])
-            } else {
-                SAME_LOGIN_KEEPALIVE_SECONDS
-            };
-            (home.home.clone(), interval)
-        })
+        .zip(&intervals)
+        .map(|(home, interval)| (home.home.clone(), *interval))
         .collect::<BTreeMap<_, _>>();
-    read_homes(
+    // Only homes due by the planning copies get a read thread; each read is
+    // still decided again from the files themselves under the home's lock.
+    let due = homes
+        .iter()
+        .zip(&intervals)
+        .filter(|(home, interval)| planned_due_at(support_dir, home, **interval, now) <= now)
+        .map(|(home, _)| home.clone())
+        .collect();
+    let read = read_homes(
         support_dir,
-        homes,
+        due,
         now,
         |saved, home, now| {
             scheduled_read_due_every(
@@ -1279,7 +1627,15 @@ fn scheduled_round_for(
             ) && background_allowed()
         },
         read,
-    )
+    );
+    // The reads may have changed the grouping (a failed shared read ends it).
+    let (_, intervals) = round_intervals(support_dir, &homes, sessions, now);
+    let next_due_at = homes
+        .iter()
+        .zip(&intervals)
+        .map(|(home, interval)| planned_due_at(support_dir, home, *interval, now))
+        .min();
+    ScheduledRound { read, next_due_at }
 }
 
 /// Whether the schedule scans for running Codex processes itself: no scan
@@ -1311,36 +1667,62 @@ fn scan_running_homes_if_due(now: u64) {
 /// One scheduler pass: read every due home. Returns how many were read.
 /// With background limit refresh off it reads nothing and scans nothing.
 pub(super) fn scheduled_round(support_dir: &Path, now: u64) -> usize {
+    scheduled_round_due(support_dir, now).read
+}
+
+/// [`scheduled_round`], with when the next round has something to do.
+fn scheduled_round_due(support_dir: &Path, now: u64) -> ScheduledRound {
     crate::codex_sign_in::end_stale_run();
     let settings = quota_refresh_settings();
     if !settings.background_quota_refresh_allowed() {
-        return 0;
+        return ScheduledRound::default();
     }
     scan_running_homes_if_due(now);
+    let next_scan_at = PROCESS_SCANNED_AT
+        .load(Ordering::Relaxed)
+        .saturating_add(PROCESS_SCAN_MIN_GAP_SECONDS);
     let homes = scheduled_homes(support_dir, now);
-    if homes.is_empty() {
-        return 0;
-    }
-    let sessions = crate::active_sessions::read_active_session_reconciliation(
-        support_dir,
-        crate::snapshots::SnapshotSource::Codex,
-    )
-    .map(|reconciliation| reconciliation.sessions)
-    .unwrap_or_default();
-    scheduled_round_for(
-        support_dir,
-        homes,
-        &sessions,
-        now,
-        || settings.background_quota_refresh_allowed_locked(),
-        |home| read_codex_usage_from_provider(&home.home, home.trust),
-    )
+    let mut round = if homes.is_empty() {
+        ScheduledRound::default()
+    } else {
+        let sessions = crate::active_sessions::read_active_session_reconciliation(
+            support_dir,
+            crate::snapshots::SnapshotSource::Codex,
+        )
+        .map(|reconciliation| reconciliation.sessions)
+        .unwrap_or_default();
+        scheduled_round_for(
+            support_dir,
+            homes,
+            &sessions,
+            now,
+            || settings.background_quota_refresh_allowed_locked(),
+            |home| read_codex_usage_from_provider(&home.home, home.trust),
+        )
+    };
+    round.next_due_at = Some(
+        round
+            .next_due_at
+            .map_or(next_scan_at, |at| at.min(next_scan_at)),
+    );
+    round
 }
 
 /// One scheduler pass in the support dir the daemon uses.
 #[cfg(test)]
 pub(crate) fn scheduled_round_now(now: u64) -> usize {
     scheduled_round(&saved_quota_support_dir(), now)
+}
+
+/// How long the scheduler sleeps after a round: until the next home is due,
+/// at most [`SCHEDULER_MAX_SLEEP`]; [`SCHEDULER_RETRY`] when one is still due
+/// (or the round failed).
+fn scheduler_sleep(next_due_at: Option<u64>, now: u64) -> Duration {
+    match next_due_at {
+        Some(at) if at <= now => SCHEDULER_RETRY,
+        Some(at) => Duration::from_secs(at - now).min(SCHEDULER_MAX_SLEEP),
+        None => SCHEDULER_MAX_SLEEP,
+    }
 }
 
 /// What an explicit refresh did.
@@ -1374,7 +1756,7 @@ fn refresh_homes_now(
     now: u64,
     read: impl Fn(&ScheduledHome) -> Result<CodexUsageProbe, String> + Sync,
 ) -> CodexExplicitRefresh {
-    let readers = same_login_readers(support_dir, &homes);
+    let readers = same_login_readers(support_dir, &homes, now);
     publish_same_login_readers(support_dir, &homes, &readers);
     let homes = homes
         .into_iter()
@@ -1400,8 +1782,21 @@ fn refresh_homes_now(
 }
 
 struct Scheduler {
-    stopped: Mutex<bool>,
+    state: Mutex<SchedulerState>,
     changed: Condvar,
+}
+
+#[derive(Default)]
+struct SchedulerState {
+    stopped: bool,
+    /// Something asked for a round before the next due time.
+    woken: bool,
+}
+
+impl Scheduler {
+    fn state(&self) -> MutexGuard<'_, SchedulerState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
 }
 
 fn scheduler_slot() -> MutexGuard<'static, Option<Arc<Scheduler>>> {
@@ -1416,7 +1811,7 @@ pub fn start_codex_quota_scheduler() -> std::io::Result<()> {
         return Ok(());
     }
     let scheduler = Arc::new(Scheduler {
-        stopped: Mutex::new(false),
+        state: Mutex::default(),
         changed: Condvar::new(),
     });
     let worker = scheduler.clone();
@@ -1429,12 +1824,22 @@ pub fn start_codex_quota_scheduler() -> std::io::Result<()> {
 
 pub(crate) fn stop_codex_quota_scheduler() {
     if let Some(scheduler) = scheduler_slot().take() {
-        *scheduler
-            .stopped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = true;
+        scheduler.state().stopped = true;
         scheduler.changed.notify_all();
     }
+}
+
+/// Run the scheduler's next round now rather than at its next wake (still at
+/// least [`SCHEDULER_RETRY`] after the one before): a home is waiting for its
+/// first reading, or background limit refresh was switched on. A round reads
+/// only homes that are due, so this never reads a home sooner than its
+/// schedule allows.
+pub(crate) fn wake_codex_quota_scheduler() {
+    let Some(scheduler) = scheduler_slot().clone() else {
+        return;
+    };
+    scheduler.state().woken = true;
+    scheduler.changed.notify_all();
 }
 
 fn run_scheduler(scheduler: &Scheduler) {
@@ -1443,30 +1848,40 @@ fn run_scheduler(scheduler: &Scheduler) {
     // The first round reads every home the daemon has not read yet.
     let mut trigger = Trigger::Startup;
     loop {
-        if *scheduler
-            .stopped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
         {
-            return;
+            let mut state = scheduler.state();
+            if state.stopped {
+                return;
+            }
+            state.woken = false;
         }
+        let started = Instant::now();
         // New readings reach the upload with the lane's next timer pass; a
         // status read serves them at once.
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let next_due_at = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::provider_calls::with_trigger(trigger, || {
-                scheduled_round(&support_dir, current_unix_seconds())
+                scheduled_round_due(&support_dir, current_unix_seconds()).next_due_at
             })
-        }));
+        }))
+        .unwrap_or(Some(0));
         trigger = Trigger::Schedule;
-        let stopped = scheduler
-            .stopped
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let (stopped, _) = scheduler
+        let sleep = scheduler_sleep(next_due_at, current_unix_seconds());
+        let (mut state, _) = scheduler
             .changed
-            .wait_timeout_while(stopped, SCHEDULER_TICK, |stopped| !*stopped)
+            .wait_timeout_while(scheduler.state(), sleep, |state| {
+                !state.stopped && !state.woken
+            })
             .unwrap_or_else(PoisonError::into_inner);
-        if *stopped {
+        if !state.stopped && state.woken {
+            // Woken early: still keep rounds this far apart.
+            let rest = SCHEDULER_RETRY.saturating_sub(started.elapsed());
+            state = scheduler
+                .changed
+                .wait_timeout_while(state, rest, |state| !state.stopped)
+                .unwrap_or_else(PoisonError::into_inner)
+                .0;
+        }
+        if state.stopped {
             return;
         }
     }
@@ -2192,6 +2607,215 @@ mod tests {
         assert!(process_scan_due(10_000 + 3_600, 10_000));
     }
 
+    #[test]
+    fn the_next_due_time_is_when_the_due_check_turns_true() {
+        let last = 1_000_000;
+        let same = mark(Some("a"), 1);
+        let switched = mark(Some("b"), 2);
+        let cases = [
+            (None, &same, 5 * 60, last, last),
+            (Some(saved_with(0, same.clone())), &same, 5 * 60, last, last),
+            (
+                Some(saved_with(last, same.clone())),
+                &same,
+                5 * 60,
+                last,
+                last + 5 * 60,
+            ),
+            (
+                Some(saved_with(last, same.clone())),
+                &same,
+                15 * 60,
+                last + 5,
+                last + 15 * 60,
+            ),
+            // A switched login: a minute after the last attempt.
+            (
+                Some(saved_with(last, same.clone())),
+                &switched,
+                15 * 60,
+                last + 5,
+                last + 60,
+            ),
+            // A clock that stepped back: due now.
+            (
+                Some(saved_with(last + 3_600, same.clone())),
+                &same,
+                5 * 60,
+                last,
+                last,
+            ),
+        ];
+        for (saved, current, interval, now, due_at) in cases {
+            assert_eq!(
+                scheduled_read_due_at(saved.as_ref(), current, interval, now),
+                due_at
+            );
+            for at in [due_at.saturating_sub(1).max(now), due_at, due_at + 1] {
+                assert_eq!(
+                    scheduled_read_due_every(saved.as_ref(), current, interval, at),
+                    scheduled_read_due_at(saved.as_ref(), current, interval, at) <= at,
+                    "{at}"
+                );
+                assert_eq!(
+                    scheduled_read_due_every(saved.as_ref(), current, interval, at),
+                    at >= due_at,
+                    "{at}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_scheduler_sleeps_until_the_next_due_time_and_at_most_a_minute() {
+        let now = 1_000_000;
+        assert_eq!(scheduler_sleep(Some(now + 5), now), Duration::from_secs(5));
+        assert_eq!(
+            scheduler_sleep(Some(now + 15 * 60), now),
+            SCHEDULER_MAX_SLEEP
+        );
+        assert_eq!(scheduler_sleep(None, now), SCHEDULER_MAX_SLEEP);
+        // Still due after the round (a read refused at the last moment, or
+        // a failed round): the old tick.
+        assert_eq!(scheduler_sleep(Some(now), now), SCHEDULER_RETRY);
+        assert_eq!(scheduler_sleep(Some(now - 60), now), SCHEDULER_RETRY);
+        assert_eq!(SCHEDULER_MAX_SLEEP.as_secs(), LOGIN_CHANGED_MIN_GAP_SECONDS);
+    }
+
+    /// A round tells when the next home is due: the in-use or unused interval
+    /// after its read, and a minute after the last read once the login
+    /// switched; that next round reads it.
+    #[test]
+    fn a_round_tells_when_the_next_home_is_due() {
+        let fixture = SameLoginFixture::new("next-due", &[("default", true, "u1", "w")]);
+        let start = current_unix_seconds() + 30;
+        assert_eq!(
+            fixture.planned_round(start, true),
+            (vec!["default".to_string()], Some(start + 5 * 60))
+        );
+        assert_eq!(
+            fixture.planned_round(start + 10, false),
+            (Vec::new(), Some(start + 15 * 60))
+        );
+        fixture.sign_in("default", "u2", "w");
+        assert_eq!(
+            fixture.planned_round(start + 20, false),
+            (Vec::new(), Some(start + 60))
+        );
+        assert_eq!(
+            fixture.planned_round(start + 60, false),
+            (vec!["default".to_string()], Some(start + 60 + 15 * 60))
+        );
+    }
+
+    /// Set a file's modification time an hour back, as an unchanged file has.
+    fn settle(path: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(SystemTime::now() - Duration::from_secs(3_600))
+            .unwrap();
+    }
+
+    /// The schedule keeps a credential's login while `auth.json` is unchanged
+    /// and its tokens live; a rewrite, a permission change or a token expiry
+    /// derives it again, and a file written just now is not kept.
+    #[test]
+    fn a_planned_login_is_kept_only_while_its_credential_is_unchanged() {
+        let root = scratch("planned-login");
+        let home = root.join("home");
+        crate::test_scratch::create_private_dir(&home).unwrap();
+        let auth = home.join("auth.json");
+        let trust = CodexHomeTrust::Managed;
+        let now = current_unix_seconds();
+        sign_in_home_with_id_token_lifetime(&home, "u1", "w", 3_600);
+        settle(&auth);
+        let first = planned_login_mark(&home, trust, now);
+        assert!(first.binding.is_some());
+        assert_eq!(first, login_mark(&home, trust));
+        let derived = planned_derives();
+        assert_eq!(planned_login_mark(&home, trust, now), first);
+        assert_eq!(planned_derives(), derived, "kept");
+        // Past the id token's expiry: derived again.
+        planned_login_mark(&home, trust, now + 3_600 + 1);
+        assert_eq!(planned_derives(), derived + 1);
+
+        // Another account, the same length: derived again, and the new one,
+        // even right after the write.
+        sign_in_home_with_id_token_lifetime(&home, "u2", "w", 3_600);
+        let second = planned_login_mark(&home, trust, now);
+        assert_ne!(second.binding, first.binding);
+        assert_eq!(second, login_mark(&home, trust));
+        let derived = planned_derives();
+        planned_login_mark(&home, trust, now);
+        assert_eq!(planned_derives(), derived + 1, "a fresh file is not kept");
+
+        // A permission change the credential reader refuses.
+        settle(&auth);
+        let settled = planned_login_mark(&home, trust, now);
+        assert_eq!(settled.binding, second.binding);
+        assert_eq!(settled, login_mark(&home, trust));
+        let derived = planned_derives();
+        planned_login_mark(&home, trust, now);
+        assert_eq!(planned_derives(), derived, "kept");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&auth, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let refused = planned_login_mark(&home, trust, now);
+        assert_eq!(refused, login_mark(&home, trust));
+        assert_eq!(refused.binding, None);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The schedule keeps a saved file while it is unchanged; a write here,
+    /// or any rewrite of the file, is seen at once.
+    #[test]
+    fn a_planned_saved_file_is_kept_only_while_unchanged() {
+        let root = scratch("planned-saved");
+        let home = root.join("home");
+        let now = current_unix_seconds();
+        let saved = |attempt_at: u64| SavedCodexQuota {
+            last_attempt_at_epoch_seconds: attempt_at,
+            ..SavedCodexQuota::new(&home)
+        };
+        write_saved_at(&root, &home, &saved(1_000_000));
+        let path = saved_path(&root, &home);
+        settle(&path);
+        assert_eq!(planned_saved(&root, &home, now), Some(saved(1_000_000)));
+        let derived = planned_derives();
+        assert_eq!(planned_saved(&root, &home, now), Some(saved(1_000_000)));
+        assert_eq!(planned_derives(), derived, "kept");
+
+        write_saved_at(&root, &home, &saved(2_000_000));
+        assert_eq!(planned_saved(&root, &home, now), Some(saved(2_000_000)));
+
+        // Rewritten in place by someone else, the same size.
+        settle(&path);
+        assert_eq!(planned_saved(&root, &home, now), Some(saved(2_000_000)));
+        let body = std::fs::read_to_string(&path).unwrap().replace(
+            "\"last_attempt_at_epoch_seconds\":2000000",
+            "\"last_attempt_at_epoch_seconds\":3000000",
+        );
+        std::fs::write(&path, body).unwrap();
+        assert_eq!(planned_saved(&root, &home, now), Some(saved(3_000_000)));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    thread_local! {
+        static PLANNED_DERIVES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Planning values derived from the files on this thread.
+    pub(super) fn note_planned_derive() {
+        PLANNED_DERIVES.with(|count| count.set(count.get() + 1));
+    }
+
+    fn planned_derives() -> usize {
+        PLANNED_DERIVES.with(std::cell::Cell::get)
+    }
+
     /// Support dirs whose reads finish at the trigger's clock.
     fn pinned_support_dirs() -> MutexGuard<'static, BTreeSet<PathBuf>> {
         static PINNED: OnceLock<Mutex<BTreeSet<PathBuf>>> = OnceLock::new();
@@ -2392,6 +3016,26 @@ mod tests {
                 |home| self.read(home, at),
             );
             self.taken_reads()
+        }
+
+        /// [`Self::round`], with when the next home is due.
+        fn planned_round(&self, at: u64, in_use: bool) -> (Vec<String>, Option<u64>) {
+            let sessions = if in_use {
+                vec![session(None, at - 60)]
+            } else {
+                Vec::new()
+            };
+            let round = scheduled_round_for(
+                &self.root,
+                self.scheduled(&[], at),
+                &sessions,
+                at,
+                || true,
+                |home| self.read(home, at),
+            );
+            let reads = self.taken_reads();
+            assert_eq!(round.read, reads.len());
+            (reads, round.next_due_at)
         }
 
         fn refresh(&self, at: u64) -> (CodexExplicitRefresh, Vec<String>) {
