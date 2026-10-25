@@ -56,9 +56,12 @@ fn entry() -> ScanIndexEntry {
 }
 fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -> SnapshotItem {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    a.claude_file_birth = ClaudeFileBirth::observe(path, None);
+    let opened = fs::File::open(path).and_then(|file| file.metadata()).ok();
+    a.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
     if let Some(birth) = birth {
         a.claude_file_birth.set_birth_for_test(birth);
+    } else {
+        a.claude_file_birth.forget_birth_for_test();
     }
     for value in lines {
         apply_claude_code_line(value, &mut a);
@@ -361,6 +364,11 @@ fn e2_path_twins_attach_the_row_once() {
     let copy = root_file("twin-b");
     let mut index = ScanIndex::default();
     let own = parse_and_remember(&first, t0(), &mut index, &[line("r", &at(1), 10)]);
+    index.files.insert(local_index_key(&copy), entry());
+    stage_twins(
+        &mut index,
+        &[(&first, t0()), (&copy, t0() + 60_000_000_000)],
+    );
     let twin = parse(
         &copy,
         Some(t0() + 60_000_000_000),
@@ -482,6 +490,10 @@ fn e2_move_then_copy_across_restart_counts_each_request_once() {
         line("h4", &at(130), 8),
     ];
     for _pass in 0..2 {
+        stage_twins(
+            &mut index,
+            &[(&b, t0() + 60_000_000_000), (&c, t0() + 120_000_000_000)],
+        );
         let b_item = parse(&b, Some(t0() + 60_000_000_000), &index, &moved);
         let c_item = parse_and_remember(&c, t0() + 120_000_000_000, &mut index, &copied);
         assert_eq!(fold(&c_item).entity.removed_requests, 3);
@@ -507,7 +519,8 @@ fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
         let mut index = ScanIndex::default();
         parse_and_remember(&x, x_birth, &mut index, &history);
         parse_and_remember(&y, y_birth, &mut index, &history);
-        let index = restart(&index);
+        let mut index = restart(&index);
+        stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
         let xs = parse(&x, Some(x_birth), &index, &history);
         let ys = parse(&y, Some(y_birth), &index, &history);
         let skipped = [&xs, &ys]
@@ -532,6 +545,7 @@ fn e2_restored_twins_both_prebirth_skip_exactly_one_never_both() {
             (&y, (&x, x_birth))
         };
         fs::remove_file(kept).unwrap();
+        stage_twins(&mut index, &[(&x, x_birth), (&y, y_birth)]);
         let alone = parse(held.0, Some(held.1), &index, &history);
         assert_eq!(fold(&alone).entity.removed_requests, 0);
         assert_eq!(fold(&alone).entity.totals().1, 2);
@@ -1104,4 +1118,286 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             join_time.as_micros(), enrichment_time.as_micros(), pipeline_time.as_micros(), allocation.requested_peak_with_overlap);
     }
     fs::remove_dir_all(dir).unwrap();
+}
+
+/// Exercise T4's actual index walk and one metadata probe per twin. Only physical
+/// birth is injected, as in parse(); Linux has no portable set-creation-time API.
+fn stage_twins(index: &mut ScanIndex, paths: &[(&Path, i128)]) {
+    let mut page = crate::snapshots::claude_history_upgrade::HistoryPage::default();
+    for (path, _) in paths {
+        index.stage_claude_history_twins(&local_index_key(path), &mut page);
+    }
+    for (path, birth) in paths {
+        let key = local_index_key(path);
+        let Some(member) = session_member(path) else {
+            continue;
+        };
+        let opened = fs::metadata(path).ok().map(|m| {
+            let mut opened =
+                crate::snapshots::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m);
+            opened.birth = u64::try_from(*birth).unwrap();
+            opened
+        });
+        let size = index.files.get(&key).map_or(0, |e| e.size_bytes);
+        index
+            .claude_money_birth_store
+            .stage_opened(&member, &key, opened, size);
+    }
+}
+
+#[test]
+fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
+    for reverse in [false, true] {
+        let early = root_file("first-early");
+        let later = root_file("first-later");
+        let history = [line("h1", &at(-100), 1), line("h2", &at(-90), 2)];
+        let mut index = ScanIndex::default();
+        index.files.insert(local_index_key(&early), entry());
+        index.files.insert(local_index_key(&later), entry());
+        assert!(index.claude_money_birth_store.is_empty());
+        let mut paths: Vec<(&Path, i128)> = vec![(&early, t0()), (&later, t0() + 5_000_000_000)];
+        if reverse {
+            paths.reverse();
+        }
+        stage_twins(&mut index, &paths);
+        // No seeded/discarded parse and no restart before these first results.
+        let items = paths
+            .iter()
+            .map(|(path, birth)| parse(path, Some(*birth), &index, &history))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            items.iter().map(|i| fold(i).entity.totals().1).sum::<u64>(),
+            2
+        );
+        assert_eq!(
+            items
+                .iter()
+                .map(|i| fold(i).entity.removed_requests)
+                .sum::<u64>(),
+            2
+        );
+        let got = publish(items, None, TelemetryRead::Loaded, &index);
+        assert_eq!(got.len(), 1);
+        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 3));
+        assert_eq!(got[0].removed_request_count, Some(2));
+        cleanup(&[&early, &later]);
+    }
+}
+
+fn agent_file(name: &str) -> PathBuf {
+    let root = scratch(name);
+    let path = root.join(ROOT).join("subagents/agent-abc.jsonl");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, b"fixture\n").unwrap();
+    path
+}
+
+#[test]
+fn e2_subagent_twins_identical_and_overlapping_count_once_in_both_orders() {
+    for overlap in [false, true] {
+        for reverse in [false, true] {
+            let early = agent_file("sub-early");
+            let later = agent_file("sub-later");
+            let own = |id, seconds, input| {
+                let mut value = line(id, &at(seconds), input);
+                value["agentId"] = json!("abc");
+                value["isSidechain"] = json!(true);
+                value
+            };
+            let history = vec![own("a", 1, 10), own("b", 2, 20)];
+            let mut later_lines = history.clone();
+            if overlap {
+                later_lines.push(own("c", 61, 30));
+            }
+            let mut index = ScanIndex::default();
+            index.files.insert(local_index_key(&early), entry());
+            index.files.insert(local_index_key(&later), entry());
+            stage_twins(
+                &mut index,
+                &[(&early, t0()), (&later, t0() + 60_000_000_000)],
+            );
+            let first = parse(&early, Some(t0()), &index, &history);
+            let second = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
+            assert_eq!(
+                fold(&first).entity.totals().1,
+                2,
+                "earliest subagent counts fully"
+            );
+            assert_eq!(fold(&second).entity.removed_requests, 2);
+            let mut items = vec![first, second];
+            if reverse {
+                items.reverse();
+            }
+            let got = publish(
+                items,
+                Some(&sidecar(&[row("a", 1, 10), row("b", 2, 20)])),
+                TelemetryRead::Loaded,
+                &index,
+            );
+            assert_eq!(got.len(), 1);
+            assert_eq!(got[0].request_count, 2 + u64::from(overlap));
+            assert_eq!(got[0].input_tokens, if overlap { 60 } else { 30 });
+            assert_eq!(got[0].removed_request_count, Some(2));
+            assert_eq!(
+                got[0].cost.as_ref().unwrap().total_cost_usd.as_deref(),
+                Some("0.0002")
+            );
+            fs::remove_dir_all(early.ancestors().nth(3).unwrap()).unwrap();
+            fs::remove_dir_all(later.ancestors().nth(3).unwrap()).unwrap();
+        }
+    }
+}
+
+#[test]
+fn e2_recreated_or_truncated_original_cannot_witness_a_copy() {
+    for (truncated, partial) in [(false, false), (false, true), (true, false), (true, true)] {
+        let early = root_file("stale-early");
+        let later = root_file("stale-later");
+        let mut historical = line("h", &at(-100), 10);
+        historical["fixture_padding"] = json!("h".repeat(512));
+        let history = [historical];
+        let original_bytes = serde_json::to_vec(&history[0]).unwrap();
+        fs::write(&early, &original_bytes).unwrap();
+        let old_handle = fs::File::open(&early).unwrap();
+        let mut index = ScanIndex::default();
+        parse_and_remember(&early, t0(), &mut index, &history);
+        index
+            .files
+            .get_mut(&local_index_key(&early))
+            .unwrap()
+            .size_bytes = original_bytes.len() as u64;
+        index.files.insert(local_index_key(&later), entry());
+        // Keep the old inode open, so unlink/create cannot recycle it.
+        if !truncated {
+            fs::remove_file(&early).unwrap();
+        }
+        let mut replacement = line("u", &at(121), 20);
+        if !truncated {
+            replacement["fixture_padding"] = json!("u".repeat(1024));
+        }
+        fs::write(&early, serde_json::to_vec(&replacement).unwrap()).unwrap();
+        let current = fs::metadata(&early).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                current.ino() == old_handle.metadata().unwrap().ino(),
+                truncated
+            );
+        }
+        assert_eq!(
+            current.len() < original_bytes.len() as u64,
+            truncated,
+            "new-inode case grows, so identity alone must reject it; truncation case shrinks"
+        );
+        let mut later_lines = history.to_vec();
+        if partial {
+            later_lines.push(line("own", &at(61), 40));
+        }
+        fs::write(
+            &later,
+            later_lines
+                .iter()
+                .map(|line| serde_json::to_string(line).unwrap() + "\n")
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut index = restart(&index); // generation/extent evidence survives restart
+        stage_twins(
+            &mut index,
+            &[
+                (&early, t0() + 120_000_000_000),
+                (&later, t0() + 60_000_000_000),
+            ],
+        );
+        let early_item = parse(&early, Some(t0() + 120_000_000_000), &index, &[replacement]);
+        let later_item = parse(&later, Some(t0() + 60_000_000_000), &index, &later_lines);
+        assert_eq!(fold(&later_item).entity.removed_requests, 0);
+        assert_eq!(fold(&later_item).entity.totals().1, 1 + u64::from(partial));
+        assert!(fold(&later_item).disclosed > 0);
+        let got = publish(
+            vec![early_item, later_item],
+            None,
+            TelemetryRead::Loaded,
+            &index,
+        );
+        assert_eq!(
+            (got[0].request_count, got[0].input_tokens),
+            (2 + u64::from(partial), if partial { 70 } else { 30 })
+        );
+        assert_eq!(got[0].removed_request_count, Some(0));
+        assert_eq!(got[0].removed_usage, Some(ClaudeRemovedUsage::default()));
+        cleanup(&[&early, &later]);
+    }
+}
+
+fn without_version(mut value: Value) -> Value {
+    value.as_object_mut().unwrap().remove("version");
+    value
+}
+
+#[test]
+fn e2_missing_own_writer_invalidates_known_prefix_and_both_own_orders() {
+    let path = root_file("missing-writer");
+    let index = ScanIndex::default();
+    for order in [0, 1, 2, 3, 4] {
+        let prefix = line("prefix", &at(-100), 10);
+        let a = line("a", &at(1), 20);
+        let b = line("b", &at(2), 30);
+        let lines = match order {
+            0 => vec![prefix, without_version(a)],
+            1 => vec![prefix, without_version(a), b],
+            2 => vec![prefix, a, without_version(b)],
+            3 => {
+                let mut missing = without_version(a);
+                missing.as_object_mut().unwrap().remove("timestamp");
+                vec![prefix, missing, b]
+            }
+            _ => {
+                let mut missing = without_version(b);
+                missing.as_object_mut().unwrap().remove("timestamp");
+                vec![prefix, a, missing]
+            }
+        };
+        let item = parse(&path, Some(t0()), &index, &lines);
+        assert_eq!(fold(&item).entity.removed_requests, 0);
+        assert_eq!(fold(&item).entity.totals().1, lines.len() as u64);
+        assert!(fold(&item).disclosed > 0);
+        let got = publish(vec![item], None, TelemetryRead::Loaded, &index);
+        assert_eq!(got[0].request_count, lines.len() as u64);
+    }
+    cleanup(&[&path]);
+}
+
+#[test]
+fn e2_all_prebirth_twins_require_known_response_writers() {
+    for missing in [false, true] {
+        let early = root_file("unknown-early");
+        let later = root_file("unknown-later");
+        let mut index = ScanIndex::default();
+        index.files.insert(local_index_key(&early), entry());
+        index.files.insert(local_index_key(&later), entry());
+        stage_twins(
+            &mut index,
+            &[(&early, t0()), (&later, t0() + 60_000_000_000)],
+        );
+        let original = line("h", &at(-100), 10);
+        let copy = if missing {
+            without_version(original.clone())
+        } else {
+            versioned(original.clone(), "99.0.0")
+        };
+        let item = parse(&later, Some(t0() + 60_000_000_000), &index, &[copy]);
+        assert_eq!(fold(&item).entity.removed_requests, 0);
+        assert_eq!(fold(&item).entity.totals().1, 1);
+        assert!(fold(&item).disclosed > 0);
+        let got = publish(
+            vec![parse(&early, Some(t0()), &index, &[original]), item],
+            None,
+            TelemetryRead::Loaded,
+            &index,
+        );
+        assert_eq!((got[0].request_count, got[0].input_tokens), (2, 20));
+        cleanup(&[&early, &later]);
+    }
 }

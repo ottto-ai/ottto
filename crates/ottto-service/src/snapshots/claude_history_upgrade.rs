@@ -455,7 +455,7 @@ pub(crate) struct HistoryPage {
     /// Its reservation takes them too, both or neither.
     staged_twins: Option<(String, Vec<(String, u64)>)>,
     /// E2: this page's indexed path-twin groups by member, built once on the
-    /// page's first owed candidate. Only members with two or more paths.
+    /// page's first parsed candidate. Only members with two or more paths.
     twin_index: Option<BTreeMap<String, Vec<(String, u64)>>>,
 }
 
@@ -682,12 +682,35 @@ impl HistoryEmission {
 }
 
 impl super::ScanIndex {
-    /// E2: stage the indexed path twins of owed candidate `index_key` for
-    /// this page's budget reservation (`HistoryPage::reserve`).
-    pub(super) fn stage_claude_history_twins(&self, index_key: &str, page: &mut HistoryPage) {
+    /// E2: stage the births of every indexed path twin before the candidate
+    /// folds; owed candidates also reserve their twins through HistoryPage.
+    pub(super) fn stage_claude_history_twins(&mut self, index_key: &str, page: &mut HistoryPage) {
+        if page.twin_index.is_none() {
+            self.claude_money_birth_store.begin_page();
+        }
         let groups = page
             .twin_index
             .get_or_insert_with(|| claude_path_twin_groups(&self.files));
+        if let Some((_, member)) =
+            super::claude_index_path_family_member(std::path::Path::new(index_key))
+        {
+            if let Some(keys) = groups.get(&member) {
+                for (key, size) in keys {
+                    if self.claude_money_birth_store.staged(key) {
+                        continue;
+                    }
+                    // Exactly one metadata read per indexed twin per page. No content read.
+                    let opened = std::fs::metadata(key)
+                        .ok()
+                        .filter(|m| m.is_file())
+                        .map(|m| {
+                            super::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m)
+                        });
+                    self.claude_money_birth_store
+                        .stage_opened(&member, key, opened, *size);
+                }
+            }
+        }
         let twins = super::claude_index_path_family_member(std::path::Path::new(index_key))
             .and_then(|(_, member)| groups.get(&member))
             .map(|keys| {
@@ -1902,12 +1925,8 @@ mod tests {
     /// pair held by another file's reservation settles on the next page.
     #[test]
     fn path_twins_reserve_both_or_neither_and_settle_within_two_pages() {
-        let index = twin_index(&[(TWIN_A, 10), (TWIN_B, 12), (OTHER, 5), (AGENT, 7)]);
+        let mut index = twin_index(&[(TWIN_A, 10), (TWIN_B, 12), (OTHER, 5), (AGENT, 7)]);
         let list = installed("");
-        let owed = |page: &mut HistoryPage, key: &str, size: u64| {
-            index.stage_claude_history_twins(key, page);
-            decide(HistoryKind::Owed, &inputs(&list, false, 2), page, key, size)
-        };
         let mut staged = HistoryPage::default();
         index.stage_claude_history_twins(TWIN_A, &mut staged);
         assert_eq!(
@@ -1917,6 +1936,20 @@ mod tests {
         );
         index.stage_claude_history_twins(OTHER, &mut staged);
         assert_eq!(staged.staged_twins, Some((OTHER.to_owned(), Vec::new())));
+        assert!(index.claude_money_birth_store.staged(TWIN_A));
+        assert!(index.claude_money_birth_store.staged(TWIN_B));
+        assert!(
+            !index.claude_money_birth_store.staged(OTHER),
+            "a lone root pays no metadata probe"
+        );
+        assert!(
+            !index.claude_money_birth_store.staged(AGENT),
+            "a lone agent pays no metadata probe"
+        );
+        let mut owed = |page: &mut HistoryPage, key: &str, size: u64| {
+            index.stage_claude_history_twins(key, page);
+            decide(HistoryKind::Owed, &inputs(&list, false, 2), page, key, size)
+        };
         for budget in [1, 2] {
             super::super::with_body_witness_adoption_page_budget(budget, || {
                 // Page 1: another owed file takes the page first.
