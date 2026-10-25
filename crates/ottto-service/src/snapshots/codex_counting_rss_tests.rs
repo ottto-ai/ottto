@@ -1,9 +1,15 @@
 //! Explicit, serial, synthetic macOS screening. This does not satisfy the
 //! separate real-history activation gate or bound whole-daemon memory.
+//!
+//! Opt-in real mode (`OTTTO_CODEX_RSS_REAL_DIR`, never set in CI) runs the
+//! same children over a frozen private directory of Codex rollouts. It prints
+//! only counts, sizes, hashes, resources and token totals: no record content,
+//! session ids, model names or paths, including on failure.
 use super::*;
 use crate::local_resource_diagnostics::cache_lifecycle;
 use crate::transcript_acquisition::Scope;
 use std::io::{BufWriter, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,9 +21,45 @@ const HISTORY: &str = "019fa111-2222-7333-8444-000000000001";
 const PENDING: &str = "019fa111-2222-7333-8444-000000000002";
 const CLOSED_TURNS: u64 = 10_000;
 const RSS_CAP: u64 = 1024 * 1024 * 1024;
-const CPU_CAP_US: u64 = 120_000_000;
-const WALL_CAP: Duration = Duration::from_secs(300);
 const REVISION: &str = "codex-rss-synthetic-v1";
+const REAL_DIR: &str = "OTTTO_CODEX_RSS_REAL_DIR";
+const RECEIPT: &str = "codex_v2_rss_receipt: ";
+const REAL_RECEIPT: &str = "codex_v2_rss_real_receipt: ";
+// Planned per-child read: the cold prefix plus a worst-case full re-read.
+const REAL_CHILD_DECODED_CAP: u64 = 2 * 1024 * 1024 * 1024;
+const REAL_TAIL_BYTES: u64 = 1024 * 1024;
+
+struct Caps {
+    rss: u64,
+    cpu_us: u64,
+    wall: Duration,
+    total: Duration,
+    pages: usize,
+}
+const SYNTHETIC_CAPS: Caps = Caps {
+    rss: RSS_CAP,
+    cpu_us: 120_000_000,
+    wall: Duration::from_secs(300),
+    total: Duration::from_secs(900),
+    pages: 32,
+};
+const REAL_CAPS: Caps = Caps {
+    rss: 1536 * 1024 * 1024,
+    cpu_us: 300_000_000,
+    wall: Duration::from_secs(600),
+    total: Duration::from_secs(1800),
+    pages: 48,
+};
+fn real_mode() -> bool {
+    std::env::var_os(REAL_DIR).is_some()
+}
+fn caps() -> &'static Caps {
+    if real_mode() {
+        &REAL_CAPS
+    } else {
+        &SYNTHETIC_CAPS
+    }
+}
 
 type Money = BTreeMap<String, Value>;
 
@@ -251,10 +293,29 @@ fn prepare(root: &Path) -> (u64, u64, u64) {
     assert!(records <= 100_000);
     (bytes, records, cold_len)
 }
+/// Private run settings shared by the real-mode parent and children; never printed.
+fn real_config(root: &Path) -> Value {
+    serde_json::from_slice(&fs::read(root.join("real.json")).unwrap()).unwrap()
+}
+fn target(root: &Path) -> PathBuf {
+    if real_mode() {
+        let name = real_config(root)["target"].as_str().unwrap().to_string();
+        root.join("sessions").join(name)
+    } else {
+        root.join("sessions/pending.jsonl")
+    }
+}
+fn scan_now(root: &Path) -> String {
+    if real_mode() {
+        real_config(root)["now"].as_str().unwrap().to_string()
+    } else {
+        NOW.to_string()
+    }
+}
 fn reset(root: &Path, cold_len: u64) {
     fs::OpenOptions::new()
         .write(true)
-        .open(root.join("sessions/pending.jsonl"))
+        .open(target(root))
         .unwrap()
         .set_len(cold_len)
         .unwrap();
@@ -263,7 +324,7 @@ fn append_tail(root: &Path) {
     let tail = fs::read(root.join("tail.jsonl")).unwrap();
     fs::OpenOptions::new()
         .append(true)
-        .open(root.join("sessions/pending.jsonl"))
+        .open(target(root))
         .unwrap()
         .write_all(&tail)
         .unwrap();
@@ -285,6 +346,11 @@ struct Observed {
     open_debt_seen: bool,
     overflow_seen: bool,
     joined_seen: bool,
+    // Real mode reports these instead of asserting a clean synthetic shape.
+    malformed_lines: usize,
+    dropped_usage_records: u64,
+    ownership_incomplete_files: usize,
+    over_line_cap: usize,
 }
 /// Complete one bounded acquisition, including all cursor pages, with the
 /// same production namespace/cache. `None` is the unpaged full-read control.
@@ -295,12 +361,14 @@ fn acquire(
     out: &mut Money,
     observed: &mut Observed,
 ) -> ScanIndex {
-    for _ in 0..32 {
+    let real = real_mode();
+    let now = scan_now(root);
+    for _ in 0..caps().pages {
         let mut scan = OwnedSourceScan::new(
             SnapshotSource::Codex,
             &[root.join("sessions")],
             index,
-            NOW,
+            &now,
             BACKFILL_WINDOW_DAYS,
             8,
             false,
@@ -320,7 +388,7 @@ fn acquire(
             {
                 let (rows, min, max) = counting.rss_pending_shape();
                 observed.max_pending_rows = observed.max_pending_rows.max(rows);
-                if rows == 64 {
+                if rows == 64 && !real {
                     assert_eq!((min, max), (4096, 4096), "all 64 rows at the content cap");
                     observed.maximal_rows_seen = true;
                 }
@@ -336,10 +404,16 @@ fn acquire(
                     ..
                 } => {
                     observed.pages += 1;
-                    assert_eq!(scan.malformed_json_line_count, 0);
-                    assert_eq!(scan.dropped_usage_record_count, 0);
-                    assert_eq!(scan.ownership_incomplete_file_count, 0);
-                    assert_eq!(scan.over_line_cap_count, 0);
+                    observed.malformed_lines += scan.malformed_json_line_count;
+                    observed.dropped_usage_records += scan.dropped_usage_record_count;
+                    observed.ownership_incomplete_files += scan.ownership_incomplete_file_count;
+                    observed.over_line_cap += scan.over_line_cap_count;
+                    if !real {
+                        assert_eq!(scan.malformed_json_line_count, 0);
+                        assert_eq!(scan.dropped_usage_record_count, 0);
+                        assert_eq!(scan.ownership_incomplete_file_count, 0);
+                        assert_eq!(scan.over_line_cap_count, 0);
+                    }
                     if let Some(c) = scan.codex_counting_v2.as_ref() {
                         observed.open_debt_seen |= c.open_turn_ui_pending_events_this_scan == 64;
                         observed.overflow_seen |= c.pending_overflow_flushes > 0;
@@ -362,7 +436,7 @@ fn acquire(
             }
         }
     }
-    panic!("acquisition exceeded 32 pages");
+    panic!("acquisition exceeded its fixed page cap");
 }
 fn process_sample() -> (u64, u64) {
     let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
@@ -381,17 +455,42 @@ fn process_sample() -> (u64, u64) {
         micros(usage.ru_utime) + micros(usage.ru_stime),
     )
 }
-fn measured_child(root: &Path, case: &str) {
-    let start = Instant::now();
-    // Process-lifetime caps, enforced during acquisition, not just at EOF.
+/// Process-lifetime caps, enforced during acquisition, not just at EOF.
+fn watchdog(start: Instant, rss_cap: u64, cpu_cap_us: u64, wall: Duration) {
     std::thread::spawn(move || loop {
         let (rss, cpu) = process_sample();
-        if rss > RSS_CAP || cpu > CPU_CAP_US || start.elapsed() > WALL_CAP {
-            eprintln!("synthetic RSS child exceeded a fixed resource cap");
+        if rss > rss_cap || cpu > cpu_cap_us || start.elapsed() > wall {
+            eprintln!("RSS measurement exceeded a fixed resource cap");
             std::process::exit(90);
         }
         std::thread::sleep(Duration::from_millis(100));
     });
+}
+/// Numbers only: summed money dimensions across sessions.
+fn totals(money: &Money) -> Value {
+    let mut out = BTreeMap::<&str, u64>::new();
+    for item in money.values() {
+        for key in [
+            "input",
+            "read",
+            "write_5m",
+            "write_1h",
+            "output",
+            "reasoning",
+            "unattributed",
+            "requests",
+        ] {
+            let total = out.entry(key).or_default();
+            *total = total.saturating_add(item[key].as_u64().unwrap_or(0));
+        }
+    }
+    json!(out)
+}
+fn measured_child(root: &Path, case: &str) {
+    let start = Instant::now();
+    let real = real_mode();
+    let caps = caps();
+    watchdog(start, caps.rss, caps.cpu_us, caps.wall);
     let _cutover = (case == "v2").then(|| codex_counting_version::TestCutover::set(0));
     let expected: Vec<Money> =
         serde_json::from_slice(&fs::read(root.join(format!("{case}-expected.json"))).unwrap())
@@ -399,9 +498,11 @@ fn measured_child(root: &Path, case: &str) {
     let cache = Arc::new(sampled_scan::SharedCache::default());
     let mut out = Money::new();
     let mut observed = Observed::default();
+    let mut retained_after_cold = false;
     let ((retained_prefill, retained_cold, retained_tail), counts) =
         cache_lifecycle::observe(|| {
-            let retained_prefill = prefill(root, &cache);
+            // Synthetic pressure entries are not mixed into real histories.
+            let retained_prefill = if real { 0 } else { prefill(root, &cache) };
             let index = acquire(
                 root,
                 ScanIndex::default(),
@@ -409,21 +510,58 @@ fn measured_child(root: &Path, case: &str) {
                 &mut out,
                 &mut observed,
             );
-            assert_eq!(out, expected[0], "cold money differs across paging");
-            assert!(
-                cache
-                    .retained_sealed_offset(&local_index_key(&root.join("sessions/pending.jsonl")))
-                    .is_some(),
-                "open-turn file must actually be retained"
-            );
+            retained_after_cold = cache
+                .retained_sealed_offset(&local_index_key(&target(root)))
+                .is_some();
+            if !real {
+                assert_eq!(out, expected[0], "cold money differs across paging");
+                assert!(
+                    retained_after_cold,
+                    "open-turn file must actually be retained"
+                );
+            }
             let retained_cold = crate::heap_layout_bound::bound(&*cache, usize::MAX).unwrap();
             append_tail(root);
             acquire(root, index, Some(&cache), &mut out, &mut observed);
-            assert_eq!(out, expected[1], "tail money differs from a full read");
+            if !real {
+                assert_eq!(out, expected[1], "tail money differs from a full read");
+            }
             let retained_tail = crate::heap_layout_bound::bound(&*cache, usize::MAX).unwrap();
             (retained_prefill, retained_cold, retained_tail)
         });
     let cursor = cache.counters_for_test();
+    let metadata: Value =
+        serde_json::from_slice(&fs::read(root.join("metadata.json")).unwrap()).unwrap();
+    if real {
+        // Paged cold + retained tail against the unpaged full read. Never
+        // format either map: keys are session ids and model names.
+        let full = expected.last().unwrap();
+        let matches = out == *full;
+        let (rss, cpu) = process_sample();
+        println!(
+            "\n{REAL_RECEIPT}{}",
+            json!({"mode":"real","case":case,
+            "sha":std::env::var("GITHUB_SHA").expect("source SHA receipt"),"input":metadata,
+            "rustc":env!("OTTTO_SCAN_LAYOUT_RUSTC"),"layout_supported":true,
+            "peak_rss_bytes":rss,"cpu_us":cpu,"wall_us":start.elapsed().as_micros(),
+            "retained_cold_bytes":retained_cold,"retained_tail_bytes":retained_tail,
+            "retained_after_cold":retained_after_cold,
+            "cache_take_hit":counts.take_hit,"cache_insert_admitted":counts.insert_admitted,
+            "cursor_paused":cursor.jobs_paused,"cursor_resumed":cursor.jobs_resumed,
+            "tail_files":observed.tails,"pages":observed.pages,"max_pending_rows":observed.max_pending_rows,
+            "open_debt_seen":observed.open_debt_seen,"overflow_seen":observed.overflow_seen,
+            "scan_counts":{"malformed_lines":observed.malformed_lines,
+                "dropped_usage_records":observed.dropped_usage_records,
+                "ownership_incomplete_files":observed.ownership_incomplete_files,
+                "over_line_cap":observed.over_line_cap},
+            "sessions":out.len(),"full_read_sessions":full.len(),
+            "totals":totals(&out),"full_read_totals":totals(full),
+            "money_matches_full_read":matches,"cache_counts":counts})
+        );
+        assert!(rss <= caps.rss && cpu <= caps.cpu_us && start.elapsed() <= caps.wall);
+        assert!(matches, "real paged money differs from the full read");
+        return;
+    }
     assert!(counts.take_hit > 0 && counts.insert_admitted > 4);
     assert!(
         counts.copy_refusal_entries_evicted
@@ -439,11 +577,9 @@ fn measured_child(root: &Path, case: &str) {
         assert!(observed.maximal_rows_seen && observed.open_debt_seen && observed.overflow_seen);
     }
     let (rss, cpu) = process_sample();
-    assert!(rss <= RSS_CAP && cpu <= CPU_CAP_US && start.elapsed() <= WALL_CAP);
-    let metadata: Value =
-        serde_json::from_slice(&fs::read(root.join("metadata.json")).unwrap()).unwrap();
+    assert!(rss <= caps.rss && cpu <= caps.cpu_us && start.elapsed() <= caps.wall);
     println!(
-        "\ncodex_v2_rss_receipt: {}",
+        "\n{RECEIPT}{}",
         json!({"fixture_revision":REVISION,"case":case,
         "sha":std::env::var("GITHUB_SHA").expect("CI SHA receipt"),"input":metadata,
         "rustc":env!("OTTTO_SCAN_LAYOUT_RUSTC"),"layout_supported":true,
@@ -458,32 +594,93 @@ fn measured_child(root: &Path, case: &str) {
     );
 }
 
-#[test]
-#[ignore = "dedicated macOS CI step: serial bounded synthetic child-process measurement"]
-fn codex_v2_synthetic_peak_rss() {
-    assert!(
-        crate::heap_layout_bound::layout_supported(),
-        "supported native layout required"
-    );
-    assert!(env!("OTTTO_SCAN_LAYOUT_RUSTC").starts_with("rustc 1.95.0 "));
-    if let Ok(case) = std::env::var(CHILD) {
-        assert!(matches!(case.as_str(), "legacy" | "v2"));
-        measured_child(
-            Path::new(&std::env::var("OTTTO_SYNTHETIC_RSS_ROOT").unwrap()),
-            &case,
-        );
-        return;
+fn sha256_file(path: &Path) -> String {
+    let mut file = File::open(path).unwrap();
+    let mut digest = Sha256::new();
+    let mut buffer = vec![0; 1 << 20];
+    loop {
+        let n = file.read(&mut buffer).unwrap();
+        if n == 0 {
+            break;
+        }
+        digest.update(&buffer[..n]);
     }
-    let started = Instant::now();
-    let fixture = Fixture(std::env::temp_dir().join(format!(
-            "ottto-synthetic-rss-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        )));
-    let root = &fixture.0;
+    format!("{:x}", digest.finalize())
+}
+/// Copy every top-level `.jsonl` of the frozen directory into the private
+/// work root, then split the largest at a line boundary into a cold prefix
+/// and a small retained-round tail. Content is only parsed, never printed.
+fn prepare_real(src: &Path, root: &Path) -> u64 {
+    let sessions = root.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    let mut names: Vec<_> = fs::read_dir(src)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter(|entry| {
+            entry.file_type().unwrap().is_file()
+                && entry.file_name().to_string_lossy().ends_with(".jsonl")
+        })
+        .map(|entry| entry.file_name())
+        .collect();
+    names.sort();
+    assert!(
+        (1..=8).contains(&names.len()),
+        "real mode needs 1..=8 top-level .jsonl files"
+    );
+    let sizes: Vec<u64> = names
+        .iter()
+        .map(|name| fs::metadata(src.join(name)).unwrap().len())
+        .collect();
+    let total: u64 = sizes.iter().sum();
+    assert!(
+        total.saturating_mul(2) <= REAL_CHILD_DECODED_CAP,
+        "real input exceeds the per-child decoded cap"
+    );
+    let mut files = Vec::new();
+    for (name, &bytes) in names.iter().zip(&sizes) {
+        let copy = sessions.join(name);
+        assert_eq!(fs::copy(src.join(name), &copy).unwrap(), bytes);
+        // The frozen source is read-only; the work copy is truncated and appended.
+        fs::set_permissions(&copy, fs::Permissions::from_mode(0o600)).unwrap();
+        files.push(json!({"bytes":bytes,"sha256":sha256_file(&copy)}));
+    }
+    let largest = (0..names.len()).max_by_key(|&n| sizes[n]).unwrap();
+    let len = sizes[largest];
+    assert!(len >= 2, "real history too small to split");
+    let window = len.min(32 * 1024 * 1024);
+    let start = len - window;
+    let mut file = File::open(sessions.join(&names[largest])).unwrap();
+    file.seek(SeekFrom::Start(start)).unwrap();
+    let mut bytes = Vec::new();
+    file.take(window).read_to_end(&mut bytes).unwrap();
+    // First boundary at or after the target tail size, else the last before
+    // it; the final byte is never a split point.
+    let wanted = (window - REAL_TAIL_BYTES.min(window / 2)) as usize;
+    let split = bytes[wanted..bytes.len() - 1]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|n| wanted + n)
+        .or_else(|| bytes[..wanted].iter().rposition(|&b| b == b'\n'))
+        .expect("real history needs a line boundary near its end");
+    let cold_len = start + split as u64 + 1;
+    assert!(cold_len < len);
+    fs::write(root.join("tail.jsonl"), &bytes[split + 1..]).unwrap();
+    fs::write(
+        root.join("real.json"),
+        json!({"target":names[largest].to_str().unwrap(),"now":crate::backfill::now_rfc3339()})
+            .to_string(),
+    )
+    .unwrap();
+    fs::write(
+        root.join("metadata.json"),
+        json!({"files":names.len(),"decoded_bytes":total,"cold_bytes":total - (len - cold_len),
+        "tail_bytes":len - cold_len,"files_sha256":files})
+        .to_string(),
+    )
+    .unwrap();
+    cold_len
+}
+fn prepare_synthetic(root: &Path) -> u64 {
     let (bytes, records, cold_len) = prepare(root);
     fs::write(
         root.join("metadata.json"),
@@ -525,6 +722,81 @@ fn codex_v2_synthetic_peak_rss() {
         )
         .unwrap();
     }
+    cold_len
+}
+/// The unmeasured parent's unpaged full-read controls over the whole input.
+fn real_controls(root: &Path) {
+    for case in ["legacy", "v2"] {
+        let _cutover = (case == "v2").then(|| codex_counting_version::TestCutover::set(0));
+        let mut full = Money::new();
+        acquire(
+            root,
+            ScanIndex::default(),
+            None,
+            &mut full,
+            &mut Observed::default(),
+        );
+        fs::write(
+            root.join(format!("{case}-expected.json")),
+            serde_json::to_vec(&[full]).unwrap(),
+        )
+        .unwrap();
+    }
+}
+
+#[test]
+#[ignore = "dedicated macOS CI step: serial bounded synthetic child-process measurement"]
+fn codex_v2_synthetic_peak_rss() {
+    assert!(
+        crate::heap_layout_bound::layout_supported(),
+        "supported native layout required"
+    );
+    assert!(env!("OTTTO_SCAN_LAYOUT_RUSTC").starts_with("rustc 1.95.0 "));
+    if let Ok(case) = std::env::var(CHILD) {
+        assert!(matches!(case.as_str(), "legacy" | "v2"));
+        measured_child(
+            Path::new(&std::env::var("OTTTO_SYNTHETIC_RSS_ROOT").unwrap()),
+            &case,
+        );
+        return;
+    }
+    let started = Instant::now();
+    let caps = caps();
+    let real_src = std::env::var_os(REAL_DIR).map(PathBuf::from);
+    let real = real_src.is_some();
+    if real {
+        // The parent's controls read the whole private input; bound them too.
+        watchdog(started, caps.rss, 2 * caps.cpu_us, caps.total);
+    }
+    // Real work copies stay inside the private frozen directory.
+    let fixture = Fixture(
+        real_src
+            .clone()
+            .unwrap_or_else(std::env::temp_dir)
+            .join(format!(
+                "{}-{}-{}",
+                if real {
+                    ".ottto-rss-real-work"
+                } else {
+                    "ottto-synthetic-rss"
+                },
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            )),
+    );
+    let root = &fixture.0;
+    let cold_len = match &real_src {
+        Some(src) => {
+            let cold_len = prepare_real(src, root);
+            real_controls(root);
+            cold_len
+        }
+        None => prepare_synthetic(root),
+    };
+    let prefix = if real { REAL_RECEIPT } else { RECEIPT };
     for case in ["legacy", "v2"] {
         reset(root, cold_len);
         let log = root.join(format!("{case}.log"));
@@ -548,21 +820,30 @@ fn codex_v2_synthetic_peak_rss() {
             if let Some(status) = child.try_wait().unwrap() {
                 break status;
             }
-            if child_started.elapsed() > WALL_CAP || started.elapsed() > Duration::from_secs(900) {
+            if child_started.elapsed() > caps.wall || started.elapsed() > caps.total {
                 child.kill().unwrap();
                 child.wait().unwrap();
-                panic!("synthetic measurement exceeded fixed wall cap");
+                panic!("RSS measurement exceeded fixed wall cap");
             }
             std::thread::sleep(Duration::from_millis(100));
         };
-        let log = fs::read_to_string(log).unwrap();
-        assert!(status.success(), "{case} child failed: {log}");
+        let log = String::from_utf8_lossy(&fs::read(log).unwrap()).into_owned();
         let receipts: Vec<_> = log
             .lines()
-            .filter(|line| line.starts_with("codex_v2_rss_receipt: "))
+            .filter(|line| line.starts_with(prefix))
             .collect();
+        if real {
+            // The child log may hold private panic text: relay receipts only.
+            for receipt in &receipts {
+                println!("\n{receipt}");
+            }
+            assert!(status.success(), "{case} child failed: {status}");
+            assert_eq!(receipts.len(), 1, "one receipt per child required");
+            continue;
+        }
+        assert!(status.success(), "{case} child failed: {log}");
         assert_eq!(receipts.len(), 1, "one receipt per child required");
         println!("\n{}", receipts[0]);
     }
-    assert!(started.elapsed() <= Duration::from_secs(900));
+    assert!(started.elapsed() <= caps.total);
 }
