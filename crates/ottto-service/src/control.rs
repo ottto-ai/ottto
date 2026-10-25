@@ -857,7 +857,12 @@ fn handle_command(
     match command {
         LocalControlCommand::Status {
             refresh_agent_status,
+            retry_relay_authorization,
         } => {
+            if retry_relay_authorization {
+                require_authorized_local_client(daemon, &authorization)?;
+                crate::snapshot_sync::reset_relay_authorization_backoff();
+            }
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
                     FileCodexAccountSlotSettingsStore::default().background_quota_refresh_allowed()
@@ -879,6 +884,7 @@ fn handle_command(
             status.update.install_owner = detect_install_owner();
             status.service_owner = service_owner_state(client_install_owner);
             crate::refresh_canonical_local_health(&mut status);
+            status.account = crate::effective_account_binding(&status);
             let mut value = to_value(status)?;
             inject_machine_icon(&mut value);
             Ok(value)
@@ -919,7 +925,11 @@ fn handle_command(
                 })?,
             )
         }
-        LocalControlCommand::AuthStatus => to_value(status_for(daemon, &authorization)?),
+        LocalControlCommand::AuthStatus => {
+            let mut status = status_for(daemon, &authorization)?;
+            status.account = crate::effective_account_binding(&status);
+            to_value(status)
+        }
         LocalControlCommand::AgentStatusRefresh {
             source,
             quota_refresh,
@@ -1497,11 +1507,8 @@ fn account_for(
     daemon: &LocalDaemon,
     authorization: &RequestAuthorization,
 ) -> Result<LocalAccountBinding, LocalApiError> {
-    match authorization {
-        RequestAuthorization::Token(token) => Ok(daemon.status(token)?.account),
-        RequestAuthorization::TrustedCompanionApp => daemon.account_for_trusted_client(),
-        RequestAuthorization::Untrusted => Err(LocalApiError::LocalClientNotTrusted),
-    }
+    // The `account` command answers with the effective account, like `status`.
+    status_for(daemon, authorization).map(|status| crate::effective_account_binding(&status))
 }
 
 fn load_claude_config_slot_settings(
@@ -4110,6 +4117,7 @@ fn repair_source(
     if dry_run {
         return Ok(plan);
     }
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     if let Some(plan) = scan_index_rebuild_override_repair(daemon, authorization, &source, &plan) {
         return Ok(plan);
     }
@@ -5283,7 +5291,9 @@ fn auth_start(
     if let Some(pending) =
         resume_history_browser_claim(&status.machine, &validated_api_base_url(None)?)?
     {
-        return begin_durable_browser_claim(daemon, pending);
+        let response = begin_durable_browser_claim(daemon, pending)?;
+        crate::snapshot_sync::reset_relay_authorization_backoff();
+        return Ok(response);
     }
     if !history_pending {
         discard_abandoned_unconfirmed_claim_credential()?;
@@ -5292,7 +5302,7 @@ fn auth_start(
     let claim = create_setup_claim(&status.machine, &nonce)?;
     let nonce = claim.client_nonce.unwrap_or(nonce);
     let claim_url = append_nonce_to_claim_url(&claim.claim_url, &nonce);
-    begin_durable_browser_claim(
+    let response = begin_durable_browser_claim(
         daemon,
         PendingAuthClaim {
             claim_code: claim.claim_code,
@@ -5301,7 +5311,9 @@ fn auth_start(
             claim_url,
             expires_at: claim.expires_at,
         },
-    )
+    )?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
+    Ok(response)
 }
 
 fn begin_durable_browser_claim(
@@ -6671,6 +6683,16 @@ fn pending_device_credential_is_past_expiry(pending: &PendingDeviceCredentialPre
         .is_ok_and(|expires_at| expires_at <= time::OffsetDateTime::now_utc())
 }
 
+fn relay_auth_local_error(url: &str, status: u16) -> LocalApiError {
+    LocalApiError::Backend(BackendErrorDetails {
+        kind: BackendErrorKind::Rejected,
+        endpoint: safe_backend_endpoint(url),
+        status: Some(status),
+        body_excerpt: None,
+        reason_code: None,
+    })
+}
+
 fn probe_pruned_device_credential_authority(
     pending: &PendingDeviceCredentialPreparation,
     candidate_secret: &str,
@@ -6690,21 +6712,35 @@ fn probe_pruned_device_credential_authority(
         .first()
         .ok_or(LocalApiError::StatePoisoned)?;
     let body = relay_token_request_payload(&pending.device, source);
+    let mut probe =
+        crate::relay_auth::Probe::begin(&api_base_url, &pending.device, candidate_secret, source)
+            .map_err(|held| relay_auth_local_error(&url, held.status))?;
     match backend_post_json::<serde_json::Value>(
         &url,
         &body,
         &[("X-Ottto-Device-Secret", candidate_secret)],
     ) {
-        Ok(_) => Ok(PrunedDeviceCredentialProbe::Confirmed),
+        Ok(_) => {
+            probe.success();
+            Ok(PrunedDeviceCredentialProbe::Confirmed)
+        }
         Err(error)
             if matches!(
                 &error,
                 LocalApiError::Backend(details) if details.status == Some(401)
             ) && pending_device_credential_is_past_expiry(pending) =>
         {
+            probe.reject(401);
             Ok(PrunedDeviceCredentialProbe::Inactive)
         }
-        Err(error) => Err(error),
+        Err(error) => {
+            if let LocalApiError::Backend(details) = &error {
+                if let Some(status @ (401 | 403)) = details.status {
+                    probe.reject(status);
+                }
+            }
+            Err(error)
+        }
     }
 }
 
@@ -9087,6 +9123,7 @@ fn setup_run(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     let status = status_for(daemon, authorization)?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
@@ -20269,6 +20306,56 @@ for line in sys.stdin:
 
     #[test]
     #[serial]
+    fn pruned_credential_probe_shares_snapshot_backoff_without_treating_a_hold_as_inactive() {
+        let support_root = telemetry_key_store_root("credential-pruned-shared-gate");
+        let secret_root = telemetry_key_store_root("credential-pruned-shared-gate-secret");
+        fs::create_dir_all(&secret_root).expect("secret root");
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_root);
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind relay backend");
+        let api_base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (pending, candidate) = seed_pending_recovery_fixture(
+            api_base_url.clone(),
+            false,
+            "2020-01-01T00:00:00Z",
+            &secret_root,
+        );
+        let server_listener = listener.try_clone().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = server_listener
+                .accept()
+                .expect("accept snapshot token request");
+            let request = read_complete_http_request(&mut stream);
+            assert!(request.contains("/relay-token"));
+            write_json_response(&mut stream, 401, "Unauthorized", r#"{"detail":"invalid"}"#);
+            stream
+        });
+        let client = crate::snapshot_client::SnapshotApiClient::new(&api_base_url);
+        assert!(client
+            .issue_relay_token(
+                &pending.device,
+                &candidate,
+                crate::snapshots::SnapshotSource::Codex
+            )
+            .is_err());
+        let _connection = server.join().expect("relay backend");
+        assert!(matches!(
+            probe_pruned_device_credential_authority(&pending, &candidate),
+            Err(LocalApiError::Backend(details)) if details.status == Some(401)
+        ));
+        listener.set_nonblocking(true).unwrap();
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(
+            FilePendingDeviceCredentialStore::default().load().unwrap(),
+            Some(pending)
+        );
+    }
+
+    #[test]
+    #[serial]
     fn confirmed_pruned_preparation_recovers_via_normal_device_auth() {
         let support_root = telemetry_key_store_root("credential-pruned-confirmed");
         let secret_root = telemetry_key_store_root("credential-pruned-confirmed-secret");
@@ -20846,6 +20933,42 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
+    fn explicit_doctor_retries_unchanged_credentials_but_status_and_untrusted_requests_do_not() {
+        let device = LocalDeviceBinding {
+            device_id: "doctor-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/doctor-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
+        for (retry, token, ok) in [
+            (false, "token", true),
+            (true, "wrong", false),
+            (true, "token", true),
+        ] {
+            let response = handle_request(
+                &daemon(),
+                LocalControlRequest {
+                    request_id: "doctor-reset".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some(token.into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Status {
+                        refresh_agent_status: false,
+                        retry_relay_authorization: retry,
+                    },
+                },
+            );
+            assert_eq!(response.ok, ok);
+            let admitted = crate::relay_auth::Probe::begin(base, &device, "same", "codex");
+            assert_eq!(admitted.is_ok(), retry && ok);
+        }
+    }
+
+    #[test]
     fn handles_authenticated_status_request() {
         let response = handle_request(
             &daemon(),
@@ -20857,6 +20980,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -20867,6 +20991,58 @@ for line in sys.stdin:
             response.payload.expect("payload").get("daemon"),
             Some(&serde_json::Value::String("running".to_string()))
         );
+    }
+
+    #[test]
+    fn status_and_account_commands_answer_with_effective_reconnect_after_auth_rejection() {
+        let daemon = daemon().with_account(connected_account());
+        let saved = daemon.account_for_trusted_client().expect("saved account");
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let request = |command| LocalControlRequest {
+            request_id: "req_test".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            token: Some("token".to_string()),
+            client_kind: Some(LocalClientKind::Cli),
+            client_install_owner: None,
+            command,
+        };
+
+        for command in [
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            },
+            LocalControlCommand::AuthStatus,
+        ] {
+            let response = handle_request(&daemon, request(command));
+            assert!(response.ok, "{response:?}");
+            let payload = response.payload.expect("payload");
+            assert_eq!(payload["account"]["state"], "error");
+            assert_eq!(payload["account"]["message"]["code"], "reconnect_required");
+            assert_eq!(
+                payload["account"]["user"]["id"],
+                serde_json::json!(saved.user.as_ref().unwrap().id)
+            );
+            assert_eq!(
+                payload["canonical_health"]["account"]["state"],
+                "reconnect_required"
+            );
+        }
+
+        let response = handle_request(&daemon, request(LocalControlCommand::Account));
+        assert!(response.ok, "{response:?}");
+        let payload = response.payload.expect("payload");
+        assert_eq!(payload["state"], "error");
+        assert_eq!(payload["message"]["code"], "reconnect_required");
+        assert_eq!(
+            payload["user"]["id"],
+            serde_json::json!(saved.user.as_ref().unwrap().id)
+        );
+
+        // The saved binding is untouched.
+        assert_eq!(daemon.account_for_trusted_client().expect("account"), saved);
     }
 
     #[test]
@@ -20912,6 +21088,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -22480,6 +22657,42 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
+    fn auth_start_clears_backoff_after_starting_a_claim_but_not_after_backend_failure() {
+        let env = history_choice_test_env();
+        let secret_root = env.root.join("secrets");
+        fs::create_dir_all(&secret_root).unwrap();
+        let _secret_guard = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secret_root);
+        let (base, server) = scripted_json_backend(vec![(503, "{}"), (200, RECEIPT_CLAIM_SUCCESS)]);
+        let _api_guard = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &base);
+        let daemon = daemon();
+        let authorization = RequestAuthorization::Token("token".to_string());
+        let device = LocalDeviceBinding {
+            device_id: "started-claim-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let mut rejected =
+            crate::relay_auth::Probe::begin(&base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
+
+        assert!(matches!(
+            auth_start(&daemon, &authorization),
+            Err(LocalApiError::Backend(details)) if details.status == Some(503)
+        ));
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_err());
+
+        let response = auth_start(&daemon, &authorization).expect("start a new claim");
+        assert_eq!(response.account.state, LocalAccountState::ClaimPending);
+        assert_eq!(response.claim_code, "claim");
+        assert!(daemon.pending_auth_claim_snapshot().unwrap().is_some());
+        assert!(crate::relay_auth::Probe::begin(&base, &device, "same", "codex").is_ok());
+        assert_eq!(server.join().unwrap().len(), 2);
+    }
+
+    #[test]
+    #[serial]
     fn repeated_auth_start_reuses_unexpired_pending_claim() {
         // Daemon with an in-flight, far-future claim: auth_start must return
         // the SAME claim (idempotent re-trigger) without minting a new one —
@@ -22495,6 +22708,14 @@ for line in sys.stdin:
             })
             .expect("begin claim");
 
+        let device = LocalDeviceBinding {
+            device_id: "pending-claim-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/pending-claim-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
         let response = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
             .expect("auth start reuses pending claim");
         assert_eq!(response.claim_code, "claim_reuse");
@@ -22503,9 +22724,17 @@ for line in sys.stdin:
             response.account.state,
             ottto_protocol::LocalAccountState::ClaimPending
         );
+        assert!(
+            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_err(),
+            "reusing an in-flight claim does not start another sign-in or reset backoff"
+        );
+        crate::relay_auth::clear(crate::relay_auth::binding_key(
+            base, &device, "same", "codex",
+        ));
     }
 
     #[test]
+    #[serial]
     fn auth_start_on_connected_daemon_does_not_create_competing_claim() {
         let daemon = daemon();
         daemon
@@ -22528,6 +22757,14 @@ for line in sys.stdin:
             )
             .expect("connect account");
 
+        let device = LocalDeviceBinding {
+            device_id: "connect-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/connect-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
         let error = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
             .expect_err("connected auth start must be explicit");
         assert!(matches!(
@@ -22536,9 +22773,17 @@ for line in sys.stdin:
                 if message.contains("already connected") && message.contains("ottto logout")
         ));
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        assert!(
+            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_err(),
+            "an already-connected refusal must retain relay authorization backoff"
+        );
+        crate::relay_auth::clear(crate::relay_auth::binding_key(
+            base, &device, "same", "codex",
+        ));
     }
 
     #[test]
+    #[serial]
     fn verify_of_ended_setup_run_lets_sign_in_reconnect_the_connected_mac() {
         const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
         let _guard = lock_backend_test_env();
@@ -22629,6 +22874,62 @@ for line in sys.stdin:
                 .map(|user| user.id.as_str()),
             "the reconnect claim keeps the bound user"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn auth_rejected_upload_lets_sign_in_reconnect_the_connected_mac() {
+        let _guard = lock_backend_test_env();
+        let root = control_test_root("auth-rejected-sign-in");
+        let _home_guard = EnvVarGuard::set_path("HOME", &root);
+        let _support_guard =
+            EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &root.join("support"));
+        let daemon = daemon()
+            .with_account(connected_account())
+            .with_connection(Some(LocalConnectionBinding {
+                setup_run_id: "setup_current".to_string(),
+                setup_run_token_expires_at: "2100-01-01T00:00:00Z".to_string(),
+                machine_id: Some("machine_test".to_string()),
+                claim_code: None,
+                api_base_url: "https://api.ottto.net".to_string(),
+            }));
+        let authorization = RequestAuthorization::Token("token".to_string());
+        daemon
+            .begin_auth_with_claim(crate::PendingAuthClaim {
+                claim_code: "claim_reconnect".to_string(),
+                claim_token: "token_reconnect".to_string(),
+                nonce: "nonce_reconnect".to_string(),
+                claim_url: "https://ottto.net/setup/claim?code=claim_reconnect".to_string(),
+                expires_at: "2100-01-01T00:00:00Z".to_string(),
+            })
+            .expect("begin claim");
+
+        // A bound user with a connection still reads as connected, so the
+        // connected-account gate is reached and refuses while Ottto has said
+        // nothing terminal.
+        let error = auth_start(&daemon, &authorization)
+            .expect_err("healthy connected Mac refuses a new claim");
+        assert!(matches!(
+            error,
+            LocalApiError::InvalidRequest(message) if message.contains("already connected")
+        ));
+
+        // Ottto rejects the relay credentials: the answer says reconnect, and
+        // the sign-in it points to is admitted over the bound account.
+        daemon
+            .record_local_health_upload_failed(crate::LocalHealthUploadFailureKind::AuthRejected)
+            .expect("record upload failure");
+        let response = auth_start(&daemon, &authorization).expect("reconnect claim is allowed");
+        assert_eq!(response.claim_code, "claim_reconnect");
+        assert_eq!(
+            response.account.user.as_ref().map(|user| user.id.as_str()),
+            connected_account()
+                .user
+                .as_ref()
+                .map(|user| user.id.as_str()),
+            "the reconnect claim keeps the bound user"
+        );
+        let _ = fs::remove_dir_all(root);
     }
 
     /// A connected Mac with a device credential and a setup run bound to
@@ -25611,6 +25912,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -25663,6 +25965,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -26354,6 +26657,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
             Some(LocalClientPeer::trusted_for_tests()),
@@ -26375,6 +26679,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );

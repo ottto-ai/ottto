@@ -436,6 +436,149 @@ fn harvest_incomplete_workspace_preserves_cache_and_allows_healthy_upload() {
     fs::remove_dir_all(root).unwrap();
 }
 
+/// One harvest against a synthetic backend whose activity hint answers with
+/// `hint_labels` (`None` fails the fetch). Returns the uploaded payload.
+fn harvest_upload_with_hint(root: &Path, workspace: &Path, hint_labels: Option<bool>) -> Value {
+    use std::io::Read;
+    use std::net::TcpListener;
+
+    let label = match hint_labels {
+        Some(true) => "on",
+        Some(false) => "off",
+        None => "unknown",
+    };
+    let transcripts = root.join(label).join("home/.claude/projects");
+    let support = root.join(label).join("support");
+    for dir in [&transcripts, &support] {
+        fs::create_dir_all(dir).unwrap();
+    }
+    let now = OffsetDateTime::now_utc();
+    let file = transcripts.join("session.jsonl");
+    let record = json!({"type":"attachment","cwd":workspace,
+        "timestamp":iso_utc(now),"attachment":{"content":"label policy evidence"}});
+    fs::write(&file, serde_json::to_vec(&record).unwrap()).unwrap();
+    set_mtime(&file, SystemTime::now() - 2 * SETTLE_WINDOW);
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let api = format!("http://{}", listener.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let end = Instant::now() + Duration::from_secs(10);
+        let mut uploads = Vec::new();
+        while uploads.is_empty() && Instant::now() < end {
+            let (mut stream, _) = match listener.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("synthetic fixture accept: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+                assert!(header.len() <= 16 * 1024);
+            }
+            let header = String::from_utf8(header).unwrap();
+            let length = header
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().unwrap())
+                })
+                .unwrap_or(0);
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).unwrap();
+            let (status, response) = if header.contains("/relay-token ") {
+                ("200 OK", json!({"token":"synthetic-relay"}))
+            } else if header.contains("/activity-hints ") {
+                match hint_labels {
+                    Some(labels) => (
+                        "200 OK",
+                        json!({"source":"claude-code",
+                        "server_time":iso_utc(now),"record_count_15m":0,"record_count_24h":0,
+                        "local_usage_reconciliation_enabled":false,"backfill_window_days":14,
+                        "workspace_labels_enabled":labels,"recommended_scan_after":iso_utc(now)}),
+                    ),
+                    None => ("500 Internal Server Error", json!({"detail":"unavailable"})),
+                }
+            } else {
+                assert!(header.contains("/context-composition/snapshot "));
+                uploads.push(serde_json::from_slice::<Value>(&body).unwrap());
+                ("200 OK", json!({"accepted":true}))
+            };
+            let response = response.to_string();
+            write!(stream, "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", response.len(), response).unwrap();
+        }
+        uploads
+    });
+    let source = SnapshotSource::ClaudeCode;
+    let device = LocalDeviceBinding {
+        device_id: "synthetic-device".into(),
+        machine_id: Some("synthetic-machine".into()),
+        sources: vec![agent_source_label(source).into()],
+    };
+    harvest_source(
+        &SnapshotApiClient::new(&api),
+        &device,
+        "synthetic-secret",
+        "synthetic-machine",
+        &api,
+        std::slice::from_ref(&transcripts),
+        &support,
+        source,
+    )
+    .unwrap();
+    let mut uploads = server.join().unwrap();
+    assert_eq!(uploads.len(), 1, "{label}: exactly one upload");
+    uploads.pop().unwrap()
+}
+
+#[test]
+fn harvest_withholds_labels_unless_a_fetched_hint_allows_them() {
+    let root = crate::test_scratch::private_dir("composition-label-policy");
+    let workspace = root.join("label-policy-repo");
+    fs::create_dir_all(&workspace).unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&workspace)
+        .args(["init", "-q"])
+        .status()
+        .unwrap();
+    assert!(status.success());
+
+    let on = harvest_upload_with_hint(&root, &workspace, Some(true));
+    assert_eq!(on["workspace_label"], "label-policy-repo");
+    assert_eq!(on["workspace_label_source"], "repository");
+    assert_eq!(on["repository_label"], "label-policy-repo");
+    assert_eq!(on["repository_label_source"], "git_root");
+    // Policy OFF and a failed hint fetch upload the same withheld payload.
+    for hint_labels in [Some(false), None] {
+        let withheld = harvest_upload_with_hint(&root, &workspace, hint_labels);
+        for field in [
+            "workspace_label",
+            "workspace_label_source",
+            "repository_label",
+            "repository_label_source",
+        ] {
+            assert!(
+                withheld[field].is_null(),
+                "{hint_labels:?}: {field} withheld"
+            );
+        }
+        assert_eq!(withheld["workspace_hash"], on["workspace_hash"]);
+        assert_eq!(withheld["repository_hash"], on["repository_hash"]);
+    }
+    fs::remove_dir_all(root).unwrap();
+}
+
 fn temp_path(name: &str) -> PathBuf {
     let counter = TEST_COUNTER.fetch_add(1, Ordering::Relaxed);
     std::env::temp_dir().join(format!(

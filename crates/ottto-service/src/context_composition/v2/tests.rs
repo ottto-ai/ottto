@@ -3829,6 +3829,84 @@ fn check_server_rules(payload: &Value) -> Result<(), String> {
 }
 
 #[test]
+fn upload_labels_need_a_fetched_hint_that_allows_them() {
+    use super::aggregate::Bucket;
+    use super::scope::{SavedIdentity, Scope};
+    use crate::snapshot_client::{decode_activity_hint, workspace_labels_allowed};
+    let now = base_now();
+    let today = day_of(now.date());
+    let window = Window::ending(today);
+    let mut scope = Scope::new(
+        "scope",
+        ScopeInfo {
+            workspace_hash: "f".repeat(64),
+            workspace_path: "/w/repo".into(),
+            identity: SavedIdentity {
+                repository_hash: Some("e".repeat(64)),
+                repository_label: Some("repo".into()),
+                repository_label_source: Some("git_root".into()),
+                repository_identity_source: Some("git_common_dir".into()),
+                workspace_kind: Some("repository_root".into()),
+                workspace_label: Some("repo".into()),
+            },
+            common_dir: None,
+        },
+    );
+    let bucket = Bucket {
+        events: 1,
+        tokens: 10,
+        residency: 10,
+        images: 0,
+    };
+    scope.agg.days.insert((today, Kind::FilesRead), bucket);
+    scope.agg.day_generation.insert(today, 1);
+    let payload = |labels_enabled: bool| {
+        let mut capture = Capture::default();
+        let target = UploadTarget {
+            uploader: &mut capture,
+            machine_id: "machine-test",
+            destination: "device|machine|api",
+            labels_enabled,
+        };
+        let (request, _) =
+            super::upload::build_request(&scope, Source::Claude, &target, now, window, 0);
+        serde_json::to_value(&request).unwrap()
+    };
+    let hint = |labels: bool| {
+        decode_activity_hint(json!({
+            "source": "claude-code", "server_time": "2026-10-25T10:00:00Z",
+            "record_count_15m": 0, "record_count_24h": 0,
+            "local_usage_reconciliation_enabled": true, "backfill_window_days": 183,
+            "workspace_labels_enabled": labels,
+            "recommended_scan_after": "2026-10-25T10:05:00Z",
+        }))
+        .unwrap()
+    };
+
+    // Policy ON keeps today's labelled payload.
+    let on = payload(workspace_labels_allowed(Some(&hint(true))));
+    assert_eq!(on, payload(true));
+    assert_eq!(on["workspace_label"], "repo");
+    assert_eq!(on["repository_label"], "repo");
+    // Policy OFF and a failed hint fetch both withhold every label.
+    let withheld = payload(false);
+    assert_eq!(
+        payload(workspace_labels_allowed(Some(&hint(false)))),
+        withheld
+    );
+    assert_eq!(payload(workspace_labels_allowed(None)), withheld);
+    for field in [
+        "workspace_label",
+        "workspace_label_source",
+        "repository_label",
+        "repository_label_source",
+    ] {
+        assert!(withheld[field].is_null(), "{field} must be withheld");
+    }
+    assert_eq!(withheld["repository_hash"], on["repository_hash"]);
+}
+
+#[test]
 fn a_maximal_upload_meets_the_server_field_rules() {
     use super::aggregate::{Bucket, FileKey, FileTotals, Slot, ToolTotals};
     use super::scope::{SavedIdentity, Scope};

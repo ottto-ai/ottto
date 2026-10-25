@@ -918,7 +918,7 @@ fn inplace_retry_claude_cycle(shed_first_batch: bool) -> InplaceRetryCycle {
 /// the sweep, which withholds the census and forces a clean follow-up.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 #[serial(source_upload_deadlines)]
 fn sync_cycle_with_recovered_shed_leaves_sweep_settled() {

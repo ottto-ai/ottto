@@ -340,7 +340,7 @@ fn same_input_finish_pair(outcome: FinishOutcome, conflict: bool, count: usize) 
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_real_finish_releases_before_cas_with_exact_conservation() {
     let [base, candidate] = same_input_finish_pair(FinishOutcome::Accept, false, 2048);
@@ -365,7 +365,7 @@ fn prior_index_lifetime_real_finish_releases_before_cas_with_exact_conservation(
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
     for (outcome, conflict) in [
@@ -383,7 +383,7 @@ fn prior_index_lifetime_real_finish_preserves_refusals_retry_and_failed_cas() {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn prior_index_lifetime_retains_real_earned_receipt_path() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -463,7 +463,7 @@ enum MoneyArm {
 /// the budget's first completed native input.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
 fn money_shadow_real_caller_parity_at_tight_allowances() {

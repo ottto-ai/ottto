@@ -40,11 +40,15 @@ fn write(path: &Path, rows: &[Value]) {
 }
 
 fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
+    scan_at(root, index, "2026-10-06T23:00:00Z")
+}
+
+fn scan_at(root: &Path, index: &mut ScanIndex, collected_at: &str) -> SourceScanResult {
     scan_source_roots_with_test_limit(
         SnapshotSource::Codex,
         &[root.join("sessions"), root.join("archived_sessions")],
         index,
-        "2026-10-06T23:00:00Z",
+        collected_at,
         7,
         10,
         false,
@@ -52,7 +56,15 @@ fn scan(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
     .unwrap()
 }
 
-fn moved_session(v2: bool, old_binding: bool) {
+/// One ACKed singleton at its original path, saved and reloaded.
+struct Acked {
+    root: PathBuf,
+    original: PathBuf,
+    index_path: PathBuf,
+    previous: ScanIndex,
+}
+
+fn acked_original(v2: bool, old_binding: bool) -> Acked {
     let root = codex_file_join::tests::fixture().0;
     fs::remove_file(root.join("sessions/a.jsonl")).unwrap();
     fs::remove_file(root.join("sessions/b.jsonl")).unwrap();
@@ -71,9 +83,16 @@ fn moved_session(v2: bool, old_binding: bool) {
     assert_eq!(result.snapshots.len(), 1);
     finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut previous);
     let old_key = local_index_key(&original);
-    assert_eq!(previous.files[&old_key].codex_counting_v2, v2);
-    assert!(previous.files[&old_key].last_snapshot_fingerprint.is_some());
-    assert!(previous.files[&old_key].last_upload_body_witness.is_some());
+    let entry = &previous.files[&old_key];
+    assert_eq!(entry.codex_counting_v2, v2);
+    assert!(entry.last_snapshot_fingerprint.is_some());
+    assert!(entry.last_upload_body_witness.is_some());
+    assert!(!entry.codex_history_is_protected(), "an ordinary singleton");
+    // This build binds even while inactive: the realistic Legacy move.
+    assert_eq!(
+        entry.codex_counting_owner,
+        Some(codex_protected_owner(SESSION))
+    );
     if !old_binding {
         previous
             .files
@@ -84,14 +103,33 @@ fn moved_session(v2: bool, old_binding: bool) {
     let index_path = root.join("index.json");
     previous.save(&index_path).unwrap();
     let previous = ScanIndex::load(&index_path).unwrap();
-    let archived = root
+    Acked {
+        root,
+        original,
+        index_path,
+        previous,
+    }
+}
+
+/// Parse the archived path with a changed body under an active cutover.
+fn parse_archived(acked: &Acked, previous: &ScanIndex, v2: bool) -> ScanIndex {
+    parse_archived_at(acked, previous, v2, "2026-10-06T23:00:00Z")
+}
+
+fn parse_archived_at(
+    acked: &Acked,
+    previous: &ScanIndex,
+    v2: bool,
+    collected_at: &str,
+) -> ScanIndex {
+    let archived = acked
+        .root
         .join("archived_sessions")
-        .join(original.file_name().unwrap());
-    fs::rename(&original, &archived).unwrap();
+        .join(acked.original.file_name().unwrap());
     write(&archived, &rows(200));
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
     let mut working = previous.clone();
-    let mut result = scan(&root, &mut working);
+    let mut result = scan_at(&acked.root, &mut working, collected_at);
     assert_eq!(result.snapshots.len(), 1, "archive is fully parsed");
     assert_eq!(result.scanned_file_count, 1);
     assert_eq!(result.snapshots[0].input_tokens, if v2 { 200 } else { 400 });
@@ -113,16 +151,116 @@ fn moved_session(v2: bool, old_binding: bool) {
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
     working
-        .committable_subset(&previous, &accepted, &BTreeMap::new())
-        .save(&index_path)
+        .committable_subset(previous, &accepted, &BTreeMap::new())
+        .save(&acked.index_path)
         .unwrap();
-    let loaded = ScanIndex::load(&index_path).unwrap();
+    let loaded = ScanIndex::load(&acked.index_path).unwrap();
     assert_eq!(loaded.files[&key].codex_counting_v2, v2);
     assert_ne!(
         loaded.files[&key].last_upload_body_witness,
-        previous.files[&old_key].last_upload_body_witness
+        acked.previous.files[&local_index_key(&acked.original)].last_upload_body_witness
     );
-    fs::remove_dir_all(root).unwrap();
+    loaded
+}
+
+fn moved_session(v2: bool, old_binding: bool) {
+    let acked = acked_original(v2, old_binding);
+    let archived = acked
+        .root
+        .join("archived_sessions")
+        .join(acked.original.file_name().unwrap());
+    fs::rename(&acked.original, &archived).unwrap();
+    parse_archived(&acked, &acked.previous, v2);
+    fs::remove_dir_all(&acked.root).unwrap();
+}
+
+/// B1 across pages: a page whose only hint is the old path's removal prunes
+/// and saves the old entry before the archived file exists; a later page
+/// parses the archived path with a changed body.
+fn pruned_moved_session(v2: bool, old_binding: bool) {
+    let acked = acked_original(v2, old_binding);
+    let old_key = local_index_key(&acked.original);
+    let outside = acked.root.join("in-flight");
+    fs::create_dir_all(&outside).unwrap();
+    let parked = outside.join(acked.original.file_name().unwrap());
+    fs::rename(&acked.original, &parked).unwrap();
+    // Inactive build: the tombstone is written whatever the cutover.
+    let mut working = acked.previous.clone();
+    let mut result = scan_source_roots_with_attribution_and_hints(
+        SnapshotSource::Codex,
+        &[
+            acked.root.join("sessions"),
+            acked.root.join("archived_sessions"),
+        ],
+        &mut working,
+        "2026-10-06T23:00:00Z",
+        7,
+        false,
+        None,
+        std::slice::from_ref(&acked.original),
+        false,
+    )
+    .unwrap();
+    assert!(result.snapshots.is_empty());
+    finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+    assert!(!working.files.contains_key(&old_key), "old entry is pruned");
+    let owner = codex_protected_owner(SESSION);
+    let expected = if v2 && old_binding {
+        AckEvidence::V2Marked
+    } else {
+        AckEvidence::LegacyAcked
+    };
+    assert_eq!(working.codex_counting_tombstones[&owner].evidence, expected);
+    // The all-accepted save publishes the pruning.
+    working.save(&acked.index_path).unwrap();
+    let pruned = ScanIndex::load(&acked.index_path).unwrap();
+    assert!(!pruned.files.contains_key(&old_key));
+    assert_eq!(pruned.codex_counting_tombstones[&owner].evidence, expected);
+    fs::rename(
+        &parked,
+        acked
+            .root
+            .join("archived_sessions")
+            .join(acked.original.file_name().unwrap()),
+    )
+    .unwrap();
+    let mut loaded = parse_archived(&acked, &pruned, v2);
+    // The archived entry now carries the evidence itself: its proven owner
+    // frees the slot at the next inventory, whatever the cutover.
+    let archived_key = local_index_key(
+        &acked
+            .root
+            .join("archived_sessions")
+            .join(acked.original.file_name().unwrap()),
+    );
+    assert!(loaded.codex_counting_tombstones.contains_key(&owner));
+    codex_counting_version::prepare_moved_evidence(
+        &mut loaded,
+        &BTreeMap::from([(archived_key, owner.clone())]),
+        true,
+    );
+    assert!(!loaded.codex_counting_tombstones.contains_key(&owner));
+    fs::remove_dir_all(&acked.root).unwrap();
+}
+
+#[test]
+fn pruned_legacy_ack_survives_a_later_archive_page_and_reload() {
+    pruned_moved_session(false, true);
+}
+
+#[test]
+fn pruned_unbound_legacy_ack_survives_a_later_archive_page_and_reload() {
+    pruned_moved_session(false, false);
+}
+
+#[test]
+fn pruned_v2_ack_survives_a_later_archive_page_and_reload() {
+    pruned_moved_session(true, true);
+}
+
+#[test]
+fn moved_bound_legacy_ack_survives_archive_changed_body_and_reload() {
+    moved_session(false, true);
 }
 
 #[test]
@@ -209,7 +347,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     }))
     .unwrap();
     index.files.insert(old_key.clone(), old.clone());
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners);
+    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
     assert_eq!(
         codex_counting_version::members_evidence([&candidate], &index),
         AckEvidence::None,
@@ -219,7 +357,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     // conservative Legacy hint, including when a V2 mark survives there.
     old.codex_counting_owner = None;
     index.files.insert(old_key.clone(), old.clone());
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners);
+    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
     let singleton = codex_counting_version::singleton_view(&candidate, &index);
     assert_eq!(
         singleton,
@@ -238,7 +376,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     ));
     old.codex_counting_owner = Some(codex_protected_owner(SESSION));
     index.files.insert(old_key, old);
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners);
+    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
     let singleton = codex_counting_version::singleton_view(&candidate, &index);
     assert_eq!(
         singleton,
@@ -253,9 +391,493 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     index
         .files
         .insert("/synthetic/missing/member.jsonl".into(), legacy);
-    codex_counting_version::prepare_moved_evidence(&mut index, &owners);
+    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
     assert_eq!(
         codex_counting_version::members_evidence([&candidate], &index),
         AckEvidence::LegacyAcked
     );
+}
+
+fn archived_candidate() -> CandidateFile {
+    let path = PathBuf::from(format!(
+        "/synthetic/archived_sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl"
+    ));
+    CandidateFile {
+        scan_root: PathBuf::from("/synthetic/archived_sessions"),
+        path,
+        size_bytes: 1,
+        modified_unix_seconds: 1,
+        modified_unix_nanos: 1,
+        source_file_fingerprint: "source".into(),
+        legacy_source_file_fingerprint: String::new(),
+        legacy_config_reconciliation_required: false,
+        opened_object_identity: String::new(),
+    }
+}
+
+fn acked_entry(v2: bool, owner: Option<String>) -> ScanIndexEntry {
+    let mut entry: ScanIndexEntry = serde_json::from_value(json!({
+        "size_bytes":1,"modified_unix_seconds":1,"source_file_fingerprint":"old",
+        "last_snapshot_fingerprint":"old-ack","codex_counting_v2":v2
+    }))
+    .unwrap();
+    entry.codex_counting_owner = owner;
+    entry
+}
+
+#[test]
+fn pruned_old_entry_keeps_cursor_and_group_counting_views() {
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let candidate = archived_candidate();
+    let owners = BTreeMap::from([(
+        local_index_key(&candidate.path),
+        codex_protected_owner(SESSION),
+    )]);
+    let old_key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
+    for (v2, bound, expected) in [
+        (false, true, AckEvidence::LegacyAcked),
+        (false, false, AckEvidence::LegacyAcked),
+        (true, true, AckEvidence::V2Marked),
+    ] {
+        let mut index = ScanIndex::default();
+        let owner = bound.then(|| codex_protected_owner(SESSION));
+        index.files.insert(old_key.clone(), acked_entry(v2, owner));
+        codex_counting_version::prepare_moved_evidence(&mut index, &owners, true);
+        let singleton = codex_counting_version::singleton_view(&candidate, &index);
+        let group = codex_counting_version::group_view([&candidate], &index);
+        assert_eq!(singleton, codex_counting_version::view(expected, CUTOVER));
+        assert!(codex_counting_version::tombstone_before_retire(
+            &mut index, &old_key
+        ));
+        index.remove_file_entry(&old_key);
+        assert!(index.files.is_empty());
+        // The paused job's next page sees the same view, so reuse holds.
+        codex_counting_version::prepare_moved_evidence(&mut index, &owners, true);
+        assert_eq!(
+            codex_counting_version::singleton_view(&candidate, &index),
+            singleton
+        );
+        assert_eq!(
+            codex_counting_version::group_view([&candidate], &index),
+            group
+        );
+    }
+}
+
+#[test]
+fn counting_tombstones_are_bounded_and_protect_current_generation_legacy_evidence() {
+    // Written and collected whatever the cutover.
+    let legacy = |n: usize| (format!("{n:064x}"), AckEvidence::LegacyAcked);
+    let tombstone = |evidence| codex_counting_version::CountingTombstone {
+        evidence,
+        retired_in: "g1".into(),
+        created_unix_ms: None,
+    };
+    let mut index = ScanIndex {
+        traversal: Some(
+            serde_json::from_value(json!({
+                "context_fingerprint":"c","census_window_end":"g1","scan_roots":[],
+                "pending_directories":[],"pending_candidates":[],"observed_index_keys":[],
+                "reconciliation_upper_bound":null,"reconciliation_after":null,
+                "reconciliation_started":false,"counts":{}
+            }))
+            .unwrap(),
+        ),
+        codex_counting_tombstones: (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            .map(legacy)
+            .map(|(owner, evidence)| (owner, tombstone(evidence)))
+            .collect(),
+        ..ScanIndex::default()
+    };
+    let owner = codex_protected_owner(SESSION);
+    let key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
+    // Full of Legacy evidence: the retirement is refused, the entry stays.
+    index
+        .files
+        .insert(key.clone(), acked_entry(false, Some(owner.clone())));
+    assert!(!codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert!(!index.codex_counting_tombstones.contains_key(&owner));
+    // V2-only evidence retires without a slot; it never selects a version.
+    index
+        .files
+        .insert(key.clone(), acked_entry(true, Some(owner.clone())));
+    assert!(codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert!(!index.codex_counting_tombstones.contains_key(&owner));
+    // A V2-only tombstone gives its slot to Legacy evidence.
+    let v2_owner = legacy(0).0;
+    index
+        .codex_counting_tombstones
+        .get_mut(&v2_owner)
+        .unwrap()
+        .evidence = AckEvidence::V2Marked;
+    index
+        .files
+        .insert(key.clone(), acked_entry(false, Some(owner.clone())));
+    assert!(codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert!(!index.codex_counting_tombstones.contains_key(&v2_owner));
+    assert_eq!(
+        index.codex_counting_tombstones[&owner].evidence,
+        AckEvidence::LegacyAcked
+    );
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES
+    );
+    // In a later generation, the oldest earlier-generation Legacy evidence
+    // gives its slot; this generation's never does.
+    index.traversal.as_mut().unwrap().census_window_end = "g2".into();
+    let later_owner = legacy(9999).0;
+    index
+        .files
+        .insert(key.clone(), acked_entry(false, Some(later_owner.clone())));
+    assert!(codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert!(!index.codex_counting_tombstones.contains_key(&legacy(1).0));
+    assert_eq!(
+        index.codex_counting_tombstones[&later_owner].retired_in,
+        "g2"
+    );
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES
+    );
+    index.files.clear();
+
+    // Absence frees a slot only in a complete inventory of a later traversal
+    // generation than the retiring one.
+    let present = BTreeMap::from([("/synthetic/p.jsonl".to_owned(), legacy(2).0)]);
+    codex_counting_version::prepare_moved_evidence(&mut index, &present, false);
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES,
+        "an incomplete inventory proves nothing absent"
+    );
+    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    assert_eq!(
+        index
+            .codex_counting_tombstones
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([legacy(2).0, later_owner.clone()]),
+        "the retiring generation's walk may have raced a rename"
+    );
+    // A live proven entry with at least the same evidence absorbs it.
+    index
+        .files
+        .insert(key.clone(), acked_entry(true, Some(legacy(2).0)));
+    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        2,
+        "V2 never absorbs Legacy"
+    );
+    index
+        .files
+        .insert(key.clone(), acked_entry(false, Some(legacy(2).0)));
+    index.files.insert(
+        "/synthetic/l.jsonl".into(),
+        acked_entry(false, Some(later_owner)),
+    );
+    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
+    assert!(index.codex_counting_tombstones.is_empty());
+    // Persisted beside the entries; absent when empty.
+    index
+        .codex_counting_tombstones
+        .insert(owner.clone(), tombstone(AckEvidence::LegacyAcked));
+    let bytes = serde_json::to_value(&index).unwrap();
+    assert_eq!(
+        bytes["codex_counting_tombstones"][&owner],
+        json!({"evidence":"legacy_acked","retired_in":"g1"})
+    );
+}
+
+#[test]
+fn invalid_counting_binding_never_masks_a_valid_owner() {
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let candidate = archived_candidate();
+    let owners = BTreeMap::from([(
+        local_index_key(&candidate.path),
+        codex_protected_owner(SESSION),
+    )]);
+    // A corrupt or future-format binding decodes as "" (invalid). The member
+    // name carries no session id, so only the valid protected owner binds it.
+    let mut member = acked_entry(false, Some(String::new()));
+    member.codex_protected_owner = Some(codex_protected_owner(SESSION));
+    let mut index = ScanIndex::default();
+    index
+        .files
+        .insert("/synthetic/sessions/a.jsonl".into(), member);
+    codex_counting_version::prepare_moved_evidence(&mut index, &owners, false);
+    assert_eq!(
+        codex_counting_version::members_evidence([&candidate], &index),
+        AckEvidence::LegacyAcked
+    );
+}
+
+#[test]
+fn full_map_never_evicts_an_owner_the_retirement_rewrites() {
+    let key = format!("/synthetic/sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl");
+    let ids = codex_session_id_candidates_from_path(Path::new(&key));
+    assert_eq!(ids.len(), 2, "legacy and modern filename identities");
+    let rewritten = codex_protected_owner(&ids[0]);
+    let tombstone = |evidence| codex_counting_version::CountingTombstone {
+        evidence,
+        retired_in: String::new(),
+        created_unix_ms: None,
+    };
+    let mut index = ScanIndex {
+        codex_counting_tombstones: (1..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            .map(|n| (format!("{n:064x}"), tombstone(AckEvidence::LegacyAcked)))
+            .chain([(rewritten.clone(), tombstone(AckEvidence::V2Marked))])
+            .collect(),
+        ..ScanIndex::default()
+    };
+    // Unbound: both identities become Legacy hints and one needs a slot. The
+    // only V2-only slot belongs to an identity being rewritten, so none frees.
+    index.files.insert(key.clone(), acked_entry(false, None));
+    assert!(!codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES
+    );
+    assert_eq!(
+        index.codex_counting_tombstones[&rewritten].evidence,
+        AckEvidence::V2Marked
+    );
+}
+
+fn retirement_generation(index: &mut ScanIndex, generation: &str) {
+    index.traversal = Some(
+        serde_json::from_value(json!({
+            "context_fingerprint":"c", "census_window_end":generation, "scan_roots":[],
+            "pending_directories":[], "pending_candidates":[], "observed_index_keys":[],
+            "reconciliation_upper_bound":index.files.keys().next_back(),
+            "reconciliation_after":null, "reconciliation_started":false, "counts":{}
+        }))
+        .unwrap(),
+    );
+}
+
+#[test]
+fn bounded_reconciliation_preserves_retired_counting_evidence_across_reload() {
+    let acked = acked_original(false, true);
+    let mut working = acked.previous.clone();
+    let old_key = local_index_key(&acked.original);
+    retirement_generation(&mut working, "2026-10-05T23:00:00Z");
+    assert!(reconcile_missing_index_entries_with_limit(&mut working, 1));
+    assert!(!working.files.contains_key(&old_key));
+    working.save(&acked.index_path).unwrap();
+    let loaded = ScanIndex::load(&acked.index_path).unwrap();
+    assert!(!loaded.files.contains_key(&old_key));
+    assert_eq!(
+        loaded.codex_counting_tombstones[&codex_protected_owner(SESSION)].evidence,
+        AckEvidence::LegacyAcked
+    );
+    fs::remove_dir_all(acked.root).unwrap();
+}
+
+/// The header roster in the available root can be complete even though root
+/// resolution omitted a previously known root. Exercise the real inventory
+/// caller and selected checkpoint, rather than passing GC a synthetic bool.
+#[test]
+fn unavailable_known_root_cannot_collect_retired_owner_before_archive_reload() {
+    for v2 in [false, true] {
+        let acked = acked_original(v2, true);
+        let archived_root = acked.root.join("archived_sessions");
+        let archived = archived_root.join(acked.original.file_name().unwrap());
+        fs::rename(&acked.original, &archived).unwrap();
+        let mut working = acked.previous.clone();
+        retirement_generation(&mut working, "2026-10-05T23:00:00Z");
+        assert!(reconcile_missing_index_entries_with_limit(&mut working, 1));
+        working.save(&acked.index_path).unwrap();
+        let retired = ScanIndex::load(&acked.index_path).unwrap();
+        let owner = codex_protected_owner(SESSION);
+        assert!(retired.codex_counting_tombstones.contains_key(&owner));
+        assert!(retired
+            .known_configured_scan_roots
+            .contains(&local_index_key(&archived_root)));
+        let hidden = acked.root.join("unavailable-archive");
+        fs::rename(&archived_root, &hidden).unwrap();
+        let control = acked.root.join("sessions/control.jsonl");
+        let mut control_rows = rows(200);
+        control_rows[0]["payload"]["id"] = json!("0199f7a0-0000-7000-8000-00000000beef");
+        write(&control, &control_rows);
+        let mut working = retired.clone();
+        let mut result = {
+            let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+            scan(&acked.root, &mut working)
+        };
+        assert_eq!(result.snapshots.len(), 1, "available-root inventory ran");
+        assert_eq!(result.snapshots[0].input_tokens, 200, "fresh V2 control");
+        assert!(result.disappeared_file_count > 0, "unresolved known root");
+        assert!(working.codex_counting_tombstones.contains_key(&owner));
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut working);
+        let accepted = result
+            .snapshots
+            .iter()
+            .map(|item| item.snapshot_fingerprint.clone())
+            .collect();
+        working
+            .committable_subset(&retired, &accepted, &BTreeMap::new())
+            .save(&acked.index_path)
+            .unwrap();
+        let checkpoint = ScanIndex::load(&acked.index_path).unwrap();
+        assert!(checkpoint.codex_counting_tombstones.contains_key(&owner));
+        fs::rename(&hidden, &archived_root).unwrap();
+        parse_archived_at(&acked, &checkpoint, v2, "2026-10-07T23:00:00Z");
+        fs::remove_dir_all(acked.root).unwrap();
+    }
+}
+
+#[test]
+fn tombstone_overflow_prefers_safe_classes_then_oldest_known_creation() {
+    for cutover in [None, Some(CUTOVER)] {
+        let _cutover = cutover.map(codex_counting_version::TestCutover::set);
+        let mut index = ScanIndex::default();
+        retirement_generation(&mut index, "g2");
+        let owner_at = |n: usize| format!("{n:064x}");
+        index.codex_counting_tombstones = (0..codex_counting_version::MAX_COUNTING_TOMBSTONES)
+            .map(|n| {
+                (
+                    owner_at(n),
+                    codex_counting_version::CountingTombstone {
+                        evidence: AckEvidence::LegacyAcked,
+                        retired_in: "g1".into(),
+                        created_unix_ms: None,
+                    },
+                )
+            })
+            .collect();
+        // Lexical order deliberately disagrees with the safety/creation order.
+        let v2_owner = owner_at(900);
+        index
+            .codex_counting_tombstones
+            .get_mut(&v2_owner)
+            .unwrap()
+            .evidence = AckEvidence::V2Marked;
+        let pre_owner = owner_at(800);
+        let pre = index.codex_counting_tombstones.get_mut(&pre_owner).unwrap();
+        pre.created_unix_ms = Some(CUTOVER - 1);
+        // Under an active cutover this is safe even in the current generation.
+        // Inactive current-generation Legacy remains protected.
+        pre.retired_in = if cutover.is_some() { "g2" } else { "g1" }.into();
+        let post_owner = owner_at(700);
+        index
+            .codex_counting_tombstones
+            .get_mut(&post_owner)
+            .unwrap()
+            .created_unix_ms = Some(CUTOVER);
+        let key = "/synthetic/sessions/current.jsonl";
+        for (n, evicted) in [(2000, v2_owner), (2001, pre_owner), (2002, post_owner)] {
+            index
+                .files
+                .insert(key.into(), acked_entry(false, Some(owner_at(n))));
+            assert!(codex_counting_version::tombstone_before_retire(
+                &mut index, key
+            ));
+            assert!(!index.codex_counting_tombstones.contains_key(&evicted));
+            assert_eq!(
+                index.codex_counting_tombstones.len(),
+                codex_counting_version::MAX_COUNTING_TOMBSTONES
+            );
+        }
+        assert!(
+            index.codex_counting_tombstones.contains_key(&owner_at(1)),
+            "unknown creation most protected while inactive"
+        );
+    }
+}
+
+#[test]
+fn absence_collection_requires_healthy_scope_and_fresh_directory_witnesses() {
+    let acked = acked_original(false, true);
+    let mut index = acked.previous.clone();
+    retirement_generation(&mut index, "g2");
+    let traversal = index.traversal.as_mut().unwrap();
+    traversal.scan_roots = vec![
+        acked.root.join("sessions"),
+        acked.root.join("archived_sessions"),
+    ];
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    for root in &traversal.scan_roots {
+        directories.observe(root, &fs::symlink_metadata(root).unwrap());
+    }
+    let inventory = codex_file_join::HeaderInventory::new(
+        &traversal.scan_roots,
+        &BTreeSet::new(),
+        Some(&directories),
+    );
+    assert!(codex_counting_version::absence_coverage_complete(
+        &index, &inventory
+    ));
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .counts
+        .disappeared_file_count = 1;
+    assert!(!codex_counting_version::absence_coverage_complete(
+        &index, &inventory
+    ));
+    index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .counts
+        .disappeared_file_count = 0;
+    index.traversal.as_mut().unwrap().watcher_hint_seen = true;
+    assert!(!codex_counting_version::absence_coverage_complete(
+        &index, &inventory
+    ));
+    index.traversal.as_mut().unwrap().watcher_hint_seen = false;
+    fs::create_dir(acked.root.join("sessions/changed-membership")).unwrap();
+    assert!(!codex_counting_version::absence_coverage_complete(
+        &index, &inventory
+    ));
+    fs::remove_dir_all(acked.root).unwrap();
+}
+
+#[test]
+fn inventory_creation_timestamp_survives_tombstone_reload() {
+    let acked = acked_original(false, true);
+    let mut index = acked.previous.clone();
+    let key = local_index_key(&acked.original);
+    assert!(codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    index.remove_file_entry(&key);
+    let owner = codex_protected_owner(SESSION);
+    assert_eq!(
+        index.codex_counting_tombstones[&owner].created_unix_ms,
+        None
+    );
+    let roots = vec![
+        acked.root.join("sessions"),
+        acked.root.join("archived_sessions"),
+    ];
+    let paths = BTreeSet::from([key]);
+    let mut directories = codex_file_join::DirectoryCensus::new();
+    for root in &roots {
+        directories.observe(root, &fs::symlink_metadata(root).unwrap());
+    }
+    let mut inventory = codex_file_join::HeaderInventory::new(&roots, &paths, Some(&directories));
+    while !inventory.step(&CodexTitleMetadata::default()) {}
+    codex_counting_version::note_inventory_created(&mut index, &inventory);
+    index.save(&acked.index_path).unwrap();
+    let loaded = ScanIndex::load(&acked.index_path).unwrap();
+    assert_eq!(
+        loaded.codex_counting_tombstones[&owner].created_unix_ms,
+        Some(1_790_848_800_000)
+    );
+    fs::remove_dir_all(acked.root).unwrap();
 }

@@ -301,6 +301,7 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
+        field!(codex_counting_tombstones, BTreeMap::is_empty);
         map.end()
     }
 }
@@ -387,6 +388,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_incidence",
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
+    "codex_counting_tombstones",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1681,6 +1683,12 @@ impl<R: BufRead + Seek> Decoder<R> {
                         }
                         "confirmed_empty_files" => {
                             index.confirmed_empty_files = self.typed(value)?
+                        }
+                        "codex_counting_tombstones" => {
+                            // Counting-only memory: damage loses it like a
+                            // lost index, never refuses the index.
+                            index.codex_counting_tombstones =
+                                self.history_scalar(value, BTreeMap::new())?
                         }
                         "file_snapshot_fingerprints" => {
                             if pass == Pass::IdentityCarry

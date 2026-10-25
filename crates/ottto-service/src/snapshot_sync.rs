@@ -4555,7 +4555,8 @@ fn upload_local_health_projection_reporting(
     // The binding this pass's requests are for, captured before any of them.
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret);
+    let binding = setup_run_refresh_binding(device, device_secret, source);
+    let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
@@ -4574,7 +4575,10 @@ fn upload_local_health_projection_reporting(
             let _ = daemon.record_local_health_upload_succeeded();
             Ok(())
         }
-        Err(error) if local_health_upload_should_refresh_setup_run(&error) => {
+        Err(error)
+            if local_health_upload_should_refresh_setup_run(&error)
+                && crate::relay_auth::take_setup_refresh(relay_binding) =>
+        {
             if let Err(refresh_error) =
                 crate::control::refresh_setup_run_token_for_persisted_connection()
             {
@@ -4596,6 +4600,10 @@ fn upload_local_health_projection_reporting(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
                 )));
             }
+            crate::relay_auth::retry_after_setup_refresh(
+                relay_binding,
+                client.relay_auth_binding(device, device_secret, source),
+            );
             match upload_local_health_projection_with(
                 client,
                 device,
@@ -4679,12 +4687,22 @@ fn setup_run_refresh_hold() -> &'static Mutex<Option<SetupRunRefreshHold>> {
 
 /// Digest of what a reattach or credential change replaces: the device id and
 /// secret, and the persisted setup run and API base. Kept in memory only.
-fn setup_run_refresh_binding(device: &LocalDeviceBinding, device_secret: &str) -> [u8; 32] {
+fn setup_run_refresh_binding(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
     digest.update(device.device_id.as_bytes());
     digest.update(b"\0");
     digest.update(device_secret.as_bytes());
+    digest.update(crate::relay_auth::binding_key(
+        &snapshot_api_base_url(),
+        device,
+        device_secret,
+        source.api_slug(),
+    ));
     if let Some(connection) = FileConnectionStore::default().load().ok().flatten() {
         digest.update(b"\0");
         digest.update(connection.setup_run_id.as_bytes());
@@ -4763,6 +4781,12 @@ fn note_setup_run_refresh_failed(binding: &[u8; 32], terminal: bool) {
     }
 }
 
+/// Explicit recovery only: also release the local-health terminal refresh hold.
+pub(crate) fn reset_relay_authorization_backoff() {
+    crate::relay_auth::reset();
+    clear_setup_run_refresh_hold();
+}
+
 fn clear_setup_run_refresh_hold() {
     if let Ok(mut hold) = setup_run_refresh_hold().lock() {
         *hold = None;
@@ -4792,6 +4816,12 @@ fn local_health_upload_failure_kind(error: &anyhow::Error) -> LocalHealthUploadF
 }
 
 fn local_health_upload_can_wait_quietly(error: &anyhow::Error) -> bool {
+    if error
+        .downcast_ref::<RelayTokenAuthorizationRejected>()
+        .is_some_and(|held| held.suppressed)
+    {
+        return true;
+    }
     if error.downcast_ref::<LocalHealthRefreshHeld>().is_some() {
         return true;
     }
@@ -17695,78 +17725,128 @@ mod tests {
     #[test]
     #[serial]
     fn local_health_upload_refreshes_inactive_device_before_retry() {
-        let root = test_dir("local-health-upload-reactivates-device");
-        let support_dir = root.join("support");
-        let secrets_dir = root.join("secrets");
-        std::fs::create_dir_all(&support_dir).expect("create support dir");
-        std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
-        let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
-        let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
-        let captured = Arc::new(Mutex::new(Vec::new()));
-        let api_base_url = local_health_reactivation_server(captured.clone());
+        for (reject_in_other_caller, reject_retry) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
+            let root = test_dir("local-health-upload-reactivates-device");
+            let support_dir = root.join("support");
+            let secrets_dir = root.join("secrets");
+            std::fs::create_dir_all(&support_dir).expect("create support dir");
+            std::fs::create_dir_all(&secrets_dir).expect("create secrets dir");
+            let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
+            let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
+            let captured = Arc::new(Mutex::new(Vec::new()));
+            let api_base_url = local_health_reactivation_server(captured.clone(), reject_retry);
 
-        let device = LocalDeviceBinding {
-            device_id: "device_test".to_string(),
-            machine_id: Some("otm_test".to_string()),
-            sources: vec!["codex".to_string()],
-        };
-        FileDeviceStore::default()
-            .save(&device)
-            .expect("save device");
-        FileConnectionStore::default()
-            .save(&LocalConnectionBinding {
-                setup_run_id: "setup_stale".to_string(),
-                setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+            let device = LocalDeviceBinding {
+                device_id: "device_test".to_string(),
                 machine_id: Some("otm_test".to_string()),
-                claim_code: None,
-                api_base_url: api_base_url.clone(),
-            })
-            .expect("save connection");
-        std::fs::write(
-            secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
-            "device-secret",
-        )
-        .expect("save device secret");
-        std::fs::write(
-            secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
-            "otsr_stale",
-        )
-        .expect("save setup token");
-
-        let client = SnapshotApiClient::new(api_base_url);
-        upload_local_health_projection_reporting(
-            &client,
-            &device,
-            "device-secret",
-            SnapshotSource::Codex,
-            "otm_test",
-            &test_daemon("otm_test"),
-        )
-        .expect("upload retries after refresh");
-
-        let requests = captured.lock().expect("captured requests").clone();
-        assert_eq!(requests.len(), 5);
-        assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
-        assert!(requests[1].contains("POST /api/v1/setup-runs/setup_stale/local-client/refresh"));
-        assert!(requests[1].contains("\"device_secret\":\"device-secret\""));
-        assert!(requests[2].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
-        assert!(requests[3].contains("POST /api/v1/apps/health/heartbeat"));
-        assert!(requests[4].contains("POST /api/v1/apps/health/projection"));
-        assert_eq!(
+                sources: vec!["codex".to_string()],
+            };
+            FileDeviceStore::default()
+                .save(&device)
+                .expect("save device");
             FileConnectionStore::default()
-                .load()
-                .expect("load refreshed connection")
-                .expect("connection exists")
-                .setup_run_id,
-            "setup_fresh"
-        );
-        assert_eq!(
-            std::fs::read_to_string(secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT))
-                .expect("read refreshed setup token"),
-            "otsr_fresh"
-        );
+                .save(&LocalConnectionBinding {
+                    setup_run_id: "setup_stale".to_string(),
+                    setup_run_token_expires_at: "2026-05-05T10:30:00Z".to_string(),
+                    machine_id: Some("otm_test".to_string()),
+                    claim_code: None,
+                    api_base_url: api_base_url.clone(),
+                })
+                .expect("save connection");
+            std::fs::write(
+                secrets_dir.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+                "device-secret",
+            )
+            .expect("save device secret");
+            std::fs::write(
+                secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT),
+                "otsr_stale",
+            )
+            .expect("save setup token");
 
-        let _ = std::fs::remove_dir_all(root);
+            if reject_in_other_caller {
+                SnapshotApiClient::new(&api_base_url)
+                    .issue_relay_token_with_timeout(
+                        &device,
+                        "device-secret",
+                        SnapshotSource::Codex,
+                        Duration::from_secs(5),
+                    )
+                    .expect_err(
+                        "another snapshot caller observes the initial authorization rejection",
+                    );
+            }
+            let client = SnapshotApiClient::new(api_base_url);
+            let result = upload_local_health_projection_reporting(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::Codex,
+                "otm_test",
+                &test_daemon("otm_test"),
+            );
+            if reject_retry {
+                assert!(result.is_err());
+                assert_eq!(
+                    captured.lock().unwrap().len(),
+                    3,
+                    "token, refresh, rejected retry"
+                );
+                assert!(!crate::relay_auth::take_setup_refresh(
+                    client.relay_auth_binding(&device, "device-secret", SnapshotSource::Codex)
+                ));
+                let held = upload_local_health_projection_reporting(
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::Codex,
+                    "otm_test",
+                    &test_daemon("otm_test"),
+                )
+                .expect_err("new setup id inherits the consumed recovery attempt");
+                assert!(
+                    held.downcast_ref::<RelayTokenAuthorizationRejected>()
+                        .unwrap()
+                        .suppressed
+                );
+                assert_eq!(
+                    captured.lock().unwrap().len(),
+                    3,
+                    "no second refresh or token request"
+                );
+                let _ = std::fs::remove_dir_all(root);
+                continue;
+            }
+            result.expect("upload retries after refresh");
+
+            let requests = captured.lock().expect("captured requests").clone();
+            assert_eq!(requests.len(), 5);
+            assert!(requests[0].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+            assert!(
+                requests[1].contains("POST /api/v1/setup-runs/setup_stale/local-client/refresh")
+            );
+            assert!(requests[1].contains("\"device_secret\":\"device-secret\""));
+            assert!(requests[2].contains("POST /api/v1/telemetry/devices/device_test/relay-token"));
+            assert!(requests[3].contains("POST /api/v1/apps/health/heartbeat"));
+            assert!(requests[4].contains("POST /api/v1/apps/health/projection"));
+            assert_eq!(
+                FileConnectionStore::default()
+                    .load()
+                    .expect("load refreshed connection")
+                    .expect("connection exists")
+                    .setup_run_id,
+                "setup_fresh"
+            );
+            assert_eq!(
+                std::fs::read_to_string(secrets_dir.join(OTTTO_SETUP_RUN_TOKEN_ACCOUNT))
+                    .expect("read refreshed setup token"),
+                "otsr_fresh"
+            );
+
+            let _ = std::fs::remove_dir_all(root);
+        }
     }
 
     #[test]
@@ -21039,11 +21119,14 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn local_health_reactivation_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+    fn local_health_reactivation_server(
+        captured: Arc<Mutex<Vec<String>>>,
+        reject_retry: bool,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local health backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
-            for index in 0..5 {
+            for index in 0..if reject_retry { 3 } else { 5 } {
                 let (mut stream, _) = listener.accept().expect("accept local health request");
                 let request = read_complete_http_request(&mut stream);
                 captured
@@ -21056,6 +21139,7 @@ mod tests {
                         "200 OK",
                         r#"{"setup_run_id":"setup_fresh","setup_run_token":"otsr_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
                     ),
+                    2 if reject_retry => ("401 Unauthorized", r#"{"error":"still inactive"}"#),
                     2 => (
                         "200 OK",
                         r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#,

@@ -7,6 +7,9 @@
 //! events add money only in a bound turn that has no native, published when
 //! the turn closes, or in an unbound span with today's rule. Published money
 //! is a monotone function of the record prefix: nothing is ever subtracted.
+#[cfg(test)]
+mod rss_test_support;
+
 use super::codex_counting_version::{self, AckEvidence, CountingVersion};
 use super::*;
 use crate::codex_scan_diagnostics::CountingV2Receipts;
