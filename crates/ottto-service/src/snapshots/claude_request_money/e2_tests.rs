@@ -2022,6 +2022,12 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
                     lines.push(own_marker);
                 }
                 lines.push(line("own", &at(101), 20));
+                if fresh_marker {
+                    let mut repeated = org_marker(ORG_B);
+                    repeated["timestamp"] = json!(at(102));
+                    lines.push(repeated);
+                    lines.push(line("own-repeat", &at(103), 30));
+                }
                 let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
                 accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
                 accumulator
@@ -2048,7 +2054,11 @@ fn e2_identity_branch_and_resume_prefix_markers_cannot_claim_own_requests() {
                         item.input_tokens,
                         item.removed_request_count
                     ),
-                    (1, 20, Some(1))
+                    if fresh_marker {
+                        (2, 50, Some(1))
+                    } else {
+                        (1, 20, Some(1))
+                    }
                 );
                 assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
                 assert_eq!(item.request_evidence.len(), 1);
@@ -2224,5 +2234,101 @@ fn e2_identity_twin_start_fills_only_unmarked_prefix_before_own_org_run() {
             assert_evidence_referenced(&item);
             cleanup(&[&a, &b]);
         }
+    });
+}
+
+#[test]
+fn e2_identity_retained_session_binding_fills_only_missing_native_shares() {
+    with_enabled(|| {
+        let path = root_file("identity-retained-start");
+        let mut index = ScanIndex::default();
+        index.session_account_bindings.insert(
+            crate::snapshots::sha256_hex(&["session_owner:v1", "synthetic-machine", ROOT]),
+            crate::snapshots::SessionAccountBinding {
+                account_identifier_hash: "c".repeat(64),
+                workspace_identifier_hash: None,
+            },
+        );
+        let index = restart(&index);
+        let mut items = vec![parse(
+            &path,
+            Some(t0()),
+            &index,
+            &[
+                line("start", &at(1), 10),
+                org_marker(ORG_B),
+                line("own-b", &at(2), 20),
+            ],
+        )];
+        claude_request_identity::retain_root_accounts(&mut items, &index, "synthetic-machine");
+        let item = tag_owned(items, &index).remove(0);
+        let parts = item.model_usage[0].identity_parts.as_ref().unwrap();
+        assert_eq!(
+            parts
+                .iter()
+                .find(
+                    |part| part.account_identifier_hash.as_deref() == Some("c".repeat(64).as_str())
+                )
+                .map(|part| (part.input_tokens, part.request_count)),
+            Some((10, 1))
+        );
+        let own = parts
+            .iter()
+            .find(|part| part.account_identifier_hash.is_none())
+            .unwrap();
+        assert_eq!((own.input_tokens, own.request_count), (20, 1));
+        assert_eq!(
+            item.request_evidence[usize::from(own.evidence_ref.unwrap())]
+                .provider_workspace_hash
+                .as_deref(),
+            Some(org_hash(ORG_B).as_str())
+        );
+        assert!(!fold(&item).accounts.as_ref().unwrap().conflict);
+        assert_evidence_referenced(&item);
+        cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_three_contradictory_start_twins_fall_back_deterministically() {
+    with_enabled(|| {
+        let a = root_file("identity-start-conflict-a");
+        let b = root_file("identity-start-conflict-b");
+        let c = root_file("identity-start-conflict-c");
+        let index = ScanIndex::default();
+        let source = [
+            (&a, ORG_A, "a"),
+            (&b, ORG_B, "b"),
+            (&c, "33333333-3333-4333-8333-333333333333", "c"),
+        ];
+        for order in [
+            [0, 1, 2],
+            [2, 1, 0],
+            [1, 0, 2],
+            [2, 0, 1],
+            [0, 2, 1],
+            [1, 2, 0],
+        ] {
+            let items = order
+                .iter()
+                .map(|i| {
+                    let (path, org, id) = source[*i];
+                    parse(
+                        path,
+                        Some(t0()),
+                        &index,
+                        &[org_marker(org), line(id, &at(1), 10)],
+                    )
+                })
+                .collect();
+            let item = tag_owned(items, &index).remove(0);
+            assert_eq!((item.request_count, item.input_tokens), (3, 30));
+            assert!(fold(&item).accounts.as_ref().unwrap().conflict);
+            assert!(item.request_evidence.is_empty());
+            assert!(rows_of(&item).all(|row| row.identity_parts.is_none()
+                && row.evidence_ref.is_none()
+                && row.account_identifier_hash.is_none()));
+        }
+        cleanup(&[&a, &b, &c]);
     });
 }

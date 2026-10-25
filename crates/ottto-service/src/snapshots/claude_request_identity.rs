@@ -1267,33 +1267,7 @@ pub(crate) fn request_accounts(
         return accounts;
     };
     let own_marker = |marker: &&OrgMarker| birth.copied_with_slack(marker.at, slack) != Some(true);
-    // Copied prefix markers cannot authorize this session's own requests.
-    // The first request's own/preceding org, never the first org found later.
-    if let Some(position) = markers
-        .entries
-        .iter()
-        .rev()
-        .filter(own_marker)
-        .find(|marker| marker.position <= first)
-        .map(|marker| marker.position)
-    {
-        // Keep the initial observation if two markers claim this same request;
-        // the contradictory stream below then falls back to this start.
-        if let Some(marker) = markers
-            .entries
-            .iter()
-            .filter(own_marker)
-            .find(|marker| marker.position == position)
-        {
-            if let Some(org) = marker.org.as_deref().filter(|_| marker.terminal_trusted) {
-                accounts.starting = Some(Arc::new(AuthorityKey {
-                    login: None,
-                    org: Some(org.to_owned()),
-                    basis: TRANSCRIPT_ORG,
-                }));
-            }
-        }
-    }
+    // Timed prefix markers use the exact money birth rule.
     if markers.overflowed {
         if let Some(marker) = markers
             .starting_marker
@@ -1313,11 +1287,12 @@ pub(crate) fn request_accounts(
     accounts.fallback = accounts.starting.clone();
     accounts.conflict = markers.overflowed;
     for marker in markers.entries.iter().filter(own_marker) {
-        let Some(org) = marker
-            .org
-            .as_deref()
-            .filter(|_| marker.terminal_trusted || accounts.runs.is_empty())
-        else {
+        let Some(org) = marker.org.as_deref().filter(|_| {
+            marker.terminal_trusted
+                || accounts.runs.last().map_or(true, |(_, key)| {
+                    key.as_ref().and_then(|key| key.org.as_deref()) == marker.org.as_deref()
+                })
+        }) else {
             accounts.conflict = true;
             continue;
         };
@@ -1349,6 +1324,19 @@ pub(crate) fn request_accounts(
                 })
             });
         accounts.runs.push((marker.position, Some(key)));
+    }
+    // Derive the first own request's start from the accepted own stream,
+    // preserving the first observation of a conflicting same-position pair.
+    if !markers.overflowed {
+        if let Some((_, key)) = accounts
+            .runs
+            .iter()
+            .rev()
+            .find(|(position, _)| *position <= first)
+        {
+            accounts.starting = key.clone();
+        }
+        accounts.fallback = accounts.starting.clone();
     }
     if accounts
         .runs
@@ -1502,11 +1490,11 @@ pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex
         return;
     }
     for item in items {
-        if !item
+        if item
             .claude_money
             .as_deref()
             .and_then(|fold| fold.accounts.as_deref())
-            .is_some_and(|accounts| accounts.subagent)
+            .is_none()
         {
             continue;
         }
@@ -1523,13 +1511,20 @@ pub(crate) fn retain_root_accounts(items: &mut [SnapshotItem], index: &ScanIndex
                     basis: TELEMETRY_LOGIN,
                 })
             });
-        if let Some(accounts) = item
-            .claude_money
-            .as_deref_mut()
-            .and_then(|fold| fold.accounts.as_deref_mut())
-        {
-            if accounts.subagent {
-                accounts.retained_root = retained;
+        let fold = item.claude_money.as_deref_mut().expect("checked fold");
+        let accounts = fold.accounts.as_deref_mut().expect("checked accounts");
+        if accounts.subagent {
+            accounts.retained_root = retained;
+        } else if retained.is_some() {
+            // A native markerless file may not yet carry its persisted creator
+            // binding. Fill only missing shares, never a later own-org run.
+            if accounts.bound.is_none() {
+                accounts.bound = retained.clone();
+            }
+            if accounts.starting.is_none() {
+                accounts.starting = retained.clone();
+                accounts.fallback = retained.clone();
+                fold.entity.inherit_missing(retained);
             }
         }
     }
@@ -1545,6 +1540,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
         starting: AccountPartition,
         bound: AccountPartition,
         conflict: bool,
+        known: bool,
     }
     let mut roots = BTreeMap::<String, Root>::new();
     for item in items.iter() {
@@ -1568,6 +1564,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             starting: accounts.starting.clone(),
             bound: accounts.bound.clone(),
             conflict: accounts.conflict,
+            known: accounts.starting.is_some(),
         };
         match roots.entry(item.source_session_id.clone()) {
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -1576,9 +1573,7 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
             std::collections::btree_map::Entry::Occupied(mut entry) => {
                 let root = entry.get_mut();
                 let any_conflict = root.conflict || candidate.conflict;
-                if root.starting.is_none() && candidate.starting.is_some()
-                    || (first < root.first && candidate.starting.is_some())
-                {
+                if !root.known && candidate.known || (first < root.first && candidate.known) {
                     *root = candidate;
                 } else if first == root.first {
                     if root.starting.is_some()
