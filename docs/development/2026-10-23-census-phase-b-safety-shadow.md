@@ -68,7 +68,9 @@ earlier than the saved witness, of any admitted copy of a duplicated shadow,
 even beside a resource-refused copy), a grant
 the census terminal finds spent is spent too, and an alarm's retry time is
 never before
-the clock passes the latest stamp. At most 512 keys are tracked, one compact line each in the saved
+the clock passes the latest stamp. The process's spent-grant cache is bounded
+too: it never evicts a refusal to admit work; after overflow an unrecorded
+grant requires proof of a newly saved counted attempt. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.
 

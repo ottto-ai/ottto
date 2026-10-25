@@ -502,30 +502,35 @@ fn unread_grant(tracked: &TrackedKey) -> Option<u64> {
 fn spent_cause(id: &str, tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
     let stamp = unread_grant(tracked)?;
     grant_spent(tracked, now, high_water).or_else(|| {
-        with_spent(|spent| {
-            spent
+        let (cause, overflow) = with_spent(|spent| {
+            let cause = spent
+                .grants
                 .get(id)
                 .filter(|(at, _)| *at == stamp)
-                .map(|(_, cause)| *cause)
+                .map(|(_, cause)| *cause);
+            (cause, spent.overflow)
+        });
+        cause.or_else(|| {
+            // Once the cache fills, an unrecorded spend is possible. Only
+            // proof of a newly saved counted attempt supplies authority.
+            // Drop the spent lock before taking the persisted lock.
+            (overflow && !with_persisted(|grants| grants.get(id).copied() == Some(stamp)))
+                .then_some("grant_clock_regressed")
         })
     })
 }
 
 /// Records `id`'s grant at `stamp` as spent for `cause` in this process.
-/// Past the cap the entry with the oldest stamp is forgotten: its grant is
-/// at least as old as every other recorded one, so its span is over first.
+/// Never evict a refusal: even the oldest grant may be inside its span after
+/// clock recovery. Overflow refuses unrecorded grants without durable proof
+/// of a new counted attempt (`spent_cause`), keeping process history bounded.
 fn record_spent(id: &str, stamp: u64, cause: &'static str) {
     with_spent(|spent| {
-        if spent.len() >= MAX_TRACKED_KEYS && !spent.contains_key(id) {
-            let oldest = spent
-                .iter()
-                .min_by_key(|(_, (at, _))| *at)
-                .map(|(id, _)| id.clone());
-            if let Some(oldest) = oldest {
-                spent.remove(&oldest);
-            }
+        if spent.grants.len() >= MAX_TRACKED_KEYS && !spent.grants.contains_key(id) {
+            spent.overflow = true;
+        } else {
+            spent.grants.insert(id.to_owned(), (stamp, cause));
         }
-        spent.insert(id.to_owned(), (stamp, cause));
     });
 }
 
@@ -670,13 +675,21 @@ pub(crate) fn key_id(key: &str) -> String {
     id
 }
 
+#[derive(Default)]
+struct SpentGrants {
+    grants: BTreeMap<String, (u64, &'static str)>,
+    overflow: bool,
+}
+
 #[cfg(test)]
 thread_local! {
     static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static PERSISTED: std::cell::RefCell<BTreeMap<String, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
-    static SPENT: std::cell::RefCell<BTreeMap<String, (u64, &'static str)>> =
-        const { std::cell::RefCell::new(BTreeMap::new()) };
+    static SPENT: std::cell::RefCell<SpentGrants> =
+        const { std::cell::RefCell::new(SpentGrants {
+            grants: BTreeMap::new(), overflow: false,
+        }) };
     static ALARMED: std::cell::RefCell<BTreeSet<(String, &'static str)>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
     static ALARM_LINES: std::cell::RefCell<Vec<String>> =
@@ -690,8 +703,10 @@ static PERSISTED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::ne
 /// grant's stamp and why): refused for as long as that stamp is the key's
 /// latest, in every working index of the process.
 #[cfg(not(test))]
-static SPENT: std::sync::Mutex<BTreeMap<String, (u64, &'static str)>> =
-    std::sync::Mutex::new(BTreeMap::new());
+static SPENT: std::sync::Mutex<SpentGrants> = std::sync::Mutex::new(SpentGrants {
+    grants: BTreeMap::new(),
+    overflow: false,
+});
 /// One alarm per key and cause per process.
 #[cfg(not(test))]
 static ALARMED: std::sync::Mutex<BTreeSet<(String, &'static str)>> =
@@ -725,11 +740,11 @@ fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
 }
 
 #[cfg(test)]
-fn with_spent<T>(f: impl FnOnce(&mut BTreeMap<String, (u64, &'static str)>) -> T) -> T {
+fn with_spent<T>(f: impl FnOnce(&mut SpentGrants) -> T) -> T {
     SPENT.with(|set| f(&mut set.borrow_mut()))
 }
 #[cfg(not(test))]
-fn with_spent<T>(f: impl FnOnce(&mut BTreeMap<String, (u64, &'static str)>) -> T) -> T {
+fn with_spent<T>(f: impl FnOnce(&mut SpentGrants) -> T) -> T {
     f(&mut SPENT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
@@ -1344,7 +1359,7 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
             // A new grant, made durable, even one stamped in the same second
             // as a spent one: only the spent grant stays refused. Never
             // before its save (a save's throwaway decode makes grants too).
-            with_spent(|spent| spent.remove(&id));
+            with_spent(|spent| spent.grants.remove(&id));
             set.insert(id, stamp);
         }
     });
@@ -1516,7 +1531,7 @@ pub(crate) mod test_support {
     /// A new daemon process: no grant saved yet, no alarm emitted yet.
     pub(crate) fn restart() {
         PERSISTED.with(|set| set.borrow_mut().clear());
-        SPENT.with(|set| set.borrow_mut().clear());
+        SPENT.with(|set| *set.borrow_mut() = SpentGrants::default());
         ALARMED.with(|set| set.borrow_mut().clear());
     }
     /// The per-key alarm budget spent by unrelated keys.
@@ -1526,6 +1541,20 @@ pub(crate) mod test_support {
             for n in 0..MAX_TRACKED_KEYS * 2 {
                 set.insert((format!("{n:064x}"), "rebuild_bound_7d"));
             }
+        });
+    }
+    /// Regression-spent grants from other checkpoints fill the process cache.
+    pub(crate) fn saturate_spent_grants(except: &str, stamp: u64) {
+        let except = key_id(except);
+        for n in 0..=MAX_TRACKED_KEYS + 1 {
+            let id = format!("{n:016x}");
+            if id != except {
+                record_spent(&id, stamp, "grant_clock_regressed");
+            }
+        }
+        with_spent(|spent| {
+            assert_eq!(spent.grants.len(), MAX_TRACKED_KEYS);
+            assert!(spent.overflow);
         });
     }
     pub(crate) fn alarm_lines() -> Vec<String> {

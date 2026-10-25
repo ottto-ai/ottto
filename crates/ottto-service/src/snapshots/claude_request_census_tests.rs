@@ -4690,6 +4690,95 @@ fn census_duplicate_rebuild_save_observed_regression_spends_the_grant() {
     }
 }
 
+/// MONEY 724h condition 3, autoreview: process-wide cache pressure from other
+/// checkpoints never revives a spent grant. Cover both an existing refusal
+/// when the cache fills and an unrecorded refusal after overflow. A new
+/// counted and saved attempt still reads. Current/earlier, OFF/ON.
+#[test]
+fn census_duplicate_rebuild_spent_cache_overflow_never_revives_a_grant() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for overflow_first in [false, true] {
+                let case = format!("shadow={enabled} {form} overflow_first={overflow_first}");
+                bound::restart();
+                let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-spent-overflow");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let clock = bound::set_now(N3_T0);
+                let mut index = ScanIndex::load(&path).unwrap();
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}"
+                );
+                if overflow_first {
+                    bound::saturate_spent_grants(&key, N3_T0 + 1);
+                }
+                drop(clock);
+
+                let clock = bound::set_now(N3_T0 - 60);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}"
+                );
+                assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                if !overflow_first {
+                    bound::saturate_spent_grants(&key, N3_T0 + 1);
+                }
+                drop(clock);
+
+                let forward = N3_T0 + 60;
+                let _clock = bound::set_now(forward);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: no revival under process-wide cache pressure"
+                );
+                assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+                assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                assert_eq!(
+                    census_rebuild_alarms(&key, "grant_clock_regressed"),
+                    1,
+                    "{case}"
+                );
+
+                let mut reloaded = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    bound::attempts(&reloaded, &key),
+                    vec![N3_T0, forward],
+                    "{case}: the original stamp still counts"
+                );
+                persist_duplicate_rebuild_grants(&mut reloaded, &path).unwrap();
+                assert_eq!(
+                    bound::saved_stamps(&path, &key),
+                    vec![N3_T0, forward],
+                    "{case}"
+                );
+                assert_eq!(
+                    census_rebuild_decision(&reloaded, &key, &fingerprint),
+                    rearmed,
+                    "{case}: a new durable counted attempt still reads"
+                );
+                assert_eq!(census_rebuild_counters(&mut reloaded), (0, 0), "{case}");
+            }
+        }
+    }
+}
+
 /// MONEY 724h condition 3, autoreview: a refusal on backward time never
 /// lowers a persisted stamp. The guard's latest stamp is a counter's (an
 /// earlier untracked refusal at `N3_T0`, no key tracked). A new duplicate key
