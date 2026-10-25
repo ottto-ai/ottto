@@ -7,8 +7,9 @@
 //! upload input. D1 only produces, persists, prunes and measures records; no
 //! fence, coverage, posture or upload decision reads them. The narrowed
 //! unhealthy-retry carry conservatively refuses its per-family exception
-//! unless a complete current record matches the committed scan identity;
-//! it never promotes that record to new-window proof or coverage.
+//! on saved negative evidence for loss or incomplete identity, and uses a
+//! bound native record only to refuse additional causes in the narrow id-less
+//! exception. A record never supplies a body ACK or new-window coverage.
 //!
 //! Census state follows the working index (`self`), never `previous`: a held
 //! or partially committed key keeps the record of the revision this window
@@ -579,6 +580,20 @@ impl ClaudeRequestCensusRecord {
             && self.retired.is_none()
             && decode_fingerprint(entry_fingerprint)
                 .is_some_and(|fingerprint| fingerprint == self.source_file_fingerprint)
+    }
+
+    /// Negative provenance check for the narrow id-less pending exception.
+    /// The pending marker supplies the exact cause; this only refuses parse
+    /// loss, stale derivation, decode invalidation, twins and retirement.
+    /// It never supplies a body ACK, coverage or a duplicate proof.
+    pub(super) fn idless_native_for(&self, entry_fingerprint: &str) -> bool {
+        self.derivation == CLAUDE_REQUEST_CENSUS_DERIVATION
+            && self.shape == ClaudeRequestCensusShape::IdentityIncomplete
+            && !self.unverified
+            && !self.twin
+            && self.retired.is_none()
+            && decode_fingerprint(entry_fingerprint)
+                .is_some_and(|fp| fp == self.source_file_fingerprint)
     }
 
     /// Freshness of a ledger holder: `current_for`, or a loss-free

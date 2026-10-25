@@ -16,6 +16,88 @@
 
 use super::*;
 
+#[test]
+#[serial(source_manifests)]
+fn accepted_retry_no_otel_change_ack_then_carry_again() {
+    if !c1a_layout_supported("accepted_body_retry") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let fixture = c1a_fixture("accepted-body-retry");
+    let session = "e7000000-0000-4000-8000-000000000007";
+    let path = fixture.root.join(format!("{session}.jsonl"));
+    std::fs::write(
+        &path,
+        rearm_transcript_line(session, None, "req_accepted_1", 0),
+    )
+    .unwrap();
+    let closing = c1b_generation(&fixture, "accepted", (8, 0));
+    assert!(closing.census_complete && closing.full_rearm);
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    let seed = c1b_generation(&fixture, "accepted", (8, 10));
+    assert!(seed.red && seed.parsed.contains(session));
+    let before = c1a_saved(&fixture);
+    assert!(before["claude_usage_family_witnesses"]
+        .get(session)
+        .is_none());
+    let entry = |saved: &serde_json::Value| {
+        saved["files"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(key, _)| key.ends_with(&format!("{session}.jsonl")))
+            .unwrap()
+            .1
+            .clone()
+    };
+    let head = entry(&before)["last_snapshot_fingerprint"].clone();
+    let retry = c1b_generation(&fixture, "accepted", (8, 20));
+    assert_eq!(
+        retry.start.as_ref().unwrap().reason,
+        "terminal_unhealthy_retry"
+    );
+    assert!(
+        !retry.parsed.contains(session),
+        "no OTEL witness is needed for an accepted body"
+    );
+    RearmFixture::append(
+        &path,
+        &rearm_transcript_line(session, None, "req_accepted_2", 1),
+    );
+    let changed = c1b_generation(&fixture, "accepted", (8, 30));
+    assert!(changed.parsed.contains(session));
+    let accepted = c1a_saved(&fixture);
+    assert_ne!(entry(&accepted)["last_snapshot_fingerprint"], head);
+    assert!(entry(&accepted)["last_upload_body_witness"]
+        .as_str()
+        .is_some());
+    let current = accepted["file_snapshot_fingerprints"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(key, _)| key.ends_with(&format!("{session}.jsonl")))
+        .unwrap()
+        .1
+        .as_array()
+        .unwrap();
+    for fingerprint in current {
+        assert!(accepted["accepted_snapshot_fingerprints"]
+            .as_array()
+            .unwrap()
+            .contains(fingerprint));
+    }
+    let next = c1b_generation(&fixture, "accepted", (8, 40));
+    assert_eq!(
+        next.start.as_ref().unwrap().reason,
+        "terminal_unhealthy_retry"
+    );
+    assert!(
+        !next.parsed.contains(session),
+        "the new exact ACK restores eligibility on the next retry"
+    );
+    assert_eq!(entry(&c1a_saved(&fixture)), entry(&accepted));
+}
+
 const C1B_MAX_PAGES: usize = 8;
 
 /// Count-only fields of the traversal start that opened a window.
