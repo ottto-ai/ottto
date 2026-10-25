@@ -515,18 +515,30 @@ fn counting_tombstones_are_bounded_and_never_evict_legacy_evidence() {
         index.codex_counting_tombstones.len(),
         codex_counting_version::MAX_COUNTING_TOMBSTONES
     );
+    // In a later generation, the oldest earlier-generation Legacy evidence
+    // gives its slot; this generation's never does.
+    index.traversal.as_mut().unwrap().census_window_end = "g2".into();
+    let later_owner = legacy(9999).0;
+    index
+        .files
+        .insert(key.clone(), acked_entry(false, Some(later_owner.clone())));
+    assert!(codex_counting_version::tombstone_before_retire(
+        &mut index, &key
+    ));
+    assert!(!index.codex_counting_tombstones.contains_key(&legacy(1).0));
+    assert_eq!(
+        index.codex_counting_tombstones[&later_owner].retired_in,
+        "g2"
+    );
+    assert_eq!(
+        index.codex_counting_tombstones.len(),
+        codex_counting_version::MAX_COUNTING_TOMBSTONES
+    );
     index.files.clear();
 
     // Absence frees a slot only in a complete inventory of a later traversal
     // generation than the retiring one.
-    let present = BTreeMap::from([("/synthetic/p.jsonl".to_owned(), legacy(1).0)]);
-    codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
-    assert_eq!(
-        index.codex_counting_tombstones.len(),
-        codex_counting_version::MAX_COUNTING_TOMBSTONES,
-        "the retiring generation's walk may have raced a rename"
-    );
-    index.traversal.as_mut().unwrap().census_window_end = "g2".into();
+    let present = BTreeMap::from([("/synthetic/p.jsonl".to_owned(), legacy(2).0)]);
     codex_counting_version::prepare_moved_evidence(&mut index, &present, false);
     assert_eq!(
         index.codex_counting_tombstones.len(),
@@ -535,22 +547,31 @@ fn counting_tombstones_are_bounded_and_never_evict_legacy_evidence() {
     );
     codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
     assert_eq!(
-        index.codex_counting_tombstones.keys().collect::<Vec<_>>(),
-        [&legacy(1).0]
+        index
+            .codex_counting_tombstones
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from([legacy(2).0, later_owner.clone()]),
+        "the retiring generation's walk may have raced a rename"
     );
     // A live proven entry with at least the same evidence absorbs it.
     index
         .files
-        .insert(key.clone(), acked_entry(true, Some(legacy(1).0)));
+        .insert(key.clone(), acked_entry(true, Some(legacy(2).0)));
     codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
     assert_eq!(
         index.codex_counting_tombstones.len(),
-        1,
+        2,
         "V2 never absorbs Legacy"
     );
     index
         .files
-        .insert(key, acked_entry(false, Some(legacy(1).0)));
+        .insert(key.clone(), acked_entry(false, Some(legacy(2).0)));
+    index.files.insert(
+        "/synthetic/l.jsonl".into(),
+        acked_entry(false, Some(later_owner)),
+    );
     codex_counting_version::prepare_moved_evidence(&mut index, &present, true);
     assert!(index.codex_counting_tombstones.is_empty());
     // Persisted beside the entries; absent when empty.

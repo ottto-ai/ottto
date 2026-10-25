@@ -43359,21 +43359,13 @@ impl ScanIndex {
                 claude_owned_start_census.insert(source_session_id.clone(), witness.clone());
             }
         }
-        // Like pruning, freeing a tombstone becomes durable only with the
-        // final all-accepted save; a partial commit keeps the union.
-        let mut codex_counting_tombstones = previous.codex_counting_tombstones.clone();
-        for (owner, tombstone) in &self.codex_counting_tombstones {
-            codex_counting_tombstones
-                .entry(owner.clone())
-                .and_modify(|kept| {
-                    kept.evidence = kept.evidence.combine(tombstone.evidence);
-                    kept.retired_in.clone_from(&tombstone.retired_in);
-                })
-                .or_insert_with(|| tombstone.clone());
-        }
         let mut result = ScanIndex {
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
-            codex_counting_tombstones,
+            // The working map, bounded: its slots were freed only against the
+            // committed state this page loaded or by its eviction order, and a
+            // tombstone for a retirement this subset does not publish only
+            // repeats the evidence of the entry it keeps.
+            codex_counting_tombstones: self.codex_counting_tombstones.clone(),
             decode_holds: self.decode_holds.clone(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: previous.generation,

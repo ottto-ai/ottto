@@ -112,10 +112,12 @@ impl AckEvidence {
 /// At most this many retired owners keep counting evidence (at most about 150
 /// bytes each in heap and on disk: a 64-byte owner hash, the retiring
 /// generation's census timestamp and the evidence; about 150 KiB when full).
-/// Legacy evidence is never evicted: a full map first drops V2-only evidence,
-/// which can change a resumed job's view but never a decision, and otherwise
-/// refuses the retirement, so the entry keeps its own evidence until a slot
-/// frees.
+/// A full map first drops V2-only evidence, which can change a resumed job's
+/// view but never a decision, then the oldest Legacy evidence retired in an
+/// earlier traversal generation (disclosed residual: that owner's moved file,
+/// if any, has gone a full walk unparsed). Legacy evidence of the current
+/// generation is never evicted: the retirement is refused and the entry keeps
+/// its own evidence until the next generation frees a slot.
 pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
 
 /// Counting evidence of a retired, unprotected entry, keyed by its owner hash
@@ -146,7 +148,7 @@ fn proven_owner(entry: &ScanIndexEntry) -> Option<&String> {
 /// Records its counting evidence under its proven owner, or as a Legacy hint
 /// under each filename identity, exactly as `prepare_moved_evidence` would
 /// read the entry. Returns false when the entry must stay instead: the map is
-/// full and only Legacy evidence remains in it. Hash-only; no file read.
+/// full of this generation's Legacy evidence. Hash-only; no file read.
 pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool {
     let Some(entry) = index.files.get(key) else {
         return true;
@@ -181,17 +183,43 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             // V2-only evidence never selects a different version.
             return true;
         }
+        // V2-only evidence first; then Legacy evidence retired in an earlier
+        // traversal generation, oldest first: a full later walk has passed it
+        // unabsorbed, so its owner was most likely deleted, not moved.
+        let mut earlier = tombstones
+            .iter()
+            .filter(|(_, tombstone)| {
+                tombstone.evidence == AckEvidence::LegacyAcked && tombstone.retired_in != retired_in
+            })
+            .map(|(owner, tombstone)| (tombstone.retired_in.as_str(), owner.as_str()))
+            .collect::<Vec<_>>();
+        earlier.sort_unstable();
         let evictable = tombstones
             .iter()
             .filter(|(_, tombstone)| tombstone.evidence != AckEvidence::LegacyAcked)
-            .map(|(owner, _)| owner.clone())
+            .map(|(owner, _)| owner.as_str())
+            .chain(earlier.into_iter().map(|(_, owner)| owner))
             .take(short)
+            .map(str::to_owned)
             .collect::<Vec<_>>();
         if evictable.len() < short {
+            // Only this generation's Legacy evidence: a burst still in flight.
             return false;
         }
+        let mut legacy_evicted = 0usize;
         for owner in evictable {
-            tombstones.remove(&owner);
+            if tombstones
+                .remove(&owner)
+                .is_some_and(|tombstone| tombstone.evidence == AckEvidence::LegacyAcked)
+            {
+                legacy_evicted += 1;
+            }
+        }
+        if legacy_evicted > 0 {
+            eprintln!(
+                "ottto-service: Codex counting tombstones full; evicted {legacy_evicted} \
+                 earlier-generation Legacy owner(s)"
+            );
         }
     }
     for (owner, evidence) in retired {
