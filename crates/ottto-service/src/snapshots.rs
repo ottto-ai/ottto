@@ -7553,7 +7553,16 @@ pub fn apply_claude_effort_evidence_with_index(
 pub fn claude_pending_family_session_ids(index: &ScanIndex) -> Vec<String> {
     index
         .claude_account_family_pending
-        .keys()
+        .iter()
+        .filter(|(_, pending)| {
+            pending.invalid
+                || !pending.previous_windows.is_empty()
+                || pending
+                    .member_requests
+                    .values()
+                    .any(|requests| requests.identity_revision.is_none())
+        })
+        .map(|(root, _)| root)
         .chain(index.claude_usage_family_pending.keys())
         .chain(index.claude_usage_family_witnesses.keys())
         .chain(
@@ -62049,7 +62058,13 @@ mod tests {
         d2_finalize_identity_revisions(&mut reloaded);
         assert!(!reloaded.accepted_snapshot_fingerprints.is_empty());
         // Every blocker must retain the old window, even though proof exists.
-        for blocker in ["withheld", "retry", "identity", "unacked"] {
+        for blocker in [
+            "withheld",
+            "retry",
+            "authority_retry",
+            "identity",
+            "unacked",
+        ] {
             let mut held = reloaded.clone();
             let key = held.files.keys().next().unwrap().clone();
             match blocker {
@@ -62069,6 +62084,13 @@ mod tests {
                 }
                 "unacked" => {
                     held.accepted_snapshot_fingerprints.clear();
+                }
+                "authority_retry" => {
+                    held.insert_claude_authority_for_test(
+                        &root,
+                        "fixture",
+                        ClaudeUsageAuthorityQuarantineDisposition::RetryPending,
+                    );
                 }
                 "retry" => {
                     let fingerprint = held.file_snapshot_fingerprints[&key]
@@ -62211,6 +62233,8 @@ mod tests {
             index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
                 .unwrap();
             assert!(!index.claude_account_family_witnesses.contains_key(&root));
+            assert!(!claude_pending_family_session_ids(&index).contains(&root));
+            assert_eq!(index.claude_account_family_pending.len(), 1);
             assert!(index.claude_account_family_pending[&root]
                 .previous_windows
                 .is_empty());
