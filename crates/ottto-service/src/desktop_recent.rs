@@ -118,6 +118,11 @@ pub(crate) fn overlay(
 }
 
 #[cfg(test)]
+pub(crate) fn saved() -> RecentActivity {
+    RECENT.lock().unwrap().clone()
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use ottto_protocol::AgentStatusPlanObservation;
@@ -216,9 +221,4 @@ mod tests {
         activity.note(&"a".repeat(64), &"b".repeat(64), t(2000), t(2000));
         assert_eq!(activity.0.len(), 1);
     }
-}
-
-#[cfg(test)]
-pub(crate) fn saved() -> RecentActivity {
-    RECENT.lock().unwrap().clone()
 }
