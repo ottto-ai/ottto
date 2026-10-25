@@ -1580,6 +1580,7 @@ fn assert_x_out_covers_finish_with(
                 Some(title),
                 attribution.as_ref(),
                 identity,
+                None,
             )
             .unwrap()
     });
@@ -2207,6 +2208,7 @@ fn x_out_charges_buffered_request_hashes_of_an_itemless_file() {
                 Some(&title),
                 None,
                 identity,
+                None,
             )
             .unwrap();
         (hashes, parsed)

@@ -9438,23 +9438,60 @@ where
     }
     let mut deferred_validation_error = None;
     let mut batches = VecDeque::new();
+    let mut groups = Vec::<Vec<(usize, usize, bool)>>::new();
+    let mut literal_families = BTreeMap::<String, Vec<(usize, usize, bool)>>::new();
+    for (index, body_length, _) in pending_by_fingerprint.into_values() {
+        let item_batch_class = batch_class(&items[index]);
+        let literal = crate::snapshots::claude_request_money::e2::enabled()
+            && serde_json::to_value(&items[index])
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .get("usage_accounting_contract")
+                        .and_then(Value::as_str)
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                });
+        let item = (index, body_length.saturating_add(1), item_batch_class);
+        if literal {
+            let member = session_id(&items[index])
+                .ok_or_else(|| anyhow!("request-owned body lacks session identity"))?;
+            let root = member
+                .split_once("_agent-")
+                .map_or(member, |(root, _)| root);
+            literal_families.entry(root.into()).or_default().push(item);
+        } else {
+            groups.push(vec![item]);
+        }
+    }
+    groups.extend(literal_families.into_values());
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
-    for (index, body_length, _) in pending_by_fingerprint.into_values() {
-        let item_bytes = body_length.saturating_add(1);
-        let item_batch_class = batch_class(&items[index]);
+    for group in groups {
+        let group_bytes = group
+            .iter()
+            .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
+        let group_class = group[0].2;
+        if group.len() > 1
+            && (group.len() > SNAPSHOT_BATCH_LIMIT
+                || group_bytes.saturating_add(2) > SNAPSHOT_BATCH_MAX_BYTES
+                || group.iter().any(|(_, _, class)| *class != group_class))
+        {
+            return Err(anyhow!(
+                "request-owned family cannot fit one snapshot batch"
+            ));
+        }
         if !batch.is_empty()
-            && (batch.len() == SNAPSHOT_BATCH_LIMIT
-                || batch_bytes.saturating_add(item_bytes) > SNAPSHOT_BATCH_MAX_BYTES
-                || current_batch_class != Some(item_batch_class))
+            && (batch.len() + group.len() > SNAPSHOT_BATCH_LIMIT
+                || batch_bytes.saturating_add(group_bytes) > SNAPSHOT_BATCH_MAX_BYTES
+                || current_batch_class != Some(group_class))
         {
             batches.push_back((std::mem::take(&mut batch), false));
             batch_bytes = 2;
         }
-        current_batch_class = Some(item_batch_class);
-        batch.push(index);
-        batch_bytes = batch_bytes.saturating_add(item_bytes);
+        current_batch_class = Some(group_class);
+        batch.extend(group.into_iter().map(|(index, _, _)| index));
+        batch_bytes = batch_bytes.saturating_add(group_bytes);
     }
     if !batch.is_empty() {
         batches.push_back((batch, false));
@@ -9500,7 +9537,18 @@ where
         let inplace_wait = attempt.as_ref().err().and_then(|error| {
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
+        let literal_batch = indices.iter().any(|index| {
+            serde_json::to_value(&items[*index])
+                .ok()
+                .is_some_and(|value| {
+                    value
+                        .get("usage_accounting_contract")
+                        .and_then(Value::as_str)
+                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                })
+        });
         match attempt {
+            Err(error) if literal_batch && inplace_wait.is_none() => return Err(error),
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
@@ -11011,6 +11059,7 @@ mod tests {
         index.files.insert(
             "synthetic/deferred.jsonl".into(),
             crate::snapshots::ScanIndexEntry {
+                claude_money_min_birth_nanos: None,
                 size_bytes: 1,
                 modified_unix_seconds: 1,
                 modified_unix_nanos: Some(1),

@@ -1605,6 +1605,7 @@ mod bounded_save_tests {
         let job = WriteJob {
             support_dir: scratch.to_path_buf(),
             jsonl: JsonlBatch {
+                telemetry_only: false,
                 now,
                 fault: super::super::PageFault::None,
                 families: Vec::with_capacity(1),

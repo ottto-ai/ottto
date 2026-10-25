@@ -3756,6 +3756,7 @@ fn deserialize_unsettled_causes<'de, D: serde::Deserializer<'de>>(
 impl Default for ScanIndex {
     fn default() -> Self {
         Self {
+            claude_money_births: Default::default(),
             decode_holds: lenient_decode::Holds::default(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
             generation: 0,
@@ -12872,24 +12873,6 @@ fn semantic_attribution_facts(item: &SnapshotItem) -> Vec<Value> {
 }
 
 fn semantic_attribution(item: &SnapshotItem) -> Value {
-    if let Some(value) = item.removed_request_count {
-        usage_accounting
-            .as_object_mut()
-            .unwrap()
-            .insert("removed_request_count".into(), json!(value));
-    }
-    if let Some(value) = item.removed_usage {
-        usage_accounting
-            .as_object_mut()
-            .unwrap()
-            .insert("removed_usage".into(), json!(value));
-    }
-    if let Some(value) = item.telemetry_owned_complete {
-        usage_accounting
-            .as_object_mut()
-            .unwrap()
-            .insert("telemetry_owned_complete".into(), json!(value));
-    }
     #[cfg(not(test))]
     let identity_collector = claude_request_identity::COLLECTOR;
     #[cfg(test)]
@@ -13027,6 +13010,19 @@ pub(crate) fn snapshot_semantic_component_hashes(
                 "request_identity".to_string(),
                 claude_request_identity::semantic_leaf(item),
             );
+    }
+    let mut ownership = serde_json::Map::new();
+    if let Some(value) = item.removed_request_count {
+        ownership.insert("removed_request_count".into(), json!(value));
+    }
+    if let Some(value) = item.removed_usage {
+        ownership.insert("removed_usage".into(), json!(value));
+    }
+    if let Some(value) = item.telemetry_owned_complete {
+        ownership.insert("telemetry_owned_complete".into(), json!(value));
+    }
+    if !ownership.is_empty() {
+        usage_accounting["request_ownership"] = Value::Object(ownership);
     }
     insert("usage_accounting", usage_accounting);
     insert(
@@ -43461,6 +43457,7 @@ impl ScanIndex {
             }
         }
         let mut result = ScanIndex {
+            claude_money_births: self.claude_money_births.clone(),
             codex_counting_moved_evidence: self.codex_counting_moved_evidence.clone(),
             decode_holds: self.decode_holds.clone(),
             schema_version: SCAN_INDEX_SCHEMA_VERSION,
