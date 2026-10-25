@@ -1111,6 +1111,8 @@ struct PermanentSnapshotRejection {
     reoffer: Option<reason_reoffer::RefusalReoffer>,
 }
 
+mod ack_retention;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotUploadProgress {
     schema_version: u16,
@@ -1130,6 +1132,9 @@ struct SnapshotUploadProgress {
     /// fingerprint.
     #[serde(default)]
     accepted_body_witnesses: BTreeMap<String, String>,
+    /// Admission only: loaded committed incidence plus bounded unsettled ACK debt.
+    #[serde(skip, default = "ack_retention::default_ack_capacity")]
+    ack_capacity: usize,
     #[serde(default)]
     accepted_cache_states: BTreeMap<String, serde_json::Value>,
     #[serde(default)]
@@ -1186,6 +1191,7 @@ impl SnapshotUploadProgress {
             historical_replay_generation: None,
             accepted_fingerprints: BTreeSet::new(),
             accepted_body_witnesses: BTreeMap::new(),
+            ack_capacity: ack_retention::default_ack_capacity(),
             accepted_cache_states: BTreeMap::new(),
             accepted_cache_heads: BTreeMap::new(),
             pending_cache_heads: BTreeMap::new(),
@@ -2327,15 +2333,15 @@ impl SnapshotUploadProgress {
     }
 
     fn finish_cycle(&mut self, path: &Path) -> Result<()> {
-        if self.permanent_rejections.is_empty()
+        if self.accepted_fingerprints.is_empty()
+            && self.permanent_rejections.is_empty()
             && self.accepted_cache_states.is_empty()
             && self.accepted_cache_heads.is_empty()
             && self.pending_cache_heads.is_empty()
         {
             return self.clear(path);
         }
-        self.accepted_fingerprints.clear();
-        self.accepted_body_witnesses.clear();
+        // Unadopted ACKs survive until a successful index save transfers them.
         // A later conflict on the refused bytes is the stronger settlement
         // fact, even while the retained refusal gates its next daily offer.
         // Keep it in the same atomic ledger so an older index-only timer can
@@ -2754,6 +2760,7 @@ fn checkpoint_partial_snapshot_index_with_comparison(
     durable.active_reason_reoffers = progress.active_reason_reoffers.clone();
     durable.attempted_reason_reoffers = progress.attempted_reason_reoffers.clone();
     durable.reason_reoffer_counts = progress.reason_reoffer_counts;
+    durable.ack_capacity = progress.ack_capacity;
     if durable != *progress || durable.schema_version != SNAPSHOT_UPLOAD_PROGRESS_SCHEMA_VERSION {
         return Err(anyhow!(
             "snapshot progress changed before partial checkpoint"
@@ -5772,6 +5779,7 @@ fn prepare_sync_source(
     )?;
     let (mut index, load_origin) =
         ScanIndex::load_for_snapshot_source_with_origin(&index_path, source, support_dir)?;
+    upload_progress.configure_ack_capacity(&index);
     // U1a-2a (C14), Codex only: the side-request ledger's gate slot, prune
     // and eager hydrate run against the index exactly as loaded, namespaced
     // by this index file. They touch only side requests and side records.
@@ -6237,6 +6245,7 @@ fn prepare_continuation_source(
     )?;
     let (mut index, _) =
         ScanIndex::load_for_snapshot_source_with_origin(&inputs.index_path, source, support_dir)?;
+    upload_progress.configure_ack_capacity(&index);
     let backfill_state = load_backfill_state(support_dir);
     let replay_generation = cycle_replay_generation(
         source,
@@ -7334,8 +7343,8 @@ fn finish_sync_source(
         }
         Err(error) => {
             // Earlier pages may have durable exact ACKs even though this pass
-            // failed. Save their wholly settled files before a later upload
-            // delta can prune those ACKs. Local-state failures leave durability
+            // failed. Save their wholly settled files and release adopted ACK
+            // capacity. Local-state failures leave durability
             // uncertain and must not certify an in-memory mutated ledger.
             if snapshot_upload_error_class(&error) != Some(SnapshotUploadErrorClass::LocalState) {
                 let side_mark = codex_side_save_mark(daemon, source, &index_path);
@@ -7361,6 +7370,12 @@ fn finish_sync_source(
                     Ok(committable) => {
                         index = committable;
                         note_codex_side_saved(daemon, &index_path, false, side_mark);
+                        upload_progress.retire_acks_after_index_save(
+                            &index,
+                            &BTreeSet::new(),
+                            locally_held_fingerprints,
+                        );
+                        upload_progress.save(&upload_progress_path)?;
                     }
                     Err(checkpoint_error) => eprintln!(
                         "local snapshot partial scan checkpoint failed for {}: {}",
@@ -7533,6 +7548,7 @@ fn finish_sync_source(
             upload_fully_settled = false;
         }
     }
+    let retired_upload_acks = upload_progress.retired_ack_candidates(&committed_index, &index);
     // Every selected-state restoration above has finished. A non-current
     // comparison already revoked this lease locally and cannot mint a native
     // correction later in this finish. Retire only that Claude prior index
@@ -7728,6 +7744,11 @@ fn finish_sync_source(
     // Before `finish_cycle` retires this cycle's quarantine records.
     let retained_refusals = PermanentRefusalCounts::of(&upload_progress);
     let retained_downgrades = PermanentRefusalCounts::authority_downgrades(&upload_progress);
+    upload_progress.retire_acks_after_index_save(
+        &index,
+        &retired_upload_acks,
+        locally_held_fingerprints,
+    );
     upload_progress.finish_cycle(&upload_progress_path)?;
 
     if let Some(count) = deferred_entity_count {
@@ -9137,6 +9158,17 @@ where
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
+    // Reserve every possible ACK before any remote side effect, including the
+    // retained retry driver. Capacity stops use the partial-index save path.
+    let new_acks = indices
+        .iter()
+        .filter(|index| {
+            !progress
+                .accepted_fingerprints
+                .contains(fingerprint(&items[**index]))
+        })
+        .count();
+    progress.admit_ack_batch(new_acks)?;
     let batch = indices
         .iter()
         .map(|index| items[*index].clone())
@@ -9367,10 +9399,9 @@ where
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
-    // A permanently invalid snapshot can keep the final scan index uncommitted
-    // across many cycles while valid sessions continue changing. Retain only
-    // fingerprints present in this cycle's policy/cutoff-filtered work so the
-    // hash-only ledger stays O(current scan), not O(all historical revisions).
+    // Input is a page/delta, not a census. Only an explicitly changed body
+    // invalidates its previous ACK here. Index settlement owns retirement;
+    // bounded admission below prevents unindexed revisions growing forever.
     let mut current_body_witnesses = BTreeMap::new();
     for item in items {
         let item_fingerprint = fingerprint(item).to_string();
@@ -9391,7 +9422,11 @@ where
     let progress_len_before_prune = progress.accepted_fingerprints.len();
     progress
         .accepted_body_witnesses
-        .retain(|fingerprint, witness| current_body_witnesses.get(fingerprint) == Some(witness));
+        .retain(|fingerprint, witness| {
+            current_body_witnesses
+                .get(fingerprint)
+                .map_or(true, |current| current == witness)
+        });
     progress
         .accepted_fingerprints
         .retain(|value| progress.accepted_body_witnesses.contains_key(value));
@@ -10850,6 +10885,9 @@ pub(crate) fn safe_error(error: &anyhow::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    mod ack_retention_tests {
+        include!("snapshot_sync/ack_retention_tests.rs");
+    }
     use crate::snapshots::finalize_scan_after_policy;
     #[test]
     fn retry_copy_keeps_compaction_events_and_never_local_context_points() {
@@ -13666,6 +13704,24 @@ mod tests {
         let path = directory.join("progress.json");
         let _ = std::fs::remove_file(&path);
         restored.save(&path).unwrap();
+        let (mut settled_index, _) = pending_head_index_item();
+        settled_index.record_accepted_snapshot_fingerprints(&restored.accepted_fingerprints);
+        let mut digest = Sha256::new();
+        for bytes in [
+            b"snapshot_file_upload_body_set:v1".as_slice(),
+            snapshot_upload_body_witness(&item).as_bytes(),
+        ] {
+            digest.update((bytes.len() as u32).to_be_bytes());
+            digest.update(bytes);
+        }
+        settled_index
+            .files
+            .values_mut()
+            .next()
+            .unwrap()
+            .last_upload_body_witness = Some(format!("{:x}", digest.finalize()));
+        settled_index.save(&directory.join("index.json")).unwrap();
+        restored.retire_acks_after_index_save(&settled_index, &BTreeSet::new(), &BTreeSet::new());
         restored.finish_cycle(&path).unwrap();
         let mut restored = SnapshotUploadProgress::load(
             &path,
@@ -16310,9 +16366,26 @@ mod tests {
         let poison_scope = &unique_poison_scope();
         let poison = format!("{:064x}", 9000);
         let mut progress = test_upload_progress();
+        let scratch = crate::test_scratch::ScratchDir::new("poison-revision-retirement");
+        let index_path = scratch.join("index.json");
+        let progress_path = scratch.join("progress.json");
+        let mut index = ScanIndex::default();
+        index.save(&index_path).unwrap();
+        progress.save(&progress_path).unwrap();
 
         for revision in 0..20 {
             let valid = format!("{:064x}", 10_000 + revision);
+            // A committed replacement of this file's exact entity incidence
+            // retires the prior revision. Page omission itself proves nothing.
+            let previous = ScanIndex::load(&index_path).unwrap();
+            index
+                .file_snapshot_fingerprints
+                .insert("changing.jsonl".into(), BTreeSet::from([valid.clone()]));
+            let retired = progress.retired_ack_candidates(&previous, &index);
+            index.save(&index_path).unwrap();
+            index = ScanIndex::load(&index_path).unwrap();
+            progress.retire_acks_after_index_save(&index, &retired, &BTreeSet::new());
+            progress.save(&progress_path).unwrap();
             let items = vec![valid.clone(), poison.clone()];
             let mut accepted = 0;
             let error = upload_resumable_batches(
@@ -16334,10 +16407,16 @@ mod tests {
                         Ok(accepted_batch(batch.len()))
                     }
                 },
-                |_| Ok(()),
+                |state| state.save(&progress_path),
             )
             .expect_err("permanent poison keeps the cycle incomplete");
 
+            progress = SnapshotUploadProgress::load(
+                &progress_path,
+                &progress.destination_namespace_hash,
+                test_quarantine_witness(),
+            )
+            .unwrap();
             assert!(is_item_specific_validation_failure(&error));
             assert_eq!(accepted, 1);
             assert_eq!(progress.accepted_fingerprints.len(), 1);
@@ -22870,7 +22949,7 @@ mod tests {
 
 crate::heap_layout_bound::fields!(SourcePreparation; native_comparison_reservation, native_comparison_lease, prepared_claude_evidence, terminal_native_traversal, native_comparison_controller, retry_authority, source, claude_scan_roots, account_witness, scan_started_at, activity_hint, receipt_window_days, context_curve_enabled, cache_observations_enabled, scan_agent_status_collection, attribution_context, upload_policy, upload_destination_namespace, receipt_client, index_path, upload_progress_path, upload_progress, committed_index, backfill_state, backfill_pending, replay_generation, legacy_reconciliation_pending, active_legacy_reconciliation, scan);
 
-crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
+crate::heap_layout_bound::fields!(SnapshotUploadProgress; schema_version, generation, destination_namespace_hash, historical_replay_generation, accepted_fingerprints, accepted_body_witnesses, ack_capacity, accepted_cache_states, accepted_cache_heads, pending_cache_heads, quarantined_fingerprints, permanent_rejections, active_quarantine_witness, active_quarantine_retries, active_reason_reoffers, attempted_reason_reoffers, reason_reoffer_counts);
 
 crate::heap_layout_bound::fields!(PendingCacheHeadFile; source_file_fingerprint, group_fingerprint, entities, reselected_heads, settled_entities);
 
