@@ -784,9 +784,36 @@ struct Catalog {
     funds: Vec<money::ShadowReservation>,
     entries: Vec<Manifest>,
     loading: Option<Ticket<Vec<Manifest>>>,
+    // Known selected-save markers leave the validated catalog initialized.
+    // Startup consumes this result before any new capture or replay.
+    resolving: Option<Ticket<Vec<Manifest>>>,
     maintenance_day: Option<u64>,
 }
 static CATALOGS: Mutex<BTreeMap<PathBuf, Catalog>> = Mutex::new(BTreeMap::new());
+
+fn catalog_result(
+    ticket: &Ticket<Vec<Manifest>>,
+) -> Result<Option<(Vec<Manifest>, money::ShadowReservation)>> {
+    // Pay the handoff BEFORE receiving. Admission pressure must leave the
+    // durable result in its ticket, rather than consume it and lose its owner.
+    let mut funds =
+        money::ShadowReservation::admit(4 * ACTIVE_MAX * MANIFEST_MAX).ok_or_else(capacity_full)?;
+    let Some(entries) = ticket.take()? else {
+        return Ok(None);
+    };
+    let charge = entries
+        .iter()
+        .try_fold(0_usize, |n, m| {
+            serde_json::to_vec(m)
+                .ok()
+                .and_then(|v| n.checked_add(v.len().saturating_mul(4)))
+        })
+        .ok_or_else(fault)?;
+    if charge > funds.bytes() || !funds.resize(charge) {
+        return Err(fault());
+    }
+    Ok(Some((entries, funds)))
+}
 
 /// Called before activity/token networking, including when the source's
 /// network backoff would otherwise skip its finish. Expiry does not need HTTP.
@@ -863,11 +890,21 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
                 funds: Vec::new(),
                 entries: Vec::new(),
                 loading: Some(ticket),
+                resolving: None,
                 maintenance_day: Some(now / 86400),
             },
         );
     }
     let catalog = catalogs.get_mut(support).unwrap();
+    if let Some(ticket) = &catalog.resolving {
+        let Some((entries, funds)) = catalog_result(ticket)? else {
+            return Ok(false);
+        };
+        catalog.entries = entries;
+        catalog.funds.clear();
+        catalog.funds.push(funds);
+        catalog.resolving = None;
+    }
     if catalog.loading.is_none() && catalog.maintenance_day != Some(now / 86400) {
         let root = dir(support);
         catalog.loading = Some(catalog_job(move || load_for_startup(&root, now))?);
@@ -875,18 +912,9 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
         return Ok(false);
     }
     if let Some(ticket) = &catalog.loading {
-        let Some(entries) = ticket.take()? else {
+        let Some((entries, funds)) = catalog_result(ticket)? else {
             return Ok(false);
         };
-        let charge = entries
-            .iter()
-            .try_fold(0_usize, |n, m| {
-                serde_json::to_vec(m)
-                    .ok()
-                    .and_then(|v| n.checked_add(v.len().saturating_mul(4)))
-            })
-            .ok_or_else(fault)?;
-        let funds = money::ShadowReservation::admit(charge).ok_or_else(capacity_full)?;
         catalog.entries = entries;
         catalog.loaded = true;
         catalog.funds.clear();
@@ -1353,7 +1381,7 @@ pub(super) fn resolve_saved(
     let Some(catalog) = catalogs.get_mut(support) else {
         return Ok(());
     };
-    if catalog.loading.is_some() {
+    if catalog.loading.is_some() || catalog.resolving.is_some() {
         return Err(capacity_full());
     }
     let _staging =
@@ -1427,7 +1455,7 @@ pub(super) fn resolve_saved(
         // could exhaust memory before a full catalog could retire. No mark is
         // published in memory until the admitted writer result is consumed.
         let root = dir(support);
-        catalog.loading = Some(catalog_job(move || {
+        catalog.resolving = Some(catalog_job(move || {
             for manifest in resolved {
                 write_manifest(&root, &manifest)?;
             }
