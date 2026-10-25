@@ -242,12 +242,15 @@ pub(super) fn existing_recovery_state(support: &Path) -> Result<bool> {
         }
         let name = entry.map_err(|_| fault())?.file_name();
         let name = name.to_str().ok_or_else(fault)?;
-        if name.split_once('.').is_some_and(|(_, extension)| {
-            matches!(
-                extension,
-                "json" | "body" | "json.tmp" | "body.tmp" | "receipt"
-            )
-        }) {
+        if name == SOURCE_BACKOFF_FILE
+            || name == "source-backoff.state.tmp"
+            || name.split_once('.').is_some_and(|(_, extension)| {
+                matches!(
+                    extension,
+                    "json" | "body" | "json.tmp" | "body.tmp" | "receipt"
+                )
+            })
+        {
             return Ok(true);
         }
     }
@@ -1317,16 +1320,52 @@ pub(super) fn replay_ticket(support: &Path, mut m: Manifest, now: u64) -> Result
         Ok((m, bytes, funds))
     })
 }
+const SOURCE_BACKOFF_FILE: &str = "source-backoff.state";
+
+fn load_source_backoff(root: &Path, now: u64) -> Result<Option<Duration>> {
+    let path = root.join(SOURCE_BACKOFF_FILE);
+    if !path.try_exists()? {
+        return Ok(None);
+    }
+    let until: u64 = serde_json::from_slice(&read_capped(&path, 64)?)?;
+    if until > now {
+        return Ok(Some(Duration::from_secs(until - now)));
+    }
+    fs::remove_file(&path)?;
+    sync_dir(root)?;
+    Ok(None)
+}
+fn persist_source_backoff(root: &Path, until: u64) -> Result<()> {
+    let path = root.join(SOURCE_BACKOFF_FILE);
+    let previous = if path.try_exists()? {
+        serde_json::from_slice::<u64>(&read_capped(&path, 64)?)?
+    } else {
+        0
+    };
+    atomic(root, &path, &serde_json::to_vec(&until.max(previous))?)
+}
 pub(super) fn outcome_ticket(
+    support: &Path,
+    m: Manifest,
+    reason: Option<Reason>,
+    not_before: u64,
+) -> Result<Ticket<Manifest>> {
+    outcome_with_source_backoff(support, m, reason, not_before, None)
+}
+fn outcome_with_source_backoff(
     support: &Path,
     mut m: Manifest,
     reason: Option<Reason>,
     not_before: u64,
+    source_until: Option<u64>,
 ) -> Result<Ticket<Manifest>> {
     let root = dir(support);
     m.terminal = reason;
     m.not_before = m.not_before.max(not_before);
     job(move || {
+        if let Some(until) = source_until {
+            persist_source_backoff(&root, until)?;
+        }
         write_manifest(&root, &m)?;
         Ok(m)
     })
@@ -1971,7 +2010,10 @@ pub(super) fn initial_post(
         |e| error_transition(e, now(support)),
     );
     let backoff = result.as_ref().err().and_then(source_backoff);
-    let ticket = outcome_ticket(support, m, reason, not_before)?;
+    let source_until = backoff.map(|delay| {
+        now(support).saturating_add(delay.unwrap_or(Duration::from_secs(300)).as_secs())
+    });
+    let ticket = outcome_with_source_backoff(support, m, reason, not_before, source_until)?;
     OUTCOMES
         .lock()
         .map_err(|_| fault())?
@@ -2206,6 +2248,14 @@ pub(super) async fn replay_due(
     policy: [u8; 32],
     authority: impl Fn() -> Result<()>,
 ) -> Result<()> {
+    let root = dir(support);
+    let observed = now(support);
+    if let Some(retry_after) = wait(job(move || load_source_backoff(&root, observed))?).await? {
+        return Err(Backoff {
+            retry_after: Some(retry_after),
+        }
+        .into());
+    }
     let binding = binding(namespace, client.recovery_origin(), machine, account);
     let (due, _scope_funds) = due(support, now(support))?;
     for m in due {
@@ -2329,7 +2379,17 @@ pub(super) async fn replay_due(
                 transition
             }
         };
-        let updated = wait(outcome_ticket(support, m, reason, not_before)?).await?;
+        let source_until = backoff.map(|delay| {
+            now(support).saturating_add(delay.unwrap_or(Duration::from_secs(300)).as_secs())
+        });
+        let updated = wait(outcome_with_source_backoff(
+            support,
+            m,
+            reason,
+            not_before,
+            source_until,
+        )?)
+        .await?;
         replace(support, updated)?;
         // Persist the immutable attempt's outcome first, then stop all further
         // replay/new POSTs through the existing source-level shed branch.
@@ -2924,5 +2984,37 @@ mod tests {
                 usize::from(basis.is_none())
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod integration_source_backoff_regressions {
+    use super::*;
+    #[test]
+    fn durable_source_backoff_outlives_attempt_replay_and_restores_the_raw_floor() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-source-backoff-restart");
+        let root = dir(&scratch);
+        private_dir(&root).unwrap();
+        let now = 1_790_000_000;
+        let until = now + 48 * 3600;
+        persist_source_backoff(&root, until).unwrap();
+        assert!(existing_recovery_state(&scratch).unwrap());
+        assert!(
+            load(&root).unwrap().is_empty(),
+            "no attempt is replay-eligible"
+        );
+        // A new process still sees the source floor after the attempt's 24h expiry.
+        assert_eq!(
+            load_source_backoff(&root, now + 24 * 3600).unwrap(),
+            Some(Duration::from_secs(24 * 3600))
+        );
+        persist_source_backoff(&root, now + 300).unwrap();
+        assert_eq!(
+            load_source_backoff(&root, now).unwrap(),
+            Some(Duration::from_secs(48 * 3600)),
+            "shorter outcomes cannot reset the raw floor"
+        );
+        assert_eq!(load_source_backoff(&root, until).unwrap(), None);
+        assert!(!root.join(SOURCE_BACKOFF_FILE).exists());
     }
 }

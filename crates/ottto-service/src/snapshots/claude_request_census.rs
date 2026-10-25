@@ -1258,32 +1258,7 @@ impl<R: std::io::Read> CensusRead<R> {
             index.claude_money_files.clear();
         }
         if self.seen_selection {
-            let mut reowe = Vec::new();
-            for (key, entry) in &index.files {
-                // Empty physical files settle locally without an entity or
-                // ACK. Keep the same exception separate from selection loss.
-                let settled_empty = index.confirmed_empty_files.contains(key)
-                    && entry.last_snapshot_fingerprint.is_none()
-                    && entry.last_upload_body_witness.is_none()
-                    && index
-                        .file_snapshot_fingerprints
-                        .get(key)
-                        .map_or(true, BTreeSet::is_empty);
-                if entry.effective_upload_body_witness_revision >= 3
-                    && !index.claude_money_files.contains_key(key)
-                    && !settled_empty
-                    && !super::money_fingerprints_below_retention_floor(
-                        index.file_snapshot_fingerprints.get(key),
-                        &index.snapshot_activity_at,
-                    )
-                {
-                    reowe.push(key.clone());
-                }
-            }
-            for key in reowe {
-                index.re_owe_effective_upload_body_witness_revision(&key, 2);
-                index.claude_request_census.invalidate_keeping_birth(&key);
-            }
+            repair_money_selection_loss(index);
         }
 
         if self.duplicate_census {
@@ -3574,5 +3549,38 @@ mod memo_accounting_tests {
         }
         assert_eq!(census.serialized_total, 0);
         assert_eq!(census.hash_total, 0);
+    }
+}
+
+/// Rearm physical revision-3 evidence whose optional logical selection was lost.
+pub(super) fn repair_money_selection_loss(index: &mut ScanIndex) {
+    let mut reowe = Vec::new();
+    for (key, entry) in &index.files {
+        if super::claude_index_path_member_ref(std::path::Path::new(key)).is_none() {
+            continue;
+        }
+        // Empty physical files settle locally without an entity or
+        // ACK. Keep the same exception separate from selection loss.
+        let settled_empty = index.confirmed_empty_files.contains(key)
+            && entry.last_snapshot_fingerprint.is_none()
+            && entry.last_upload_body_witness.is_none()
+            && index
+                .file_snapshot_fingerprints
+                .get(key)
+                .map_or(true, BTreeSet::is_empty);
+        if entry.effective_upload_body_witness_revision >= 3
+            && !index.claude_money_files.contains_key(key)
+            && !settled_empty
+            && !super::money_fingerprints_below_retention_floor(
+                index.file_snapshot_fingerprints.get(key),
+                &index.snapshot_activity_at,
+            )
+        {
+            reowe.push(key.clone());
+        }
+    }
+    for key in reowe {
+        index.re_owe_effective_upload_body_witness_revision(&key, 2);
+        index.claude_request_census.invalidate_keeping_birth(&key);
     }
 }

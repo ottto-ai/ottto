@@ -488,6 +488,7 @@ struct Decoder<R> {
     counts: Counts,
     family_spans: BTreeMap<&'static str, Span>,
     census_resources: [bool; 2],
+    seen_money_selection: bool,
 }
 #[derive(Clone, Copy)]
 struct Span {
@@ -848,6 +849,7 @@ fn read_inner<R: BufRead + Seek>(
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
         census_resources,
+        seen_money_selection: false,
     };
     // Controls are checked before any record can exhaust hold admission.
     // Otherwise a future ledger placed after damaged records could be renamed
@@ -895,6 +897,9 @@ fn read_inner<R: BufRead + Seek>(
     index.retain_decodable_codex_parent_state();
     index.drop_unbound_claude_authority_records(stage);
     settle_retired_family_decode(&mut index);
+    if decoder.seen_money_selection {
+        claude_request_census::repair_money_selection_loss(&mut index);
+    }
     Ok(index)
 }
 
@@ -938,6 +943,7 @@ pub(super) fn read_identity_carry(
         counts: Counts::default(),
         family_spans: BTreeMap::new(),
         census_resources,
+        seen_money_selection: false,
     };
     let mut carry = decoder.index(Pass::IdentityCarry)?;
     controls(&carry, source)?;
@@ -1524,6 +1530,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                                 .claude_request_census
                         }
                         "claude_money_files" => {
+                            self.seen_money_selection = true;
                             index.claude_money_files =
                                 self.census(value, "claude_money_files")?.claude_money_files;
                         }

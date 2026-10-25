@@ -2071,6 +2071,9 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("retry inserted");
+        let progress_limit = reason_reoffer::now_unix_seconds()
+            .saturating_add(crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2));
+        let not_before = not_before.min(progress_limit);
         record.retry_after_unix_seconds = not_before;
         if let Some((hold, deadline)) = previous {
             record.hold = Some(hold);
@@ -24039,5 +24042,38 @@ mod request_owned_retry_tests {
             body_excerpt: Some(r#"{"detail":[{"loc":["body","snapshots",0,"removed_usage"],"type":"greater_than_equal"}]}"#.into()) });
         assert!(!is_literal_version_skew(&invalid));
         assert!(is_item_specific_validation_failure(&invalid));
+    }
+}
+
+#[cfg(test)]
+mod integration_progress_regressions {
+    use super::*;
+    #[test]
+    fn long_recovery_timer_keeps_unrelated_ack_and_cache_state_loadable() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-long-route-progress");
+        let path = scratch.join("progress.json");
+        let namespace = "a".repeat(64);
+        let accepted = "b".repeat(64);
+        let pending = "c".repeat(64);
+        let body = "d".repeat(64);
+        let witness = snapshot_quarantine_witness(SnapshotSource::ClaudeCode);
+        let mut progress = SnapshotUploadProgress::new(namespace.clone(), witness.clone());
+        progress.record_body(&accepted, &body);
+        progress
+            .accepted_cache_states
+            .insert(accepted.clone(), serde_json::json!({"observations": []}));
+        progress.quarantine_transient_body(&pending, &body, current_unix_seconds() + 48 * 3600);
+        assert!(snapshot_quarantine_deadline_is_bounded(
+            &progress.quarantined_fingerprints[&pending]
+        ));
+        progress.save(&path).unwrap();
+        let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+        assert!(restored.accepted_fingerprints.contains(&accepted));
+        assert_eq!(restored.accepted_body_witnesses[&accepted], body);
+        assert_eq!(
+            restored.accepted_cache_states[&accepted],
+            serde_json::json!({"observations": []})
+        );
+        assert!(restored.quarantined_fingerprints.contains_key(&pending));
     }
 }

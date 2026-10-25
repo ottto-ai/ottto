@@ -484,12 +484,33 @@ pub(crate) fn synthetic_fingerprints(index: &ScanIndex) -> impl Iterator<Item = 
         .map(|state| &state.revision)
 }
 
-pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &[SnapshotItem]) {
-    for item in items {
+pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &mut Vec<SnapshotItem>) {
+    items.retain(|item| {
         let key = store::money_key("synthetic:", &item.source_session_id);
         if synthetic(item)
             && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_CONTRACT)
         {
+            let body = super::super::snapshot_upload_body_witness(item);
+            let unchanged = index.claude_money_files.get(&key).is_some_and(|old| {
+                old.revision == item.snapshot_fingerprint
+                    && old.synthetic_body.as_deref() == Some(body.as_str())
+            }) && index
+                .accepted_snapshot_fingerprints
+                .contains(&item.snapshot_fingerprint)
+                && !index.quarantine_requires_retry_body(&item.snapshot_fingerprint, &body)
+                && !index
+                    .active_request_money_support_dir
+                    .as_deref()
+                    .is_some_and(|support| {
+                        super::money_due(
+                            support,
+                            &format!("synthetic:{}", item.source_session_id),
+                            super::page_now(support),
+                        )
+                    });
+            if unchanged {
+                return false;
+            }
             index.claude_money_files.insert(
                 key,
                 MoneyFileSelection {
@@ -497,7 +518,7 @@ pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &[SnapshotItem]) 
                     root: item.source_session_id.clone(),
                     member: item.source_session_id.clone(),
                     consumed: None,
-                    synthetic_body: Some(super::super::snapshot_upload_body_witness(item)),
+                    synthetic_body: Some(body),
                     reparse_union: None,
                 },
             );
@@ -506,13 +527,15 @@ pub(crate) fn finalize_synthetic(index: &mut ScanIndex, items: &[SnapshotItem]) 
         {
             index.claude_money_files.remove(&key);
         }
-    }
+        true
+    });
 }
 
 pub(crate) fn selected_money_files(
     index: &ScanIndex,
     previous: &ScanIndex,
     safe: &BTreeSet<String>,
+    accepted: &BTreeSet<String>,
     settled: impl Fn(&str) -> bool,
 ) -> BTreeMap<String, MoneyFileSelection> {
     let mut selected = previous
@@ -526,7 +549,11 @@ pub(crate) fn selected_money_files(
         .map(|(key, state)| (key.clone(), state.clone()))
         .collect::<BTreeMap<_, _>>();
     for (key, state) in &index.claude_money_files {
-        if safe.contains(key) || (state.synthetic_body.is_some() && settled(&state.revision)) {
+        if safe.contains(key)
+            || (state.synthetic_body.is_some()
+                && accepted.contains(&state.revision)
+                && settled(&state.revision))
+        {
             selected.insert(key.clone(), state.clone());
         }
     }
@@ -580,5 +607,90 @@ mod decoder_tests {
                 loaded.generation + 1
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod integration_selection_regressions {
+    use super::*;
+    #[test]
+    fn assembled_lenient_decode_rearms_lost_claude_selection_without_touching_codex() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-selection-assembled");
+        let path = scratch.join("index.json");
+        let key = "/home/projects/-fixture/a1111111-1111-4111-8111-111111111111.jsonl";
+        let codex = "/home/sessions/2026/10/rollout-native.jsonl";
+        let mut index = ScanIndex::default();
+        let mut entry = crate::snapshots::tests::manifest_index_entry(Some(&"d".repeat(64)));
+        entry.source_file_fingerprint = "a".repeat(64);
+        entry.last_upload_body_witness = Some("e".repeat(64));
+        entry.effective_upload_body_witness_revision = 3;
+        index.files.insert(key.into(), entry.clone());
+        entry.effective_upload_body_witness_revision = 24;
+        index.files.insert(codex.into(), entry);
+        index.claude_request_census.insert_for_test(
+            key,
+            ClaudeRequestCensusRecord::synthetic_for_test(
+                &"a".repeat(64),
+                1,
+                super::super::super::claude_request_census::ClaudeRequestCensusShape::Exact,
+                vec![1],
+            ),
+        );
+        let mut wire = serde_json::to_value(&index).unwrap();
+        wire["claude_money_files"] = serde_json::json!({key: {"revision": false}});
+        std::fs::write(&path, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(loaded.files[key].effective_upload_body_witness_revision, 2);
+        assert!(!loaded
+            .claude_request_census
+            .get(key)
+            .unwrap()
+            .current_for(&"a".repeat(64)));
+        assert_eq!(
+            loaded.files[codex].effective_upload_body_witness_revision,
+            24
+        );
+    }
+    #[test]
+    fn accepted_synthetic_noop_requires_the_same_body_and_never_commits_a_refused_correction() {
+        let mut index = ScanIndex::default();
+        let mut item = super::super::synthetic_carrier("synthetic-root", "2026-08-03T10:00:00Z");
+        item.snapshot_fingerprint = "a".repeat(64);
+        item.usage_accounting_contract = Some(REQUEST_OWNED_CONTRACT.into());
+        item.input_tokens = 10;
+        let body = super::super::super::snapshot_upload_body_witness(&item);
+        let mut first = vec![item.clone()];
+        finalize_synthetic(&mut index, &mut first);
+        assert_eq!(first.len(), 1, "unaccepted output remains owed");
+        index
+            .accepted_snapshot_fingerprints
+            .insert(item.snapshot_fingerprint.clone());
+        let previous = index.clone();
+        let mut repeated = vec![item.clone()];
+        finalize_synthetic(&mut index, &mut repeated);
+        assert!(repeated.is_empty(), "the exact accepted body is a noop");
+        item.input_tokens = 11;
+        let corrected_body = super::super::super::snapshot_upload_body_witness(&item);
+        assert_ne!(body, corrected_body);
+        let mut corrected = vec![item.clone()];
+        finalize_synthetic(&mut index, &mut corrected);
+        assert_eq!(
+            corrected.len(),
+            1,
+            "same fingerprint does not cover a changed body"
+        );
+        let selected = selected_money_files(
+            &index,
+            &previous,
+            &BTreeSet::new(),
+            &BTreeSet::new(),
+            |_| true,
+        );
+        let key = store::money_key("synthetic:", &item.source_session_id);
+        assert_eq!(
+            selected[&key].synthetic_body.as_deref(),
+            Some(body.as_str()),
+            "a quarantine/old ACK cannot certify this correction"
+        );
     }
 }

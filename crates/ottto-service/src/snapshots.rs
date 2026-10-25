@@ -7036,7 +7036,7 @@ pub fn finalize_scan_after_policy_with_body_witness(
     });
 
     if source == SnapshotSource::ClaudeCode && index.request_money_live_revision() {
-        claude_request_money::finalize_synthetic(index, &result.snapshots);
+        claude_request_money::finalize_synthetic(index, &mut result.snapshots);
     }
     // State-only Codex entities do not have a source-file fingerprint, so they
     // cannot use the file finalization table above. Rebind their durable map to
@@ -43366,7 +43366,7 @@ impl ScanIndex {
             claude_usage_family_pending: self.claude_usage_family_pending.clone(),
             claude_request_census: self.claude_request_census.clone(),
             claude_money_files: claude_request_money::selected_money_files(
-                self, previous, &safe_keys, settled,
+                self, previous, &safe_keys, accepted, settled,
             ),
             claude_money_selection_changed: BTreeSet::new(),
             claude_request_census_shadow: self.claude_request_census_shadow.clone(),
