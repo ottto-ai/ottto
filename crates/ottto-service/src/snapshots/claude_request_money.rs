@@ -83,11 +83,9 @@ use store::{ClaudeLedger, ClaudeLedgerAcquire, PendingMemo, WriteJob};
 
 pub(crate) mod e2;
 mod emit;
-// One owner for the request-owned literal: the history gate. The alias keeps
-// the emitter's import until it names the owner directly.
+// One owner for the request-owned literal: the history gate.
 pub(crate) use super::claude_history_upgrade::{
     is_request_owned_literal, request_owned_family_root,
-    REQUEST_OWNED_USAGE_CONTRACT as REQUEST_OWNED_CONTRACT,
 };
 
 pub(crate) const CLAUDE_REQUEST_COUNTING: &str = "claude_request_counting:v1";

@@ -689,6 +689,52 @@ fn e2_resolver_conflict_is_counted_and_emitted() {
 }
 
 #[test]
+fn e2_withheld_session_keeps_every_item_unchanged_for_the_hold() {
+    let first = root_file("withheld-a");
+    let copy = root_file("withheld-b");
+    let index = ScanIndex::default();
+    let canonical = |items: &[SnapshotItem]| {
+        items
+            .iter()
+            .map(|item| {
+                crate::canonical_json::canonicalize(&serde_json::to_value(item).unwrap()).unwrap()
+            })
+            .collect::<Vec<_>>()
+    };
+    let page = || {
+        vec![
+            parse(&first, Some(t0()), &index, &[line("r", &at(1), 10)]),
+            parse(&copy, Some(t0()), &index, &[line("o", &at(2), 20)]),
+        ]
+    };
+    // Held (absent twin, uncertified, ...): both paths stay, untouched, and
+    // the session is returned so the caller holds it (owed, not settled).
+    let mut items = page();
+    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
+    let before = canonical(&items);
+    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    assert_eq!(withheld, BTreeSet::from([ROOT.to_owned()]));
+    assert_eq!(items.len(), 2, "no path of a withheld session is dropped");
+    assert_eq!(canonical(&items), before);
+    assert!(items
+        .iter()
+        .all(|item| item.usage_accounting_contract.is_none()));
+    // Not held: one summed body, nothing withheld.
+    let mut items = page();
+    let withheld = with_enabled(|| finish_page(&mut items, &index, TelemetryRead::Loaded));
+    assert!(withheld.is_empty());
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].request_count, 2);
+    // Gate off withholds nothing and changes nothing.
+    let mut items = page();
+    items[0].claude_money.as_deref_mut().unwrap().entity.held = true;
+    let before = canonical(&items);
+    assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+    assert_eq!(canonical(&items), before);
+    cleanup(&[&first, &copy]);
+}
+
+#[test]
 fn e2_gate_off_keeps_canonical_bytes_and_fingerprint() {
     let p = root_file("dark");
     let index = ScanIndex::default();

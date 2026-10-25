@@ -278,8 +278,7 @@ fn e2_transient_failure_resends_the_exact_literal_bytes() {
     let mut item = crate::snapshots::cache_adapter_tests::cache_fixture_item();
     item.cache_observations = None;
     item.cache_base_head_etag = None;
-    item.usage_accounting_contract =
-        Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT.into());
+    item.usage_accounting_contract = Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
     item.removed_request_count = Some(3);
     item.removed_usage = Some(crate::snapshots::ClaudeRemovedUsage {
         input_tokens: 11,

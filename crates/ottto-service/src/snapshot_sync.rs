@@ -8609,7 +8609,8 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // E2 bodies are final before any identity owner runs: contract 5, D1 and
     // the account hash then tag the rows that upload (donor #699 order).
     // Gate off this only counts, so the page is unchanged.
-    crate::snapshots::claude_request_money::e2::finish_page(
+    // Withheld entities stay on the page and owed: delayed, never settled.
+    let withheld = crate::snapshots::claude_request_money::e2::finish_page(
         &mut scan_result.snapshots,
         index,
         if telemetry_read_failed {
@@ -8618,6 +8619,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
         },
     );
+    disposition.hold_request_owned(withheld);
     if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
         // No owed history file settles on estimates because this page could
         // not read telemetry: the emission seam drops its bodies, keeps its

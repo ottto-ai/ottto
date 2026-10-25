@@ -45728,6 +45728,9 @@ mod tests {
     mod e2_disposition_tests {
         include!("snapshots/e2_disposition_tests.rs");
     }
+    mod e2_identity_pipeline_tests {
+        include!("snapshots/e2_identity_pipeline_tests.rs");
+    }
     use super::*;
     use base64::Engine as _;
 

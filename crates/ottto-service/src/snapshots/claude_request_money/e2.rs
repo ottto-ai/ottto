@@ -969,11 +969,16 @@ pub(crate) enum TelemetryRead {
 /// explicit gate permits mutation; one summed entity is emitted per session
 /// (path twins sum). A failed telemetry read never yields a "complete"
 /// body; T4 keeps that page's owed history files owed.
+///
+/// Returns the sessions whose entity was withheld (held twin, uncertified,
+/// identity already tagged, overflow). Their items stay on the page
+/// unchanged so the caller holds them (`hold_request_owned`): a removed item
+/// would let the page settle its file without a body. Gate off: empty.
 pub(crate) fn finish_page(
     items: &mut Vec<SnapshotItem>,
     index: &ScanIndex,
     telemetry: TelemetryRead,
-) {
+) -> BTreeSet<String> {
     struct Session {
         entity: ClaudeEntityBody,
         complete: bool,
@@ -1065,7 +1070,7 @@ pub(crate) fn finish_page(
         }
     }
     if !enabled() {
-        return;
+        return BTreeSet::new();
     }
     let locations = sessions
         .iter()
@@ -1081,16 +1086,23 @@ pub(crate) fn finish_page(
             (session.to_owned(), state.entity)
         })
         .collect::<BTreeMap<_, _>>();
+    let mut withheld = BTreeSet::new();
     items.retain_mut(|item| {
         if item.claude_money.is_none() {
             return true;
         }
         // One body per session: the first item carries the summed entity.
+        // A withheld session keeps every item (twins too) for the hold.
         let Some(entity) = entities.remove(&item.source_session_id) else {
-            return false;
+            return withheld.contains(&item.source_session_id);
         };
-        super::emit::apply(item, &entity)
+        // apply refuses before mutating, so a withheld item is unchanged.
+        if !super::emit::apply(item, &entity) {
+            withheld.insert(item.source_session_id.clone());
+        }
+        true
     });
+    withheld
 }
 
 /// Sessions with a live indexed root path that is not on this page: never
