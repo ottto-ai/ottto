@@ -521,6 +521,7 @@ impl FileFold {
             self.disclosed += self.responses; // unknown birth: counted, disclosed
         }
         if self.copied == 0 {
+            self.finish_identity_start(false);
             return;
         }
         // The witness order is total over (effective birth, location), so of
@@ -532,6 +533,7 @@ impl FileFold {
             self.money_birth.writer_certified(self.first_own)
         };
         if keep {
+            self.finish_identity_start(true);
             self.copy = Default::default();
             return;
         }
@@ -545,6 +547,16 @@ impl FileFold {
         self.skipped.clear();
         self.disclosed += self.copied;
         self.copied = 0;
+        self.finish_identity_start(false);
+    }
+
+    fn finish_identity_start(&mut self, prefix_excluded: bool) {
+        if let Some(accounts) = self.accounts.as_deref_mut() {
+            accounts.finish_native(prefix_excluded);
+            if accounts.conflict {
+                self.entity.repartition(accounts.fallback.clone());
+            }
+        }
     }
 
     fn original_witness(&self, context: Option<&ReadContext<'_>>) -> bool {

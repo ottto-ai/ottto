@@ -1227,9 +1227,10 @@ pub(crate) struct RequestAccounts {
     pub(crate) subagent: bool,
     pub(crate) inherited: u64,
     skipped_inherited: u64,
+    first_retained: Option<u64>,
 }
 crate::heap_layout_bound::fields!(AuthorityKey; login, org, basis);
-crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited);
+crate::heap_layout_bound::fields!(RequestAccounts; starting, fallback, bound, retained_root, runs, mixed, conflict, subagent, inherited, skipped_inherited, first_retained);
 
 /// One account policy for E2. Never use a later marker for an earlier request.
 /// A malformed, overflowing or contradictory stream falls back as a whole.
@@ -1352,9 +1353,8 @@ pub(crate) fn request_accounts(
         .runs
         .iter()
         .any(|(_, key)| key != &accounts.starting);
-    if accounts.conflict {
-        accounts.runs = Vec::new();
-    }
+    // Keep bounded runs through native copy adjudication so the first
+    // retained request can establish the real start even under a conflict.
     accounts
 }
 
@@ -1380,6 +1380,9 @@ impl RequestAccounts {
                 || matches!(self.runs.binary_search_by_key(&sequence, |(position, _)| *position), Err(at) if at > 0))
     }
     pub(crate) fn observe(&mut self, sequence: u64, copied: bool) {
+        if !copied {
+            self.first_retained.get_or_insert(sequence);
+        }
         if self.is_inherited(sequence) {
             let into = if copied {
                 &mut self.skipped_inherited
@@ -1387,6 +1390,26 @@ impl RequestAccounts {
                 &mut self.inherited
             };
             *into = into.saturating_add(1);
+        }
+    }
+    /// Called only after the existing money owner has confirmed/restored
+    /// copies. Excluded prefix requests cannot choose the session's start.
+    pub(crate) fn finish_native(&mut self, prefix_excluded: bool) {
+        if prefix_excluded && !self.subagent {
+            if let Some(first) = self.first_retained {
+                self.starting = self
+                    .runs
+                    .iter()
+                    .rev()
+                    .find(|(position, _)| *position <= first)
+                    .and_then(|(_, key)| key.clone())
+                    .or_else(|| self.bound.clone());
+                self.fallback = self.starting.clone();
+                self.mixed = self.runs.iter().any(|(_, key)| key != &self.starting);
+            }
+        }
+        if self.conflict {
+            self.runs = Vec::new();
         }
     }
     pub(crate) fn restore_copies(&mut self) {

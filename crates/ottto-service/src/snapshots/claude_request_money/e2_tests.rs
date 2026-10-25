@@ -2332,3 +2332,79 @@ fn e2_identity_three_contradictory_start_twins_fall_back_deterministically() {
         cleanup(&[&a, &b, &c]);
     });
 }
+
+#[test]
+fn e2_identity_copied_prefix_cannot_choose_subagent_or_side_call_start() {
+    with_enabled(|| {
+        let path = root_file("identity-own-start");
+        let agent = path
+            .parent()
+            .unwrap()
+            .join(ROOT)
+            .join("subagents/agent-abc.jsonl");
+        fs::create_dir_all(agent.parent().unwrap()).unwrap();
+        fs::write(&agent, b"fixture\n").unwrap();
+        let index = ScanIndex::default();
+        let mut old = org_marker(ORG_A);
+        old["timestamp"] = json!(at(1));
+        let mut own = org_marker(ORG_B);
+        own["timestamp"] = json!(at(100));
+        let root = parse(
+            &path,
+            Some(t0() + 100_000_000_000),
+            &index,
+            &[
+                old,
+                line("copied", &at(2), 10),
+                own,
+                line("own", &at(101), 20),
+            ],
+        );
+        assert_eq!(
+            fold(&root)
+                .accounts
+                .as_ref()
+                .unwrap()
+                .starting
+                .as_ref()
+                .unwrap()
+                .org
+                .as_deref(),
+            Some(org_hash(ORG_B).as_str())
+        );
+        let mut child = line("child", &at(102), 30);
+        child["agentId"] = json!("abc");
+        child["isSidechain"] = json!(true);
+        let child = parse(&agent, Some(t0()), &index, &[org_marker(ORG_A), child]);
+        let mut items = vec![root, child];
+        let read = sidecar(&[row("own", 1, 20), row("child", 2, 30), row("side", 3, 40)]);
+        attach_page(&mut items, &read);
+        side_calls_page(
+            &mut items,
+            &api_report(&read),
+            &ClaudeTraceOwnershipLoadReport::default(),
+            &index,
+        );
+        let items = tag_owned(items, &index);
+        assert_eq!(items.iter().map(|item| item.request_count).sum::<u64>(), 3);
+        for item in &items {
+            assert_eq!(item.request_evidence.len(), 1);
+            assert_eq!(
+                item.request_evidence[0].provider_workspace_hash.as_deref(),
+                Some(org_hash(ORG_B).as_str())
+            );
+            assert!(rows_of(item)
+                .all(|row| row.evidence_ref == Some(0) && row.identity_parts.is_none()));
+            assert_evidence_referenced(item);
+        }
+        assert!(items
+            .iter()
+            .flat_map(|item| &item.model_usage)
+            .any(|row| row
+                .selector_context
+                .get("request_usage_origin")
+                .map(String::as_str)
+                == Some("telemetry_reported")));
+        cleanup(&[&path]);
+    });
+}
