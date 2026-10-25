@@ -10104,6 +10104,7 @@ where
     let mut adaptive_splits = 0usize;
     let mut adaptive_attempts = 0usize;
     let mut conflicted_entities = 0usize;
+    let mut local_admission_deferred = 0usize;
     let mut literal_retry_after = None::<u64>;
 
     while let Some((indices, adaptive)) = batches.pop_front() {
@@ -10144,6 +10145,40 @@ where
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
         match attempt {
+            Err(error) if error.is::<unknown_recovery::UnsentPacking>() => {
+                let admission = error
+                    .downcast_ref::<unknown_recovery::UnsentPacking>()
+                    .unwrap();
+                if let Some(resume) = &admission.resume {
+                    let (captured, other): (Vec<_>, Vec<_>) =
+                        indices.into_iter().partition(|index| {
+                            resume.iter().any(|fp| fp == fingerprint(&items[*index]))
+                        });
+                    if captured.len() != resume.len() || other.is_empty() {
+                        return Err(error);
+                    }
+                    batches.push_front((other, false));
+                    batches.push_front((captured, false));
+                } else if indices.len() > 1 {
+                    let middle = indices.len() / 2;
+                    batches.push_front((indices[middle..].to_vec(), false));
+                    batches.push_front((indices[..middle].to_vec(), false));
+                } else {
+                    // No POST or intent exists for this indivisible oversized
+                    // offer. Keep local retry debt and continue healthy siblings.
+                    let item = &items[indices[0]];
+                    progress.quarantine_transient_body(
+                        fingerprint(item),
+                        &body_witness(item),
+                        current_unix_seconds().saturating_add(300),
+                    );
+                    persist(progress).map_err(|_| SnapshotLocalStateRejected {
+                        operation: "save local custody admission hold",
+                    })?;
+                    local_admission_deferred += 1;
+                    eprintln!("claude_request_money recovery_unsent_oversize=1");
+                }
+            }
             Err(error) if error.is::<unknown_recovery::Deferred>() => {
                 return Ok(ResumableUploadResult::Deferred {
                     count: indices.len(),
@@ -10389,9 +10424,9 @@ where
         Ok(ResumableUploadResult::Shed {
             retry_after: Some(Duration::from_secs(delay)),
         })
-    } else if conflicted_entities > 0 {
+    } else if conflicted_entities.saturating_add(local_admission_deferred) > 0 {
         Ok(ResumableUploadResult::Deferred {
-            count: conflicted_entities,
+            count: conflicted_entities.saturating_add(local_admission_deferred),
         })
     } else if permanent_rejected > 0 {
         Ok(ResumableUploadResult::Rejected {

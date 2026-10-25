@@ -146,6 +146,22 @@ impl std::error::Error for Deferred {}
 pub(super) fn now(support: &Path) -> u64 {
     money::recovery_now(support)
 }
+/// Local admission before capture/POST. Only unsent offers may be packed
+/// again; a pending capture supplies its exact entity partition on resume.
+#[derive(Debug)]
+pub(super) struct UnsentPacking {
+    pub resume: Option<Vec<String>>,
+}
+impl std::fmt::Display for UnsentPacking {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money unsent batch exceeds bounded custody admission")
+    }
+}
+impl std::error::Error for UnsentPacking {}
+fn unsent_packing() -> anyhow::Error {
+    UnsentPacking { resume: None }.into()
+}
+
 #[derive(Debug)]
 struct CustodyFault;
 impl std::fmt::Display for CustodyFault {
@@ -1427,7 +1443,7 @@ pub(super) fn manifest(
                         .map_or(0, String::len),
                 );
             if files.len() >= 256 || key.len() > 4096 || metadata_bytes > MANIFEST_MAX / 2 {
-                return Err(fault());
+                return Err(unsent_packing());
             }
             files.push(key.clone());
             file_revisions.push(index.files[key].source_file_fingerprint.clone());
@@ -1470,7 +1486,7 @@ pub(super) fn manifest(
         index,
         &money::recovery_scope::Scope::seed(entities.iter().map(|e| e.root.clone())),
     )
-    .ok_or_else(fault)?;
+    .ok_or_else(unsent_packing)?;
     let now = now(support);
     let lineage = format!("{:x}", lineage.finalize());
     static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -1573,6 +1589,33 @@ pub(super) fn initial_post(
     policy: [u8; 32],
     state: &mut SendState,
 ) -> Result<crate::snapshot_client::SnapshotBatchResponse> {
+    if let SendState::Ready(manifest, _, _) = state {
+        let matches = manifest.entities.len() == request.snapshots.len()
+            && manifest
+                .entities
+                .iter()
+                .zip(&request.snapshots)
+                .all(|(entity, item)| {
+                    entity.session == item.source_session_id
+                        && entity.fingerprint == item.snapshot_fingerprint
+                        && entity.witness == snapshot_upload_body_witness(item)
+                });
+        if !matches {
+            // The uploader restarts after an async capture. Earlier ACKs may
+            // change its pending packing; recover the already captured exact
+            // partition, without changing or subdividing its retained body.
+            return Err(UnsentPacking {
+                resume: Some(
+                    manifest
+                        .entities
+                        .iter()
+                        .map(|e| e.fingerprint.clone())
+                        .collect(),
+                ),
+            }
+            .into());
+        }
+    }
     if matches!(state, SendState::Empty) {
         // Pay before copying private metadata from the already packed request.
         // Reject an oversized manifest before allocating the serialized body.
@@ -1588,7 +1631,7 @@ pub(super) fn initial_post(
             policy,
         )?;
         if !manifest_fits(&m) {
-            return Err(fault());
+            return Err(unsent_packing());
         }
         drop(metadata_scratch);
         if CATALOGS
@@ -1636,7 +1679,7 @@ pub(super) fn initial_post(
 
             // A terminal lineage can make normal offers, but never acquire a
             // fresh UNKNOWN allowance through reserialization or restart.
-            let body = encode(request, m.head_cas)?;
+            let body = encode(request, m.head_cas).map_err(|_| unsent_packing())?;
             if !initial_authorized(index, support, &m) {
                 return Err(Deferred {
                     reason: None,
@@ -1647,7 +1690,7 @@ pub(super) fn initial_post(
             }
             return client.upload_recovery_bytes(token, request, head_cas, &body);
         }
-        let body = encode(request, m.head_cas)?;
+        let body = encode(request, m.head_cas).map_err(|_| unsent_packing())?;
         *state = SendState::Reserving(m, body, funds);
         return Err(Pending.into());
     }

@@ -3309,6 +3309,69 @@ fn p2a_completed_finish_keeps_catalog_and_quiet_privacy_cycles_ready() {
 #[serial(source_cadences)]
 #[serial(client_report)]
 #[serial(claude_request_money_shadow)]
+fn p2a_unsent_metadata_admission_splits_then_resumes_exact_captures() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
+    let _live = money::LiveForTest::new(&control.support);
+    let original = std::fs::read_to_string(control.transcript()).unwrap();
+    let parent = control.transcript().parent().unwrap().to_path_buf();
+    let mut expected = BTreeSet::new();
+    for family in 0..24 {
+        let root = if family == 0 {
+            IDENTITY_PIPELINE_ROOT.to_owned()
+        } else {
+            format!("{:08x}-1111-4111-8111-111111111111", 0x40000000u32 + family)
+        };
+        expected.insert(root.clone());
+        let body = original
+            .replace(IDENTITY_PIPELINE_ROOT, &root)
+            .replace("req_1", &format!("metadata-{family}-request-1"))
+            .replace("req_2", &format!("metadata-{family}-request-2"))
+            .replace("m1", &format!("metadata-{family}-message-1"))
+            .replace("m2", &format!("metadata-{family}-message-2"));
+        for alias in 0..6 {
+            let name = if alias == 0 {
+                root.clone()
+            } else {
+                format!(
+                    "{:08x}-2222-4222-8222-222222222222",
+                    0x50000000u32 + family * 6 + alias
+                )
+            };
+            std::fs::write(parent.join(format!("{name}.jsonl")), &body).unwrap();
+        }
+    }
+    control.cycle();
+    let posts = control.server.raw_batches.lock().unwrap();
+    assert!(posts.len() > 1 && posts.len() < 16,
+        "24 small entities fit one wire page but their complete alias metadata needs bounded packing");
+    let mut observed = BTreeSet::new();
+    for raw in posts.iter() {
+        assert!(raw.len() <= 4 * 1024 * 1024);
+        let batch: serde_json::Value = serde_json::from_str(raw).unwrap();
+        for item in batch["snapshots"].as_array().unwrap() {
+            assert!(
+                observed.insert(item["source_session_id"].as_str().unwrap().to_owned()),
+                "capture resume must not POST an already acknowledged partition twice"
+            );
+        }
+    }
+    assert_eq!(observed, expected);
+    assert!(unknown_recovery::initialized(&control.support));
+    control.recovery_startup(current_unix_seconds());
+    assert!(unknown_recovery::active_for_test(&control.support).is_empty());
+    eprintln!("MONEY_UNKNOWN_PACKING unsent_metadata_split=true async_partition_preserved=true all_entities_saved=true duplicate_post=false");
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
 fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_credentials() {
     use crate::snapshots::claude_request_money as money;
     if !crate::heap_layout_bound::layout_supported() {
