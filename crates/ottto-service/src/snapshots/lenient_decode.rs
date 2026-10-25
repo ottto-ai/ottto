@@ -300,6 +300,10 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_incidence, BTreeMap::is_empty);
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
+        field!(
+            claude_money_birth_store,
+            claude_money_birth_store::BirthStore::is_empty
+        );
         map.end()
     }
 }
@@ -385,6 +389,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_incidence",
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
+    "claude_money_birth_store",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1741,6 +1746,18 @@ impl<R: BufRead + Seek> Decoder<R> {
                         "accepted_rebuild_last_alarm_unix_seconds" => {
                             index.accepted_rebuild_last_alarm_unix_seconds =
                                 self.diagnostic_timestamp(value)?;
+                        }
+                        "claude_money_birth_store" => {
+                            // Optional money hints cannot rebuild or pause an otherwise valid index.
+                            // Bound allocation before decoding; do not carry through identity repair.
+                            index.claude_money_birth_store = if value.len <= 4 * 1024 * 1024 {
+                                self.typed::<claude_money_birth_store::BirthStore>(value)
+                                    .ok()
+                                    .and_then(claude_money_birth_store::BirthStore::valid)
+                                    .unwrap_or_default()
+                            } else {
+                                Default::default()
+                            };
                         }
                         "accepted_rebuild_incidence" => {
                             if value.len > CARRIED_ACK_BYTES_MAX as u64 {
