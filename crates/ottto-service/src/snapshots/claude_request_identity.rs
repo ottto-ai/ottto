@@ -1232,6 +1232,10 @@ pub(crate) struct ScanEvidence<'a> {
     status_coverage: Option<crate::claude_status_coverage::Ledger>,
     /// Key of the shared default folder, where the email basis never applies.
     default_home: Option<crate::claude_status_coverage::HomeKey>,
+    /// Pre-enrichment native evidence already saved by this scan. Request
+    /// telemetry may veto its original org for billing without changing the
+    /// unambiguous native account used by local Desktop activity.
+    native_originals: Option<&'a BTreeMap<String, super::SessionAccountEvidence>>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1293,6 +1297,14 @@ impl<'a> ScanEvidence<'a> {
             }
         }
         evidence
+    }
+
+    pub(crate) fn with_native_originals(
+        mut self,
+        originals: &'a BTreeMap<String, super::SessionAccountEvidence>,
+    ) -> Self {
+        self.native_originals = Some(originals);
+        self
     }
 
     /// The root whose rows name `request_id` (`Some(None)`: several roots).
@@ -1945,11 +1957,6 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                     sha2::Sha256::digest(request.request_id.as_bytes())
                 ))
         });
-        // Enrichment uses this request's own entrypoint, event clock and
-        // governing marker. It never changes the existing billing classifier.
-        if !self.grouping.unowned_request && !duplicated_elsewhere {
-            self.note_desktop_activity(item, &request);
-        }
         let facts = RequestFacts {
             root: &self.root,
             source_session_id: &item.source_session_id,
@@ -1977,6 +1984,22 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             duplicated_elsewhere,
         };
         let identity = classify_ref(self.evidence, &facts);
+        // Activity never overrides stronger request identity. A later Desktop
+        // line can, however, qualify a marker flip the session-first CLI origin
+        // would refuse solely as UntrustedFlip.
+        if !self.grouping.unowned_request && !duplicated_elsewhere {
+            let original = match self.evidence.native_originals {
+                Some(originals) => originals.get(&item.source_session_id),
+                None => item.session_account_evidence.as_ref(),
+            };
+            Self::note_desktop_activity(
+                &mut self.grouping.desktop_recent,
+                item,
+                original,
+                &request,
+                identity,
+            );
+        }
         self.grouping.add(
             request.bucket_start,
             request.row_key,
@@ -1985,14 +2008,20 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         );
     }
 
-    fn note_desktop_activity(&mut self, item: &SnapshotItem, request: &Request<'_>) {
+    fn note_desktop_activity(
+        activity: &mut crate::desktop_recent::RecentActivity,
+        item: &SnapshotItem,
+        original: Option<&super::SessionAccountEvidence>,
+        request: &Request<'_>,
+        identity: IdentityRef<'_>,
+    ) {
         let Some(occurrence) = item.claude_usage_occurrences.get(request.request_id) else {
             return;
         };
         if !occurrence.desktop_request || !occurrence.event_clock_complete {
             return;
         }
-        let Some(owner) = item.session_account_evidence.as_ref() else {
+        let Some(owner) = original else {
             return;
         };
         if owner.evidence_source != "claude_desktop_original:v1"
@@ -2012,13 +2041,24 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         let MarkerVerdict::Trusted(org) = markers.verdict(sequence, true) else {
             return;
         };
+        match identity {
+            IdentityRef::Refused(Refusal::UntrustedFlip) | IdentityRef::Missing => {}
+            IdentityRef::Refused(_) => return,
+            IdentityRef::Tagged(key) => {
+                if key.login.is_some_and(|login| login != account)
+                    || key.org.is_some_and(|actual| actual != org)
+                {
+                    return;
+                }
+            }
+        }
         let (Ok(at), Ok(now)) = (
             OffsetDateTime::parse(request.timestamp, &Rfc3339),
             OffsetDateTime::parse(&item.collected_at, &Rfc3339),
         ) else {
             return;
         };
-        self.grouping.desktop_recent.note(account, org, at, now);
+        activity.note(account, org, at, now);
     }
 
     pub(crate) fn finish(self) -> Grouping {

@@ -41,13 +41,17 @@ impl RecentActivity {
         }
     }
 
-    fn overlay(&self, snapshots: &mut [AgentStatusSnapshot], now: OffsetDateTime) {
+    fn overlay(
+        &self,
+        snapshots: &mut [AgentStatusSnapshot],
+        health: &AgentStatusSnapshot,
+        now: OffsetDateTime,
+    ) {
         // This is the EXISTING config-selected account observation, independent
         // of CLI login and the Desktop collector's inferred current org.
-        let mut selected = snapshots
+        let mut selected = health
+            .plan_observations
             .iter()
-            .filter(|s| s.source == SourceKind::ClaudeCode)
-            .flat_map(|s| &s.plan_observations)
             .filter(|o| {
                 o.auth_mode.as_deref() == Some("claude_desktop")
                     && o.evidence_method.as_deref() == Some("claude_desktop_session_bucket")
@@ -63,16 +67,19 @@ impl RecentActivity {
                 // Clear even an old decoded/stored value: only process memory
                 // may supply this field, and every response evaluates expiry.
                 row.desktop_recent_at = None;
-                if snapshot.source != SourceKind::ClaudeCode
-                    || account.is_none()
-                    || row.account_identifier_hash != account
-                {
+                if snapshot.source != SourceKind::ClaudeCode {
+                    continue;
+                }
+                let Some(account) = account.as_deref() else {
+                    continue;
+                };
+                if row.account_identifier_hash.as_deref() != Some(account) {
                     continue;
                 }
                 let Some(org) = row.organization_identifier_hash.as_deref() else {
                     continue;
                 };
-                let key = (account.as_ref().unwrap().clone(), org.to_owned());
+                let key = (account.to_owned(), org.to_owned());
                 if let Some(at) = self.0.get(&key).filter(|at| recent(**at, now)) {
                     row.desktop_recent_at = at.format(&Rfc3339).ok();
                 }
@@ -99,11 +106,15 @@ pub(crate) fn publish(activity: RecentActivity) {
     }
 }
 
-pub(crate) fn overlay(snapshots: &mut [AgentStatusSnapshot], now: OffsetDateTime) {
+pub(crate) fn overlay(
+    snapshots: &mut [AgentStatusSnapshot],
+    health: &AgentStatusSnapshot,
+    now: OffsetDateTime,
+) {
     RECENT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .overlay(snapshots, now);
+        .overlay(snapshots, health, now);
 }
 
 #[cfg(test)]
@@ -151,28 +162,46 @@ mod tests {
             row(&a, Some(&y), false),
             row(&b, Some(&x), false),
         ])];
-        activity.overlay(&mut snapshots, t(1900));
+        let health = snapshots[0].clone();
+        activity.overlay(&mut snapshots, &health, t(1900));
         let rows = &snapshots[0].plan_observations;
         assert!(rows[0].desktop_recent_at.is_none());
         assert!(rows[1].desktop_recent_at.is_some());
         assert!(rows[2].desktop_recent_at.is_some());
         assert!(rows[3].desktop_recent_at.is_none());
-        activity.overlay(&mut snapshots, t(1901));
+        activity.overlay(&mut snapshots, &health, t(1901));
         assert!(snapshots[0].plan_observations[1]
             .desktop_recent_at
             .is_none());
-        activity.overlay(&mut snapshots, t(2791));
+        activity.overlay(&mut snapshots, &health, t(2791));
         assert!(snapshots[0]
             .plan_observations
             .iter()
             .all(|r| r.desktop_recent_at.is_none()));
         // Merely knowing the org never supplies the selected account.
-        snapshots[0].plan_observations[0].is_current = Some(false);
-        activity.overlay(&mut snapshots, t(1900));
+        let mut no_selection = health.clone();
+        no_selection.plan_observations[0].is_current = Some(false);
+        activity.overlay(&mut snapshots, &no_selection, t(1900));
         assert!(snapshots[0]
             .plan_observations
             .iter()
             .all(|r| r.desktop_recent_at.is_none()));
+    }
+
+    #[test]
+    fn desktop_recent_uses_health_selection_when_default_upload_is_shadowed() {
+        let a = "a".repeat(64);
+        let x = "c".repeat(64);
+        let mut activity = RecentActivity::default();
+        activity.note(&a, &x, t(1000), t(1000));
+        // A registered slot owns the metered upload: Desktop config selection
+        // is still present in source health, but not in the upload snapshots.
+        let health = snapshot(vec![row(&a, None, true)]);
+        let mut snapshots = vec![snapshot(vec![row(&a, Some(&x), false)])];
+        activity.overlay(&mut snapshots, &health, t(1000));
+        assert!(snapshots[0].plan_observations[0]
+            .desktop_recent_at
+            .is_some());
     }
 
     #[test]
@@ -187,4 +216,9 @@ mod tests {
         activity.note(&"a".repeat(64), &"b".repeat(64), t(2000), t(2000));
         assert_eq!(activity.0.len(), 1);
     }
+}
+
+#[cfg(test)]
+pub(crate) fn saved() -> RecentActivity {
+    RECENT.lock().unwrap().clone()
 }

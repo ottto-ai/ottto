@@ -9,7 +9,9 @@ array; `[]` means no in-memory collection. The separate local-control command is
 Older daemons reject the unknown command; callers must not retry with refresh.
 Transport/authentication errors retain the usual CLI JSON error and exit codes.
 
-Existing exact `plan_observations` can optionally contain
+The existing health snapshot supplies config-selected account evidence even
+when a registered slot shadows the default upload. Existing exact
+`plan_observations` can optionally contain
 `"desktop_recent_at":"2026-10-25T10:00:00Z"`. This is the latest qualifying
 request event time for that exact account hash and organization hash, restricted
 to the Desktop account already selected by `lastKnownAccountUuid`. Account
@@ -25,7 +27,11 @@ physical usage record of a progressive response must qualify; missing or mixed
 entrypoints fail closed. Resuming a Desktop session in a terminal cannot extend
 Desktop activity, and starting on CLI does not hide subsequent Desktop requests.
 Native, unimported, unambiguous Desktop session evidence supplies the account;
-organization membership alone never supplies it. The existing capture/permit
+organization membership alone never supplies it. This uses the native original
+already saved before request enrichment, since the existing billing veto may
+mark an old native org conflicted after a valid same-account org switch. Stronger
+per-request ownership/account/org mismatches still veto activity; the existing
+billing veto and classifier are unchanged. The existing capture/permit
 and successful request-fold gates still apply. Incomplete or unmatched evidence
 stays absent; this signal is opportunistic, not proof of the current UI selection.
 

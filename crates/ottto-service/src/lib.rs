@@ -1322,15 +1322,22 @@ impl LocalDaemon {
                 )
             })
             .collect::<Result<Vec<_>, _>>()?;
-        let mut snapshots = collections
+        let snapshots = collections
             .iter()
-            .flat_map(|collection| collection.snapshots.iter().cloned())
+            .flat_map(|collection| {
+                let mut snapshots = collection.snapshots.clone();
+                desktop_recent::overlay(
+                    &mut snapshots,
+                    &collection.source_health_snapshot,
+                    time::OffsetDateTime::now_utc(),
+                );
+                snapshots
+            })
             .collect::<Vec<_>>();
         let mut state = self.state()?;
         for collection in collections {
             upsert_agent_status_snapshot(&mut state, collection.source_health_snapshot.clone());
         }
-        desktop_recent::overlay(&mut snapshots, time::OffsetDateTime::now_utc());
         Ok(snapshots)
     }
 

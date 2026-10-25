@@ -554,14 +554,20 @@ fn cached_from_owner(
     let Some(owner) = owner else {
         return Vec::new();
     };
-    let mut snapshots = [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
+    [SourceKind::Codex, SourceKind::ClaudeCode, SourceKind::Pi]
         .iter()
         .filter(|candidate| source.map_or(true, |source| source == *candidate))
         .filter_map(|source| owner.lanes[index(source)].cached())
-        .flat_map(|collection| collection.snapshots.clone())
-        .collect::<Vec<_>>();
-    crate::desktop_recent::overlay(&mut snapshots, OffsetDateTime::now_utc());
-    snapshots
+        .flat_map(|collection| {
+            let mut snapshots = collection.snapshots.clone();
+            crate::desktop_recent::overlay(
+                &mut snapshots,
+                &collection.source_health_snapshot,
+                OffsetDateTime::now_utc(),
+            );
+            snapshots
+        })
+        .collect::<Vec<_>>()
 }
 
 /// Use the existing scan's full collection (including all account/home bindings)

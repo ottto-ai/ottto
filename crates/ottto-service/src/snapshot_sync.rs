@@ -8527,6 +8527,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             crate::snapshots::claude_request_identity::desktop_census(index),
         )
         .with_status_coverage(crate::claude_status_coverage::snapshot())
+        .with_native_originals(&originals)
     });
     if !full_rearm_evidence_complete {
         index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
