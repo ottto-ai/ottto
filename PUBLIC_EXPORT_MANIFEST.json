@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 843,
-  "content_sha256": "8790516494537be62e27bf9dc96280cd80a69e64be6c85a9bdfbe598130dfe3e",
+  "content_sha256": "bb98666dbcdf2c5ee49bc57c9a5c1a425df1a4a086bde762a08a4e14068cec29",
   "files": [
     {
       "executable": false,
@@ -1637,8 +1637,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/unknown_recovery.rs",
-      "sha256": "38f500862d8b1b409d9ccf9a38592352bcf3a5ab5cde4366ceacdcc4351c5430",
-      "size_bytes": 94672
+      "sha256": "5cf7ecea1558202dcb5adf7e5b1a4c9d7319deb9a80e28c8ce3aebc7ce2a2b01",
+      "size_bytes": 95235
     },
     {
       "executable": false,
@@ -1651,8 +1651,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots.rs",
-      "sha256": "1ba8143346e47426287eb2f6285c17037e4d4ba51da957aabd98bffb106b4df1",
-      "size_bytes": 3483239
+      "sha256": "c3de73187044a31895fdf32f20ca4bc74df8b28929975757136f20616f9548b5",
+      "size_bytes": 3483771
     },
     {
       "executable": false,
@@ -5904,7 +5904,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-25T03:13:48+00:00",
+  "generated_at": "2026-10-25T03:32:56+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 844,
   "public_roots": [
@@ -5943,5 +5943,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "298e0b14ab33f6617dc7043d1d7258bd29af3fe3"
+  "source_commit": "829c2faada9a62e72eabee7f5298ac6cf94018a1"
 }
