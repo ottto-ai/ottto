@@ -414,7 +414,7 @@ new_case other-workflow-pending-does-not-block-green-ci
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request" "600|pull_request|7|main|example|.github/workflows/other.yml"
 pr_checks checks 500 "10|Rust contracts|completed|success|500" \
-  "20|Public surface checks|in_progress||600"
+  "120|Public surface checks|in_progress||600"
 run_guard 0 7
 expect_log "$MERGE_CALL"
 expect_no_log "sleep"
