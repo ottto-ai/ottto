@@ -3768,6 +3768,7 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 /// the thread once, with its full usage. An unchanged generation after
 /// that publishes nothing new: no second admission, no resurrected hold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3859,6 +3860,7 @@ fn assert_admitted_once(
 /// memo miss: the file is re-read (still ahead, so held and memoized again)
 /// and the new entry hits while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3896,6 +3898,7 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
 /// change alone cures it, and the thread is admitted once with its full
 /// usage.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let home = CreatedThreadHome::new(10, false);
     home.project(home.bytes(9), 9);
@@ -3930,6 +3933,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
 /// hits; growth re-reads it, and once the projection binds the grown file it
 /// stays held (no admission), memoized again and hit again while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
     let home = CreatedThreadHome::new(2, true);
     home.project(home.bytes(3), 3);
@@ -4080,6 +4084,7 @@ fn assert_oracle(
 /// the file to its extent binds the parent and cures it: the memo must miss
 /// (exact stamp), and the thread is admitted once, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4134,6 +4139,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
 /// miss), and the re-read binds the spawn parent: the usage-free thread is
 /// no longer ownership-incomplete, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4188,6 +4194,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
 /// refs are insert-only until a reset, so the memo entry, not the index, is
 /// where the fresh ref is observable.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4246,6 +4253,7 @@ const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 /// Once the last created thread leaves the state census, the entry misses
 /// and the ordinary session is admitted, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
     // The created thread itself is complete and admitted; until the state
     // census drops it, it records no memo entry, so every memo counter
@@ -4400,6 +4408,7 @@ fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
 /// - T18: growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -4863,6 +4872,7 @@ fn append_parent_turn(path: &Path, n: u64) {
 /// fresh read of the same generation does (same index, no memo), field by
 /// field plus `scanned_session_count`, and what a cold settled scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -4912,6 +4922,7 @@ fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
 /// T14: after a restart (a new `SharedCache`, the index kept) the held fork
 /// is read once and recorded, then hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -4943,6 +4954,7 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
 /// records no parent ref, before or after an index reset; its memo hit
 /// re-requests nothing. P-T32 covers an ordinary fork's re-request.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4964,6 +4976,7 @@ fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
 /// child's entry misses once, counted `memo_miss_other`, and the fork
 /// settles on the new parent object exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5016,6 +5029,7 @@ fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
 /// unchanged P identity, then recorded once, then quiet: nothing is parsed
 /// again, and the census equals the cold oracle.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -5152,6 +5166,7 @@ fn restarts_in_scope(scan: &SourceScanResult) -> Option<u64> {
 /// every generation) and its misses are `memo_miss_other`, never an
 /// exact-stamp miss; it is never admitted.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn child_of_a_growing_parent_never_hits() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5193,6 +5208,7 @@ fn child_of_a_growing_parent_never_hits() {
 /// witness drops and the fork settles exactly as a cold scan (here held and
 /// memoized: kind (iii)).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let parent = home.fixture.file(PARENT);
@@ -5286,6 +5302,7 @@ fn mid_ledger_divergence_is_admitted_and_never_memoized() {
 /// refuses C (parent-pending: not recorded, nothing published). Later
 /// generations settle on the new P exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5342,6 +5359,7 @@ fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
 /// finishes the fence re-opens P and refuses C. A fresh cache makes C read
 /// in full (no memo). Later generations settle exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
     let home = ForkHome::new(&ForkHome::diverging_child(12));
     let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -5458,6 +5476,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
 /// is ahead of its projection) hits while unchanged; growth is an
 /// exact-stamp miss with the grown extent, re-read and held again as cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::with_lineage(10, false, "user", Some(SPAWN_PARENT));
@@ -5514,6 +5533,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
 /// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
 /// `over_line_cap` and the terminal trio included, equals a cold read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
     let home = CreatedThreadHome::new(10, true);
     let mut row = format!(
@@ -5559,6 +5579,7 @@ fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
 /// the memo: its first record is not an owning header, so the header
 /// inventory holds the page, as on main.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let fixture = ScanRoot::with_sessions(&[]);
@@ -5630,6 +5651,7 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
 /// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
 /// miss and the re-read settles exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::parent()[1..]);
@@ -5665,6 +5687,7 @@ fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
 /// an exact-stamp miss (a tail could not replay it): it counts
 /// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn growth_with_a_sidecar_change_counts_an_other_miss() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5711,6 +5734,7 @@ fn growth_with_a_sidecar_change_counts_an_other_miss() {
 /// shrink each miss once, re-read equal to cold; a shrink is never counted
 /// as an exact-stamp (growth) miss.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn touched_replaced_or_shrunk_held_file_misses() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5864,6 +5888,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
 /// T16: the memo has no clock input. The same unchanged hold collected a
 /// week later hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_a_week_later_is_the_same_hit() {
     let home = CreatedThreadHome::new(10, true);
     let cache = Arc::new(SharedCache::default());
@@ -6046,6 +6071,7 @@ fn assert_warm_covers_cold(
 /// revert, two-page, historical-replay and strict/park generations
 /// (method-level `l_sb_*` tests in `snapshots.rs`).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
     let home = CreatedThreadHome::new(10, true);
     home.set_tokens(CREATED, 50);
@@ -7428,6 +7454,7 @@ fn spent_budget_holds_a_new_fork_deferred_once_then_absent() {
 /// restart, and memo-hits from its second generation. Once refs leave the
 /// set it resolves as a cold scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
@@ -7627,6 +7654,7 @@ fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
 /// page), and the namespace is marked matched for exactly that traversal,
 /// so a later page of it re-applies without matching.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn step_start_matches_once_per_traversal() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7666,6 +7694,7 @@ fn step_start_matches_once_per_traversal() {
 /// append to the file drops A's witness and the file is read again.
 /// (Rev 5's admitted-B variant is dropped per the lease's N3.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn misnamed_parent_rollout_witnesses_no_ledger_and_absent() {
     const A: &str = "019fa111-2222-7333-8444-cccccccccccc";
     const B: &str = "019fa111-2222-7333-8444-dddddddddddd";
@@ -7776,6 +7805,7 @@ fn write_rollout(fixture: &ScanRoot, id: &str, parent: Option<&str>, records: &[
 /// after an index reset and re-requests its parent ref, exactly as its
 /// fresh parse did.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7811,6 +7841,7 @@ fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
 /// appears (sorted before P), G and P are read, P is admitted with its own
 /// usage, P's RAM witness is gone, and the chain settles as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn admitted_parent_loses_its_witness_and_its_child_resolves() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -7920,6 +7951,7 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
 /// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
 /// and neither file is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn fork_cycle_is_witnessed_and_then_quiet() {
     let fixture = ScanRoot::with_sessions(&[]);
     write_rollout(&fixture, PARENT, Some(CHILD), &ForkHome::diverging_child(2));
@@ -8012,6 +8044,7 @@ fn resolvable_chain_never_counts_parent_held() {
 /// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
 /// chain's next generation parses nothing and its holds memo-hit.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_held_witness_survives_another_namespaces_pages() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -8121,6 +8154,7 @@ fn held_then_quiet_from(
 /// the fork is held under it, never `ParentLossy`, and nothing is read
 /// again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_parent_holds_its_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::copy(
@@ -8185,6 +8219,7 @@ fn append_oversized_line(path: &Path) {
 /// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
 /// nothing is read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     append_oversized_line(&home.fixture.file(PARENT));
@@ -8245,6 +8280,7 @@ fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
 /// copies are a join `CandidateCopy` refusal before any parse, so they
 /// never reach event (c).)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
     const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
     let fixture = ScanRoot::with_sessions(&[]);
@@ -8321,6 +8357,7 @@ const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
 /// ref already held from an earlier traversal) runs no restart; C before P
 /// runs at most one (C is pending before P's step-map entry exists).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn deferred_intermediate_parent_is_not_reread_every_generation() {
     for c_first in [false, true] {
         let fixture = ScanRoot::with_sessions(&[]);
@@ -8554,6 +8591,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
 /// it again (the page-to-traversal fold, traversal-cumulative per page),
 /// P's witness survives every page, and restarts stay within budget.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn multi_page_traversal_folds_parent_causes_and_matches_once() {
     let fillers = (0..12)
         .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
@@ -8642,6 +8680,7 @@ fn multi_page_traversal_folds_parent_causes_and_matches_once() {
 /// generation, so C may count `ParentHeld` then, never later. Both settle as
 /// a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
     for c_first in [false, true] {
         let fixture = chain_fixture(c_first);
@@ -8725,6 +8764,7 @@ fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
 /// longer validates and does not hide P: C is held `Duplicated` (never
 /// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
