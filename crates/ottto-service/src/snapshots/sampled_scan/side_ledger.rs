@@ -328,8 +328,25 @@ impl SideLedger {
     }
 
     /// C14 step 1, at the start of a namespace's pass. A replaced slot's
-    /// entries stay; only the namespace's gate memory is lost.
+    /// entries stay; only the namespace's gate memory is lost. Production
+    /// enters through `open_index_pass` with the page's kind.
+    #[cfg(test)]
     pub(in crate::snapshots) fn begin_pass(&mut self, ns: u128, now: u64) -> GateOpen {
+        self.begin_pass_of(ns, now, crate::snapshots::CodexPageKind::Ordinary)
+    }
+
+    /// C14 step 1 for a page of `kind`. Only an ordinary pass closes the
+    /// gate until its save: a continuation page makes no G7 charge, so it
+    /// leaves no unsaved charge for the gate to hold back, and it neither
+    /// clears `saved` nor manufactures it (C-1). The next ordinary pass sees
+    /// the last ordinary or EOF save's outcome. A namespace with no slot
+    /// (new or evicted) is placed as for an ordinary pass.
+    pub(in crate::snapshots) fn begin_pass_of(
+        &mut self,
+        ns: u128,
+        now: u64,
+        kind: crate::snapshots::CodexPageKind,
+    ) -> GateOpen {
         self.pass_seq = self.pass_seq.saturating_add(1);
         let first_in_process = !self.seen_ns.contains(&ns);
         if first_in_process {
@@ -358,9 +375,11 @@ impl SideLedger {
                 true
             }
         };
-        let slot = self.slot_mut(ns).expect("slot was just found or placed");
-        slot.saved = false;
-        slot.last_pass_unix = now;
+        if kind == crate::snapshots::CodexPageKind::Ordinary {
+            let slot = self.slot_mut(ns).expect("slot was just found or placed");
+            slot.saved = false;
+            slot.last_pass_unix = now;
+        }
         GateOpen {
             side_allowed,
             first_in_process,
@@ -655,7 +674,8 @@ impl SideLedger {
         now: u64,
         index: &mut crate::snapshots::ScanIndex,
     ) -> GateOpen {
-        let (gate, wanted) = self.open_index_pass(ns, now);
+        let (gate, wanted) =
+            self.open_index_pass(ns, now, crate::snapshots::CodexPageKind::Ordinary);
         if let Some(wanted) = wanted {
             let keys = index_parent_keys(&index.files, &wanted);
             self.hydrate_index_pass(ns, &wanted, &keys, index);
@@ -663,15 +683,16 @@ impl SideLedger {
         gate
     }
 
-    /// C14's first part, under the lock: the gate slot, and the parent
-    /// digests of this namespace's entries (None: it has none, and C14
-    /// builds nothing).
+    /// C14's first part, under the lock: the gate slot (`begin_pass_of`
+    /// for the page's kind), and the parent digests of this namespace's
+    /// entries (None: it has none, and C14 builds nothing).
     pub(in crate::snapshots) fn open_index_pass(
         &mut self,
         ns: u128,
         now: u64,
+        kind: crate::snapshots::CodexPageKind,
     ) -> (GateOpen, Option<BTreeSet<u128>>) {
-        let gate = self.begin_pass(ns, now);
+        let gate = self.begin_pass_of(ns, now, kind);
         if !self.has_namespace(ns) {
             return (gate, None);
         }
@@ -1796,5 +1817,85 @@ mod tests {
             namespace_of(Path::new("/b/index.json"))
         );
         assert_ne!(parent_of("/p.jsonl"), parent_of("/q.jsonl"));
+    }
+
+    /// Stage 1 C-1 (a), (b): a continuation pass reads the gate and leaves
+    /// `saved` and `last_pass_unix` as they were, so the next ordinary pass
+    /// sees the last ordinary save's outcome; the ordinary pass is unchanged.
+    /// A namespace with no slot (evicted) is placed as for an ordinary pass.
+    #[test]
+    fn a_continuation_pass_keeps_the_gate_and_places_a_missing_slot() {
+        use crate::snapshots::CodexPageKind::Continuation;
+        let mut ledger = SideLedger::default();
+        // (a) The ordinary save succeeded.
+        ledger.begin_pass(5, 10);
+        let mark = ledger.save_mark(5);
+        ledger.note_saved(5, 15, false, mark);
+        let saved = *ledger.slot(5).unwrap();
+        assert!(saved.saved);
+        for now in [20, 21, 22] {
+            assert!(ledger.begin_pass_of(5, now, Continuation).side_allowed);
+            assert_eq!(*ledger.slot(5).unwrap(), saved, "neither cleared nor set");
+        }
+        assert!(ledger.begin_pass(5, 30).side_allowed, "next ordinary");
+        // (b) That ordinary pass's save failed: a continuation does not
+        // open the gate.
+        let unsaved = *ledger.slot(5).unwrap();
+        assert_eq!((unsaved.saved, unsaved.last_pass_unix), (false, 30));
+        assert!(!ledger.begin_pass_of(5, 40, Continuation).side_allowed);
+        assert_eq!(*ledger.slot(5).unwrap(), unsaved);
+        assert!(!ledger.begin_pass(5, 50).side_allowed, "still gated");
+        // Evicted by GATE_SLOTS newer namespaces: placed as today.
+        for ns in 100..100 + GATE_SLOTS as u128 {
+            ledger.begin_pass(ns, 60 + ns as u64);
+        }
+        assert!(ledger.slot(5).is_none());
+        let incarnation = ledger.wseq + 1;
+        assert!(ledger.begin_pass_of(5, 500, Continuation).side_allowed);
+        assert_eq!(
+            *ledger.slot(5).unwrap(),
+            GateSlot {
+                ns: 5,
+                saved: false,
+                last_pass_unix: 500,
+                last_saved_unix: 500,
+                incarnation,
+                saved_wseq: 0,
+                full_saved_wseq: 0,
+            }
+        );
+        assert!(!ledger.begin_pass(5, 510).side_allowed);
+    }
+
+    /// Stage 1 C-1 (c): the EOF continuation page's full save (C15 on its
+    /// `Ok` arm, mark read before it) moves the slot's watermarks and opens
+    /// the gate; the continuation's C14 before it moved nothing.
+    #[test]
+    fn an_eof_continuation_save_moves_the_watermarks() {
+        use crate::snapshots::CodexPageKind::Continuation;
+        if !layout_supported() {
+            return;
+        }
+        let ns = 61;
+        let mut ledger = SideLedger::default();
+        ledger.begin_pass(ns, 100);
+        // An ordinary charge whose save failed.
+        ledger.charge(key(ns, 1), entry(), 100).unwrap();
+        let charged = *ledger.get(&key(ns, 1)).unwrap();
+        assert!(!ledger.saved_covers(ns, &charged));
+        let before = *ledger.slot(ns).unwrap();
+        assert!(!ledger.begin_pass_of(ns, 200, Continuation).side_allowed);
+        assert_eq!(*ledger.slot(ns).unwrap(), before, "C14 moves nothing");
+        let mark = ledger.save_mark(ns);
+        ledger.note_saved(ns, 300, true, mark);
+        let slot = *ledger.slot(ns).unwrap();
+        assert!(slot.saved);
+        assert_eq!(
+            (slot.saved_wseq, slot.full_saved_wseq),
+            (ledger.wseq, ledger.wseq)
+        );
+        assert_eq!((slot.last_saved_unix, slot.last_pass_unix), (300, 100));
+        assert!(ledger.saved_covers(ns, &charged), "the charge is on disk");
+        assert!(ledger.begin_pass(ns, 400).side_allowed);
     }
 }

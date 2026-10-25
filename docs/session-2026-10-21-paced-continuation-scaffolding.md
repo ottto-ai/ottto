@@ -56,19 +56,18 @@ Only a byte-budget-exhausted `Paused` page whose work is at most 20 s, and whose
   - An account switch still ends the wait at once. `collect_file_activity_for` now returns whether it did.
 - `SnapshotCycleOwner` records the Codex preparation start and hands the ordinary page's ticket over after a successful finish, bound to the destination and scan authority it ran under, but only while enabled.
 
-## Interfaces left for the cursor owner
+## Cursor side (integrated 2026-10-24, still inert)
 
-The cursor side is `CursorContinuation`. The production stub `NoCursorContinuation` never mints a ticket and is never ready. None of its methods makes a network call:
+The cursor side is `CursorContinuation`, implemented by `CodexContinuation` over the cursor owner's `CodexCursorPort`. It is reached only behind `ENABLED`. None of its methods makes a network call:
 
 | Method | Role |
 |---|---|
-| `ticket_for` | Mint the ticket at the single pause site. |
-| `ready` | `cursor_continuation_ready`. |
-| `page(ticket, deadline)` | One resume-only page: load, C14 continuation pass, scan, C15 mark, save, note. Past `deadline`, stop at the next record boundary, save and return `PausedContended`, without a ticket or request. Only byte-budget exhaustion returns `Paused(ticket)`. |
+| `ticket_for` | The ticket minted at the single pause site. |
+| `ready` | `cursor_continuation_ready`, plus the ticket's cached inputs. |
+| `page(ticket, deadline, ordinary_equivalent)` | One resume-only page on a named, explicitly joined worker thread: load, a continuation-local prepare that refuses before any read when the destination is not quiescent, C14 continuation pass, scan. Only an EOF page is saved, through the unchanged ordinary finish on the parent. Past `deadline` the job pauses at the next `step()` return without a ticket (`PausedContended`). Only byte-budget exhaustion returns `Paused(ticket)`. A worker panic maps to `Failed` and disables continuation pages for the process lifetime. |
 
-Two more pieces are left open:
-- `CursorTicket` is a sealed placeholder for the cursor owner's fields. The cursor side returns an EOF page as `EofCompletion::new(preparation, index, scan)`; StateMissing completes or defers it.
-- `production_ordinary_equivalent` always returns `None`: the scaffold cannot establish ordinary coverage for same-revision guard/E2 admission. Historical tick/cycle maxima do not bound a later cycle or lock wait, and directives/backoff may change during the attempt. The guard must refuse acceleration on `None`, even after accelerated pages finish; it must not substitute a historical estimate. A future implementation needs an actual ordinary eligibility/coverage witness carried through final admission. The unused loop-history machinery has been removed.
+- `CursorTicket` carries the cursor ticket and the minting cycle's cached inputs. The attribution context is moved, never copied, and lives at most a fixed lifetime from the minting prepare: min(ordinary interval, Hot floor, loop interval). The lifetime is checked before each page and again before the EOF upload, and every ordinary Codex prepare drops the ticket. The held inputs are charged as process-retained memory.
+- The page's ordinary equivalent is exactly the cadence's `ordinary_interval()`, and `None` while failing, disabled or in upload backoff. It is a per-page lower bound of ordinary accrual, not coverage; coverage for same-revision admission is the cursor owner's guard.
 
 ## Platform gates
 
@@ -97,7 +96,7 @@ CI only. The new tests are in `adaptive_collector.rs` and `snapshot_sync/continu
 - refusal, unknown and busy inputs, a revoked Codex grant and a changed account;
 - a failed cycle or a lost grant clearing the ticket, tickets taken and written only under the sync lock, and a replacement ticket plus request between precheck and lock obeying its new due time;
 - the authority digest agreeing with `validate_snapshot_scan_authority` field by field;
-- the slow-later-cycle counterexample to historical coverage, and final same-revision admission refusing unknown coverage after directive/backoff changes (a consumer model; c22's real guard is not present);
+- the ordinary equivalent: exactly the ordinary interval with no historical estimate, and unknown while failing, disabled or in backoff (the 2026-10-24 integration replaced the earlier always-unknown stub);
 - ordinary-cycle cadence parity with and without continuation pages;
 - the inert default's constant gate and stubs.
 

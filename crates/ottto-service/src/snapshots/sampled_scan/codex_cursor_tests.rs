@@ -2466,6 +2466,7 @@ fn live_job_charge_is_estimated_between_bounded_walks() {
         unavailable_resumes: 0,
         charge: None,
         eof_applied: false,
+        pace: JobPace::new([0; 2], std::time::Instant::now(), false),
     };
     assert_eq!(meta.charge_estimate(0, 64), None, "the first step walks");
     meta.record_charge(1_000, 10, 64);
@@ -3767,6 +3768,7 @@ fn created_usage(scan: &SourceScanResult) -> Vec<(u64, u64)> {
 /// the thread once, with its full usage. An unchanged generation after
 /// that publishes nothing new: no second admission, no resurrected hold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3858,6 +3860,7 @@ fn assert_admitted_once(
 /// memo miss: the file is re-read (still ahead, so held and memoized again)
 /// and the new entry hits while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
     let home = CreatedThreadHome::new(3, false);
     let cache = Arc::new(SharedCache::default());
@@ -3895,6 +3898,7 @@ fn projection_ahead_created_thread_memo_wakes_on_projection_change() {
 /// change alone cures it, and the thread is admitted once with its full
 /// usage.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
     let home = CreatedThreadHome::new(10, false);
     home.project(home.bytes(9), 9);
@@ -3929,6 +3933,7 @@ fn lagging_projection_catching_up_cures_an_unchanged_created_thread() {
 /// hits; growth re-reads it, and once the projection binds the grown file it
 /// stays held (no admission), memoized again and hit again while unchanged.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn created_thread_fork_stays_held_after_growth_and_still_memo_hits() {
     let home = CreatedThreadHome::new(2, true);
     home.project(home.bytes(3), 3);
@@ -4079,6 +4084,7 @@ fn assert_oracle(
 /// the file to its extent binds the parent and cures it: the memo must miss
 /// (exact stamp), and the thread is admitted once, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4133,6 +4139,7 @@ fn rollout_declared_created_thread_memo_misses_on_the_curing_append() {
 /// miss), and the re-read binds the spawn parent: the usage-free thread is
 /// no longer ownership-incomplete, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
     let home = CreatedThreadHome::with_lineage(3, false, "user", Some(SPAWN_PARENT));
     let cache = Arc::new(SharedCache::default());
@@ -4187,6 +4194,7 @@ fn rollout_declared_created_thread_memo_wakes_on_extent_update() {
 /// refs are insert-only until a reset, so the memo entry, not the index, is
 /// where the fresh ref is observable.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn bound_created_thread_fork_memo_misses_on_growth_and_drops_the_bound_parent() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4245,6 +4253,7 @@ const ORPHAN: &str = "01a0dead-49cf-7460-9fd7-f7dbfd2f05e4";
 /// Once the last created thread leaves the state census, the entry misses
 /// and the ordinary session is admitted, exactly as a cold parse.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn candidate_less_hold_memo_misses_when_the_last_created_thread_goes() {
     // The created thread itself is complete and admitted; until the state
     // census drops it, it records no memo entry, so every memo counter
@@ -4399,6 +4408,7 @@ fn stored_memo_key(home: &CreatedThreadHome, cache: &SharedCache) -> String {
 /// - T18: growth with every other input unchanged is counted as an
 ///   exact-stamp miss with the grown extent, then re-read equal to cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn usage_bearing_fork_hold_memo_hit_replays_the_fresh_census() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -4862,6 +4872,7 @@ fn append_parent_turn(path: &Path, n: u64) {
 /// fresh read of the same generation does (same index, no memo), field by
 /// field plus `scanned_session_count`, and what a cold settled scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -4911,6 +4922,7 @@ fn kind_iii_fork_hold_hits_and_replays_a_fresh_read_exactly() {
 /// T14: after a restart (a new `SharedCache`, the index kept) the held fork
 /// is read once and recorded, then hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let (index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -4942,6 +4954,7 @@ fn a_new_shared_cache_rereads_a_held_fork_once_then_hits() {
 /// records no parent ref, before or after an index reset; its memo hit
 /// re-requests nothing. P-T32 covers an ordinary fork's re-request.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -4963,6 +4976,7 @@ fn memo_hit_after_an_index_reset_requests_no_parent_ref() {
 /// child's entry misses once, counted `memo_miss_other`, and the fork
 /// settles on the new parent object exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5015,6 +5029,7 @@ fn replaced_parent_object_misses_the_child_and_settles_like_a_cold_scan() {
 /// unchanged P identity, then recorded once, then quiet: nothing is parsed
 /// again, and the census equals the cold oracle.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_ledger_arrival_at_an_unchanged_identity_misses_at_most_once() {
     let home = CreatedThreadHome::with_lineage(2, true, "agent_created_thread", Some(SPAWN_PARENT));
     home.project(home.bytes(2), 2);
@@ -5151,6 +5166,7 @@ fn restarts_in_scope(scan: &SourceScanResult) -> Option<u64> {
 /// every generation) and its misses are `memo_miss_other`, never an
 /// exact-stamp miss; it is never admitted.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn child_of_a_growing_parent_never_hits() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5192,6 +5208,7 @@ fn child_of_a_growing_parent_never_hits() {
 /// witness drops and the fork settles exactly as a cold scan (here held and
 /// memoized: kind (iii)).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn absent_parent_fork_is_held_then_settles_when_its_parent_arrives() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let parent = home.fixture.file(PARENT);
@@ -5285,6 +5302,7 @@ fn mid_ledger_divergence_is_admitted_and_never_memoized() {
 /// refuses C (parent-pending: not recorded, nothing published). Later
 /// generations settle on the new P exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::diverging_child(3));
@@ -5341,6 +5359,7 @@ fn parent_rewritten_after_the_child_lookup_refuses_the_child() {
 /// finishes the fence re-opens P and refuses C. A fresh cache makes C read
 /// in full (no memo). Later generations settle exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_changed_between_the_child_step_calls_refuses_it_on_resume() {
     let home = ForkHome::new(&ForkHome::diverging_child(12));
     let (mut index, _, n) = home.settle(ScanIndex::default(), &Arc::new(SharedCache::default()), 0);
@@ -5457,6 +5476,7 @@ fn bind_seed_short_of_the_read_extent_is_never_recorded() {
 /// is ahead of its projection) hits while unchanged; growth is an
 /// exact-stamp miss with the grown extent, re-read and held again as cold.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::with_lineage(10, false, "user", Some(SPAWN_PARENT));
@@ -5513,6 +5533,7 @@ fn kind_i_usage_hold_hits_unchanged_and_misses_grown() {
 /// `MAX_JSONL_LINE_BYTES`) is memoized and hits; every replayed count,
 /// `over_line_cap` and the terminal trio included, equals a cold read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
     let home = CreatedThreadHome::new(10, true);
     let mut row = format!(
@@ -5558,6 +5579,7 @@ fn terminal_over_line_cap_hold_hits_with_the_cold_counts() {
 /// the memo: its first record is not an owning header, so the header
 /// inventory holds the page, as on main.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let fixture = ScanRoot::with_sessions(&[]);
@@ -5629,6 +5651,7 @@ fn non_monotone_legacy_trigger_hold_hits_exactly_and_misses_on_growth() {
 /// parent-pending): memoized, hit while unchanged; growth is an exact-stamp
 /// miss and the re-read settles exactly as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = ForkHome::new(&ForkHome::parent()[1..]);
@@ -5664,6 +5687,7 @@ fn prefix_exhausted_fork_hold_hits_exactly_and_misses_on_growth() {
 /// an exact-stamp miss (a tail could not replay it): it counts
 /// `memo_miss_other`, re-reads equal to cold, and the new entry hits.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn growth_with_a_sidecar_change_counts_an_other_miss() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5710,6 +5734,7 @@ fn growth_with_a_sidecar_change_counts_an_other_miss() {
 /// shrink each miss once, re-read equal to cold; a shrink is never counted
 /// as an exact-stamp (growth) miss.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn touched_replaced_or_shrunk_held_file_misses() {
     use crate::local_resource_diagnostics::codex_memo_lifecycle;
     let home = CreatedThreadHome::new(10, true);
@@ -5863,6 +5888,7 @@ fn memo_digest_fences_receipt_contents_context_census_flags_and_members() {
 /// T16: the memo has no clock input. The same unchanged hold collected a
 /// week later hits with the same disclosure.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn memo_hit_a_week_later_is_the_same_hit() {
     let home = CreatedThreadHome::new(10, true);
     let cache = Arc::new(SharedCache::default());
@@ -6045,6 +6071,7 @@ fn assert_warm_covers_cold(
 /// revert, two-page, historical-replay and strict/park generations
 /// (method-level `l_sb_*` tests in `snapshots.rs`).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn warm_state_only_blocks_cover_cold_across_a_generation_sweep() {
     let home = CreatedThreadHome::new(10, true);
     home.set_tokens(CREATED, 50);
@@ -7427,6 +7454,7 @@ fn spent_budget_holds_a_new_fork_deferred_once_then_absent() {
 /// restart, and memo-hits from its second generation. Once refs leave the
 /// set it resolves as a cold scan does.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn full_ref_set_holds_a_new_fork_deferred_ref_without_restart() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
@@ -7626,6 +7654,7 @@ fn a_deferred_ref_hold_built_before_its_proof_is_not_memoized() {
 /// page), and the namespace is marked matched for exactly that traversal,
 /// so a later page of it re-applies without matching.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn step_start_matches_once_per_traversal() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7665,6 +7694,7 @@ fn step_start_matches_once_per_traversal() {
 /// append to the file drops A's witness and the file is read again.
 /// (Rev 5's admitted-B variant is dropped per the lease's N3.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn misnamed_parent_rollout_witnesses_no_ledger_and_absent() {
     const A: &str = "019fa111-2222-7333-8444-cccccccccccc";
     const B: &str = "019fa111-2222-7333-8444-dddddddddddd";
@@ -7775,6 +7805,7 @@ fn write_rollout(fixture: &ScanRoot, id: &str, parent: Option<&str>, records: &[
 /// after an index reset and re-requests its parent ref, exactly as its
 /// fresh parse did.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::rename(
@@ -7810,6 +7841,7 @@ fn witnessed_fork_memo_hit_after_an_index_reset_re_requests_its_parent_ref() {
 /// appears (sorted before P), G and P are read, P is admitted with its own
 /// usage, P's RAM witness is gone, and the chain settles as a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn admitted_parent_loses_its_witness_and_its_child_resolves() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -7919,6 +7951,7 @@ fn out_of_window_parent_holds_its_fork_until_touched() {
 /// cycle and witnesses both `ForkCycle`. From then both are held `ForkCycle`
 /// and neither file is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn fork_cycle_is_witnessed_and_then_quiet() {
     let fixture = ScanRoot::with_sessions(&[]);
     write_rollout(&fixture, PARENT, Some(CHILD), &ForkHome::diverging_child(2));
@@ -8011,6 +8044,7 @@ fn resolvable_chain_never_counts_parent_held() {
 /// pages of another namespace (past `NAMESPACE_STALE_PAGES`), the held
 /// chain's next generation parses nothing and its holds memo-hit.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn parent_held_witness_survives_another_namespaces_pages() {
     let fixture = chain_fixture(false);
     let away = fixture.root.parent().unwrap().join("grandparent-away");
@@ -8120,6 +8154,7 @@ fn held_then_quiet_from(
 /// the fork is held under it, never `ParentLossy`, and nothing is read
 /// again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_parent_holds_its_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     fs::copy(
@@ -8184,6 +8219,7 @@ fn append_oversized_line(path: &Path) {
 /// again: P is parsed exactly once, C is held `ParentLossy`, and from then on
 /// nothing is read.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     append_oversized_line(&home.fixture.file(PARENT));
@@ -8244,6 +8280,7 @@ fn lossy_parent_is_read_once_and_witnessed_parent_lossy() {
 /// copies are a join `CandidateCopy` refusal before any parse, so they
 /// never reach event (c).)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicated_lossy_parent_is_never_witnessed_parent_lossy() {
     const OTHER_HEADER: &str = "019fa111-2222-7333-8444-444444444444";
     let fixture = ScanRoot::with_sessions(&[]);
@@ -8320,6 +8357,7 @@ const ABSENT_GRANDPARENT: &str = "019fa111-2222-7333-8444-333333333333";
 /// ref already held from an earlier traversal) runs no restart; C before P
 /// runs at most one (C is pending before P's step-map entry exists).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn deferred_intermediate_parent_is_not_reread_every_generation() {
     for c_first in [false, true] {
         let fixture = ScanRoot::with_sessions(&[]);
@@ -8553,6 +8591,7 @@ fn spent_budget_chain_never_counts_parent_debt_and_converges() {
 /// it again (the page-to-traversal fold, traversal-cumulative per page),
 /// P's witness survives every page, and restarts stay within budget.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn multi_page_traversal_folds_parent_causes_and_matches_once() {
     let fillers = (0..12)
         .map(|n| format!("019fa111-2222-7333-8444-9000000000{n:02}"))
@@ -8641,6 +8680,7 @@ fn multi_page_traversal_folds_parent_causes_and_matches_once() {
 /// generation, so C may count `ParentHeld` then, never later. Both settle as
 /// a cold scan.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
     for c_first in [false, true] {
         let fixture = chain_fixture(c_first);
@@ -8724,6 +8764,7 @@ fn pending_parent_replaces_its_parent_held_witness_with_a_wait_record() {
 /// longer validates and does not hide P: C is held `Duplicated` (never
 /// `ParentLossy`) and then nothing, neither copy of P nor C, is read again.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn duplicate_after_an_admitted_ledger_holds_the_fork_duplicated() {
     let home = ForkHome::new(&ForkHome::diverging_child(3));
     let cache = Arc::new(SharedCache::default());
@@ -9783,4 +9824,1926 @@ fn a_release_without_a_measure_drops_no_proof() {
     assert!(unwound.is_err());
     assert!(!cursor_held());
     refuses(overflow, "poisoned cursor");
+}
+
+// Stage 1 S1-a (`stage1/c14c15-answer.md` §7): continuation pages. Inert in
+// production; these drive `OwnedSourceScan::new_continuation` directly.
+
+/// Steps `scan` to completion with the collector's post-policy finalization
+/// (as `page_selections`).
+fn finish_page(mut scan: OwnedSourceScan) -> (ScanIndex, SourceScanResult) {
+    for _ in 0..100_000 {
+        match scan.step(None) {
+            OwnedSourceScanStep::Pending(next) => scan = next,
+            OwnedSourceScanStep::Complete {
+                mut index, scan, ..
+            } => {
+                let mut projected = scan.clone();
+                apply_upload_policy(
+                    SnapshotSource::Codex,
+                    &mut projected.snapshots,
+                    SnapshotUploadPolicy::default(),
+                );
+                finalize_scan_after_policy(SnapshotSource::Codex, &mut projected, &mut index);
+                let accepted = projected
+                    .snapshots
+                    .iter()
+                    .map(|snapshot| snapshot.snapshot_fingerprint.clone())
+                    .collect();
+                index.record_accepted_snapshot_fingerprints(&accepted);
+                return (index, scan);
+            }
+        }
+    }
+    panic!("the continuation page did not finish");
+}
+
+/// One continuation page of the paused job whose member index keys are
+/// `members`, over `root` (`days`, `curve` as the ordinary pages used),
+/// standing for `ordinary` of the ordinary cadence (§6).
+#[allow(clippy::too_many_arguments)]
+fn continuation_page_in(
+    root: &Path,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    namespace: &str,
+    collected_at: &str,
+    days: u64,
+    curve: bool,
+    members: &BTreeSet<String>,
+    ordinary: Option<std::time::Duration>,
+    tweak: impl Fn(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    let mut scan = OwnedSourceScan::new_continuation(
+        std::slice::from_ref(&root.to_path_buf()),
+        index,
+        collected_at,
+        days,
+        10,
+        false,
+        curve,
+        members,
+        ordinary,
+    );
+    tweak(&mut scan);
+    finish_page(scan.with_sampled_acquisition(Arc::clone(cache), Scope(namespace.into())))
+}
+
+/// `continuation_page_in` over a `ScanRoot` page's settings, with today's
+/// production ordinary equivalent (`None`: unknown, so the resumed attempt
+/// loses its acceleration and mints no further ticket).
+fn continuation_page(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    members: &BTreeSet<String>,
+    tweak: impl Fn(&mut OwnedSourceScan),
+) -> (ScanIndex, SourceScanResult) {
+    continuation_page_in(
+        &fixture.root,
+        index,
+        cache,
+        "cursor-fixture",
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        true,
+        members,
+        None,
+        tweak,
+    )
+}
+
+fn page_clock(cache: &SharedCache) -> (u64, u64) {
+    cache
+        .with_cursor(|cursor| (cursor.rotation.page, cursor.proof_rotation.page))
+        .unwrap()
+}
+
+fn paused_unavailable_resumes(cache: &SharedCache) -> Option<u32> {
+    cache
+        .with_cursor(|cursor| match &cursor.slot {
+            Slot::Paused(job) => job.cursor.as_ref().map(|meta| meta.unavailable_resumes),
+            Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+        })
+        .flatten()
+}
+
+/// A `ScanRoot` page that leaves SESSION's job paused (scaled budgets), and
+/// the job's member keys.
+fn paused_singleton(fixture: &ScanRoot, cache: &Arc<SharedCache>) -> (ScanIndex, BTreeSet<String>) {
+    let (index, _) = page(fixture, ScanIndex::default(), Some(Arc::clone(cache)));
+    assert_eq!(counter(cache, |c| c.jobs_paused), 1, "{}", counters(cache));
+    let members = cache.paused_members_for_test().expect("paused job");
+    assert_eq!(
+        members,
+        BTreeSet::from([local_index_key(&fixture.file(SESSION))])
+    );
+    (index, members)
+}
+
+/// §7 D: a continuation page selects only the paused job's pending paths:
+/// it resumes the job and leaves every other pending path queued and
+/// unread. It never plans or starts an attempt (`jobs_started`,
+/// `groups_started` unchanged) and pages the job to its one completion,
+/// with the unpaged read's output.
+#[test]
+fn continuation_selects_only_job_paths_and_never_starts_attempts() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let other = fixture.file(SESSION_B);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        // SESSION_B was read as a singleton; queue it again as a fresh
+        // census member the next ordinary page would select.
+        let template = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .iter()
+            .find(|pending| pending.path == fixture.file(SESSION))
+            .cloned()
+            .expect("the paused job's path stays pending");
+        let traversal = index.traversal.as_mut().unwrap();
+        if !traversal.pending_candidates.iter().any(|p| p.path == other) {
+            let mut queued = template;
+            queued.path = other.clone();
+            traversal.pending_candidates.push_back(queued);
+        }
+        let entry = |index: &ScanIndex| {
+            serde_json::to_value(index.files.get(&local_index_key(&other))).unwrap()
+        };
+        let other_entry = entry(&index);
+        let started = counter(&cache, |c| c.jobs_started);
+        let groups = counter(&cache, |c| c.groups_started);
+        let mut published = None;
+        for _ in 0..64 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page(&fixture, index, &cache, &members, |_| {});
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(counter(&cache, |c| c.jobs_started), started);
+            assert_eq!(counter(&cache, |c| c.groups_started), groups);
+            assert!(pending_hint(&index, &other).is_some(), "still queued");
+            assert_eq!(entry(&index), other_entry, "never read");
+            assert!(
+                scan.continuation_ticket().is_none(),
+                "an unknown ordinary equivalent ends the attempt's acceleration"
+            );
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                published = Some(scan);
+                break;
+            }
+            assert!(scan.snapshots.is_empty(), "a paused job publishes nothing");
+        }
+        let published = published.unwrap_or_else(|| panic!("{}", counters(&cache)));
+        assert!(cache.cursor_slot_free());
+        // Only the job's file publishes, as the unpaged read does.
+        let unpaged = fingerprints(&unpaged);
+        let published = fingerprints(&published);
+        assert!(!published.is_empty());
+        assert!(published
+            .iter()
+            .all(|fingerprint| unpaged.contains(fingerprint)));
+    });
+}
+
+/// §7 D (N3): group preparation on a continuation page. The paused group's
+/// selected members are job-owned, so preparation requeues them and starts
+/// no group attempt; the resume pages the same job. `groups_started` stays
+/// one from the first ordinary page to the completion.
+#[test]
+fn continuation_prepares_no_group_attempt() {
+    use crate::snapshots::codex_file_join::tests::usage;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const OWNER: &str = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+    const AT: &str = "2026-10-06T23:00:00Z";
+    fn chain(prefix: &str, created: &str, start: u64) -> Vec<u8> {
+        let mut body = codex_line(json!({"type": "session_meta", "timestamp": created,
+            "payload": {"id": OWNER, "timestamp": created}}));
+        for i in 0..30_u64 {
+            let after = start + 10 * (i + 1);
+            body.extend(codex_line(json!({"type": "token_usage_record",
+                "timestamp": "2026-10-01T10:01:00Z", "payload": {"thread_id": OWNER,
+                "response_id": format!("{prefix}-{i}"), "usage": usage(10),
+                "thread_token_usage": usage(after)}})));
+            let at = format!(
+                "2026-10-01T{:02}:{:02}:{:02}Z",
+                10 + after / 3600,
+                after / 60 % 60,
+                after % 60
+            );
+            body.extend(codex_line(json!({"type": "event_msg", "timestamp": at,
+                "payload": {"type": "token_count", "info": {"last_token_usage": usage(10),
+                "total_token_usage": usage(after)}}})));
+        }
+        body
+    }
+    let dir = Temp::new("group-continuation", b"");
+    fs::remove_file(&dir.0).unwrap();
+    let sessions = dir.0.join("sessions");
+    fs::create_dir_all(&sessions).unwrap();
+    fs::write(
+        sessions.join("a.jsonl"),
+        chain("a", "2026-10-01T10:00:00Z", 0),
+    )
+    .unwrap();
+    fs::write(
+        sessions.join("b.jsonl"),
+        chain("b", "2026-10-01T10:30:00Z", 300),
+    )
+    .unwrap();
+    let ordinary = |index: ScanIndex, cache: &Arc<SharedCache>| {
+        finish_page(
+            OwnedSourceScan::new(
+                SnapshotSource::Codex,
+                std::slice::from_ref(&sessions),
+                index,
+                AT,
+                7,
+                10,
+                false,
+                None,
+                &[],
+                false,
+                false,
+            )
+            .with_sampled_acquisition(Arc::clone(cache), Scope("group-fixture".into())),
+        )
+    };
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        // Ordinary pages until the group job pauses (a group whose probes
+        // outran a page takes a page of its own first).
+        let mut index = ScanIndex::default();
+        for _ in 0..8 {
+            index = ordinary(index, &cache).0;
+            if cache.paused_members_for_test().is_some() {
+                break;
+            }
+        }
+        let first = cache.counters_for_test();
+        assert_eq!(first.groups_started, 1, "{first:?}");
+        assert!(first.jobs_paused > 0, "{first:?}");
+        let members = cache.paused_members_for_test().expect("paused group");
+        assert_eq!(members.len(), 2, "both members belong to the job");
+        let started = first.jobs_started;
+        for _ in 0..128 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, scan) = continuation_page_in(
+                &sessions,
+                index,
+                &cache,
+                "group-fixture",
+                AT,
+                7,
+                false,
+                &members,
+                None,
+                |_| {},
+            );
+            index = next;
+            let now = cache.counters_for_test();
+            assert_eq!(now.groups_started, 1, "never restarted: {now:?}");
+            assert_eq!(now.jobs_started, started, "{now:?}");
+            assert_eq!(now.jobs_resumed, resumed + 1, "{now:?}");
+            if now.jobs_certified + now.jobs_uncertified > 0 {
+                assert!(cache.cursor_slot_free());
+                return;
+            }
+            assert!(
+                scan.snapshots.is_empty(),
+                "a paused group publishes nothing"
+            );
+        }
+        panic!(
+            "group job did not complete: {:?}",
+            cache.counters_for_test()
+        );
+    });
+}
+
+/// §7 D: during the bounded walk (pending directories), a continuation page
+/// selects nothing, resumes nothing and does not advance the walk.
+#[test]
+fn continuation_during_walk_is_noop() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let walking = index
+            .traversal
+            .as_ref()
+            .unwrap()
+            .pending_candidates
+            .front()
+            .cloned()
+            .expect("pending path");
+        let mut directory = walking;
+        directory.path = fixture.root.clone();
+        index
+            .traversal
+            .as_mut()
+            .unwrap()
+            .pending_directories
+            .push_back(directory);
+        let before = cache.counters_for_test();
+        let directories = |index: &ScanIndex| {
+            index
+                .traversal
+                .as_ref()
+                .unwrap()
+                .pending_directories
+                .iter()
+                .map(|pending| pending.path.clone())
+                .collect::<Vec<_>>()
+        };
+        let walk = directories(&index);
+        let (index, scan) = continuation_page(&fixture, index, &cache, &members, |_| {});
+        let after = cache.counters_for_test();
+        assert_eq!(after.jobs_resumed, before.jobs_resumed, "{after:?}");
+        assert_eq!(after.jobs_started, before.jobs_started);
+        assert_eq!(directories(&index), walk, "the walk did not advance");
+        assert!(
+            pending_hint(&index, &path).is_some(),
+            "the job path stays queued"
+        );
+        assert!(!cache.cursor_slot_free(), "still paused");
+        assert!(scan.snapshots.is_empty());
+    });
+}
+
+/// §7 E: a continuation page never ticks the cursor page clock (nor the
+/// proof rotation's); an ordinary page ticks it once.
+#[test]
+fn continuation_does_not_advance_rotation_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let clock = page_clock(&cache);
+        for _ in 0..3 {
+            let resumed = counter(&cache, |c| c.jobs_resumed);
+            let (next, _) = continuation_page(&fixture, index, &cache, &members, |_| {});
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_resumed), resumed + 1);
+            assert_eq!(page_clock(&cache), clock, "no tick");
+        }
+        page(&fixture, index, Some(Arc::clone(&cache)));
+        assert_eq!(page_clock(&cache), (clock.0 + 1, clock.0 + 1));
+    });
+}
+
+/// §7 E: waiters keep their turn across continuation pages. A waiter ahead
+/// of a newcomer stays active and ahead for any number of continuation
+/// pages; `WAITER_ACTIVE_PAGES` ordinary pages retire it.
+#[test]
+fn waiters_keep_turn_across_continuation_pages() {
+    let cache = SharedCache::default();
+    let scope = Scope("waiters".into());
+    let note = |continuation: bool| {
+        let mut page = PageBudget::default();
+        if continuation {
+            page.set_continuation(None);
+        }
+        page.note_page(&cache, &scope);
+        assert!(page.continuation() == continuation);
+    };
+    cache
+        .with_cursor(|cursor| cursor.rotation.wait("waiter"))
+        .unwrap();
+    note(false);
+    let ahead = || {
+        cache
+            .with_cursor(|cursor| {
+                (
+                    cursor.rotation.turn("waiter"),
+                    cursor.rotation.turn("newcomer"),
+                )
+            })
+            .unwrap()
+    };
+    assert_eq!(ahead(), (true, false));
+    for _ in 0..2 * WAITER_ACTIVE_PAGES {
+        note(true);
+        assert_eq!(ahead(), (true, false), "the waiter keeps its turn");
+    }
+    for _ in 0..WAITER_ACTIVE_PAGES {
+        note(false);
+    }
+    assert_eq!(ahead(), (true, true), "ordinary pages retire the waiter");
+}
+
+/// §7 E2: unavailable resumes count ordinary pages only. Continuation pages
+/// whose evidence is unavailable defer the job without counting, however
+/// many; the job then still ends after exactly `UNAVAILABLE_RESUMES`
+/// ordinary pages.
+#[test]
+fn e2_counts_only_ordinary_pages() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    let flipped = |scan: &mut OwnedSourceScan| {
+        scan.sidecar_census_complete = false;
+        scan.context_curve_enabled = !scan.context_curve_enabled;
+    };
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        let pages = u64::from(UNAVAILABLE_RESUMES) + 2;
+        for page in 1..=pages {
+            let (next, _) = continuation_page(&fixture, index, &cache, &members, flipped);
+            index = next;
+            assert_eq!(counter(&cache, |c| c.jobs_deferred_inputs), page);
+            assert_eq!(paused_unavailable_resumes(&cache), Some(0), "uncounted");
+        }
+        assert_eq!(counter(&cache, |c| c.jobs_unavailable_ended), 0);
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        for page in 1..=u64::from(UNAVAILABLE_RESUMES) {
+            let (next, _, _) = page_steps(
+                &fixture,
+                index,
+                Some(Arc::clone(&cache)),
+                "cursor-fixture",
+                NOW,
+                flipped,
+                10_000,
+            );
+            index = next;
+            if page < u64::from(UNAVAILABLE_RESUMES) {
+                assert_eq!(paused_unavailable_resumes(&cache), Some(page as u32));
+            }
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_unavailable_ended),
+            1,
+            "{}",
+            counters(&cache)
+        );
+        assert!(cache.cursor_slot_free());
+        assert_eq!(pending_hint(&index, &path), None, "dequeued");
+    });
+}
+
+/// §7 E2: a continuation page never evicts another namespace's job, stale
+/// or not; an ordinary page of that namespace evicts a stale one.
+#[test]
+fn continuation_never_evicts_a_foreign_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        // Stale: its namespace has not paged for `NAMESPACE_STALE_PAGES`.
+        cache
+            .with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES)
+            .unwrap();
+        assert!(cache.cursor_resume(&Scope("other".into()), true).is_none());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 0);
+        assert!(!cache.cursor_slot_free());
+        assert!(cache.cursor_resume(&Scope("other".into()), false).is_none());
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        assert!(cache.cursor_slot_free());
+    });
+}
+
+/// §7 A: a ticket only for a paused, valid, budget-exhausted, accelerated
+/// attempt. A fresh key's attempt is accelerated, so every pause of its
+/// ordinary pages mints one (`ticket_for` reads it); the page that completes
+/// the job, an uncached page, a page whose cursor budget is not exhausted and
+/// an unaccelerated attempt mint none. Ordinary-only pages never pace.
+#[test]
+fn ticket_only_for_paused_valid_exhausted_accelerated_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    let (_, uncached) = page(&fixture, ScanIndex::default(), None);
+    assert!(uncached.continuation_ticket().is_none(), "no cursor");
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, scan) = page(&fixture, ScanIndex::default(), Some(Arc::clone(&cache)));
+        assert_eq!(counter(&cache, |c| c.jobs_paused), 1);
+        let paused = cache
+            .with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => job.cursor.as_ref().map(accelerated),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+            })
+            .flatten();
+        assert_eq!(paused, Some(true), "a fresh key's attempt is accelerated");
+        let minted = scan
+            .continuation_ticket()
+            .cloned()
+            .expect("paused: a ticket");
+        assert_eq!(Some(&minted), cache.paused_ticket_for_test().as_ref());
+        let port = CodexCursorPort::new(Arc::clone(&cache));
+        assert_eq!(port.ticket_for(&scan), Some(minted));
+        // The pause site's own conditions, on the resumed job.
+        let (mut job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused job");
+        let limits = Limits::current();
+        let fresh = PageBudget::default();
+        let mut exhausted = PageBudget::default();
+        exhausted.charge(true, limits.cursor);
+        assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+        assert!(
+            cache.continuation_ticket(&job, &fresh).is_none(),
+            "not exhausted"
+        );
+        assert!(cache.continuation_ticket(&job, &exhausted).is_some());
+        job.cursor.as_mut().unwrap().pace.accelerate = false;
+        assert!(
+            cache.continuation_ticket(&job, &exhausted).is_none(),
+            "unaccelerated"
+        );
+        job.cursor.as_mut().unwrap().pace.accelerate = true;
+        assert!(matches!(lease.pause(job), PauseEnd::Paused));
+        for _ in 0..64 {
+            let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+            index = next;
+            assert_eq!(
+                scan.continuation_ticket().is_some(),
+                cache.paused_members_for_test().is_some(),
+                "a ticket exactly when the page paused the job: {}",
+                counters(&cache)
+            );
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(scan.continuation_ticket().is_none(), "completed: none");
+                assert_eq!(counter(&cache, |c| c.deferred_paced), 0);
+                return;
+            }
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+/// §7 ready: `cursor_continuation_ready` readies the exact paused,
+/// accelerated attempt (its members are the job's), and refuses a foreign,
+/// stale or restarted ticket and an unaccelerated attempt. A refused ticket
+/// names no members. No IO: only the cursor lock.
+#[test]
+fn ready_refuses_foreign_stale_restarted_or_unaccelerated_job() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(40);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        let exact = cache.paused_ticket_for_test().expect("paused job");
+        let ready = |ticket: &CodexCursorTicket| cache.cursor_continuation_ready(ticket);
+        let port = CodexCursorPort::new(Arc::clone(&cache));
+        assert_eq!(ready(&exact), Ok(()));
+        let members = cache.paused_members_for_test();
+        assert!(members.is_some());
+        assert_eq!(cache.continuation_members(&exact), members);
+        assert!(port.ready(&exact));
+        assert_eq!(port.members(&exact), members);
+        let set_accelerate = |accelerate: bool| {
+            cache
+                .with_cursor(|cursor| {
+                    if let Slot::Paused(job) = &mut cursor.slot {
+                        job.cursor.as_mut().unwrap().pace.accelerate = accelerate;
+                    }
+                })
+                .unwrap();
+        };
+        set_accelerate(false);
+        assert_eq!(ready(&exact), Err(ReadyRefusal::Unaccelerated));
+        assert_eq!(cache.continuation_members(&exact), None);
+        assert!(!port.ready(&exact));
+        assert_eq!(port.members(&exact), None);
+        set_accelerate(true);
+        let foreign = CodexCursorTicket {
+            namespace: ticket_digest(b"namespace", &[b"other"]),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&foreign), Err(ReadyRefusal::Foreign));
+        let other_file = CodexCursorTicket {
+            key: ticket_digest(b"rotation_key", &[b"cursor-fixture", b"/other"]),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&other_file), Err(ReadyRefusal::Stale));
+        let other_generation = CodexCursorTicket {
+            fence: Some(ticket_digest(b"fence", &[b"another generation"])),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&other_generation), Err(ReadyRefusal::Stale));
+        let restarted_attempt = CodexCursorTicket {
+            started: exact.started + 1,
+            ..exact.clone()
+        };
+        assert_eq!(ready(&restarted_attempt), Err(ReadyRefusal::Restarted));
+        let restarted_cache = CodexCursorTicket {
+            epoch: exact.epoch.wrapping_add(1),
+            ..exact.clone()
+        };
+        assert_eq!(ready(&restarted_cache), Err(ReadyRefusal::Restarted));
+        // A fresh cache (a process restart) never matches, and an empty
+        // slot of the same cursor state is stale.
+        let fresh = SharedCache::default();
+        assert_eq!(
+            fresh.cursor_continuation_ready(&exact),
+            Err(ReadyRefusal::Restarted)
+        );
+        let epoch = fresh.with_cursor(|cursor| cursor.id).unwrap();
+        assert_eq!(
+            fresh.cursor_continuation_ready(&CodexCursorTicket {
+                epoch,
+                ..exact.clone()
+            }),
+            Err(ReadyRefusal::Stale)
+        );
+        // The digests bind full, length-prefixed values.
+        assert_ne!(
+            ticket_digest(b"rotation_key", &[b"ab", b"c"]),
+            ticket_digest(b"rotation_key", &[b"a", b"bc"])
+        );
+        assert_eq!(
+            crate::heap_layout_bound::bound(&exact, usize::MAX),
+            Some(std::mem::size_of::<CodexCursorTicket>()),
+            "fixed-size, inline"
+        );
+    });
+}
+
+// Stage 1 S1-b (`stage1/c14c15-answer.md` §6, §7 Guard row; conditions 2 and
+// 4): the accelerate guard, its pace table and their accounting.
+
+fn rev(ino: u64, extent: u64) -> OpenStamp {
+    OpenStamp {
+        dev: 1,
+        ino,
+        extent,
+        modified: (1, 0),
+        changed: (1, 0),
+    }
+}
+
+fn secs(n: u64) -> std::time::Duration {
+    std::time::Duration::from_secs(n)
+}
+
+/// A job's `JobMeta` around `pace` (accrual tests).
+fn pace_meta(temp: &Temp, pace: JobPace) -> JobMeta {
+    JobMeta {
+        key: "key".into(),
+        namespace: "namespace".into(),
+        stamp_open: OpenStamp::capture(&File::open(&temp.0).unwrap()).unwrap(),
+        started: 0,
+        dependencies: None,
+        owner: None,
+        counting: String::new(),
+        fence: None,
+        census_trusted: true,
+        pages: 1,
+        unavailable_resumes: 0,
+        charge: None,
+        eof_applied: false,
+        pace,
+    }
+}
+
+/// `key`'s attempt begun at `t0` on `rev`, whose ordinary equivalent is
+/// `equivalent` at its last page `at`, recorded there (a pause or an end).
+fn paced(
+    table: &mut PaceTable,
+    key: [u64; 2],
+    rev: &OpenStamp,
+    t0: std::time::Instant,
+    equivalent: std::time::Duration,
+    at: std::time::Instant,
+) {
+    assert!(table.begin(key, rev, t0));
+    let mut pace = JobPace::new(key, t0, true);
+    pace.equiv_secs = Some(equivalent);
+    pace.last_page_mono = at;
+    assert!(table.record(&pace, at));
+}
+
+fn offsets(table: &PaceTable, key: [u64; 2]) -> Option<(u32, u32)> {
+    let slot = table.slots[table.position(key)?].as_ref()?;
+    Some((slot.same_off, slot.new_off))
+}
+
+const START: PaceVerdict = PaceVerdict::Start { accelerate: true };
+const START_UNACCELERATED: PaceVerdict = PaceVerdict::Start { accelerate: false };
+
+/// §7 Guard: an ordinary page accrues its elapsed time; a continuation page
+/// at least the ordinary interval it stands for. The same revision then waits
+/// the whole ordinary equivalent after the attempt's start, to the second
+/// (rounded up), and no longer.
+#[test]
+fn paced_same_revision_waits_ordinary_equivalent() {
+    let temp = Temp::new("pace-same", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "scope", "/a");
+    let same = rev(7, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    with_pace_clock(Some(t0 + secs(10)), false, || {
+        assert_eq!(accrue_equivalent(&mut meta, false, None), Some(secs(10)));
+    });
+    with_pace_clock(Some(t0 + secs(20)), false, || {
+        // Ten seconds elapsed, standing for ten minutes of ordinary pages.
+        assert_eq!(
+            accrue_equivalent(&mut meta, true, Some(secs(600))),
+            Some(secs(600))
+        );
+    });
+    with_pace_clock(Some(t0 + secs(50)), false, || {
+        // An interval shorter than the gap: the gap counts.
+        assert_eq!(
+            accrue_equivalent(&mut meta, true, Some(secs(1))),
+            Some(secs(30))
+        );
+    });
+    assert!(meta.pace.accelerate);
+    assert_eq!(meta.pace.equiv_secs, Some(secs(640)));
+    // The pause half a second later records the ordinary tail too.
+    let pause = t0 + secs(50) + std::time::Duration::from_millis(500);
+    assert!(table.record(&meta.pace, pause));
+    assert_eq!(offsets(&table, key), Some((641, 641)), "rounded up");
+    assert_eq!(
+        table.verdict(key, &same, t0 + secs(640)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(key, &same, t0 + secs(641)), START);
+    // A later record of the same attempt never lowers its offsets.
+    let mut earlier = meta.pace;
+    earlier.equiv_secs = Some(secs(5));
+    assert!(table.record(&earlier, pause));
+    assert_eq!(offsets(&table, key), Some((641, 641)));
+}
+
+/// §7 Guard: a changed revision (growth, ctime) waits `min(1 h, equivalent)`;
+/// the same revision of the same attempt still waits the whole equivalent.
+#[test]
+fn paced_new_bytes_waits_min_hour_or_equivalent() {
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    let (short, long) = (pace_key("ns", "s", "/short"), pace_key("ns", "s", "/long"));
+    paced(&mut table, short, &rev(1, 100), t0, secs(600), t0 + secs(5));
+    paced(
+        &mut table,
+        long,
+        &rev(2, 100),
+        t0,
+        secs(7_200),
+        t0 + secs(5),
+    );
+    assert_eq!(offsets(&table, short), Some((600, 600)));
+    assert_eq!(offsets(&table, long), Some((7_200, 3_600)));
+    let grown = rev(1, 200);
+    assert_eq!(
+        table.verdict(short, &grown, t0 + secs(599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(short, &grown, t0 + secs(600)), START);
+    let long_grown = rev(2, 200);
+    assert_eq!(
+        table.verdict(long, &long_grown, t0 + secs(3_599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(table.verdict(long, &long_grown, t0 + secs(3_600)), START);
+    let mut touched = rev(2, 100);
+    touched.changed = (2, 0);
+    assert_eq!(
+        table.verdict(long, &touched, t0 + secs(3_600)),
+        START,
+        "ctime"
+    );
+    assert_eq!(
+        table.verdict(long, &rev(2, 100), t0 + secs(3_600)),
+        PaceVerdict::Defer,
+        "no new bytes: the whole equivalent"
+    );
+    assert_eq!(table.verdict(long, &rev(2, 100), t0 + secs(7_200)), START);
+}
+
+/// §7 Guard: an attempt with no continuation page is never paced (its
+/// equivalent is its elapsed time, exactly), and an unaccelerated attempt has
+/// no ticket, so no continuation page: today's cadence either way.
+#[test]
+fn unaccelerated_attempt_is_never_paced() {
+    let temp = Temp::new("pace-ordinary", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let same = rev(1, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    for page in 1..=3 {
+        let at = t0 + std::time::Duration::from_millis(1_500 * page);
+        with_pace_clock(Some(at), false, || {
+            accrue_equivalent(&mut meta, false, None).expect("known");
+        });
+    }
+    assert!(table.record(&meta.pace, t0 + secs(7)));
+    assert_eq!(offsets(&table, key), Some((0, 0)), "no surplus, no pacing");
+    assert_eq!(table.verdict(key, &same, t0 + secs(7)), START);
+    // An unaccelerated start (coverage lost to an eviction) is today's start;
+    // its ordinary pages leave zero offsets too.
+    table.unknown_until = Some(t0 + secs(100));
+    let other = pace_key("ns", "s", "/b");
+    assert_eq!(
+        table.verdict(other, &rev(2, 1), t0 + secs(8)),
+        START_UNACCELERATED
+    );
+    assert!(table.begin(other, &rev(2, 1), t0 + secs(8)));
+    let pace = JobPace::new(other, t0 + secs(8), false);
+    assert!(table.record(&pace, t0 + secs(9)));
+    assert_eq!(offsets(&table, other), Some((0, 0)));
+    assert_ne!(
+        table.verdict(other, &rev(2, 1), t0 + secs(9)),
+        PaceVerdict::Defer
+    );
+}
+
+/// §7 Guard, through the scan: an accelerated attempt that took a
+/// continuation page standing for ten minutes, then was lost (its
+/// equivalent kept), is not restarted on the same revision before that
+/// equivalent. The paced deferral leaves the file pending (owed), and is not
+/// a waiter (it blocks no other file's turn), a completion, a fence or a
+/// loss. Once eligible, the restart is accelerated again.
+#[test]
+fn paced_defer_is_pending_not_waiter_not_fenced() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let waiter = rotation_key("cursor-fixture", &local_index_key(&path));
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (index, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        let (index, scan) = with_pace_clock(Some(t0 + secs(1)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_some(),
+            "a known equivalent keeps the attempt accelerated: {}",
+            counters(&cache)
+        );
+        // The stale job is evicted (lost); its equivalent stays recorded.
+        with_pace_clock(Some(t0 + secs(2)), false, || {
+            cache
+                .with_cursor(|cursor| cursor.rotation.page += NAMESPACE_STALE_PAGES)
+                .unwrap();
+            assert!(cache.cursor_resume(&Scope("other".into()), false).is_none());
+        });
+        assert_eq!(counter(&cache, |c| c.jobs_lost), 1);
+        cache
+            .with_cursor(|cursor| cursor.rotation.wait(&waiter))
+            .unwrap();
+        let (index, _) = with_pace_clock(Some(t0 + secs(3)), false, || {
+            page(&fixture, index, Some(Arc::clone(&cache)))
+        });
+        let now = cache.counters_for_test();
+        assert_eq!(now.deferred_paced, 1, "{now:?}");
+        assert_eq!(now.jobs_started, 1, "{now:?}");
+        assert_eq!(now.deferred_next_generation, 0, "not fenced: {now:?}");
+        assert_eq!(now.jobs_lost, 1, "not a loss: {now:?}");
+        assert_eq!(now.jobs_certified + now.jobs_uncertified, 0, "{now:?}");
+        assert!(pending_hint(&index, &path).is_some(), "owed: still pending");
+        cache
+            .with_cursor(|cursor| {
+                assert!(
+                    !cursor.rotation.waiting.contains_key(&waiter),
+                    "not a waiter"
+                );
+                assert!(cursor.rotation.turn("cursor-fixture\0/another"));
+                assert!(
+                    !cursor.rotation.attempted.contains_key(&waiter),
+                    "not fenced"
+                );
+                assert!(
+                    !cursor.rotation.served.contains_key(&waiter),
+                    "not completed"
+                );
+            })
+            .unwrap();
+        assert!(cache.cursor_slot_free());
+        // Eligible after the recorded equivalent (601 s from the start).
+        with_pace_clock(Some(t0 + secs(601)), false, || {
+            page(&fixture, index, Some(Arc::clone(&cache)))
+        });
+        let now = cache.counters_for_test();
+        assert_eq!(now.deferred_paced, 1, "{now:?}");
+        assert_eq!(now.jobs_started, 2, "{now:?}");
+        let accelerated = cache
+            .with_cursor(|cursor| match &cursor.slot {
+                Slot::Paused(job) => job.cursor.as_ref().map(accelerated),
+                Slot::Empty | Slot::ActiveElsewhere { .. } => None,
+            })
+            .flatten();
+        assert_eq!(accelerated, Some(true), "{now:?}");
+    });
+}
+
+/// §7 Guard, condition 4: a full table places in a free slot, else an
+/// expired one (lossless: `unknown_until` untouched), else evicts the slot
+/// expiring first and holds `unknown_until` at its deadline: until then a key
+/// with no slot (the evicted one included) starts unaccelerated, while keys
+/// with slots keep their coverage. Later evictions never lower the hold.
+#[test]
+fn pace_lossy_eviction_disables_acceleration_until_expiry() {
+    let t0 = std::time::Instant::now();
+    let keys = (0..ROTATION_KEYS)
+        .map(|i| pace_key("ns", "s", &format!("/{i}")))
+        .collect::<Vec<_>>();
+    let full = || {
+        let mut table = PaceTable::default();
+        for (i, key) in keys.iter().enumerate() {
+            paced(
+                &mut table,
+                *key,
+                &rev(i as u64 + 1, 10),
+                t0,
+                secs(1_000 + i as u64),
+                t0,
+            );
+        }
+        assert!(table.slots.iter().all(Option::is_some));
+        table
+    };
+    // Expired-slot reuse: keys 0..=2 have expired by t0 + 1002 s.
+    let mut table = full();
+    let fresh = pace_key("ns", "s", "/fresh");
+    assert!(table.begin(fresh, &rev(900, 1), t0 + secs(1_002)));
+    assert_eq!(table.unknown_until, None, "lossless");
+    assert!(table.position(keys[0]).is_none() && table.position(fresh).is_some());
+    // Overflow: nothing expired, the earliest deadline is evicted (lossy).
+    let mut table = full();
+    paced(
+        &mut table,
+        fresh,
+        &rev(900, 1),
+        t0 + secs(10),
+        secs(5_000),
+        t0 + secs(10),
+    );
+    assert!(table.position(keys[0]).is_none());
+    assert_eq!(table.unknown_until, Some(t0 + secs(1_000)));
+    let later = t0 + secs(11);
+    assert_eq!(
+        table.verdict(keys[0], &rev(1, 10), later),
+        START_UNACCELERATED
+    );
+    let stranger = pace_key("ns", "s", "/stranger");
+    assert_eq!(
+        table.verdict(stranger, &rev(901, 1), later),
+        START_UNACCELERATED
+    );
+    assert_eq!(
+        table.verdict(keys[1], &rev(2, 10), later),
+        PaceVerdict::Defer
+    );
+    assert_eq!(
+        table.verdict(stranger, &rev(901, 1), t0 + secs(1_000)),
+        START
+    );
+    // A later eviction raises the hold; none lowers it.
+    assert!(table.begin(stranger, &rev(901, 1), later));
+    assert_eq!(table.unknown_until, Some(t0 + secs(1_001)));
+    table.unknown_until = Some(t0 + secs(9_000));
+    assert!(table.begin(pace_key("ns", "s", "/third"), &rev(902, 1), later));
+    assert_eq!(table.unknown_until, Some(t0 + secs(9_000)), "preserved");
+}
+
+/// Condition 2: keys include the namespace, the receipt/replay scope and the
+/// path, length-prefixed. A slot of another object under a matching key (a
+/// replaced file, or a collision) never shortens a deferral and never lends
+/// its coverage: it defers its changed-revision offset, then starts
+/// unaccelerated, and the live slot is kept (not overwritten) until it
+/// expires.
+#[test]
+fn pace_keys_isolate_namespaces_scopes_and_objects() {
+    let key = pace_key("ns", "scope", "/a");
+    assert_ne!(key, pace_key("other", "scope", "/a"));
+    assert_ne!(key, pace_key("ns", "another", "/a"));
+    assert_ne!(key, pace_key("ns", "scope", "/b"));
+    assert_ne!(pace_key("ab", "c", "/a"), pace_key("a", "bc", "/a"));
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    paced(&mut table, key, &rev(1, 100), t0, secs(7_200), t0);
+    let foreign = pace_key("other", "scope", "/a");
+    assert_eq!(table.verdict(foreign, &rev(1, 100), t0 + secs(1)), START);
+    // Another object (dev/ino) under the same key.
+    let replaced = rev(2, 100);
+    assert_eq!(
+        table.verdict(key, &replaced, t0 + secs(3_599)),
+        PaceVerdict::Defer
+    );
+    assert_eq!(
+        table.verdict(key, &replaced, t0 + secs(3_600)),
+        START_UNACCELERATED
+    );
+    assert!(
+        !table.begin(key, &replaced, t0 + secs(3_600)),
+        "the live slot stays"
+    );
+    assert_eq!(offsets(&table, key), Some((7_200, 3_600)));
+    assert_eq!(
+        table.verdict(key, &rev(1, 100), t0 + secs(3_600)),
+        PaceVerdict::Defer
+    );
+    // Expired, the slot is free for the new object.
+    assert_eq!(table.verdict(key, &replaced, t0 + secs(7_200)), START);
+    assert!(table.begin(key, &replaced, t0 + secs(7_200)));
+    assert_eq!(offsets(&table, key), Some((0, 0)));
+}
+
+/// §7 Guard: a process restart is a fresh table (every key starts
+/// accelerated, nothing deferred), never another cache's slots.
+#[test]
+fn pace_restart_is_fresh() {
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let old = SharedCache::default();
+    old.with_cursor(|cursor| paced(&mut cursor.pace, key, &rev(1, 1), t0, secs(7_200), t0))
+        .unwrap();
+    assert_eq!(
+        old.with_cursor(|cursor| cursor.pace.verdict(key, &rev(1, 1), t0 + secs(1)))
+            .unwrap(),
+        PaceVerdict::Defer
+    );
+    let restarted = SharedCache::default();
+    restarted
+        .with_cursor(|cursor| {
+            assert!(cursor.pace.slots.iter().all(Option::is_none));
+            assert_eq!(cursor.pace.unknown_until, None);
+            assert_eq!(cursor.pace.verdict(key, &rev(1, 1), t0 + secs(1)), START);
+        })
+        .unwrap();
+}
+
+/// §7 Guard, condition 2: a clock failure, an unknown ordinary interval or an
+/// overflow is unknown coverage. The attempt loses its acceleration for good
+/// (no further ticket); its pause or end forgets its slot and holds
+/// `unknown_until` past its deadline and at least an hour ahead, so its next
+/// start is today's, unaccelerated. Narrowing never shortens a deadline.
+#[test]
+fn pace_clock_failure_is_unknown() {
+    let temp = Temp::new("pace-clock", b"{}\n");
+    let t0 = std::time::Instant::now();
+    let key = pace_key("ns", "s", "/a");
+    let same = rev(1, 100);
+    let mut table = PaceTable::default();
+    assert!(table.begin(key, &same, t0));
+    let mut meta = pace_meta(&temp, JobPace::new(key, t0, true));
+    with_pace_clock(Some(t0 + secs(5)), true, || {
+        assert_eq!(accrue_equivalent(&mut meta, true, Some(secs(600))), None);
+    });
+    assert!(!meta.pace.accelerate);
+    assert_eq!(meta.pace.equiv_secs, None);
+    with_pace_clock(Some(t0 + secs(6)), false, || {
+        assert_eq!(accrue_equivalent(&mut meta, false, None), None, "sticky");
+    });
+    assert!(!meta.pace.accelerate);
+    assert!(!table.record(&meta.pace, t0 + secs(6)));
+    assert!(table.position(key).is_none());
+    assert_eq!(table.unknown_until, Some(t0 + secs(3_606)));
+    assert_eq!(table.verdict(key, &same, t0 + secs(7)), START_UNACCELERATED);
+    // A failing elapsed time at the record itself forgets the slot too.
+    let other = pace_key("ns", "s", "/b");
+    paced(&mut table, other, &rev(2, 1), t0, secs(9_000), t0);
+    let pace = JobPace::new(other, t0, true);
+    with_pace_clock(None, true, || assert!(!table.record(&pace, t0 + secs(8))));
+    assert!(table.position(other).is_none());
+    assert_eq!(
+        table.unknown_until,
+        Some(t0 + secs(9_000)),
+        "past its deadline"
+    );
+    // Production's continuation input today is unknown (`None`).
+    let mut continued = pace_meta(&temp, JobPace::new(other, t0, true));
+    with_pace_clock(Some(t0 + secs(9)), false, || {
+        assert_eq!(accrue_equivalent(&mut continued, true, None), None);
+    });
+    assert!(!continued.pace.accelerate);
+    // Narrowing rounds up and refuses what a u32 offset cannot hold.
+    assert_eq!(
+        pace_offset(std::time::Duration::from_millis(1_001)),
+        Some(2)
+    );
+    assert_eq!(pace_offset(secs(u64::from(u32::MAX))), Some(u32::MAX));
+    assert_eq!(pace_offset(secs(u64::from(u32::MAX) + 1)), None);
+    let huge = pace_key("ns", "s", "/huge");
+    assert!(table.begin(huge, &rev(3, 1), t0));
+    let mut overflow = JobPace::new(huge, t0, true);
+    overflow.equiv_secs = Some(secs(u64::from(u32::MAX) + 1));
+    overflow.last_page_mono = t0;
+    assert!(
+        !table.record(&overflow, t0),
+        "overflow: unknown, never a shorter deadline"
+    );
+    assert!(table.position(huge).is_none());
+}
+
+/// Condition 4 layout proof: the slot, the table and the job's pace facts
+/// have exactly the granted inline sizes and own no heap, so a full table
+/// walks to its `size_of` only.
+#[test]
+fn pace_table_layout_is_inline_and_bounded() {
+    use std::mem::size_of;
+    #[cfg(target_pointer_width = "64")]
+    {
+        assert_eq!(size_of::<std::time::Instant>(), 16);
+        assert_eq!(size_of::<OpenStamp>(), 56);
+        assert_eq!(size_of::<PaceSlot>(), 96);
+        assert_eq!(size_of::<Option<PaceSlot>>(), 96, "the Instant niche");
+        assert_eq!(size_of::<PaceTable>(), 6_160);
+        assert_eq!(size_of::<JobPace>(), 72);
+    }
+    assert!(size_of::<CursorState>() >= size_of::<PaceTable>());
+    assert!(size_of::<SharedCache>() >= size_of::<CursorState>());
+    assert!(size_of::<JobMeta>() >= size_of::<JobPace>());
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let mut table = PaceTable::default();
+    let empty = crate::heap_layout_bound::bound(&table, usize::MAX);
+    for i in 0..ROTATION_KEYS {
+        paced(
+            &mut table,
+            pace_key("ns", "s", &i.to_string()),
+            &rev(i as u64, 1),
+            t0,
+            secs(9),
+            t0,
+        );
+    }
+    assert!(table.slots.iter().all(Option::is_some));
+    assert_eq!(empty, Some(size_of::<PaceTable>()));
+    assert_eq!(
+        crate::heap_layout_bound::bound(&table, usize::MAX),
+        Some(size_of::<PaceTable>())
+    );
+    assert_eq!(
+        crate::heap_layout_bound::bound(&JobPace::new([1; 2], t0, true), usize::MAX),
+        Some(size_of::<JobPace>())
+    );
+}
+
+/// Every live pace slot of `cache` (64 distinct keys), deadlines ahead.
+fn fill_pace(cache: &SharedCache) {
+    let t0 = std::time::Instant::now();
+    cache
+        .with_cursor(|cursor| {
+            for i in 0..ROTATION_KEYS {
+                let key = pace_key("fill", "s", &i.to_string());
+                paced(
+                    &mut cursor.pace,
+                    key,
+                    &rev(i as u64, 1),
+                    t0,
+                    secs(9_000),
+                    t0,
+                );
+            }
+        })
+        .unwrap();
+}
+
+/// Condition 4 accounting, each site exactly once:
+/// - cursor feasibility and reservation (`state_for_main`, `cursor_resident`)
+///   carry the table inside `size_of_val(CursorState)` and never walk it;
+/// - the whole-cache bound carries it inside `size_of::<SharedCache>()` (the
+///   `Arc` payload) and not in the locked parts;
+/// - `context_overhead`, which every release (copy refusal, Path A, and
+///   #665's X_out/peak `prove_release` through `release_room_for_main`) adds
+///   beside `state_for_main`, leaves it out;
+/// - a job's pace facts are inside its own walk (`paused_charge`), with no
+///   heap, and the table is not reachable from a job.
+#[test]
+fn pace_table_is_charged_once_in_admission_release_and_whole_cache() {
+    use crate::heap_layout_bound::bound;
+    use std::mem::{align_of, size_of};
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let side = crate::snapshots::sampled_scan::side_ledger::SIDE_LEDGER_BYTES;
+    let cache = Arc::new(SharedCache::default());
+    let walked = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                let mut c = Counter::new(usize::MAX);
+                cursor.heap_bound(&mut c).unwrap();
+                c.bytes
+            })
+            .unwrap()
+    };
+    let empty_heap = walked(&cache);
+    let main_state = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| state_for_main(cursor))
+            .flatten()
+            .unwrap()
+    };
+    let empty_state = main_state(&cache);
+    fill_pace(&cache);
+    let state = main_state(&cache);
+    assert_eq!(state, empty_state, "a full table adds no walked bytes");
+    assert_eq!(walked(&cache), empty_heap);
+    assert_eq!(
+        state,
+        size_of::<CursorState>() + empty_heap,
+        "once, via size_of_val"
+    );
+    assert_eq!(cache.cursor_resident(), state);
+    // Whole cache: once, in the `Arc` payload; the locked parts never carry it.
+    let mut whole = Counter::new(usize::MAX);
+    cache.heap_bound(&mut whole).unwrap();
+    let mut parts = Counter::new(usize::MAX);
+    cache.inner.heap_bound(&mut parts).unwrap();
+    cache.cursor.heap_bound(&mut parts).unwrap();
+    assert_eq!(
+        whole.bytes,
+        size_of::<SharedCache>()
+            + align_of::<SharedCache>()
+            + 2 * size_of::<usize>()
+            + parts.bytes
+            + side
+    );
+    // The release math: `context_overhead` without the table, beside
+    // `state_for_main` with it.
+    let fixture = ScanRoot::new(4);
+    let scan = OwnedSourceScan::new(
+        SnapshotSource::Codex,
+        std::slice::from_ref(&fixture.root),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        None,
+        &[],
+        false,
+        false,
+    )
+    .with_sampled_acquisition(Arc::clone(&cache), Scope("ns".into()));
+    let context = scan.sampling.as_ref().unwrap();
+    let overhead = crate::snapshots::sampled_scan::context_overhead(context).unwrap();
+    assert_eq!(
+        overhead,
+        size_of::<crate::snapshots::sampled_scan::Context>() + size_of::<SharedCache>()
+            - size_of::<PaceTable>()
+            + align_of::<SharedCache>()
+            + 2 * size_of::<usize>()
+            + side
+            + bound(&context.namespace, STATE_BYTES).unwrap()
+            + bound(&context.admission, STATE_BYTES).unwrap()
+    );
+    assert!(crate::snapshots::sampled_scan::context_overhead_covers(
+        context
+    ));
+    let retained = cache.retained().unwrap();
+    let room = cache.release_room_for_main(&retained, overhead, |_| true);
+    assert_eq!(room, Some(STATE_BYTES - state - overhead));
+    drop(retained);
+    // A job: its pace facts walk to nothing beyond its own size.
+    let temp = Temp::new("pace-job", b"{}\n");
+    let meta = pace_meta(&temp, JobPace::new([1; 2], std::time::Instant::now(), true));
+    let mut c = Counter::new(usize::MAX);
+    meta.pace.heap_bound(&mut c).unwrap();
+    assert_eq!(c.bytes, 0);
+}
+
+/// Condition 4 boundaries with a full table: a mandatory claim fits exactly
+/// at `state + claim + SIDE_LEDGER_BYTES + retained floor` (the table counted
+/// once inside `state`) and not one byte past; counting the table twice
+/// would refuse that fit, so a budget one table short refuses. A hopeless
+/// claim evicts nothing and leaves the table as it was.
+#[test]
+fn pace_table_admission_boundary_beside_the_side_reservation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let cache = Arc::new(SharedCache::default());
+    fill_pace(&cache);
+    let floor = admission_floor(&cache);
+    let state = cache.cursor_resident();
+    let claim = 4096;
+    with_test_state_budget(state + claim + floor, || {
+        assert!(cache.cursor_reserve(claim + 1).is_none(), "one byte past");
+        let credit = cache.cursor_reserve(claim).expect("exactly fits");
+        assert_eq!(cache.cursor_resident(), state + claim);
+        credit.refund();
+    });
+    with_test_state_budget(
+        state + claim + floor - std::mem::size_of::<PaceTable>(),
+        || {
+            assert!(cache.cursor_reserve(claim).is_none());
+        },
+    );
+    let table = |cache: &SharedCache| {
+        cache
+            .with_cursor(|cursor| {
+                (
+                    cursor
+                        .pace
+                        .slots
+                        .iter()
+                        .filter(|slot| slot.is_some())
+                        .count(),
+                    cursor.pace.unknown_until,
+                )
+            })
+            .unwrap()
+    };
+    let before = table(&cache);
+    for budget in [floor - 1, state + floor] {
+        with_test_state_budget(budget, || assert!(cache.cursor_reserve(1).is_none()));
+    }
+    assert_eq!(table(&cache), before);
+    assert_eq!(before, (ROTATION_KEYS, None));
+    assert_eq!(cache.cursor_reserved(), 0);
+}
+
+/// S1-b carry-forward: the pause site mints its ticket with no lock held
+/// (`cursor_held`, `retained_held` both false there), and its one
+/// `with_cursor` would trip `CursorHeld` on a relock instead of deadlocking.
+#[test]
+fn pause_site_mints_without_relock() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
+    if !crate::heap_layout_bound::layout_supported() || !cfg!(debug_assertions) {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        paused_singleton(&fixture, &cache);
+        let (job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused");
+        let mut exhausted = PageBudget::default();
+        exhausted.charge(true, Limits::current().cursor);
+        assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+        assert!(cache.continuation_ticket(&job, &exhausted).is_some());
+        assert!(!cursor_held());
+        assert!(matches!(lease.pause(job), PauseEnd::Paused));
+        let (job, lease) = cache
+            .cursor_resume(&Scope("cursor-fixture".into()), false)
+            .expect("paused");
+        let relock = catch_unwind(AssertUnwindSafe(|| {
+            cache.with_cursor(|_| cache.continuation_ticket(&job, &exhausted))
+        }));
+        assert!(relock.is_err(), "a relock is caught, never a deadlock");
+        assert!(!cursor_held());
+        drop(lease);
+    });
+}
+
+/// EOF seam (condition 3, c22 side): only a continuation page that commits
+/// its job (and whose native finish succeeds) is marked committed: the one
+/// scan StateMissing may hand to `EofCompletion::new`. Its pausing pages and
+/// an ordinary page's completion are not; a re-paused accelerated job mints
+/// a ticket again.
+#[test]
+fn continuation_committed_marks_only_the_eof_page() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        for _ in 0..64 {
+            let (next, scan) = continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            );
+            index = next;
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(scan.continuation_committed(), "{}", counters(&cache));
+                assert!(scan.continuation_ticket().is_none());
+                assert!(!scan.snapshots.is_empty());
+                assert!(cache.cursor_slot_free());
+                // An ordinary page's completion is never a continuation EOF.
+                let fixture = ScanRoot::new(80);
+                let ordinary = Arc::new(SharedCache::default());
+                let mut index = ScanIndex::default();
+                for _ in 0..64 {
+                    let (next, scan) = page(&fixture, index, Some(Arc::clone(&ordinary)));
+                    index = next;
+                    assert!(!scan.continuation_committed());
+                    if counter(&ordinary, |c| c.jobs_certified) > 0 {
+                        return;
+                    }
+                }
+                panic!("{}", counters(&ordinary));
+            }
+            assert!(!scan.continuation_committed());
+            assert!(scan.continuation_ticket().is_some(), "{}", counters(&cache));
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+/// c22 Q1 (ruling (a) KEEP): a continuation page still runs
+/// `codex_parent_step_start`, so it may read a parent sample outside its
+/// job's files. That read is charged to the page's singleton budget (one
+/// `SAMPLE_READ_BYTES` per opened parent) and happens once per traversal
+/// (the matched mark), so later continuation pages read and charge nothing.
+/// On the same pages, with the production continuation side pass, the four
+/// §7 exclusions hold: no G7 charge or side-due write (the side ledger and
+/// requests are unchanged), no proof hook job, and no sweep (an orphan side
+/// record and the sweep cursor stay).
+#[test]
+fn continuation_parent_reads_are_page_charged_and_exclusions_hold() {
+    use std::os::unix::fs::MetadataExt;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::with_sessions(&[(SESSION, 80), (SESSION_B, 2)]);
+    let parent = fixture.file(SESSION_B);
+    let cache = Arc::new(SharedCache::default());
+    let index_path = Path::new("/tmp/ottto-s1b-q1-index.json");
+    with_test_limits(2048, 1024, 64, || {
+        let (mut index, members) = paused_singleton(&fixture, &cache);
+        assert!(!members.contains(&local_index_key(&parent)));
+        let traversal = index.traversal.as_ref().expect("the job's traversal");
+        assert!(crate::snapshots::codex_frozen_census_valid(traversal));
+        assert!(
+            traversal
+                .codex_rollout_paths
+                .iter()
+                .any(|path| path.ends_with(&format!("{SESSION_B}.jsonl"))),
+            "the parent is in the frozen census"
+        );
+        // A G7/side-due candidate on the owed parent, and a sweep orphan.
+        let meta = fs::metadata(&parent).unwrap();
+        index.codex_parent_side_requests.insert(
+            local_index_key(&parent),
+            crate::snapshots::SideRequest {
+                dev_ino: (meta.dev(), meta.ino()),
+                needed_extent: meta.len() + 1,
+                state: crate::snapshots::SideRequestState::Live,
+                state_extent: meta.len(),
+                state_ctime: (meta.ctime(), meta.ctime_nsec()),
+                attempt_extent: 0,
+                attempt_ctime: (0, 0),
+                attempts: 0,
+                not_before_unix_seconds: 0,
+                needed_charge: None,
+                referenced_epoch: 0,
+            },
+        );
+        let orphan = "/nonexistent/s1b-q1-orphan-rollout.jsonl".to_owned();
+        index.codex_parent_side.insert(
+            orphan.clone(),
+            serde_json::from_value(serde_json::json!({
+                "verdict": { "kind": "settled" },
+                "seal": {
+                    "stamp": {
+                        "length": 4096,
+                        "device": 1,
+                        "inode": 2,
+                        "modified": [1_792_540_800, 5],
+                        "changed": [1_792_540_800, 5],
+                    },
+                    "scope": crate::snapshots::codex_parent_side_scope().0,
+                    "sample_len": 4096,
+                    "head_sha256": "a".repeat(64),
+                    "boundary_sha256": "b".repeat(64),
+                    "verified_unix_seconds": 1_792_540_800,
+                    "sealed_unix_seconds": 1_792_540_800,
+                },
+                "parsed": {
+                    "dev": 1,
+                    "ino": 2,
+                    "extent": 4096,
+                    "modified": [1_792_540_800, 5],
+                    "changed": [1_792_540_800, 5],
+                },
+                "generation": 1,
+                "referenced_epoch": 0,
+            }))
+            .unwrap(),
+        );
+        for page in 0..64 {
+            // The parent stays owed: referenced, with no completed ledger.
+            index
+                .codex_parent_ownership_refs
+                .insert(SESSION_B.to_owned());
+            index.codex_parent_ownership_ledgers.remove(SESSION_B);
+            let pass = crate::snapshots::begin_codex_continuation_side_pass(
+                &cache, index_path, &mut index,
+            );
+            assert_eq!(pass.kind, crate::snapshots::CodexPageKind::Continuation);
+            let ledger = cache.side_ledger().len();
+            let requests = serde_json::to_value(&index.codex_parent_side_requests).unwrap();
+            let side = serde_json::to_value(&index.codex_parent_side).unwrap();
+            let sweep = index.codex_parent_side_cursor.clone();
+            let matches = crate::snapshots::codex_parent_step_start_matches_for_test();
+            let mut scan = OwnedSourceScan::new_continuation(
+                std::slice::from_ref(&fixture.root),
+                index,
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                10,
+                false,
+                true,
+                &members,
+                Some(secs(600)),
+            )
+            .with_sampled_acquisition(Arc::clone(&cache), Scope("cursor-fixture".into()))
+            .with_codex_side_pass(Some(pass));
+            let mut singleton = 0;
+            let mut steps = 0;
+            let result = loop {
+                assert!(steps < 100_000, "page {page}: the page did not finish");
+                steps += 1;
+                match scan.step(None) {
+                    OwnedSourceScanStep::Pending(next) => {
+                        singleton = next.codex_page.singleton_decoded;
+                        scan = next;
+                    }
+                    OwnedSourceScanStep::Complete {
+                        index: next, scan, ..
+                    } => {
+                        index = next;
+                        break scan;
+                    }
+                }
+            };
+            let matched = crate::snapshots::codex_parent_step_start_matches_for_test() - matches;
+            if page == 0 {
+                // One matching pass, one opened parent: one sample read,
+                // charged to this page's singleton budget.
+                assert_eq!(matched, 1, "{}", counters(&cache));
+                assert_eq!(singleton, SAMPLE_READ_BYTES, "{}", counters(&cache));
+            } else {
+                // The traversal is matched: no further read or charge.
+                assert_eq!(matched, 0, "page {page}: {}", counters(&cache));
+                assert_eq!(singleton, 0, "page {page}: {}", counters(&cache));
+            }
+            // The four exclusions, on the same page.
+            assert_eq!(cache.side_ledger().len(), ledger, "page {page}: no G7");
+            assert_eq!(
+                serde_json::to_value(&index.codex_parent_side_requests).unwrap(),
+                requests,
+                "page {page}: no G7 or side-due write"
+            );
+            assert_eq!(
+                cache.proof_suspended_for_test(),
+                None,
+                "page {page}: no hook job"
+            );
+            assert_eq!(
+                serde_json::to_value(&index.codex_parent_side).unwrap(),
+                side,
+                "page {page}: not swept"
+            );
+            assert!(index.codex_parent_side.contains_key(&orphan));
+            assert_eq!(index.codex_parent_side_cursor, sweep, "page {page}");
+            if counter(&cache, |c| c.jobs_certified) > 0 {
+                assert!(page > 0, "the job spans continuation pages");
+                assert!(result.continuation_committed(), "{}", counters(&cache));
+                return;
+            }
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+// Stage 1 integration (StateMissing, under c22's K5/K6/K7/W9 rulings): the
+// leased deadline and capture lines, the no-save continuation contract and a
+// worker panic's next ordinary page. New tests only.
+
+/// K6: the deadline is a continuation page's only: an ordinary budget
+/// ignores it, and a continuation budget stops at it without exhausting its
+/// bytes (so `continuation_ticket`, which still requires exhaustion, mints
+/// nothing).
+#[test]
+fn continuation_deadline_stops_only_continuation_budgets() {
+    let t0 = std::time::Instant::now();
+    let limits = Limits::current();
+    let mut ordinary = PageBudget::default();
+    ordinary.set_continuation_deadline(t0);
+    let mut continuation = PageBudget::default();
+    continuation.set_continuation(Some(secs(600)));
+    with_pace_clock(Some(t0 + secs(1)), false, || {
+        assert!(
+            !continuation.deadline_passed(),
+            "no deadline: today's budget"
+        );
+        assert!(!ordinary.deadline_passed(), "an ordinary page has none");
+        assert!(!ordinary.cursor_stop(limits));
+        assert_eq!(
+            ordinary.cursor_stop(limits),
+            ordinary.cursor_exhausted(limits)
+        );
+    });
+    continuation.set_continuation_deadline(t0 + secs(5));
+    with_pace_clock(Some(t0 + secs(4)), false, || {
+        assert!(!continuation.cursor_stop(limits), "before the deadline");
+    });
+    with_pace_clock(Some(t0 + secs(5)), false, || {
+        assert!(continuation.deadline_passed());
+        assert!(continuation.cursor_stop(limits));
+        assert!(!continuation.cursor_exhausted(limits), "bytes remain");
+    });
+}
+
+/// K6 through the scan: a continuation page past its deadline pauses the
+/// job at the next `step()` return, still paused and resumable, and mints no
+/// ticket (`PausedContended`); the same page without a deadline keeps the
+/// attempt accelerated.
+#[test]
+fn continuation_page_past_its_deadline_pauses_without_a_ticket() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (index, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        let paused = counter(&cache, |c| c.jobs_paused);
+        let (_, scan) = with_pace_clock(Some(t0 + secs(10)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |scan| scan.codex_page.set_continuation_deadline(t0 + secs(5)),
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_none(),
+            "a deadline pause mints no ticket: {}",
+            counters(&cache)
+        );
+        assert!(!scan.continuation_committed());
+        assert!(scan.snapshots.is_empty());
+        assert_eq!(counter(&cache, |c| c.jobs_paused), paused + 1);
+        assert_eq!(cache.paused_members_for_test(), Some(members.clone()));
+        let (_, scan) = with_pace_clock(Some(t0 + secs(11)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                index,
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            scan.continuation_ticket().is_some(),
+            "no deadline: the byte budget, as today: {}",
+            counters(&cache)
+        );
+    });
+}
+
+/// K5.2/K5.3: Codex holds no request-identity permit (`OtherSource`), so
+/// the ordinary Codex page never captures; neither does its continuation,
+/// in tests too, where capture would otherwise be the default.
+#[test]
+fn continuation_capture_mode_is_the_ordinary_codex_mode() {
+    use crate::snapshots::claude_request_identity::{
+        capture_by_default, permit_when, CohortDenial, COHORT_HINT_TOKEN,
+    };
+    for token in [None, Some(COHORT_HINT_TOKEN)] {
+        assert!(matches!(
+            permit_when(true, SnapshotSource::Codex, token),
+            Err(CohortDenial::OtherSource)
+        ));
+    }
+    let ordinary_capture =
+        permit_when(true, SnapshotSource::Codex, Some(COHORT_HINT_TOKEN)).is_ok();
+    assert!(
+        capture_by_default(),
+        "the default the continuation must not use"
+    );
+    let fixture = ScanRoot::new(4);
+    let scan = OwnedSourceScan::new_continuation(
+        std::slice::from_ref(&fixture.root),
+        ScanIndex::default(),
+        NOW,
+        BACKFILL_WINDOW_DAYS,
+        10,
+        false,
+        true,
+        &BTreeSet::new(),
+        None,
+    );
+    assert_eq!(scan.claude_request_identity_capture, ordinary_capture);
+}
+
+/// K7: continuation pages save nothing, so every page starts from the index
+/// the minting ordinary page saved. Pages from that same unsaved index still
+/// page the job to its one commit, which publishes the unpaged read's output;
+/// every page before it publishes nothing (K7.1) and re-pauses with a ticket.
+#[test]
+fn continuation_pages_from_the_unsaved_index_reach_the_commit() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let unpaged = fingerprints(&unpaged);
+    let cache = Arc::new(SharedCache::default());
+    with_test_limits(2048, 1024, 64, || {
+        let (saved, members) = paused_singleton(&fixture, &cache);
+        for page in 0..64 {
+            let (_, scan) = continuation_page_in(
+                &fixture.root,
+                saved.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            );
+            if scan.continuation_committed() {
+                assert!(!unpaged.is_empty());
+                assert_eq!(fingerprints(&scan), unpaged, "page {page}");
+                assert!(cache.cursor_slot_free());
+                return;
+            }
+            assert!(scan.snapshots.is_empty(), "page {page}: K7.1");
+            assert!(
+                scan.continuation_ticket().is_some(),
+                "page {page}: {}",
+                counters(&cache)
+            );
+        }
+        panic!("{}", counters(&cache));
+    });
+}
+
+/// K7.2 proof: a continuation page whose job's member changed under it is
+/// not saved. The ordinary pages that follow, from the index the minting
+/// page saved, re-derive the whole debt: they publish exactly the unpaged
+/// read of the changed file, nothing older and nothing lost. Pace clock: the
+/// changed revision waits the guard's equivalent first (deferred, not lost).
+#[test]
+fn a_dropped_continuation_end_leaves_its_debt_to_the_ordinary_pass() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let path = fixture.file(SESSION);
+    let cache = Arc::new(SharedCache::default());
+    let t0 = std::time::Instant::now();
+    with_test_limits(2048, 1024, 64, || {
+        let (saved, members) =
+            with_pace_clock(Some(t0), false, || paused_singleton(&fixture, &cache));
+        // Rewrite one byte of the already-read prefix in place, and grow.
+        let bytes = fs::read(&path).unwrap();
+        let at = bytes
+            .windows(8)
+            .position(|window| window == b"10:00:00")
+            .unwrap()
+            + 7;
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .write_all_at(b"1", at as u64)
+            .unwrap();
+        fixture.append(SESSION, &token_line(81));
+        let (_, dropped) = with_pace_clock(Some(t0 + secs(1)), false, || {
+            continuation_page_in(
+                &fixture.root,
+                saved.clone(),
+                &cache,
+                "cursor-fixture",
+                NOW,
+                BACKFILL_WINDOW_DAYS,
+                true,
+                &members,
+                Some(secs(600)),
+                |_| {},
+            )
+        });
+        assert!(
+            dropped.snapshots.is_empty() || dropped.continuation_committed(),
+            "K7.1: no snapshots before EOF"
+        );
+        assert!(
+            !dropped.continuation_committed(),
+            "a changed member never commits"
+        );
+        drop(dropped);
+        let (_, current) = page(&fixture, ScanIndex::default(), None);
+        let expected = fingerprints(&current);
+        assert!(!expected.is_empty());
+        let mut index = saved;
+        let mut published = BTreeSet::new();
+        for page_number in 0..64u64 {
+            let (next, scan) = with_pace_clock(Some(t0 + secs(3_601 + page_number)), false, || {
+                page(&fixture, index, Some(Arc::clone(&cache)))
+            });
+            index = next;
+            published.extend(fingerprints(&scan));
+            if expected.iter().all(|f| published.contains(f)) {
+                assert!(
+                    published.iter().all(|f| expected.contains(f)),
+                    "nothing older than the changed file: {}",
+                    counters(&cache)
+                );
+                return;
+            }
+        }
+        panic!("the debt was lost: {}", counters(&cache));
+    });
+}
+
+/// W9: a continuation worker that panicked while holding the cursor, the
+/// retained or the side-ledger lock leaves the process running. The next
+/// ordinary pages neither panic nor deadlock, and fail closed: they publish
+/// nothing the unpaged read would not, and a poisoned cursor admits nothing.
+#[test]
+fn ordinary_pages_after_a_worker_panic_under_any_lock_fail_closed() {
+    use crate::snapshots::sampled_scan::TestLock;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let fixture = ScanRoot::new(80);
+    let (_, unpaged) = page(&fixture, ScanIndex::default(), None);
+    let unpaged = fingerprints(&unpaged);
+    for lock in [TestLock::Cursor, TestLock::Retained, TestLock::Side] {
+        let cache = Arc::new(SharedCache::default());
+        with_test_limits(2048, 1024, 64, || {
+            let (mut index, _) = paused_singleton(&fixture, &cache);
+            let worker = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .name("ottto-codex-continuation".to_string())
+                    .spawn_scoped(scope, || cache.panic_under_lock_for_test(lock))
+                    .unwrap()
+                    .join()
+            });
+            assert!(worker.is_err(), "{lock:?}: the panic stays on the worker");
+            assert!(!cursor_held() && !crate::snapshots::sampled_scan::retained_held());
+            for _ in 0..8 {
+                let (next, scan) = page(&fixture, index, Some(Arc::clone(&cache)));
+                index = next;
+                assert!(
+                    fingerprints(&scan).iter().all(|f| unpaged.contains(f)),
+                    "{lock:?}"
+                );
+                if lock == TestLock::Cursor {
+                    assert!(cache.cursor_reserve(1).is_none(), "admits nothing");
+                }
+            }
+        });
+    }
 }

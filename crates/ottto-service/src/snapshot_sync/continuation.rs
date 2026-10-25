@@ -10,28 +10,33 @@
 //! their own deadline, so other sources' due work and network cadence are
 //! unchanged, and an EOF completion does not move the ordinary Codex cadence.
 //!
-//! Everything here is compiled in and **inert**: [`ENABLED`] is false, the
-//! cursor side is the [`NoCursorContinuation`] stub (c22 owns hunks A/D/E and
-//! the guard, after #660), and the platform gates are [`NoPlatformSignals`],
-//! whose unknown state falls back to the ordinary cadence. Inert parity rests
-//! on that constant gate and on review: the loop takes today's path before it
-//! reaches anything in this module.
+//! Everything here is compiled in and **inert**: [`ENABLED`] is false, and the
+//! platform gates are [`NoPlatformSignals`], whose unknown state falls back to
+//! the ordinary cadence. The cursor side is [`CodexContinuation`], the adapter
+//! over c22's `CodexCursorPort` (hunks A/D/E and the guard). It runs each page
+//! on a short-lived, explicitly joined worker (Option W) and is reached only
+//! behind [`ENABLED`]. Inert parity rests on that constant gate and on review:
+//! the loop takes today's path before it reaches anything in this module.
 
 use super::live_snapshot_retry::LiveRetryOwner;
 use super::{
     complete_continuation_eof, enabled_snapshot_sources, load_snapshot_device_credentials,
-    snapshot_api_base_url, snapshot_upload_destination_namespace, source_upload_backoff_remaining,
-    with_source_cadence, ScanIndex, SnapshotSource, SourcePreparation, SourceScanResult,
-    SNAPSHOT_SYNC_LOCK,
+    run_continuation_scan, safe_error, snapshot_api_base_url,
+    snapshot_upload_destination_namespace, source_upload_backoff_remaining, with_source_cadence,
+    ContinuationInputs, ContinuationScan, ScanIndex, SnapshotSource, SourcePreparation,
+    SourceScanResult, SNAPSHOT_SYNC_INTERVAL, SNAPSHOT_SYNC_LOCK,
 };
 use crate::adaptive_collector::{ContinuationPacing, SourceCadence};
+use crate::snapshots::sampled_scan::SharedCache;
+use crate::snapshots::{CodexCursorPort, CodexCursorTicket};
 use crate::LocalDaemon;
 use anyhow::{anyhow, Result};
 use ottto_core::LocalDeviceBinding;
 use ottto_protocol::LocalCollectorState;
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard, TryLockError};
 use std::time::{Duration, Instant};
 use zeroize::Zeroize;
 
@@ -53,17 +58,56 @@ pub(super) const PACING: ContinuationPacing = ContinuationPacing {
 pub(super) const CONTENTION_WORK: Duration = Duration::from_secs(20);
 
 /// c22's cursor binding for one paused attempt (hunk A: namespace, rotation
-/// key, `stamp_open`, `started`), minted only at the single pause site. The
-/// scaffolding carries no cursor fields, and nothing in production mints one.
-#[allow(dead_code)] // Minted only by c22's pause site (hunk A, after #660).
-pub(super) struct CursorTicket {
-    _sealed: (),
+/// key, `stamp_open`, `started`), minted only at the single pause site, with
+/// the same-cycle inputs its continuation pages run on.
+pub(super) struct CursorTicket(CursorParts);
+
+enum CursorParts {
+    Codex(Box<CodexPage>),
+    /// A stand-in for the fakes, which have no cursor state.
+    #[cfg(test)]
+    Synthetic,
 }
 
-/// What c22's EOF page hands back: the committed job's preparation, index and
-/// scan. StateMissing settles it ([`Host::complete_eof`] or
-/// [`Host::defer_eof`]) through the same completion an ordinary Codex finish
-/// runs. Nothing in production builds one until c22 wires its EOF page.
+/// One paused attempt's ticket and the inputs its pages run on (`None` until
+/// the minting finish attaches them; a ticket without inputs is never ready).
+/// The inputs move to the worker with the page and back with a re-pause,
+/// never copied (K2).
+struct CodexPage {
+    cursor: CodexCursorTicket,
+    inputs: Option<ContinuationInputs>,
+}
+
+crate::heap_layout_bound::fields!(CodexPage; cursor, inputs);
+
+impl CursorTicket {
+    fn codex(cursor: CodexCursorTicket) -> Self {
+        Self(CursorParts::Codex(Box::new(CodexPage {
+            cursor,
+            inputs: None,
+        })))
+    }
+
+    #[cfg(test)]
+    pub(super) fn synthetic() -> Self {
+        Self(CursorParts::Synthetic)
+    }
+
+    /// Process-retained bytes of this ticket's boxed page and inputs, through
+    /// the existing requested-layout admission (`None`: unknown, refused).
+    fn retained_bound(&self, limit: usize) -> Option<usize> {
+        match &self.0 {
+            CursorParts::Codex(page) => crate::heap_layout_bound::bound(page, limit),
+            #[cfg(test)]
+            CursorParts::Synthetic => Some(0),
+        }
+    }
+}
+
+/// What an EOF page hands back: the committed job's preparation, index and
+/// scan, built only from a page whose `continuation_committed()` is true.
+/// StateMissing settles it ([`Host::complete_eof`] or [`Host::defer_eof`])
+/// through the same completion an ordinary Codex finish runs.
 pub(super) struct EofCompletion(EofParts);
 
 enum EofParts {
@@ -74,13 +118,9 @@ enum EofParts {
 }
 
 impl EofCompletion {
-    #[allow(dead_code)] // Built only by c22's EOF page (after #660).
-    pub(super) fn new(
-        preparation: SourcePreparation,
-        index: ScanIndex,
-        scan: SourceScanResult,
-    ) -> Self {
-        Self(EofParts::Scan(Box::new((preparation, index, scan))))
+    /// The committed page's parts, moved from the worker unchanged.
+    fn of(parts: Box<(SourcePreparation, ScanIndex, SourceScanResult)>) -> Self {
+        Self(EofParts::Scan(parts))
     }
 
     #[cfg(test)]
@@ -99,58 +139,97 @@ impl EofCompletion {
 }
 
 /// The permission a finished Codex page leaves for the next continuation page.
-/// Both bindings are fixed-size digests, so the slot never allocates.
+/// Both bindings are fixed-size digests; the cursor side's boxed inputs are
+/// charged as process-retained memory ([`retained_bound`]).
 pub(super) struct ContinuationTicket {
     /// SHA-256 of the destination namespace the asking page ran under.
     destination: [u8; 32],
     /// The scan authority the asking page ran under ([`current_authority`]).
     authority: [u8; 32],
     cursor: CursorTicket,
+    /// The fixed lifetime of the cached inputs (K2/P-1, [`ticket_lifetime`]):
+    /// valid from `issued` until before `expires`. A page or EOF upload
+    /// outside it never runs, and nothing renews it.
+    issued: Instant,
+    expires: Instant,
 }
 
-/// How one continuation page ended on the cursor side.
-#[allow(dead_code)] // Only c22's cursor port (after #660) produces these outside tests.
+impl ContinuationTicket {
+    /// Attach the minting page's inputs (K2: moved from its preparation).
+    pub(super) fn with_inputs(mut self, inputs: ContinuationInputs) -> Self {
+        match &mut self.cursor.0 {
+            CursorParts::Codex(page) => page.inputs = Some(inputs),
+            #[cfg(test)]
+            CursorParts::Synthetic => drop(inputs),
+        }
+        self
+    }
+
+    fn valid_at(&self, now: Instant) -> bool {
+        lifetime_holds(self.issued, self.expires, now)
+    }
+}
+
+/// `issued <= now < expires` on the monotonic clock: an earlier `now` (a
+/// rolled-back test clock) is as invalid as a later one.
+fn lifetime_holds(issued: Instant, expires: Instant, now: Instant) -> bool {
+    issued <= now && now < expires
+}
+
+/// How one continuation page ended on the cursor side. No end but `Eof`
+/// saves anything (K7): the job's progress lives in the cursor slot.
 pub(super) enum PageEnd {
-    /// Saved `Ok` with its C15 callback, and the job paused again at its byte
-    /// budget: the only end that may ask for another page.
+    /// The job paused again at its byte budget: the only end that may ask for
+    /// another page.
     Paused(CursorTicket),
-    /// Saved at a deadline or contention boundary, without exhausting the byte
-    /// budget. No ticket or continuation request may follow this pause.
+    /// Paused at the deadline, without exhausting the byte budget. No ticket
+    /// or continuation request may follow this pause.
     PausedContended,
-    /// The resume was refused or not `Active`; the job's paths stay pending for
-    /// the next ordinary pass.
+    /// The resume was refused or not `Active`, the page refused before any
+    /// read (K1.1), or it ended with debt or a disclosure it does not save
+    /// (K7.2); the job's paths stay pending for the next ordinary pass.
     Deferred,
     /// The job reached EOF and committed; its upload obligation remains.
     Eof(EofCompletion),
     /// The lease was lost, the page was dropped, or the process is stopping.
     /// Nothing was saved.
+    #[allow(dead_code)] // No stop signal reaches a page yet; the fakes use it.
     Cancelled,
-    /// A local error, such as a failed or CAS-refused save.
+    /// A local error (a failed load, a worker that panicked or could not
+    /// keep its invariants). Nothing was saved.
     Failed(anyhow::Error),
 }
 
-/// The cursor side of a continuation page. c22 implements it after #660.
-/// None of its methods may make a network call; the EOF completion upload is
-/// StateMissing's ([`Host::complete_eof`]).
+/// The cursor side of a continuation page ([`CodexContinuation`] over c22's
+/// `CodexCursorPort`). None of its methods may make a network call; the EOF
+/// completion upload is StateMissing's ([`Host::complete_eof`]).
 pub(super) trait CursorContinuation {
     /// Hunk A: the ticket of a just-finished ordinary Codex page, only for a
     /// valid, budget-exhausted, accelerated pause.
     fn ticket_for(&self, scan: &SourceScanResult) -> Option<CursorTicket>;
     /// `cursor_continuation_ready`: under the cursor lock, with no IO.
     fn ready(&mut self, ticket: &CursorTicket) -> bool;
-    /// One resume-only page: `ScanIndex::load`, then
-    /// `begin_codex_side_pass(Continuation)`, the scan, the C15 mark, the save
-    /// and `note_codex_side_saved` on `Ok`. Once `deadline` passes, the page
-    /// stops at the next record boundary, saves and returns `PausedContended`.
-    /// The deadline is cooperative: the in-progress record, local finalization
-    /// and scheduling may overrun it; it is not a hard lock-hold bound.
-    fn page(&mut self, ticket: CursorTicket, deadline: Instant) -> PageEnd;
+    /// One resume-only page: `ScanIndex::load`, the continuation-local
+    /// prepare (K1), `begin_codex_continuation_side_pass`, the scan. No end
+    /// but EOF saves (K7); an EOF page's index and scan go to the parent's
+    /// unchanged finish. Once `deadline` passes, the job pauses at the next
+    /// `step()` return without a ticket (`PausedContended`, K6). The deadline
+    /// is cooperative: the in-progress record, C14, local finalization and
+    /// scheduling may overrun it; it is not a hard lock-hold bound.
+    /// `ordinary_equivalent` is the interval this page stands for (K4).
+    fn page(
+        &mut self,
+        ticket: CursorTicket,
+        deadline: Instant,
+        ordinary_equivalent: Option<Duration>,
+    ) -> PageEnd;
 }
 
-/// The production cursor side until c22's hunks land: there is never a
-/// continuation.
+/// A cursor side with no continuation, for the inert controls.
+#[cfg(test)]
 pub(super) struct NoCursorContinuation;
 
+#[cfg(test)]
 impl CursorContinuation for NoCursorContinuation {
     fn ticket_for(&self, _scan: &SourceScanResult) -> Option<CursorTicket> {
         None
@@ -158,7 +237,12 @@ impl CursorContinuation for NoCursorContinuation {
     fn ready(&mut self, _ticket: &CursorTicket) -> bool {
         false
     }
-    fn page(&mut self, _ticket: CursorTicket, _deadline: Instant) -> PageEnd {
+    fn page(
+        &mut self,
+        _ticket: CursorTicket,
+        _deadline: Instant,
+        _ordinary_equivalent: Option<Duration>,
+    ) -> PageEnd {
         PageEnd::Deferred
     }
 }
@@ -236,6 +320,8 @@ pub(super) enum Skip {
     Destination,
     NotReady,
     CadenceUnavailable,
+    /// The ticket's fixed lifetime ended (K2/P-1).
+    Expired,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +355,7 @@ impl Outcome {
                 Skip::Destination => "skipped_destination",
                 Skip::NotReady => "skipped_not_ready",
                 Skip::CadenceUnavailable => "skipped_cadence_unavailable",
+                Skip::Expired => "skipped_expired",
             },
             Outcome::Paused => "paused",
             Outcome::PausedContended => "paused_contended",
@@ -346,6 +433,12 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         // An ordinary pass cleared it after the check above.
         return Outcome::Skipped(Skip::NoTicket);
     };
+    // K2/P-1: the cached inputs' fixed lifetime, before anything reads them.
+    // An expired ticket is dropped here (its context zeroized), so a later
+    // earlier-looking clock cannot revive it.
+    if !ticket.valid_at(now) {
+        return skip(host, Skip::Expired);
+    }
     // The same authority an ordinary pass checks at every prepare and finish:
     // device, machine, Codex grant, endpoint and account.
     if host.authority() != Some(ticket.authority) {
@@ -361,13 +454,21 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
         destination,
         authority,
         cursor,
+        issued,
+        expires,
     } = ticket;
     let deadline = started
         .checked_add(CONTENTION_WORK)
         .map_or(ordinary_deadline, |limit| limit.min(ordinary_deadline));
+    // K4: computed here, on this thread, under the lock and after every
+    // recheck above; `None` (unknown) ends the attempt's acceleration.
+    let backoff = host.upload_backoff();
+    let ordinary = host
+        .cadence(|cadence| ordinary_equivalent(cadence, backoff))
+        .flatten();
     let qos = RestoreQos(gates);
     let ended = if port.ready(&cursor) {
-        Some(port.page(cursor, deadline))
+        Some(port.page(cursor, deadline, ordinary))
     } else {
         None
     };
@@ -375,21 +476,32 @@ pub(super) fn run_page<H: Host, P: CursorContinuation, G: PlatformGates>(
     drop(qos);
     let (outcome, next) = match ended {
         None => (Outcome::Skipped(Skip::NotReady), None),
+        // The same lifetime: a page never renews it.
         Some(PageEnd::Paused(cursor)) => (
             Outcome::Paused,
             Some(ContinuationTicket {
                 destination,
                 authority,
                 cursor,
+                issued,
+                expires,
             }),
         ),
         Some(PageEnd::PausedContended) => (Outcome::PausedContended, None),
         Some(PageEnd::Deferred) => (Outcome::Deferred, None),
         Some(PageEnd::Cancelled) => (Outcome::Cancelled, None),
-        Some(PageEnd::Failed(_)) => (Outcome::Failed, None),
-        Some(PageEnd::Eof(completion)) => {
-            (settle_eof(host, completion, destination, authority), None)
+        Some(PageEnd::Failed(error)) => {
+            // The sync phase only, never raw details (as an ordinary pass).
+            eprintln!(
+                "local snapshot continuation page failed: {}",
+                safe_error(&error)
+            );
+            (Outcome::Failed, None)
         }
+        Some(PageEnd::Eof(completion)) => (
+            settle_eof(host, completion, destination, authority, (issued, expires)),
+            None,
+        ),
     };
     let finished = host.now();
     let outcome = match next {
@@ -444,9 +556,11 @@ impl<G: PlatformGates> Drop for RestoreQos<'_, G> {
     }
 }
 
-/// Settle an EOF page, still under the sync lock. The authority, destination
-/// and upload backoff are rechecked before the first network call of the page.
-/// The completion upload is attempted once and never retried here.
+/// Settle an EOF page, still under the sync lock. The ticket's lifetime
+/// (K2/P-1), the authority, destination and upload backoff are rechecked
+/// immediately before the first network call of the page. The completion
+/// upload is attempted once and never retried here. A deferred completion can
+/// cost a re-read of the whole attempt, not one page.
 ///
 /// An EOF completion is not an ordinary scan: the unchanged
 /// `finish_sync_source` records its cadence as one, so the ordinary Codex clock
@@ -458,8 +572,11 @@ fn settle_eof<H: Host>(
     completion: EofCompletion,
     destination: [u8; 32],
     authority: [u8; 32],
+    (issued, expires): (Instant, Instant),
 ) -> Outcome {
-    let current = !host.upload_backoff()
+    let now = host.now();
+    let current = lifetime_holds(issued, expires, now)
+        && !host.upload_backoff()
         && host.destination() == Some(destination)
         && host.authority() == Some(authority);
     let clock = if current {
@@ -616,20 +733,85 @@ pub(super) fn current_authority(
 }
 
 /// The ticket an ordinary Codex page's pause minted, bound to the destination
-/// and the scan authority it ran under. Read before the finish consumes the
-/// scan. No authority, no ticket.
+/// and the scan authority it ran under, with its fixed lifetime. Read before
+/// the finish consumes the scan. No authority or no finite lifetime, no
+/// ticket (K2: no attribution-bearing continuation without a bound).
 pub(super) fn ordinary_ticket(
     port: &impl CursorContinuation,
     scan: &SourceScanResult,
     destination_namespace: &str,
     authority: Option<[u8; 32]>,
+    lifetime: Option<(Instant, Instant)>,
 ) -> Option<ContinuationTicket> {
     let authority = authority?;
+    let (issued, expires) = lifetime?;
     port.ticket_for(scan).map(|cursor| ContinuationTicket {
         destination: destination_digest(destination_namespace),
         authority,
         cursor,
+        issued,
+        expires,
     })
+}
+
+/// K2/P-1: the fixed lifetime of a ticket's cached inputs, from the start of
+/// the ordinary Codex prepare whose policy they carry (`prepared_at`). It
+/// ends at the earliest of the capture-time `ordinary_interval`, the Hot
+/// floor and the loop interval. The next ordinary prepare starts no earlier
+/// than the loop interval after this cycle ends, so the bound never reaches
+/// it; the activity hint carries no key or grant expiry to add. Fixed here:
+/// no later page, failure, backoff or missing prepare extends it. `None` (no
+/// prepare time, a zero bound or an overflow) mints no ticket.
+pub(super) fn lifetime_from(
+    prepared_at: Option<Instant>,
+    cadence: &SourceCadence,
+) -> Option<(Instant, Instant)> {
+    let prepared_at = prepared_at?;
+    let bound = cadence
+        .ordinary_interval()
+        .min(cadence.hot_min_interval())
+        .min(SNAPSHOT_SYNC_INTERVAL);
+    if bound.is_zero() {
+        return None;
+    }
+    Some((prepared_at, prepared_at.checked_add(bound)?))
+}
+
+/// [`lifetime_from`] on Codex's production cadence.
+pub(super) fn ticket_lifetime(prepared_at: Option<Instant>) -> Option<(Instant, Instant)> {
+    with_source_cadence(SnapshotSource::Codex, |cadence| {
+        lifetime_from(prepared_at, cadence)
+    })
+    .flatten()
+}
+
+/// An ordinary Codex prepare is starting: whatever it learns (a disable, a
+/// new key epoch, another destination) replaces the cached inputs, so the
+/// older ticket and its context are dropped now. Only while enabled.
+pub(super) fn invalidate_on_ordinary_prepare() {
+    if ENABLED {
+        clear(&mut CodexCadence, &TICKET);
+    }
+}
+
+/// K2 accounting: the held ticket's inputs (context inventories, strings,
+/// cached policy) as process-retained memory, outside every rotation frame.
+/// `None` (unsupported layout, unknown size) makes the rotation discard it.
+pub(super) fn retained_bound(limit: usize) -> Option<usize> {
+    if !ENABLED {
+        return Some(0);
+    }
+    match lock_slot(&TICKET).as_ref() {
+        None => Some(0),
+        Some(ticket) => ticket.cursor.retained_bound(limit),
+    }
+}
+
+/// The rotation refused the retained charge: drop the ticket and its inputs.
+pub(super) fn discard_retained() {
+    if ENABLED {
+        clear(&mut CodexCadence, &TICKET);
+    }
 }
 
 /// After an ordinary Codex finish, under `SNAPSHOT_SYNC_LOCK`: keep the page's
@@ -762,10 +944,18 @@ impl Host for ProductionHost<'_> {
     }
     fn defer_eof(&mut self, completion: EofCompletion) {
         // Nothing is uploaded or saved: the committed job stays owed to the
-        // next ordinary pass, which re-reads at most this page.
+        // next ordinary pass. Its attempt was consumed when it committed, so
+        // this can cost a re-read of the whole attempt; it is counted.
+        let deferred = EOF_DEFERRALS.fetch_add(1, Ordering::Relaxed) + 1;
+        eprintln!(
+            "local snapshot continuation EOF deferred to the ordinary pass ({deferred} so far); its attempt may be re-read"
+        );
         drop(completion);
     }
 }
+
+/// EOF completions deferred to the ordinary pass, process lifetime.
+static EOF_DEFERRALS: AtomicU64 = AtomicU64::new(0);
 
 /// One production continuation page, or a skip while inert.
 pub(super) fn run_production_page(
@@ -785,7 +975,7 @@ pub(super) fn run_production_page(
             daemon,
             retry,
         },
-        &mut NoCursorContinuation,
+        &mut CodexContinuation::new(&daemon.transcript_cache, home, support_dir),
         &mut NoPlatformSignals,
         SNAPSHOT_SYNC_LOCK.get_or_init(|| Mutex::new(())),
         &TICKET,
@@ -793,18 +983,263 @@ pub(super) fn run_production_page(
     )
 }
 
-/// Ordinary-page coverage for c22's same-revision guard and E2 accounting.
-/// `None` means no acceleration: neither elapsed continuation work nor an
-/// observed loop maximum proves when the unaccelerated attempt would finish.
-/// Ordinary cycles and lock waits have no enforced duration bound, and policy
-/// can change during an attempt. This scaffold supplies no coverage witness,
-/// so it always refuses coverage, regardless of ENABLED or cadence history.
-/// A future integration must preserve the actual ordinary eligibility clock
-/// through final admission, including directive and upload-backoff changes,
-/// before returning any credit here.
-#[allow(dead_code)] // c22's guard (after #660) is the first production caller.
-pub(super) fn production_ordinary_equivalent() -> Option<Duration> {
-    None
+/// K4 (amended W12): the interval a continuation page stands for in c22's
+/// E2 accounting (`max(elapsed, ordinary)`), read once per page by
+/// [`run_page`] under the sync lock after its rechecks, so only while
+/// enabled. It is exactly `ordinary_interval`: the tier floor, or the failure
+/// backoff while failing, lengthened only by the server directive, with no
+/// clamp, floor or historical estimate. It is a per-page lower bound of what
+/// ordinary scheduling would have taken, not coverage: cycle and lock delays
+/// are unbounded, so acceleration can start a later same-revision attempt
+/// earlier by that overhead (accepted Stage 1 design; the guard is c22's).
+/// `None` (unknown) while disabled, failing or in upload backoff; an
+/// unreadable cadence reaches the caller as `None` too.
+pub(super) fn ordinary_equivalent(
+    cadence: &SourceCadence,
+    upload_backoff: bool,
+) -> Option<Duration> {
+    let state = cadence.state();
+    if upload_backoff
+        || state == LocalCollectorState::Failing
+        || state == LocalCollectorState::Disabled
+    {
+        return None;
+    }
+    Some(cadence.ordinary_interval())
+}
+
+/// Set after any continuation worker panicked, or broke a page invariant
+/// (W8): no further ticket is minted or readied for the process lifetime.
+static WORKER_LATCHED: AtomicBool = AtomicBool::new(false);
+
+/// W1: everything that crosses the worker join, and the port the worker
+/// builds, is `Send` by its own types (checked here at compile time; no
+/// `unsafe impl`). The closure itself is bounded by [`on_worker`].
+const _: () = {
+    const fn assert_send<T: Send>() {}
+    assert_send::<PageEnd>();
+    assert_send::<EofCompletion>();
+    assert_send::<WorkerEnd>();
+    assert_send::<CodexPage>();
+    assert_send::<ContinuationInputs>();
+    assert_send::<SourcePreparation>();
+    assert_send::<ScanIndex>();
+    assert_send::<SourceScanResult>();
+    assert_send::<CodexCursorPort>();
+    assert_send::<CodexCursorTicket>();
+    assert_send::<Arc<SharedCache>>();
+};
+
+/// Why the worker did not return its page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerFailure {
+    /// The thread could not start: nothing ran.
+    Spawn,
+    /// The page panicked on the worker.
+    Panicked,
+}
+
+/// Option W: run `body` on one named, short-lived worker and join it
+/// explicitly, so a panic comes back as `Err` instead of unwinding the
+/// caller. The caller holds `SNAPSHOT_SYNC_LOCK` through the join and touches
+/// nothing else; the worker never takes that lock and makes no callback,
+/// channel send or wait toward the caller (W2). Thread-locals are the
+/// worker's own: none is inherited (W10).
+fn on_worker<T: Send>(body: impl FnOnce() -> T + Send) -> std::result::Result<T, WorkerFailure> {
+    std::thread::scope(|scope| {
+        let worker = std::thread::Builder::new()
+            .name("ottto-codex-continuation".to_string())
+            .spawn_scoped(scope, body)
+            .map_err(|_| WorkerFailure::Spawn)?;
+        worker.join().map_err(|_| WorkerFailure::Panicked)
+    })
+}
+
+/// W11: the worker's own background QoS, applied inside the worker. The
+/// platform call is hunk F, still under its parent decision, so production
+/// answers `Unknown` and the page reads nothing.
+fn no_worker_qos() -> PlatformState {
+    PlatformState::Unknown
+}
+
+/// How the page ended on the worker. Everything here is `Send` (W1) and
+/// moves to the parent; nothing is shared.
+enum WorkerEnd {
+    /// The job paused again at its byte budget: the page, with its new
+    /// cursor ticket and the inputs it moved to the worker.
+    Paused(Box<CodexPage>),
+    /// Completed without committing and without a ticket (K6 deadline, or
+    /// debt / a disclosure that is not saved, K7.2).
+    Stopped,
+    /// Nothing ran past the worker's own gates (QoS, members).
+    Deferred,
+    /// The continuation-local prepare refused before any read (K1.1).
+    Refused(&'static str),
+    /// The job committed: the parts the parent's unchanged finish uploads.
+    Eof(Box<(SourcePreparation, ScanIndex, SourceScanResult)>),
+    /// A non-EOF end produced snapshots (K7.1): nothing is saved, and the
+    /// worker latch is set.
+    Unexpected,
+    Failed(anyhow::Error),
+}
+
+/// The production cursor side: c22's `CodexCursorPort`, with each page run
+/// on an explicitly joined worker (Option W, W1–W12).
+pub(super) struct CodexContinuation<'a> {
+    cache: &'a Arc<SharedCache>,
+    home: &'a Path,
+    support_dir: &'a Path,
+    /// The worker's QoS (W11): [`no_worker_qos`] in production.
+    worker_qos: fn() -> PlatformState,
+    /// The process latch (W8): [`WORKER_LATCHED`] in production.
+    latch: &'static AtomicBool,
+}
+
+impl<'a> CodexContinuation<'a> {
+    pub(super) fn new(cache: &'a Arc<SharedCache>, home: &'a Path, support_dir: &'a Path) -> Self {
+        Self {
+            cache,
+            home,
+            support_dir,
+            worker_qos: no_worker_qos,
+            latch: &WORKER_LATCHED,
+        }
+    }
+
+    fn port(&self) -> CodexCursorPort {
+        CodexCursorPort::new(Arc::clone(self.cache))
+    }
+
+    fn latched(&self) -> bool {
+        self.latch.load(Ordering::SeqCst)
+    }
+}
+
+impl CursorContinuation for CodexContinuation<'_> {
+    fn ticket_for(&self, scan: &SourceScanResult) -> Option<CursorTicket> {
+        if self.latched() {
+            return None;
+        }
+        self.port().ticket_for(scan).map(CursorTicket::codex)
+    }
+
+    fn ready(&mut self, ticket: &CursorTicket) -> bool {
+        match &ticket.0 {
+            CursorParts::Codex(page) => {
+                !self.latched() && page.inputs.is_some() && self.port().ready(&page.cursor)
+            }
+            #[cfg(test)]
+            CursorParts::Synthetic => false,
+        }
+    }
+
+    fn page(
+        &mut self,
+        ticket: CursorTicket,
+        deadline: Instant,
+        ordinary_equivalent: Option<Duration>,
+    ) -> PageEnd {
+        // One variant outside tests: the fakes' synthetic ticket is the other.
+        #[allow(clippy::infallible_destructuring_match)]
+        let page = match ticket.0 {
+            CursorParts::Codex(page) => page,
+            #[cfg(test)]
+            CursorParts::Synthetic => return PageEnd::Deferred,
+        };
+        let (cache, home, support_dir, qos) =
+            (self.cache, self.home, self.support_dir, self.worker_qos);
+        let ended = on_worker(move || {
+            page_on_worker(
+                cache,
+                home,
+                support_dir,
+                page,
+                deadline,
+                ordinary_equivalent,
+                qos,
+            )
+        });
+        page_end(ended, deadline, Instant::now(), self.latch)
+    }
+}
+
+/// The parent's mapping of a joined worker's end (W7, W8, K7).
+fn page_end(
+    ended: std::result::Result<WorkerEnd, WorkerFailure>,
+    deadline: Instant,
+    now: Instant,
+    latch: &AtomicBool,
+) -> PageEnd {
+    match ended {
+        // Nothing ran: the ticket and request are cleared by `run_page`.
+        Err(WorkerFailure::Spawn) => PageEnd::Deferred,
+        Err(WorkerFailure::Panicked) => {
+            latch.store(true, Ordering::SeqCst);
+            PageEnd::Failed(anyhow!("continuation worker panicked"))
+        }
+        Ok(WorkerEnd::Paused(page)) => PageEnd::Paused(CursorTicket(CursorParts::Codex(page))),
+        Ok(WorkerEnd::Stopped) if now >= deadline => PageEnd::PausedContended,
+        Ok(WorkerEnd::Stopped | WorkerEnd::Deferred) => PageEnd::Deferred,
+        Ok(WorkerEnd::Refused(label)) => {
+            eprintln!("local snapshot continuation page refused: {label}");
+            PageEnd::Deferred
+        }
+        Ok(WorkerEnd::Eof(parts)) => PageEnd::Eof(EofCompletion::of(parts)),
+        Ok(WorkerEnd::Unexpected) => {
+            latch.store(true, Ordering::SeqCst);
+            PageEnd::Failed(anyhow!("continuation page produced snapshots before EOF"))
+        }
+        Ok(WorkerEnd::Failed(error)) => PageEnd::Failed(error),
+    }
+}
+
+/// The whole page on one thread (W4): the worker's QoS, the members, then
+/// the continuation-local prepare and scan. Nothing is saved before EOF (K7),
+/// and no cursor credit, lease or active file outlives this call (W3).
+#[allow(clippy::too_many_arguments)]
+fn page_on_worker(
+    cache: &Arc<SharedCache>,
+    home: &Path,
+    support_dir: &Path,
+    mut page: Box<CodexPage>,
+    deadline: Instant,
+    ordinary_equivalent: Option<Duration>,
+    qos: fn() -> PlatformState,
+) -> WorkerEnd {
+    if qos() != PlatformState::Allowed {
+        return WorkerEnd::Deferred;
+    }
+    let Some(members) = CodexCursorPort::new(Arc::clone(cache)).members(&page.cursor) else {
+        return WorkerEnd::Deferred;
+    };
+    let Some(inputs) = page.inputs.as_mut() else {
+        return WorkerEnd::Deferred;
+    };
+    match run_continuation_scan(
+        home,
+        support_dir,
+        cache,
+        inputs,
+        &members,
+        ordinary_equivalent,
+        deadline,
+    ) {
+        Err(error) => WorkerEnd::Failed(error),
+        Ok(ContinuationScan::Refused(reason)) => WorkerEnd::Refused(reason.label()),
+        Ok(ContinuationScan::StepRefused) => WorkerEnd::Deferred,
+        Ok(ContinuationScan::Committed(parts)) => WorkerEnd::Eof(parts),
+        Ok(ContinuationScan::Uncommitted { snapshots, .. }) if snapshots != 0 => {
+            WorkerEnd::Unexpected
+        }
+        Ok(ContinuationScan::Uncommitted {
+            ticket: Some(cursor),
+            ..
+        }) => {
+            page.cursor = cursor;
+            WorkerEnd::Paused(page)
+        }
+        Ok(ContinuationScan::Uncommitted { ticket: None, .. }) => WorkerEnd::Stopped,
+    }
 }
 
 #[cfg(test)]

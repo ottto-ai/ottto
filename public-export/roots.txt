@@ -2,6 +2,7 @@
 .cargo/audit.toml
 .github/dependabot.yml
 .github/workflows/ci.yml
+.github/workflows/linux-tests.yml
 .github/workflows/macos-stable-release.yml
 AGENTS.md
 CLAUDE.md

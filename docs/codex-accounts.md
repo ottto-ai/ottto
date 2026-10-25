@@ -175,7 +175,11 @@ The daemon reads each Codex home's limits on its own schedule (every 5 minutes
 for a home in use on this Mac, every 15 minutes otherwise, and once a day for a
 second home signed into the same login) and every status read serves the saved
 reading. Each scheduled read is one `codex app-server` run, which also lets
-Codex renew that home's sign-in.
+Codex renew that home's sign-in. The scheduler sleeps until the next home is
+due, and at most a minute, whether or not any app is in front, so a login
+switched outside the daemon is read within a minute (and at least a minute
+after that home's previous read). Between wakes it reuses what it derived from
+the settings, credential and saved files while they are unchanged.
 
 "Background limit refresh" turns these scheduled reads off for every Codex home
 on this Mac at once, the default home included. It is on until the owner
@@ -188,8 +192,9 @@ daemon cannot read counts as off.
 While it is off:
 
 - the scheduler reads no home: no `codex app-server` run, no running-process
-  scan, and no once-a-day same-login read. The setting is read on every tick
-  and checked again under the settings lock right before each read;
+  scan, and no once-a-day same-login read. The setting is read on every
+  scheduler wake and checked again under the settings lock right before each
+  read; switching it back on wakes the scheduler at once;
 - a person's **Refresh limits**, setup and sign-in checks still read;
 - saved readings are still served and age as usual: shown stale after 30
   minutes, and not shown past the last-known cap;

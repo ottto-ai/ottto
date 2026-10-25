@@ -941,6 +941,7 @@ fn proven_from(result: ChildResult) -> CodexParentPrefixProof {
 /// parent, an unsigned record between matches, and a boundary-buffer
 /// overflow (count-only in job mode, the same 64-record rule).
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
     let root = temp_root("job-parity");
     let parent = rollout(&root, PARENT);
@@ -1067,6 +1068,7 @@ fn a_job_decides_as_the_complete_ledger_and_its_proof_reparses_as_main() {
 /// is `ParentExhausted`, while P's complete ledger (which saw the row) would
 /// decide it: the job never decides on a withheld row.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_straddling_parent_row_pushes_no_signature() {
     let root = temp_root("job-straddle");
     let parent = rollout(&root, PARENT);
@@ -1114,6 +1116,7 @@ fn a_straddling_parent_row_pushes_no_signature() {
 
 /// No overshoot: a run reads only while one more step fits its budget.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_job_reads_nothing_past_its_budget() {
     let root = temp_root("job-budget");
     let parent = rollout(&root, PARENT);
@@ -1590,6 +1593,7 @@ use sampled_scan::codex_cursor::{Limits, PageBudget};
 /// is `Proven` as the complete ledger decides. Its install then reparses C
 /// exactly as the complete ledger does. Nothing is left in the holder.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn the_hook_proves_an_owed_child_end_to_end() {
     let mut scene = Scene::owed("hook-e2e");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1632,6 +1636,7 @@ fn the_hook_proves_an_owed_child_end_to_end() {
 /// revalidates its held FDs and P's locate, and finishes it. The entry
 /// stays `Owed` in between.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_budget_short_page_suspends_and_the_next_page_finishes() {
     let mut scene = Scene::owed("hook-suspend");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1662,6 +1667,7 @@ fn a_budget_short_page_suspends_and_the_next_page_finishes() {
 /// with a `Census` wake; the next visit does not retry it until the census
 /// fingerprint (or C) changes. Then P is back and the job proves C.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn an_identity_refusal_waits_for_its_census_wake() {
     let mut scene = Scene::owed("hook-identity");
     let parent_key = local_index_key(&scene.parent);
@@ -1769,6 +1775,7 @@ fn a_memory_dropped_job_backs_off_and_rereads_nothing_inside_the_backoff() {
 /// no proof (nothing read, the entry untouched) and finishes none: a held
 /// job steps fd-only and suspends again. A saved pass finishes it.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_closed_side_gate_starts_and_finishes_no_proof() {
     let limits = Limits::current();
     let index_path = Path::new(HOOK_INDEX);
@@ -1826,6 +1833,7 @@ fn a_closed_side_gate_starts_and_finishes_no_proof() {
 /// held while the job was suspended), the finish records the same and owes
 /// nothing either.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_lineage_held_parent_is_refused_before_its_read_and_owes_nothing() {
     let held = SideVerdict::Held {
         lineage: true,
@@ -1919,6 +1927,7 @@ fn the_stage1_gates_exclude_a_continuation_page_whatever_its_gate() {
 /// the orphan and finishes the job. (The ordinary save outage, where a held
 /// job steps fd-only and suspends, is `a_closed_side_gate_...`.)
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_continuation_page_steps_no_held_job_and_sweeps_nothing() {
     let mut scene = Scene::owed("hook-continuation");
     let cache = Arc::new(sampled_scan::SharedCache::default());
@@ -1964,6 +1973,7 @@ fn a_continuation_page_steps_no_held_job_and_sweeps_nothing() {
 /// each off (`MemoryRefused` + `Backoff`). Repeated retirements therefore
 /// pace the restarts: one per backoff, none inside it, never proven.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn main_retirements_pace_the_restarts() {
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-retired");
@@ -2034,6 +2044,7 @@ fn an_invalid_page_whose_suspend_fails_backs_off_and_publishes_nothing() {
 /// side-allowed page. On a save-outage page its ring entry waits (no
 /// backoff write, nothing read); the next open page drains it.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_save_outage_page_leaves_the_retired_record_for_an_open_gate() {
     let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
     let mut scene = Scene::owed("hook-retired-outage");
@@ -2604,6 +2615,7 @@ fn a_proven_entry_ends_its_childs_hold_memo() {
 /// verdict and generation; an unchanged expired seal does not wake it, and
 /// the backoff still governs.
 #[test]
+#[cfg_attr(not(target_os = "macos"), ignore = "needs macOS heap layout")]
 fn a_parent_held_wake_fires_on_a_refreshed_seal_only() {
     let now = sampled_scan::now_seconds();
     let mut scene = Scene::owed("hook-seal-refresh");
@@ -2769,4 +2781,129 @@ fn a_hold_built_before_its_proof_is_not_memoized() {
             watcher_hint: false,
         });
     assert!(!awaits(&scene, &parsed), "an unavailable census");
+}
+
+/// Stage 1 S1-a (§7 exclusion row 31, owner default NO): the proof hook
+/// never spends a continuation page's leftover. On the production
+/// continuation pass (`begin_codex_continuation_side_pass`) with a leftover
+/// that proves the owed child on an ordinary page, nothing is read, no job
+/// starts and the entry is unchanged; the ordinary control spends it.
+#[test]
+fn the_proof_hook_spends_no_continuation_leftover() {
+    let leftover = codex_proof_step_reserve() + SIDE_FENCE_READ_BYTES;
+    let mut scene = Scene::owed("hook-continuation-leftover");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    assert_eq!(continuation.kind, CodexPageKind::Continuation);
+    let owed = scene.owed_entry();
+    for _ in 0..3 {
+        let mut page = page_with(leftover);
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            page.singleton_remaining(Limits::current()),
+            leftover,
+            "the leftover is untouched"
+        );
+        assert_eq!(cache.proof_suspended_for_test(), None, "no job");
+        assert_eq!(scene.owed_entry(), owed);
+    }
+    let mut page = page_with(leftover);
+    scene.hook(&cache, &mut page);
+    assert!(
+        page.singleton_remaining(Limits::current()) < leftover,
+        "the ordinary page spends it"
+    );
+}
+
+/// Stage 1 S1-a (§7 exclusion row 32): the side sweep never runs on the
+/// production continuation pass, with no held job either: an orphan side
+/// record and the sweep cursor stay as they are until an ordinary page.
+#[test]
+fn the_side_sweep_never_runs_on_a_continuation_pass() {
+    let mut scene = Scene::owed("hook-continuation-sweep");
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let continuation =
+        begin_codex_continuation_side_pass(&cache, Path::new(HOOK_INDEX), &mut scene.index);
+    let orphan = "/nonexistent/s1a-orphan-rollout.jsonl".to_owned();
+    let record = scene.index.codex_parent_side[&local_index_key(&scene.parent)].clone();
+    scene.index.codex_parent_side.insert(orphan.clone(), record);
+    let side = serde_json::to_value(&scene.index.codex_parent_side).unwrap();
+    let cursor = scene.index.codex_parent_side_cursor.clone();
+    for _ in 0..3 {
+        let mut page = PageBudget::default();
+        scene.hook_in(
+            &cache,
+            &continuation,
+            &mut page,
+            sampled_scan::now_seconds(),
+        );
+        assert_eq!(
+            serde_json::to_value(&scene.index.codex_parent_side).unwrap(),
+            side,
+            "not swept"
+        );
+        assert_eq!(scene.index.codex_parent_side_cursor, cursor);
+    }
+    scene.hook(&cache, &mut PageBudget::default());
+    assert!(!scene.index.codex_parent_side.contains_key(&orphan));
+}
+
+/// Stage 1 C-1 (a), (b), (d), on the production passes: a continuation
+/// page's C14 (non-EOF, or refused after C14: it charges nothing and never
+/// saves) neither closes nor opens the outage gate. After a saved ordinary
+/// pass the next ordinary pass may charge and due side work; after a failed
+/// ordinary save it stays gated.
+#[test]
+fn a_continuation_pass_neither_closes_nor_opens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    for ordinary_saved in [true, false] {
+        let cache = Arc::new(sampled_scan::SharedCache::default());
+        let mut index = ScanIndex::default();
+        assert!(
+            begin_codex_side_pass(&cache, index_path, &mut index)
+                .gate
+                .side_allowed
+        );
+        if ordinary_saved {
+            let mark = codex_side_save_mark(&cache, index_path);
+            note_codex_side_pass_saved(&cache, index_path, false, mark);
+        }
+        for _ in 0..3 {
+            let continuation = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+            assert_eq!(continuation.kind, CodexPageKind::Continuation);
+            assert_eq!(continuation.gate.side_allowed, ordinary_saved);
+            assert!(!continuation.side_charge_allowed() && !continuation.side_due_allowed());
+        }
+        let next = begin_codex_side_pass(&cache, index_path, &mut index);
+        assert_eq!(next.gate.side_allowed, ordinary_saved, "the next ordinary");
+        assert_eq!(next.side_charge_allowed(), ordinary_saved);
+        assert_eq!(next.side_due_allowed(), ordinary_saved);
+    }
+}
+
+/// Stage 1 C-1 (c): the EOF continuation page's full save (C15, `full`,
+/// mark read before it) is what reopens a gate a failed ordinary save
+/// closed.
+#[test]
+fn an_eof_continuation_save_reopens_the_side_gate() {
+    let index_path = Path::new(HOOK_INDEX);
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let mut index = ScanIndex::default();
+    begin_codex_side_pass(&cache, index_path, &mut index);
+    // That ordinary save failed: no C15.
+    let eof = begin_codex_continuation_side_pass(&cache, index_path, &mut index);
+    assert!(!eof.gate.side_allowed);
+    let mark = codex_side_save_mark(&cache, index_path);
+    note_codex_side_pass_saved(&cache, index_path, true, mark);
+    assert!(
+        begin_codex_side_pass(&cache, index_path, &mut index)
+            .gate
+            .side_allowed
+    );
 }
