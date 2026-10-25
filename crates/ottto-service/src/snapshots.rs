@@ -26503,6 +26503,17 @@ impl OwnedSourceScan {
                         .map(resolve_codex_identity)
                 };
                 let codex_counting_v2 = parser.accumulator.codex_counting_v2();
+                let evicted_legacy_v2_owner = parser
+                    .accumulator
+                    .source_session_id
+                    .as_deref()
+                    .filter(|_| {
+                        codex_counting_version::evicted_legacy_selected_v2(
+                            &parser.accumulator,
+                            index,
+                        )
+                    })
+                    .map(codex_protected_owner);
                 // Counting receipts reach the scan's local diagnostics only
                 // when this parse finishes: once per finished active file (a
                 // joined group is one).
@@ -26514,10 +26525,7 @@ impl OwnedSourceScan {
                         .map(|counting| {
                             let mut receipts = census.codex_counting_v2.clone().unwrap_or_default();
                             counting.fold_receipts(&mut receipts);
-                            if codex_counting_version::evicted_legacy_selected_v2(
-                                &parser.accumulator,
-                                index,
-                            ) {
+                            if evicted_legacy_v2_owner.is_some() {
                                 receipts.legacy_to_v2_after_tombstone_eviction = receipts
                                     .legacy_to_v2_after_tombstone_eviction
                                     .saturating_add(1);
@@ -26624,6 +26632,9 @@ impl OwnedSourceScan {
                     pending!();
                 }
                 if let Some(receipts) = codex_counting_receipts {
+                    if let Some(owner) = evicted_legacy_v2_owner {
+                        codex_counting_version::note_evicted_legacy_v2_selection(index, &owner);
+                    }
                     census.codex_counting_v2 = Some(receipts);
                 }
                 let target_finalization_credit = if comparison_target {

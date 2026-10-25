@@ -1052,10 +1052,13 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
     owners.push("private-invalid-owner".into());
     owners.push(format!("{:064x}", limit + 9));
     let mut value = serde_json::to_value(ScanIndex::default()).unwrap();
-    value["codex_counting_evicted_legacy"] = json!(owners);
+    value["codex_counting_evicted_legacy"] = json!(owners
+        .iter()
+        .map(|owner| json!({"owner":owner,"selected_v2":false}))
+        .collect::<Vec<_>>());
     let derived: ScanIndex = serde_json::from_value(value.clone()).unwrap();
     let expected = (10..limit + 10)
-        .map(|n| format!("{n:064x}"))
+        .map(|n| json!({"owner":format!("{n:064x}"),"selected_v2":false}))
         .collect::<Vec<_>>();
     assert_eq!(
         serde_json::to_value(&derived.codex_counting_evicted_legacy).unwrap(),
@@ -1122,4 +1125,36 @@ fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
         &accumulator,
         &index
     ));
+}
+
+#[test]
+fn preexisting_v2_ack_does_not_absorb_an_unobserved_legacy_eviction_flip() {
+    let acked = acked_original(true, true);
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let owner = codex_protected_owner(SESSION);
+    let mut index = acked.previous.clone();
+    // A mixed owner view has a V2-marked live entry and a Legacy tombstone.
+    // Removing the latter loses its LAST Legacy carrier, despite the V2 ACK.
+    evict_counting_owner(&mut index, &owner, None);
+    write(&acked.original, &rows(200));
+    let result = scan_at(&acked.root, &mut index, "2026-10-07T23:00:00Z");
+    let receipts = result.codex_counting_v2.as_deref().unwrap();
+    assert_eq!(receipts.v2_sessions, 1);
+    assert_eq!(receipts.legacy_to_v2_after_tombstone_eviction, 1);
+    let record = serde_json::to_value(&index.codex_counting_evicted_legacy).unwrap();
+    assert_eq!(record[0]["selected_v2"], true);
+    // Persist the observation with a partial checkpoint retaining the old V2
+    // ACK. Only after that observation may the old ACK absorb correlation.
+    let mut checkpoint =
+        index.committable_subset(&acked.previous, &BTreeSet::new(), &BTreeMap::new());
+    checkpoint.save(&acked.index_path).unwrap();
+    let mut loaded = ScanIndex::load(&acked.index_path).unwrap();
+    assert_eq!(
+        serde_json::to_value(&loaded.codex_counting_evicted_legacy).unwrap(),
+        record
+    );
+    let owners = BTreeMap::from([(local_index_key(&acked.original), owner)]);
+    codex_counting_version::prepare_moved_evidence(&mut loaded, &owners, false);
+    assert!(loaded.codex_counting_evicted_legacy.is_empty());
+    fs::remove_dir_all(acked.root).unwrap();
 }

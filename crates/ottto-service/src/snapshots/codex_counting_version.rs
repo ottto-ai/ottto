@@ -128,10 +128,19 @@ pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
 /// by version selection, reuse, ACK, settlement or dedup logic.
 pub(super) const MAX_EVICTED_LEGACY_OWNERS: usize = 256;
 
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct EvictedLegacyOwner {
+    owner: String,
+    /// A pre-existing V2 ACK cannot absorb an eviction before its resulting
+    /// V2 selection has been observed. Diagnostic only, never version evidence.
+    #[serde(default)]
+    selected_v2: bool,
+}
+
 #[derive(Clone, Debug, Default, Serialize)]
 #[serde(transparent)]
 pub(super) struct EvictedLegacyOwners {
-    owners: VecDeque<String>,
+    owners: VecDeque<EvictedLegacyOwner>,
 }
 
 impl EvictedLegacyOwners {
@@ -139,22 +148,23 @@ impl EvictedLegacyOwners {
         self.owners.is_empty()
     }
 
-    fn remember(&mut self, owner: String) {
-        self.owners.retain(|previous| previous != &owner);
+    fn remember(&mut self, record: EvictedLegacyOwner) {
+        self.owners
+            .retain(|previous| previous.owner != record.owner);
         if self.owners.len() == MAX_EVICTED_LEGACY_OWNERS {
             self.owners.pop_front();
         }
-        self.owners.push_back(owner);
+        self.owners.push_back(record);
     }
 }
 
 impl<'de> Deserialize<'de> for EvictedLegacyOwners {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = VecDeque::<String>::deserialize(deserializer)?;
+        let raw = VecDeque::<EvictedLegacyOwner>::deserialize(deserializer)?;
         let mut recent = Self::default();
-        for owner in raw {
-            if valid_codex_protected_owner(&owner) {
-                recent.remember(owner);
+        for record in raw {
+            if valid_codex_protected_owner(&record.owner) {
+                recent.remember(record);
             }
         }
         Ok(recent)
@@ -169,13 +179,36 @@ pub(super) fn evicted_legacy_selected_v2(
     accumulator: &SnapshotAccumulator,
     index: &ScanIndex,
 ) -> bool {
-    accumulator.codex_counting_v2()
-        && accumulator.source_session_id.as_deref().is_some_and(|id| {
-            index
-                .codex_counting_evicted_legacy
-                .owners
-                .contains(&codex_protected_owner(id))
-        })
+    if !accumulator.codex_counting_v2() {
+        return false;
+    }
+    let Some(id) = accumulator.source_session_id.as_deref() else {
+        return false;
+    };
+    let owner = codex_protected_owner(id);
+    index
+        .codex_counting_evicted_legacy
+        .owners
+        .iter()
+        .any(|record| record.owner == owner)
+}
+
+/// Called only when the finished-parse receipt is published, after side-read
+/// and failure exits. Keep the record until committed evidence or FIFO aging
+/// absorbs it; the bit survives partial checkpoints and restart.
+pub(super) fn note_evicted_legacy_v2_selection(index: &mut ScanIndex, owner: &str) {
+    if let Some(record) = index
+        .codex_counting_evicted_legacy
+        .owners
+        .iter_mut()
+        .find(|record| record.owner == owner)
+    {
+        record.selected_v2 = true;
+    }
+}
+
+fn absorbs_evicted_legacy(evidence: AckEvidence, selected_v2: bool) -> bool {
+    evidence == AckEvidence::LegacyAcked || (selected_v2 && evidence == AckEvidence::V2Marked)
 }
 
 /// Drain this scan's eviction events and add current gauges to the existing
@@ -325,7 +358,12 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
                 // inventory pass below; any remaining Legacy carrier also
                 // forces Legacy through ordinary evidence selection, so only
                 // loss of the last carrier can produce a V2 flip receipt.
-                index.codex_counting_evicted_legacy.remember(owner);
+                index
+                    .codex_counting_evicted_legacy
+                    .remember(EvictedLegacyOwner {
+                        owner,
+                        selected_v2: false,
+                    });
             }
         }
         eprintln!(
@@ -467,8 +505,9 @@ pub(super) fn prepare_moved_evidence(
     absence_coverage: bool,
 ) {
     index.codex_counting_moved_evidence.clear();
-    // A loaded, committed carrier of either version absorbs the diagnostic record.
-    // Do not remove it on a mere selection or absence: the move may span scans.
+    // A restored Legacy carrier absorbs the loss. A V2 carrier absorbs it
+    // only after a V2 selection was observed: that carrier might predate the
+    // evicted Legacy tombstone. Absence alone proves no flip was observed.
     if !index.codex_counting_evicted_legacy.is_empty() {
         // Borrow at most 256 hashes. Walk the index once, rather than once per
         // diagnostic record, and allocate no copied owner strings.
@@ -476,19 +515,22 @@ pub(super) fn prepare_moved_evidence(
             .codex_counting_evicted_legacy
             .owners
             .iter()
-            .collect::<BTreeSet<_>>();
+            .map(|record| (&record.owner, record.selected_v2))
+            .collect::<BTreeMap<_, _>>();
         // A restored tombstone is also a committed carrier. Absorb before
         // absence GC below: losing that restored carrier to GC later must not
         // be attributed to the earlier cap eviction.
-        pending.retain(|owner| {
+        pending.retain(|owner, selected_v2| {
             !index
                 .codex_counting_tombstones
                 .get(*owner)
-                .is_some_and(|tombstone| tombstone.evidence != AckEvidence::None)
+                .is_some_and(|tombstone| absorbs_evicted_legacy(tombstone.evidence, *selected_v2))
         });
         for entry in index.files.values() {
-            if AckEvidence::of_view(Some(entry)) != AckEvidence::None {
-                if let Some(owner) = proven_owner(entry) {
+            if let Some(owner) = proven_owner(entry) {
+                if pending.get(owner).is_some_and(|selected_v2| {
+                    absorbs_evicted_legacy(AckEvidence::of_view(Some(entry)), *selected_v2)
+                }) {
                     pending.remove(owner);
                 }
             }
@@ -497,7 +539,7 @@ pub(super) fn prepare_moved_evidence(
             .codex_counting_evicted_legacy
             .owners
             .iter()
-            .map(|owner| !pending.contains(owner))
+            .map(|record| !pending.contains_key(&record.owner))
             .collect::<Vec<_>>();
         drop(pending);
         let mut absorbed = absorbed.into_iter();
@@ -758,5 +800,6 @@ impl crate::heap_layout_bound::HeapLayoutBound for AckEvidence {
     }
 }
 
+crate::heap_layout_bound::fields!(EvictedLegacyOwner; owner, selected_v2);
 crate::heap_layout_bound::fields!(EvictedLegacyOwners; owners);
 crate::heap_layout_bound::fields!(CountingTombstone; evidence, retired_in, created_unix_ms);
