@@ -916,7 +916,7 @@ fn e2_membership_hash_collision_never_substitutes_for_exact_request_identity() {
     let mut view = family_membership(&items, &[0]);
     // Force an accelerator collision. The request map/set, not the hash,
     // decides ownership and side-call subtraction.
-    view[0].0 = membership_hash("other");
+    view.entries[0] = membership_hash("other") & !view.member_mask;
     assert_eq!(holders(&items, &view, "other"), Holders::None);
     assert!(!matching_members(&view, "other")
         .any(|i| items[i].claude_usage_request_ids.contains("other")));
@@ -944,12 +944,18 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         } else {
             agents.join(format!("agent-{member}.jsonl"))
         };
-        items.push(parse(
-            &path,
-            Some(t0()),
-            &index,
-            &[line(&id(member), &at(1), 10)],
-        ));
+        let lines = (member..ROWS)
+            .step_by(MEMBERS)
+            .map(|i| {
+                let request = if i < MEMBERS {
+                    id(i)
+                } else {
+                    format!("native-{i:06}")
+                };
+                line(&request, &at(1), 10)
+            })
+            .collect::<Vec<_>>();
+        items.push(parse(&path, Some(t0()), &index, &lines));
     }
     // An off-page member is parsed through the native resolver and recorded
     // through the actual census writer, rather than hand-feeding holder sets.
@@ -975,7 +981,11 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         &[off_page],
     );
     let rows = (0..ROWS)
-        .map(|i| row(&id(i), i as u64 + 1, 10))
+        .map(|i| {
+            let mut api = row(&id(i), i as u64 + 1, 10);
+            api.observed_at = at(1); // sequence is not a seconds field
+            refingerprint(api)
+        })
         .collect::<Vec<_>>();
     let read = sidecar(&rows); // canonical permissive reader, including health
     let api = api_report(&read);
@@ -1011,8 +1021,8 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         "family membership/join took {join_time:?}"
     );
     assert_eq!(
-        view.capacity() * std::mem::size_of::<(u64, usize)>(),
-        MEMBERS * 16
+        view.entries.capacity() * std::mem::size_of::<u64>(),
+        ROWS * 8
     );
     drop(view);
     let wire = |items: &[SnapshotItem]| {
@@ -1038,7 +1048,7 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
         let enrichment_time = start.elapsed();
         assert!(page
             .iter()
-            .all(|item| fold(item).telemetry.membership.is_empty()));
+            .all(|item| fold(item).telemetry.membership.entries.is_empty()));
         assert_eq!(
             page.iter().map(|item| requests(item, MATCHED)).sum::<u64>(),
             MEMBERS as u64
@@ -1078,11 +1088,11 @@ fn e2_large_family_join_and_pipeline_are_bounded_in_dark_and_enabled_modes() {
             assert_eq!(page.len(), MEMBERS);
             assert_eq!(
                 page.iter().map(|item| item.request_count).sum::<u64>(),
-                (ROWS - OFF_PAGE) as u64
+                (2 * ROWS - MEMBERS - OFF_PAGE) as u64
             );
             assert!(page
                 .iter()
-                .all(|item| item.telemetry_owned_complete == Some(true)));
+                .all(|item| item.telemetry_owned_complete == Some(false)));
         } else {
             assert_eq!(
                 wire(&page),

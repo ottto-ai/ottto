@@ -261,7 +261,7 @@ struct FoldTelemetry {
     side_calls_done: bool,
     /// One family view on its first fold only. Hashes accelerate exact request
     /// lookups; collisions are checked against the existing request sets.
-    membership: Vec<(u64, usize)>,
+    membership: FamilyMembership,
 }
 crate::heap_layout_bound::fields!(FoldTelemetry; read, complete, start_bucket, side_candidates, side_calls_done, membership);
 
@@ -590,10 +590,19 @@ fn membership_hash(request_id: &str) -> u64 {
     hash.finish()
 }
 
-/// One compact view built from the existing request sets. No request strings
-/// are copied. Attach and side-call subtraction share it; the latter consumes
-/// it before allocating candidate hashes or trace owners.
-fn family_membership(items: &[SnapshotItem], members: &[usize]) -> Vec<(u64, usize)> {
+/// A transient member index in the low bits, a hash accelerator in the rest.
+/// At 736 members this leaves 54 hash bits. Collisions only add exact lookups;
+/// they never certify membership. Eight bytes per existing request, no strings.
+#[derive(Debug, Clone, Default)]
+struct FamilyMembership {
+    entries: Vec<u64>,
+    member_mask: u64,
+}
+crate::heap_layout_bound::fields!(FamilyMembership; entries, member_mask);
+
+/// Attach and subtraction share this one view, consumed before candidate
+/// hashes and trace owners are allocated. Indices are into the unchanged page.
+fn family_membership(items: &[SnapshotItem], members: &[usize]) -> FamilyMembership {
     let count = members
         .iter()
         .map(|&index| {
@@ -606,7 +615,9 @@ fn family_membership(items: &[SnapshotItem], members: &[usize]) -> Vec<(u64, usi
                     .count()
         })
         .sum();
-    let mut view = Vec::with_capacity(count);
+    let bits = usize::BITS - items.len().saturating_sub(1).leading_zeros();
+    let member_mask = u64::MAX.checked_shr(64 - bits).unwrap_or(0);
+    let mut entries = Vec::with_capacity(count);
     for &index in members {
         let item = &items[index];
         for id in item.claude_usage_request_ids.iter().chain(
@@ -614,27 +625,31 @@ fn family_membership(items: &[SnapshotItem], members: &[usize]) -> Vec<(u64, usi
                 .keys()
                 .filter(|id| !item.claude_usage_request_ids.contains(*id)),
         ) {
-            view.push((membership_hash(id), index));
+            entries.push((membership_hash(id) & !member_mask) | index as u64);
         }
     }
-    view.sort_unstable();
-    view
+    entries.sort_unstable();
+    FamilyMembership {
+        entries,
+        member_mask,
+    }
 }
 
 fn matching_members<'a>(
-    view: &'a [(u64, usize)],
+    view: &'a FamilyMembership,
     request_id: &str,
 ) -> impl Iterator<Item = usize> + 'a {
-    let hash = membership_hash(request_id);
-    let start = view.partition_point(|&(key, _)| key < hash);
-    view[start..]
+    let hash_mask = !view.member_mask;
+    let hash = membership_hash(request_id) & hash_mask;
+    let start = view.entries.partition_point(|key| key & hash_mask < hash);
+    view.entries[start..]
         .iter()
-        .take_while(move |&&(key, _)| key == hash)
-        .map(|&(_, index)| index)
+        .take_while(move |&&key| key & hash_mask == hash)
+        .map(|&key| (key & view.member_mask) as usize)
 }
 
 /// Same-session twins share the first holder; distinct sessions are ambiguous.
-fn holders(items: &[SnapshotItem], view: &[(u64, usize)], request_id: &str) -> Holders<usize> {
+fn holders(items: &[SnapshotItem], view: &FamilyMembership, request_id: &str) -> Holders<usize> {
     let mut found = None::<usize>;
     let mut held = false;
     for index in matching_members(view, request_id) {
@@ -812,7 +827,7 @@ pub(crate) fn attach_page(items: &mut [SnapshotItem], read: &ClaudeApiEvidenceRe
                     start_bucket: start_bucket.clone(),
                     side_candidates: counts.unheld as u64,
                     side_calls_done: counts.unheld == 0,
-                    membership: Vec::new(),
+                    membership: FamilyMembership::default(),
                 };
                 if index == first {
                     fold.disclosed += disclosed;
@@ -858,9 +873,6 @@ pub(crate) fn side_calls_page(
     let mut wanted = BTreeMap::<&str, Vec<u64>>::new();
     let mut invalid = BTreeMap::<&str, u64>::new();
     for (root, members) in &families {
-        let Some(rows) = api.evidence.get(root.as_str()) else {
-            continue; // unhealthy sidecar pair: stays undone and disclosed
-        };
         let first = members
             .iter()
             .copied()
@@ -874,6 +886,9 @@ pub(crate) fn side_calls_page(
                 .telemetry
                 .membership,
         );
+        let Some(rows) = api.evidence.get(root.as_str()) else {
+            continue; // unhealthy pair: discard the view, stay undone/disclosed
+        };
         let mut family = Vec::with_capacity(rows.len());
         for row in rows {
             if matching_members(&membership, &row.request_id).any(|index| {
@@ -953,7 +968,7 @@ pub(crate) fn side_calls_page(
             let Some(target) = target else {
                 // Its member counts it when read; a named member with no
                 // transcript anywhere cannot, so that is disclosed.
-                if !fallback && owner != root && !family_census.members.contains(owner) {
+                if !fallback && owner != root.as_str() && !family_census.members.contains(owner) {
                     disclosed += 1;
                 }
                 continue;
