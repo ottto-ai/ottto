@@ -819,7 +819,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
         // replacement, without reversing the Catalog -> OUTCOMES lock order.
         let count = outcomes.get(support).map_or(0, Vec::len);
         let handoff = money::ShadowReservation::admit(count.saturating_mul(4 * MANIFEST_MAX))
-            .ok_or_else(fault)?;
+            .ok_or_else(capacity_full)?;
         let mut updates = Vec::new();
         let mut waiting = false;
         if let Some(tickets) = outcomes.get_mut(support) {
@@ -878,7 +878,7 @@ fn startup_inner(support: &Path, binding: Option<&str>, now: u64) -> Result<bool
                     .and_then(|v| n.checked_add(v.len().saturating_mul(4)))
             })
             .ok_or_else(fault)?;
-        let funds = money::ShadowReservation::admit(charge).ok_or_else(fault)?;
+        let funds = money::ShadowReservation::admit(charge).ok_or_else(capacity_full)?;
         catalog.entries = entries;
         catalog.funds.clear();
         catalog.funds.push(funds);
@@ -1070,7 +1070,7 @@ pub(super) fn add(support: &Path, m: Manifest) -> Result<()> {
     let catalog = catalogs.get_mut(support).ok_or_else(fault)?;
     if !catalog.entries.iter().any(|old| old.id == m.id) {
         let charge = serde_json::to_vec(&m)?.len().saturating_mul(4);
-        let funds = money::ShadowReservation::admit(charge).ok_or_else(fault)?;
+        let funds = money::ShadowReservation::admit(charge).ok_or_else(capacity_full)?;
         catalog.entries.push(m);
         catalog.funds.push(funds);
     }
@@ -1092,8 +1092,8 @@ pub(super) fn due(support: &Path, now: u64) -> Result<(Vec<Manifest>, money::Sha
     for m in catalog.entries.iter().filter(eligible) {
         serde_json::to_writer(&mut length, m)?;
     }
-    let funds =
-        money::ShadowReservation::admit(length.bytes.saturating_mul(4)).ok_or_else(fault)?;
+    let funds = money::ShadowReservation::admit(length.bytes.saturating_mul(4))
+        .ok_or_else(capacity_full)?;
     Ok((
         catalog.entries.iter().filter(eligible).cloned().collect(),
         funds,
@@ -1118,7 +1118,7 @@ pub(super) fn retained_progress_bodies(
     let charge = count
         .saturating_mul(1024)
         .saturating_add(if count == 0 { 0 } else { 4096 });
-    let funds = money::ShadowReservation::admit(charge).ok_or_else(fault)?;
+    let funds = money::ShadowReservation::admit(charge).ok_or_else(capacity_full)?;
     let mut bodies = BTreeMap::new();
     for e in catalog.entries.iter().flat_map(|m| &m.entities) {
         if progress.accepted_body_witnesses.get(&e.fingerprint) == Some(&e.witness)
@@ -1240,7 +1240,7 @@ pub(super) fn replay_ticket(support: &Path, mut m: Manifest, now: u64) -> Result
     let support = support.to_path_buf();
     job(move || {
         let root = dir(&support);
-        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
+        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(capacity_full)?;
         if now >= m.deadline || m.posts >= 4 || m.slot >= 3 {
             return Err(fault());
         }
@@ -1459,7 +1459,8 @@ pub(super) fn manifest(
             .snapshots
             .iter()
             .any(|item| item.cache_observations.is_some());
-    let _metadata_funds = money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(fault)?;
+    let _metadata_funds =
+        money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(capacity_full)?;
     let mut entities = Vec::new();
     let mut metadata_bytes = 0_usize;
     let mut lineage = Sha256::new();
@@ -1682,9 +1683,9 @@ pub(super) fn initial_post(
     if matches!(state, SendState::Empty) {
         // Pay before copying private metadata from the already packed request.
         // Reject an oversized manifest before allocating the serialized body.
-        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(fault)?;
+        let funds = money::ShadowReservation::admit(BODY_FUNDS).ok_or_else(capacity_full)?;
         let metadata_scratch =
-            money::ShadowReservation::admit(8 * MANIFEST_MAX).ok_or_else(fault)?;
+            money::ShadowReservation::admit(8 * MANIFEST_MAX).ok_or_else(capacity_full)?;
         let m = manifest(
             support,
             index,
@@ -1903,7 +1904,8 @@ pub(super) async fn outcomes(support: &Path) -> Result<()> {
         .remove(support)
         .unwrap_or_default();
     for ticket in tickets {
-        let _handoff = money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(fault)?;
+        let _handoff =
+            money::ShadowReservation::admit(4 * MANIFEST_MAX).ok_or_else(capacity_full)?;
         replace(
             support,
             wait(ticket)

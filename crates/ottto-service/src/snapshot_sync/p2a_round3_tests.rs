@@ -3513,8 +3513,9 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
         unknown_recovery::offline_startup(&control.support, now).unwrap(),
         "normal capacity pressure must not become a sticky global fault"
     );
-    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 17); // original + sixteen
-                                                                      // Save only real ACKs through the actual selected-index save before retiring custody.
+    // Original prepared offer plus sixteen independently captured batches.
+    assert_eq!(control.server.raw_batches.lock().unwrap().len(), 17);
+    // Save only real ACKs through the actual selected-index save before retiring custody.
     index.record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
     index.save(&control.index_path).unwrap();
     unknown_recovery::resolve_saved(&control.support, &index, &progress, now).unwrap();

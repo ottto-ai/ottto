@@ -306,7 +306,11 @@ fn poll(mut pending: PendingFinish) -> Result<()> {
             // A completed future has consumed its writer results. Independent
             // outcome tickets remain owned by the current catalog. Only an
             // interrupted future can leave an unseen durable counter.
-            pending.completed = true;
+            pending.completed = result.is_ok()
+                || result
+                    .as_ref()
+                    .err()
+                    .is_some_and(|error| error.is::<super::SnapshotEntityDeferred>());
             record_refusal(&pending.support_dir, &result);
             result
         }
