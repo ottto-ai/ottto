@@ -6620,6 +6620,11 @@ fn finish_sync_source(
     let mut actual_native_conjunction = false;
     if source == SnapshotSource::ClaudeCode {
         let evidence_started = Instant::now();
+        crate::snapshots::claude_request_identity::retain_root_accounts(
+            &mut scan_result.snapshots,
+            &index,
+            machine_id,
+        );
         let applied = try_apply_claude_local_evidence_to_scan_with_comparison(
             support_dir,
             &mut scan_result,

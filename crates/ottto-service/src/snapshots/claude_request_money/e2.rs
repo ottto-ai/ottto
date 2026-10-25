@@ -199,11 +199,20 @@ impl ClaudeEntityBody {
     }
     /// Identity can collapse an undecidable session without changing money.
     pub(crate) fn repartition(&mut self, account: AccountPartition) {
+        self.map_accounts(|_| account.clone());
+    }
+    /// Resolve provisional Unknown shares without rewriting any own org run.
+    pub(crate) fn inherit_missing(&mut self, account: AccountPartition) {
+        if account.is_some() && self.grains.keys().any(|(_, _, key)| key.is_none()) {
+            self.map_accounts(|key| key.or_else(|| account.clone()));
+        }
+    }
+    fn map_accounts(&mut self, mut place: impl FnMut(AccountPartition) -> AccountPartition) {
         let grains = std::mem::take(&mut self.grains);
-        for ((key, origin, _), grain) in grains {
+        for ((key, origin, account), grain) in grains {
             Self::merge_grain(
                 self.grains
-                    .entry((key, origin, account.clone()))
+                    .entry((key, origin, place(account)))
                     .or_default(),
                 &grain,
             );
@@ -312,7 +321,7 @@ pub(crate) struct FileFold {
     responses: u64,
     root_fallbacks: u64,
     side: ClaudeMoneyTokens,
-    side_requests: u64,
+    pub(crate) side_requests: u64,
     telemetry: FoldTelemetry,
     pub(crate) accounts: Option<Box<RequestAccounts>>,
 }
@@ -399,6 +408,8 @@ impl FileFold {
             bound,
             first_sequence,
             subagent,
+            self.money_birth,
+            SLACK,
         )));
     }
 
