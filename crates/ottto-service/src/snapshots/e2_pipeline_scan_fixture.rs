@@ -122,3 +122,10 @@ pub(crate) fn explicitly_held(
 ) -> bool {
     disposition.quarantined_source_session_ids.contains(session)
 }
+
+pub(crate) fn indexed_size(index: &ScanIndex, path: &Path) -> Option<u64> {
+    index
+        .files
+        .get(&local_index_key(path))
+        .map(|entry| entry.size_bytes)
+}

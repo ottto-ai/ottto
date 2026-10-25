@@ -1043,9 +1043,17 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
                 root_body.input_tokens, 11,
                 "trace-named side call must never fall back to root"
             );
-        } else {
+        } else if scanner.paths().contains(&root) {
             assert!(crate::snapshots::e2_pipeline_scan_fixture::explicitly_held(&p.disposition, ROOT),
                 "absent root must have an explicit hold; a partial family cannot silently cancel it");
+        } else {
+            // The one-file page read another member first: the root was not
+            // read, so nothing about it was decided. It must still be due.
+            assert_ne!(
+                crate::snapshots::e2_pipeline_scan_fixture::indexed_size(&p.index, &root),
+                Some(std::fs::metadata(&root).unwrap().len()),
+                "an unread root keeps its old extent, so its append stays due"
+            );
         }
         // An absent agent must stay due or be co-scheduled. Observe the next
         // real bounded pages; a named side call must eventually reach it.
@@ -1062,6 +1070,12 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
             .iter()
             .filter(|s| s.source_session_id == ROOT)
             .all(|s| s.input_tokens == 11));
+        assert!(
+            items
+                .iter()
+                .any(|s| s.source_session_id == ROOT && s.input_tokens == 11),
+            "the appended root must eventually publish, without the named side call"
+        );
         assert!(items.iter().any(|s| s.source_session_id==format!("{ROOT}_agent-000") && s.input_tokens==25),"off-page named agent must eventually publish its side call");
     });
 }
@@ -1127,12 +1141,27 @@ fn retry_case(conflict: bool) {
             &mut p.scan,
             &p.disposition,
         );
-        let mut failed_settlement =
-            settle_checkpointed_upload(p.index, &committed, &progress, &holds, false);
-        settle_index_after_upload(&mut failed_settlement.index, &committed, &progress);
-        let prior = c.reload(&mut failed_settlement.index);
+        // Production transport-error seam: progress is durable first, then
+        // only wholly settled files advance in the partial checkpoint.
         let progress_path = c.base.join("progress.json");
         progress.save(&progress_path).unwrap();
+        let index_path = c.base.join("scan-index.json");
+        checkpoint_partial_snapshot_index_with_comparison(
+            &p.index,
+            &committed,
+            &progress,
+            &p.scan.snapshots,
+            Some(&p.scan),
+            &holds.held_fingerprints,
+            &index_path,
+            &progress_path,
+            || Ok(()),
+            None,
+            None,
+            Some(crate::snapshots::UnsettledUploadCause::UploadError),
+        )
+        .unwrap();
+        let prior = ScanIndex::load(&index_path).unwrap();
         let mut progress = SnapshotUploadProgress::load(
             &progress_path,
             &format!("{:064x}", 99),
