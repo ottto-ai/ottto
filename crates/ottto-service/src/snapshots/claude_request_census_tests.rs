@@ -1601,7 +1601,8 @@ fn census_records_are_charged_with_the_scan_index_and_leave_entries_alone() {
         return;
     }
     // CI layout: the hash-only Codex counting-owner Option<String> adds 24
-    // inline bytes to the previous 440-byte entry. Census still adds none.
+    // inline bytes to the previous 440-byte entry. Census and Claude money
+    // births add none: births live in the ScanIndex side table.
     const SCAN_INDEX_ENTRY_BYTES: usize = 464;
     assert_eq!(
         std::mem::size_of::<ScanIndexEntry>(),

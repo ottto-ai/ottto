@@ -9,6 +9,64 @@ pub(crate) mod codex_memo_lifecycle;
 #[cfg_attr(not(test), allow(dead_code))] // first production callers are the side rows
 pub(crate) mod codex_side_lifecycle;
 
+/// Nonzero-only counters on the existing native_collection_page line.
+#[derive(Default, Serialize)]
+struct ClaudeRecordCaps {
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_half_files: u64,
+    #[serde(skip_serializing_if = "is_zero")]
+    claude_money_record_cap_hits: u64,
+}
+fn is_zero(value: &u64) -> bool {
+    *value == 0
+}
+#[cfg(not(test))]
+static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(not(test))]
+static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+thread_local! {
+    static CLAUDE_CAP_HALF: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+    static CLAUDE_CAP_HITS: std::sync::atomic::AtomicU64 = const { std::sync::atomic::AtomicU64::new(0) };
+}
+fn with_claude_record_caps<T>(
+    f: impl FnOnce(&std::sync::atomic::AtomicU64, &std::sync::atomic::AtomicU64) -> T,
+) -> T {
+    #[cfg(test)]
+    {
+        CLAUDE_CAP_HALF.with(|half| CLAUDE_CAP_HITS.with(|hits| f(half, hits)))
+    }
+    #[cfg(not(test))]
+    {
+        f(&CLAUDE_CAP_HALF, &CLAUDE_CAP_HITS)
+    }
+}
+pub(crate) fn claude_record_cap_half_file() {
+    with_claude_record_caps(|half, _| {
+        half.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+pub(crate) fn claude_record_cap_hit() {
+    with_claude_record_caps(|_, hits| {
+        hits.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    });
+}
+fn take_claude_record_caps() -> ClaudeRecordCaps {
+    with_claude_record_caps(|half, hits| ClaudeRecordCaps {
+        claude_money_record_cap_half_files: half.swap(0, std::sync::atomic::Ordering::Relaxed),
+        claude_money_record_cap_hits: hits.swap(0, std::sync::atomic::Ordering::Relaxed),
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn take_claude_record_caps_for_test() -> (u64, u64) {
+    let c = take_claude_record_caps();
+    (
+        c.claude_money_record_cap_half_files,
+        c.claude_money_record_cap_hits,
+    )
+}
+
 const SCHEMA_VERSION: u8 = 2;
 
 /// Cumulative shared-process totals, NOT events attributed to the finishing
@@ -165,9 +223,16 @@ impl Probe {
             collection: CollectionCounts,
             #[serde(flatten)]
             money: crate::snapshots::claude_request_money::e2::Counts,
+            #[serde(flatten)]
+            caps: ClaudeRecordCaps,
         }
         let counts = WithMoney {
             collection: counts,
+            caps: if source == "claude_code" {
+                take_claude_record_caps()
+            } else {
+                Default::default()
+            },
             money: if source == "claude_code" {
                 crate::snapshots::claude_request_money::e2::take_counts()
             } else {
