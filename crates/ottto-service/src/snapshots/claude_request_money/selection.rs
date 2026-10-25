@@ -669,7 +669,7 @@ mod integration_selection_regressions {
         let mut repeated = vec![item.clone()];
         finalize_synthetic(&mut index, &mut repeated);
         assert!(repeated.is_empty(), "the exact accepted body is a noop");
-        item.input_tokens = 11;
+        item.tool_usage_truncated = true;
         let corrected_body = super::super::super::snapshot_upload_body_witness(&item);
         assert_ne!(body, corrected_body);
         let mut corrected = vec![item.clone()];
