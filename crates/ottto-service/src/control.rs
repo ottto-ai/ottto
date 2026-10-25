@@ -20088,14 +20088,16 @@ for line in sys.stdin:
                 .expect("old authority remains admissible before confirmation"),
             (old_device.clone(), old_secret)
         );
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
 
         let pending = mark_pending_device_credential_guards_passed(&pending, &pending_store)
             .expect("persist pre-confirm crash boundary");
         // Once the confirm request can be sent, a lost response is ambiguous:
         // the server may already have revoked the prior generation.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
 
         let confirmed = mark_pending_device_credential_confirmed(
             &pending,
@@ -20128,7 +20130,9 @@ for line in sys.stdin:
         // local files still exist, neither snapshots nor cached OTLP admission
         // may use it across this crash cut.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
 
         assert_eq!(recover_pending_device_credential_at_startup(), Ok(true));
         assert!(pending_store.load().expect("pending cleared").is_none());
@@ -20137,7 +20141,7 @@ for line in sys.stdin:
                 .expect("promoted authority admitted"),
             (confirmed.device, candidate)
         );
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
     }
 
     #[test]
@@ -20191,7 +20195,9 @@ for line in sys.stdin:
             Some(pending.clone())
         );
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_err());
-        assert!(crate::otlp_relay::relay_admission_ready().is_err());
+        assert!(
+            crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_err()
+        );
         assert!(matches!(
             setup_run_token_for_connection(DEFAULT_API_BASE_URL, &connection),
             Err(LocalApiError::IdentityMutationInProgress)
@@ -20230,7 +20236,7 @@ for line in sys.stdin:
         // inert orphan, but without the journal it is neither discoverable nor
         // authority and the next exact journal-bound stage replaces it.
         assert!(crate::snapshot_client::load_snapshot_device_credentials().is_ok());
-        assert!(crate::otlp_relay::relay_admission_ready().is_ok());
+        assert!(crate::snapshot_client::ensure_no_incomplete_device_credential_promotion().is_ok());
     }
 
     #[test]

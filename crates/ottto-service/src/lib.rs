@@ -6562,7 +6562,7 @@ mod tests {
     fn snapshot_sync_stall_never_masks_a_blocking_failure() {
         let daemon = daemon().with_account(account("user_1", "ron@example.com"));
         daemon
-            .record_snapshot_sync_stalled(45, Some("otlp_relay"))
+            .record_snapshot_sync_stalled(45, Some("agent_status"))
             .expect("record sync stall");
         daemon
             .record_local_health_upload_failed(LocalHealthUploadFailureKind::BackendUnreachable)
