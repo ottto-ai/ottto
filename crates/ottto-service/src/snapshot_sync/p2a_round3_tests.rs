@@ -3770,11 +3770,24 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
             deferred.count, 2,
             "early dependency scope; message_only={message_only}"
         );
+        let saved = control.saved();
+        let current_scope = unknown_recovery::held_roots(&control.support, &saved)
+            .expect("current dependency evidence must admit this three-file control");
+        assert!(current_scope.roots.contains(dependent));
+        assert!(
+            !current_scope.roots.contains(unrelated),
+            "renamed request and message identities must be independent; message_only={message_only}"
+        );
+        let active = unknown_recovery::active_for_test(&control.support);
         let posts = control.server.raw_batches.lock().unwrap().clone();
         assert_eq!(
             posts.len(),
             2,
-            "only unrelated fresh work may POST; message_only={message_only}"
+            "only unrelated fresh work may POST; message_only={message_only}; retained scopes={:?}",
+            active
+                .iter()
+                .map(|m| (&m.scope.roots, m.posts, m.ack_saved))
+                .collect::<Vec<_>>()
         );
         let batch: serde_json::Value = serde_json::from_str(&posts[1]).unwrap();
         let items = batch["snapshots"].as_array().unwrap();
