@@ -307,21 +307,26 @@ pub(crate) enum HistoryDecision {
     LiteralDenied,
 }
 
-/// Indexed Claude member files present under two or more paths (path
-/// twins), by member id, with their indexed sizes. One sorted borrowed pass;
-/// only twin groups are kept.
+/// Claude member files present under two or more paths (path twins), by
+/// member id: indexed paths with their indexed sizes, plus paths this
+/// traversal observed that are not indexed yet (`None`: a first-seen twin
+/// or a new copy). One sorted borrowed pass; only twin groups are kept.
 fn claude_path_twin_groups(
     files: &BTreeMap<String, super::ScanIndexEntry>,
-) -> BTreeMap<String, Vec<(String, u64)>> {
+    observed: Option<&BTreeSet<String>>,
+) -> BTreeMap<String, Vec<(String, Option<u64>)>> {
+    let unindexed = observed
+        .into_iter()
+        .flatten()
+        .filter(|key| !files.contains_key(*key))
+        .map(|key| (key.as_str(), None));
     let mut members = files
         .iter()
-        .filter_map(|(key, entry)| {
+        .map(|(key, entry)| (key.as_str(), Some(entry.size_bytes)))
+        .chain(unindexed)
+        .filter_map(|(key, size)| {
             let member = super::claude_index_path_member_ref(std::path::Path::new(key))?;
-            Some((
-                (member.root, member.subagent_stem),
-                key.as_str(),
-                entry.size_bytes,
-            ))
+            Some(((member.root, member.subagent_stem), key, size))
         })
         .collect::<Vec<_>>();
     members.sort_unstable();
@@ -341,6 +346,25 @@ fn claude_path_twin_groups(
             (member, keys)
         })
         .collect()
+}
+
+/// Test-only synthetic physical births for staged twin probes, matching the
+/// parser's birth setter: Linux has no portable set-creation-time API.
+#[cfg(test)]
+thread_local! {
+    static STAGED_BIRTHS_FOR_TEST: std::cell::RefCell<BTreeMap<String, u64>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+
+#[cfg(test)]
+pub(crate) fn with_staged_births_for_test<T>(
+    births: BTreeMap<String, u64>,
+    run: impl FnOnce() -> T,
+) -> T {
+    let previous = STAGED_BIRTHS_FOR_TEST.with(|slot| slot.replace(births));
+    let value = run();
+    STAGED_BIRTHS_FOR_TEST.with(|slot| slot.replace(previous));
+    value
 }
 
 /// The `history_emission_denied` reason of a literal-only denial.
@@ -454,9 +478,10 @@ pub(crate) struct HistoryPage {
     /// directory, with indexed sizes) of the owed candidate being decided.
     /// Its reservation takes them too, both or neither.
     staged_twins: Option<(String, Vec<(String, u64)>)>,
-    /// E2: this page's indexed path-twin groups by member, built once on the
-    /// page's first parsed candidate. Only members with two or more paths.
-    twin_index: Option<BTreeMap<String, Vec<(String, u64)>>>,
+    /// E2: this page's path-twin groups by member, built once on the page's
+    /// first parsed candidate. Only members with two or more paths; a path
+    /// observed but not indexed yet has no size.
+    twin_index: Option<BTreeMap<String, Vec<(String, Option<u64>)>>>,
 }
 
 crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index);
@@ -688,9 +713,14 @@ impl super::ScanIndex {
         if page.twin_index.is_none() {
             self.claude_money_birth_store.begin_page();
         }
-        let groups = page
-            .twin_index
-            .get_or_insert_with(|| claude_path_twin_groups(&self.files));
+        let groups = page.twin_index.get_or_insert_with(|| {
+            claude_path_twin_groups(
+                &self.files,
+                self.traversal
+                    .as_ref()
+                    .map(|traversal| &traversal.observed_index_keys),
+            )
+        });
         if let Some((_, member)) =
             super::claude_index_path_family_member(std::path::Path::new(index_key))
         {
@@ -706,17 +736,31 @@ impl super::ScanIndex {
                         .map(|m| {
                             super::claude_context_file_birth::ClaudeOpenedBirth::from_metadata(&m)
                         });
-                    self.claude_money_birth_store
-                        .stage_opened(&member, key, opened, *size);
+                    #[cfg(test)]
+                    let opened = opened.map(|mut opened| {
+                        if let Some(birth) = STAGED_BIRTHS_FOR_TEST
+                            .with(|births| births.borrow().get(key.as_str()).copied())
+                        {
+                            opened.birth = birth;
+                        }
+                        opened
+                    });
+                    self.claude_money_birth_store.stage_opened(
+                        &member,
+                        key,
+                        opened,
+                        size.unwrap_or(0),
+                    );
                 }
             }
         }
         let twins = super::claude_index_path_family_member(std::path::Path::new(index_key))
             .and_then(|(_, member)| groups.get(&member))
             .map(|keys| {
+                // Only indexed twins carry a size to reserve.
                 keys.iter()
                     .filter(|(key, _)| key != index_key)
-                    .cloned()
+                    .filter_map(|(key, size)| Some((key.clone(), (*size)?)))
                     .collect()
             })
             .unwrap_or_default();

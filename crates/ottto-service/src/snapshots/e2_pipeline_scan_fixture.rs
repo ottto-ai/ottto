@@ -28,7 +28,6 @@ impl E2ScanFixture {
         hints: &[PathBuf],
     ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
         self.observed.lock().unwrap().clear();
-        let mut seen = BTreeSet::new();
         let mut scan = OwnedSourceScan::new_with_identity_capture(
             SnapshotSource::ClaudeCode,
             roots,
@@ -46,6 +45,25 @@ impl E2ScanFixture {
         if sampled {
             scan = scan.with_sampled_acquisition(self.cache.clone(), Scope("e2-pipeline".into()));
         }
+        // The same synthetic root births reach the page's staged twin probes,
+        // which read metadata before the file is opened for parse.
+        let staged = births
+            .iter()
+            .filter(|(path, _)| {
+                claude_index_path_member_ref(path)
+                    .is_some_and(|member| member.subagent_stem.is_none())
+            })
+            .filter_map(|(path, birth)| Some((local_index_key(path), u64::try_from(*birth).ok()?)))
+            .collect();
+        claude_history_upgrade::with_staged_births_for_test(staged, || self.drive(scan, births))
+    }
+
+    fn drive(
+        &self,
+        mut scan: OwnedSourceScan,
+        births: &BTreeMap<PathBuf, i128>,
+    ) -> (ScanIndex, SourceScanResult, (usize, usize, usize)) {
+        let mut seen = BTreeSet::new();
         for _ in 0..100_000 {
             // Existing fixture setter changes only physical birth. JSONL still
             // comes from the opened reader, including retained prefix/suffix.

@@ -87,20 +87,23 @@ pub(in crate::snapshots) struct ReadContext<'a> {
     pub(in crate::snapshots) path: &'a Path,
 }
 impl ReadContext<'_> {
-    /// Current index membership plus this page's metadata generation probe.
+    /// Current membership plus this page's metadata generation probe.
     /// No filesystem lookup here: T4's twin walk already paid for it.
     fn live(&self, member: &str, location: LocationKey) -> bool {
-        self.index.claude_money_birth_store.witnessed(location)
-            && self
-                .index
-                .files
-                .keys()
-                .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
+        self.index.claude_money_birth_store.witnessed(location) && self.indexed(member, location)
     }
+    /// An indexed path, or one this traversal observed that is not indexed
+    /// yet (a first-seen twin or a new copy still to be read on this page).
     fn indexed(&self, member: &str, location: LocationKey) -> bool {
         self.index
             .files
             .keys()
+            .chain(
+                self.index
+                    .traversal
+                    .iter()
+                    .flat_map(|traversal| traversal.observed_index_keys.iter()),
+            )
             .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
     }
 }
