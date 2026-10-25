@@ -1960,6 +1960,8 @@ fn shadow_page_body(
                 {
                     counts.captures_taken += 1;
                     note_message_record(ledger, index, key, fingerprint, &capture, &mut counts);
+                    // Families reached earlier may have scoped this file.
+                    scope.refresh_file(index, ledger.census(), key);
                     family_captures
                         .insert((root.to_owned(), item.source_session_id.clone()), capture);
                 }

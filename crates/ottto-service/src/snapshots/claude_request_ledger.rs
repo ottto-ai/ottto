@@ -359,6 +359,16 @@ impl ClaudeScopeDebt {
         self.message_unknown += other.message_unknown;
         self.new_unrecorded += other.new_unrecorded;
     }
+
+    /// Remove `other`, a part `add` put in.
+    fn sub(&mut self, other: &Self) {
+        self.lost -= other.lost;
+        self.over_budget -= other.over_budget;
+        self.stale -= other.stale;
+        self.unverified -= other.unverified;
+        self.message_unknown -= other.message_unknown;
+        self.new_unrecorded -= other.new_unrecorded;
+    }
 }
 
 /// One indexed file's contribution to its group's completeness.
@@ -525,6 +535,48 @@ impl ClaudeLedgerScope {
         self.debt.add(&debt);
         self.files.insert(key.to_owned(), debt);
         debt
+    }
+
+    /// Recompute file `key`'s debt after its message record changed (a
+    /// family reached later took its capture): the groups and families added
+    /// before see the current debt. A file not added yet is left alone.
+    pub(crate) fn refresh_file(
+        &mut self,
+        index: &ScanIndex,
+        ledger: &ClaudeRequestCensus,
+        key: &str,
+    ) {
+        let Some(old) = self.files.get(key).copied() else {
+            return;
+        };
+        let FileDebt(new) = file_debt(index, ledger, key);
+        if new == old {
+            return;
+        }
+        self.files.insert(key.to_owned(), new);
+        self.debt.sub(&old);
+        self.debt.add(&new);
+        if let Some(files) = claude_project_group(key).and_then(|group| self.groups.get_mut(group))
+        {
+            for (_, debt, _) in files.iter_mut().filter(|(file, _, _)| file == key) {
+                *debt = new;
+            }
+        }
+        if let Some(family) = claude_index_path_member_ref(Path::new(key))
+            .and_then(|member| self.families.get_mut(member.root))
+        {
+            family.sub(&old);
+            family.add(&new);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_blocks_for_test(
+        &self,
+        own_key: &str,
+        message: bool,
+    ) -> Option<ClaudeUndecidedBy> {
+        self.group_blocks(own_key, message)
     }
 
     /// Whether family `root` was added.
