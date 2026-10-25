@@ -787,6 +787,18 @@ impl P2aControl {
     fn cycle_deferred(&self) {
         Self::assert_deferred(self.cycle_result());
     }
+    fn cycle_shed(&self, minimum: Duration) {
+        let streak = shed_streak_for_test(SnapshotSource::ClaudeCode);
+        let before = Instant::now();
+        self.cycle();
+        assert_eq!(shed_streak_for_test(SnapshotSource::ClaudeCode), streak + 1,
+            "a known shed must retain source-level backoff instead of becoming generic UNKNOWN deferral");
+        assert!(source_upload_deadlines()
+            .lock()
+            .unwrap()
+            .get("claude_code")
+            .is_some_and(|deadline| *deadline >= before + minimum));
+    }
     fn assert_deferred(result: Result<(usize, Vec<SnapshotItem>)>) {
         let error = result.expect_err("this boundary must report unsettled delivery");
         let deferred = error
@@ -4378,7 +4390,11 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
         let _live = money::LiveForTest::new(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle_deferred();
+        if matches!(status, 429 | 503) {
+            control.cycle_shed(Duration::from_secs(7200));
+        } else {
+            control.cycle_deferred();
+        }
         let m = unknown_recovery::active_for_test(&control.support)
             .pop()
             .unwrap();
@@ -4409,7 +4425,7 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
             );
             {
                 let _due = money::PageClockForTest::new(&control.support, now + 7200);
-                control.cycle();
+                control.cycle_shed(Duration::from_secs(7200));
             }
             assert_eq!(control.server.raw_batches.lock().unwrap().len(), 2);
             assert_eq!(
@@ -4425,6 +4441,71 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
             assert_eq!(m.terminal, Some(expected));
         }
     }
+}
+
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+#[serial(claude_request_money_shadow)]
+fn p2a_unknown_shed_blocks_unrelated_snapshot_posts_at_the_cycle_boundary() {
+    use crate::snapshots::claude_request_money as money;
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let _native = crate::snapshots::claude_native_comparison::enable_for_test();
+    for status in [429, 503] {
+        let control = P2aControl::with_recovery_evidence(FinishOutcome::HttpFailure {
+            status,
+            retry_after: 7200,
+        });
+        let _live = money::LiveForTest::new(&control.support);
+        control.cycle_shed(Duration::from_secs(7200));
+        let original = std::fs::read_to_string(control.transcript()).unwrap();
+        let fresh = "33333333-3333-4333-8333-333333333333";
+        std::fs::write(
+            control
+                .transcript()
+                .with_file_name(format!("{fresh}.jsonl")),
+            original
+                .replace(IDENTITY_PIPELINE_ROOT, fresh)
+                .replace("req_1", "shed-independent-1")
+                .replace("req_2", "shed-independent-2")
+                .replace("m1", "shed-independent-message-1")
+                .replace("m2", "shed-independent-message-2"),
+        )
+        .unwrap();
+        *control.server.outcome.lock().unwrap() = FinishOutcome::Accept;
+        control.cadence.next_due_cycle();
+        let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+        let collection = AgentStatusCollection {
+            snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+            source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+            codex_scan_homes: Vec::new(),
+            codex_home_bindings: Vec::new(),
+        };
+        crate::agent_status_refresh::with_test_collection(collection, || {
+            sync_once_with_retry(
+                &control.fixture.home,
+                &control.support,
+                &control.daemon,
+                &mut retry,
+            )
+        })
+        .unwrap();
+        assert_eq!(
+            control.server.raw_batches.lock().unwrap().len(),
+            1,
+            "the real source deadline blocks unrelated newly computed POSTs after a shed"
+        );
+        assert_eq!(shed_streak_for_test(SnapshotSource::ClaudeCode), 1);
+        assert!(money::money_due(
+            &control.support,
+            &control.transcript().to_string_lossy(),
+            u64::MAX
+        ));
+    }
+    eprintln!("MONEY_UNKNOWN_SOURCE_BACKOFF statuses=429,503 source_deadline=true unrelated_post_before_retry_after=false");
 }
 
 #[test]
@@ -4764,7 +4845,7 @@ fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
     control.restart();
     *control.server.outcome.lock().unwrap() = FinishOutcome::LiteralSkew;
     let _clock = money::PageClockForTest::new(&control.support, now + 300);
-    control.cycle();
+    control.cycle_shed(Duration::from_secs(1800));
     let posts = control.server.raw_batches.lock().unwrap();
     assert_eq!(
         posts.len(),
@@ -5010,7 +5091,7 @@ fn p2a_unknown_retry_after_crossing_deadline_expires_without_replay() {
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
-        control.cycle_deferred();
+        control.cycle_shed(Duration::from_secs(172800));
     }
     let attempt = unknown_recovery::active_for_test(&control.support)
         .pop()

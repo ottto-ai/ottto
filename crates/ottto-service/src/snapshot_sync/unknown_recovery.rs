@@ -135,6 +135,7 @@ pub(super) struct Deferred {
     pub reason: Option<Reason>,
     pub not_before: u64,
     pub route_unavailable: bool,
+    pub source_backoff: Option<Option<Duration>>,
 }
 impl std::fmt::Display for Deferred {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -142,6 +143,22 @@ impl std::fmt::Display for Deferred {
     }
 }
 impl std::error::Error for Deferred {}
+#[derive(Debug)]
+pub(super) struct Backoff {
+    pub retry_after: Option<Duration>,
+}
+impl std::fmt::Display for Backoff {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("request money replay honors source backoff")
+    }
+}
+impl std::error::Error for Backoff {}
+fn source_backoff(error: &anyhow::Error) -> Option<Option<Duration>> {
+    error
+        .downcast_ref::<UploadShed>()
+        .map(|shed| shed.retry_after)
+        .or_else(|| is_literal_version_skew(error).then_some(Some(Duration::from_secs(1800))))
+}
 
 pub(super) fn now(support: &Path) -> u64 {
     money::recovery_now(support)
@@ -1699,6 +1716,7 @@ pub(super) fn initial_post(
                 reason: None,
                 not_before: now(support),
                 route_unavailable: false,
+                source_backoff: None,
             }
             .into());
         }
@@ -1707,6 +1725,7 @@ pub(super) fn initial_post(
                 reason: None,
                 not_before: now(support),
                 route_unavailable: false,
+                source_backoff: None,
             }
             .into());
         }
@@ -1718,6 +1737,7 @@ pub(super) fn initial_post(
                     reason: None,
                     not_before: now(support),
                     route_unavailable: false,
+                    source_backoff: None,
                 }
                 .into());
             }
@@ -1730,6 +1750,7 @@ pub(super) fn initial_post(
                     reason: None,
                     not_before: now(support),
                     route_unavailable: false,
+                    source_backoff: None,
                 }
                 .into());
             }
@@ -1778,6 +1799,7 @@ pub(super) fn initial_post(
             reason: None,
             not_before: now(support),
             route_unavailable: false,
+            source_backoff: None,
         }
         .into());
     }
@@ -1786,6 +1808,7 @@ pub(super) fn initial_post(
             reason: None,
             not_before: now(support),
             route_unavailable: false,
+            source_backoff: None,
         }
         .into());
     }
@@ -1796,6 +1819,7 @@ pub(super) fn initial_post(
             reason: None,
             not_before: now(support),
             route_unavailable: false,
+            source_backoff: None,
         }
         .into());
     }
@@ -1840,6 +1864,7 @@ pub(super) fn initial_post(
         ),
         |e| error_transition(e, now(support)),
     );
+    let backoff = result.as_ref().err().and_then(source_backoff);
     let ticket = outcome_ticket(support, m, reason, not_before)?;
     OUTCOMES
         .lock()
@@ -1852,6 +1877,7 @@ pub(super) fn initial_post(
         Err(error) => Err(Deferred {
             reason,
             not_before,
+            source_backoff: backoff,
             route_unavailable: error
                 .downcast_ref::<UploadShed>()
                 .is_some_and(|s| s.request_owned_route_unavailable),
@@ -2120,6 +2146,7 @@ pub(super) async fn replay_due(
                 Ok(response)
             });
         drop(bytes);
+        let backoff = result.as_ref().err().and_then(source_backoff);
         let mut m = m;
         let (reason, not_before) = match result {
             Ok(response) if !response.disabled => {
@@ -2169,6 +2196,11 @@ pub(super) async fn replay_due(
         };
         let updated = wait(outcome_ticket(support, m, reason, not_before)?).await?;
         replace(support, updated)?;
+        // Persist the immutable attempt's outcome first, then stop all further
+        // replay/new POSTs through the existing source-level shed branch.
+        if let Some(retry_after) = backoff {
+            return Err(Backoff { retry_after }.into());
+        }
     }
     Ok(())
 }
