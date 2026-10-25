@@ -4155,12 +4155,49 @@ struct ClaudeAccountFamilyWitness {
 // Only the account-family proof uses this version. Usage proofs retain v1.
 const CLAUDE_ACCOUNT_REQUEST_SET_VERSION: &str = "claude_account_request_set:v2";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ClaudeAccountRequestSet {
     /// Sorted 8-byte SHA-256 prefixes, packed as base64 (no JSON byte arrays).
     prefixes: String,
     /// Full-hash-set commitment: equal prefixes never hide a changed full set.
     fingerprint: String,
+}
+
+impl Serialize for ClaudeAccountRequestSet {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        let digest = self
+            .fingerprint
+            .strip_prefix(CLAUDE_ACCOUNT_REQUEST_SET_VERSION)
+            .and_then(|value| value.strip_prefix(':'))
+            .ok_or_else(|| serde::ser::Error::custom("invalid account request-set version"))?;
+        serializer.serialize_str(&format!("{}:{digest}", self.prefixes))
+    }
+}
+impl<'de> Deserialize<'de> for ClaudeAccountRequestSet {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
+        let value = String::deserialize(deserializer)?;
+        let (prefixes, digest) = value
+            .split_once(':')
+            .ok_or_else(|| serde::de::Error::custom("invalid account request-set encoding"))?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(serde::de::Error::custom(
+                "invalid account request-set digest",
+            ));
+        }
+        Ok(Self {
+            prefixes: prefixes.to_string(),
+            fingerprint: format!("{CLAUDE_ACCOUNT_REQUEST_SET_VERSION}:{digest}"),
+        })
+    }
 }
 
 impl ClaudeAccountRequestSet {
@@ -4207,7 +4244,7 @@ impl ClaudeAccountRequestSet {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(from = "ClaudeAccountFamilyPendingWire")]
 struct ClaudeAccountFamilyPendingWindow {
     version: String,
@@ -4215,9 +4252,36 @@ struct ClaudeAccountFamilyPendingWindow {
     account_identifier_hash: String,
     evidence_request_count: u128,
     members: BTreeMap<String, u64>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     member_requests: BTreeMap<String, ClaudeAccountRequestSet>,
     invalid: bool,
+}
+
+impl Serialize for ClaudeAccountFamilyPendingWindow {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(None)?;
+        map.serialize_entry("v", &self.version)?;
+        map.serialize_entry("w", &self.census_window_end)?;
+        map.serialize_entry("a", &self.account_identifier_hash)?;
+        map.serialize_entry("e", &self.evidence_request_count)?;
+        // Normal members' exact counts are already encoded in the packed
+        // lengths. Preserve explicit counts for malformed/incomplete holds.
+        let implicit_members = self.members.len() == self.member_requests.len()
+            && self.members.iter().all(|(member, count)| {
+                self.member_requests.get(member).is_some_and(|set| {
+                    (set.prefixes.len() as u128 * 3 / 4 / 8) == u128::from(*count)
+                })
+            });
+        if !implicit_members {
+            map.serialize_entry("members", &self.members)?;
+        }
+        map.serialize_entry("r", &self.member_requests)?;
+        map.serialize_entry("i", &self.invalid)?;
+        map.end()
+    }
 }
 
 // Accept old full-hash records at the record boundary used by all three index
@@ -4225,17 +4289,24 @@ struct ClaudeAccountFamilyPendingWindow {
 #[derive(Deserialize)]
 struct ClaudeAccountFamilyPendingWire {
     #[serde(default)]
+    #[serde(rename = "v", alias = "version")]
     version: String,
     #[serde(default)]
     previous_windows: Vec<ClaudeAccountFamilyPendingWindow>,
+    #[serde(rename = "w", alias = "census_window_end")]
     census_window_end: String,
+    #[serde(rename = "a", alias = "account_identifier_hash")]
     account_identifier_hash: String,
+    #[serde(rename = "e", alias = "evidence_request_count")]
     evidence_request_count: u128,
+    #[serde(default)]
     members: BTreeMap<String, u64>,
     #[serde(default)]
+    #[serde(rename = "r", alias = "member_requests")]
     member_requests: BTreeMap<String, ClaudeAccountRequestSet>,
     #[serde(default)]
     member_request_id_hashes: BTreeMap<String, BTreeSet<String>>,
+    #[serde(rename = "i", alias = "invalid")]
     invalid: bool,
 }
 
@@ -4265,12 +4336,29 @@ impl From<ClaudeAccountFamilyPendingWire> for ClaudeAccountFamilyPendingWindow {
                     .any(|set| set.unpack().is_none());
             wire.member_requests
         };
+        let members = if wire.version == CLAUDE_ACCOUNT_REQUEST_SET_VERSION {
+            let derived = member_requests
+                .iter()
+                .filter_map(|(member, set)| {
+                    set.unpack()
+                        .map(|bytes| (member.clone(), (bytes.len() / 8) as u64))
+                })
+                .collect::<BTreeMap<_, _>>();
+            if wire.members.is_empty() {
+                derived
+            } else {
+                invalid |= wire.members != derived;
+                wire.members
+            }
+        } else {
+            wire.members
+        };
         let mut pending = Self {
             version: CLAUDE_ACCOUNT_REQUEST_SET_VERSION.to_string(),
             census_window_end: wire.census_window_end,
             account_identifier_hash: wire.account_identifier_hash,
             evidence_request_count: wire.evidence_request_count,
-            members: wire.members,
+            members,
             member_requests,
             invalid,
         };
@@ -61561,8 +61649,23 @@ mod tests {
         let record = old["claude_account_family_pending"][&root]
             .as_object_mut()
             .unwrap();
-        record.remove("version");
-        record.remove("member_requests");
+        for key in ["v", "w", "a", "e", "r", "i"] {
+            record.remove(key);
+        }
+        record.insert("census_window_end".into(), json!("2026-08-02T07:10:00Z"));
+        record.insert("account_identifier_hash".into(), json!("a".repeat(64)));
+        record.insert("evidence_request_count".into(), json!(5));
+        record.insert("invalid".into(), json!(false));
+        record.insert(
+            "members".into(),
+            serde_json::to_value(
+                items
+                    .iter()
+                    .map(|item| (item.source_session_id.clone(), item.request_count))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        );
         record.insert(
             "member_request_id_hashes".into(),
             serde_json::to_value(
@@ -61616,7 +61719,7 @@ mod tests {
                 .get("member_request_id_hashes")
                 .is_none());
             assert_eq!(
-                saved["claude_account_family_pending"][&root]["version"],
+                saved["claude_account_family_pending"][&root]["v"],
                 CLAUDE_ACCOUNT_REQUEST_SET_VERSION
             );
             let again: ScanIndex = serde_json::from_value(saved).unwrap();
