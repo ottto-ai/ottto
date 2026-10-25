@@ -38126,7 +38126,7 @@ fn ensure_bounded_traversal(
                         .collect::<BTreeSet<_>>()
                 })
                 .unwrap_or_default();
-        // Use the graph-free accepted path for large non-window retries. Its
+        // Use graph-free accepted carry when the ordinary scratch refuses. Its
         // refusal leaves the old red checkpoint and all pending/fingerprints
         // intact; uncovered history must never turn a memory limit into reads.
         let streaming_carry = window_scratch_admitted
@@ -38138,20 +38138,20 @@ fn ensure_bounded_traversal(
             && index.claude_request_identity_contract.is_some()
             && claude_accepted_ledger_is_current(index)
             && index.upload_context_fingerprint == index.active_upload_context_fingerprint
-            && (stale_pending_roots.len() >= 512
-                || (!claude_stale_family_carry_scratch_admitted(
-                    index,
-                    &stale_pending_roots,
-                    index
-                        .claude_usage_family_witnesses
-                        .values()
-                        .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
-                        .count(),
-                ) && index.files.iter().any(|(key, entry)| {
-                    claude_index_path_member_ref(Path::new(key))
-                        .is_some_and(|member| stale_pending_roots.contains(member.root))
-                        && claude_stale_member_independently_accepted(index, key, entry)
-                })));
+            && !claude_stale_family_carry_scratch_admitted(
+                index,
+                &stale_pending_roots,
+                index
+                    .claude_usage_family_witnesses
+                    .values()
+                    .filter(|witness| !claude_usage_family_witness_legacy_free(witness))
+                    .count(),
+            )
+            && index.files.iter().any(|(key, entry)| {
+                claude_index_path_member_ref(Path::new(key))
+                    .is_some_and(|member| stale_pending_roots.contains(member.root))
+                    && claude_stale_member_independently_accepted(index, key, entry)
+            });
         #[cfg(test)]
         let streaming_carry = streaming_carry
             && !KEEP_STALE_CLAUDE_FAMILY_REARM_FOR_TEST.with(std::cell::Cell::get)

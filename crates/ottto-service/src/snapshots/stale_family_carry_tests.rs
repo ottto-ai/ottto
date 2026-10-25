@@ -3676,11 +3676,42 @@ fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
 }
 
 #[test]
+fn admitted_legacy_carry_keeps_its_existing_path_at_512_families() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 512, true);
+    fixture.index.bounded_sweep_had_unsettled_upload = false;
+    for entry in fixture.index.files.values_mut() {
+        entry.last_upload_body_witness = None;
+    }
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(claude_stale_family_carry_scratch_admitted(
+        &fixture.index,
+        &stale,
+        0
+    ));
+    assert!(!claude_stale_rearm_can_reopen_fence(&fixture.index, &stale));
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 512);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+#[test]
 fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
     }
-    let mut fixture = scoped_retry_fixture(1, 512, false);
+    let mut fixture = scoped_retry_fixture(1, 6356, false);
     let files = serde_json::to_value(&fixture.index.files).unwrap();
     let pending = fixture.index.claude_usage_family_pending.clone();
     let bindings = fixture.index.session_account_bindings.clone();
