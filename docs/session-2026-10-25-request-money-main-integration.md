@@ -26,3 +26,10 @@ distinguish catalog maintenance from completed retained finishes and inject
 changes after an actual custody checkpoint. Unsupported ACK witness versions
 still fail closed before intent or POST. Validation runs in CI; this change does
 not activate collection or authorize a release.
+
+The lost-member regression also observes the actual scope-walk key visits.
+Indexed and retained census file keys are visited once; telemetry/message ledger
+keys are excluded. Visits stay within the key count funded by scope admission.
+A caller-thread I/O receipt asserts zero filesystem operations, independently
+of the asynchronous writer, so the walk spends none of the page read budget.
+The original lost-debt and undecided verdict assertions remain.

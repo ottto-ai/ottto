@@ -514,6 +514,17 @@ impl<'i> ClaudeScopeFiles<'i> {
         roots: &BTreeSet<&str>,
         deadline: Instant,
     ) -> Option<Self> {
+        Self::walk_observed(index, roots, deadline, |_| {})
+    }
+
+    // A no-op observer in production; tests count the actual key reads of the
+    // same walk, before path classification can hide an out-of-scope visit.
+    fn walk_observed(
+        index: &'i ScanIndex,
+        roots: &BTreeSet<&str>,
+        deadline: Instant,
+        mut visit: impl FnMut(&str),
+    ) -> Option<Self> {
         let mut files = Self::default();
         let residue = index
             .claude_request_census
@@ -523,6 +534,7 @@ impl<'i> ClaudeScopeFiles<'i> {
             if Instant::now() >= deadline {
                 return None;
             }
+            visit(key);
             if index.confirmed_empty_files.contains(key) {
                 continue;
             }
@@ -1476,12 +1488,54 @@ mod unbuilt_lifecycle_tests {
 
     #[test]
     fn scope_walk_retains_unindexed_birth_stub_as_lost_debt() {
-        let index = index(6);
+        let mut index = index(6);
+        // Non-file ledger records must never be visited, even when retained
+        // alongside the invalidated transcript's birth-only stub.
+        index
+            .claude_request_census
+            .insert_for_test(&telemetry_key("unrelated-root"), record('c', NOW));
+        index
+            .claude_request_census
+            .insert_for_test(&message_key(OLDER), record('d', NOW));
+        let retained = index
+            .claude_request_census
+            .retained_file_keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(retained, BTreeSet::from([OWN, OLDER]));
+        let read_budget = index.files.len() + retained.len();
+        let mut visited = Vec::new();
         assert!(!index.files.contains_key(OLDER));
         assert!(index.claude_request_census.get(OLDER).is_none());
         assert!(index.claude_request_census.retained_birth(OLDER).is_some());
-        let files =
-            ClaudeScopeFiles::walk(&index, &BTreeSet::from(["A", "B"]), deadline()).unwrap();
+        let (files, io) = crate::retry_allocation_probe::measure_money_io_caller_thread(|| {
+            ClaudeScopeFiles::walk_observed(
+                &index,
+                &BTreeSet::from(["A", "B"]),
+                deadline(),
+                |key| visited.push(key.to_owned()),
+            )
+            .unwrap()
+        });
+        assert!(visited.iter().all(|key| retained.contains(key.as_str())));
+        assert_eq!(
+            visited.iter().map(String::as_str).collect::<BTreeSet<_>>(),
+            retained
+        );
+        assert_eq!(
+            visited.len(),
+            retained.len(),
+            "indexed/residue overlap is read once"
+        );
+        assert!(
+            visited.len() <= read_budget,
+            "scope key reads exceed admission"
+        );
+        assert_eq!(
+            io,
+            crate::retry_allocation_probe::MoneyIoReceipt::default(),
+            "scope walk must consume none of the page's filesystem read budget"
+        );
         assert!(
             files.groups["-same"].contains(&OLDER),
             "residue must reach group scope"

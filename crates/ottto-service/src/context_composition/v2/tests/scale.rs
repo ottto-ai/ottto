@@ -601,10 +601,7 @@ fn report(
     };
     let peak = max_rss_bytes() + worker_peak;
     let (state_read, written) = super::super::checkpoint::IO_BYTES.with(|io| io.get());
-    println!(
-        "[{phase}] bytes_read={} bytes_written={} bytes_fsynced={}",
-        state_read, written, written
-    );
+    println!("[{phase}] bytes_read={state_read} bytes_written={written} bytes_fsynced={written}");
     println!(
         "[{phase}] rss_after_mib={:.2} rss_after_above_start_mib={:.2}",
         rss_bytes() as f64 / 1048576.0,

@@ -246,11 +246,13 @@ pub(crate) struct MoneyIoReceipt {
     pub read_dir: usize,
 }
 static MONEY_IO: std::sync::Mutex<Option<MoneyIoReceipt>> = std::sync::Mutex::new(None);
+thread_local! {
+    static MONEY_CALLER_IO: Cell<Option<MoneyIoReceipt>> = const { Cell::new(None) };
+}
 // Boundary attempts, including failed calls; not OS syscall or byte counts.
 // Writer and telemetry-sidecar operations share this observer.
 pub(crate) fn money_io_attempt(kind: MoneyIoKind) {
-    let mut observation = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner());
-    if let Some(receipt) = observation.as_mut() {
+    fn record(receipt: &mut MoneyIoReceipt, kind: MoneyIoKind) {
         match kind {
             MoneyIoKind::Open => receipt.open += 1,
             MoneyIoKind::Metadata => receipt.metadata += 1,
@@ -265,7 +267,37 @@ pub(crate) fn money_io_attempt(kind: MoneyIoKind) {
             }
         }
     }
+    MONEY_CALLER_IO.with(|cell| {
+        if let Some(mut receipt) = cell.get() {
+            record(&mut receipt, kind);
+            cell.set(Some(receipt));
+        }
+    });
+    let mut observation = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = observation.as_mut() {
+        record(receipt, kind);
+    }
 }
+
+// Isolate synchronous scope-walk reads from the concurrent custody writer.
+pub(crate) fn measure_money_io_caller_thread<T>(f: impl FnOnce() -> T) -> (T, MoneyIoReceipt) {
+    MONEY_CALLER_IO.with(|cell| {
+        assert!(cell.get().is_none());
+        cell.set(Some(MoneyIoReceipt::default()));
+    });
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MONEY_CALLER_IO.with(|cell| cell.set(None));
+        }
+    }
+    let reset = Reset;
+    let value = f();
+    let receipt = MONEY_CALLER_IO.with(|cell| cell.get().unwrap());
+    drop(reset);
+    (value, receipt)
+}
+
 pub(crate) fn measure_money_io<T>(f: impl FnOnce() -> T) -> (T, MoneyIoReceipt) {
     {
         let mut observation = MONEY_IO.lock().unwrap_or_else(|p| p.into_inner());
