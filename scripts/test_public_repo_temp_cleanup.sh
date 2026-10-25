@@ -120,6 +120,17 @@ new_target() {
   echo "$target"
 }
 
+# First path the rm stub saw; shows the case output when rm was never called
+# (the script exited before creating its temp checkout).
+first_rm_target() {
+  if [[ ! -f "$STUB_RM_COUNT.targets" ]]; then
+    echo "Expected rm calls, got none (case $case_index, status $case_status)" >&2
+    cat "$case_out" >&2
+    exit 1
+  fi
+  head -n 1 "$STUB_RM_COUNT.targets"
+}
+
 expect_status() {
   if [[ "$case_status" -ne "$1" ]]; then
     echo "Expected exit status $1, got $case_status ($2)" >&2
@@ -235,7 +246,7 @@ done
 # The real surface CI trap preserves its own failure status (2 from a missing
 # staged output) while cleanup of its mktemp checkout is exhausted.
 run_case 99 bash "$SURFACE_SCRIPT" --staged-output "$tmp_dir/missing-staged-output"
-surface_target="$(head -n 1 "$STUB_RM_COUNT.targets")"
+surface_target="$(first_rm_target)"
 [[ "$surface_target" == /* && "${surface_target%/*}" == "$case_dir" && "${surface_target##*/}" == tmp.* ]] || {
   echo "Refusing unexpected surface checkout path: $surface_target" >&2
   exit 1
@@ -247,7 +258,7 @@ grep -Fq "public-surface-ci: staged output is not a directory" "$case_out"
 grep -Fq "::warning::public-surface-ci: temp dir cleanup incomplete after 5 attempts; left $surface_target in place (script exit status unchanged)" "$case_out"
 
 run_case 0 bash "$SURFACE_SCRIPT" --staged-output "$tmp_dir/missing-staged-output"
-surface_target="$(head -n 1 "$STUB_RM_COUNT.targets")"
+surface_target="$(first_rm_target)"
 expect_status 2 "surface CI failure with clean cleanup"
 expect_rm_calls 1 "surface CI failure with clean cleanup"
 [[ ! -e "$surface_target" ]] || { echo "Expected surface CI to remove $surface_target" >&2; exit 1; }

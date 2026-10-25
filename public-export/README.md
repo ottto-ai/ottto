@@ -146,9 +146,10 @@ private paths and secret-like content. The expected public-v1 source state is
 zero rewrite-required references; the rewrite rules remain a guardrail for
 legacy or newly introduced private repository names, not a normal cutover
 dependency.
-Run `scripts/public_repo_surface_ci.sh --staged-output ...` when you need the
-closest local substitute for the future public repository's `public-surface`
-GitHub Actions job. The smoke copies the bundle into a temporary git checkout,
+Run `scripts/public_repo_surface_ci.sh --staged-output ...` on macOS when you
+need the closest local substitute for the public repository's surface checks.
+GitHub Actions runs the same steps in two halves: `--scope portable` in the
+Linux `public-surface` job and `--scope macos` in the macOS `rust` job. The smoke copies the bundle into a temporary git checkout,
 runs schema/registry validation, shellcheck, export tests, release/installer
 dry-run tests, manifest/skeleton, secret-scan, contract checks, and verifies a
 self-exported bundle from that temporary checkout. The staged copy intentionally

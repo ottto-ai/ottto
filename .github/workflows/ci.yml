@@ -40,6 +40,11 @@ jobs:
       - name: Compiler receipt
         run: rustc -Vv && cargo -V
 
+      - name: macOS-native public surface checks
+        # Real plutil/codesign/LaunchServices and macOS /bin/bash 3.2; the
+        # portable remainder runs in "Public surface checks" on Linux.
+        run: /bin/bash scripts/public_repo_surface_ci.sh --scope macos
+
       - name: Rust format
         run: cargo fmt --all --check
 
@@ -72,28 +77,32 @@ jobs:
   public-surface:
     name: Public surface checks
     timeout-minutes: 30
-    runs-on: macos-15
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
-      - name: Install script prerequisites
-        env:
-          HOMEBREW_NO_REQUIRE_TAP_TRUST: "1"
+      # Pinned binary with the action's per-version SHA-256; no unverified
+      # cargo-install fallback.
+      - name: Install shellcheck
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: shellcheck@0.11.0
+          fallback: none
+
+      - name: Tool receipt
         run: |
           set -euo pipefail
-          brew untap aws/tap azure/bicep 2>/dev/null || true
-          if ! command -v jq >/dev/null 2>&1; then
-            brew install jq
-          fi
-          if ! command -v shellcheck >/dev/null 2>&1; then
-            brew install shellcheck
-          fi
+          shellcheck --version | grep -Fx 'version: 0.11.0'
+          bash --version | head -n1
+          jq --version
+          python3 --version
+          cargo -V
 
       - name: Public surface gate
-        run: bash scripts/public_repo_surface_ci.sh
+        run: bash scripts/public_repo_surface_ci.sh --scope portable
 
   dependency-review:
     name: Dependency review
@@ -116,16 +125,20 @@ jobs:
 
   rust-advisories:
     name: Rust advisory audit
-    timeout-minutes: 20
-    runs-on: macos-15
+    timeout-minutes: 10
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
           persist-credentials: false
 
+      # cargo audit reads only the lockfiles, so the runner OS does not matter.
       - name: Install cargo-audit
-        run: cargo install cargo-audit --locked
+        uses: taiki-e/install-action@1e29709c0ec63babbe8f266397a465f29a825f91 # v2.87.31
+        with:
+          tool: cargo-audit@0.22.2
+          fallback: none
 
       - name: Runtime advisory audit
         run: cargo audit --deny warnings

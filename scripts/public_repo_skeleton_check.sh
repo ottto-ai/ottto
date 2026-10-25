@@ -228,6 +228,8 @@ require_grep 'github-actions' ".github/dependabot.yml" "GitHub Actions dependenc
 require_grep 'package-ecosystem: cargo' ".github/dependabot.yml" "Cargo dependency hygiene"
 require_grep 'cargo clippy' ".github/workflows/ci.yml" "Rust clippy CI"
 require_grep 'public_repo_surface_ci\.sh' ".github/workflows/ci.yml" "public surface CI gate"
+require_grep 'public_repo_surface_ci\.sh --scope portable' ".github/workflows/ci.yml" "portable (Linux) public surface CI gate"
+require_grep 'public_repo_surface_ci\.sh --scope macos' ".github/workflows/ci.yml" "macOS-native public surface CI gate"
 require_grep 'workflow_dispatch' ".github/workflows/macos-stable-release.yml" "stable release manual dispatch"
 require_grep 'macos-stable-release' ".github/workflows/macos-stable-release.yml" "stable release protected environment"
 require_grep 'macos_attestation_bind\.sh' ".github/workflows/macos-stable-release.yml" "stable release attestation binding"

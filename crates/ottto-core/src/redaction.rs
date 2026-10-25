@@ -162,6 +162,7 @@ fn is_secret_key(key: &str) -> bool {
         "otel_exporter_otlp_headers",
         "password",
         "refresh_token",
+        "revocation_receipt",
         "secret",
         "token",
     ]
@@ -262,6 +263,7 @@ fn is_secret_assignment_key(key: &str) -> bool {
         "ingest_key",
         "claim_token",
         "setup_run_token",
+        "revocation_receipt",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -318,7 +320,7 @@ fn is_vendor_secret(value: &str) -> bool {
         return true;
     }
     // ottto first-party tokens.
-    if lower.starts_with("ottto_") {
+    if lower.starts_with("ottto_") || lower.starts_with("otrr_") {
         return true;
     }
     // GitHub PATs and tokens.
@@ -514,6 +516,22 @@ fn id_char(ch: char) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn revocation_receipt_is_redacted_in_diagnostics() {
+        let receipt = "otrr_synthetic_receipt";
+        for text in [
+            receipt.to_string(),
+            format!("revocation_receipt={receipt}"),
+            format!(r#"{{"revocation_receipt":"{receipt}"}}"#),
+        ] {
+            assert!(!redact_inline(&text).contains(receipt));
+        }
+        assert_eq!(
+            redact_key_value("revocation_receipt", receipt),
+            RedactedValue::String("[REDACTED]".to_string())
+        );
+    }
 
     #[test]
     fn redacts_secret_keys() {

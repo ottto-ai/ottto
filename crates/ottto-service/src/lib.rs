@@ -895,6 +895,19 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// Registration requested browser consent. Preserve the bound account and
+    /// candidate; expose the existing sign-in action instead of a failed setup.
+    pub(crate) fn mark_history_choice_required(&self) -> Result<(), LocalApiError> {
+        let mut state = self.state()?;
+        state.account.state = LocalAccountState::ReattachRequired;
+        state.account.message = Some(StableMessage {
+            code: "history_choice_required".to_string(),
+            text: "Waiting for browser sign-in to finish.".to_string(),
+        });
+        state.account.can_reconnect = Some(true);
+        Ok(())
+    }
+
     /// Keep the pending browser claim resumable while exposing an actionable,
     /// typed device-authority conflict instead of an endless claim-pending loop.
     pub fn mark_reattach_required(

@@ -1016,7 +1016,7 @@ fn member_eof(
         }
         let mut snapshots = parsed.snapshots;
         for snapshot in &mut snapshots {
-            apply_codex_state_evidence(snapshot, inputs.metadata);
+            apply_codex_state_evidence(snapshot, inputs.metadata, &member.path);
         }
         let baseline = LegacyBaseline {
             owner: group.owner.clone(),
