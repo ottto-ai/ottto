@@ -3909,6 +3909,11 @@ pub(crate) fn record_claude_request_census(
     }
 }
 
+/// Observe the N3 wall clock at the checkpoint boundary, as well as load.
+pub(super) fn observe_duplicate_rebuild_clock(index: &mut ScanIndex) {
+    rebuild_bound::observe_clock(index);
+}
+
 /// MONEY N3: a Claude parse of `path` is starting (spends a pending rearm).
 pub(crate) fn note_duplicate_rebuild_started(index: &mut ScanIndex, path: &Path) {
     rebuild_bound::note_started(index, path);
@@ -8157,9 +8162,4 @@ mod memo_accounting_tests {
         assert_eq!(census.serialized_total, 0);
         assert_eq!(census.hash_total, 0);
     }
-}
-
-/// Observe the N3 wall clock at the checkpoint boundary, as well as load.
-pub(super) fn observe_duplicate_rebuild_clock(index: &mut ScanIndex) {
-    rebuild_bound::observe_clock(index);
 }

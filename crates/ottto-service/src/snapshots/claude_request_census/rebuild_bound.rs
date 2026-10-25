@@ -487,9 +487,7 @@ fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64, born: u64) -> Op
     let stamp = unread_grant(tracked)?;
     if now < high_water.max(stamp) {
         Some("grant_clock_regressed")
-    } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ)
-        || monotonic_millis().saturating_sub(born) > N3_GRANT_MAX_LOAD_TO_READ * 1000
-    {
+    } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ) || grant_age_expired(born) {
         Some("grant_read_span_expired")
     } else {
         None
@@ -742,16 +740,47 @@ static SPENT: std::sync::Mutex<SpentGrants> = std::sync::Mutex::new(SpentGrants 
 static ALARMED: std::sync::Mutex<BTreeSet<(String, &'static str)>> =
     std::sync::Mutex::new(BTreeSet::new());
 
-/// Elapsed process time, independent of wall-clock corrections. Milliseconds
-/// preserve the inclusive span boundary without truncating a late read to it.
+/// Suspend-inclusive elapsed time, independent of wall-clock corrections.
+/// macOS Instant/CLOCK_UPTIME_RAW stops in sleep; CLOCK_MONOTONIC_RAW is
+/// mach_continuous_time in time units, including sleep. Linux BOOTTIME has
+/// the same suspend-inclusive contract. Unsupported/failed clocks refuse.
 fn monotonic_millis() -> u64 {
     #[cfg(test)]
     if let Some(elapsed) = TEST_ELAPSED.with(std::cell::Cell::get) {
         return elapsed;
     }
-    static START: std::sync::LazyLock<std::time::Instant> =
-        std::sync::LazyLock::new(std::time::Instant::now);
-    START.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    {
+        #[cfg(target_os = "macos")]
+        let clock = libc::CLOCK_MONOTONIC_RAW;
+        #[cfg(target_os = "linux")]
+        let clock = libc::CLOCK_BOOTTIME;
+        let mut spec = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes only the provided initialized timespec.
+        if unsafe { libc::clock_gettime(clock, &mut spec) } != 0 {
+            return u64::MAX;
+        }
+        if spec.tv_sec < 0 || !(0..1_000_000_000).contains(&spec.tv_nsec) {
+            return u64::MAX;
+        }
+        (spec.tv_sec as u64)
+            .checked_mul(1000)
+            .and_then(|seconds| seconds.checked_add(spec.tv_nsec as u64 / 1_000_000))
+            .unwrap_or(u64::MAX)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    u64::MAX
+}
+
+fn grant_age_expired(born: u64) -> bool {
+    let now = monotonic_millis();
+    born == u64::MAX
+        || now == u64::MAX
+        || now < born
+        || now - born > N3_GRANT_MAX_LOAD_TO_READ * 1000
 }
 
 /// Each N3 load and checkpoint observes wall time, even without a new grant.
@@ -1778,6 +1807,30 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Clock failure, reversal or sleep cannot turn unknown/late real age
+    /// into authority. The inclusive span remains valid through its last ms.
+    #[test]
+    fn grant_age_failure_reversal_and_suspend_spend_the_grant() {
+        let born = 1_000;
+        for (now, expired) in [
+            (born + N3_GRANT_MAX_LOAD_TO_READ * 1000, false),
+            (born + N3_GRANT_MAX_LOAD_TO_READ * 1000 + 1, true),
+            // Two awake hours plus eighteen suspended hours.
+            (born + 20 * 3600 * 1000, true),
+            (born - 1, true),
+            (u64::MAX, true),
+        ] {
+            TEST_ELAPSED.with(|cell| cell.set(Some(now)));
+            assert_eq!(grant_age_expired(born), expired, "clock={now}");
+        }
+        TEST_ELAPSED.with(|cell| cell.set(Some(1_000)));
+        assert!(
+            grant_age_expired(u64::MAX),
+            "failed birth stays refused after recovery"
+        );
+        TEST_ELAPSED.with(|cell| cell.set(None));
+    }
 
     /// The field's own decoder, as a plain Serde path runs it.
     fn field_priors(raw: &str) -> serde_json::Result<BTreeMap<String, String>> {
