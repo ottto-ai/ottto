@@ -29,7 +29,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub(crate) const GATE: bool = false;
 /// A record this much older than its file's effective birth was copied in.
 /// Copies written within it are counted (known residual, disclosed nowhere).
-const SLACK: i128 = 2_000_000_000;
+pub(in crate::snapshots) const SLACK: i128 = 2_000_000_000;
 const HOUR_NANOS: i128 = 3_600_000_000_000;
 /// Same bound the P1 holder walk used; a hit is counted and disclosed.
 const SIDE_CALL_DEADLINE: Duration = Duration::from_millis(250);
@@ -79,34 +79,17 @@ impl ReadContext<'_> {
             .keys()
             .any(|key| member_matches(Path::new(key), member) && location_key(key) == location)
     }
-    fn has_twins(&self, member: &str) -> bool {
-        self.index
-            .files
-            .keys()
-            .filter(|key| member_matches(Path::new(key), member))
-            .take(2)
-            .count()
-            > 1
-    }
 }
 
 fn member_matches(path: &Path, session: &str) -> bool {
-    claude_index_path_member_ref(path).is_some_and(|member| match member.subagent_stem {
-        None => member.root == session,
-        Some(stem) => {
-            session
-                .strip_prefix(member.root)
-                .and_then(|s| s.strip_prefix('_'))
-                == Some(stem)
-        }
-    })
+    claude_index_path_member_ref(path).is_some_and(|member| member.matches_member(session))
 }
 
 /// Same member spelling as T4's twin index, including subagent stems.
 fn session_member(path: &Path) -> Option<std::borrow::Cow<'_, str>> {
     let member = claude_index_path_member_ref(path)?;
     Some(match member.subagent_stem {
-        Some(stem) => std::borrow::Cow::Owned(format!("{}_{stem}", member.root)),
+        Some(_) => std::borrow::Cow::Owned(member.into_owned().1),
         None => std::borrow::Cow::Borrowed(member.root),
     })
 }
@@ -513,7 +496,12 @@ impl FileFold {
         let needs_original = self.first_own.is_none()
             || matches!(self.role, Role::Twin)
             || context.is_some_and(|context| {
-                session_member(context.path).is_some_and(|member| context.has_twins(&member))
+                self.location.is_some_and(|Located(location)| {
+                    context
+                        .index
+                        .claude_money_birth_store
+                        .staged_location(location)
+                })
             });
         let keep = self.money_birth.writer_certified(self.first_own)
             && (!needs_original || self.original_witness(context));

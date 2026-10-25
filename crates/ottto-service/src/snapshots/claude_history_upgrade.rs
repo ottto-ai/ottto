@@ -1936,6 +1936,16 @@ mod tests {
         );
         index.stage_claude_history_twins(OTHER, &mut staged);
         assert_eq!(staged.staged_twins, Some((OTHER.to_owned(), Vec::new())));
+        assert!(index.claude_money_birth_store.staged(TWIN_A));
+        assert!(index.claude_money_birth_store.staged(TWIN_B));
+        assert!(
+            !index.claude_money_birth_store.staged(OTHER),
+            "a lone root pays no metadata probe"
+        );
+        assert!(
+            !index.claude_money_birth_store.staged(AGENT),
+            "a lone agent pays no metadata probe"
+        );
         let mut owed = |page: &mut HistoryPage, key: &str, size: u64| {
             index.stage_claude_history_twins(key, page);
             decide(HistoryKind::Owed, &inputs(&list, false, 2), page, key, size)

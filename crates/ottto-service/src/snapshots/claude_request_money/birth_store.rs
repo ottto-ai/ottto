@@ -280,9 +280,10 @@ impl BirthStore {
         self.1.clear();
     }
     pub(in crate::snapshots) fn staged(&self, path: &str) -> bool {
-        self.1
-            .binary_search_by_key(&location_key(path), |o| o.0)
-            .is_ok()
+        self.staged_location(location_key(path))
+    }
+    pub(in crate::snapshots) fn staged_location(&self, path: LocationKey) -> bool {
+        self.1.binary_search_by_key(&path, |o| o.0).is_ok()
     }
     pub(in crate::snapshots) fn witnessed(&self, path: LocationKey) -> bool {
         self.1
@@ -305,7 +306,7 @@ impl BirthStore {
             current.size >= indexed_size
                 && self
                     .get(session)
-                    .and_then(|s| s.4.iter().find(|o| o.0 == pk))
+                    .and_then(|s| s.4.binary_search_by_key(&pk, |o| o.0).ok().map(|i| &s.4[i]))
                     .is_some_and(|o| o.3.covers(current))
         });
         let status = u8::from(opened.is_some()) | (u8::from(valid) << 1);
@@ -322,6 +323,7 @@ impl BirthStore {
         birth: i128,
         opened: ClaudeOpenedBirth,
     ) {
+        let remembered = self.observed_birth(session, path).is_some();
         self.record_observation(session, path, birth);
         let sk = session_key(session);
         let pk = location_key(path);
@@ -333,7 +335,7 @@ impl BirthStore {
             return;
         };
         let o = &mut s.4[j];
-        if o.3.inode == 0 && i128::from(o.1) == birth {
+        if !remembered && i128::from(o.1) == birth {
             o.3 = BirthIdentity::from_opened(opened);
         } else if o.3.covers(opened) {
             o.3.size = u32::try_from(opened.size).unwrap_or(u32::MAX);
@@ -604,10 +606,11 @@ mod tests {
         );
         assert_eq!(restored.observed_birth("s", "A"), Some(100));
         assert_eq!(std::mem::size_of::<BirthIdentity>(), 16);
-        assert_eq!(std::mem::size_of::<(LocationKey, u8)>(), 24);
-        println!("F1C_COUNT_SIZE birth_identity_bytes={} transient_probe_bytes={} opened_metadata_bytes={} claude_file_birth_bytes={}",
+        assert_eq!(std::mem::size_of::<(LocationKey, u8)>(), 17);
+        println!("F1C_COUNT_SIZE birth_identity_bytes={} transient_probe_bytes={} opened_metadata_bytes={} claude_file_birth_bytes={} old_writer_run_bytes={}",
             std::mem::size_of::<BirthIdentity>(), std::mem::size_of::<(LocationKey, u8)>(),
-            std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>());
+            std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>(),
+            std::mem::size_of::<Option<(u8, u64)>>());
     }
 
     #[test]
@@ -624,6 +627,22 @@ mod tests {
             assert_eq!(restored.observed_birth("s", "A"), Some(100));
             assert_eq!(restored.effective_cutoff("s", "A"), Some(100));
             assert!(!restored.witnessed(location_key("A")));
+            let mut restored = restored;
+            restored.stage_opened(
+                "s",
+                "A",
+                Some(ClaudeOpenedBirth {
+                    birth: 100,
+                    device: 1,
+                    inode: 2,
+                    size: 10,
+                }),
+                10,
+            );
+            assert!(
+                !restored.witnessed(location_key("A")),
+                "legacy minima have no recorded generation to compare"
+            );
         }
     }
 

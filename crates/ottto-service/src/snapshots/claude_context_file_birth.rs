@@ -280,7 +280,7 @@ impl ClaudeFileBirth {
         let own = self
             .physical_birth_nanos()
             .zip(timestamp.and_then(rfc3339_unix_nanos))
-            .is_some_and(|(birth, at)| at >= birth - 2_000_000_000);
+            .is_some_and(|(birth, at)| at >= birth - super::claude_request_money::e2::SLACK);
         if own {
             self.writer.observe(version);
         }
