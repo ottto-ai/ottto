@@ -1753,6 +1753,12 @@ impl ClaudeRequestCensusShadowState {
     }
 }
 
+/// A shadow state whose evidence was drained as a resource outcome: unknown,
+/// so closed like a malformed one (the lenient reader's resource path).
+pub(super) fn unknown_shadow_state() -> ClaudeRequestCensusShadowState {
+    ClaudeRequestCensusShadowState::closed()
+}
+
 /// Compact wire form, keys short on purpose:
 /// `{"v":1,"fp":"<64 hex>","w":<unix>,"s":"exact","tw":true,"u":true,"b":"<base64>"}`.
 /// `b` is the request hashes as base64 of big-endian u64s (10.67 B per hash);
@@ -2000,6 +2006,11 @@ pub(super) fn normalized_bounded_bytes(
     use std::io::Read;
     let mut normalized = Vec::new();
     let mut reader = CensusRead::new(bytes);
+    // Main's bounded reader always normalizes: the bounded shape parser runs
+    // on these bytes before any record-local tolerant decoder, so raw
+    // optional evidence (a nonfinite or deep census) must not reach it, OFF
+    // included.
+    reader.normalize = true;
     reader.read_to_end(&mut normalized)?;
     Ok((normalized, reader.take_state()))
 }
@@ -6206,7 +6217,14 @@ mod phase_b_tests {
             !ClaudeRequestCensusJoin::new(&reloaded, 7, &BTreeSet::new())
                 .disjointness_complete(true)
         );
-        let outside = good.replacen('{', "{\"ordinary\":1e400,", 1);
+        // #718 ignores unknown root fields without interpreting them; a
+        // known ordinary field keeps its strict decode.
+        let outside = good.replacen(
+            "\"generation\":",
+            "\"generation\":1e400,\"ignored_generation\":",
+            1,
+        );
+        assert_ne!(outside, good);
         assert!(
             decode_bounded_index(outside.as_bytes()).is_err(),
             "the ordinary shape guard remains strict"

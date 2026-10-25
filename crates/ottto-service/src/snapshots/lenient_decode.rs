@@ -1952,7 +1952,14 @@ impl<R: BufRead + Seek> Decoder<R> {
             || (optional_census(Some(field))
                 && self.census_resources[usize::from(field == "claude_request_census_shadow")])
         {
-            return Ok(ScanIndex::default());
+            let mut index = ScanIndex::default();
+            if field == "claude_request_census_shadow" {
+                // Unknown, as the census reader reads drained evidence: the
+                // safety marker and rebuild guard close, never a fresh
+                // default (SI-724-B3).
+                index.claude_request_census_shadow = claude_request_census::unknown_shadow_state();
+            }
+            return Ok(index);
         }
         self.reader.seek(SeekFrom::Start(span.start))?;
         let prefix = format!("{{\"files\":{{}},\"{field}\":");

@@ -1890,6 +1890,23 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
                 actual.as_object_mut().unwrap().remove(key);
                 expected.as_object_mut().unwrap().remove(key);
             }
+            // SI-724-B3b: the "N3 initialized" marker is the rebuild guard's,
+            // saved beside the shadow state it backs. Only a damaged shadow
+            // state, which closes the guard, writes it here.
+            if actual
+                .as_object_mut()
+                .unwrap()
+                .remove("claude_census_rebuild_initialized")
+                .is_some()
+            {
+                assert!(name.starts_with("shadow"), "{name}: marker");
+                assert!(
+                    crate::snapshots::claude_request_census::duplicate_rebuild_test_support::closed(
+                        &loaded
+                    ),
+                    "{name}: the marker backs a closed guard"
+                );
+            }
             assert_eq!(actual, expected, "all other fields: {name}");
             if name == "record" {
                 assert_eq!(
@@ -4876,8 +4893,14 @@ fn census_rebuild_duplicated_root_fields_refuse_and_keep_the_index() {
             );
             let path = scratch.join("index.json");
             std::fs::write(&path, &raw).unwrap();
-            let entries = || std::fs::read_dir(scratch.as_ref()).unwrap().count();
-            let before = entries();
+            // A quarantine would leave a `.corrupt.` sibling.
+            let quarantined = || {
+                std::fs::read_dir(scratch.as_ref())
+                    .unwrap()
+                    .filter_map(Result::ok)
+                    .filter(|entry| entry.file_name().to_string_lossy().contains(".corrupt."))
+                    .count()
+            };
             assert!(ScanIndex::load(&path).is_err(), "{case}: load refused");
             assert!(
                 decode_bounded_index(raw.as_bytes()).is_err(),
@@ -4892,7 +4915,7 @@ fn census_rebuild_duplicated_root_fields_refuse_and_keep_the_index() {
             );
             assert!(plain.clone().save(&path).is_err(), "{case}: CAS refused");
             assert_eq!(std::fs::read_to_string(&path).unwrap(), raw, "{case}: kept");
-            assert_eq!(entries(), before, "{case}: never quarantined");
+            assert_eq!(quarantined(), 0, "{case}: never quarantined");
         }
     }
 }

@@ -1276,9 +1276,13 @@ fn optional_raw_cap_counts_object_field_leading_whitespace() {
     file.flush().unwrap();
     drop(file);
     let native = claude_request_census::decode_index(File::open(&path).unwrap()).unwrap();
-    assert!(native.claude_request_census_shadow.is_empty());
     let loaded = ScanIndex::load(&path).unwrap();
-    assert!(loaded.claude_request_census_shadow.is_empty());
+    // Phase B: a drained (unknown) shadow state is closed, never a fresh
+    // default (SI-724-B3): its safety marker and rebuild guard close.
+    for index in [&native, &loaded] {
+        assert!(!index.claude_request_census_shadow.is_empty());
+        assert!(claude_request_census::duplicate_rebuild_test_support::closed(index));
+    }
     assert_sibling(&loaded);
     assert_eq!(corrupt_count(scratch.as_ref()), 0);
 }
