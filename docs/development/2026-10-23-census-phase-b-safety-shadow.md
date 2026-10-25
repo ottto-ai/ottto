@@ -61,9 +61,11 @@ made or reused, no new key admitted and no read admitted
 (`grant_clock_regressed`, counted as exhausted) until the clock passes it; a
 grant found spent stays spent in its process (in the same working index
 too), and nothing on backward time lowers a persisted stamp (a refusal, a
-lost guard's reconstruction, which keeps its saved witness, or an identity
+lost guard's reconstruction (including a present guard with missing state),
+which keeps its saved witness, or an identity
 revoke, which keeps the removed key's latest stamp; every closure starts no
-earlier than the saved witness, of any copy of a duplicated shadow), a grant
+earlier than the saved witness, of any admitted copy of a duplicated shadow,
+even beside a resource-refused copy), a grant
 the census terminal finds spent is spent too, and an alarm's retry time is
 never before
 the clock passes the latest stamp. At most 512 keys are tracked, one compact line each in the saved

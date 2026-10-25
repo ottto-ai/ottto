@@ -4703,11 +4703,12 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
 }
 
 /// MONEY 724h condition 3, autoreview: a guard lost with its saved witness
-/// ahead of the wall clock (thirty days ahead here), alone, with its priors
-/// field refused too, or with its shadow duplicated (the witness in either
-/// copy; the bounded reader too), is closed from that witness, never from the
-/// backward clock. The save keeps the witness, so a reload one window later, still
-/// behind it, refuses the duplicate key; only one window past the witness is
+/// ahead of the wall clock (thirty days ahead here), missing or emptied (or
+/// retaining only earlier stamps), with its priors field refused too, or with
+/// its shadow duplicated (the witness in either copy, a resource-refused
+/// sibling included; the bounded reader too), is closed from that witness,
+/// never from the backward clock. The save keeps the witness, so a reload one
+/// window later, still behind it, refuses the duplicate key; only one window past the witness is
 /// it granted. In one process and across a restart; OFF and ON.
 #[test]
 fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
@@ -4723,9 +4724,13 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
     let witness = N3_T0 + 30 * N3_DAY;
     let variants = [
         "lost",
+        "present_empty",
+        "present_earlier",
         "priors_refused",
         "duplicate_first",
         "duplicate_second",
+        "duplicate_resource_first",
+        "duplicate_resource_second",
     ];
     for enabled in [false, true] {
         let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
@@ -4740,22 +4745,36 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
             let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
             let fingerprint = original.files[&key].source_file_fingerprint.clone();
             let path = scratch.join("index.json");
-            // The guard (`"n"`) is gone; only its witness is left, with a
-            // malformed priors field (refused), or in one copy of a
-            // duplicated shadow.
+            // Only the witness survives intact: the guard is missing,
+            // emptied or older, the priors refused, or the shadow duplicated.
             let raw = census_duplicate_rebuild_raw(&original, &key, Some(serde_json::json!({})));
             let shadow = r#""claude_request_census_shadow":{"n":{}}"#;
             assert_eq!(raw.matches(shadow).count(), 1, "{case}");
             assert!(!raw.contains("claude_census_rebuild_priors"), "{case}");
             let field = "\"claude_request_census_shadow\"";
+            // Only the optional sibling is over-depth; the index remains
+            // readable, and its valid copy's witness must survive both readers.
+            let resource = format!(r#"{{"x":{}0{}}}"#, "[".repeat(257), "]".repeat(257));
             let replacement = match variant {
                 "lost" => format!(r#"{field}:{{"nw":{witness}}}"#),
+                "present_empty" => format!(r#"{field}:{{"n":{{}},"nw":{witness}}}"#),
+                "present_earlier" => format!(
+                    r#"{field}:{{"n":{{"k":{{"{}":"17:{}"}}}},"nw":{witness}}}"#,
+                    bound::key_id(&key),
+                    N3_T0 - N3_DAY
+                ),
                 "priors_refused" => format!(
                     r#"{field}:{{"nw":{witness}}},"claude_census_rebuild_priors":{{"{}":7}}"#,
                     bound::key_id(&key)
                 ),
                 "duplicate_first" => format!(r#"{field}:{{"nw":{witness}}},{field}:{{}}"#),
                 "duplicate_second" => format!(r#"{field}:{{}},{field}:{{"nw":{witness}}}"#),
+                "duplicate_resource_first" => {
+                    format!(r#"{field}:{resource},{field}:{{"nw":{witness}}}"#)
+                }
+                "duplicate_resource_second" => {
+                    format!(r#"{field}:{{"nw":{witness}}},{field}:{resource}"#)
+                }
                 other => panic!("{other}"),
             };
             let raw = raw.replace(shadow, &replacement);

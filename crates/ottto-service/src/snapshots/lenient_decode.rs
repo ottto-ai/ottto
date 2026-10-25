@@ -2062,7 +2062,17 @@ impl<R: BufRead + Seek> Decoder<R> {
                 // Unknown, as the census reader reads drained evidence: the
                 // safety marker and rebuild guard close, never a fresh
                 // default (SI-724-B3).
-                index.claude_request_census_shadow = claude_request_census::unknown_shadow_state();
+                // A resource-refused sibling copy must not erase this
+                // copy's admitted witness. The shared resource flag closes
+                // both shadows, but each span keeps its own evidence bounds.
+                let witness = if span.resource {
+                    0
+                } else {
+                    self.isolated_bytes(span)?
+                        .map_or(0, |bytes| claude_request_census::shadow_witness(&bytes))
+                };
+                index.claude_request_census_shadow =
+                    claude_request_census::unknown_shadow_state(witness);
             }
             return Ok(index);
         }

@@ -1754,9 +1754,12 @@ impl ClaudeRequestCensusShadowState {
 }
 
 /// A shadow state whose evidence was drained as a resource outcome: unknown,
-/// so closed like a malformed one (the lenient reader's resource path).
-pub(super) fn unknown_shadow_state() -> ClaudeRequestCensusShadowState {
-    ClaudeRequestCensusShadowState::closed()
+/// so closed like a malformed one (the lenient reader's resource path),
+/// preserving an admitted sibling copy's valid witness.
+pub(super) fn unknown_shadow_state(witness: u64) -> ClaudeRequestCensusShadowState {
+    let mut state = ClaudeRequestCensusShadowState::closed();
+    state.rebuild_witness = valid_witness(witness);
+    state
 }
 
 /// Compact wire form, keys short on purpose:

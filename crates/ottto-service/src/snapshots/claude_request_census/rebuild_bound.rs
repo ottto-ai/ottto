@@ -812,6 +812,13 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             }
         }
     };
+    // A present guard whose contents no longer account for its still-counted
+    // witness lost state too. In particular, `n: {}` beside a future `nw`
+    // must never become a fresh guard or lower that saved witness.
+    if carried > guard.latest_stamp() && counted(carried, now) {
+        lost = true;
+        close(&mut guard.closed_at, now.max(carried));
+    }
     let missing = lost;
     if marker_refused && !priors_refused {
         // SI-724-B3b: value-level damage to the marker is isolated, and the
