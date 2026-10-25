@@ -4606,6 +4606,90 @@ fn census_duplicate_rebuild_terminal_observed_regression_spends_the_grant() {
     }
 }
 
+/// MONEY 724h condition 3, autoreview: a save's throwaway CAS decode can be
+/// the first observer of backward time. It spends the grant for the original
+/// working index too, before any admission or terminal can observe it.
+/// Both plain and bounded CAS, current and earlier forms, OFF and ON.
+#[test]
+fn census_duplicate_rebuild_save_observed_regression_spends_the_grant() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            for bounded in [false, true] {
+                let case = format!("shadow={enabled} {form} bounded={bounded}");
+                bound::restart();
+                let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-save-clock");
+                let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+                let fingerprint = original.files[&key].source_file_fingerprint.clone();
+                let path = scratch.join("index.json");
+                std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+                let clock = bound::set_now(N3_T0);
+                let mut index = ScanIndex::load(&path).unwrap();
+                persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+                assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    rearmed,
+                    "{case}: before regression"
+                );
+                drop(clock);
+
+                let clock = bound::set_now(N3_T0 - 60);
+                if bounded {
+                    index.save_with_read_limit(&path, 64 * 1024 * 1024).unwrap();
+                } else {
+                    index.save(&path).unwrap();
+                }
+                // No decision or terminal here: only the CAS decode saw the
+                // rollback, and its exhausted flags were discarded.
+                assert_eq!(bound::saved_stamps(&path, &key), vec![N3_T0], "{case}");
+                drop(clock);
+
+                let forward = N3_T0 + 60;
+                let _clock = bound::set_now(forward);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: save-observed regression stays spent"
+                );
+                assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+                assert_eq!(census_rebuild_counters(&mut index), (1, 0), "{case}");
+                assert_eq!(
+                    census_rebuild_alarms(&key, "grant_clock_regressed"),
+                    1,
+                    "{case}"
+                );
+
+                let mut reloaded = ScanIndex::load(&path).unwrap();
+                assert_eq!(
+                    bound::attempts(&reloaded, &key),
+                    vec![N3_T0, forward],
+                    "{case}: a new counted attempt"
+                );
+                persist_duplicate_rebuild_grants(&mut reloaded, &path).unwrap();
+                assert_eq!(
+                    bound::saved_stamps(&path, &key),
+                    vec![N3_T0, forward],
+                    "{case}"
+                );
+                assert_eq!(
+                    census_rebuild_decision(&reloaded, &key, &fingerprint),
+                    rearmed,
+                    "{case}: only after the new grant is saved"
+                );
+            }
+        }
+    }
+}
+
 /// MONEY 724h condition 3, autoreview: a refusal on backward time never
 /// lowers a persisted stamp. The guard's latest stamp is a counter's (an
 /// earlier untracked refusal at `N3_T0`, no key tracked). A new duplicate key

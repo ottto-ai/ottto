@@ -832,7 +832,8 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     // MONEY 724h condition 3: behind the guard's latest persisted stamp the
     // wall clock went backward. That time is no new authority: no grant is
     // made or reused, and no new key is admitted, until the clock passes it.
-    let regressed = now < guard.latest_stamp();
+    let high_water = guard.latest_stamp();
+    let regressed = now < high_water;
     guard.settle_clock(now);
     let mut priors = std::mem::take(&mut index.claude_census_rebuild_priors);
     if lost && priors.is_empty() {
@@ -1012,8 +1013,15 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             })
         };
         if unspent.is_none() {
-            // Spent (or never this process's): never reused later.
-            spend(id, tracked);
+            // A save's throwaway CAS decode may be the first observer of a
+            // spent grant. Remember it for the original working index too,
+            // whose flags survive that discarded decode.
+            if let Some(cause) = grant_spent(tracked, now, high_water) {
+                mark_spent(id, tracked, cause);
+            } else {
+                // Spent (or never this process's): never reused later.
+                spend(id, tracked);
+            }
         }
         if unspent.is_some() && open {
             // This process saved the grant and has not started its read. A
