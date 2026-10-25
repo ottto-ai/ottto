@@ -7,10 +7,11 @@
 use super::*;
 
 /// Compiled V2 cutover, Unix milliseconds, compared with the root origin
-/// header's `session_meta.payload.timestamp`. `None` keeps every session on
-/// Legacy counting. Activation is a separate reviewed change that freezes one
-/// instant after the group parser path is configured; never a moving time.
-pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: Option<i64> = None;
+/// header's `session_meta.payload.timestamp`: 2026-10-26T12:00:00Z. Sessions
+/// whose root header is at or after it, and that no Legacy writer has already
+/// acknowledged, use V2; every earlier session stays Legacy. Frozen once; never
+/// move it. `None` would keep every session on Legacy counting.
+pub(super) const CODEX_COUNTING_V2_CUTOVER_UNIX_MS: Option<i64> = Some(1_793_016_000_000);
 
 #[cfg(test)]
 thread_local! {
@@ -23,12 +24,12 @@ fn cutover_unix_ms() -> Option<i64> {
     CODEX_COUNTING_V2_CUTOVER_UNIX_MS
 }
 
-/// Tests may substitute a cutover on their own thread.
+/// Tests see only a cutover set on their own thread, never the compiled one,
+/// so fixtures stamped with the wall clock cannot switch rule once the
+/// compiled instant passes.
 #[cfg(test)]
 fn cutover_unix_ms() -> Option<i64> {
-    TEST_CUTOVER_UNIX_MS
-        .with(std::cell::Cell::get)
-        .or(CODEX_COUNTING_V2_CUTOVER_UNIX_MS)
+    TEST_CUTOVER_UNIX_MS.with(std::cell::Cell::get)
 }
 
 /// Activates a cutover for scan-level tests on this thread until dropped.

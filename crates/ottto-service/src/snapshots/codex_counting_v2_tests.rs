@@ -1193,3 +1193,12 @@ fn codex_v2_receipts_reach_local_diagnostics_with_open_turn_debt() {
         "a Legacy decision folds nothing"
     );
 }
+
+/// Activation freezes one instant, 2026-10-26T12:00:00Z; it must never move.
+#[test]
+fn codex_counting_v2_compiled_cutover_is_frozen() {
+    assert_eq!(
+        codex_counting_version::CODEX_COUNTING_V2_CUTOVER_UNIX_MS,
+        Some(1_793_016_000_000)
+    );
+}
