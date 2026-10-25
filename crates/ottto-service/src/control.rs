@@ -5292,18 +5292,15 @@ fn begin_durable_browser_claim(
     daemon: &LocalDaemon,
     pending: PendingAuthClaim,
 ) -> Result<AuthStartResponse, LocalApiError> {
-    let expected = local_history_recovery_expected()?;
+    let _identity_lock = lock_setup_run_binding();
+    require_identity_mutation_reservation(None)?;
     let registration = history_account_store()
         .load()
         .is_ok_and(|account| registration_history_choice_account(&account));
     let response = daemon.begin_auth_with_claim(pending)?;
     let mut persisted = response.account.clone();
-    if expected {
-        persisted.message = Some(if registration {
-            registration_history_choice_message()
-        } else {
-            local_release_pending_message()
-        });
+    if registration {
+        persisted.message = Some(registration_history_choice_message());
     }
     history_account_store()
         .save(&persisted)
@@ -5312,8 +5309,18 @@ fn begin_durable_browser_claim(
 }
 
 fn retire_refused_registration_after_browser_answer(claim_code: &str) -> Result<(), LocalApiError> {
-    let browser: Option<StoredHistoryBrowserClaim> =
-        history_load(history_stores().browser.as_ref())?;
+    retire_refused_registration_after_browser_answer_with_stores(claim_code, &history_stores())
+}
+
+fn retire_refused_registration_after_browser_answer_with_stores(
+    claim_code: &str,
+    stores: &HistoryStores,
+) -> Result<(), LocalApiError> {
+    let browser: Option<StoredHistoryBrowserClaim> = match history_load(stores.browser.as_ref()) {
+        Ok(browser) => browser,
+        Err(_) if !local_history_recovery_expected()? => return Ok(()),
+        Err(error) => return Err(error),
+    };
     if !browser.is_some_and(|browser| {
         browser.registration_pending && browser.claim.claim_code == claim_code
     }) {
@@ -5348,52 +5355,38 @@ fn retire_refused_registration_after_browser_answer(claim_code: &str) -> Result<
     }
 }
 
-const LOCAL_HISTORY_RECOVERY_PENDING: &str = "local_history_recovery_pending";
+fn history_recovery_indicator_path() -> PathBuf {
+    history_support_dir().join("local-history-recovery-required")
+}
 
 fn local_history_recovery_expected() -> Result<bool, LocalApiError> {
+    // Presence only: no device selector, timestamp, receipt, or credential is
+    // mirrored here. The actual marker/proof remain Keychain-only. This lets a
+    // locked optional Keychain be distinguished from ordinary first sign-in,
+    // without changing the account captured by an identity reservation.
+    match fs::symlink_metadata(history_recovery_indicator_path()) {
+        Ok(metadata) if metadata.is_file() => return Ok(true),
+        Ok(_) => return Err(LocalApiError::StatePoisoned),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(_) => return Err(LocalApiError::StatePoisoned),
+    }
     history_account_store()
         .load()
-        .map(|account| {
-            account.message.as_ref().is_some_and(|m| {
-                matches!(
-                    m.code.as_str(),
-                    LOCAL_HISTORY_RECOVERY_PENDING | "history_choice_required"
-                )
-            })
-        })
+        .map(|account| registration_history_choice_account(&account))
         .map_err(|_| LocalApiError::StatePoisoned)
 }
 
-fn local_release_pending_message() -> StableMessage {
-    StableMessage {
-        code: LOCAL_HISTORY_RECOVERY_PENDING.to_string(),
-        text: "Waiting for browser sign-in to finish.".to_string(),
-    }
-}
-
 fn persist_local_release_expected() -> Result<(), LocalApiError> {
-    let store = history_account_store();
-    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
-    account.message = Some(local_release_pending_message());
-    store
-        .save(&account)
+    ottto_core::write_owner_only_file_atomic(&history_recovery_indicator_path(), b"1")
         .map_err(|_| LocalApiError::StatePoisoned)
 }
 
 fn clear_local_release_expected() -> Result<(), LocalApiError> {
-    let store = history_account_store();
-    let mut account = store.load().map_err(|_| LocalApiError::StatePoisoned)?;
-    if account
-        .message
-        .as_ref()
-        .is_some_and(|m| m.code == LOCAL_HISTORY_RECOVERY_PENDING)
-    {
-        account.message = None;
-        store
-            .save(&account)
-            .map_err(|_| LocalApiError::StatePoisoned)?;
+    match fs::remove_file(history_recovery_indicator_path()) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(LocalApiError::StatePoisoned),
     }
-    Ok(())
 }
 
 fn registration_history_choice_account(account: &LocalAccountBinding) -> bool {
@@ -7236,17 +7229,9 @@ fn reset_local_account_files_locked(
     require_cloud_session_cleanup_before_identity_change(
         &crate::cloud_sessions::CloudSessionGrantStore::default(),
     )?;
-    if local_history_recovery_expected()? {
-        let mut account = LocalAccountBinding::not_connected();
-        account.message = Some(local_release_pending_message());
-        FileAccountStore::default()
-            .save(&account)
-            .map_err(|_| LocalApiError::StatePoisoned)?;
-    } else {
-        FileAccountStore::default()
-            .reset()
-            .map_err(|_| LocalApiError::StatePoisoned)?;
-    }
+    FileAccountStore::default()
+        .reset()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
     FileConnectionStore::default()
         .reset()
         .map_err(|_| LocalApiError::StatePoisoned)?;
@@ -7532,10 +7517,14 @@ fn stage_local_release(
     let api_base_url = validated_api_base_url(Some(api_base_url))?;
     let existing: Option<LocalReleaseMarker> = history_load(stores.marker.as_ref())?;
     // Preserve the original boundary across a refresh/retry of the release.
-    let same_release = existing
-        .as_ref()
-        .is_some_and(|m| m.device_id == release.device_id && m.api_base_url == api_base_url
-            && !m.ceremony_closed && now.checked_sub(m.released_at).is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age)));
+    let same_release = existing.as_ref().is_some_and(|m| {
+        m.device_id == release.device_id
+            && m.api_base_url == api_base_url
+            && !m.ceremony_closed
+            && now
+                .checked_sub(m.released_at)
+                .is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age))
+    });
     if !same_release {
         stores
             .receipt
@@ -7606,7 +7595,10 @@ fn clear_local_release(stores: &HistoryStores) -> Result<(), LocalApiError> {
         .delete()
         .map_err(|_| LocalApiError::StatePoisoned)?;
     clear_local_release_expected()?;
-    stores.marker.delete().map_err(|_| LocalApiError::StatePoisoned)
+    stores
+        .marker
+        .delete()
+        .map_err(|_| LocalApiError::StatePoisoned)
 }
 
 #[derive(Debug, Deserialize)]
@@ -9514,11 +9506,12 @@ fn setup_result_from_detail(
         })
         .collect::<Vec<_>>();
 
-    let local_claim: Option<StoredHistoryBrowserClaim> = match history_load(history_stores().browser.as_ref()) {
-        Ok(claim) => claim,
-        Err(_) if !local_history_recovery_expected()? => None,
-        Err(error) => return Err(error),
-    };
+    let local_claim: Option<StoredHistoryBrowserClaim> =
+        match history_load(history_stores().browser.as_ref()) {
+            Ok(claim) => claim,
+            Err(_) if !local_history_recovery_expected()? => None,
+            Err(error) => return Err(error),
+        };
     let local_claim_url = local_claim
         .filter(|claim| {
             claim.setup_run_id.as_deref() == Some(connection.setup_run_id.as_str())
@@ -24939,6 +24932,9 @@ for line in sys.stdin:
                 .claim_code,
             "claim"
         );
+        assert!(
+            retire_refused_registration_after_browser_answer_with_stores("claim", &stores).is_ok()
+        );
         assert!(history_choice_request_body(&server.join().unwrap()[0])
             .get("revocation_receipt")
             .is_none());
@@ -24950,7 +24946,9 @@ for line in sys.stdin:
             history_choice_create(&blocked_base, &stores, 102).is_err(),
             "known release must not silently downgrade when Keychain is locked"
         );
-        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
     }
 
     #[test]
@@ -24988,6 +24986,51 @@ for line in sys.stdin:
         ] {
             assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
         }
+    }
+
+    #[test]
+    #[serial]
+    fn history_choice_release_recovery_preserves_identity_reservation_witness() {
+        let _lock = lock_backend_test_env();
+        let (root, _guards, daemon, _) =
+            connected_binding_fixture("history-reservation", DEFAULT_API_BASE_URL.into());
+        let account = FileAccountStore::default().load().unwrap();
+        let reservation = reserve_identity_mutation(false).unwrap();
+        let stores = history_stores();
+        history_choice_stage_test_release(&stores, DEFAULT_API_BASE_URL, history_now());
+        {
+            let _identity_lock = lock_setup_run_binding();
+            assert_eq!(reservation.validate_locked(), Ok(()));
+        }
+        let pending = PendingAuthClaim {
+            claim_code: "claim".into(),
+            claim_token: "token".into(),
+            nonce: "nonce".into(),
+            claim_url: "https://ottto.net/setup/claim?code=claim".into(),
+            expires_at: "2030-01-01T00:00:00Z".into(),
+        };
+        assert!(matches!(
+            begin_durable_browser_claim(&daemon, pending),
+            Err(LocalApiError::IdentityMutationInProgress)
+        ));
+        clear_local_release(&stores).unwrap();
+        assert_eq!(FileAccountStore::default().load().unwrap(), account);
+        {
+            let _identity_lock = lock_setup_run_binding();
+            assert_eq!(reservation.validate_locked(), Ok(()));
+            let mut changed = account;
+            changed.message = Some(StableMessage {
+                code: "unrelated-authority-change".into(),
+                text: "synthetic".into(),
+            });
+            FileAccountStore::default().save(&changed).unwrap();
+            assert_eq!(
+                reservation.validate_locked(),
+                Err(LocalApiError::IdentityMutationInProgress)
+            );
+        }
+        drop(reservation);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
