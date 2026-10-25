@@ -33,7 +33,10 @@
 //!   Behind the guard's latest persisted stamp, time is no new authority: no
 //!   grant is made or reused, no new key admitted and no read admitted
 //!   (`grant_clock_regressed`, counted like an exhausted key), until the
-//!   clock passes that stamp. A grant found spent stays spent in its process.
+//!   clock passes that stamp. A grant found spent stays spent in its process,
+//!   in the same working index too, until a new counted attempt. A stamp is
+//!   only ever raised, never lowered by a refusal on backward time, so the
+//!   latest stamp (and the witness) never falls.
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
 //!   reached the key yet does not spend an attempt. A grant authorizes a read
@@ -447,6 +450,22 @@ fn within(stamp: u64, now: u64, window: u64) -> bool {
     now <= stamp || now - stamp <= window
 }
 
+/// Condition 3: a persisted stamp is only ever raised, never lowered by a
+/// wall clock behind it, so the guard's latest stamp (the high-water and
+/// the witness) never falls and no window it starts is shortened.
+fn raise(at: &mut u64, now: u64) {
+    *at = (*at).max(now);
+}
+
+/// `raise` for the closure stamp; `UNSTAMPED` is no stamp.
+fn close(closed_at: &mut Option<u64>, now: u64) {
+    *closed_at = Some(
+        closed_at
+            .filter(|at| *at != UNSTAMPED)
+            .map_or(now, |at| at.max(now)),
+    );
+}
+
 /// MONEY 724h P2 and condition 3: why `tracked`'s grant (its latest counted
 /// stamp, saved before the scan) can no longer authorize a read, if it is
 /// pending, neither refused nor started. Before `high_water`, the guard's
@@ -454,10 +473,7 @@ fn within(stamp: u64, now: u64, window: u64) -> bool {
 /// backward: no new authority. Past `N3_GRANT_MAX_LOAD_TO_READ` the span is
 /// over.
 fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
-    if !tracked.has(PENDING) || tracked.has(EXHAUSTED) || tracked.has(STARTED) {
-        return None;
-    }
-    let stamp = *tracked.attempts.last()?;
+    let stamp = unread_grant(tracked)?;
     if now < high_water.max(stamp) {
         Some("grant_clock_regressed")
     } else if now > stamp.saturating_add(N3_GRANT_MAX_LOAD_TO_READ) {
@@ -465,6 +481,48 @@ fn grant_spent(tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'stat
     } else {
         None
     }
+}
+
+/// The stamp of `tracked`'s grant while it is pending, neither refused nor
+/// started.
+fn unread_grant(tracked: &TrackedKey) -> Option<u64> {
+    if !tracked.has(PENDING) || tracked.has(EXHAUSTED) || tracked.has(STARTED) {
+        return None;
+    }
+    tracked.attempts.last().copied()
+}
+
+/// `grant_spent`, sticky in this process: a grant `admission_refused` found
+/// spent stays spent while its stamp is the key's latest, even in the same
+/// working index once the wall clock is back inside its span.
+fn spent_cause(id: &str, tracked: &TrackedKey, now: u64, high_water: u64) -> Option<&'static str> {
+    let stamp = unread_grant(tracked)?;
+    grant_spent(tracked, now, high_water).or_else(|| {
+        with_spent(|spent| {
+            spent
+                .get(id)
+                .filter(|(at, _)| *at == stamp)
+                .map(|(_, cause)| *cause)
+        })
+    })
+}
+
+/// Records `id`'s grant at `stamp` as spent for `cause` in this process.
+/// Past the cap the entry with the oldest stamp is forgotten: its grant is
+/// at least as old as every other recorded one, so its span is over first.
+fn record_spent(id: &str, stamp: u64, cause: &'static str) {
+    with_spent(|spent| {
+        if spent.len() >= MAX_TRACKED_KEYS && !spent.contains_key(id) {
+            let oldest = spent
+                .iter()
+                .min_by_key(|(_, (at, _))| *at)
+                .map(|(id, _)| id.clone());
+            if let Some(oldest) = oldest {
+                spent.remove(&oldest);
+            }
+        }
+        spent.insert(id.to_owned(), (stamp, cause));
+    });
 }
 
 /// A grant found spent stays spent in this process: its saved grant is
@@ -555,7 +613,7 @@ impl DuplicateRebuildGuard {
 
     fn refuse_untracked(&mut self, now: u64) {
         self.untracked_refused = self.untracked_refused.saturating_add(1);
-        self.untracked_refused_at = now;
+        raise(&mut self.untracked_refused_at, now);
     }
 
     /// The window witness saved beside the guard: its latest stamp, or 0
@@ -613,6 +671,8 @@ thread_local! {
     static TEST_NOW: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
     static PERSISTED: std::cell::RefCell<BTreeMap<String, u64>> =
         const { std::cell::RefCell::new(BTreeMap::new()) };
+    static SPENT: std::cell::RefCell<BTreeMap<String, (u64, &'static str)>> =
+        const { std::cell::RefCell::new(BTreeMap::new()) };
     static ALARMED: std::cell::RefCell<BTreeSet<(String, &'static str)>> =
         const { std::cell::RefCell::new(BTreeSet::new()) };
     static ALARM_LINES: std::cell::RefCell<Vec<String>> =
@@ -622,6 +682,12 @@ thread_local! {
 /// the saved grant's stamp.
 #[cfg(not(test))]
 static PERSISTED: std::sync::Mutex<BTreeMap<String, u64>> = std::sync::Mutex::new(BTreeMap::new());
+/// Grants this process found spent as it admitted a read (key id, the
+/// grant's stamp and why): refused for as long as that stamp is the key's
+/// latest, in every working index of the process.
+#[cfg(not(test))]
+static SPENT: std::sync::Mutex<BTreeMap<String, (u64, &'static str)>> =
+    std::sync::Mutex::new(BTreeMap::new());
 /// One alarm per key and cause per process.
 #[cfg(not(test))]
 static ALARMED: std::sync::Mutex<BTreeSet<(String, &'static str)>> =
@@ -650,6 +716,17 @@ fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
 #[cfg(not(test))]
 fn with_persisted<T>(f: impl FnOnce(&mut BTreeMap<String, u64>) -> T) -> T {
     f(&mut PERSISTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner))
+}
+
+#[cfg(test)]
+fn with_spent<T>(f: impl FnOnce(&mut BTreeMap<String, (u64, &'static str)>) -> T) -> T {
+    SPENT.with(|set| f(&mut set.borrow_mut()))
+}
+#[cfg(not(test))]
+fn with_spent<T>(f: impl FnOnce(&mut BTreeMap<String, (u64, &'static str)>) -> T) -> T {
+    f(&mut SPENT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner))
 }
@@ -746,7 +823,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     if lost && priors.is_empty() {
         // Counted like an orphan; a saved prior counts as one below instead.
         guard.orphaned = guard.orphaned.saturating_add(1);
-        guard.orphaned_at = now;
+        raise(&mut guard.orphaned_at, now);
     }
     if priors_refused {
         // Trust none of the priors (a duplicated field's first copy
@@ -755,8 +832,8 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         // P1a); every other empty fingerprint takes the ordinary path.
         priors.clear();
         guard.priors_refused = guard.priors_refused.saturating_add(1);
-        guard.priors_refused_at = now;
-        guard.closed_at = Some(now);
+        raise(&mut guard.priors_refused_at, now);
+        close(&mut guard.closed_at, now);
     }
     // A revoked key is out of this bound's control (SI-724-B1b): its prior
     // is dropped with it, never counted as an orphan.
@@ -795,8 +872,8 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
     for id in orphans {
         priors.remove(&id);
         guard.orphaned = guard.orphaned.saturating_add(1);
-        guard.orphaned_at = now;
-        guard.closed_at = Some(now);
+        raise(&mut guard.orphaned_at, now);
+        close(&mut guard.closed_at, now);
         if transient.refusals.len() < MAX_ALARMS_PER_TERMINAL {
             transient.refusals.push((id, "orphaned_rearm"));
         }
@@ -936,6 +1013,9 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             tracked.attempts.push(now);
             tracked.flags = PENDING | (tracked.flags & CURRENT);
             transient.grants.push((id.clone(), now));
+            // A new grant, even one stamped in the same second as a spent
+            // one: only the spent grant stays refused.
+            with_spent(|spent| spent.remove(id.as_str()));
             // A marked entry is already empty and reads as Rearmed: this
             // counted attempt is its only authorization, saved before the
             // daemon's scan (`persist_grants`).
@@ -1037,9 +1117,9 @@ pub(crate) fn revoke_for_identity(
     guard.keys.remove(&id);
     let revoked = guard.revoked.entry(id.clone()).or_default();
     revoked.tokens.push(token);
-    revoked.at = now;
+    raise(&mut revoked.at, now);
     guard.identity_revoked = guard.identity_revoked.saturating_add(1);
-    guard.identity_revoked_at = now;
+    raise(&mut guard.identity_revoked_at, now);
     guard.unsaved.keys.insert(key.to_owned());
     shadow.rebuild_witness = guard.latest_stamp();
     with_persisted(|set| set.remove(&id));
@@ -1156,11 +1236,14 @@ pub(crate) fn held(index: &ScanIndex, key: &str) -> bool {
 /// `tracked`'s grant is spent (its span over, or the wall clock behind the
 /// guard's latest persisted stamp). A spent grant stays spent (`spend`).
 fn admission_refused(guard: &DuplicateRebuildGuard, id: &str, tracked: &TrackedKey) -> bool {
-    let spent = grant_spent(tracked, now_unix(), guard.latest_stamp()).is_some();
-    if spent {
-        spend(id, tracked);
+    let Some(cause) = spent_cause(id, tracked, now_unix(), guard.latest_stamp()) else {
+        return false;
+    };
+    spend(id, tracked);
+    if let Some(stamp) = unread_grant(tracked) {
+        record_spent(id, stamp, cause);
     }
-    spent
+    true
 }
 
 /// Candidate selection: `key` holds an unspent grant of this load, so its
@@ -1268,7 +1351,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     let spent: BTreeMap<&str, &'static str> = guard
         .keys
         .iter()
-        .filter_map(|(id, key)| Some((id, key, grant_spent(key, now, high_water)?)))
+        .filter_map(|(id, key)| Some((id, key, spent_cause(id, key, now, high_water)?)))
         .filter(|(id, key, _)| {
             !key.has(CURRENT)
                 || rearmed_ids
@@ -1381,6 +1464,7 @@ pub(crate) mod test_support {
     /// A new daemon process: no grant saved yet, no alarm emitted yet.
     pub(crate) fn restart() {
         PERSISTED.with(|set| set.borrow_mut().clear());
+        SPENT.with(|set| set.borrow_mut().clear());
         ALARMED.with(|set| set.borrow_mut().clear());
     }
     /// The per-key alarm budget spent by unrelated keys.

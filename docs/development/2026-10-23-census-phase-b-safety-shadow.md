@@ -59,7 +59,8 @@ persisted (MONEY 724h condition 3): a wall clock that goes backward never
 clamps or expires one early, and behind the guard's latest stamp no grant is
 made or reused, no new key admitted and no read admitted
 (`grant_clock_regressed`, counted as exhausted) until the clock passes it; a
-grant found spent stays spent in its process. At most 512 keys are tracked, one compact line each in the saved
+grant found spent stays spent in its process (in the same working index
+too), and a refusal on backward time never lowers a persisted stamp. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.
 

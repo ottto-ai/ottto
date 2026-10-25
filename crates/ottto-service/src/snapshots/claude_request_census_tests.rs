@@ -4460,6 +4460,22 @@ fn census_duplicate_rebuild_backward_clock_spends_the_grant() {
                 );
                 drop(clock);
 
+                // The clock comes back inside the grant's span with the same
+                // working index (no reload): the spent grant stays spent.
+                let clock = bound::set_now(N3_T0 + 60);
+                assert_eq!(
+                    census_rebuild_decision(&index, &key, &fingerprint),
+                    refused,
+                    "{case}: spent in this working index too"
+                );
+                assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+                assert_eq!(
+                    census_rebuild_counters(&mut index),
+                    (1, 0),
+                    "{case}: still counted as exhausted"
+                );
+                drop(clock);
+
                 // Reloaded while the clock is still behind: no new attempt.
                 if restart {
                     bound::restart();
@@ -4509,6 +4525,102 @@ fn census_duplicate_rebuild_backward_clock_spends_the_grant() {
                     "{case}: saved before the scan"
                 );
             }
+        }
+    }
+}
+
+/// MONEY 724h condition 3, autoreview: a refusal on backward time never
+/// lowers a persisted stamp. The guard's latest stamp is a counter's (an
+/// earlier untracked refusal at `N3_T0`, no key tracked). A new duplicate key
+/// reached with the wall clock one hour back is refused; the save keeps the
+/// counter's stamp, so the witness never falls and a reload a minute later,
+/// still behind, refuses it again. Once the clock passes the stamp a counted
+/// attempt reads it. In one process and across a restart; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for restart in [false, true] {
+            let case = format!("shadow={enabled} restart={restart}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-clock-back-counter");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            std::fs::write(
+                &path,
+                census_duplicate_rebuild_raw(
+                    &original,
+                    &key,
+                    Some(serde_json::json!({ "u": 1, "ua": N3_T0 })),
+                ),
+            )
+            .unwrap();
+
+            let back = N3_T0 - 3_600;
+            let clock = bound::set_now(back);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}: no new key on backward time"
+            );
+            assert!(bound::attempts(&index, &key).is_empty(), "{case}");
+            assert_eq!(bound::witness(&index), N3_T0, "{case}: never lowered");
+            assert_eq!(
+                census_rebuild_counters(&mut index),
+                (2, 0),
+                "{case}: both refusals counted"
+            );
+            assert_eq!(
+                census_rebuild_alarms(&key, "grant_clock_regressed"),
+                1,
+                "{case}: alarmed"
+            );
+            index.save(&path).unwrap();
+            drop(clock);
+
+            if restart {
+                bound::restart();
+            }
+            let clock = bound::set_now(back + 60);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(bound::witness(&index), N3_T0, "{case}: saved as kept");
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}: still behind, still no new authority"
+            );
+            assert!(bound::attempts(&index, &key).is_empty(), "{case}");
+            assert_eq!(bound::witness(&index), N3_T0, "{case}");
+            assert_eq!(census_rebuild_counters(&mut index), (3, 0), "{case}");
+            index.save(&path).unwrap();
+            drop(clock);
+
+            let forward = N3_T0 + 60;
+            let _clock = bound::set_now(forward);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![forward],
+                "{case}: a counted attempt once the clock passes the stamp"
+            );
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}"
+            );
         }
     }
 }
