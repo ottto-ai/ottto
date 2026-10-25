@@ -4835,3 +4835,69 @@ fn fallback_withholds_and_ineligible_items_carry_no_display() {
     let wire = serde_json::to_string(&timed).unwrap();
     assert!(!wire.contains("latest_request_at") && !wire.contains("last_used_at"));
 }
+
+/// End to end on parsed requests: the newest own request's account is
+/// current, and a response without a complete event clock proves no order.
+#[test]
+fn transcript_path_current_account_is_the_newest_parsed_request() {
+    let (dir, root, mut items) = claude_account_family_fixture();
+    items.truncate(1);
+    let api = (1..=4)
+        .map(|n| {
+            let mut row = complete_api_row(&root, &format!("req_{n}"), n, 10, 10, 0);
+            if n > 2 {
+                row.account_identifier_hash = Some("b".repeat(64));
+            }
+            signed(row)
+        })
+        .collect::<Vec<_>>();
+    let trace = (1..=4)
+        .map(|n| complete_trace_row(&root, &format!("req_{n}"), ""))
+        .collect::<Vec<_>>();
+    let (api, trace) = reports(api, trace);
+    let evidence = ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+    let mut unclocked = items.clone();
+
+    identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    let display = items[0].claude_account_display.as_deref().expect("display");
+    assert_eq!(display.current.status, "known");
+    assert_eq!(display.current.account_identifier_hash, Some("b".repeat(64)));
+    assert_eq!(
+        display.current.latest_request_at.as_deref(),
+        Some("2026-08-02T07:00:03Z")
+    );
+    let accounts = display
+        .history
+        .iter()
+        .map(|entry| {
+            (
+                entry.account_identifier_hash.clone(),
+                entry.request_count,
+                entry.last_used_at.clone(),
+                entry.current,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        accounts,
+        vec![
+            (Some("b".repeat(64)), 2, Some("2026-08-02T07:00:03Z".to_string()), true),
+            (Some(OWNER_A.to_string()), 2, Some("2026-08-02T07:00:01Z".to_string()), false),
+        ]
+    );
+
+    unclocked[0]
+        .claude_usage_occurrences
+        .get_mut("req_1")
+        .unwrap()
+        .event_clock_complete = false;
+    identity::apply_scan(&mut unclocked, &evidence, BTreeMap::new());
+    if let Some(display) = unclocked[0].claude_account_display.as_deref() {
+        assert_eq!(display.current.status, "unknown");
+        assert_eq!(
+            display.current.unknown_reason.as_deref(),
+            Some("request_order_unavailable")
+        );
+    }
+    let _ = fs::remove_dir_all(dir);
+}

@@ -211,11 +211,7 @@ fn reconcile_with_registrations(
                 continue;
             }
             if let Some(snapshot) = observed.get(session.source_session_id.as_str()) {
-                let mut rebuilt = active_session_from_snapshot(source, snapshot, agent_status);
-                if carry_unobserved {
-                    keep_unchanged_session_accounts(&mut rebuilt, &session);
-                }
-                sessions.push(rebuilt);
+                sessions.push(active_session_from_snapshot(source, snapshot, agent_status));
                 selected_snapshots.insert(session.source_session_id.clone(), snapshot);
                 continue;
             }
@@ -442,24 +438,11 @@ fn active_session_from_snapshot(
     }
 }
 
-/// A re-read without new activity that could not rebuild the account facts
-/// (this cycle ran no per-request identity pass for it) keeps the listed
-/// row's: the same newest request still decides them. Any newer activity, a
-/// policy change or a rebuilt answer always wins, so nothing older resurfaces.
-fn keep_unchanged_session_accounts(rebuilt: &mut ActiveSession, listed: &ActiveSession) {
-    if rebuilt.current_account.is_none()
-        && rebuilt.account_history.is_empty()
-        && rebuilt.source_last_activity_at == listed.source_last_activity_at
-    {
-        rebuilt.current_account = listed.current_account.clone();
-        rebuilt.account_history = listed.account_history.clone();
-    }
-}
-
 /// The account of the session's newest own request and its usage per
 /// (account, workspace, subscription), from the snapshot's own contract-5
-/// request identity only. Rebuilt from scratch on every re-read, so a cached
-/// row never lends its old identity to new activity. Other sources, and
+/// request identity only. Rebuilt from scratch on every re-read (equal last
+/// activity does not prove the same requests), so a cached row never lends
+/// its identity to usage it did not see; only an unread row keeps its own. Other sources, and
 /// Claude items this scan did not tag, leave both absent: the current login,
 /// a plan observation or the lifetime account never stands in for them.
 fn session_accounts(
@@ -1895,18 +1878,27 @@ mod tests {
         .sessions;
         assert_eq!(quiet[0].current_account.as_ref(), Some(&display.current));
 
-        // Re-read with no new activity by a cycle that ran no per-request
-        // identity pass: the same newest request still decides, so the listed
-        // facts stay. A rebuilt answer for the same activity replaces them.
+        // Any re-read rebuilds from its own evidence. The same last activity
+        // does not prove the same requests (a second request in that same
+        // instant, or a corrected body), so a re-read this cycle could not
+        // tag clears the listed facts rather than lend them to new usage.
         let mut untagged = tagged.clone();
         untagged.claude_account_display = None;
+        untagged.input_tokens += 7;
+        untagged.request_count += 1;
         let reread = reconcile(
             &untagged,
             SnapshotSource::ClaudeCode,
             "2026-07-19T10:07:00Z",
         );
-        assert_eq!(reread[0].current_account.as_ref(), Some(&display.current));
-        assert_eq!(reread[0].account_history, display.history);
+        assert_eq!(reread[0].current_account, None);
+        assert!(reread[0].account_history.is_empty());
+        // Even a byte-identical re-read without an identity pass clears them.
+        let mut same = tagged.clone();
+        same.claude_account_display = None;
+        let unchanged = reconcile(&same, SnapshotSource::ClaudeCode, "2026-07-19T10:07:15Z");
+        assert_eq!(unchanged[0].current_account, None);
+        // A rebuilt answer for the same activity replaces the listed one.
         let mut retagged = tagged.clone();
         retagged.claude_account_display = Some(Box::new(account_display("account-b")));
         let replaced = reconcile(
@@ -1918,8 +1910,7 @@ mod tests {
             replaced[0].current_account,
             Some(account_display("account-b").current)
         );
-        // Newer activity without per-request identity: the listed identity is
-        // never resurrected for requests it did not see.
+        // Newer activity without per-request identity: absent too.
         let mut newer = untagged.clone();
         newer.source_last_activity_at = Some("2026-07-19T10:08:00Z".into());
         let advanced = reconcile(&newer, SnapshotSource::ClaudeCode, "2026-07-19T10:09:00Z");

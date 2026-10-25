@@ -504,6 +504,7 @@ impl Grouping {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn add(
         &mut self,
         bucket_start: &str,
@@ -2281,13 +2282,15 @@ impl<'s, 'a> RequestSink<'s, 'a> {
             request.row_key,
             request.usage,
             identity,
-            // The owned occurrence's own clock, never the observer time a
-            // reported rebuild falls back to: without one ("") no request is
-            // provably newest.
-            request.occurrence.map(|_| {
+            // The owned occurrence's own complete clock, never the observer
+            // time a reported rebuild falls back to. A response with an
+            // unstamped record keeps an earlier record's time, which proves no
+            // order: without a complete clock ("") no request is provably newest.
+            request.occurrence.map(|(_, event_clock_complete)| {
                 item.claude_usage_occurrences
                     .get(request.request_id)
                     .and_then(|occurrence| occurrence.timestamp.as_deref())
+                    .filter(|_| event_clock_complete)
                     .unwrap_or("")
             }),
         );
