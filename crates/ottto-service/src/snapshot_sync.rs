@@ -8576,6 +8576,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     // that family unproven, not suppress an unrelated healthy family.
     let mut api_report = crate::claude_local_otel::ClaudeLocalOtelLoadReport::default();
     let mut trace_report = crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default();
+    // E2: roots whose strict API and trace reads were both healthy. A healthy
+    // sidecar may hold no rows for the root, so evidence keys cannot say this.
+    let mut strict_healthy_roots = BTreeSet::new();
     for root_session_id in usage_roots {
         let mut api = api_read.take_strict_report(support_dir, &root_session_id);
         let mut trace = match prepared.as_mut() {
@@ -8602,6 +8605,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             continue;
         }
         stats.complete_sidecar_root_count += 1;
+        if request_owned_enabled {
+            strict_healthy_roots.insert(root_session_id.clone());
+        }
         let api_request_ids = api
             .evidence
             .get(&root_session_id)
@@ -8728,11 +8734,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             if let Some(root) =
                 crate::snapshots::claude_request_money::request_owned_family_root(item)
             {
-                // API attachment alone cannot certify side-call coverage. The
-                // aggregate admits a root only after BOTH strict reads succeed.
-                if !api_report.evidence.contains_key(root)
-                    || !trace_report.evidence.contains_key(root)
-                {
+                // API attachment alone cannot certify side-call coverage. A
+                // root is complete only after BOTH strict reads succeed.
+                if !strict_healthy_roots.contains(root) {
                     item.telemetry_owned_complete = Some(false);
                 }
             }
