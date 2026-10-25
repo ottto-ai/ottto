@@ -1805,6 +1805,33 @@ impl ClaudeHistoryEmissionItem for SnapshotItem {
     }
 }
 
+// UNKNOWN is a logical dependency hold, including bodies without a physical
+// fingerprint. Failure to close evidence is an independent budget hold.
+enum UnknownHistoryScope {
+    Inactive,
+    Refused,
+    Closed(crate::snapshot_sync::unknown_recovery::HeldRoots),
+}
+impl UnknownHistoryScope {
+    fn hold(&self, root: &str) -> Option<HistoryHold> {
+        match self {
+            Self::Inactive => None,
+            Self::Refused => Some(HistoryHold::Budget),
+            Self::Closed(scope) => scope
+                .roots
+                .contains(root)
+                .then_some(HistoryHold::UnknownOutcome),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Inactive => true,
+            Self::Refused => false,
+            Self::Closed(scope) => scope.roots.is_empty(),
+        }
+    }
+}
+
 /// Request evidence for this session's own billed requests names more than one
 /// account, so no single account may stand for its cumulative usage.
 pub(crate) const CLAUDE_ACCOUNT_WITHHELD_MULTIPLE_ACCOUNTS: &str = "multiple_accounts";
@@ -36876,8 +36903,8 @@ impl ScanIndex {
         if source != SnapshotSource::ClaudeCode {
             return 0;
         }
-        self.hold_parsed_unknown_claude_aliases(snapshots);
-        if self.claude_history_emission.files.is_empty() {
+        let unknown = self.hold_parsed_unknown_claude_aliases(snapshots);
+        if self.claude_history_emission.files.is_empty() && unknown.is_empty() {
             return 0;
         }
         if claude_reemission_stop_latched() {
@@ -36892,7 +36919,9 @@ impl ScanIndex {
                 .and_then(|fingerprint| emission.files.get_mut(fingerprint))
                 .filter(|gated| gated.held.is_some())
             else {
-                return true;
+                return unknown
+                    .hold(claude_snapshot_family_root_ref(snapshot))
+                    .is_none();
             };
             gated.local.insert(snapshot.snapshot_fingerprint.clone());
             false
@@ -36903,69 +36932,106 @@ impl ScanIndex {
     /// An unseen filename can disclose a different logical family only when
     /// parsed. Apply that family's existing UNKNOWN hold before finalization,
     /// so a fresh physical alias cannot advance a tuple or escape as a new body.
-    fn hold_parsed_unknown_claude_aliases(&mut self, snapshots: &[SnapshotItem]) {
+    fn hold_parsed_unknown_claude_aliases(
+        &mut self,
+        snapshots: &[SnapshotItem],
+    ) -> UnknownHistoryScope {
         let Some(support) = self.active_request_money_support_dir.as_deref() else {
-            return;
+            return UnknownHistoryScope::Inactive;
         };
         if !claude_request_money::request_owned_live(support) {
-            return;
+            return UnknownHistoryScope::Inactive;
         }
-        let held = crate::snapshot_sync::unknown_recovery::held_roots(support, self);
-        #[cfg(test)]
-        crate::snapshot_sync::unknown_recovery::trace_scope_for_test(|| {
-            format!(
-                "emission_scope roots={:?} catalog_ready={} ledger_ready={} last_close={}",
-                held.as_ref().map(|scope| &scope.roots),
-                crate::snapshot_sync::unknown_recovery::initialized(support),
-                claude_request_money::recovery_scope::evidence_ready_for_test(support),
-                claude_request_money::recovery_scope::last_stage_for_test(),
-            )
-        });
+        let scope = match crate::snapshot_sync::unknown_recovery::held_roots(support, self) {
+            Some(scope) => UnknownHistoryScope::Closed(scope),
+            None => UnknownHistoryScope::Refused,
+        };
         for snapshot in snapshots {
-            if held.as_ref().is_some_and(|roots| {
-                !roots
-                    .roots
-                    .contains(claude_snapshot_family_root_ref(snapshot))
-            }) {
-                continue;
-            }
-            let Some(source) = snapshot.source_file_fingerprint.as_ref() else {
+            let root = claude_snapshot_family_root_ref(snapshot);
+            let Some(reason) = scope.hold(root) else {
                 continue;
             };
-            if let Some(gated) = self.claude_history_emission.files.get_mut(source) {
+            let source = snapshot.source_file_fingerprint.as_deref();
+            if let Some(gated) =
+                source.and_then(|source| self.claude_history_emission.files.get_mut(source))
+            {
                 if gated.held.is_none() {
-                    gated.held = Some(HistoryHold::UnknownOutcome);
+                    gated.held = Some(reason);
                 }
-                continue;
+                gated.local.insert(snapshot.snapshot_fingerprint.clone());
             }
-            let Some((key, entry)) = self
-                .files
-                .iter()
-                .find(|(_, entry)| &entry.source_file_fingerprint == source)
-            else {
-                continue;
-            };
-            let previous = (entry.last_snapshot_fingerprint.is_some()
-                || entry.last_upload_body_witness.is_some()
-                || entry.effective_upload_body_witness_revision != 0
-                || self.confirmed_empty_files.contains(key))
-            .then(|| claude_history_upgrade::HeldUploadTuple {
-                last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
-                last_upload_body_witness: entry.last_upload_body_witness.clone(),
-                revision: entry.effective_upload_body_witness_revision,
-                file_snapshot_fingerprints: self.file_snapshot_fingerprints.get(key).cloned(),
-                confirmed_empty: self.confirmed_empty_files.contains(key),
-            });
-            self.claude_history_emission.files.insert(
-                source.clone(),
-                claude_history_upgrade::GatedHistory {
-                    index_key: key.clone(),
-                    held: Some(HistoryHold::UnknownOutcome),
-                    previous,
-                    local: BTreeSet::new(),
-                },
-            );
+            let decoded = source.and_then(claude_request_census::decode_fingerprint);
+            // A virtual/rebuilt body may lack its original physical fingerprint.
+            // Bind the hold to current file identities before finalization, so
+            // removing that body cannot certify an empty file or stamp it.
+            for (key, entry) in &self.files {
+                let census = self.claude_request_census.get(key);
+                let selected = self.claude_money_files.get(key);
+                let source_matches = source.is_some_and(|source| {
+                    entry.source_file_fingerprint == source
+                        || selected.is_some_and(|state| state.revision == source)
+                        || decoded.is_some_and(|fp| {
+                            census.is_some_and(|record| record.money_revision() == fp)
+                        })
+                });
+                let logical_match = reason == HistoryHold::UnknownOutcome
+                    && claude_request_money::logical_family_member(self, key).is_some_and(
+                        |(family, member)| family == root && member == snapshot.source_session_id,
+                    );
+                if !source_matches && !logical_match {
+                    continue;
+                }
+                let fingerprint = source
+                    .filter(|_| source_matches)
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        census.map(|record| {
+                            use std::fmt::Write;
+                            let mut fingerprint = String::with_capacity(64);
+                            for byte in record.money_revision() {
+                                write!(&mut fingerprint, "{byte:02x}").unwrap();
+                            }
+                            fingerprint
+                        })
+                    })
+                    .or_else(|| selected.map(|state| state.revision.clone()))
+                    .or_else(|| {
+                        (!entry.source_file_fingerprint.is_empty())
+                            .then(|| entry.source_file_fingerprint.clone())
+                    });
+                let Some(fingerprint) = fingerprint else {
+                    continue;
+                };
+                if let Some(gated) = self.claude_history_emission.files.get_mut(&fingerprint) {
+                    if gated.held.is_none() {
+                        gated.held = Some(reason);
+                    }
+                    gated.local.insert(snapshot.snapshot_fingerprint.clone());
+                    continue;
+                }
+                let previous = (entry.last_snapshot_fingerprint.is_some()
+                    || entry.last_upload_body_witness.is_some()
+                    || entry.effective_upload_body_witness_revision != 0
+                    || self.confirmed_empty_files.contains(key))
+                .then(|| claude_history_upgrade::HeldUploadTuple {
+                    last_snapshot_fingerprint: entry.last_snapshot_fingerprint.clone(),
+                    last_upload_body_witness: entry.last_upload_body_witness.clone(),
+                    revision: entry.effective_upload_body_witness_revision,
+                    file_snapshot_fingerprints: self.file_snapshot_fingerprints.get(key).cloned(),
+                    confirmed_empty: self.confirmed_empty_files.contains(key),
+                });
+                self.claude_history_emission.files.insert(
+                    fingerprint,
+                    claude_history_upgrade::GatedHistory {
+                        index_key: key.clone(),
+                        held: Some(reason),
+                        previous,
+                        local: BTreeSet::from([snapshot.snapshot_fingerprint.clone()]),
+                    },
+                );
+            }
         }
+        scope
     }
 
     /// Hook for resend paths outside the page (StateMissing #706 re-offer
