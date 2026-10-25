@@ -37265,6 +37265,28 @@ fn ensure_bounded_traversal(
             window.process != claude_full_rearm_process()
                 || window.context_fingerprint != context_fingerprint
         });
+    // An exhausted red non-window carry needs no mid-walk position repair.
+    // After a same-context restart, discard its process-local decision but
+    // keep the committed fingerprints and durable retry checkpoint. The next
+    // due start recomputes every family's eligibility from durable evidence.
+    // Active walks, Fix 2 windows, missing provenance and context changes keep
+    // the existing BASE rewind below.
+    let recompute_terminal_carry = !window_origin_invalid
+        && index.claude_full_rearm_progress.full_rearm_window.is_none()
+        && !index.claude_full_rearm_progress.full_rearm_window_next
+        && carry.capped_roots.is_empty()
+        && carry.replay.is_empty()
+        && carry.origin.as_ref().is_some_and(|origin| {
+            !origin.full_rearm_window
+                && origin.process != claude_full_rearm_process()
+                && origin.context_fingerprint == context_fingerprint
+        })
+        && index.traversal.as_ref().is_some_and(|traversal| {
+            traversal.context_fingerprint == context_fingerprint
+                && traversal.pending_directories.is_empty()
+                && traversal.pending_candidates.is_empty()
+                && traversal.counts.has_errors()
+        });
     if source == SnapshotSource::ClaudeCode
         && (window_origin_invalid || (!carry.is_empty() && !carry_origin_valid))
     {
@@ -37275,7 +37297,7 @@ fn ensure_bounded_traversal(
         let retained = std::mem::take(&mut index.claude_stale_family_carry);
         // A completed checkpoint already takes the ordinary fresh-start
         // stale-pending re-arm below; only an active walk needs rewinding.
-        if !retained.is_empty() && index.traversal.is_some() {
+        if !recompute_terminal_carry && !retained.is_empty() && index.traversal.is_some() {
             for (key, entry) in &mut index.files {
                 if claude_index_path_member_ref(Path::new(key)).is_some_and(|member| {
                     retained.roots.contains(member.root)
@@ -37330,6 +37352,11 @@ fn ensure_bounded_traversal(
                         && index.claude_usage_authority_quarantine.iter().any(|(root, record)| {
                             record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
                                 && record.retry_after_unix_seconds <= now
+                                // A start already served all deadlines at or
+                                // before it, even if a held/deleted member
+                                // yielded no item and retained its old record.
+                                && rfc3339_unix_seconds(&traversal.census_window_end)
+                                    .is_some_and(|started| record.retry_after_unix_seconds > started)
                                 && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
                                     claude_usage_authority_preserves_pending(record, witness)
                                 })

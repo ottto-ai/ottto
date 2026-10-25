@@ -2458,7 +2458,7 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
     assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
     assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_wait);
     for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
-        record.retry_after_unix_seconds = 0;
+        record.retry_after_unix_seconds = rfc3339_unix_seconds(CARRY_FAILED).unwrap() + 1;
     }
     let terminal = fixture.roots[0].clone();
     let record = fixture
@@ -2484,6 +2484,53 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
     );
     assert_eq!(fixture.index.claude_usage_authority_quarantine, holds);
     assert_eq!(fixture.index.session_account_bindings, bindings);
+    // Third cycle: the served family yielded no item (e.g. deleted while
+    // red), so its record/deadline did not advance. Persist that checkpoint
+    // and require the hourly backoff rather than another deadline wake.
+    std::fs::remove_file(
+        &fixture
+            .candidates
+            .iter()
+            .find(|candidate| {
+                claude_index_path_member_ref(&candidate.path).unwrap().root == fixture.roots[1]
+            })
+            .unwrap()
+            .path,
+    )
+    .unwrap();
+    carry_red(&mut fixture.index, CARRY_RETRY, 7);
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .unhealthy_retry_not_before_unix_seconds =
+        rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+    fixture.index = carry_reload(fixture.index);
+    let waiting = serde_json::to_value(&fixture.index).unwrap();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RESUME,
+            BACKFILL_WINDOW_DAYS,
+        );
+    });
+    assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index).unwrap(), waiting);
+    let hourly = OffsetDateTime::from_unix_timestamp(
+        (rfc3339_unix_seconds(CARRY_RETRY).unwrap() + UNHEALTHY_SCAN_RETRY_MAX_SECONDS) as i64,
+    )
+    .unwrap()
+    .format(&Rfc3339)
+    .unwrap();
+    let third = carry_start(&mut fixture.index, &hourly, BACKFILL_WINDOW_DAYS);
+    assert_eq!(third["reason"], "terminal_unhealthy_retry");
+    assert_eq!(third["carried_pending_families"], 32);
+    assert_eq!(third["rearmed_index_files"], 0);
+    assert_eq!(fixture.index.claude_usage_authority_quarantine, holds);
+    assert_eq!(fixture.index.session_account_bindings, bindings);
     let candidate = fixture
         .candidates
         .iter_mut()
@@ -2503,6 +2550,138 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
             Some(CandidateParseReason::AuthorityQuarantine)
         )
     );
+}
+
+/// A restart after a red terminal discards the process-local carry decision,
+/// then recomputes from durable acceptance, fingerprints and witnesses. A
+/// context change, mid-walk checkpoint or lost acceptance still keeps BASE.
+#[test]
+fn scoped_unhealthy_retry_restart_recomputes_terminal_carry_from_durable_state() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    for case in [
+        "restart",
+        "context",
+        "mid_walk",
+        "missing_ack",
+        "invalid_pending",
+        "daily_replay",
+    ] {
+        let mut fixture = scoped_retry_fixture(9, 32, false);
+        let first = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+        assert_eq!(first["carried_pending_families"], 32);
+        assert_eq!(
+            scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+            0
+        );
+        carry_red(&mut fixture.index, CARRY_RETRY, 7);
+        fixture
+            .index
+            .mark_bounded_sweep_unsettled_by(UnsettledUploadCause::RejectedWithHolds);
+        fixture.index = carry_reload(fixture.index);
+        fixture
+            .index
+            .claude_stale_family_carry
+            .origin
+            .as_mut()
+            .unwrap()
+            .process = claude_full_rearm_process().wrapping_add(2);
+        match case {
+            "mid_walk" => fixture
+                .index
+                .traversal
+                .as_mut()
+                .unwrap()
+                .pending_candidates
+                .push_back(carry_replayed(&local_index_key(
+                    &fixture.candidates[0].path,
+                ))),
+            "missing_ack" => fixture.index.accepted_snapshot_fingerprints.clear(),
+            "invalid_pending" => {
+                for root in fixture.roots.iter().skip(9) {
+                    fixture
+                        .index
+                        .claude_usage_family_pending
+                        .get_mut(root)
+                        .unwrap()
+                        .invalid = true;
+                }
+            }
+            "daily_replay" => {
+                fixture
+                    .index
+                    .claude_duplicate_fence_next_full_rearm_unix_seconds =
+                    rfc3339_unix_seconds(CARRY_SECOND_RETRY)
+            }
+            _ => (),
+        }
+        let before = serde_json::to_value(&fixture.index).unwrap();
+        if case == "restart" {
+            let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+                ensure_bounded_traversal(
+                    SnapshotSource::ClaudeCode,
+                    &[],
+                    &mut fixture.index,
+                    CARRY_RETRY,
+                    BACKFILL_WINDOW_DAYS,
+                );
+            });
+            assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+            assert!(fixture.index.claude_stale_family_carry.is_empty());
+            assert_eq!(
+                serde_json::to_value(&fixture.index).unwrap()["files"],
+                before["files"]
+            );
+            assert_eq!(
+                scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+                0
+            );
+        }
+        let days = BACKFILL_WINDOW_DAYS + u64::from(case == "context");
+        let row = carry_start(&mut fixture.index, CARRY_SECOND_RETRY, days);
+        let healthy_full = scoped_retry_full_reads(&fixture.index, &fixture.candidates);
+        if case == "restart" {
+            assert_eq!(row["reason"], "terminal_unhealthy_retry");
+            assert_eq!(row["carried_pending_families"], 32);
+            assert_eq!(row["rearmed_index_files"], 0);
+            assert_eq!(healthy_full, 0);
+            assert_eq!(
+                fixture
+                    .index
+                    .claude_stale_family_carry
+                    .origin
+                    .as_ref()
+                    .unwrap()
+                    .process,
+                claude_full_rearm_process()
+            );
+            let after = serde_json::to_value(carry_reload(fixture.index.clone())).unwrap();
+            for field in [
+                "claude_request_census",
+                "session_account_bindings",
+                "claude_usage_family_witnesses",
+                "claude_usage_authority_quarantine",
+                "accepted_snapshot_fingerprints",
+                "file_snapshot_fingerprints",
+            ] {
+                assert_eq!(
+                    serde_json::to_vec(&before[field]).unwrap(),
+                    serde_json::to_vec(&after[field]).unwrap(),
+                    "{field}"
+                );
+            }
+            for root in fixture.roots.iter().skip(9) {
+                assert_compacted_and_invalid(&fixture.index, root);
+            }
+        } else {
+            assert_eq!(row["carried_pending_families"], 0, "{case}");
+            if !matches!(case, "context" | "mid_walk") {
+                assert_eq!(row["rearmed_index_files"], 32, "{case}");
+            }
+            assert_eq!(healthy_full, 32, "{case}");
+        }
+    }
 }
 
 /// Each refusal affects only its own family. None is hidden by the acceptance
