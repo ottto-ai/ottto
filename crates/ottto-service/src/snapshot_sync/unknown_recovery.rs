@@ -1878,6 +1878,12 @@ pub(super) fn initial_post(
         }
         .into());
     }
+    #[cfg(test)]
+    POSTED_ENTITY.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            *captured = request.snapshots.last().cloned();
+        }
+    });
     let result = client
         .upload_recovery_bytes(token, request, head_cas, &body)
         .and_then(|response| {
@@ -1998,6 +2004,32 @@ pub(super) fn current_literal_guard(_index: &ScanIndex, _m: &Manifest) -> Litera
 }
 #[cfg(test)]
 thread_local! { static TEST_LITERAL_GUARD: std::cell::Cell<Option<LiteralPermit>> = const { std::cell::Cell::new(None) }; }
+
+#[cfg(test)]
+thread_local! { static POSTED_ENTITY: std::cell::RefCell<Option<Option<SnapshotItem>>> = const { std::cell::RefCell::new(None) }; }
+/// One explicitly armed typed entity, captured after finalization and current
+/// authorization. Other tests retain nothing; wire types stay serialize-only.
+#[cfg(test)]
+pub(super) struct PostedEntityForTest;
+#[cfg(test)]
+impl PostedEntityForTest {
+    pub(super) fn new() -> Self {
+        POSTED_ENTITY.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(None);
+        });
+        Self
+    }
+    pub(super) fn take(&self) -> Option<SnapshotItem> {
+        POSTED_ENTITY.with(|slot| slot.borrow_mut().as_mut().and_then(Option::take))
+    }
+}
+#[cfg(test)]
+impl Drop for PostedEntityForTest {
+    fn drop(&mut self) {
+        POSTED_ENTITY.with(|slot| *slot.borrow_mut() = None);
+    }
+}
 
 pub(super) fn admitted(
     index: &mut ScanIndex,

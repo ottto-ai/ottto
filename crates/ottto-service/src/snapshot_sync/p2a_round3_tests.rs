@@ -3417,11 +3417,19 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
     let _live = money::LiveForTest::new(&control.support);
+    let capture = unknown_recovery::PostedEntityForTest::new();
     control.cycle();
     // cycle().1 is the pre-finalization scan. Clone the actual finalized wire
     // entity so these telemetry-only carriers have the literal synthetic
     // selected-body proof that their retirement requires.
-    let sample: SnapshotItem = serde_json::from_value(control.offers().pop().unwrap()).unwrap();
+    let sample = capture.take().expect("actual finalized typed POST entity");
+    drop(capture);
+    assert_eq!(
+        sample.snapshot_fingerprint,
+        control.offers().last().unwrap()["snapshot_fingerprint"]
+            .as_str()
+            .unwrap()
+    );
     assert_eq!(
         sample.usage_accounting_contract.as_deref(),
         Some(money::REQUEST_OWNED_CONTRACT)
