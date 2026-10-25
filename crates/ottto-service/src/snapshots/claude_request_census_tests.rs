@@ -4626,11 +4626,11 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
 }
 
 /// MONEY 724h condition 3, autoreview: a guard lost with its saved witness
-/// ahead of the wall clock (thirty days ahead here) is reconstructed closed
-/// from that witness, never from the backward clock. The save keeps the
-/// witness, so a reload one window later, still behind it, refuses the
-/// duplicate key; only one window past the witness is it granted. In one
-/// process and across a restart; OFF and ON.
+/// ahead of the wall clock (thirty days ahead here), alone or with its priors
+/// field refused too, is closed from that witness, never from the backward
+/// clock. The save keeps the witness, so a reload one window later, still
+/// behind it, refuses the duplicate key; only one window past the witness is
+/// it granted. In one process and across a restart; OFF and ON.
 #[test]
 fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
     use crate::snapshots::claude_request_census::{
@@ -4644,23 +4644,35 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
     let witness = N3_T0 + 30 * N3_DAY;
     for enabled in [false, true] {
         let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
-        for restart in [false, true] {
-            let case = format!("shadow={enabled} restart={restart}");
+        for (priors, restart) in [(false, false), (false, true), (true, false), (true, true)] {
+            let case = format!("shadow={enabled} priors_refused={priors} restart={restart}");
             bound::restart();
             let scratch =
                 crate::test_scratch::ScratchDir::new("census-rebuild-lost-future-witness");
             let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
             let fingerprint = original.files[&key].source_file_fingerprint.clone();
             let path = scratch.join("index.json");
-            // The guard (`"n"`) is gone; only its witness is left.
+            // The guard (`"n"`) is gone; only its witness is left, and with
+            // `priors` a malformed priors field (refused).
             let raw = census_duplicate_rebuild_raw(&original, &key, Some(serde_json::json!({})));
             let shadow = r#""claude_request_census_shadow":{"n":{}}"#;
             assert_eq!(raw.matches(shadow).count(), 1, "{case}");
+            assert!(!raw.contains("claude_census_rebuild_priors"), "{case}");
+            let refused_priors = if priors {
+                format!(
+                    r#","claude_census_rebuild_priors":{{"{}":7}}"#,
+                    bound::key_id(&key)
+                )
+            } else {
+                String::new()
+            };
             std::fs::write(
                 &path,
                 raw.replace(
                     shadow,
-                    &format!(r#""claude_request_census_shadow":{{"nw":{witness}}}"#),
+                    &format!(
+                        r#""claude_request_census_shadow":{{"nw":{witness}}}{refused_priors}"#
+                    ),
                 ),
             )
             .unwrap();
@@ -4710,6 +4722,67 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
                 "{case}"
             );
         }
+    }
+}
+
+/// MONEY 724h condition 3, autoreview: a refused key's alarm never reports a
+/// retry before the wall clock passes the guard's latest stamp. A key whose
+/// two stamps still count (`N3_T0`, `N3_T0` + 1 d) is refused at
+/// `N3_T0` + 2 d while another stamp (an untracked refusal's) lies thirty
+/// days ahead: its retry is after that stamp, not at its oldest stamp's
+/// expiry. OFF and ON.
+#[test]
+fn census_duplicate_rebuild_retry_waits_for_the_latest_stamp() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
+    let refused = (CandidateDecision::Skip, None);
+    let ahead = N3_T0 + 30 * N3_DAY;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        let case = format!("shadow={enabled}");
+        bound::restart();
+        let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-retry-high-water");
+        let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+        let fingerprint = original.files[&key].source_file_fingerprint.clone();
+        let path = scratch.join("index.json");
+        std::fs::write(
+            &path,
+            census_duplicate_rebuild_raw(
+                &original,
+                &key,
+                Some(serde_json::json!({
+                    "k": { (bound::key_id(&key)): format!("1:{N3_T0},{}", N3_T0 + N3_DAY) },
+                    "u": 1,
+                    "ua": ahead,
+                })),
+            ),
+        )
+        .unwrap();
+        let _clock = bound::set_now(N3_T0 + 2 * N3_DAY);
+        let mut index = ScanIndex::load(&path).unwrap();
+        assert!(bound::exhausted(&index, &key), "{case}");
+        assert_eq!(
+            census_rebuild_decision(&index, &key, &fingerprint),
+            refused,
+            "{case}"
+        );
+        assert_eq!(census_rebuild_counters(&mut index), (2, 0), "{case}");
+        let hash8 = &bound::key_id(&key)[..8];
+        let retries: Vec<u64> = bound::alarm_lines()
+            .iter()
+            .filter(|line| {
+                line.contains("duplicate rebuild exhausted alarm")
+                    && line.contains(&format!("key_hash8={hash8} "))
+                    && line.contains("cause=rebuild_bound_7d ")
+            })
+            .map(|line| {
+                line.split("retry_after_unix=")
+                    .nth(1)
+                    .and_then(|rest| rest.split(';').next())
+                    .and_then(|retry| retry.parse().ok())
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(retries, vec![ahead + 1], "{case}: after the latest stamp");
     }
 }
 

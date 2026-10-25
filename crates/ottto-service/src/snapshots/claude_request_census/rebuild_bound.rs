@@ -36,8 +36,10 @@
 //!   clock passes that stamp. A grant found spent stays spent in its process,
 //!   in the same working index too, until a new counted attempt. A stamp is
 //!   only ever raised, never lowered by a refusal on backward time, so the
-//!   latest stamp (and the witness) never falls: a lost guard's closure keeps
-//!   its saved witness, and an identity revoke the removed key's latest stamp.
+//!   latest stamp (and the witness) never falls: every closure (a lost guard,
+//!   refused priors, an orphan) starts no earlier than the saved witness, and
+//!   an identity revoke keeps the removed key's latest stamp. An alarm's
+//!   retry is never before the clock passes the latest stamp.
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
 //!   reached the key yet does not spend an attempt. A grant authorizes a read
@@ -779,6 +781,10 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         return;
     }
     let now = now_unix();
+    // Condition 3: the saved witness as a stamp (a malformed one, `u64::MAX`,
+    // is none). Every closure starts no earlier, so a guard rebuilt or closed
+    // on backward time never lowers the latest stamp below it.
+    let carried = if witness == u64::MAX { 0 } else { witness };
     // MONEY 724f P1: a missing guard is fresh only without evidence of
     // earlier activity. With its window witness still recent, a priors field
     // present, or the "N3 initialized" marker present (SI-724-B3b: the root
@@ -813,14 +819,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         guard.closed_at = Some(UNSTAMPED);
     }
     if guard.closed_at == Some(UNSTAMPED) {
-        // Condition 3: a lost guard's closure keeps its saved witness (a
-        // malformed one, `u64::MAX`, is no stamp), so a reconstruction on
-        // backward time never lowers the latest stamp.
-        guard.closed_at = Some(if witness == u64::MAX {
-            now
-        } else {
-            now.max(witness)
-        });
+        guard.closed_at = Some(now.max(carried));
     }
     // MONEY 724h condition 3: behind the guard's latest persisted stamp the
     // wall clock went backward. That time is no new authority: no grant is
@@ -841,7 +840,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         priors.clear();
         guard.priors_refused = guard.priors_refused.saturating_add(1);
         raise(&mut guard.priors_refused_at, now);
-        close(&mut guard.closed_at, now);
+        close(&mut guard.closed_at, now.max(carried));
     }
     // A revoked key is out of this bound's control (SI-724-B1b): its prior
     // is dropped with it, never counted as an orphan.
@@ -881,7 +880,7 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         priors.remove(&id);
         guard.orphaned = guard.orphaned.saturating_add(1);
         raise(&mut guard.orphaned_at, now);
-        close(&mut guard.closed_at, now);
+        close(&mut guard.closed_at, now.max(carried));
         if transient.refusals.len() < MAX_ALARMS_PER_TERMINAL {
             transient.refusals.push((id, "orphaned_rearm"));
         }
@@ -1376,6 +1375,13 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
         .map(|(id, _, cause)| (id.as_str(), cause))
         .collect();
     let mut emitted = 0;
+    // Behind the guard's latest stamp nothing is admitted until the wall
+    // clock passes it, whatever else a retry waits for.
+    let gate = if now < high_water {
+        high_water.saturating_add(1)
+    } else {
+        0
+    };
     let tracked = guard
         .keys
         .iter()
@@ -1388,10 +1394,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
                     .first()
                     .map_or(0, |stamp| stamp.saturating_add(ATTEMPT_WINDOW_SECONDS + 1))
             };
-            // Behind the guard's latest stamp, nothing is admitted until the
-            // wall clock passes it.
-            let regressed = now < high_water;
-            let after_regression = || high_water.saturating_add(1);
+            let regressed = gate != 0;
             let (cause, retry_after) = match guard.closed_at {
                 _ if !key.has(EXHAUSTED) => {
                     let cause = spent[id.as_str()];
@@ -1402,7 +1405,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
                         if key.attempts.len() >= MAX_ATTEMPTS_PER_WINDOW {
                             oldest()
                         } else if regressed {
-                            after_regression()
+                            gate
                         } else {
                             now
                         },
@@ -1413,12 +1416,17 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
                     closed_at.saturating_add(WINDOW_SECONDS + 1),
                 ),
                 _ if regressed && key.attempts.len() < MAX_ATTEMPTS_PER_WINDOW => {
-                    ("grant_clock_regressed", after_regression())
+                    ("grant_clock_regressed", gate)
                 }
                 _ if key.has(HELD) => ("legacy_rearm_held", oldest()),
                 _ => ("rebuild_bound_7d", oldest()),
             };
-            (id.as_str(), cause, key.attempts.len(), retry_after)
+            (
+                id.as_str(),
+                cause,
+                key.attempts.len(),
+                retry_after.max(gate),
+            )
         });
     let untracked = index
         .claude_request_census
@@ -1438,7 +1446,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
                 }
                 .saturating_add(WINDOW_SECONDS + 1),
             };
-            (id.as_str(), *cause, 0, retry_after)
+            (id.as_str(), *cause, 0, retry_after.max(gate))
         });
     for (id, cause, attempts, retry_after) in tracked.chain(untracked) {
         if emitted >= MAX_ALARMS_PER_TERMINAL {
