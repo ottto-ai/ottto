@@ -39141,6 +39141,7 @@ fn reconcile_missing_index_entries_with_side(
             && codex_counting_version::tombstone_before_retire(index, key)
         {
             index.remember_removed_read_witness(key);
+            index.record_confirmed_absent_claude_account_member(key);
             index.files.remove(key);
             index.confirmed_empty_files.remove(key);
             index.file_snapshot_fingerprints.remove(key);
@@ -44360,6 +44361,18 @@ impl ScanIndex {
         true
     }
 
+    // Called only after an existing source-removal guard admitted absence.
+    // Partial upload omission and unverified audit retirement never call it.
+    fn record_confirmed_absent_claude_account_member(&mut self, key: &str) {
+        if self.files.contains_key(key) {
+            if let Some((root, member)) = claude_index_path_family_member(Path::new(key)) {
+                if let Some(pending) = self.claude_account_family_pending.get_mut(&root) {
+                    pending.confirmed_absent_members.insert(member);
+                }
+            }
+        }
+    }
+
     fn remove_file_entry(&mut self, key: &str) {
         if self.decode_holds_file(key) {
             return;
@@ -44375,13 +44388,7 @@ impl ScanIndex {
             self.codex_parent_ownership_ledgers.remove(&session_id);
         }
         self.remember_removed_read_witness(key);
-        if self.files.contains_key(key) {
-            if let Some((root, member)) = claude_index_path_family_member(Path::new(key)) {
-                if let Some(pending) = self.claude_account_family_pending.get_mut(&root) {
-                    pending.confirmed_absent_members.insert(member);
-                }
-            }
-        }
+        self.record_confirmed_absent_claude_account_member(key);
         self.files.remove(key);
         self.terminal_jsonl_dispositions.remove(key);
         self.confirmed_empty_files.remove(key);
@@ -62513,7 +62520,8 @@ mod tests {
 
     #[test]
     fn claude_account_pending_disappearance_and_empty_members_respect_partial_checkpoints() {
-        for empty in [false, true] {
+        for removal in ["guarded", "bounded", "empty"] {
+            let empty = removal == "empty";
             let (dir, root, items) = claude_account_family_fixture();
             let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
             let mut previous = d2_family_index(&dir, &root);
@@ -62568,8 +62576,44 @@ mod tests {
                     .insert(child_key.clone(), "held".into());
                 held.retire_committed_claude_account_pending_windows();
                 assert!(held.claude_account_family_pending.contains_key(&root));
+            } else if removal == "bounded" {
+                working.traversal = Some(ScanTraversalCheckpoint {
+                    context_fingerprint: "c".repeat(64),
+                    census_window_end: "2026-08-02T07:11:00Z".into(),
+                    scan_roots: vec![dir.clone()],
+                    pending_directories: VecDeque::new(),
+                    pending_candidates: VecDeque::new(),
+                    observed_index_keys: working
+                        .files
+                        .keys()
+                        .filter(|key| *key != &child_key)
+                        .cloned()
+                        .collect(),
+                    codex_rollout_paths: BTreeSet::new(),
+                    codex_join_directory_census: None,
+                    reconciliation_upper_bound: working.files.keys().next_back().cloned(),
+                    reconciliation_after: None,
+                    reconciliation_started: false,
+                    watcher_hint_seen: false,
+                    codex_parent_resolution_retry_required: false,
+                    unhealthy_retry_attempt: 0,
+                    unhealthy_retry_not_before_unix_seconds: None,
+                    counts: ScanTraversalCounts::default(),
+                    residue: ScanTraversalResidue::default(),
+                });
+                assert!(reconcile_missing_index_entries_with_limit(
+                    &mut working,
+                    usize::MAX
+                ));
+                working.traversal = None;
+                assert!(!working.files.contains_key(&child_key));
             } else {
                 working.remove_file_entry(&child_key);
+            }
+            if !empty {
+                assert!(working.claude_account_family_pending[&root]
+                    .confirmed_absent_members
+                    .contains(&items[1].source_session_id));
             }
             let accepted = working
                 .file_snapshot_fingerprints
