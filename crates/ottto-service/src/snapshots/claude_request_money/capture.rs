@@ -345,8 +345,9 @@ fn prune_unlisted(plan: &mut Plan, build: u64) {
 
 /// Make the fallback's families (at most 64) the only eligible ones and
 /// record this page's consumed turns, which are never eligible again before
-/// a complete plan selects them. False (nothing eligible) when funds refuse
-/// the fallback set.
+/// a complete plan selects them. The funded selection is also kept in the
+/// families' entries, so it outlasts another page's complete plan. False
+/// (nothing eligible) when funds refuse the fallback set.
 fn fallback_plan<'a>(plan: &mut Plan, entries: impl Iterator<Item = (&'a str, u64, bool)>) -> bool {
     plan.fallback = Some(BTreeSet::new());
     plan.fallback_funds = Funds::default();
@@ -384,6 +385,11 @@ fn fallback_plan<'a>(plan: &mut Plan, entries: impl Iterator<Item = (&'a str, u6
         }
     }
     if funded {
+        for key in &fallback {
+            if let Some(entry) = plan.entries.get_mut(key) {
+                entry.eligible = true;
+            }
+        }
         plan.fallback = Some(fallback);
         plan.fallback_funds = fallback_funds;
     }
@@ -1876,12 +1882,16 @@ mod bounded_tests {
             (0..NEXT_PAGE_FAMILIES).all(|at| !begins(&b[at])),
             "B's consumed families stay excluded after A's complete plan"
         );
+        assert!(
+            (NEXT_PAGE_FAMILIES..2 * NEXT_PAGE_FAMILIES).all(|at| begins(&b[at])),
+            "B's fallback selection outlasts A's complete plan"
+        );
         assert_eq!(scheduling_turn(&support, &key(&b[0]), 0), 9100);
         assert_eq!(capture_reserved(), before + plan_funds_for_test(&support));
         forget_plan(&support);
         assert_eq!(capture_reserved(), before);
         super::super::disable_shadow_for_test(&support);
-        println!("MONEY_P1B_PLAN_SCOPE_WIDE pages=A,B,A,B,fallback(B),A families_per_page=192 a_rebuilt=0 b_consumed_eligible_after_a=0");
+        println!("MONEY_P1B_PLAN_SCOPE_WIDE pages=A,B,A,B,fallback(B),A families_per_page=192 a_rebuilt=0 b_consumed_eligible_after_a=0 b_fallback_eligible_after_a=64");
     }
 
     /// Each page updates the plan in place and reuses its funds, so a family
