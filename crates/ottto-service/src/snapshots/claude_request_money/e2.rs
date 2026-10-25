@@ -863,7 +863,7 @@ pub(crate) fn side_calls_page(
     index: &ScanIndex,
 ) {
     if enabled() {
-        claude_request_identity::inherit_root_accounts(items);
+        claude_request_identity::inherit_root_accounts(items, false);
     }
     let owing = |item: &SnapshotItem| {
         item.claude_money
@@ -1070,7 +1070,7 @@ pub(crate) fn finish_page(
         .map(|(bucket, _)| bucket)
         .unwrap_or_default();
     if enabled() {
-        claude_request_identity::inherit_root_accounts(items);
+        claude_request_identity::inherit_root_accounts(items, true);
         claude_request_identity::record_page_identity_counts(items);
     }
     let mut sessions = BTreeMap::<&str, Session>::new();

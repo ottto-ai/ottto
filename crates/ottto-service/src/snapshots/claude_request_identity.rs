@@ -1252,7 +1252,7 @@ pub(crate) fn request_accounts(
         return accounts;
     }
     let Some(markers) = markers else {
-        accounts.conflict = accounts.starting.is_none();
+        // Unknown here is provisional until existing account evidence runs.
         return accounts;
     };
     let Some(first) = first_sequence else {
@@ -1414,7 +1414,14 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         if accounts.subagent {
             continue;
         }
-        if accounts.starting.is_none() && !accounts.mixed {
+        if accounts.starting.is_none()
+            && !accounts.mixed
+            && item.claude_usage_request_ids.iter().all(|request| {
+                !evidence
+                    .invalid_logins
+                    .contains(&(root.as_str(), request.as_str()))
+            })
+        {
             if let Some(login) = qualified {
                 let key = Some(Arc::new(AuthorityKey {
                     login: Some(login),
@@ -1475,7 +1482,7 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
 
 /// Root placement is fixed before summing path twins. A missing/Unknown root
 /// stays Unknown; a subagent's own marker can never manufacture a root account.
-pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem]) {
+pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem], settled: bool) {
     // Select the root's earliest native start, independently of page/map order.
     // Contradictory observations at the same start use the retained binding.
     struct Root {
@@ -1527,6 +1534,11 @@ pub(crate) fn inherit_root_accounts(items: &mut [SnapshotItem]) {
                 }
                 root.conflict |= any_conflict;
             }
+        }
+    }
+    if settled {
+        for root in roots.values_mut() {
+            root.conflict |= root.starting.is_none();
         }
     }
     for item in items {
@@ -2368,6 +2380,13 @@ pub(super) struct Request<'r> {
     pub(super) usage: &'r UsageTotals,
 }
 
+#[derive(Clone, Copy)]
+struct ActivityRequest<'r> {
+    request_id: &'r str,
+    occurrence: Option<(u64, bool)>,
+    timestamp: &'r str,
+}
+
 /// Classifies one item's requests as the row builder produces them and folds
 /// each straight into a bounded `Grouping`; no request is retained.
 pub(crate) struct RequestSink<'s, 'a> {
@@ -2507,7 +2526,11 @@ impl<'s, 'a> RequestSink<'s, 'a> {
                 &mut self.grouping.desktop_recent,
                 item,
                 original,
-                &request,
+                ActivityRequest {
+                    request_id: request.request_id,
+                    occurrence: request.occurrence,
+                    timestamp: request.timestamp,
+                },
                 identity,
             );
         }
@@ -2523,7 +2546,7 @@ impl<'s, 'a> RequestSink<'s, 'a> {
         activity: &mut crate::desktop_recent::RecentActivity,
         item: &SnapshotItem,
         original: Option<&super::SessionAccountEvidence>,
-        request: &Request<'_>,
+        request: ActivityRequest<'_>,
         identity: IdentityRef<'_>,
     ) {
         let Some(occurrence) = item.claude_usage_occurrences.get(request.request_id) else {
@@ -2762,6 +2785,85 @@ pub(crate) fn apply_scan_with_ownership(
     outcome
 }
 
+fn publish_request_owned_activity(
+    item: &SnapshotItem,
+    evidence: &ScanEvidence<'_>,
+    ownership: &TranscriptOwnership<'_>,
+) {
+    let Some(fold) = item.claude_money.as_deref() else {
+        return;
+    };
+    let Some(root) = owner_root(item) else {
+        return;
+    };
+    let original = match evidence.native_originals {
+        Some(originals) => originals.get(&item.source_session_id),
+        None => item.session_account_evidence.as_ref(),
+    };
+    let mut activity = crate::desktop_recent::RecentActivity::default();
+    for (request_id, occurrence) in &item.claude_usage_occurrences {
+        if !occurrence.desktop_request
+            || occurrence.usage.is_zero()
+            || fold.is_skipped(occurrence.sequence)
+        {
+            continue;
+        }
+        let duplicated = !ownership.duplicates.is_empty()
+            && ownership.duplicates.contains_key(&format!(
+                "{:x}",
+                sha2::Sha256::digest(request_id.as_bytes())
+            ));
+        if duplicated {
+            continue;
+        }
+        let Some(timestamp) = occurrence.timestamp.as_deref() else {
+            continue;
+        };
+        let desktop = item
+            .origin
+            .as_ref()
+            .and_then(|origin| origin.entrypoint.as_deref())
+            == Some("claude-desktop");
+        let facts = RequestFacts {
+            root,
+            source_session_id: &item.source_session_id,
+            request_id,
+            terminal_unix_seconds: rfc3339_unix_seconds(timestamp),
+            event_clock_complete: occurrence.event_clock_complete,
+            marker: item
+                .claude_org_markers
+                .as_deref()
+                .map_or(MarkerVerdict::None, |markers| {
+                    markers.verdict(occurrence.sequence, desktop)
+                }),
+            desktop,
+            scan_unix_seconds: rfc3339_unix_seconds(&item.collected_at),
+            email_home: item
+                .claude_org_markers
+                .as_deref()
+                .and_then(|markers| markers.email_home(occurrence.sequence)),
+            session_start_unix_seconds: item
+                .source_started_at
+                .as_deref()
+                .and_then(rfc3339_unix_seconds),
+            duplicated_elsewhere: false,
+        };
+        let identity = classify_ref(evidence, &facts);
+        RequestSink::note_desktop_activity(
+            &mut activity,
+            item,
+            original,
+            ActivityRequest {
+                request_id,
+                occurrence: Some((occurrence.sequence, occurrence.event_clock_complete)),
+                timestamp,
+            },
+            identity,
+        );
+    }
+    crate::desktop_recent::publish(activity);
+}
+
 fn tag_item(
     item: &mut SnapshotItem,
     evidence: &ScanEvidence<'_>,
@@ -2771,15 +2873,40 @@ fn tag_item(
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
+        if item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .any(|row| !local_subscription(row))
+        {
+            return None;
+        }
         // Single-account markerless bodies keep their established D1 wire
         // shape. The account owner already tagged their final usage uniformly.
-        if item.claude_org_markers.is_none() && super::exact_session_account_hash(item).is_some() {
+        if item.claude_org_markers.is_none()
+            && super::exact_session_account_hash(item).is_some()
+            && item.claude_money.as_deref().is_some_and(|fold| {
+                let mut partitions = fold.entity.grains.keys().map(|(_, _, account)| account);
+                let first = partitions.next();
+                partitions.all(|account| Some(account) == first)
+            })
+            && item
+                .claude_money
+                .as_deref()
+                .and_then(|fold| fold.accounts.as_deref())
+                .is_some_and(|accounts| accounts.starting.is_some() && !accounts.conflict)
+        {
             return None;
         }
         let grouping = request_owned_grouping(item, None)?;
         normalize_activity(item);
         let tagged = apply_grouped(item, grouping);
         if matches!(tagged, Ok(Tagged::Sent { .. })) {
+            publish_request_owned_activity(item, evidence, ownership);
             return Some(tagged);
         }
         let fallback = item
@@ -2791,7 +2918,11 @@ fn tag_item(
             .clone();
         IDENTITY_COUNTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grouping = request_owned_grouping(item, Some(&fallback))?;
-        return Some(apply_grouped(item, grouping));
+        let tagged = apply_grouped(item, grouping);
+        if tagged.is_ok() {
+            publish_request_owned_activity(item, evidence, ownership);
+        }
+        return Some(tagged);
     }
     let root = owner_root(item)?;
     let reported_usage = item.usage_accounting_contract.as_deref() == Some(REPORTED);

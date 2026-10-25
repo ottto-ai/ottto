@@ -1644,3 +1644,130 @@ fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copie
         cleanup(&[&path]);
     });
 }
+
+#[test]
+fn e2_identity_external_billing_keeps_cost_without_subscription_identity() {
+    with_enabled(|| {
+        for (field, value) in [("auth_mode", "api_key"), ("billing_provider", "bedrock")] {
+            let path = root_file("identity-external");
+            let index = ScanIndex::default();
+            let mut accumulator = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+            accumulator.claude_file_birth = ClaudeFileBirth::observe(&path, None);
+            accumulator.claude_file_birth.set_birth_for_test(t0());
+            accumulator
+                .current_selector
+                .insert(field, value.into(), "synthetic_native_route");
+            for line in [org_marker(ORG_A), line("one", &at(1), 10)] {
+                apply_claude_code_line(&line, &mut accumulator);
+            }
+            accumulator.finalize_claude_responses_e2(
+                None,
+                Some(ReadContext {
+                    index: &index,
+                    path: &path,
+                }),
+            );
+            let mut items =
+                accumulator.into_items(&path, "2026-08-02T09:00:00Z", "fixture".into(), None);
+            assert!(finish_page(&mut items, &index, TelemetryRead::Loaded).is_empty());
+            assert!(rows_of(&items[0])
+                .any(|row| !crate::snapshots::claude_request_accounts::local_subscription(row)));
+            let api = ClaudeLocalOtelLoadReport::default();
+            let trace = ClaudeTraceOwnershipLoadReport::default();
+            let evidence =
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            let outcome =
+                claude_request_identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+            assert_eq!(outcome.ineligible, 1);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (1, 10));
+            assert!(items[0].request_evidence.is_empty());
+            assert!(rows_of(&items[0])
+                .all(|row| row.evidence_ref.is_none() && row.identity_parts.is_none()));
+            cleanup(&[&path]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_provisional_unknown_twin_does_not_poison_later_marked_twin() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let a = root_file("identity-retained-a");
+            let b = root_file("identity-retained-b");
+            let index = ScanIndex::default();
+            let mut first = parse(&a, Some(t0()), &index, &[line("a", &at(1), 10)]);
+            // Native Desktop metadata/account owner installs this after the finalizer.
+            crate::snapshots::set_session_account_hash(&mut first, Some(&"a".repeat(64)));
+            let second = parse(
+                &b,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_B), line("b", &at(2), 20)],
+            );
+            let mut items = if reverse {
+                vec![second, first]
+            } else {
+                vec![first, second]
+            };
+            let read = sidecar(&[row("a", 1, 10), identity_api_row("b", 2, 20, ORG_B)]);
+            attach_page(&mut items, &read);
+            let api = api_report(&read);
+            let trace = ClaudeTraceOwnershipLoadReport::default();
+            side_calls_page(&mut items, &api, &trace, &index);
+            let evidence =
+                claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
+            claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+            assert!(items
+                .iter()
+                .all(|item| !fold(item).accounts.as_ref().unwrap().conflict));
+            let items = tag_owned(items, &index);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(items[0].request_evidence.len(), 2);
+            assert!(items[0]
+                .request_evidence
+                .iter()
+                .any(|entry| entry.provider_workspace_hash.as_deref()
+                    == Some(org_hash(ORG_B).as_str())));
+            assert_evidence_referenced(&items[0]);
+            cleanup(&[&a, &b]);
+        }
+    });
+}
+
+#[test]
+fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
+    with_enabled(|| {
+        let path = root_file("identity-desktop-activity");
+        let index = ScanIndex::default();
+        let now = time::OffsetDateTime::now_utc()
+            .replace_nanosecond(0)
+            .unwrap();
+        let event = now - time::Duration::seconds(2);
+        let clock = event
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let mut desktop = line("desktop-recent", &clock, 10);
+        desktop["entrypoint"] = json!("claude-desktop");
+        let mut item = parse(&path, Some(t0()), &index, &[org_marker(ORG_A), desktop]);
+        item.collected_at = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap();
+        let account = "d".repeat(64);
+        item.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+            provider: "anthropic",
+            account_identifier_hash: Some(account.clone()),
+            provider_workspace_hash: Some(org_hash(ORG_A)),
+            identity_hash_scheme: "provider-sha256:v1",
+            evidence_source: "claude_desktop_original:v1",
+            identity_disposition: Some("complete"),
+            source_created_at: Some(clock),
+        });
+        let item = tag_owned(vec![item], &index).remove(0);
+        assert_eq!(item.request_count, 1);
+        assert_eq!(
+            crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+            Some(event)
+        );
+        cleanup(&[&path]);
+    });
+}
