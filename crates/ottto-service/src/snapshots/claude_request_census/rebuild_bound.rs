@@ -1021,9 +1021,6 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
             tracked.attempts.push(now);
             tracked.flags = PENDING | (tracked.flags & CURRENT);
             transient.grants.push((id.clone(), now));
-            // A new grant, even one stamped in the same second as a spent
-            // one: only the spent grant stays refused.
-            with_spent(|spent| spent.remove(id.as_str()));
             // A marked entry is already empty and reads as Rearmed: this
             // counted attempt is its only authorization, saved before the
             // daemon's scan (`persist_grants`).
@@ -1329,6 +1326,10 @@ pub(crate) fn persist_grants(index: &mut ScanIndex, path: &Path) -> anyhow::Resu
                 // Unrecorded: the next load counts it again (fail closed).
                 break;
             }
+            // A new grant, made durable, even one stamped in the same second
+            // as a spent one: only the spent grant stays refused. Never
+            // before its save (a save's throwaway decode makes grants too).
+            with_spent(|spent| spent.remove(&id));
             set.insert(id, stamp);
         }
     });

@@ -4461,8 +4461,11 @@ fn census_duplicate_rebuild_backward_clock_spends_the_grant() {
                 drop(clock);
 
                 // The clock comes back inside the grant's span with the same
-                // working index (no reload): the spent grant stays spent.
+                // working index (no reload): the spent grant stays spent, a
+                // save between (its throwaway decode makes a tentative grant)
+                // included.
                 let clock = bound::set_now(N3_T0 + 60);
+                index.save(&path).unwrap();
                 assert_eq!(
                     census_rebuild_decision(&index, &key, &fingerprint),
                     refused,
@@ -4577,6 +4580,8 @@ fn census_duplicate_rebuild_terminal_observed_regression_spends_the_grant() {
 
             let forward = N3_T0 + 60;
             let clock = bound::set_now(forward);
+            // A save first: its throwaway decode never revives the grant.
+            index.save(&path).unwrap();
             assert_eq!(
                 census_rebuild_decision(&index, &key, &fingerprint),
                 refused,
