@@ -4337,10 +4337,16 @@ fn write_jsonl(
             owe_coverage(support_dir, observed, true);
         }
     }
-    let deferred_bytes = deferred_rows(memos, batch)
-        .map(|family| serialized_len(&family.row) + 1)
-        .sum::<u64>();
     let deferred_count = memos.iter().filter(|memo| memo.deferred.is_some()).count() as u64;
+    // Refusal/off batches may carry only the small fallback admission.
+    // Do not allocate a scratch ledger when there is no deferred suffix.
+    let deferred_bytes = if deferred_count == 0 {
+        0
+    } else {
+        deferred_rows(memos, batch)
+            .map(|family| serialized_len(&family.row) + 1)
+            .sum::<u64>()
+    };
     let rows = batch.families.iter().map(FamilyRows::rows).sum::<u64>() + deferred_count;
     let room = JSONL_DAY_CAP_BYTES - JSONL_SEAL_RESERVE_BYTES;
     let mut file = DayFile::open(&day_path(&dir, &today), batch.buffer_bytes, room);
@@ -4424,21 +4430,23 @@ fn write_jsonl(
     // Families before this suffix are already in schedule order. Compute
     // each deferred digest before acknowledging it, without expanding the
     // entire suffix into retained FamilyRows.
-    let empty = ClaudeLedger::empty(false);
-    for memo in memos.iter_mut() {
-        if let Some((root, state, reason)) = memo.deferred.take() {
-            let mut family = failure_rows(
-                &root,
-                reason,
-                state,
-                now,
-                batch.coverage.snapshot,
-                &empty,
-                &mut Default::default(),
-            );
-            memo.published.digest = semantic_digest(&mut family);
-            memo.basis = None;
-            kept += u64::from(file.push(&family.row));
+    if deferred_count > 0 {
+        let empty = ClaudeLedger::empty(false);
+        for memo in memos.iter_mut() {
+            if let Some((root, state, reason)) = memo.deferred.take() {
+                let mut family = failure_rows(
+                    &root,
+                    reason,
+                    state,
+                    now,
+                    batch.coverage.snapshot,
+                    &empty,
+                    &mut Default::default(),
+                );
+                memo.published.digest = semantic_digest(&mut family);
+                memo.basis = None;
+                kept += u64::from(file.push(&family.row));
+            }
         }
     }
     let coverage_fits = file.push(&batch.coverage);
