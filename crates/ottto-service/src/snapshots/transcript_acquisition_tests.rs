@@ -176,7 +176,11 @@ fn acquire_items_with(
         );
     }
     let acquisition = parser
-        .retain_reduction(scope, now, budget)
+        .retain_reduction(
+            scope,
+            now,
+            sampled_scan::RetainBudget::granted_unclassified(budget),
+        )
         .unwrap()
         .unwrap();
     assert_eq!(acquisition.reduction.is_some(), predicted.is_some());
@@ -324,6 +328,137 @@ fn sampled_native_claude_compaction_pairs_across_tail_passes() {
     assert_eq!(body[0]["compaction_count"], json!(1));
     assert_eq!(body, oracle(&fixture, source));
 }
+/// D1: the Codex context windows ride the retained accumulator, so every
+/// real incremental Tail pass (one record per pass, so each window rule meets
+/// a record boundary: change, equal-peak tie, missing window, fill) renders
+/// what a full re-read renders.
+#[test]
+fn sampled_native_codex_context_windows_match_full_read_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::Codex;
+    let fixture = Fixture::new(source);
+    // (last-turn context, window) per record; cumulative input grows.
+    let records: [(u64, Option<u64>); 7] = [
+        (100, Some(1_000)),
+        (200, Some(1_000)),
+        (200, Some(2_000)),
+        (150, None),
+        (300, None),
+        (300, Some(3_000)),
+        (120, Some(2_000)),
+    ];
+    let expected = [
+        // (first, peak, last) windows after each record.
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(1_000)),
+        (Some(1_000), Some(1_000), Some(2_000)),
+        (Some(1_000), Some(1_000), None),
+        (Some(1_000), None, None),
+        (Some(1_000), Some(3_000), Some(3_000)),
+        (Some(1_000), Some(3_000), Some(2_000)),
+    ];
+    let mut total = 0;
+    let mut retained = None;
+    for (step, ((context, window), want)) in records.into_iter().zip(expected).enumerate() {
+        total += context;
+        let mut record = json!({"type":"event_msg", "timestamp":"2026-10-07T10:00:00Z",
+            "payload":{"type":"token_count", "info":{"model":"gpt-6",
+            "total_token_usage":{"input_tokens":total,"cached_input_tokens":total/2,"output_tokens":step},
+            "last_token_usage":{"input_tokens":context,"cached_input_tokens":context/2,"output_tokens":1}}}});
+        if let Some(window) = window {
+            record["payload"]["info"]["model_context_window"] = json!(window);
+        }
+        fixture.append(&record);
+        let (next, mode, _, body) = acquire(&fixture, source, retained, 100 + step as u64);
+        // The first pass builds the retained state; every later pass is a
+        // real incremental Tail from it.
+        if step > 0 {
+            assert_eq!(mode, ReadMode::Tail, "step {step}");
+        }
+        assert!(next.is_some(), "step {step}: the reduction is retained");
+        assert_eq!(body, oracle(&fixture, source), "step {step}");
+        let window = |key: &str| body[0].get(key).and_then(Value::as_u64);
+        assert_eq!(
+            (
+                window("first_turn_context_window_tokens"),
+                window("peak_context_fill_window_tokens"),
+                window("last_turn_context_window_tokens"),
+            ),
+            want,
+            "step {step}"
+        );
+        retained = next;
+    }
+}
+/// The fold builds Claude sizes from the retained boundaries and owned
+/// requests, so a Tail pass that sees the next request gives the full read's
+/// sizes. Rebuilt here with every request owned, as for an exclusive root.
+#[test]
+fn sampled_native_claude_compaction_sizes_across_tail_passes() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let source = SnapshotSource::ClaudeCode;
+    let metadata = CodexTitleMetadata::default();
+    let scope = Scope(format!("synthetic-native-{source:?}"));
+    let rebuilt = |mut items: Vec<SnapshotItem>| {
+        let mut item = items.remove(0);
+        let mut owned = item
+            .claude_usage_occurrences
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        owned.sort_by_key(|occurrence| occurrence.sequence);
+        rebuild_claude_context_posture(&mut item, &owned, None);
+        item
+    };
+    let fixture = Fixture::new(source);
+    fixture.append(&usage(source, 100, 0, "claude-opus-4-8"));
+    fixture.append(&json!({"type":"system", "subtype":"compact_boundary",
+        "sessionId":"native-tail-fixture", "timestamp":"2026-10-07T10:30:05Z",
+        "compactMetadata":{"trigger":"manual","preTokens":900000}}));
+    let (retained, _, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, None, 100, true);
+    assert!(retained.is_some());
+    let first = rebuilt(items);
+    assert_eq!(
+        first.compaction_events,
+        vec![SnapshotCompactionEvent {
+            at: "2026-10-07T10:30:05Z".to_string(),
+            before: first.first_turn_context_tokens,
+            after: None,
+            trigger: Some("manual".to_string()),
+        }]
+    );
+
+    fixture.append(&usage(source, 40, 1, "claude-opus-4-8"));
+    let (_, mode, _, items) =
+        acquire_items_with(&fixture, source, &metadata, &scope, retained, 101, true);
+    assert_eq!(mode, ReadMode::Tail);
+    let tail = rebuilt(items);
+    let mut full = parse_claude_code_jsonl_file_with_artifacts(
+        &fixture.0,
+        NOW,
+        "native-fixture".into(),
+        false,
+    )
+    .unwrap();
+    apply_upload_policy(source, &mut full, SnapshotUploadPolicy::default());
+    let full = rebuilt(full);
+    assert_eq!(
+        tail.compaction_events[0].before,
+        first.first_turn_context_tokens
+    );
+    assert_eq!(
+        tail.compaction_events[0].after,
+        tail.last_turn_context_tokens
+    );
+    assert!(tail.compaction_events[0].after.is_some());
+    assert_eq!(tail.compaction_events, full.compaction_events);
+    assert_eq!(tail.local_context_points, full.local_context_points);
+}
 #[test]
 fn sampled_native_cache_eviction_and_active_state_accounting() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -350,7 +485,7 @@ fn sampled_native_cache_eviction_and_active_state_accounting() {
         assert_eq!(cache.insert("fixture".into(), retained), supported);
         if supported {
             assert!(cache.resident_bound().unwrap() >= measured.unwrap());
-            let retained = cache.take("fixture").unwrap();
+            let retained = cache.take("fixture").unwrap().retained;
             let native_copy = retained.state.clone();
             let clone_bound = cache.bound_with(&native_copy).unwrap();
             let combined_bound = cache.bound_with(&(retained, native_copy)).unwrap();
@@ -438,8 +573,16 @@ fn cache_lifecycle_native_retention_preserves_body_and_audit_debt() {
         ReadMode::Tail
     );
     while !parser.step().unwrap() {}
-    let (certificate, refused) =
-        observe(|| parser.retain_reduction(&scope, 101, 0).unwrap().unwrap());
+    let (certificate, refused) = observe(|| {
+        parser
+            .retain_reduction(
+                &scope,
+                101,
+                sampled_scan::RetainBudget::granted_unclassified(0),
+            )
+            .unwrap()
+            .unwrap()
+    });
     assert!(certificate.reduction.is_none());
     assert_eq!(
         certificate
@@ -519,11 +662,11 @@ fn sampled_native_partial_eof_or_copy_refusal_keeps_audit_certificate() {
                 .retain_reduction(
                     &scope,
                     101,
-                    if partial {
+                    sampled_scan::RetainBudget::granted_unclassified(if partial {
                         crate::transcript_cache::ENTRY_BYTES
                     } else {
                         0
-                    },
+                    }),
                 )
                 .unwrap()
                 .unwrap();
@@ -1057,7 +1200,11 @@ fn sampled_native_live_inputs_restored_after_charge_and_copy() {
         ));
     }
     let completed = parser
-        .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+        .retain_reduction(
+            &scope,
+            100,
+            sampled_scan::RetainBudget::granted_unclassified(crate::transcript_cache::ENTRY_BYTES),
+        )
         .unwrap()
         .unwrap();
     assert!(
@@ -1699,7 +1846,8 @@ fn step_until(
 }
 
 /// L-A1 guard matrix: the copy-refusal release called directly on the real
-/// step-start shape of an unsampled native read, and on a borrowed Tail.
+/// step-start shape of an unsampled native read, and on a borrowed Tail
+/// (P1-RETAIN R0: no release unless it borrows more than its reduction).
 #[test]
 fn sampled_unsampled_native_refusal_guard_matrix() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -1899,7 +2047,10 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
         assert_eq!(counts.clear_other_active, 0, "{source:?}");
         drop(scan);
 
-        // A Tail active borrows the taken reduction: ClearOtherActive.
+        // P1-RETAIN R0: a sampled Tail singleton borrows only its taken
+        // reduction, so its step-start refusal releases nothing, measured or
+        // not; its release is decided at completion. Any other borrowed
+        // state keeps ClearOtherActive.
         let tail = ScanFixture::new(source);
         let tail_cache = Arc::new(sampled_scan::SharedCache::default());
         tail.file.append(&usage(source, 100, 0, "fixture-model"));
@@ -1925,13 +2076,43 @@ fn sampled_unsampled_native_refusal_guard_matrix() {
             ),
             "precondition: a Tail active {source:?}"
         );
+        assert!(
+            sampled_scan::borrows_only_retained_reduction(scan.active_file.as_deref().unwrap()),
+            "precondition: shape F {source:?}"
+        );
         let (_, measured) = scan.sampled_copy_parts();
         assert!(measured.is_some(), "{source:?}");
-        let counts = release(&scan, measured);
-        assert_eq!(counts.clear_other_active, 1, "Tail {source:?}");
-        assert_eq!(counts.clear_full_resident_bound_unknown, 0, "{source:?}");
+        for resident in [measured, None] {
+            assert_eq!(
+                release(&scan, resident),
+                crate::local_resource_diagnostics::cache_lifecycle::Counts::default(),
+                "Tail {source:?} measured {}",
+                resident.is_some()
+            );
+        }
+        let candidate = scan.active_file.as_deref().unwrap().candidate.clone();
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.push(candidate);
+        assert!(!sampled_scan::borrows_only_retained_reduction(active));
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "Tail alias {source:?}"
+        );
+        let active = scan.active_file.as_deref_mut().unwrap();
+        active.aliases.clear();
+        active.applied_receipts.insert(String::new(), None);
+        assert!(!sampled_scan::borrows_only_retained_reduction(active));
+        assert_eq!(
+            release(&scan, measured).clear_other_active,
+            1,
+            "Tail receipt {source:?}"
+        );
     }
 }
+
+#[path = "retain_release_tests.rs"]
+mod retain_release_tests;
 
 #[test]
 fn sampled_production_large_baseline_index_does_not_disable_small_active_tail() {
@@ -2397,7 +2578,13 @@ fn sampled_native_priority_witness_refusal_keeps_native_output_and_certificate()
             .retention_bound(crate::transcript_cache::ENTRY_BYTES)
             .is_none());
         let completed = sampled
-            .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+            .retain_reduction(
+                &scope,
+                100,
+                sampled_scan::RetainBudget::granted_unclassified(
+                    crate::transcript_cache::ENTRY_BYTES,
+                ),
+            )
             .unwrap()
             .unwrap();
         assert!(completed.reduction.is_none());
@@ -2705,7 +2892,13 @@ fn side_certificate_reports_unsealed_without_cache_events() {
         while !parser.step().unwrap() {}
         observe(|| {
             parser
-                .retain_reduction(&scope, 100, crate::transcript_cache::ENTRY_BYTES)
+                .retain_reduction(
+                    &scope,
+                    100,
+                    sampled_scan::RetainBudget::granted_unclassified(
+                        crate::transcript_cache::ENTRY_BYTES,
+                    ),
+                )
                 .unwrap()
                 .unwrap()
         })

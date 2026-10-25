@@ -11018,8 +11018,8 @@ fn collect_claude_oauth_usage_unstamped(
     let account_state_dir =
         claude_oauth_usage_account_state_dir(account_identifier_hash, organization_identifier_hash);
     let mut read_schedule = claude_credit_pools::read_claude_read_schedule(&account_state_dir);
-    let latest_activity_at =
-        claude_oauth_latest_activity_at(account_identifier_hash, organization_identifier_hash);
+    let (latest_activity_at, feed_fresh_at) =
+        claude_oauth_activity(account_identifier_hash, organization_identifier_hash);
     // The scan lists a session only while its activity advances: keep every
     // sighting, even when this pass serves the stored reading.
     if read_schedule.observe_activity(latest_activity_at) {
@@ -11028,6 +11028,7 @@ fn collect_claude_oauth_usage_unstamped(
     let mut slot_seconds = claude_oauth_usage_slot_seconds(
         &read_schedule,
         latest_activity_at,
+        feed_fresh_at,
         account_identifier_hash,
         organization_identifier_hash,
         now,
@@ -12229,20 +12230,23 @@ fn claude_oauth_passive_config(
         .unwrap_or_default()
 }
 
-/// Latest Claude session activity for this exact binding, from the daemon's
-/// active-session scan.
-fn claude_oauth_latest_activity_at(
+/// Latest activity for this exact binding and its feed's observation horizon,
+/// read together from the daemon's completed Claude active-session scan.
+fn claude_oauth_activity(
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
-) -> Option<u64> {
+) -> (Option<u64>, Option<u64>) {
     let reconciliation = crate::active_sessions::read_active_session_reconciliation(
         &default_support_dir(),
         crate::snapshots::SnapshotSource::ClaudeCode,
     );
-    claude_credit_pools::claude_latest_activity_at(
-        reconciliation.as_ref(),
-        account_identifier_hash,
-        organization_identifier_hash,
+    (
+        claude_credit_pools::claude_latest_activity_at(
+            reconciliation.as_ref(),
+            account_identifier_hash,
+            organization_identifier_hash,
+        ),
+        claude_credit_pools::claude_activity_feed_fresh_at(reconciliation.as_ref()),
     )
 }
 
@@ -12251,6 +12255,7 @@ fn claude_oauth_latest_activity_at(
 fn claude_oauth_usage_slot_seconds(
     read_schedule: &claude_credit_pools::ClaudeReadSchedule,
     latest_activity_at: Option<u64>,
+    feed_fresh_at: Option<u64>,
     account_identifier_hash: &str,
     organization_identifier_hash: &str,
     now: u64,
@@ -12258,6 +12263,7 @@ fn claude_oauth_usage_slot_seconds(
     claude_credit_pools::claude_usage_slot_seconds(
         read_schedule,
         latest_activity_at,
+        feed_fresh_at,
         claude_oauth_usage_fresh_age_seconds(account_identifier_hash, organization_identifier_hash),
         claude_credit_pools::CLAUDE_ACTIVITY_CADENCE_ENABLED,
         now,

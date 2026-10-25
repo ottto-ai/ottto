@@ -4,16 +4,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="${PUBLIC_MANIFEST_REPO_ROOT:-$DEFAULT_REPO_ROOT}"
+STAGED_OUTPUT=0
 
 usage() {
   cat <<'USAGE'
 Usage: public_repo_manifest_check.sh [--staged-output <dir>]
 
-Verifies PUBLIC_EXPORT_MANIFEST.json for a root-shaped public ottto checkout.
-The manifest must list every non-manifest file with size, mode, executable bit,
-and SHA-256 digest, and its content_sha256 must match that deterministic file
-inventory. Override PUBLIC_MANIFEST_REPO_ROOT or pass --staged-output to check a
-generated bundle.
+Verifies PUBLIC_EXPORT_MANIFEST.json for a root-shaped public ottto tree,
+normally a generated export bundle (--staged-output). The manifest must list
+every non-manifest file with size, mode, executable bit, and SHA-256 digest,
+and its content_sha256 must match that deterministic file inventory.
+
+The public repository does not commit PUBLIC_EXPORT_MANIFEST.json; derive it
+from a commit with scripts/public_repo_manifest.sh. Without --staged-output the
+check reads the root of this checkout (or PUBLIC_MANIFEST_REPO_ROOT) and exits 2
+when that root has no manifest.
 USAGE
 }
 
@@ -25,6 +30,7 @@ while [[ "$#" -gt 0 ]]; do
         exit 2
       }
       REPO_ROOT="$2"
+      STAGED_OUTPUT=1
       shift 2
       ;;
     -h|--help)
@@ -43,7 +49,7 @@ if ! command -v python3 >/dev/null 2>&1; then
   exit 2
 fi
 
-python3 - "$REPO_ROOT" <<'PY'
+python3 - "$REPO_ROOT" "$STAGED_OUTPUT" <<'PY'
 from __future__ import annotations
 
 import hashlib
@@ -55,6 +61,7 @@ import sys
 from pathlib import Path, PurePosixPath
 
 repo_root = Path(sys.argv[1]).resolve()
+staged_output = sys.argv[2] == "1"
 manifest_path = repo_root / "PUBLIC_EXPORT_MANIFEST.json"
 
 
@@ -160,6 +167,12 @@ def load_manifest() -> dict[str, object]:
     if not repo_root.is_dir():
         die(f"repository root is not a directory: {repo_root}")
     if not manifest_path.is_file():
+        if not staged_output:
+            die(
+                "PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree, not committed; "
+                "use scripts/public_repo_manifest.sh --facts (or --digest), or pass "
+                f"--staged-output <bundle> to check an export bundle: {repo_root}"
+            )
         die(f"required manifest is missing: {manifest_path}")
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))

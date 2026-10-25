@@ -2,12 +2,17 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$SCRIPT_DIR/public_repo_temp_cleanup.sh"
 DEFAULT_TARGET_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TARGET_DIR="${PUBLIC_CUTOVER_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
 SOURCE_REPO_ROOT="${PUBLIC_CUTOVER_SOURCE_REPO_ROOT:-}"
 BOOTSTRAP_REPORT=""
 REPORT_PATH=""
 SKIP_SURFACE_CI=0
+MANIFEST_SOURCE="bundle"
+SELF_EXPORT_DIR=""
+script_completed=0
 
 usage() {
   cat <<'USAGE'
@@ -20,7 +25,10 @@ does not include absolute local filesystem paths.
 
 Checks:
   - target checkout shape and private-monorepo path rejection
-  - PUBLIC_EXPORT_MANIFEST.json integrity
+  - PUBLIC_EXPORT_MANIFEST.json integrity: the applied bundle's copy, or, when
+    the target carries none, the manifest derived from the target HEAD (clean
+    checkout required; the target is self-exported to check the bundle-level
+    manifest and skeleton)
   - optional bootstrap apply-report consistency
   - public skeleton, secret scan, and public/private contract checks
   - public-surface CI smoke unless --skip-surface-ci is passed
@@ -144,7 +152,6 @@ for path in "${private_shape_paths[@]}"; do
 done
 
 required_files=(
-  "PUBLIC_EXPORT_MANIFEST.json"
   "public-export/roots.txt"
   "scripts/public_repo_cutover_closeout.sh"
   "scripts/public_repo_manifest_check.sh"
@@ -170,6 +177,23 @@ required_executables=(
 for path in "${required_executables[@]}"; do
   require_executable "$TARGET_DIR/$path"
 done
+
+# A committed public checkout does not track PUBLIC_EXPORT_MANIFEST.json; its
+# manifest is derived from HEAD, so the working tree must equal HEAD.
+if [[ ! -f "$TARGET_DIR/PUBLIC_EXPORT_MANIFEST.json" ]]; then
+  MANIFEST_SOURCE="derived"
+  require_executable "$TARGET_DIR/scripts/public_repo_manifest.sh"
+  require_executable "$TARGET_DIR/scripts/public_repo_export_bundle.sh"
+  if [[ -n "$SOURCE_REPO_ROOT" && -d "$SOURCE_REPO_ROOT/backend" && -d "$SOURCE_REPO_ROOT/frontend" ]]; then
+    fail "private consumer contract checks need the PUBLIC_EXPORT_MANIFEST.json of an applied export bundle; target has none"
+  fi
+  if ! target_status="$(git -C "$TARGET_DIR" status --porcelain=v1 --untracked-files=all)"; then
+    fail "git status failed for target"
+  fi
+  if [[ -n "$target_status" ]]; then
+    fail "target has no PUBLIC_EXPORT_MANIFEST.json, so its manifest is derived from HEAD; the target must be a clean checkout"
+  fi
+fi
 
 python3 - "$TARGET_DIR" "$BOOTSTRAP_REPORT" "$REPORT_PATH" "$SKIP_SURFACE_CI" "$SOURCE_REPO_ROOT" <<'PY'
 from __future__ import annotations
@@ -282,6 +306,29 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def manifest_facts() -> dict[str, Any]:
+    if not (target_root / "PUBLIC_EXPORT_MANIFEST.json").is_file():
+        proc = subprocess.run(
+            ["bash", str(target_root / "scripts/public_repo_manifest.sh"), "--repo", str(target_root), "--facts"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            die(f"target manifest could not be derived from HEAD: {proc.stderr.strip()}")
+        derived = json.loads(proc.stdout)
+        return {
+            key: derived.get(key)
+            for key in (
+                "schema_version",
+                "source_commit",
+                "candidate_file_count",
+                "output_file_count",
+                "file_record_count",
+                "content_sha256",
+                "public_roots",
+            )
+        }
     manifest = load_json(target_root / "PUBLIC_EXPORT_MANIFEST.json", "public export manifest")
     files = manifest.get("files")
     public_roots = manifest.get("public_roots")
@@ -429,11 +476,36 @@ run_step() {
   "$@"
 }
 
-run_step "verify target manifest" \
-  "$TARGET_DIR/scripts/public_repo_manifest_check.sh" --staged-output "$TARGET_DIR"
+if [[ "$MANIFEST_SOURCE" == "bundle" ]]; then
+  run_step "verify target manifest" \
+    "$TARGET_DIR/scripts/public_repo_manifest_check.sh" --staged-output "$TARGET_DIR"
+  skeleton_root="$TARGET_DIR"
+else
+  cleanup_self_export() {
+    local status=$?
+    # Bash 3.2 can report status 0 here after a nounset abort.
+    if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+      echo "public-cutover-closeout: exited before completion" >&2
+      status=1
+    fi
+    public_repo_remove_temp_dir "public-cutover-closeout" "$SELF_EXPORT_DIR" || true
+    exit "$status"
+  }
+  SELF_EXPORT_DIR="$(mktemp -d)"
+  trap cleanup_self_export EXIT
+  run_step "self-export target for manifest checks" \
+    env PUBLIC_EXPORT_REPO_ROOT="$TARGET_DIR" "$TARGET_DIR/scripts/public_repo_export_bundle.sh" \
+      --output-dir "$SELF_EXPORT_DIR/ottto" --force
+  run_step "verify target manifest" \
+    "$TARGET_DIR/scripts/public_repo_manifest_check.sh" --staged-output "$SELF_EXPORT_DIR/ottto"
+  run_step "verify target self-export matches target HEAD" \
+    "$TARGET_DIR/scripts/public_repo_manifest.sh" --repo "$TARGET_DIR" \
+      --compare "$SELF_EXPORT_DIR/ottto/PUBLIC_EXPORT_MANIFEST.json"
+  skeleton_root="$SELF_EXPORT_DIR/ottto"
+fi
 
 run_step "verify target skeleton" \
-  env PUBLIC_SKELETON_REPO_ROOT="$TARGET_DIR" "$TARGET_DIR/scripts/public_repo_skeleton_check.sh"
+  env PUBLIC_SKELETON_REPO_ROOT="$skeleton_root" "$TARGET_DIR/scripts/public_repo_skeleton_check.sh"
 
 if [[ -n "$SOURCE_REPO_ROOT" ]]; then
   run_step "scan target and source export history" \
@@ -571,6 +643,29 @@ def load_json(path: Path, label: str) -> dict[str, Any]:
 
 
 def manifest_facts() -> dict[str, Any]:
+    if not (target_root / "PUBLIC_EXPORT_MANIFEST.json").is_file():
+        proc = subprocess.run(
+            ["bash", str(target_root / "scripts/public_repo_manifest.sh"), "--repo", str(target_root), "--facts"],
+            check=False,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if proc.returncode != 0:
+            die(f"target manifest could not be derived from HEAD: {proc.stderr.strip()}")
+        derived = json.loads(proc.stdout)
+        return {
+            key: derived.get(key)
+            for key in (
+                "schema_version",
+                "source_commit",
+                "candidate_file_count",
+                "output_file_count",
+                "file_record_count",
+                "content_sha256",
+                "public_roots",
+            )
+        }
     manifest = load_json(target_root / "PUBLIC_EXPORT_MANIFEST.json", "public export manifest")
     files = manifest.get("files")
     public_roots = manifest.get("public_roots")
@@ -685,3 +780,4 @@ print(
 if report_path is not None:
     print("public-cutover-closeout: wrote path-safe report")
 PY
+script_completed=1

@@ -1424,6 +1424,60 @@ fn group_with_legacy_tee_is_byte_charged() {
     });
     assert_eq!(lifecycle.clear_other_active, 1);
     assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+    // P1-RETAIN R0 (T-R0d): given a Tail acquisition and with every other
+    // borrowed-state conjunct cleared, the group conjunct alone keeps the job
+    // off shape F, so its refusal keeps ClearOtherActive and its completion
+    // never reaches R0's release.
+    let active = owned.active_file.as_deref_mut().unwrap();
+    let mut file = fs::File::open(&active.candidate.path).unwrap();
+    let plan = crate::transcript_acquisition::ReadPlan::prepare(
+        &mut file,
+        None,
+        &Scope("group-fixture".into()),
+        None,
+        100,
+    )
+    .unwrap();
+    let sampling = active.sampling.replace(sampled_scan::Active {
+        key: String::new(),
+        scope: Scope("group-fixture".into()),
+        mode: crate::transcript_acquisition::ReadMode::Tail,
+        audit_due: None,
+        retained_hint: Some((0, 0)),
+        retained_finalization_charge: 0,
+        retained_usage: None,
+    });
+    let acquisition = active.parser.reader.acquisition.replace(plan);
+    let replay = active.parser.accumulator.codex_tier_replay.take();
+    let aliases = std::mem::take(&mut active.aliases);
+    let receipts = std::mem::take(&mut active.applied_receipts);
+    let comparison_target = std::mem::replace(&mut active.comparison_target, false);
+    let cursor = active.cursor.take();
+    assert!(active.group.is_some());
+    assert!(!sampled_scan::borrows_only_retained_reduction(active));
+    let group = active.group.take();
+    assert!(
+        sampled_scan::borrows_only_retained_reduction(active),
+        "precondition: only the group conjunct differs from shape F"
+    );
+    active.group = group;
+    let (_, lifecycle) = crate::local_resource_diagnostics::cache_lifecycle::observe(|| {
+        sampled_scan::release_cache_for_copy_refusal(
+            owned.sampling.as_ref(),
+            owned.active_file.as_deref(),
+            measured,
+        )
+    });
+    assert_eq!(lifecycle.clear_other_active, 1, "a Tail group job");
+    assert_eq!(lifecycle.clear_full_resident_bound_unknown, 0);
+    let active = owned.active_file.as_deref_mut().unwrap();
+    active.sampling = sampling;
+    active.parser.reader.acquisition = acquisition;
+    active.parser.accumulator.codex_tier_replay = replay;
+    active.aliases = aliases;
+    active.applied_receipts = receipts;
+    active.comparison_target = comparison_target;
+    active.cursor = cursor;
     fs::remove_dir_all(root).unwrap();
 }
 

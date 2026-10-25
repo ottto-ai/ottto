@@ -189,6 +189,42 @@ fn encoding_was_refused(outcome: &Result<ureq::Response, ureq::Error>) -> bool {
 pub struct UploadShed {
     pub status: u16,
     pub retry_after: Option<Duration>,
+    /// The backend's error code when it is one the daemon recognizes. Only
+    /// this fixed name survives; the rest of the response body is discarded.
+    pub code: Option<UploadShedCode>,
+}
+
+/// The backend error code of the 503 that defers a batch while an original
+/// session identity cannot be evaluated.
+pub const SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE: &str = "snapshot_original_identity_unavailable";
+
+/// A shed's backend error code, kept only when it is one of these fixed names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadShedCode {
+    /// `snapshot_original_identity_unavailable`: the decision waits for the
+    /// identity, not for the request, so it keeps its own backoff whatever
+    /// `Retry-After` accompanies it and is never resent in place.
+    OriginalIdentityUnavailable,
+}
+
+impl UploadShedCode {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::OriginalIdentityUnavailable => SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE,
+        }
+    }
+
+    fn recognize(code: &str) -> Option<Self> {
+        (code == SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE)
+            .then_some(Self::OriginalIdentityUnavailable)
+    }
+}
+
+impl UploadShed {
+    /// The identity deferral, recognized by its fixed backend code.
+    pub fn is_original_identity_unavailable(&self) -> bool {
+        self.code == Some(UploadShedCode::OriginalIdentityUnavailable)
+    }
 }
 
 impl std::fmt::Display for UploadShed {
@@ -242,13 +278,34 @@ pub(crate) fn parse_retry_after(value: &str, now: OffsetDateTime) -> Option<Dura
     Some(Duration::from_secs(delta.whole_seconds().unsigned_abs()).min(MAX_HONOURED_RETRY_AFTER))
 }
 
-fn shed_from_response(status: u16, response: &ureq::Response) -> UploadShed {
+/// Bytes of a shed body read to recognize its code. The backend's error
+/// envelope is a few hundred bytes; a longer body is not recognized.
+const SHED_BODY_EXCERPT_BYTES: u64 = 4 * 1024;
+
+fn shed_from_response(status: u16, response: ureq::Response) -> UploadShed {
+    let retry_after = response
+        .header("Retry-After")
+        .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc()));
+    let mut excerpt = Vec::new();
+    let code = response
+        .into_reader()
+        .take(SHED_BODY_EXCERPT_BYTES)
+        .read_to_end(&mut excerpt)
+        .ok()
+        .and_then(|_| shed_code(&excerpt));
     UploadShed {
         status,
-        retry_after: response
-            .header("Retry-After")
-            .and_then(|value| parse_retry_after(value, OffsetDateTime::now_utc())),
+        retry_after,
+        code,
     }
+}
+
+/// The recognized top-level `code` of a backend error envelope, which must be
+/// a JSON object. Any other code, a malformed or truncated body, a non-object
+/// body or a non-string code is `None`; no body text outlives this call.
+fn shed_code(excerpt: &[u8]) -> Option<UploadShedCode> {
+    let envelope = serde_json::from_slice::<Value>(excerpt).ok()?;
+    UploadShedCode::recognize(envelope.as_object()?.get("code")?.as_str()?)
 }
 
 /// The backend refused a snapshot batch before payload validation because the
@@ -513,6 +570,14 @@ impl UploadFailureDiagnostics {
             && (self.status_family == "transport_timeout" || self.http_status == Some(504))
     }
 
+    /// The status of a snapshot-batch server error that a prompt resend of
+    /// the same idempotent page may clear: 500 or 502 only. Other endpoints,
+    /// other statuses and transport failures never qualify.
+    pub(crate) fn transient_batch_status(&self) -> Option<u16> {
+        self.http_status
+            .filter(|status| self.endpoint == "snapshot_batch" && matches!(status, 500 | 502))
+    }
+
     pub fn safe_message(&self) -> String {
         format!(
             "{} failed (endpoint={}, status_family={}, retryable={}, request_id={})",
@@ -585,6 +650,11 @@ pub struct ActivityHintResponse {
     pub session_titles_enabled: bool,
     #[serde(default = "default_true")]
     pub workspace_labels_enabled: bool,
+    /// `workspace_labels_enabled` exactly as sent; `None` when the response
+    /// omitted it (the field above then defaults to on). Set only by
+    /// `decode_activity_hint`. Instruction-file paths need `Some(true)`.
+    #[serde(skip)]
+    pub workspace_labels_explicit: Option<bool>,
     #[serde(default)]
     pub session_artifacts_enabled: bool,
     // Opt-out (default on). The backend resolves the full cascade (telemetry-off
@@ -635,6 +705,17 @@ pub struct ActivityHintResponse {
     #[serde(default)]
     pub session_request_identity_contract: Option<String>,
     pub recommended_scan_after: String,
+}
+
+/// Decodes an activity hint and records whether `workspace_labels_enabled`
+/// was actually sent.
+pub(crate) fn decode_activity_hint(value: Value) -> Result<ActivityHintResponse> {
+    let mut hint = ActivityHintResponse::deserialize(&value)
+        .map_err(|error| anyhow!("parse activity hint response failed: {error}"))?;
+    hint.workspace_labels_explicit = value
+        .get("workspace_labels_enabled")
+        .and_then(Value::as_bool);
+    Ok(hint)
 }
 
 fn default_true() -> bool {
@@ -711,6 +792,8 @@ impl SnapshotEntityRejection {
                 "occurred_at_utc_normalization_out_of_range"
             }
             "usage_accounting_authority_downgrade" => "usage_accounting_authority_downgrade",
+            // Logged by name; persisted as the old enum value `other`.
+            "original_pair_candidate_unproved" => "original_pair_candidate_unproved",
             _ => "other",
         }
     }
@@ -1640,8 +1723,10 @@ impl SnapshotApiClient {
         device_secret: &str,
         source: SnapshotSource,
     ) -> Result<String> {
+        // The shared upload agent follows redirects and pools nothing (see
+        // `timeout_agent`), so a per-call credential agent loses no warm socket.
         self.issue_relay_token_with_agent(
-            &self.agent,
+            &credential_timeout_agent(SNAPSHOT_HTTP_READ_TIMEOUT),
             device,
             device_secret,
             source,
@@ -1834,8 +1919,9 @@ impl SnapshotApiClient {
                     &other,
                 )),
             })?
-            .into_json()
+            .into_json::<Value>()
             .map_err(|error| anyhow!("parse activity hint response failed: {error}"))
+            .and_then(decode_activity_hint)
     }
 
     pub fn upload_batch(
@@ -2001,12 +2087,13 @@ impl SnapshotApiClient {
             // server's own backoff so the caller can honour it instead of
             // re-uploading identical bytes on the next tick.
             Err(ureq::Error::Status(code @ (429 | 503), response)) => {
-                let shed = shed_from_response(code, &response);
+                let server_request_id = response.header("X-Request-ID").map(str::to_string);
+                let shed = shed_from_response(code, response);
                 self.record_batch_http_failure(
                     request,
                     ottto_protocol::UploadReceiptOutcomeV1::Shed,
                     code,
-                    response.header("X-Request-ID"),
+                    server_request_id.as_deref(),
                     shed.retry_after.map(|retry_after| retry_after.as_secs()),
                     retry.is_some(),
                 );
@@ -2933,7 +3020,16 @@ fn validate_cloud_session_scan_receipt(
 }
 
 pub(crate) fn timeout_agent(read_timeout: Duration) -> ureq::Agent {
-    crate::retry_tls::agent_builder()
+    with_snapshot_timeouts(crate::retry_tls::agent_builder(), read_timeout)
+}
+
+/// `timeout_agent` for a request that carries the device secret: no redirects.
+fn credential_timeout_agent(read_timeout: Duration) -> ureq::Agent {
+    with_snapshot_timeouts(crate::retry_tls::credential_agent_builder(), read_timeout)
+}
+
+fn with_snapshot_timeouts(builder: ureq::AgentBuilder, read_timeout: Duration) -> ureq::Agent {
+    builder
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT)
         .timeout_read(read_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT)
@@ -3018,14 +3114,13 @@ fn cloud_session_deadline_agent(timeout: Duration) -> Result<(ureq::Agent, Durat
     if dns_timeout.is_zero() || request_timeout.is_zero() {
         return Err(anyhow!("cloud-session request deadline is too small"));
     }
-    let agent = crate::retry_tls::agent_builder()
+    // Cloud-session requests carry either the long-lived device secret or
+    // a relay bearer token. Never let ureq replay either credential to a
+    // redirect target; a 3xx is handled as an ordinary non-success status.
+    let agent = crate::retry_tls::credential_agent_builder()
         .timeout_connect(SNAPSHOT_HTTP_CONNECT_TIMEOUT.min(request_timeout))
         .timeout_read(request_timeout)
         .timeout_write(SNAPSHOT_HTTP_WRITE_TIMEOUT.min(request_timeout))
-        // Cloud-session requests carry either the long-lived device secret or
-        // a relay bearer token. Never let ureq replay either credential to a
-        // redirect target; a 3xx is handled as an ordinary non-success status.
-        .redirects(0)
         .max_idle_connections(0)
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,
@@ -3144,6 +3239,32 @@ mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    #[test]
+    fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
+        use crate::retry_tls::credential_test_support::{
+            assert_never_logged, install_host_logger, RedirectingBackend,
+        };
+        install_host_logger();
+        let device = LocalDeviceBinding {
+            device_id: "device-synthetic".to_string(),
+            machine_id: None,
+            sources: vec!["codex".to_string()],
+        };
+        for status in ["302 Found", "307 Temporary Redirect"] {
+            let secret = format!("synthetic-snapshot-device-secret-{}", &status[..3]);
+            let backend = RedirectingBackend::start(status);
+            assert!(SnapshotApiClient::new(backend.base_url.clone())
+                .issue_relay_token(&device, &secret, SnapshotSource::Codex)
+                .is_err());
+            let request = backend.finish();
+            assert!(
+                request.starts_with("POST /api/v1/telemetry/devices/device-synthetic/relay-token ")
+            );
+            assert!(request.contains(&format!("X-Ottto-Device-Secret: {secret}")));
+            assert_never_logged(&secret);
+        }
+    }
 
     #[test]
     fn stale_older_rejection_reason_is_safe_but_unknown_reasons_are_not() {
@@ -3551,6 +3672,45 @@ mod tests {
         assert!(excerpt.contains("[path]"));
         assert!(!excerpt.contains("/Users/ron"));
         assert!(excerpt.chars().count() <= 503);
+    }
+
+    #[test]
+    fn shed_code_keeps_only_a_recognized_backend_code() {
+        let identity = br#"{"error":"ServiceOverloadedError","detail":"Original session identity evaluation is temporarily unavailable","request_id":"synthetic","code":"snapshot_original_identity_unavailable"}"#;
+        assert_eq!(
+            shed_code(identity),
+            Some(UploadShedCode::OriginalIdentityUnavailable)
+        );
+        assert_eq!(
+            UploadShedCode::OriginalIdentityUnavailable.as_str(),
+            SNAPSHOT_ORIGINAL_IDENTITY_UNAVAILABLE
+        );
+        let oversized = format!(
+            r#"{{"detail":"{}","code":"snapshot_original_identity_unavailable"}}"#,
+            "x".repeat(SHED_BODY_EXCERPT_BYTES as usize)
+        );
+        let truncated = &oversized.as_bytes()[..SHED_BODY_EXCERPT_BYTES as usize];
+        let bodies: [&[u8]; 11] = [
+            br#"{"code":"cursor_allocation_timeout"}"#,
+            br#"{"code":"accept_discovery_shared_lock_timeout"}"#,
+            br#"{"detail":"snapshot_original_identity_unavailable"}"#,
+            br#"{"code":"Snapshot_Original_Identity_Unavailable"}"#,
+            br#"{"code":17}"#,
+            br#"{"code":null}"#,
+            br#"["snapshot_original_identity_unavailable"]"#,
+            b"snapshot_original_identity_unavailable",
+            b"<html>503 Service Unavailable</html>",
+            b"",
+            truncated,
+        ];
+        for body in bodies {
+            assert_eq!(
+                shed_code(body),
+                None,
+                "{}",
+                String::from_utf8_lossy(&body[..body.len().min(80)])
+            );
+        }
     }
 
     #[test]
@@ -4864,7 +5024,7 @@ mod tests {
     }
 }
 
-crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
+crate::heap_layout_bound::fields!(ActivityHintResponse; source, server_time, last_data_at, record_count_15m, record_count_24h, local_usage_reconciliation_enabled, backfill_window_days, session_titles_enabled, workspace_labels_enabled, workspace_labels_explicit, session_artifacts_enabled, mcp_inventory_harvest_enabled, context_footprint_harvest_enabled, session_attribution_enabled, session_attribution_labels_enabled, session_attribution_hmac_key, session_attribution_hmac_key_version, session_context_curve_contract, session_cache_observations_contract, snapshot_head_cas_required, census_residue_status_contract, session_request_identity_contract, recommended_scan_after);
 
 impl crate::heap_layout_bound::HeapLayoutBound for SnapshotApiClient {
     fn heap_bound(&self, c: &mut crate::heap_layout_bound::Counter) -> Option<()> {

@@ -23,9 +23,9 @@
 //! Methodology changes apply forward only: a checkpoint keeps its offset
 //! when the parser changes, so old bytes are never read twice.
 //!
-//! The whole reader is off until the server accepts changed-days uploads
-//! (see `changed_days_enabled`); until then the kinds_version 1 harvest runs
-//! unchanged.
+//! The reader replaces the kinds_version 1 harvest when the compile-time
+//! switch `CHANGED_DAYS_UPLOAD_ENABLED` is on (see `changed_days_enabled`);
+//! with the switch off the kinds_version 1 harvest runs unchanged.
 
 mod aggregate;
 mod audit;
@@ -45,26 +45,29 @@ pub(super) use harvest::spawn_v2_sync;
 
 use std::time::Duration;
 
-/// Compile-time switch for the changed-days reader and uploader. The server
-/// refuses `upload_mode: "changed_days"` until its write path ships, and the
-/// reader's forward-only first run happens once, so the reader must not start
-/// before its uploads can land. Flip to `true` in the release that ships the
-/// reader.
-const CHANGED_DAYS_UPLOAD_ENABLED: bool = false;
+/// Compile-time switch for the changed-days reader and uploader. On: the
+/// daemon runs this reader and uploads changed days (kinds_version 2), and the
+/// kinds_version 1 harvest no longer runs. Set it back to `false` to return to
+/// the kinds_version 1 harvest; the reader's local state stays on disk and is
+/// not read while the switch is off.
+const CHANGED_DAYS_UPLOAD_ENABLED: bool = true;
 /// Development override for the switch above (truthy value turns it on;
-/// debug builds only). The server refuses changed-days uploads until its
-/// write path ships.
+/// debug builds only). It matters only while the switch is off.
 const CHANGED_DAYS_ENV: &str = "OTTTO_CONTEXT_COMPOSITION_CHANGED_DAYS";
 
 pub(super) fn changed_days_enabled() -> bool {
-    // The override works in debug builds only: in a release build it would
-    // stop the kinds_version 1 uploads and spend the once-per-install first
-    // run before the server accepts changed days.
-    CHANGED_DAYS_UPLOAD_ENABLED
-        || (cfg!(debug_assertions)
-            && std::env::var(CHANGED_DAYS_ENV)
-                .map(|value| super::harvest::is_truthy(&value))
-                .unwrap_or(false))
+    changed_days_gate(
+        CHANGED_DAYS_UPLOAD_ENABLED,
+        cfg!(debug_assertions),
+        std::env::var(CHANGED_DAYS_ENV).ok().as_deref(),
+    )
+}
+
+/// The switch decision. The override works in debug builds only: in a
+/// release build with the switch off it would stop the kinds_version 1
+/// uploads and spend the once-per-install first run early.
+fn changed_days_gate(switch: bool, debug_build: bool, override_value: Option<&str>) -> bool {
+    switch || (debug_build && override_value.is_some_and(super::harvest::is_truthy))
 }
 
 /// Local state folder, under the composition state folder.
@@ -90,13 +93,10 @@ const MIN_UPTIME: Duration = Duration::from_secs(15 * 60);
 const RUN_WALL_CAP: Duration = Duration::from_secs(30 * 60);
 
 // Budgets.
-/// Full reads (rewritten files, files live at install) and reads after a
-/// state fallback, per day.
+/// Full reads (rewritten files, and full reads still waiting from an
+/// earlier build's install) and reads after a state fallback, per day.
 /// New bytes are not capped.
 const REPAIR_BYTES_PER_DAY: u64 = 1024 * 1024 * 1024;
-/// A file modified this recently at the first run is "live at install" and
-/// is read from its start once, within the repair budget.
-const LIVE_AT_INSTALL: Duration = Duration::from_secs(24 * 60 * 60);
 /// Audit re-reads of files already read whole, per day (see `audit`).
 const AUDIT_BYTES_PER_DAY: u64 = 100 * 1000 * 1000;
 /// Audited files per day at most, so many small files never turn the audit

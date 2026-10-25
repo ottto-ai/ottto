@@ -268,14 +268,121 @@ struct EmptyCounts {}
 pub(crate) fn traversal_transition(source: &str, counts: &impl Serialize) {
     traversal_point("bounded_traversal_transition", source, counts);
 }
+#[derive(Serialize)]
+struct ListMissingCause {
+    cause: &'static str,
+}
+
 /// Local alarm, once per Claude cycle while it lasts: the re-emission list was
 /// installed once and its file is now missing, so the one-time history
-/// re-read is paused. No path, id or wire event.
-pub(crate) fn claude_reemission_list_missing() {
+/// re-read is paused. `cause` names why it reads installed: the seen-marker,
+/// Set intent, or intent that could not be read (addendum 3). No path, id or
+/// wire event.
+pub(crate) fn claude_reemission_list_missing(cause: &'static str) {
     traversal_point(
         "claude_reemission_list_missing_after_install",
         "claude_code",
-        &EmptyCounts {},
+        &ListMissingCause { cause },
+    );
+}
+/// Local alarm, at most hourly: Claude history owes an upgrade to the active
+/// body-witness revision while the protected list was never installed, so
+/// the history gate holds it. Counts only; no path, id or wire event.
+pub(crate) fn claude_history_upgrade_owed_without_list(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_upgrade_owed_without_list",
+        "claude_code",
+        counts,
+    );
+}
+/// Local alarm, at most hourly: a complete Claude terminal kept the retired
+/// family tombstone uncertainty fence up, because more absent witnessed roots
+/// need a tombstone than fit under the cap. Counts only; no path, id or wire
+/// event.
+pub(crate) fn claude_absent_family_tombstone_uncertain(counts: &impl Serialize) {
+    traversal_point(
+        "claude_absent_family_tombstone_uncertain",
+        "claude_code",
+        counts,
+    );
+}
+static HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct HistoryProofCorrectionDeferred {
+    history_proof_correction_deferred: u64,
+    history_proof_correction_deferred_total: u64,
+}
+
+/// Local counter (StateMissing M2, SOURCE h695 N6): proof-correction members
+/// the history gate holds, deferred instead of blocking settlement. This
+/// settlement's count and a saturating process total. Counts only; no path,
+/// id or wire event.
+pub(crate) fn claude_history_proof_correction_deferred(members: usize) {
+    let members = u64::try_from(members).unwrap_or(u64::MAX);
+    let previous = HISTORY_PROOF_CORRECTION_DEFERRED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_history_proof_correction_deferred",
+        "claude_code",
+        &HistoryProofCorrectionDeferred {
+            history_proof_correction_deferred: members,
+            history_proof_correction_deferred_total: previous.saturating_add(members),
+        },
+    );
+}
+/// Local diagnostic, at most hourly: the backfill state's
+/// `prior_history_unverified` marker has been read set since the given time
+/// (first seen by this process). Counts and times only; no path, id or wire
+/// event.
+pub(crate) fn claude_prior_history_unverified(counts: &impl Serialize) {
+    traversal_point("claude_prior_history_unverified", "claude_code", counts);
+}
+/// Local alarm, once per refusal: a body-witness revision with no history
+/// policy row was not activated, and the previous active revision was kept.
+/// Counts only; no path, id or wire event.
+pub(crate) fn claude_history_revision_activation_refused(counts: &impl Serialize) {
+    traversal_point(
+        "claude_history_revision_activation_refused",
+        "claude_code",
+        counts,
+    );
+}
+static REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[derive(Serialize)]
+struct ReemissionFamilyClosureRootAbsentExcluded {
+    claude_reemission_family_closure_root_absent_excluded: u64,
+    claude_reemission_family_closure_root_absent_excluded_total: u64,
+}
+
+/// Local counter (StateMissing M1, SOURCE d680b524): subagent members the
+/// history gate held only through their listed family root while the root
+/// file is absent. This page's count and a saturating process total. Counts
+/// only; no path, id or wire event.
+pub(crate) fn claude_reemission_family_closure_root_absent_excluded(members: u64) {
+    let previous = REEMISSION_FAMILY_CLOSURE_ROOT_ABSENT_EXCLUDED_TOTAL
+        .fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |total| Some(total.saturating_add(members)),
+        )
+        .unwrap_or(u64::MAX);
+    traversal_point(
+        "claude_reemission_family_closure_root_absent_excluded",
+        "claude_code",
+        &ReemissionFamilyClosureRootAbsentExcluded {
+            claude_reemission_family_closure_root_absent_excluded: members,
+            claude_reemission_family_closure_root_absent_excluded_total: previous
+                .saturating_add(members),
+        },
     );
 }
 /// Local alarm: the one-time Claude history re-read latched its stop until
@@ -794,6 +901,52 @@ pub(crate) fn capture<T>(f: impl FnOnce() -> T) -> (T, Vec<serde_json::Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn history_proof_correction_deferral_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_history_proof_correction_deferred(2);
+            claude_history_proof_correction_deferred(3);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_history_proof_correction_deferred"
+        );
+        assert_eq!(lines[1]["counts"]["history_proof_correction_deferred"], 3);
+        let first = lines[0]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]["history_proof_correction_deferred_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 2 && second >= first + 3, "{first} {second}");
+    }
+    #[test]
+    fn family_closure_root_absent_exclusion_is_counted() {
+        let ((), lines) = capture(|| {
+            claude_reemission_family_closure_root_absent_excluded(1);
+            claude_reemission_family_closure_root_absent_excluded(2);
+        });
+        assert_eq!(lines.len(), 2);
+        assert_eq!(
+            lines[0]["stage"],
+            "claude_reemission_family_closure_root_absent_excluded"
+        );
+        assert_eq!(
+            lines[1]["counts"]["claude_reemission_family_closure_root_absent_excluded"],
+            2
+        );
+        let first = lines[0]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        let second = lines[1]["counts"]
+            ["claude_reemission_family_closure_root_absent_excluded_total"]
+            .as_u64()
+            .unwrap();
+        assert!(first >= 1 && second >= first + 2, "{first} {second}");
+    }
     fn max_read_counts() -> ReadCounts {
         let gate = AssessedBool {
             assessed: usize::MAX,

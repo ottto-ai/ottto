@@ -17,7 +17,9 @@ use super::aggregate::{
     all_kinds, day_of, kind_from_str, kind_position, part_from_str, part_position, Aggregate,
     Contribution, Day, Sink, Slot, Window, ALL_PARTS,
 };
-use super::checkpoint::{Checkpoint, CopiedMode, Index, ParseState, Status, StoredParse};
+use super::checkpoint::{
+    install_path, Checkpoint, CopiedMode, Index, ParseState, Status, StoredParse,
+};
 use super::decode::{claude_never_counted, codex_never_counted, content_chars_and_images, Raw};
 use super::file::{new_parse_state, read_lines, LineSink, LineStats, Names, Source};
 use super::harvest::{begin_run, run_source, Run, SourceStats};
@@ -864,7 +866,17 @@ struct Env {
 }
 
 impl Env {
+    /// Both agents already installed (on an empty transcript folder, a day
+    /// before `base_now`), so every file a test writes is born after the
+    /// install and read from its start as new bytes.
     fn new(name: &str) -> Self {
+        let env = Self::uninstalled(name);
+        env.install(base_now() - time::Duration::days(1));
+        env
+    }
+
+    /// No state yet: the test's first run is the install.
+    fn uninstalled(name: &str) -> Self {
         let root = scratch(name);
         let state = root.join("state");
         let workspace = root.join("workspace");
@@ -873,6 +885,14 @@ impl Env {
             root: root.join("transcripts"),
             state,
             workspace,
+        }
+    }
+
+    fn install(&self, at: OffsetDateTime) {
+        for source in [Source::Claude, Source::Codex] {
+            let stats = self.run(source, at, None);
+            assert_eq!((stats.files_checked, stats.scan_errors), (0, 0));
+            assert!(install_path(&self.state, source.label()).exists());
         }
     }
 
@@ -1375,8 +1395,8 @@ fn later_opening_verdict_transitions_do_not_reread_counted_bytes() {
 }
 
 #[test]
-fn first_run_is_forward_only_and_reads_live_files_once() {
-    let env = Env::new("composition-v2-first-run");
+fn first_run_is_forward_only_even_for_live_files() {
+    let env = Env::uninstalled("composition-v2-first-run");
     let now = base_now();
     let day = now.date();
     let cwd = env.cwd();
@@ -1393,18 +1413,28 @@ fn first_run_is_forward_only_and_reads_live_files_once() {
         .set_modified(old_time)
         .unwrap();
     let stats = env.run(Source::Claude, now, None);
-    assert_eq!(stats.bytes_repair, fs::metadata(&live).unwrap().len());
-    assert_eq!(stats.bytes_new, 0);
-    let scope = env.scope(Source::Claude);
-    let first = total_tokens(&scope.agg);
-    assert!(first > 0);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.files_read),
+        (0, 0, 0)
+    );
+    assert_eq!((stats.install_forward_only, stats.dormant_found), (2, 2));
 
-    // The old file only counts what is appended after install.
-    append_records(&old, &claude_turn(&cwd, day, 3));
+    // Each file only counts what is appended after install.
+    let appended = claude_turn(&cwd, day, 3);
+    for path in [&live, &old] {
+        append_records(path, &appended);
+    }
     let stats = env.run(Source::Claude, now + time::Duration::hours(1), None);
-    assert!(stats.bytes_new > 0 && stats.bytes_repair == 0);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair),
+        (2 * body(&appended).len() as u64, 0)
+    );
+    let first = total_tokens(&env.scope(Source::Claude).agg);
+    assert!(first > 0);
+    append_records(&old, &claude_turn(&cwd, day, 4));
+    env.run(Source::Claude, now + time::Duration::hours(2), None);
     let second = total_tokens(&env.scope(Source::Claude).agg);
-    assert_eq!(second, first * 2);
+    assert_eq!(second * 2, first * 3);
 
     // Same-day restart: the run gate refuses a second run today.
     let record = begin_run(&env.state, now).unwrap();
@@ -1415,6 +1445,234 @@ fn first_run_is_forward_only_and_reads_live_files_once() {
     assert!(begin_run(&env.state, now + time::Duration::days(1))
         .unwrap()
         .is_some());
+    env.cleanup();
+}
+
+/// A transcript of `source` in `env`, written now.
+fn write_session(env: &Env, source: Source, name: &str, day: Date) -> (PathBuf, Vec<Value>) {
+    let (claude, codex) = every_family(&env.cwd(), day);
+    let (path, records) = match source {
+        Source::Claude => (env.root.join(format!("p/{name}.jsonl")), claude),
+        Source::Codex => (
+            env.root
+                .join(format!("2026/rollout-2026-10-22T00-00-00-{name}.jsonl")),
+            codex,
+        ),
+    };
+    write_records(&path, &records);
+    (path, records)
+}
+
+/// An unrelated line every reader skips, dated `day`.
+fn later_line(day: Date, n: u32) -> Value {
+    json!({"type":"unused","timestamp":ts(day, n)})
+}
+
+#[test]
+fn install_reads_nothing_from_files_still_being_written() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::uninstalled(&format!("composition-install-in-flight-{source:?}"));
+        let now = OffsetDateTime::now_utc();
+        // Sessions still being written when the app is installed.
+        let (a, _) = write_session(&env, source, "a", now.date());
+        let (b, _) = write_session(&env, source, "b", now.date());
+        let stats = env.run(source, now, None);
+        assert_eq!(
+            (
+                stats.bytes_new,
+                stats.bytes_repair,
+                stats.bytes_head,
+                stats.files_read,
+                stats.lines.lines
+            ),
+            (0, 0, 0, 0, 0),
+            "{source:?}"
+        );
+        assert_eq!(
+            (
+                stats.install_forward_only,
+                stats.dormant_found,
+                stats.checkpoint_restarts,
+                stats.full_read_waiting_files,
+                stats.full_read_backlog_bytes
+            ),
+            (2, 2, 0, 0, 0)
+        );
+        let index = read_index(&env.state, source);
+        for path in [&a, &b] {
+            let pin = index
+                .files
+                .values()
+                .find(|pin| Path::new(&pin.path) == path.as_path())
+                .unwrap();
+            let size = fs::metadata(path).unwrap().len();
+            assert_eq!(
+                (pin.start, pin.origin, pin.waiting),
+                (size, Some(size), false)
+            );
+        }
+        assert!(index.scope_generations.is_empty(), "nothing counted");
+
+        // The next day reads only what the sessions wrote since, even with
+        // the whole repair budget free.
+        let next = now + time::Duration::days(1);
+        let line = later_line(next.date(), 1);
+        append_records(&a, std::slice::from_ref(&line));
+        let stats = env.run(source, next, None);
+        assert_eq!(
+            (stats.bytes_new, stats.bytes_repair, stats.lines.lines),
+            (body(std::slice::from_ref(&line)).len() as u64, 0, 1)
+        );
+        assert_eq!(
+            (stats.full_read_waiting_files, stats.install_forward_only),
+            (0, 0)
+        );
+        env.cleanup();
+    }
+}
+
+#[test]
+fn file_created_after_install_is_read_from_its_start() {
+    for source in [Source::Claude, Source::Codex] {
+        let env = Env::uninstalled(&format!("composition-install-then-new-{source:?}"));
+        let now = OffsetDateTime::now_utc();
+        let (live, _) = write_session(&env, source, "a", now.date());
+        assert_eq!(env.run(source, now, None).install_forward_only, 1);
+        // Born after the install record's cutoff: new bytes from zero.
+        let (born, records) = write_session(&env, source, "b", now.date());
+        let size = fs::metadata(&born).unwrap().len();
+        let stats = env.run(source, now + time::Duration::days(1), None);
+        assert_eq!(
+            (
+                stats.bytes_new,
+                stats.bytes_repair,
+                stats.new_files,
+                stats.install_forward_only,
+                stats.lines.lines
+            ),
+            (size, 0, 1, 0, records.len() as u64),
+            "{source:?}"
+        );
+        let scope = env.scope(source);
+        let checkpoint = |path: &Path| {
+            scope
+                .files
+                .values()
+                .find(|checkpoint| Path::new(&checkpoint.path) == path)
+                .cloned()
+        };
+        let read = checkpoint(&born).unwrap();
+        assert_eq!((read.origin, read.offset), (Some(0), size));
+        assert!(checkpoint(&live).is_none(), "unchanged since install");
+        env.cleanup();
+    }
+}
+
+#[test]
+fn earlier_build_install_backlog_keeps_draining() {
+    let env = Env::uninstalled("composition-earlier-install-backlog");
+    let now = base_now();
+    let cwd = env.cwd();
+    let older = env.root.join("p/older.jsonl");
+    write_records(&older, &claude_turn(&cwd, now.date(), 1));
+    File::options()
+        .write(true)
+        .open(&older)
+        .unwrap()
+        .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600))
+        .unwrap();
+    let newer = env.root.join("p/newer.jsonl");
+    write_records(&newer, &claude_turn(&cwd, now.date(), 2));
+    env.run(Source::Claude, now - time::Duration::days(1), None);
+    earlier_build_install_backlog(&env, Source::Claude, &[&older, &newer]);
+    let older_size = fs::metadata(&older).unwrap().len();
+    let newer_size = fs::metadata(&newer).unwrap().len();
+    let run = |day: i64, budget: u64| {
+        env.run_with(
+            Source::Claude,
+            now + time::Duration::days(day),
+            None,
+            budget,
+            &mut FolderResolver::default(),
+        )
+    };
+
+    // Budget for one file: the newest is read whole, the other waits.
+    let stats = run(0, newer_size);
+    assert_eq!(
+        (stats.bytes_repair, stats.bytes_new, stats.files_read),
+        (newer_size, 0, 1)
+    );
+    assert_eq!(
+        (stats.full_read_waiting_files, stats.full_read_backlog_bytes),
+        (1, older_size)
+    );
+    // No budget: still waiting, never dropped.
+    let stats = run(1, 0);
+    assert_eq!((stats.bytes_repair, stats.files_read), (0, 0));
+    assert_eq!(
+        (stats.full_read_waiting_files, stats.full_read_backlog_bytes),
+        (1, older_size)
+    );
+    // Budget again: the rest drains, whole and from its start.
+    let stats = run(2, REPAIR_BYTES_PER_DAY);
+    assert_eq!((stats.bytes_repair, stats.files_read), (older_size, 1));
+    assert_eq!(
+        (stats.full_read_waiting_files, stats.full_read_backlog_bytes),
+        (0, 0)
+    );
+    let scope = env.scope(Source::Claude);
+    assert!(scope
+        .files
+        .values()
+        .all(|checkpoint| checkpoint.origin == Some(0)));
+    assert_eq!(v2_rows(&scope.agg), whole_rows_of(&[&older, &newer]));
+    env.cleanup();
+}
+
+#[test]
+fn agent_reset_starts_files_still_being_written_at_their_end() {
+    let env = Env::new("composition-reset-in-flight");
+    let now = base_now();
+    let cwd = env.cwd();
+    let path = env.root.join("p/a.jsonl");
+    write_records(&path, &claude_turn(&cwd, now.date(), 1));
+    env.run(Source::Claude, now, None);
+    // Still being written when the index is lost.
+    append_records(&path, &claude_turn(&cwd, now.date(), 2));
+    let at_reset = fs::metadata(&path).unwrap().len();
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(
+        (
+            stats.agent_resets,
+            stats.install_forward_only,
+            stats.bytes_new + stats.bytes_repair
+        ),
+        (1, 1, 0)
+    );
+    // The set-aside scope's reset commits the next day, still reading nothing.
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (stats.scopes_committed, stats.bytes_new + stats.bytes_repair),
+        (1, 0)
+    );
+    let line = later_line(now.date(), 3);
+    append_records(&path, std::slice::from_ref(&line));
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.install_forward_only
+        ),
+        (body(std::slice::from_ref(&line)).len() as u64, 0, 0)
+    );
+    let checkpoint = &env.scope(Source::Claude).files["a.jsonl"];
+    assert_eq!(
+        (checkpoint.origin, checkpoint.offset),
+        (Some(at_reset), fs::metadata(&path).unwrap().len())
+    );
     env.cleanup();
 }
 
@@ -2157,10 +2415,6 @@ fn scope_key_is_stable_across_worktrees() {
     let state = base.join("state");
     let path = env_root.join("p/s.jsonl");
     let now = base_now();
-    write_records(
-        &path,
-        &claude_turn(&worktree.to_string_lossy(), now.date(), 1),
-    );
     let run = |now: OffsetDateTime, resolver: &mut dyn ScopeResolver| {
         let mut run = Run {
             start_verdicts: Default::default(),
@@ -2178,6 +2432,16 @@ fn scope_key_is_stable_across_worktrees() {
             None,
         )
     };
+    // Installed before the session starts, so its transcript is new bytes.
+    fs::create_dir_all(&env_root).unwrap();
+    run(
+        now - time::Duration::days(1),
+        &mut super::scope::GitScopeResolver,
+    );
+    write_records(
+        &path,
+        &claude_turn(&worktree.to_string_lossy(), now.date(), 1),
+    );
     let in_worktree = |name: &str| worktree.join(name).to_string_lossy().into_owned();
     append_records(
         &path,
@@ -2820,6 +3084,25 @@ fn read_index(state: &Path, source: Source) -> Index {
         .unwrap()
 }
 
+/// Turn install pins (each at its file's end) into the backlog an earlier
+/// build's install left for files live at install: unscoped, from offset
+/// zero, waiting for a full read within the repair budget.
+fn earlier_build_install_backlog(env: &Env, source: Source, paths: &[&Path]) {
+    let mut index = read_index(&env.state, source);
+    for path in paths {
+        let pin = index
+            .files
+            .values_mut()
+            .find(|pin| Path::new(&pin.path) == *path)
+            .unwrap();
+        assert!(pin.scope.is_none() && pin.start == pin.size && !pin.waiting);
+        pin.start = 0;
+        pin.origin = Some(0);
+        pin.waiting = true;
+    }
+    super::checkpoint::write_json(&harvest::index_path(&env.state, source), &index).unwrap();
+}
+
 #[test]
 fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     let base = scratch("composition-v2-wt-gone");
@@ -2843,10 +3126,6 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
     let root = base.join("transcripts");
     let state = base.join("state");
     let now = base_now();
-    write_records(
-        &root.join("p/main.jsonl"),
-        &claude_turn(&main.to_string_lossy(), now.date(), 1),
-    );
     let run = |now: OffsetDateTime| {
         let mut resolver = super::scope::GitScopeResolver;
         let mut run = Run {
@@ -2860,6 +3139,13 @@ fn worktree_removed_before_its_first_read_counts_in_its_repository() {
         };
         run_source(&mut run, Source::Claude, std::slice::from_ref(&root), None)
     };
+    // Installed before the main checkout's session starts (new bytes).
+    fs::create_dir_all(&root).unwrap();
+    run(now - time::Duration::days(1));
+    write_records(
+        &root.join("p/main.jsonl"),
+        &claude_turn(&main.to_string_lossy(), now.date(), 1),
+    );
     run(now);
     // Between two daily runs: a worktree is created, used and removed; an
     // hourly wake sees it while it exists.
@@ -2945,7 +3231,8 @@ fn failing_file_is_retried_once_then_quarantined() {
 
 #[test]
 fn resume_of_a_dormant_file_adds_residency_only_to_copied_days() {
-    let env = Env::new("composition-v2-dormant-resume");
+    // The first run is the install: the old file starts at its end.
+    let env = Env::uninstalled("composition-v2-dormant-resume");
     let now = base_now();
     let day = now.date();
     let old_day = day - time::Duration::days(20);
@@ -4272,12 +4559,15 @@ fn damage_shard(manifest: &Path, key: &str, damage: &str) {
 
 #[test]
 fn full_reads_stop_at_their_granted_end() {
-    let env = Env::new("composition-v2-repair-end");
+    let env = Env::uninstalled("composition-v2-repair-end");
     let now = base_now();
     let day = now.date();
     let cwd = env.cwd();
     let path = env.root.join("p/s.jsonl");
     write_records(&path, &claude_turn(&cwd, day, 1));
+    // A full read waiting from an earlier build's install.
+    env.run(Source::Claude, now - time::Duration::days(1), None);
+    earlier_build_install_backlog(&env, Source::Claude, &[&path]);
     let granted = fs::metadata(&path).unwrap().len();
     // The file grows between discovery and its open; the budget holds only
     // its size at discovery.
@@ -4368,7 +4658,11 @@ fn uncommitted_first_scope_shards_remain_pending() {
     assert_eq!(stats.scopes_committed, 0);
     let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
     assert_eq!((stats.scopes_quarantined, stats.scopes_committed), (0, 1));
-    assert_eq!(stats.bytes_repair, fs::metadata(&path).unwrap().len());
+    // Born after the install: read again from its start as new bytes.
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair),
+        (fs::metadata(&path).unwrap().len(), 0)
+    );
     assert_eq!(v2_rows(&env.scope(Source::Claude).agg), whole_rows(&path));
     env.cleanup();
 }
@@ -4867,10 +5161,15 @@ fn interrupted_install_with_lost_index_resets_all_scopes_without_replay() {
     let other = other_workspace(&env);
     write_records(&a, &claude_turn(&env.cwd(), now.date(), 1));
     write_records(&b, &claude_turn(&other, now.date(), 2));
+    // An install by an earlier build read files live at install, committed
+    // a scope and stopped before saving its index. This build's install
+    // reads nothing, so that state is made from a crashed run whose index
+    // is then lost.
     harvest::tests::set_crash_after(Some(1));
     env.run(Source::Claude, now, None);
     harvest::tests::set_crash_after(None);
-    assert!(!harvest::index_path(&env.state, Source::Claude).exists());
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    assert!(install_path(&env.state, Source::Claude.label()).exists());
     let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
     assert_eq!(
         (
@@ -4884,6 +5183,61 @@ fn interrupted_install_with_lost_index_resets_all_scopes_without_replay() {
     let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
     assert_eq!(stats.scopes_committed, 2);
     assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    env.cleanup();
+}
+
+#[test]
+fn crash_during_install_before_index_save_resets_without_replay() {
+    let env = Env::uninstalled("composition-install-crash");
+    let now = base_now();
+    let day = now.date();
+    let cwd = env.cwd();
+    let a = env.root.join("p/a.jsonl");
+    let b = env.root.join("p/b.jsonl");
+    write_records(&a, &claude_turn(&cwd, day, 1));
+    write_records(&b, &claude_turn(&cwd, day, 2));
+    // This build's install writes its record, then stops before saving
+    // its index: the record stays, the index is lost.
+    let stats = env.run(Source::Claude, now, None);
+    assert_eq!(stats.bytes_new + stats.bytes_repair, 0);
+    fs::remove_file(harvest::index_path(&env.state, Source::Claude)).unwrap();
+    assert!(install_path(&env.state, Source::Claude.label()).exists());
+    let at_reset = [&a, &b].map(|path| fs::metadata(path).unwrap().len());
+
+    // The next run is a reset, not a second install: every file is pinned
+    // at its end and nothing is read.
+    let stats = env.run(Source::Claude, now + time::Duration::days(1), None);
+    assert_eq!(
+        (
+            stats.agent_resets,
+            stats.install_forward_only,
+            stats.bytes_new,
+            stats.bytes_repair,
+            stats.files_read
+        ),
+        (1, 2, 0, 0, 0)
+    );
+    // The reset commits the next day, still reading nothing.
+    let stats = env.run(Source::Claude, now + time::Duration::days(2), None);
+    assert_eq!(
+        (stats.scopes_committed, stats.bytes_new + stats.bytes_repair),
+        (1, 0)
+    );
+
+    // Only what is appended after the reset is read.
+    let appended = claude_turn(&cwd, day, 3);
+    for path in [&a, &b] {
+        append_records(path, &appended);
+    }
+    let stats = env.run(Source::Claude, now + time::Duration::days(3), None);
+    assert_eq!(
+        (stats.bytes_new, stats.bytes_repair, stats.agent_resets),
+        (2 * body(&appended).len() as u64, 0, 0)
+    );
+    let scope = env.scope(Source::Claude);
+    for (name, size) in ["a.jsonl", "b.jsonl"].iter().zip(at_reset) {
+        assert_eq!(scope.files[*name].origin, Some(size));
+    }
     env.cleanup();
 }
 
@@ -5019,6 +5373,35 @@ fn failed_missing_pin_reset_with_equal_offset_stays_pending_after_crash() {
     assert!(stats.checkpoint_restarts > 0);
     assert_eq!(total_tokens(&env.scope(Source::Claude).agg), before);
     env.cleanup();
+}
+
+#[test]
+fn changed_days_reader_runs_in_this_build() {
+    // The daemon starts this reader, and the worker runs, instead of the
+    // kinds_version 1 harvest.
+    assert!(changed_days_enabled());
+}
+
+#[test]
+fn changed_days_switch_rules() {
+    // Switch on: the reader runs in every build, whatever the override says.
+    for debug_build in [false, true] {
+        for value in [None, Some("0"), Some("off"), Some("1")] {
+            assert!(changed_days_gate(true, debug_build, value));
+        }
+    }
+    // Switch off: the kinds_version 1 harvest runs; release builds ignore
+    // the override.
+    for value in [None, Some("0"), Some("off"), Some("1"), Some("true")] {
+        assert!(!changed_days_gate(false, false, value));
+    }
+    // Switch off, debug build: only a truthy override turns the reader on.
+    for value in [None, Some(""), Some("0"), Some("off"), Some("no")] {
+        assert!(!changed_days_gate(false, true, value));
+    }
+    for value in ["1", "true", " on ", "YES"] {
+        assert!(changed_days_gate(false, true, Some(value)));
+    }
 }
 
 #[path = "tests/a34.rs"]

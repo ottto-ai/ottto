@@ -42,6 +42,9 @@ impl Marker {
             response_count_before: 0,
             pair_key: self.key,
             has_parent_link: self.parent,
+            trigger: None,
+            id_less_before: false,
+            id_less_after: false,
         }
     }
 }

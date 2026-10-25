@@ -589,14 +589,16 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     .unwrap();
     assert!(dropped.get("proof_correction").is_none());
 
-    // The old loader's invalid branch is the unchanged shared helper.
+    // The old loader's invalid branch used this shared quarantine helper.
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-old-reader");
     let path = scratch.join("index.json");
     index.save(&path).unwrap();
     let encoded_index_bytes = fs::metadata(&path).unwrap().len();
     let files = index.files.len();
     let accepted_entities = index.accepted_snapshot_fingerprints.len();
-    let rebuilt = quarantine_invalid_scan_index(&path).unwrap();
+    let rebuilt =
+        quarantine_invalid_scan_index(&path, "decode", None, None, None, SystemTime::now())
+            .unwrap();
     assert!(!path.exists());
     assert!(rebuilt.files.is_empty());
     for slot in 0..2 {
@@ -2564,6 +2566,9 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
             .source_file_fingerprint
             .clear();
     }
+    // Every loaded or saved index carries the tombstone marker (SOURCE
+    // Round 13 F1).
+    expected.claude_retired_family_tombstones_initialized = true;
     // Empty maps are omitted by ScanIndex's persisted representation.
     serde_json::to_value(expected).unwrap()
 }
