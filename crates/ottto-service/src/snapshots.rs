@@ -4929,8 +4929,8 @@ fn claude_fence_closed_retry_carry(
             .claude_request_census
             .get(index_key)
             .is_some_and(|record| {
-                !record.current_for(&entry.source_file_fingerprint)
-                    && !(idless && record.idless_native_for(&entry.source_file_fingerprint))
+                !(record.current_for(&entry.source_file_fingerprint)
+                    || idless && record.idless_native_for(&entry.source_file_fingerprint))
             });
         if index
             .claude_usage_family_pending
