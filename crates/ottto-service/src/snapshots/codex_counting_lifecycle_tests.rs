@@ -326,6 +326,7 @@ fn moved_evidence_is_shared_by_group_cursor_and_retained_restore() {
     let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
     let path = PathBuf::from("/synthetic/archived_sessions/current.jsonl");
     let candidate = CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path: path.clone(),
         size_bytes: 1,
@@ -403,6 +404,7 @@ fn archived_candidate() -> CandidateFile {
         "/synthetic/archived_sessions/rollout-2026-10-01T10-00-00-{SESSION}.jsonl"
     ));
     CandidateFile {
+        physical_identity: None,
         scan_root: PathBuf::from("/synthetic/archived_sessions"),
         path,
         size_bytes: 1,

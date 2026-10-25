@@ -314,6 +314,7 @@ impl HeaderInventory {
             );
             let seconds = stat.modified().ok().and_then(unix_seconds).unwrap_or(0);
             let mut candidate = CandidateFile {
+                physical_identity: None,
                 scan_root,
                 path,
                 size_bytes: stat.len(),
@@ -1598,6 +1599,7 @@ pub(super) mod tests {
             }
         }
         let metadata = CodexTitleMetadata::default();
+        boot.admit_for_test(index);
         let mut job = boot.into_job(JobInputs {
             metadata: &metadata,
             traces,
@@ -1608,6 +1610,7 @@ pub(super) mod tests {
         })?;
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
+            index,
             metadata: &metadata,
             attribution: None,
             artifacts: false,
@@ -3743,6 +3746,7 @@ pub(super) mod tests {
             )
             .unwrap();
         }
+        boot.admit_for_test(&previous);
         let mut job = boot
             .into_job(JobInputs {
                 metadata: &metadata,
@@ -3755,6 +3759,7 @@ pub(super) mod tests {
             .unwrap();
         let no_scope = |_: &CandidateFile| None;
         let inputs = StepInputs {
+            index: &previous,
             metadata: &metadata,
             attribution: Some(&context),
             artifacts: false,

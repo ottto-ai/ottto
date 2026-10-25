@@ -301,6 +301,7 @@ impl Serialize for ScanIndex {
         field!(accepted_rebuild_pending_since_unix_seconds, Option::is_none);
         field!(accepted_rebuild_last_alarm_unix_seconds, Option::is_none);
         field!(codex_counting_tombstones, BTreeMap::is_empty);
+        field!(reread_guard, reread_guard::State::is_empty);
         map.end()
     }
 }
@@ -387,6 +388,7 @@ pub(super) const FIELDS: &[&str] = &[
     "accepted_rebuild_pending_since_unix_seconds",
     "accepted_rebuild_last_alarm_unix_seconds",
     "codex_counting_tombstones",
+    "reread_guard",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -1427,6 +1429,7 @@ impl<R: BufRead + Seek> Decoder<R> {
                         } => {}
                         "schema_version" => index.schema_version = self.typed(value)?,
                         "generation" => index.generation = self.typed(value)?,
+                        "reread_guard" => index.reread_guard = self.typed(value)?,
                         "upload_context_fingerprint" => {
                             index.upload_context_fingerprint = self.typed(value)?
                         }
