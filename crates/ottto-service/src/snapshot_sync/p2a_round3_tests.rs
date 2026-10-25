@@ -853,6 +853,13 @@ impl P2aControl {
             });
             let mut frame = match frame {
                 Ok(Some(frame)) => frame,
+                Ok(None) if retained.is_none() => {
+                    // A validated catalog can park this source for ordinary
+                    // retirement without failing the global cycle. Still
+                    // require actual collection within the same 32 turns.
+                    money::store::flush();
+                    continue;
+                }
                 Ok(None) => return Ok(retained.expect("resumed exact scan completed")),
                 Err(error)
                     if error
