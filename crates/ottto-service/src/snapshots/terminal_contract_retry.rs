@@ -99,8 +99,9 @@ pub(crate) fn rearm<'a>(
     let current = current_contract();
     let mut count = 0;
     for (fingerprint, record) in records {
-        let unassessed_pending = record.reconstruction_contract == UNKNOWN_CONTRACT
-            && record.disposition == SnapshotQuarantineDisposition::RetryPending;
+        let unassessed_pending = record.disposition == SnapshotQuarantineDisposition::RetryPending
+            && (record.reconstruction_contract == UNKNOWN_CONTRACT
+                || record.contract_retry_claims.is_some());
         if (record.disposition != SnapshotQuarantineDisposition::UnprovenTerminal
             && !unassessed_pending)
             || record.reconstruction_contract >= current
@@ -166,35 +167,48 @@ pub(crate) fn exhaust(record: &mut SnapshotQuarantineRecord) -> bool {
     false
 }
 
-/// Merge only like-version, exact-body budgets. A newer claim also owns its
+/// Merge exact-body budgets by version, then maximum claims. A newer claim owns its
 /// cooldown; an older timer or copy cannot revive it. Other retry policy stays
 /// with the caller. Contract bumps create a distinct budget.
 pub(crate) fn merge_claims(
     record: &mut SnapshotQuarantineRecord,
     other: &SnapshotQuarantineRecord,
 ) -> bool {
-    let before = record.clone();
-    if record.reconstruction_contract == other.reconstruction_contract
-        && record.upload_body_witness == other.upload_body_witness
-    {
-        if let Some(claims) = other.contract_retry_claims {
-            let previous = record.contract_retry_claims;
-            record.contract_retry_claims = Some(previous.unwrap_or(0).max(claims));
-            if previous.is_none_or(|n| n < claims)
-                && record.disposition == SnapshotQuarantineDisposition::RetryPending
-            {
-                record.retry_after_unix_seconds = record
-                    .retry_after_unix_seconds
-                    .max(other.retry_after_unix_seconds);
-            }
-            if previous.is_none_or(|n| n <= claims)
-                && other.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
-            {
-                record.disposition = other.disposition;
-                record.failed_reconstruction_count = other.failed_reconstruction_count;
-                record.retry_after_unix_seconds = 0;
-            }
+    let Some(claims) = other.contract_retry_claims else {
+        return false;
+    };
+    if record.upload_body_witness != other.upload_body_witness {
+        return false;
+    }
+    if record.reconstruction_contract < other.reconstruction_contract {
+        let superseded = record.disposition == SnapshotQuarantineDisposition::SupersededTerminal;
+        *record = other.clone();
+        if superseded {
+            record.disposition = SnapshotQuarantineDisposition::SupersededTerminal;
+            record.retry_after_unix_seconds = 0;
         }
+        return true;
+    }
+    if record.reconstruction_contract != other.reconstruction_contract {
+        return false;
+    }
+    let before = record.clone();
+    let previous = record.contract_retry_claims;
+    record.contract_retry_claims = Some(previous.unwrap_or(0).max(claims));
+    if previous.is_none_or(|n| n < claims)
+        && record.disposition == SnapshotQuarantineDisposition::RetryPending
+    {
+        record.retry_after_unix_seconds = record
+            .retry_after_unix_seconds
+            .max(other.retry_after_unix_seconds);
+    }
+    if previous.is_none_or(|n| n <= claims)
+        && other.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
+        && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
+    {
+        record.disposition = other.disposition;
+        record.failed_reconstruction_count = other.failed_reconstruction_count;
+        record.retry_after_unix_seconds = 0;
     }
     *record != before
 }

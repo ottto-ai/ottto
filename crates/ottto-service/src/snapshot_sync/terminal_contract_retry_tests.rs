@@ -613,7 +613,7 @@ struct ReadBudgetFixture {
 }
 impl ReadBudgetFixture {
     fn new() -> Self {
-        let retained = RetainedRetryFixture::new();
+        let mut retained = RetainedRetryFixture::new();
         let root = retained.scratch.join("sources");
         std::fs::create_dir_all(&root).unwrap();
         for name in ["held", "unrelated"] {
@@ -647,13 +647,27 @@ impl ReadBudgetFixture {
         for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
             progress.quarantine_body(&fingerprint, &body);
         }
-        index.files = seeded.files;
-        index
-            .file_snapshot_fingerprints
-            .extend(seeded.file_snapshot_fingerprints);
-        index
-            .snapshot_activity_at
-            .extend(seeded.snapshot_activity_at);
+        // Keep the scanner's complete settled baseline (roots, family census
+        // and current identity contract). A deliberately stale identity token
+        // would independently and correctly request history reconstruction.
+        let old = serde_json::to_value(&index).unwrap();
+        let mut settled = serde_json::to_value(&seeded).unwrap();
+        retained.index_guard["claude_request_identity_contract"] =
+            settled["claude_request_identity_contract"].clone();
+        for field in [
+            "generation",
+            "session_account_bindings",
+            "claude_request_identity_contract_changed",
+            "claude_history_gate_loaded",
+            "claude_history_cutoff_unix_seconds",
+            "accepted_snapshot_fingerprints",
+            "accepted_snapshot_fingerprint_ledger_version",
+        ] {
+            settled[field] = old[field].clone();
+        }
+        let old_incidence = index.file_snapshot_fingerprints.clone();
+        index = serde_json::from_value(settled).unwrap();
+        index.file_snapshot_fingerprints.extend(old_incidence);
         index.quarantined_snapshot_fingerprints = progress.quarantined_fingerprints.clone();
         index.save(&retained.index_path).unwrap();
         progress.save(&retained.progress_path).unwrap();
@@ -861,17 +875,20 @@ fn terminal_contract_stale_index_and_same_generation_cas_keep_maximum_claim() {
             index.quarantined_snapshot_fingerprints[&fixture.fingerprint].contract_retry_claims,
             Some(2)
         );
-        // An old record embedded in a current generation cannot lower either CAS.
-        index.quarantined_snapshot_fingerprints.insert(
-            fixture.fingerprint.clone(),
-            stale[&fixture.fingerprint].clone(),
-        );
-        index.save(&fixture.retained.index_path).unwrap();
-        progress.quarantined_fingerprints.insert(
-            fixture.fingerprint.clone(),
-            stale[&fixture.fingerprint].clone(),
-        );
-        progress.save(&fixture.retained.progress_path).unwrap();
+        // Older records embedded in a current generation cannot lower either
+        // CAS, including an index copy from before this contract version.
+        for old_version in [2, 1] {
+            let mut old = stale[&fixture.fingerprint].clone();
+            old.reconstruction_contract = old_version;
+            index
+                .quarantined_snapshot_fingerprints
+                .insert(fixture.fingerprint.clone(), old.clone());
+            index.save(&fixture.retained.index_path).unwrap();
+            progress
+                .quarantined_fingerprints
+                .insert(fixture.fingerprint.clone(), old);
+            progress.save(&fixture.retained.progress_path).unwrap();
+        }
         (index, progress) = fixture.retained.load();
         for record in [
             &index.quarantined_snapshot_fingerprints[&fixture.fingerprint],
@@ -942,4 +959,44 @@ fn terminal_contract_malformed_claims_exhaust_without_reset_or_opaque_hold() {
             fixture.assert_retained(&index, &progress);
         }
     }
+}
+
+#[test]
+fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
+    let mut progress = test_upload_progress();
+    let fp = "a".repeat(64);
+    for _ in 0..MAX_SNAPSHOT_RECONSTRUCTION_FAILURES {
+        progress.quarantine_body(&fp, &fp);
+    }
+    with_contract(2, || {
+        crate::snapshots::terminal_contract_retry::rearm(
+            &mut progress.quarantined_fingerprints,
+            progress.active_quarantine_witness.as_ref(),
+        );
+        let record = progress.quarantined_fingerprints.get_mut(&fp).unwrap();
+        record.retry_after_unix_seconds = 0;
+        assert!(progress.prepare_quarantine_retries(&BTreeMap::new()));
+        assert_eq!(
+            progress.quarantined_fingerprints[&fp].contract_retry_claims,
+            Some(1)
+        );
+    });
+    with_contract(3, || {
+        assert_eq!(
+            crate::snapshots::terminal_contract_retry::rearm(
+                &mut progress.quarantined_fingerprints,
+                progress.active_quarantine_witness.as_ref()
+            ),
+            1
+        );
+        let record = &progress.quarantined_fingerprints[&fp];
+        assert_eq!(record.reconstruction_contract, 3);
+        assert_eq!(record.contract_retry_claims, Some(0));
+        assert!(
+            record.retry_after_unix_seconds
+                >= current_unix_seconds() + SNAPSHOT_QUARANTINE_RETRY_SECONDS - 1
+        );
+        assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
+        assert!(progress.active_quarantine_retries.is_empty());
+    });
 }
