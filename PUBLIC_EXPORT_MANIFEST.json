@@ -1,6 +1,6 @@
 {
   "candidate_file_count": 843,
-  "content_sha256": "8066ac67de06e1f9333df450fdb4cd77cbed993ffd32d1ca6736bd8ad6f2a7bc",
+  "content_sha256": "6093bbaa14f67073c99345a4b5ad5fc72bdb37fef9b5dfea53011830b19d0d27",
   "files": [
     {
       "executable": false,
@@ -1448,8 +1448,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_retry.rs",
-      "sha256": "58a9f11a848befb3cb97858ea3df1a1a591d071b36f57cdd71587cb223486ec3",
-      "size_bytes": 11782
+      "sha256": "7f946e29b31a805c08b1f8660b7f8c41d4d8f9bc6112c483038ba6f11c7d5bea",
+      "size_bytes": 13198
     },
     {
       "executable": false,
@@ -1560,8 +1560,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/p2a_round3_tests.rs",
-      "sha256": "1d063f268405c5d3ee43d0c2b1a6707a54286b50441da48c2750cc042a4410dd",
-      "size_bytes": 187109
+      "sha256": "e6ec33d73c2bfa322a1c8222c90ee523d75e664ed1ca40a2e4a1d978c58e7c8f",
+      "size_bytes": 187800
     },
     {
       "executable": false,
@@ -1637,8 +1637,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshot_sync/unknown_recovery.rs",
-      "sha256": "7c086390c4b5e90a2c5ed392d893b1b18005662bc952854e40726de9be5f693a",
-      "size_bytes": 92394
+      "sha256": "f98b1990b3bb5e30a9a7548e9759accb49fae503f9099134a909ab140a15c226",
+      "size_bytes": 94089
     },
     {
       "executable": false,
@@ -1840,8 +1840,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/custody.rs",
-      "sha256": "8b8399f22cfb7790579c889938bbbedfed417fbb36a7df6a03c52f1d22efc63e",
-      "size_bytes": 119976
+      "sha256": "b31b5b970427fb8f7b404bff7f6ef48a397d320d980484f1071a37373835a0fe",
+      "size_bytes": 121258
     },
     {
       "executable": false,
@@ -1896,8 +1896,8 @@
       "executable": false,
       "mode": "0644",
       "path": "crates/ottto-service/src/snapshots/claude_request_money/store.rs",
-      "sha256": "ea237eb9e9d411d37f4614dd1d613bd822109afcc6d8444068f79d63f49161ed",
-      "size_bytes": 83464
+      "sha256": "79f44282c6f0a2abd90b1bd7087a1e2ae255fe9535fa81c98477d1caab960553",
+      "size_bytes": 87120
     },
     {
       "executable": false,
@@ -5904,7 +5904,7 @@
       "size_bytes": 9551
     }
   ],
-  "generated_at": "2026-10-24T23:21:30+00:00",
+  "generated_at": "2026-10-25T00:28:30+00:00",
   "generated_by": "public_repo_export_bundle.sh",
   "output_file_count": 844,
   "public_roots": [
@@ -5943,5 +5943,5 @@
   ],
   "rewrites_applied": {},
   "schema_version": 1,
-  "source_commit": "b935003742f4b3dcf1240d95f79a9f0b3744877f"
+  "source_commit": "a1b59ac6d37fcce03b1853c78660b1f0ada2b70a"
 }
