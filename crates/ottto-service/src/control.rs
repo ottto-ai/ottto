@@ -22685,6 +22685,7 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn auth_rejected_upload_lets_sign_in_reconnect_the_connected_mac() {
         let _guard = lock_backend_test_env();
         let root = control_test_root("auth-rejected-sign-in");
