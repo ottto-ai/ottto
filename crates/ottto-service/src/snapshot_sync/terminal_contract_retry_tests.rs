@@ -506,7 +506,10 @@ fn successful_contract_retry(restart_after_selection: bool) {
             );
             progress.save(&fixture.progress_path).unwrap();
         }
-        let items = vec![held_fingerprint(), retained_ack(), retained_refusal()];
+        // The unrelated permanent refusal remains in the durable fixture,
+        // outside this attempt's frozen input. Including it would correctly
+        // report the whole input as Rejected despite accepting the retry.
+        let items = vec![held_fingerprint(), retained_ack()];
         let mut accepted = 0;
         let mut offered = Vec::new();
         let result = upload_resumable_batches_with_body_witness(
@@ -565,7 +568,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
         assert!(progress.active_quarantine_retries.is_empty());
         let mut duplicate_uploads = 0;
         let mut duplicate_accepted = 0;
-        upload_resumable_batches_with_body_witness(
+        let duplicate_result = upload_resumable_batches_with_body_witness(
             &items,
             &unique_poison_scope(),
             &mut progress,
@@ -579,6 +582,7 @@ fn successful_contract_retry(restart_after_selection: bool) {
             |state| state.save(&fixture.progress_path),
         )
         .unwrap();
+        assert_eq!(duplicate_result, ResumableUploadResult::Completed);
         assert_eq!(
             (duplicate_uploads, duplicate_accepted),
             (0, 0),
