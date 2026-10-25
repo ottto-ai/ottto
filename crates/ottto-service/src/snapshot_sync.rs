@@ -10983,6 +10983,7 @@ mod tests {
                 codex_captured_tier_receipt_required: false,
                 codex_captured_uncommitted: false,
                 codex_counting_v2: false,
+                codex_counting_owner: None,
                 effective_upload_body_witness_revision: 0,
             },
         );
@@ -21591,6 +21592,9 @@ mod tests {
             );
             std::fs::remove_dir_all(root).unwrap();
         }
+    }
+    mod codex_counting_lifecycle_tests {
+        include!("snapshot_sync/codex_counting_lifecycle_tests.rs");
     }
     fn prepare_codex_union_fixture(root: &Path, index: &mut ScanIndex) -> SourceScanResult {
         let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
