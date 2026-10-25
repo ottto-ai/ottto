@@ -36,7 +36,7 @@
 //!    out-of-process TCP-connect probe or another upload path reaching the
 //!    backend — the same last-resort self-restart.
 //! 6. Proactively, `net_transition` watches macOS routing-table changes and
-//!    force-rebuilds both upstream pools on any interface/address transition,
+//!    force-rebuilds the shared upstream pools on any interface/address transition,
 //!    independent of the reactive ladders above.
 
 use crate::snapshot_client::UploadFailureDiagnostics;
@@ -931,20 +931,7 @@ fn parse_probe_target(base: &str) -> Option<(String, u16)> {
     }
 }
 
-/// The OTLP upstream agent lives in `otlp_relay` (its warm pool is
-/// intentionally longer-lived than the shared pair), so rebuilds are
-/// requested through this flag and applied lazily on the relay's next use.
-static OTLP_AGENT_REBUILD_REQUESTED: AtomicBool = AtomicBool::new(false);
-
-pub(crate) fn request_upstream_otlp_agent_rebuild() {
-    OTLP_AGENT_REBUILD_REQUESTED.store(true, Ordering::SeqCst);
-}
-
-pub(crate) fn take_upstream_otlp_agent_rebuild_request() -> bool {
-    OTLP_AGENT_REBUILD_REQUESTED.swap(false, Ordering::SeqCst)
-}
-
-/// Force-rebuild BOTH upstream pools right now. Called by the proactive
+/// Force-rebuild the shared upstream pools right now. Called by the proactive
 /// macOS network-transition observer (`net_transition`): after an interface
 /// or address change, every pooled socket may be bound to a dead local IP, so
 /// drop them all instead of waiting for error-classification streaks — this
@@ -960,7 +947,6 @@ pub(crate) fn force_rebuild_upstream_agents(reason: &str) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         *agents = build_shared_agents();
     }
-    request_upstream_otlp_agent_rebuild();
 }
 
 struct SharedAgents {
@@ -1001,11 +987,6 @@ pub(crate) fn shared_agents() -> (ureq::Agent, ureq::Agent) {
         .lock()
         .map(|mut state| state.streak.should_rebuild(now))
         .unwrap_or(false);
-    if transport_rebuild {
-        // A sustained transport outage taints every pool in the process, so
-        // schedule the OTLP upstream agent for the same treatment.
-        request_upstream_otlp_agent_rebuild();
-    }
     let mut agents = SHARED_AGENTS
         .get_or_init(|| Mutex::new(build_shared_agents()))
         .lock()
@@ -1164,7 +1145,7 @@ fn sync_watchdog() -> &'static Mutex<SyncWatchdogState> {
     SYNC_WATCHDOG.get_or_init(|| Mutex::new(SyncWatchdogState::default()))
 }
 
-/// Record that a non-snapshot-sync upstream path (agent-status upload, OTLP
+/// Record that a non-snapshot-sync upstream path (agent-status upload)
 /// relay forward) reached the backend. This is the watchdog's evidence that
 /// a concurrent snapshot-sync outage is process-local, not the network.
 pub(crate) fn note_upstream_upload_succeeded(path: &'static str) {
@@ -1697,7 +1678,10 @@ mod tests {
         // Same outage with another upload path healthy: restart.
         let mut split = SyncWatchdogState::default();
         let _ = split.decide_sync_failure(None, false, None, false, start);
-        split.note_other_upload("otlp_relay", past_restart_window - Duration::from_secs(60));
+        split.note_other_upload(
+            "agent_status",
+            past_restart_window - Duration::from_secs(60),
+        );
         assert_eq!(
             split
                 .decide_sync_failure(dns_outage, false, None, false, past_restart_window)
@@ -1709,7 +1693,10 @@ mod tests {
         // fallback resolver instead of churning the process.
         let mut short_dns = SyncWatchdogState::default();
         let _ = short_dns.decide_sync_failure(None, false, None, false, start);
-        short_dns.note_other_upload("otlp_relay", past_restart_window - Duration::from_secs(60));
+        short_dns.note_other_upload(
+            "agent_status",
+            past_restart_window - Duration::from_secs(60),
+        );
         assert!(short_dns
             .decide_sync_failure(
                 Some(Duration::from_secs(30 * 60)),
@@ -2047,19 +2034,6 @@ mod tests {
         // Pool rebuilds stay allowed offline — dropping idle sockets is
         // harmless and leaves the daemon ready for when the network returns.
         assert!(state.streak.should_rebuild(long_after));
-    }
-
-    #[test]
-    fn transport_rebuild_request_reaches_the_otlp_agent_flag() {
-        // Drain any request left over from other tests in this process.
-        let _ = take_upstream_otlp_agent_rebuild_request();
-        assert!(!take_upstream_otlp_agent_rebuild_request());
-        request_upstream_otlp_agent_rebuild();
-        assert!(take_upstream_otlp_agent_rebuild_request());
-        assert!(
-            !take_upstream_otlp_agent_rebuild_request(),
-            "the request is consumed by the rebuild"
-        );
     }
 
     #[cfg(target_os = "macos")]
