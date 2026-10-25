@@ -4529,6 +4529,78 @@ fn census_duplicate_rebuild_backward_clock_spends_the_grant() {
     }
 }
 
+/// MONEY 724h condition 3, autoreview: a backward clock first observed by
+/// the census terminal (before any read is admitted) spends the grant as
+/// admission does. Counted as exhausted there; once the clock is back inside
+/// the grant's span the same working index still refuses it, and a reload
+/// in the same process makes a new counted attempt instead of reusing it.
+/// Current and earlier forms; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_terminal_observed_regression_spends_the_grant() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for form in ["current", "earlier"] {
+            let case = format!("shadow={enabled} {form}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-terminal-clock");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            std::fs::write(&path, census_rebuild_form_raw(&original, &key, form)).unwrap();
+            let clock = bound::set_now(N3_T0);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+            drop(clock);
+
+            // The terminal runs with the clock one minute back.
+            let clock = bound::set_now(N3_T0 - 60);
+            assert_eq!(
+                census_rebuild_counters(&mut index),
+                (1, 0),
+                "{case}: counted as exhausted"
+            );
+            assert_eq!(
+                census_rebuild_alarms(&key, "grant_clock_regressed"),
+                1,
+                "{case}"
+            );
+            drop(clock);
+
+            let forward = N3_T0 + 60;
+            let clock = bound::set_now(forward);
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}: spent in this working index"
+            );
+            assert_eq!(bound::held(&index, &key), form == "earlier", "{case}");
+            drop(clock);
+
+            let _clock = bound::set_now(forward);
+            let index = ScanIndex::load(&path).unwrap();
+            assert_eq!(
+                bound::attempts(&index, &key),
+                vec![N3_T0, forward],
+                "{case}: never reused; a new counted attempt"
+            );
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}"
+            );
+        }
+    }
+}
+
 /// MONEY 724h condition 3, autoreview: a refusal on backward time never
 /// lowers a persisted stamp. The guard's latest stamp is a counter's (an
 /// earlier untracked refusal at `N3_T0`, no key tracked). A new duplicate key
@@ -4626,15 +4698,17 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
 }
 
 /// MONEY 724h condition 3, autoreview: a guard lost with its saved witness
-/// ahead of the wall clock (thirty days ahead here), alone or with its priors
-/// field refused too, is closed from that witness, never from the backward
-/// clock. The save keeps the witness, so a reload one window later, still
+/// ahead of the wall clock (thirty days ahead here), alone, with its priors
+/// field refused too, or with its shadow duplicated (the witness in either
+/// copy; the bounded reader too), is closed from that witness, never from the
+/// backward clock. The save keeps the witness, so a reload one window later, still
 /// behind it, refuses the duplicate key; only one window past the witness is
 /// it granted. In one process and across a restart; OFF and ON.
 #[test]
 fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
     use crate::snapshots::claude_request_census::{
-        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+        decode_bounded_index, duplicate_rebuild_test_support as bound,
+        persist_duplicate_rebuild_grants,
     };
     let rearmed = (
         CandidateDecision::Parse,
@@ -4642,42 +4716,50 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
     );
     let refused = (CandidateDecision::Skip, None);
     let witness = N3_T0 + 30 * N3_DAY;
+    let variants = [
+        "lost",
+        "priors_refused",
+        "duplicate_first",
+        "duplicate_second",
+    ];
     for enabled in [false, true] {
         let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
-        for (priors, restart) in [(false, false), (false, true), (true, false), (true, true)] {
-            let case = format!("shadow={enabled} priors_refused={priors} restart={restart}");
+        for (variant, restart) in variants
+            .into_iter()
+            .flat_map(|variant| [(variant, false), (variant, true)])
+        {
+            let case = format!("shadow={enabled} {variant} restart={restart}");
             bound::restart();
             let scratch =
                 crate::test_scratch::ScratchDir::new("census-rebuild-lost-future-witness");
             let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
             let fingerprint = original.files[&key].source_file_fingerprint.clone();
             let path = scratch.join("index.json");
-            // The guard (`"n"`) is gone; only its witness is left, and with
-            // `priors` a malformed priors field (refused).
+            // The guard (`"n"`) is gone; only its witness is left, with a
+            // malformed priors field (refused), or in one copy of a
+            // duplicated shadow.
             let raw = census_duplicate_rebuild_raw(&original, &key, Some(serde_json::json!({})));
             let shadow = r#""claude_request_census_shadow":{"n":{}}"#;
             assert_eq!(raw.matches(shadow).count(), 1, "{case}");
             assert!(!raw.contains("claude_census_rebuild_priors"), "{case}");
-            let refused_priors = if priors {
-                format!(
-                    r#","claude_census_rebuild_priors":{{"{}":7}}"#,
+            let field = "\"claude_request_census_shadow\"";
+            let replacement = match variant {
+                "lost" => format!(r#"{field}:{{"nw":{witness}}}"#),
+                "priors_refused" => format!(
+                    r#"{field}:{{"nw":{witness}}},"claude_census_rebuild_priors":{{"{}":7}}"#,
                     bound::key_id(&key)
-                )
-            } else {
-                String::new()
-            };
-            std::fs::write(
-                &path,
-                raw.replace(
-                    shadow,
-                    &format!(
-                        r#""claude_request_census_shadow":{{"nw":{witness}}}{refused_priors}"#
-                    ),
                 ),
-            )
-            .unwrap();
+                "duplicate_first" => format!(r#"{field}:{{"nw":{witness}}},{field}:{{}}"#),
+                "duplicate_second" => format!(r#"{field}:{{}},{field}:{{"nw":{witness}}}"#),
+                other => panic!("{other}"),
+            };
+            let raw = raw.replace(shadow, &replacement);
+            std::fs::write(&path, &raw).unwrap();
 
             let clock = bound::set_now(N3_T0);
+            let bounded = decode_bounded_index(raw.as_bytes()).unwrap();
+            assert!(bound::closed(&bounded), "{case}: bounded reader");
+            assert_eq!(bound::witness(&bounded), witness, "{case}: bounded reader");
             let mut index = ScanIndex::load(&path).unwrap();
             persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
             assert!(bound::closed(&index), "{case}: lost, never fresh");

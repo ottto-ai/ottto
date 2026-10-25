@@ -63,7 +63,9 @@ grant found spent stays spent in its process (in the same working index
 too), and nothing on backward time lowers a persisted stamp (a refusal, a
 lost guard's reconstruction, which keeps its saved witness, or an identity
 revoke, which keeps the removed key's latest stamp; every closure starts no
-earlier than the saved witness), and an alarm's retry time is never before
+earlier than the saved witness, of any copy of a duplicated shadow), a grant
+the census terminal finds spent is spent too, and an alarm's retry time is
+never before
 the clock passes the latest stamp. At most 512 keys are tracked, one compact line each in the saved
 index; past that new keys are refused for one window. Only well-formed
 fingerprints (64 lowercase hex) are rearmed.

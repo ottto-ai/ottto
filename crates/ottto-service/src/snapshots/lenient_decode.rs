@@ -1437,6 +1437,19 @@ impl<R: BufRead + Seek> Decoder<R> {
                         index.claude_request_census = ClaudeRequestCensus::default();
                         self.census.duplicate_census = true;
                     } else if name == "claude_request_census_shadow" {
+                        // MONEY 724h condition 3: both copies' witnesses are
+                        // kept for the closure (`finish_decode`).
+                        let copy = if value.resource {
+                            0
+                        } else {
+                            self.isolated_bytes(value)?
+                                .map_or(0, |bytes| claude_request_census::shadow_witness(&bytes))
+                        };
+                        let first = claude_request_census::decoded_witness(
+                            &index.claude_request_census_shadow,
+                        );
+                        self.census.duplicate_shadow_witness =
+                            self.census.duplicate_shadow_witness.max(first).max(copy);
                         index.claude_request_census_shadow =
                             ClaudeRequestCensusShadowState::default();
                         self.census.duplicate_shadow = true;

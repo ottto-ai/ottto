@@ -33,11 +33,12 @@
 //!   Behind the guard's latest persisted stamp, time is no new authority: no
 //!   grant is made or reused, no new key admitted and no read admitted
 //!   (`grant_clock_regressed`, counted like an exhausted key), until the
-//!   clock passes that stamp. A grant found spent stays spent in its process,
-//!   in the same working index too, until a new counted attempt. A stamp is
-//!   only ever raised, never lowered by a refusal on backward time, so the
-//!   latest stamp (and the witness) never falls: every closure (a lost guard,
-//!   refused priors, an orphan) starts no earlier than the saved witness, and
+//!   clock passes that stamp. A grant found spent (by admission or the census
+//!   terminal) stays spent in its process, in the same working index too,
+//!   until a new counted attempt. A stamp is only ever raised, never lowered
+//!   by a refusal on backward time, so the latest stamp (and the witness)
+//!   never falls: every closure (a lost or duplicated guard, refused priors,
+//!   an orphan) starts no earlier than the saved witness (of any copy), and
 //!   an identity revoke keeps the removed key's latest stamp. An alarm's
 //!   retry is never before the clock passes the latest stamp.
 //! - A persisted rearm is counted again on the first load of each process, or
@@ -1252,11 +1253,17 @@ fn admission_refused(guard: &DuplicateRebuildGuard, id: &str, tracked: &TrackedK
     let Some(cause) = spent_cause(id, tracked, now_unix(), guard.latest_stamp()) else {
         return false;
     };
+    mark_spent(id, tracked, cause);
+    true
+}
+
+/// `tracked`'s grant was found spent (by admission or the terminal): its saved
+/// grant is forgotten and the spend recorded, so it stays refused.
+fn mark_spent(id: &str, tracked: &TrackedKey, cause: &'static str) {
     spend(id, tracked);
     if let Some(stamp) = unread_grant(tracked) {
         record_spent(id, stamp, cause);
     }
-    true
 }
 
 /// Candidate selection: `key` holds an unspent grant of this load, so its
@@ -1374,6 +1381,13 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
         })
         .map(|(id, _, cause)| (id.as_str(), cause))
         .collect();
+    // Observed here first (no read admitted yet), a spent grant stays spent
+    // as well. The identity path's key is never among them.
+    for (&id, &cause) in &spent {
+        if let Some(tracked) = guard.keys.get(id) {
+            mark_spent(id, tracked, cause);
+        }
+    }
     let mut emitted = 0;
     // Behind the guard's latest stamp nothing is admitted until the wall
     // clock passes it, whatever else a retry waits for.

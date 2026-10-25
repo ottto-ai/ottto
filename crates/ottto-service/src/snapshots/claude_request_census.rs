@@ -2039,6 +2039,9 @@ pub(super) struct CensusDecodeState {
     pub(super) ambiguous_keys: BTreeSet<String>,
     pub(super) duplicate_census: bool,
     pub(super) duplicate_shadow: bool,
+    /// MONEY 724h condition 3: the latest valid witness of a duplicated
+    /// shadow's later copies (0 for none).
+    pub(super) duplicate_shadow_witness: u64,
     pub(super) seen_priors: bool,
     pub(super) priors_refused: bool,
 }
@@ -2051,6 +2054,9 @@ impl CensusDecodeState {
             .extend(other.ambiguous_keys.into_iter().take(remaining));
         self.duplicate_census |= other.duplicate_census;
         self.duplicate_shadow |= other.duplicate_shadow;
+        self.duplicate_shadow_witness = self
+            .duplicate_shadow_witness
+            .max(other.duplicate_shadow_witness);
         self.seen_priors |= other.seen_priors;
         self.priors_refused |= other.priors_refused;
     }
@@ -2065,9 +2071,14 @@ pub(super) fn finish_decode(index: &mut ScanIndex, mut state: CensusDecodeState)
         index.claude_request_census = ClaudeRequestCensus::default();
     }
     if state.duplicate_shadow {
-        // Which copy holds the rebuild guard is unknown: close it.
+        // Which copy holds the rebuild guard is unknown: close it. MONEY 724h
+        // condition 3: the closure keeps the latest valid witness of any
+        // copy, so it never starts before it.
+        let witness = valid_witness(index.claude_request_census_shadow.rebuild_witness)
+            .max(state.duplicate_shadow_witness);
         index.claude_request_census_shadow = ClaudeRequestCensusShadowState {
             rebuild_bound: Some(Box::new(rebuild_bound::DuplicateRebuildGuard::closed())),
+            rebuild_witness: witness,
             ..ClaudeRequestCensusShadowState::default()
         };
     }
@@ -2109,6 +2120,28 @@ pub(super) fn finish_decode(index: &mut ScanIndex, mut state: CensusDecodeState)
             .safety_incomplete
             .mark_overflow(SafetyIncompleteOverflowCause::DecodeLoss);
     }
+}
+
+/// MONEY 724h condition 3: a witness as a stamp; the malformed sentinel
+/// (`u64::MAX`) is none.
+fn valid_witness(witness: u64) -> u64 {
+    if witness == u64::MAX {
+        0
+    } else {
+        witness
+    }
+}
+
+/// MONEY 724h condition 3: the valid witness of one shadow copy, decoded as
+/// the shadow itself is (0 for none or an undecodable copy).
+pub(super) fn shadow_witness(bytes: &[u8]) -> u64 {
+    serde_json::from_slice::<ClaudeRequestCensusShadowState>(bytes)
+        .map_or(0, |state| decoded_witness(&state))
+}
+
+/// MONEY 724h condition 3: the valid witness of a decoded shadow.
+pub(super) fn decoded_witness(state: &ClaudeRequestCensusShadowState) -> u64 {
+    valid_witness(state.rebuild_witness)
 }
 
 /// Derive positional slots from Serde's own field metadata rather than pinning
@@ -2187,6 +2220,7 @@ struct CensusRead<R> {
     ambiguous_keys: BTreeSet<String>,
     duplicate_census: bool,
     duplicate_shadow: bool,
+    duplicate_shadow_witness: u64,
     shadow_key: bool,
     shadow_state: bool,
     /// MONEY P1b: the captured value is `claude_census_rebuild_priors`.
@@ -2223,6 +2257,7 @@ impl<R: std::io::Read> CensusRead<R> {
             ambiguous_keys: BTreeSet::new(),
             duplicate_census: false,
             duplicate_shadow: false,
+            duplicate_shadow_witness: 0,
             shadow_key: false,
             shadow_state: false,
             priors_state: false,
@@ -2254,6 +2289,7 @@ impl<R: std::io::Read> CensusRead<R> {
             ambiguous_keys: std::mem::take(&mut self.ambiguous_keys),
             duplicate_census: self.duplicate_census,
             duplicate_shadow: self.duplicate_shadow,
+            duplicate_shadow_witness: self.duplicate_shadow_witness,
             seen_priors: self.seen_priors,
             priors_refused: self.priors_refused,
         }
@@ -2395,6 +2431,13 @@ impl<R: std::io::Read> CensusRead<R> {
                     _ => {}
                 }
             }
+        }
+        if self.shadow_state && self.duplicate_shadow && !overflow {
+            // MONEY 724h condition 3: a later copy of a duplicated shadow is
+            // discarded, but its witness is kept (`finish_decode`), in every
+            // mode.
+            self.duplicate_shadow_witness =
+                self.duplicate_shadow_witness.max(shadow_witness(&bytes));
         }
         if self.priors_state {
             // MONEY P1b: decoded in isolation in every mode. A malformed,
