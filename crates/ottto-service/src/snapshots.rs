@@ -109,6 +109,8 @@ use local_context_points::{local_context_points_recent, LocalContextPoints};
 mod pi_retry_inputs;
 mod sampled_audit;
 mod sampled_jsonl;
+#[cfg(test)]
+pub(crate) mod e2_pipeline_scan_fixture;
 pub(crate) mod sampled_scan;
 #[cfg(test)]
 mod transcript_acquisition_tests;

@@ -21523,6 +21523,9 @@ mod tests {
     mod history_upgrade_pipeline_tests {
         include!("snapshot_sync/history_upgrade_pipeline_tests.rs");
     }
+    mod claude_money_e2_pipeline_tests {
+        include!("snapshot_sync/claude_money_e2_pipeline_tests.rs");
+    }
     mod claude_request_money_pipeline_tests {
         include!("snapshot_sync/claude_request_money_pipeline_tests.rs");
     }
