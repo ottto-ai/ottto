@@ -12,6 +12,7 @@ use crate::{
     SetupRunReadStart, StagedAccountSwitch,
 };
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use ottto_core::token_store::OTTTO_REVOCATION_RECEIPT_ACCOUNT;
 use ottto_core::{
     compiled_build_id, compiled_release_channel, compiled_release_version,
     default_prior_device_path, default_support_dir, execute_local_uninstall,
@@ -7143,8 +7144,108 @@ fn create_setup_claim(
     nonce: &str,
 ) -> Result<SetupClaimCreateResponse, LocalApiError> {
     let url = api_url("/api/v1/setup-claims");
-    let body = setup_claim_create_body(machine, nonce);
-    backend_post_json(&url, &body, &[])
+    // Serialize receipt handoff with releases and other claim creates, without
+    // holding the identity lifecycle mutex over network I/O.
+    let _receipt_lock = REVOCATION_RECEIPT_LOCK
+        .lock()
+        .map_err(|_| LocalApiError::StatePoisoned)?;
+    create_setup_claim_with_receipt(
+        &url,
+        machine,
+        nonce,
+        &KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
+        time::OffsetDateTime::now_utc().unix_timestamp(),
+    )
+}
+
+const REVOCATION_RECEIPT_MAX_AGE_SECONDS: i64 = 24 * 60 * 60;
+static REVOCATION_RECEIPT_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StoredRevocationReceipt {
+    revocation_receipt: SecretString,
+    received_at: i64,
+}
+
+fn store_revocation_receipt(
+    store: &impl ControlTokenStore,
+    receipt: Option<SecretString>,
+    received_at: i64,
+) {
+    // A confirmed release supersedes any older receipt, even on a server
+    // which omits the additive field. Storage errors fail toward fresh setup;
+    // never fall back to a plain file or include the receipt in an error.
+    let _ = store.delete();
+    if let Some(receipt) = receipt.filter(|value| !value.expose_secret().trim().is_empty()) {
+        let stored = StoredRevocationReceipt {
+            revocation_receipt: receipt,
+            received_at,
+        };
+        if let Ok(encoded) = serde_json::to_string(&stored) {
+            let _ = store.save(&encoded);
+        }
+    }
+}
+
+fn remember_revocation_receipt(device_released: bool, receipt: Option<SecretString>) {
+    if device_released {
+        if let Ok(_receipt_lock) = REVOCATION_RECEIPT_LOCK.lock() {
+            store_revocation_receipt(
+                &KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT),
+                receipt,
+                time::OffsetDateTime::now_utc().unix_timestamp(),
+            );
+        }
+    }
+}
+
+fn create_setup_claim_with_receipt(
+    url: &str,
+    machine: &MachineIdentity,
+    nonce: &str,
+    store: &impl ControlTokenStore,
+    now: i64,
+) -> Result<SetupClaimCreateResponse, LocalApiError> {
+    let encoded = store.load().ok();
+    let stored = encoded
+        .as_deref()
+        .and_then(|encoded| serde_json::from_str::<StoredRevocationReceipt>(encoded).ok());
+    // Take before sending. If deletion fails, do not send the receipt. A crash
+    // or failed cleanup after a 2xx must never cause a second claim to reuse it.
+    let receipt = if encoded.is_some() && store.delete().is_ok() {
+        stored.filter(|value| {
+            now.checked_sub(value.received_at)
+                .is_some_and(|age| (0..REVOCATION_RECEIPT_MAX_AGE_SECONDS).contains(&age))
+        })
+    } else {
+        None
+    };
+    let mut body = setup_claim_create_body(machine, nonce);
+    if let Some(receipt) = &receipt {
+        body["revocation_receipt"] = json!(receipt.revocation_receipt.expose_secret());
+    }
+    let result = crate::retry_tls::credential_agent()
+        .post(url)
+        .set("Accept", "application/json")
+        .timeout(BACKEND_REQUEST_TIMEOUT)
+        .send_json(&body);
+    let status = match &result {
+        Ok(response) => Some(response.status()),
+        Err(ureq::Error::Status(status, _)) => Some(*status),
+        Err(ureq::Error::Transport(_)) => None,
+    };
+    // Decide from HTTP status BEFORE decoding: even a malformed 2xx spends it.
+    if !status.is_some_and(|status| (200..300).contains(&status) || (400..500).contains(&status)) {
+        if let Some(receipt) = receipt {
+            if let Ok(encoded) = serde_json::to_string(&receipt) {
+                let _ = store.save(&encoded);
+            }
+        }
+    }
+    let response = result.map_err(|error| backend_error_from_ureq(url, error))?;
+    backend_success(url, response)?
+        .into_json()
+        .map_err(|error| backend_response_unexpected(url, error.to_string()))
 }
 
 fn setup_claim_create_body(machine: &MachineIdentity, nonce: &str) -> serde_json::Value {
@@ -8798,6 +8899,8 @@ struct SetupRunDisconnectResponse {
     /// this Mac's device registration. Older servers omit the field.
     #[serde(default)]
     device_released: bool,
+    #[serde(default)]
+    revocation_receipt: Option<SecretString>,
 }
 
 /// This Mac's active relay-device id and secret, presented on a cloud
@@ -8840,6 +8943,8 @@ fn device_release_proof(device_id: String, device_secret: String) -> Option<Devi
 #[derive(Debug, Deserialize)]
 struct DeviceSelfReleaseResponse {
     device_released: bool,
+    #[serde(default)]
+    revocation_receipt: Option<SecretString>,
 }
 
 /// Ask Ottto to release this Mac's registration with the device's own
@@ -8876,7 +8981,10 @@ fn release_device_without_setup_run(api_base_url: &str, release: &DeviceReleaseP
         .ok()
         .filter(|response| response.status() == 200)
         .and_then(|response| response.into_json::<DeviceSelfReleaseResponse>().ok())
-        .is_some_and(|response| response.device_released)
+        .is_some_and(|response| {
+            remember_revocation_receipt(response.device_released, response.revocation_receipt);
+            response.device_released
+        })
 }
 
 fn setup_run_disconnect_body(release: Option<&DeviceReleaseProof>) -> serde_json::Value {
@@ -9253,7 +9361,10 @@ fn disconnect_setup_run_local_client(
         ),
     );
     let body = setup_run_disconnect_body(release);
-    backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])
+    let mut response: SetupRunDisconnectResponse =
+        backend_post_json(&url, &body, &[("X-Ottto-Setup-Run-Token", setup_run_token)])?;
+    remember_revocation_receipt(response.device_released, response.revocation_receipt.take());
+    Ok(response)
 }
 
 /// Call `wait_for_setup_run_verification_with_base` with one transparent
@@ -23811,6 +23922,217 @@ for line in sys.stdin:
         )
         .expect("release disconnect response");
         assert!(released.device_released);
+    }
+
+    #[test]
+    fn revocation_receipt_release_responses_are_optional_and_debug_redacted() {
+        let secret = "otrr_synthetic_response_receipt";
+        for receipt in [None, Some(serde_json::Value::Null), Some(json!(secret))] {
+            let mut body = json!({"setup_run_id":"run", "run_status":"disconnected",
+                "client_disconnected":true, "disconnected_at":"2026-10-25T10:00:00Z",
+                "device_released":true});
+            if let Some(receipt) = receipt {
+                body["revocation_receipt"] = receipt;
+            }
+            let disconnect: SetupRunDisconnectResponse =
+                serde_json::from_value(body.clone()).unwrap();
+            let release: DeviceSelfReleaseResponse = serde_json::from_value(body).unwrap();
+            assert_eq!(
+                disconnect
+                    .revocation_receipt
+                    .as_ref()
+                    .map(SecretString::expose_secret),
+                release
+                    .revocation_receipt
+                    .as_ref()
+                    .map(SecretString::expose_secret)
+            );
+            assert!(!format!("{disconnect:?} {release:?}").contains(secret));
+        }
+    }
+
+    fn revocation_receipt_claim_http(
+        store: &impl ControlTokenStore,
+        now: i64,
+        status: &str,
+        body: &str,
+    ) -> (
+        Result<SetupClaimCreateResponse, LocalApiError>,
+        serde_json::Value,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/api/v1/setup-claims",
+            listener.local_addr().unwrap()
+        );
+        let response = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_complete_http_request(&mut stream);
+            stream.write_all(response.as_bytes()).unwrap();
+            request
+        });
+        let result =
+            create_setup_claim_with_receipt(&url, &test_machine(), "synthetic-nonce", store, now);
+        let request = server.join().unwrap();
+        assert!(request.starts_with("POST /api/v1/setup-claims "));
+        (
+            result,
+            serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap(),
+        )
+    }
+
+    const RECEIPT_CLAIM_SUCCESS: &str = r#"{"claim_code":"claim","claim_token":"token","claim_url":"https://ottto.net/connect","expires_at":"2030-01-01T00:00:00Z"}"#;
+
+    #[test]
+    #[serial]
+    fn revocation_receipt_persists_then_is_sent_once_without_logging() {
+        use crate::retry_tls::credential_test_support::{assert_never_logged, install_host_logger};
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        install_host_logger();
+        let store = MemoryTokenStore::new();
+        let receipt = "otrr_synthetic_sent_once";
+        store_revocation_receipt(&store, Some(SecretString::new(receipt)), 100);
+        let persisted: StoredRevocationReceipt =
+            serde_json::from_str(&store.load().unwrap()).unwrap();
+        assert_eq!(persisted.received_at, 100);
+        assert!(!format!("{persisted:?}").contains(receipt));
+        let (result, body) =
+            revocation_receipt_claim_http(&store, 101, "201 Created", RECEIPT_CLAIM_SUCCESS);
+        assert!(result.is_ok());
+        assert_eq!(body["revocation_receipt"], receipt);
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        let (result, body) =
+            revocation_receipt_claim_http(&store, 102, "200 OK", RECEIPT_CLAIM_SUCCESS);
+        assert!(result.is_ok());
+        assert!(body.get("revocation_receipt").is_none());
+        assert_never_logged(receipt);
+    }
+
+    #[test]
+    #[serial]
+    fn revocation_receipt_is_dropped_on_any_definitive_answer_before_decode() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        for status in [
+            "200 OK",
+            "204 No Content",
+            "400 Bad Request",
+            "401 Unauthorized",
+            "404 Not Found",
+            "422 Unprocessable Entity",
+            "429 Too Many Requests",
+        ] {
+            let store = MemoryTokenStore::new();
+            let receipt = "otrr_synthetic_definitive";
+            store_revocation_receipt(&store, Some(SecretString::new(receipt)), 100);
+            let (result, body) = revocation_receipt_claim_http(&store, 101, status, "{}");
+            assert!(result.is_err());
+            assert_eq!(body["revocation_receipt"], receipt);
+            assert!(
+                matches!(store.load(), Err(TokenStoreError::Missing)),
+                "{status}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn revocation_receipt_expires_at_24_hours_and_rejects_clock_rollback() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        for age in [
+            -1,
+            REVOCATION_RECEIPT_MAX_AGE_SECONDS - 1,
+            REVOCATION_RECEIPT_MAX_AGE_SECONDS,
+            REVOCATION_RECEIPT_MAX_AGE_SECONDS + 1,
+        ] {
+            let store = MemoryTokenStore::new();
+            store_revocation_receipt(
+                &store,
+                Some(SecretString::new("otrr_synthetic_expiry")),
+                100,
+            );
+            let (result, body) =
+                revocation_receipt_claim_http(&store, 100 + age, "200 OK", RECEIPT_CLAIM_SUCCESS);
+            assert!(result.is_ok());
+            assert_eq!(
+                body.get("revocation_receipt").is_some(),
+                age == REVOCATION_RECEIPT_MAX_AGE_SECONDS - 1
+            );
+            assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn revocation_receipt_survives_retryable_answers_and_transport_failure() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let _lock = lock_backend_test_env();
+        let store = MemoryTokenStore::new();
+        store_revocation_receipt(&store, Some(SecretString::new("otrr_synthetic_retry")), 100);
+        let before = store.load().unwrap();
+        for status in ["503 Service Unavailable", "302 Found"] {
+            let (result, _) = revocation_receipt_claim_http(&store, 101, status, "{}");
+            assert!(result.is_err());
+            assert_eq!(store.load().unwrap(), before);
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!(
+            "http://{}/api/v1/setup-claims",
+            listener.local_addr().unwrap()
+        );
+        drop(listener);
+        assert!(create_setup_claim_with_receipt(
+            &url,
+            &test_machine(),
+            "synthetic-nonce",
+            &store,
+            102
+        )
+        .is_err());
+        assert_eq!(store.load().unwrap(), before);
+    }
+
+    #[test]
+    fn revocation_receipt_absent_on_a_later_release_clears_old_receipt() {
+        use ottto_core::token_store::MemoryTokenStore;
+        let store = MemoryTokenStore::new();
+        store_revocation_receipt(&store, Some(SecretString::new("otrr_synthetic_old")), 100);
+        store_revocation_receipt(&store, None, 101);
+        assert!(matches!(store.load(), Err(TokenStoreError::Missing)));
+    }
+
+    #[test]
+    #[serial]
+    fn revocation_receipt_delete_failure_never_sends_the_receipt() {
+        use ottto_core::token_store::MemoryTokenStore;
+        struct Undeletable(MemoryTokenStore);
+        impl ControlTokenStore for Undeletable {
+            fn load(&self) -> Result<String, TokenStoreError> {
+                self.0.load()
+            }
+            fn save(&self, value: &str) -> Result<(), TokenStoreError> {
+                self.0.save(value)
+            }
+            fn delete(&self) -> Result<(), TokenStoreError> {
+                Err(TokenStoreError::Store(
+                    "synthetic deletion failure".to_string(),
+                ))
+            }
+        }
+        let _lock = lock_backend_test_env();
+        let store = Undeletable(MemoryTokenStore::new());
+        store_revocation_receipt(
+            &store,
+            Some(SecretString::new("otrr_synthetic_undeletable")),
+            100,
+        );
+        let (result, body) =
+            revocation_receipt_claim_http(&store, 101, "200 OK", RECEIPT_CLAIM_SUCCESS);
+        assert!(result.is_ok());
+        assert!(body.get("revocation_receipt").is_none());
     }
 
     #[test]

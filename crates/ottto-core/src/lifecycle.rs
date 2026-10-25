@@ -2,6 +2,7 @@ use crate::local_service::{
     user_launchctl_domain, MACOS_LAUNCH_AGENT_LABEL, MACOS_LEGACY_LAUNCH_AGENT_LABEL,
     OTTTO_LEGACY_SERVICE_BINARY_NAME, OTTTO_SERVICE_BINARY_NAME,
 };
+use crate::token_store::OTTTO_REVOCATION_RECEIPT_ACCOUNT;
 #[cfg(target_os = "macos")]
 use crate::token_store::{
     classify_security_cli_delete_output, ControlTokenStore, KeychainSecretStore,
@@ -190,6 +191,13 @@ pub fn plan_local_uninstall(home: &Path) -> UninstallPlan {
         UninstallAction {
             action: "remove_pending_setup_run_credential".to_string(),
             target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_PENDING_SETUP_RUN_TOKEN_ACCOUNT}"),
+            kind: "local_keychain_item".to_string(),
+            requires_confirmation: true,
+            destructive: true,
+        },
+        UninstallAction {
+            action: "remove_revocation_receipt".to_string(),
+            target: format!("{OTTTO_KEYCHAIN_SERVICE}/{OTTTO_REVOCATION_RECEIPT_ACCOUNT}"),
             kind: "local_keychain_item".to_string(),
             requires_confirmation: true,
             destructive: true,
@@ -522,6 +530,12 @@ fn run_command(program: &str, args: &[&str]) -> Result<(), String> {
 #[cfg(target_os = "macos")]
 fn remove_keychain_tokens(report: &mut CleanupReport) {
     let mut failures = 0usize;
+    if let Err(error) =
+        KeychainSecretStore::keychain_only(OTTTO_REVOCATION_RECEIPT_ACCOUNT).delete()
+    {
+        failures += 1;
+        report.fail(format!("delete revocation receipt: {error}"));
+    }
     for account in [
         OTTTO_KEYCHAIN_ACCOUNT,
         OTTTO_SETUP_RUN_TOKEN_ACCOUNT,
@@ -741,6 +755,10 @@ identifier:                 net.ottto.Companion
                 (
                     "remove_pending_setup_run_credential",
                     "net.ottto.service/pending-setup-run-token"
+                ),
+                (
+                    "remove_revocation_receipt",
+                    "net.ottto.service/revocation-receipt"
                 ),
             ]
         );
