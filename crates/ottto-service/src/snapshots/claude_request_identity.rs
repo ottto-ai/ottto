@@ -1398,6 +1398,13 @@ impl RequestAccounts {
 pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &ScanEvidence<'_>) {
     for item in items {
         let root = super::claude_snapshot_family_root_ref(item).to_owned();
+        // The existing account owner already proved uniform request coverage.
+        // This is retained evidence, never today's login or a later marker.
+        let qualified = item
+            .claude_org_markers
+            .is_none()
+            .then(|| super::exact_session_account_hash(item))
+            .flatten();
         let Some(fold) = item.claude_money.as_deref_mut() else {
             continue;
         };
@@ -1406,6 +1413,20 @@ pub(crate) fn reconcile_request_accounts(items: &mut [SnapshotItem], evidence: &
         };
         if accounts.subagent {
             continue;
+        }
+        if accounts.starting.is_none() && !accounts.mixed {
+            if let Some(login) = qualified {
+                let key = Some(Arc::new(AuthorityKey {
+                    login: Some(login),
+                    org: None,
+                    basis: TELEMETRY_LOGIN,
+                }));
+                accounts.starting = key.clone();
+                accounts.fallback = key.clone();
+                accounts.bound = key.clone();
+                accounts.conflict = false;
+                fold.entity.repartition(key);
+            }
         }
         for (request, occurrence) in &item.claude_usage_occurrences {
             match evidence.requests.get(&(root.as_str(), request.as_str())) {
@@ -2750,6 +2771,11 @@ fn tag_item(
     if super::claude_request_money::e2::enabled()
         && super::claude_history_upgrade::is_request_owned_literal(item)
     {
+        // Single-account markerless bodies keep their established D1 wire
+        // shape. The account owner already tagged their final usage uniformly.
+        if item.claude_org_markers.is_none() && super::exact_session_account_hash(item).is_some() {
+            return None;
+        }
         let grouping = request_owned_grouping(item, None)?;
         normalize_activity(item);
         let tagged = apply_grouped(item, grouping);

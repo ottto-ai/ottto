@@ -1571,3 +1571,76 @@ fn e2_identity_inherited_counter_streams_union_of_native_twin_requests() {
         cleanup(&[&a, &b]);
     });
 }
+
+#[test]
+fn e2_identity_disjoint_inherited_counter_exceeds_each_twin_in_both_orders() {
+    with_enabled(|| {
+        let a = root_file("identity-count-disjoint-a");
+        let b = root_file("identity-count-disjoint-b");
+        let index = ScanIndex::default();
+        let one = parse(
+            &a,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first-a", &at(1), 1),
+                line("a-one", &at(2), 1),
+                line("a-two", &at(3), 1),
+            ],
+        );
+        let two = parse(
+            &b,
+            Some(t0()),
+            &index,
+            &[
+                org_marker(ORG_A),
+                line("first-b", &at(1), 1),
+                line("b-one", &at(2), 1),
+                line("b-two", &at(3), 1),
+            ],
+        );
+        for items in [vec![one.clone(), two.clone()], vec![two, one]] {
+            assert_eq!(
+                serde_json::to_value(claude_request_identity::page_identity_counts(&items))
+                    .unwrap(),
+                json!({"claude_inherited_org_requests":4})
+            );
+        }
+        cleanup(&[&a, &b]);
+    });
+}
+
+#[test]
+fn e2_identity_inherited_counter_excludes_held_copies_and_restores_counted_copies() {
+    with_enabled(|| {
+        let path = root_file("identity-count-copy");
+        let index = ScanIndex::default();
+        for restore in [false, true] {
+            let version = if restore { "unknown" } else { "2.1.309" };
+            let item = parse(
+                &path,
+                Some(t0() + 100_000_000_000),
+                &index,
+                &[
+                    org_marker(ORG_A),
+                    versioned(line("prefix", &at(1), 1), version),
+                    versioned(line("inherited-copy", &at(2), 1), version),
+                    versioned(line("own", &at(101), 1), version),
+                ],
+            );
+            assert_eq!(
+                fold(&item).entity.removed_requests,
+                if restore { 0 } else { 2 }
+            );
+            let counts =
+                serde_json::to_value(claude_request_identity::page_identity_counts(&[item]))
+                    .unwrap();
+            assert_eq!(
+                counts,
+                json!({"claude_inherited_org_requests":if restore { 2 } else { 1 }})
+            );
+        }
+        cleanup(&[&path]);
+    });
+}
