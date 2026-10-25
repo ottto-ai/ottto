@@ -599,6 +599,13 @@ fn first_alarm(id: &str, cause: &'static str) -> bool {
     with_alarmed(|set| set.len() < MAX_TRACKED_KEYS * 2 && set.insert((id.to_owned(), cause)))
 }
 
+/// SI-724-F2: the guard-loss alarm's own budget, one entry per cause (three
+/// at most, outside the per-key cap), so key alarms never crowd it out. The
+/// `"guard"` id never collides with a key id (hex).
+fn first_guard_alarm(cause: &'static str) -> bool {
+    with_alarmed(|set| set.insert(("guard".to_owned(), cause)))
+}
+
 fn emit_alarm(line: String) {
     #[cfg(test)]
     ALARM_LINES.with(|lines| lines.borrow_mut().push(line.clone()));
@@ -1136,7 +1143,7 @@ pub(super) fn terminal(index: &ScanIndex) -> (u64, u64, u64, u64) {
     };
     if let Some(cause) = index.claude_request_census.rebuild_transient.guard_loss {
         // SI-724-F2: count-only (no key identity), once per cause per process.
-        if first_alarm("guard", cause) {
+        if first_guard_alarm(cause) {
             let retry_after = guard
                 .closed_at
                 .unwrap_or(guard.orphaned_at)
@@ -1222,6 +1229,15 @@ pub(crate) mod test_support {
     pub(crate) fn restart() {
         PERSISTED.with(|set| set.borrow_mut().clear());
         ALARMED.with(|set| set.borrow_mut().clear());
+    }
+    /// The per-key alarm budget spent by unrelated keys.
+    pub(crate) fn saturate_key_alarms() {
+        ALARMED.with(|set| {
+            let mut set = set.borrow_mut();
+            for n in 0..MAX_TRACKED_KEYS * 2 {
+                set.insert((format!("{n:064x}"), "rebuild_bound_7d"));
+            }
+        });
     }
     pub(crate) fn alarm_lines() -> Vec<String> {
         ALARM_LINES.with(|lines| lines.borrow().clone())

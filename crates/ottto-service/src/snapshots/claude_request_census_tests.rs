@@ -4716,8 +4716,8 @@ fn census_rebuild_deep_or_wide_marker_closes_only_n3_on_every_reader() {
 /// healthy index: no duplicate, nothing tracked) closes admission for one
 /// window and raises a count-only, rate-limited guard-loss alarm: `n` dropped
 /// with the marker left (guard missing), a malformed marker, or a malformed
-/// `n` (undecodable). Once per cause per process, again after a restart.
-/// OFF and ON.
+/// `n` (undecodable). Once per cause per process, again after a restart,
+/// even with the per-key alarm budget spent. OFF and ON.
 #[test]
 fn census_rebuild_guard_loss_alarms_with_no_key_pending() {
     use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
@@ -4748,6 +4748,9 @@ fn census_rebuild_guard_loss_alarms_with_no_key_pending() {
             for process in 0..2 {
                 let case = format!("{case} process={process}");
                 bound::restart();
+                if process == 1 {
+                    bound::saturate_key_alarms();
+                }
                 let alarms = bound::alarm_lines().len();
                 let mut index = ScanIndex::load(&path).unwrap();
                 assert!(!bound::pending(&index, &key), "{case}: no key pending");
