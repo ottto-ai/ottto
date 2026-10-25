@@ -113,6 +113,7 @@ impl ContinuationFixture {
                 now,
                 window_start_unix_seconds: now.saturating_sub(30 * 86_400),
             }),
+            None,
         );
         index.save(&self.index_path).unwrap();
         progress.save(&self.upload_progress_path).unwrap();
@@ -380,6 +381,7 @@ fn the_continuation_prepare_matches_the_ordinary_tail_on_a_quiescent_fixture() {
             now,
             window_start_unix_seconds: now.saturating_sub(30 * 86_400),
         }),
+        None,
     );
     assert!(!claimed, "quiescent: the minting cycle claimed already");
     index.activate_effective_upload_body_witness_revision(effective_upload_body_witness_revision(
@@ -449,7 +451,8 @@ fn the_upload_claim_predicate_is_pure_and_matches_the_ordinary_selection() {
                 &index,
                 &generation,
                 false,
-                Some(&scope)
+                Some(&scope),
+                None,
             )
         );
     }
@@ -540,6 +543,8 @@ fn a_pending_admission_reoffer_refuses_the_continuation_prepare() {
     index.quarantined_snapshot_fingerprints.insert(
         fingerprint,
         SnapshotQuarantineRecord {
+            hold: None,
+            version_skew_attempts: 0,
             witness: SnapshotQuarantineWitness {
                 item_wire_byte_limit: 128 * 1024,
                 ..snapshot_quarantine_witness(SnapshotSource::Codex)
@@ -583,6 +588,8 @@ fn a_due_quarantine_retry_refuses_the_continuation_prepare() {
     progress.quarantined_fingerprints.insert(
         "f".repeat(64),
         SnapshotQuarantineRecord {
+            hold: None,
+            version_skew_attempts: 0,
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: 0,
             upload_body_witness: None,
@@ -611,6 +618,8 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
     index.quarantined_snapshot_fingerprints.insert(
         fingerprint.clone(),
         SnapshotQuarantineRecord {
+            hold: None,
+            version_skew_attempts: 0,
             witness: snapshot_quarantine_witness(SnapshotSource::Codex),
             retry_after_unix_seconds: 0,
             upload_body_witness: Some(body.clone()),
@@ -644,6 +653,7 @@ fn a_due_reason_reoffer_refuses_the_continuation_prepare() {
             now,
             window_start_unix_seconds: now.saturating_sub(30 * 86_400),
         }),
+        None,
     ));
     assert_eq!(
         selected.active_reason_reoffers.len(),

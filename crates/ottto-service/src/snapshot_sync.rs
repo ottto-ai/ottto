@@ -6436,6 +6436,7 @@ fn continuation_upload_claim_needed(
         replay_generation,
         false,
         Some(reoffer),
+        None, // Codex continuation owns no retained money bodies.
     )
 }
 
@@ -6609,6 +6610,7 @@ fn prepare_continuation_source(
             window_start_unix_seconds: reoffer_now
                 .saturating_sub(inputs.receipt_window_days.saturating_mul(86_400)),
         }),
+        None,
     );
     if claimed {
         return Ok(Err(ContinuationRefusal::UploadClaim));
