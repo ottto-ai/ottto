@@ -329,6 +329,15 @@ impl SnapshotUploadProgress {
         if pending.bodies.len() == handoff.bodies.len() && !pending.bodies.is_empty() {
             return Ok(());
         }
+        if removed.is_empty() {
+            // Visible cleanup is not permission to bypass its durable-save/CAS
+            // barrier: a previous attempt may have renamed before sync failed.
+            let generation = self.generation;
+            if let Err(error) = self.save(progress_path) {
+                self.generation = generation;
+                return Err(error);
+            }
+        }
         let previous = saved.upload_ack_retirement_handoff.take();
         saved.upload_ack_retirement_handoff = (!pending.bodies.is_empty()).then_some(pending);
         let generation = saved.generation;

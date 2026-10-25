@@ -908,6 +908,23 @@ fn retirement_handoff_recovers_5000_acks_after_index_commit_and_cleanup_save_fai
         let mut progress =
             SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
                 .unwrap();
+        if failure == "index_cas" {
+            // Cleanup is already visible, but proof consumption still needs a
+            // successful progress save. A stale generation must keep authority.
+            let mut concurrent = progress.clone();
+            concurrent.save(&progress_path).unwrap();
+            assert!(progress
+                .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path,)
+                .is_err());
+            assert!(ScanIndex::load(&index_path)
+                .unwrap()
+                .upload_ack_retirement_handoff
+                .is_some());
+            progress =
+                SnapshotUploadProgress::load(&progress_path, &namespace, test_quarantine_witness())
+                    .unwrap();
+            saved = ScanIndex::load(&index_path).unwrap();
+        }
         progress
             .recover_ack_retirement_handoff(&mut saved, &index_path, &progress_path)
             .unwrap();

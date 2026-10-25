@@ -62,3 +62,7 @@ A full unsettled allowance still permits a newly ACKed body for a committed
 live entity. Reservations are recomputed from held ACKs and the frozen input
 page, so repeated admission cannot accumulate credit, and unrelated omitted
 entities never borrow unused live-incidence slots.
+
+Consuming the handoff always crosses a successful progress-save/CAS barrier,
+even when an earlier cleanup is already visible. A failed cleanup or stale
+progress generation keeps the proof available for the next recovery attempt.
