@@ -667,10 +667,11 @@ fn note_scan_index_quarantine_rebuild(
 
 /// One armed user Repair passing the seven-day guard (SI-718-O1). The guard
 /// was keeping the damaged index because it holds session-identity state;
-/// the override keeps that state too. It strictly decodes
-/// `lenient_decode::IDENTITY_CARRY_FIELDS` from the current bytes, refusing
+/// the override keeps that state too. It decodes
+/// `lenient_decode::IDENTITY_CARRY_FIELDS` by each field's policy, refusing
 /// (source stays paused, index untouched, counted, alarmed) when any of them
-/// cannot be recovered, and otherwise durably REPLACES the index with a
+/// cannot be recovered (tombstone loss instead raises its fence), and otherwise
+/// durably REPLACES the index with a
 /// generation-0 rebuild that carries them. A replacement scan that then
 /// fails reloads that carried state, never an empty graph. The damaged bytes
 /// stay as the `.corrupt.override.` witness (a hard link), which re-arms the
@@ -711,6 +712,9 @@ fn override_scan_index_rebuild_loop(
             .accepted_rebuild_pending_since_unix_seconds
             .get_or_insert(unix_seconds_at(now));
     }
+    // This replacement bypasses save_internal, but is still a writer of the
+    // marked tombstone format. Carry already raised its fence on any loss.
+    rebuilt.claude_retired_family_tombstones_initialized = true;
     // Prepare everything reversible before spending the durable cooldown.
     let stamp_path = scan_index_override_stamp_path(support_dir, source);
     let prior_stamp = match fs::read(&stamp_path) {
@@ -726,9 +730,10 @@ fn override_scan_index_rebuild_loop(
     };
     // This replacement deliberately bypasses save_internal's record normalizers
     // and CAS: the locked damaged index cannot pass its ordinary CAS decoder.
-    // Safe today because the rebuild starts from Default, carries only strictly
-    // decoded identity fields, admits all ACK debt before writing, and derives
-    // every non-carried record on scan. New carried fields must preserve this.
+    // Safe today because the rebuild starts from Default, carries identity
+    // fields by their own decoding policy, admits all ACK debt before writing,
+    // and derives every non-carried record on scan. New carried fields must
+    // preserve this.
     let mut stamp_attempted = false;
     let mut replaced = false;
     let temp_path = path.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -801,12 +806,15 @@ fn override_scan_index_rebuild_loop(
     // Once replaced, this was an actual override (never a refused press), even
     // if the final directory sync reports an uncertain durability outcome.
     result?;
+    // This function also returns directly to Repair callers. Establish the
+    // fresh-load memo here, before any first census or replay can advance it.
+    rebuilt.settle_claude_index_load(path, ScanIndexLoadOrigin::Quarantined);
     Ok(rebuilt)
 }
 
 impl ScanIndex {
     /// SI-718-O1: what an override rebuild keeps from the damaged index
-    /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, strictly decoded). Bindings
+    /// (`lenient_decode::IDENTITY_CARRY_FIELDS`, each field's decoder). Bindings
     /// stay authoritative, so conflicting creator evidence defers; held and
     /// deferred families stay held; duplicate ownership and owned-start /
     /// stale-carry posture stay fail-closed. The contract token is kept and
@@ -825,6 +833,13 @@ impl ScanIndex {
         self.claude_account_deferred_holds = carry.claude_account_deferred_holds;
         self.claude_request_identity_contract = carry.claude_request_identity_contract;
         self.claude_request_identity_contract_changed = true;
+        // Retirement evidence gates re-entry even when the file graph needs
+        // rebuilding. Its decoder has already raised any uncertainty fence.
+        self.claude_retired_family_tombstones = carry.claude_retired_family_tombstones;
+        self.claude_retired_family_tombstones_initialized =
+            carry.claude_retired_family_tombstones_initialized;
+        self.claude_retired_family_tombstones_uncertain =
+            carry.claude_retired_family_tombstones_uncertain;
         self.claude_owned_start_census = carry.claude_owned_start_census;
         self.claude_stale_family_carry = carry.claude_stale_family_carry;
         self.claude_duplicate_request_owners = carry.claude_duplicate_request_owners;

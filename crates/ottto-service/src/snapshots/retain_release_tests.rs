@@ -1123,6 +1123,9 @@ fn x_out_coverage_witness_names_every_finished_field() {
             peak_context_fill_tokens: _,                    // I
             first_turn_context_tokens: _,                   // I
             last_turn_context_tokens: _,                    // I
+            first_turn_context_window_tokens: _,            // I (Codex only; D1)
+            peak_context_fill_window_tokens: _,             // I (Codex only; D1)
+            last_turn_context_window_tokens: _,             // I (Codex only; D1)
             compaction_count: _,                            // I
             compaction_timestamps: _,                       // D
             compaction_events: _,                           // K (empty on Claude)

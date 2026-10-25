@@ -1698,7 +1698,9 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
     let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
     let mut base = census_index_json(serde_json::json!({}));
     base["generation"] = serde_json::json!(7);
-    let expected = base.clone();
+    let mut expected = base.clone();
+    // Every loaded index carries the tombstone marker (SOURCE Round 13 F1).
+    expected["claude_retired_family_tombstones_initialized"] = serde_json::json!(true);
     for (name, field, raw) in [
         ("field", "claude_request_census", "1e400".to_owned()),
         (
