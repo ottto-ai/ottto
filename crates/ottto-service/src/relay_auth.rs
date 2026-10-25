@@ -102,6 +102,19 @@ fn random() -> u64 {
 }
 
 impl Gate {
+    fn make_room(&mut self, key: Key) {
+        if self.rejected.len() >= MAX_BINDINGS && !self.rejected.contains_key(&key) {
+            if let Some(oldest) = self
+                .rejected
+                .iter()
+                .min_by_key(|(_, held)| held.until)
+                .map(|(key, _)| *key)
+            {
+                self.rejected.remove(&oldest);
+            }
+        }
+    }
+
     fn admit(
         &mut self,
         key: Key,
@@ -145,16 +158,7 @@ impl Gate {
             .rejected
             .get(&key)
             .map_or(1, |held| held.failures.saturating_add(1));
-        if self.rejected.len() >= MAX_BINDINGS && !self.rejected.contains_key(&key) {
-            if let Some(oldest) = self
-                .rejected
-                .iter()
-                .min_by_key(|(_, held)| held.until)
-                .map(|(key, _)| *key)
-            {
-                self.rejected.remove(&oldest);
-            }
-        }
+        self.make_room(key);
         self.rejected.insert(
             key,
             Rejected {
@@ -249,15 +253,24 @@ pub(crate) fn take_setup_refresh(key: Key) -> bool {
 
 /// A successful setup credential refresh admits one immediate retry without
 /// resetting the rejection streak if the device is still rejected.
-pub(crate) fn retry_after_setup_refresh(key: Key) {
-    if let Some(held) = gate()
+pub(crate) fn retry_after_setup_refresh(previous_key: Key, refreshed_key: Key) {
+    let mut gate = gate()
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .rejected
-        .get_mut(&key)
-    {
-        held.retry_after_refresh = true;
-    }
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let Some(previous) = gate.rejected.get_mut(&previous_key) else {
+        return;
+    };
+    previous.refresh_available = false;
+    let previous = *previous;
+    gate.make_room(refreshed_key);
+    // A refresh may replace the setup-run id. That is still the same recovery
+    // attempt, not an explicit user reattach: carry its consumed refresh and
+    // rejection ladder to the exact binding the retry will use.
+    let refreshed = gate.rejected.entry(refreshed_key).or_insert(previous);
+    refreshed.failures = refreshed.failures.max(previous.failures);
+    refreshed.until = refreshed.until.max(previous.until);
+    refreshed.refresh_available = false;
+    refreshed.retry_after_refresh = true;
 }
 
 /// Success clears only the binding whose request actually succeeded.
@@ -338,7 +351,7 @@ mod tests {
         gate().lock().unwrap().reject(key, 401, now, 0, true, true);
         assert!(take_setup_refresh(key));
         assert!(!take_setup_refresh(key));
-        retry_after_setup_refresh(key);
+        retry_after_setup_refresh(key, key);
         gate().lock().unwrap().admit(key, now, 1).unwrap();
         assert!(gate().lock().unwrap().admit(key, now, 2).is_err());
         gate()
@@ -351,6 +364,30 @@ mod tests {
         assert_eq!(state.until - now, BASE);
         assert!(gate().lock().unwrap().admit(key, now, 3).is_err());
         clear(key);
+    }
+
+    #[test]
+    fn refreshed_setup_run_inherits_rejections_and_consumed_refresh() {
+        let old = [94; 32];
+        let new = [95; 32];
+        let now = Instant::now();
+        gate().lock().unwrap().reject(old, 401, now, 0, true, true);
+        assert!(take_setup_refresh(old));
+        retry_after_setup_refresh(old, new);
+        assert!(!take_setup_refresh(new));
+        assert_eq!(
+            gate().lock().unwrap().admit(new, now, 1).unwrap(),
+            (false, false)
+        );
+        gate()
+            .lock()
+            .unwrap()
+            .reject(new, 401, now, 0, false, false);
+        assert_eq!(gate().lock().unwrap().rejected[&new].failures, 2);
+        assert!(!take_setup_refresh(new));
+        assert!(gate().lock().unwrap().admit(new, now, 2).is_err());
+        clear(old);
+        clear(new);
     }
 
     #[test]

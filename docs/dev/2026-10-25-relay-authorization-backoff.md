@@ -11,7 +11,8 @@ clear rejection state; no tokens are cached beyond their existing lifetime.
 The local-health path keeps its existing terminal setup-run refresh hold. Each
 rejected probe grants one setup refresh opportunity, including when another
 caller observed the rejection first. A successful refresh admits one retry
-without resetting the device rejection streak or granting another refresh.
+without resetting the device rejection streak or granting another refresh,
+including when that refresh replaces the setup-run id.
 Concurrent initial rejections count as one wave. Local scans, quota/account
 checks and their scheduling keep running. The existing reconnect-required health classification remains typed.
 

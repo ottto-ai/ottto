@@ -4587,7 +4587,10 @@ fn upload_local_health_projection_reporting(
                     "refresh setup-run credentials after relay auth rejection failed: {refresh_error}"
                 )));
             }
-            crate::relay_auth::retry_after_setup_refresh(relay_binding);
+            crate::relay_auth::retry_after_setup_refresh(
+                relay_binding,
+                client.relay_auth_binding(device, device_secret),
+            );
             match upload_local_health_projection_with(
                 client,
                 device,
@@ -17290,7 +17293,9 @@ mod tests {
     #[test]
     #[serial]
     fn local_health_upload_refreshes_inactive_device_before_retry() {
-        for reject_in_other_caller in [false, true] {
+        for (reject_in_other_caller, reject_retry) in
+            [(false, false), (true, false), (false, true), (true, true)]
+        {
             let root = test_dir("local-health-upload-reactivates-device");
             let support_dir = root.join("support");
             let secrets_dir = root.join("secrets");
@@ -17299,7 +17304,7 @@ mod tests {
             let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support_dir);
             let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets_dir);
             let captured = Arc::new(Mutex::new(Vec::new()));
-            let api_base_url = local_health_reactivation_server(captured.clone());
+            let api_base_url = local_health_reactivation_server(captured.clone(), reject_retry);
 
             let device = LocalDeviceBinding {
                 device_id: "device_test".to_string(),
@@ -17339,15 +17344,47 @@ mod tests {
                 .expect_err("OTLP observes the initial authorization rejection");
             }
             let client = SnapshotApiClient::new(api_base_url);
-            upload_local_health_projection_reporting(
+            let result = upload_local_health_projection_reporting(
                 &client,
                 &device,
                 "device-secret",
                 SnapshotSource::Codex,
                 "otm_test",
                 &test_daemon("otm_test"),
-            )
-            .expect("upload retries after refresh");
+            );
+            if reject_retry {
+                assert!(result.is_err());
+                assert_eq!(
+                    captured.lock().unwrap().len(),
+                    3,
+                    "token, refresh, rejected retry"
+                );
+                assert!(!crate::relay_auth::take_setup_refresh(
+                    client.relay_auth_binding(&device, "device-secret")
+                ));
+                let held = upload_local_health_projection_reporting(
+                    &client,
+                    &device,
+                    "device-secret",
+                    SnapshotSource::Codex,
+                    "otm_test",
+                    &test_daemon("otm_test"),
+                )
+                .expect_err("new setup id inherits the consumed recovery attempt");
+                assert!(
+                    held.downcast_ref::<RelayTokenAuthorizationRejected>()
+                        .unwrap()
+                        .suppressed
+                );
+                assert_eq!(
+                    captured.lock().unwrap().len(),
+                    3,
+                    "no second refresh or token request"
+                );
+                let _ = std::fs::remove_dir_all(root);
+                continue;
+            }
+            result.expect("upload retries after refresh");
 
             let requests = captured.lock().expect("captured requests").clone();
             assert_eq!(requests.len(), 5);
@@ -20647,11 +20684,14 @@ mod tests {
         format!("http://{address}")
     }
 
-    fn local_health_reactivation_server(captured: Arc<Mutex<Vec<String>>>) -> String {
+    fn local_health_reactivation_server(
+        captured: Arc<Mutex<Vec<String>>>,
+        reject_retry: bool,
+    ) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind local health backend");
         let address = listener.local_addr().expect("local address");
         std::thread::spawn(move || {
-            for index in 0..5 {
+            for index in 0..if reject_retry { 3 } else { 5 } {
                 let (mut stream, _) = listener.accept().expect("accept local health request");
                 let request = read_complete_http_request(&mut stream);
                 captured
@@ -20664,6 +20704,7 @@ mod tests {
                         "200 OK",
                         r#"{"setup_run_id":"setup_fresh","setup_run_token":"otsr_fresh","expires_at":"2026-06-11T18:30:00Z"}"#,
                     ),
+                    2 if reject_retry => ("401 Unauthorized", r#"{"error":"still inactive"}"#),
                     2 => (
                         "200 OK",
                         r#"{"token":"relay-token-codex","expires_at":"2026-06-01T10:15:00Z"}"#,
