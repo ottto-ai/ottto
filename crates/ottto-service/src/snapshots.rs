@@ -4161,6 +4161,8 @@ struct ClaudeAccountRequestSet {
     prefixes: String,
     /// Full-hash-set commitment: equal prefixes never hide a changed full set.
     fingerprint: String,
+    /// Exact source/entity/body revision that finalized with this account.
+    identity_revision: Option<String>,
 }
 
 impl Serialize for ClaudeAccountRequestSet {
@@ -4173,7 +4175,12 @@ impl Serialize for ClaudeAccountRequestSet {
             .strip_prefix(CLAUDE_ACCOUNT_REQUEST_SET_VERSION)
             .and_then(|value| value.strip_prefix(':'))
             .ok_or_else(|| serde::ser::Error::custom("invalid account request-set version"))?;
-        serializer.serialize_str(&format!("{}:{digest}", self.prefixes))
+        let revision = self
+            .identity_revision
+            .as_deref()
+            .map(|value| format!(":{value}"))
+            .unwrap_or_default();
+        serializer.serialize_str(&format!("{}:{digest}{revision}", self.prefixes))
     }
 }
 impl<'de> Deserialize<'de> for ClaudeAccountRequestSet {
@@ -4181,9 +4188,24 @@ impl<'de> Deserialize<'de> for ClaudeAccountRequestSet {
         deserializer: D,
     ) -> std::result::Result<Self, D::Error> {
         let value = String::deserialize(deserializer)?;
-        let (prefixes, digest) = value
+        let (prefixes, commitment) = value
             .split_once(':')
             .ok_or_else(|| serde::de::Error::custom("invalid account request-set encoding"))?;
+        let (digest, identity_revision) = commitment
+            .split_once(':')
+            .map_or((commitment, None), |(digest, revision)| {
+                (digest, Some(revision))
+            });
+        if identity_revision.is_some_and(|revision| {
+            revision.len() != 64
+                || !revision
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }) {
+            return Err(serde::de::Error::custom(
+                "invalid account identity revision",
+            ));
+        }
         if digest.len() != 64
             || !digest
                 .bytes()
@@ -4196,6 +4218,7 @@ impl<'de> Deserialize<'de> for ClaudeAccountRequestSet {
         Ok(Self {
             prefixes: prefixes.to_string(),
             fingerprint: format!("{CLAUDE_ACCOUNT_REQUEST_SET_VERSION}:{digest}"),
+            identity_revision: identity_revision.map(str::to_string),
         })
     }
 }
@@ -4224,6 +4247,7 @@ impl ClaudeAccountRequestSet {
         Some(Self {
             prefixes: base64::engine::general_purpose::STANDARD_NO_PAD.encode(packed),
             fingerprint: claude_account_request_id_set_fingerprint(hashes),
+            identity_revision: None,
         })
     }
 
@@ -7098,6 +7122,40 @@ pub fn finalize_scan_after_policy_with_body_witness(
                     &body_witness(snapshot),
                 )
         });
+        if source == SnapshotSource::ClaudeCode {
+            if let Some((root, member)) =
+                claude_index_path_family_member(Path::new(&pending.index_key))
+            {
+                if let Some(account_pending) = index.claude_account_family_pending.get_mut(&root) {
+                    let mut owned = result
+                        .snapshots
+                        .iter()
+                        .filter(|item| {
+                            item.source_file_fingerprint.as_deref()
+                                == Some(pending.source_file_fingerprint.as_str())
+                        })
+                        .peekable();
+                    let account = &account_pending.account_identifier_hash;
+                    let qualified = !account_pending.invalid
+                        && owned.peek().is_some()
+                        && owned.all(|item| {
+                            item.source_session_id == member
+                                && exact_session_account_hash(item).as_ref() == Some(account)
+                        });
+                    if let Some(requests) = account_pending.member_requests.get_mut(&member) {
+                        requests.identity_revision = qualified
+                            .then(|| {
+                                claude_account_identity_revision(
+                                    &pending.source_file_fingerprint,
+                                    final_group_fingerprint.as_deref(),
+                                    final_upload_body_witness.as_deref(),
+                                )
+                            })
+                            .flatten();
+                    }
+                }
+            }
+        }
         if let Some(entry) = index.files.get_mut(&pending.index_key) {
             entry.last_snapshot_fingerprint = final_group_fingerprint.clone();
             entry.last_upload_body_witness = final_upload_body_witness.clone();
@@ -11735,7 +11793,9 @@ fn accumulate_claude_family_pending(
                 continue;
             };
             if let Some(previous) = pending.member_requests.get(&item.source_session_id) {
-                if previous != &requests {
+                if previous.prefixes != requests.prefixes
+                    || previous.fingerprint != requests.fingerprint
+                {
                     pending.invalid = true;
                 }
             } else {
@@ -11944,6 +12004,19 @@ fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPendingWi
         }
     }
     expected > 0 && union.len() as u128 == expected
+}
+
+fn claude_account_identity_revision(
+    source: &str,
+    entity_set: Option<&str>,
+    body_set: Option<&str>,
+) -> Option<String> {
+    Some(sha256_hex(&[
+        "claude_account_identity_revision:v1",
+        source,
+        entity_set?,
+        body_set?,
+    ]))
 }
 
 fn claude_account_request_id_set_fingerprint(hashes: &BTreeSet<String>) -> String {
@@ -42720,17 +42793,15 @@ impl ScanIndex {
                 if pending.previous_windows.is_empty() {
                     return None;
                 }
-                let witness = self.claude_account_family_witnesses.get(root)?;
                 let window = rfc3339_unix_seconds(&pending.census_window_end)?;
+                // Each member's finalized account-bearing revision is stronger
+                // than a family-only witness and also covers healthy singletons.
                 if pending.invalid
-                    || witness.account_identifier_hash != pending.account_identifier_hash
-                    || witness.evidence_request_count != pending.evidence_request_count
-                    || witness.members != pending.members
-                    || witness.member_request_id_fingerprints.len() != pending.member_requests.len()
-                    || pending.member_requests.iter().any(|(member, requests)| {
-                        witness.member_request_id_fingerprints.get(member)
-                            != Some(&requests.fingerprint)
-                    })
+                    || pending.member_requests.len() != pending.members.len()
+                    || pending
+                        .member_requests
+                        .values()
+                        .any(|requests| requests.identity_revision.is_none())
                     || self.claude_usage_authority_quarantine.contains_key(root)
                     || self.decode_holds_family(root)
                 {
@@ -42756,7 +42827,24 @@ impl ScanIndex {
             if entry.source_file_fingerprint.is_empty()
                 || self.decode_holds_file(key)
                 || self.claude_account_deferred_holds.contains_key(key)
-                || self.claude_owned_start_census.contains_key(&member)
+                || self
+                    .claude_owned_start_census
+                    .get(&member)
+                    .is_some_and(|owned| {
+                        owned.verified_source_file_fingerprint.is_none()
+                            || owned.verified_source_file_fingerprint
+                                != owned.emitted_source_file_fingerprint
+                    })
+                || self.claude_account_family_pending[&root]
+                    .member_requests
+                    .get(&member)
+                    .and_then(|requests| requests.identity_revision.as_ref())
+                    != claude_account_identity_revision(
+                        &entry.source_file_fingerprint,
+                        entry.last_snapshot_fingerprint.as_deref(),
+                        entry.last_upload_body_witness.as_deref(),
+                    )
+                    .as_ref()
                 || !fingerprints.is_some_and(|fps| {
                     !fps.is_empty()
                         && fps.iter().all(|fp| {
@@ -61627,6 +61715,36 @@ mod tests {
         index
     }
 
+    fn d2_finalize_identity_revisions(index: &mut ScanIndex) {
+        for (key, entry) in &mut index.files {
+            let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
+                continue;
+            };
+            entry.source_file_fingerprint = "new-source".into();
+            entry.last_snapshot_fingerprint = Some("new-entity-set".into());
+            entry.last_upload_body_witness = Some("new-account-body-set".into());
+            let entity = format!(
+                "{:x}",
+                Sha256::digest(format!("{key}:new-account").as_bytes())
+            );
+            index
+                .file_snapshot_fingerprints
+                .insert(key.clone(), BTreeSet::from([entity.clone()]));
+            index.accepted_snapshot_fingerprints.insert(entity);
+            if let Some(requests) = index
+                .claude_account_family_pending
+                .get_mut(&root)
+                .and_then(|pending| pending.member_requests.get_mut(&member))
+            {
+                requests.identity_revision = claude_account_identity_revision(
+                    &entry.source_file_fingerprint,
+                    entry.last_snapshot_fingerprint.as_deref(),
+                    entry.last_upload_body_witness.as_deref(),
+                );
+            }
+        }
+    }
+
     #[test]
     fn claude_account_pending_v2_parity_and_old_index_upgrade() {
         let (dir, root, items) = claude_account_family_fixture();
@@ -61913,14 +62031,12 @@ mod tests {
             "2026-08-02T07:11:00Z",
         );
         assert!(reloaded.claude_account_family_witnesses.contains_key(&root));
+        d2_finalize_identity_revisions(&mut reloaded);
+        assert!(!reloaded.accepted_snapshot_fingerprints.is_empty());
         // Every blocker must retain the old window, even though proof exists.
         for blocker in ["withheld", "retry", "identity", "unacked"] {
             let mut held = reloaded.clone();
             let key = held.files.keys().next().unwrap().clone();
-            held.files.get_mut(&key).unwrap().source_file_fingerprint = "read".into();
-            for entry in held.files.values_mut() {
-                entry.source_file_fingerprint = "read".into();
-            }
             match blocker {
                 "withheld" => {
                     held.claude_account_deferred_holds
@@ -61974,9 +62090,6 @@ mod tests {
             );
         }
         // Only this family's fully accepted newer proof retires old pending.
-        for entry in reloaded.files.values_mut() {
-            entry.source_file_fingerprint = "read".into();
-        }
         let retained_other = reloaded.claude_account_family_pending[&root].clone();
         reloaded.claude_account_family_pending.insert(
             "identity-incomplete-other-family".into(),
@@ -61992,6 +62105,145 @@ mod tests {
         assert!(reloaded.claude_account_family_pending[&root]
             .previous_windows
             .is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_new_identity_cannot_retire_using_prior_revision_acks() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        let mut previous = d2_family_index(&dir, &root);
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut previous,
+            false,
+            "2026-08-02T07:10:00Z",
+        );
+        let mut working = previous.clone();
+        apply_claude_effort_evidence_with_index(
+            &mut items.clone(),
+            &evidence,
+            &mut working,
+            true,
+            "2026-08-02T07:11:00Z",
+        );
+        d2_finalize_identity_revisions(&mut working);
+        let newer_entities = working
+            .file_snapshot_fingerprints
+            .values()
+            .flatten()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        for accepted_count in 0..newer_entities.len() {
+            let accepted = newer_entities
+                .iter()
+                .take(accepted_count)
+                .cloned()
+                .collect();
+            let mut partial = working.committable_subset(&previous, &accepted, &BTreeMap::new());
+            let path = dir.join(format!("partial-{accepted_count}.json"));
+            partial.save(&path).unwrap();
+            let loaded =
+                lenient_decode::read_file(File::open(path).unwrap(), "test", "claude_code")
+                    .unwrap();
+            assert_eq!(
+                loaded.claude_account_family_pending[&root]
+                    .previous_windows
+                    .len(),
+                1
+            );
+        }
+        let mut accepted = working.committable_subset(&previous, &newer_entities, &BTreeMap::new());
+        accepted.save(&dir.join("all-accepted.json")).unwrap();
+        assert!(accepted.claude_account_family_pending[&root]
+            .previous_windows
+            .is_empty());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_accepted_singleton_and_completed_owned_start_do_not_grow() {
+        let (dir, root, items) = claude_account_family_fixture();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 4]);
+        let mut index = d2_family_index(&dir, &root);
+        index.files.retain(|key, _| {
+            claude_index_path_family_member(Path::new(key))
+                .is_some_and(|(_, member)| member == root)
+        });
+        index
+            .file_snapshot_fingerprints
+            .retain(|key, _| index.files.contains_key(key));
+        index.claude_owned_start_census.insert(
+            root.clone(),
+            ClaudeOwnedStartCensusWitness {
+                marker_source_file_fingerprint: "completed".into(),
+                verified_source_file_fingerprint: Some("completed".into()),
+                emitted_source_file_fingerprint: Some("completed".into()),
+            },
+        );
+        let path = dir.join("singleton.json");
+        for window in 0..5 {
+            apply_claude_effort_evidence_with_index(
+                &mut vec![items[0].clone()],
+                &evidence,
+                &mut index,
+                true,
+                &format!("2026-08-02T07:1{window}:00Z"),
+            );
+            d2_finalize_identity_revisions(&mut index);
+            index.save(&path).unwrap();
+            index = lenient_decode::read_file(File::open(&path).unwrap(), "test", "claude_code")
+                .unwrap();
+            assert!(!index.claude_account_family_witnesses.contains_key(&root));
+            assert!(index.claude_account_family_pending[&root]
+                .previous_windows
+                .is_empty());
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn claude_account_pending_finalizer_records_exact_account_bearing_upload_revision() {
+        let (dir, root, _) = claude_account_family_fixture();
+        let mut index = ScanIndex::default();
+        let mut result = scan_source_roots_with_limit(
+            SnapshotSource::ClaudeCode,
+            &[dir.clone()],
+            &mut index,
+            "2026-08-02T07:01:00Z",
+            BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        let evidence = claude_account_family_evidence(&root, &vec!["a".repeat(64); 5]);
+        apply_claude_effort_evidence_with_index(
+            &mut result.snapshots,
+            &evidence,
+            &mut index,
+            true,
+            "2026-08-02T07:01:00Z",
+        );
+        assert!(index.claude_account_family_pending[&root]
+            .member_requests
+            .values()
+            .all(|set| set.identity_revision.is_none()));
+        finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut result, &mut index);
+        for (key, entry) in &index.files {
+            let (_, member) = claude_index_path_family_member(Path::new(key)).unwrap();
+            let expected = claude_account_identity_revision(
+                &entry.source_file_fingerprint,
+                entry.last_snapshot_fingerprint.as_deref(),
+                entry.last_upload_body_witness.as_deref(),
+            );
+            assert!(expected.is_some());
+            assert_eq!(
+                index.claude_account_family_pending[&root].member_requests[&member]
+                    .identity_revision,
+                expected
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -83607,7 +83859,7 @@ crate::heap_layout_bound::fields!(BucketRowAccumulator; selector_context, select
 crate::heap_layout_bound::fields!(CandidateFile; physical_identity, scan_root, path, size_bytes, modified_unix_seconds, modified_unix_nanos, source_file_fingerprint, legacy_source_file_fingerprint, legacy_config_reconciliation_required, opened_object_identity);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPending; current, previous_windows);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyPendingWindow; version, census_window_end, account_identifier_hash, evidence_request_count, members, member_requests, invalid);
-crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint);
+crate::heap_layout_bound::fields!(ClaudeAccountRequestSet; prefixes, fingerprint, identity_revision);
 crate::heap_layout_bound::fields!(ClaudeAccountFamilyWitness; account_identifier_hash, evidence_request_count, members, member_request_id_fingerprints);
 crate::heap_layout_bound::fields!(ClaudeCompactionObservation; kind, timestamp, pre_tokens, post_tokens, cumulative_dropped_tokens, duration_ms, response_count_before, pair_key, has_parent_link, trigger, id_less_before, id_less_after);
 crate::heap_layout_bound::fields!(ClaudeDesktopIdentityEvidence; account_identifier_hash, provider_workspace_hash, source_created_at, imported);
