@@ -1903,6 +1903,7 @@ fn p2a_old_v1_head_is_replaced_by_literal_and_exact_ack_is_not_old_settlement() 
 #[serial(claude_request_money_shadow)]
 fn p2a_whole_file_copy_same_session_emits_one_union_with_mac_wide_distinct_ids() {
     let fixture = PipelineFixture::new("p2a-whole-file-union");
+    let _live = money::LiveForTest::settled(&fixture.support);
     money::enable_shadow_for_test(&fixture.support);
     let original = fixture.root.join(format!("{}.jsonl", PIPELINE_SESSIONS[1]));
     let duplicate = fixture.root.join(format!("{MONEY_PIPELINE_COPY}.jsonl"));

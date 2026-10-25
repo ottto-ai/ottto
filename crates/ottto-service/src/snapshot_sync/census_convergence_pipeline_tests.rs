@@ -557,6 +557,8 @@ impl PipelineFixture {
 
 impl Drop for PipelineFixture {
     fn drop(&mut self) {
+        crate::snapshots::claude_request_money::capture::purge_scope_for_test(&self.support);
+        crate::snapshots::claude_request_money::disable_shadow_for_test(&self.support);
         let _ = std::fs::remove_dir_all(&self.base);
     }
 }

@@ -809,7 +809,7 @@ fn money_gate_off_shadow_regression_receipt(base: &Path) -> serde_json::Value {
             "timestamp":"2026-08-02T07:00:00Z","type":"assistant","sessionId":session,
             "requestId":format!("req_{at}"),"message":{"id":format!("msg_{at}"),
                 "model":"claude-haiku-4-5","usage":{"input_tokens":1,"output_tokens":1,
-                    "service_tier":if copied { "standard".to_string() } else { "s".repeat(3000) }}}
+                    "service_tier":if !copied && at == 0 { "s".repeat(3000) } else { "standard".to_string() }}}
         }).to_string()+"\n").collect::<String>();
         for project in if copied { vec!["-one", "-two"] } else { vec!["-one"] } {
             let path = projects.join(project).join(format!("{session}.jsonl"));

@@ -552,6 +552,9 @@ impl ClaudeLedgerScope {
         page_roots: &BTreeSet<&str>,
         deadline: Instant,
     ) -> Option<Self> {
+        if Instant::now() >= deadline {
+            return None;
+        }
         if page_groups.is_empty() && page_roots.is_empty() {
             return Some(Self::default());
         }
@@ -678,13 +681,25 @@ impl ClaudeLedgerScope {
                 return None;
             }
             let debt = self.file_debt(index, ledger, key);
-            let birth = index
-                .claude_request_census
-                .get(key)
-                .and_then(|record| record.birth())
-                .map(|birth| birth.unix_seconds)
+            let live = index.request_money_live_revision();
+            // The OFF shadow keeps main's counted-only newborn rule. Live
+            // release custody and retained births are not OFF setup work.
+            let unbuilt = if live {
+                debt.unbuilt()
+            } else {
+                debt.new_unrecorded > 0
+            };
+            let birth = live
+                .then(|| {
+                    index
+                        .claude_request_census
+                        .get(key)
+                        .and_then(|record| record.birth())
+                        .map(|birth| birth.unix_seconds)
+                })
+                .flatten()
                 .or_else(|| {
-                    (debt.unbuilt() && self.birth_stats < UNBUILT_BIRTH_STATS)
+                    (unbuilt && self.birth_stats < UNBUILT_BIRTH_STATS)
                         .then(|| {
                             self.birth_stats += 1;
                             std::fs::metadata(key)
@@ -695,13 +710,15 @@ impl ClaudeLedgerScope {
                         })
                         .flatten()
                 });
-            let released = ledger
-                .get(&super::claude_request_money::store::money_key(
-                    "unbuilt:", key,
-                ))
-                .is_some_and(|record| {
-                    record.window() & super::claude_request_money::UNBUILT_RELEASED != 0
-                });
+            let released = live
+                && unbuilt
+                && ledger
+                    .get(&super::claude_request_money::store::money_key(
+                        "unbuilt:", key,
+                    ))
+                    .is_some_and(|record| {
+                        record.window() & super::claude_request_money::UNBUILT_RELEASED != 0
+                    });
             files.push(((*key).to_owned(), debt, birth, released));
         }
         self.groups.insert(group.to_owned(), files);
@@ -732,14 +749,21 @@ impl ClaudeLedgerScope {
     /// SOURCE's held-unbuilt-older rule (P1 counts only): an unbuilt file of
     /// `own_key`'s group (its own file aside) has an unknown birth or one
     /// earlier than `holder_birth` (the winning holder's; None: unknown).
-    fn unbuilt_older(&self, own_key: &str, holder_birth: Option<u64>) -> bool {
+    fn unbuilt_older(&self, own_key: &str, holder_birth: Option<u64>, live: bool) -> bool {
         let Some(files) = claude_project_group(own_key).and_then(|group| self.groups.get(group))
         else {
             return false;
         };
         let mut blocked = false;
         for (key, debt, birth, released) in files {
-            if key == own_key || !debt.unbuilt() || *released {
+            if key == own_key
+                || !(if live {
+                    debt.unbuilt()
+                } else {
+                    debt.new_unrecorded > 0
+                })
+                || *released
+            {
                 continue;
             }
             if match (birth, holder_birth) {
@@ -891,7 +915,10 @@ impl ClaudeClassifyContext<'_, '_> {
             .get(winner)
             .and_then(|record| record.birth())
             .map(|birth| birth.unix_seconds);
-        if self.scope.unbuilt_older(own_key, birth) {
+        if self
+            .scope
+            .unbuilt_older(own_key, birth, self.index.request_money_live_revision())
+        {
             self.unbuilt_older.set(self.unbuilt_older.get() + 1);
             return true;
         }

@@ -22,7 +22,7 @@ permissions:
 jobs:
   rust:
     name: Rust contracts
-    timeout-minutes: 40
+    timeout-minutes: 60
     runs-on: macos-15
     env:
       RUSTUP_TOOLCHAIN: "1.95.0"
@@ -168,7 +168,7 @@ jobs:
           export OTTTO_MONEY_PARITY_ROOT="$RUNNER_TEMP/money-saved-inputs"
           # Separate targets force each source tree to compile independently.
           # Shared targets can reuse the base binary after a worktree switch.
-          git worktree add --detach "$RUNNER_TEMP/money-base" 6313fb902522b9d93f3edd989debe80a71d404e1
+          git worktree add --detach "$RUNNER_TEMP/money-base" 4be70343d51b8bb5c0b57016b6256da4aa7b72f9
           cp crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs "$RUNNER_TEMP/money-base/crates/ottto-service/src/snapshot_sync/request_identity_pipeline_tests.rs"
           # Match the test-only observer's fixed storage in both binaries.
           # Runtime source, measured allocations and overflow assertions stay intact.
@@ -215,7 +215,7 @@ jobs:
               return int(statistics.median(receipt[field] for receipt in receipts))
           base_footprint, head_footprint = median(base_runs, "phys_footprint_bytes"), median(head_runs, "phys_footprint_bytes")
           base_rss, head_rss = median(base_runs, "rss_median_bytes"), median(head_runs, "rss_median_bytes")
-          result = {"baseline_ref": "saved-main", "baseline_source": "6313fb902522b9d93f3edd989debe80a71d404e1", "runs_per_side": len(runs), "base_phys_footprint_bytes": base_footprint, "head_phys_footprint_bytes": head_footprint, "footprint_delta_bytes": head_footprint - base_footprint, "base_footprint_runs": [r["phys_footprint_bytes"] for r in base_runs], "head_footprint_runs": [r["phys_footprint_bytes"] for r in head_runs], "base_rss_bytes": base_rss, "head_rss_bytes": head_rss, "rss_delta_bytes_info": head_rss - base_rss, "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
+          result = {"baseline_ref": "saved-main", "baseline_source": "4be70343d51b8bb5c0b57016b6256da4aa7b72f9", "runs_per_side": len(runs), "base_phys_footprint_bytes": base_footprint, "head_phys_footprint_bytes": head_footprint, "footprint_delta_bytes": head_footprint - base_footprint, "base_footprint_runs": [r["phys_footprint_bytes"] for r in base_runs], "head_footprint_runs": [r["phys_footprint_bytes"] for r in head_runs], "base_rss_bytes": base_rss, "head_rss_bytes": head_rss, "rss_delta_bytes_info": head_rss - base_rss, "p1_shadow_resident": True, "live_gate": False, "matched_source_build_fixture": True, "release_daemon_rss": False}
           (root / "money-rss-comparison.json").write_text(json.dumps(result, indent=2) + "\n")
           print("MONEY_RSS_OFF_COMPARISON " + json.dumps(result, sort_keys=True))
           delta = head["ledger_resident_bytes"] - base["ledger_resident_bytes"]

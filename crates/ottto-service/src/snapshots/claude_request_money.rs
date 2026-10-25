@@ -2708,6 +2708,9 @@ async fn build_page_with_coverage(
                 let paused = end.started.saturating_duration_since(before_wait);
                 deadline += paused;
                 body_deadline += paused;
+                // Later families share the same money-only clock. A disk
+                // receipt after family zero cannot spend their body window.
+                later_families += paused;
                 first_family_deadline += paused;
                 clock.deadline += paused;
                 counts.admitted_peak_bytes = counts

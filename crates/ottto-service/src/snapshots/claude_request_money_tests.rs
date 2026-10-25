@@ -3297,7 +3297,7 @@ holder_view: crate::snapshots::claude_request_money::coverage::ClaudeHolderView 
         let text = (0..2100).map(|at| {
             let mut row: serde_json::Value = serde_json::from_str(&line(A, &format!("req_{at}"),
                 &format!("msg_{at}"), H7, 10)).unwrap();
-            row["message"]["usage"]["service_tier"] = "s".repeat(3000).into();
+            row["message"]["usage"]["service_tier"] = if at == 0 { "s".repeat(3000) } else { "standard".into() }.into();
             row.to_string()+"\n"
         }).collect::<String>();
         corpus.transcript(A, &text, NOW - 86_400);

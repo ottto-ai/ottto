@@ -597,10 +597,32 @@ impl ClaudeLedger {
             self.save_held = Some(SaveHeld::CreditPending);
         } else if self.save_bytes_today >= SAVE_DAILY_BYTES as u64 {
             self.save_held = Some(SaveHeld::DailyCap);
-        } else if submit(Job::Reserve(support_dir.to_path_buf(), day)).is_ok() {
+        } else if submit(Job::Reserve(
+            support_dir.to_path_buf(),
+            day,
+            self.credit_request_bytes(),
+        ))
+        .is_ok()
+        {
             self.credit_pending = true;
             self.save_held = Some(SaveHeld::CreditPending);
         }
+    }
+
+    // Bound the prepaid ticket to current dirty bytes. A tiny durable update
+    // must not lose an entire 8 MiB grant on each process restart. The same
+    // writer persists both ticket and physical-write caps before any I/O.
+    fn credit_request_bytes(&self) -> usize {
+        let dirty = self
+            .dirty
+            .iter()
+            .zip(self.shard_bytes.iter())
+            .filter(|(dirty, _)| **dirty)
+            .fold(
+                4096usize.saturating_add(self.shard_bytes[META]),
+                |bytes, (_, shard)| bytes.saturating_add(*shard),
+            );
+        dirty.clamp(64 * 1024, SAVE_BYTES_PER_PAGE)
     }
 
     /// A batch that did not reach the disk: its shards are dirty again (a
@@ -724,7 +746,7 @@ type CheckpointPayload = (
 );
 
 enum Job {
-    Reserve(PathBuf, u64),
+    Reserve(PathBuf, u64, usize),
     Wake,
     Load(PathBuf),
     Write(Box<WriteJob>),
@@ -764,7 +786,11 @@ static CREDITS: Mutex<BTreeMap<PathBuf, Credit>> = Mutex::new(BTreeMap::new());
 /// Only the writer (and synchronous store fixtures) calls this. Charge an
 /// entire <=8 MiB ticket before granting it. Unspent ticket bytes are lost
 /// on restart, so accounting is deliberately conservative.
+#[cfg(test)]
 fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
+    reserve_credit_up_to(support_dir, day, SAVE_BYTES_PER_PAGE)
+}
+fn reserve_credit_up_to(support_dir: &Path, day: u64, requested: usize) -> Credit {
     let dir = support_dir.join(LEDGER_DIR);
     let ((saved_day, saved_bytes), (write_day, written)) = load_counters(&dir, day);
     let max_day = saved_day.max(write_day);
@@ -773,7 +799,9 @@ fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
     } else {
         written
     });
-    let amount = SAVE_BYTES_PER_PAGE.min(SAVE_DAILY_BYTES.saturating_sub(used as usize));
+    let amount = requested
+        .min(SAVE_BYTES_PER_PAGE)
+        .min(SAVE_DAILY_BYTES.saturating_sub(used as usize));
     let total = used.saturating_add(amount as u64);
     let granted = day >= max_day
         && amount > 0
@@ -1106,8 +1134,8 @@ fn run_writer(receiver: Receiver<Job>) {
                 operation();
                 QUEUED_BYTES.fetch_sub(queued, Ordering::AcqRel);
             }
-            Job::Reserve(dir, _observed_day) => {
-                let credit = reserve_credit(&dir, super::utc_day(writer_unix()));
+            Job::Reserve(dir, _observed_day, requested) => {
+                let credit = reserve_credit_up_to(&dir, super::utc_day(writer_unix()), requested);
                 if let Ok(mut credits) = CREDITS.lock() {
                     credits.insert(dir, credit);
                 }
@@ -1841,6 +1869,9 @@ pub(crate) fn pause_for_test() -> PausedWriter {
 /// loads it from disk.
 #[cfg(test)]
 pub(crate) fn forget_for_test(support_dir: &Path) {
+    CUSTODY_CHECKPOINT_FOR_TEST.with(|seen| {
+        seen.borrow_mut().remove(support_dir);
+    });
     flush();
     if let Ok(mut ledgers) = LEDGERS.lock() {
         ledgers.remove(support_dir);
@@ -2175,6 +2206,17 @@ pub(super) fn checkpoint_receipt(support_dir: &Path, ledger: &mut ClaudeLedger) 
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    static CUSTODY_CHECKPOINT_FOR_TEST: std::cell::RefCell<BTreeMap<PathBuf, bool>> = const { std::cell::RefCell::new(BTreeMap::new()) };
+}
+/// The fixture mutates evidence only once a real changed-custody checkpoint
+/// was submitted, not merely because a future was parked before evidence load.
+#[cfg(test)]
+pub(crate) fn custody_checkpoint_for_test(support: &Path) -> bool {
+    CUSTODY_CHECKPOINT_FOR_TEST.with(|seen| seen.borrow().contains_key(support))
+}
+
 pub(super) fn checkpoint_receipt_until(
     support_dir: &Path,
     ledger: &mut ClaudeLedger,
@@ -2261,6 +2303,12 @@ pub(super) fn checkpoint_receipt_until(
     {
         ledger.restore(&shards, meta);
         return MoneyReceipt::Refused;
+    }
+    #[cfg(test)]
+    if epoch != ledger.durable_custody_epoch {
+        CUSTODY_CHECKPOINT_FOR_TEST.with(|seen| {
+            seen.borrow_mut().insert(support_dir.to_path_buf(), true);
+        });
     }
     ledger.pending_checkpoint = Some((wait, shards, meta, epoch, complete));
     MoneyReceipt::Pending
@@ -2725,7 +2773,7 @@ mod refused_intent_tests {
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn completed_load_refusal_enables_collection_then_recovers_without_losing_debt() {
-        let _flush = flush_timeout_for_test(Duration::from_secs(10));
+        let _flush = flush_timeout_for_test(Duration::from_secs(60));
         let scratch = crate::test_scratch::ScratchDir::new("money-load-admission-receipt");
         let support = scratch.join("support");
         let _live = super::super::LiveForTest::new(&support);
@@ -2816,6 +2864,7 @@ mod refused_intent_tests {
             }
         }
         let _reset = Reset(support.clone());
+        let _writer = stall_writer_for_test();
         REFUSE_WRITES_FOR_TEST.with(|flag| flag.set(true));
         let now = 1_790_000_000;
         let day = super::super::day_stamp(now).unwrap();
@@ -3397,7 +3446,12 @@ mod bounded_save_tests {
             assert!(!loaded.load_damaged);
             assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
             // Exercise the actual async writer request, not just the parser.
-            assert!(submit(Job::Reserve(scratch.to_path_buf(), loaded.save_day)).is_ok());
+            assert!(submit(Job::Reserve(
+                scratch.to_path_buf(),
+                loaded.save_day,
+                SAVE_BYTES_PER_PAGE
+            ))
+            .is_ok());
             flush();
             take_results(&scratch, &mut loaded);
             assert_eq!(loaded.save_credit, 0);

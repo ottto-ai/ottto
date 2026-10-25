@@ -847,6 +847,7 @@ impl P2aControl {
                 codex_scan_homes: Vec::new(),
                 codex_home_bindings: Vec::new(),
             };
+            let resuming_finish = money_resume::pending_for_test(&self.support);
             let frame = self.resource_call("prepare_or_resume", || {
                 crate::agent_status_refresh::with_test_collection(collection(), || {
                     prepare_sync_source(
@@ -866,7 +867,7 @@ impl P2aControl {
             });
             let mut frame = match frame {
                 Ok(Some(frame)) => frame,
-                Ok(None) if retained.is_none() => {
+                Ok(None) if retained.is_none() || !resuming_finish => {
                     // A validated catalog can park this source for ordinary
                     // retirement without failing the global cycle. Still
                     // require actual collection within the same 32 turns.
@@ -2076,6 +2077,9 @@ fn p2a_continuously_changing_evidence_finishes_frozen_epoch_then_next_epoch() {
         let mut attempts = 0;
         control
             .cycle_changing(|attempt| {
+                if sequence > 0 && !money::store::custody_checkpoint_for_test(&control.support) {
+                    return;
+                }
                 attempts += 1;
                 assert!(
                     attempt < 12,
@@ -2315,6 +2319,7 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     money::enable_shadow_for_test(&control.support);
     control.cycle();
     let _live = money::LiveForTest::settled(&control.support);
+    control.recovery_startup(current_unix_seconds());
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
         let vacant = money::store::LEDGER_MAX_RECORDS - ledger.census().record_count();
@@ -2424,6 +2429,7 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
     let mut control = P2aControl::new(FinishOutcome::Accept);
     control.cycle();
     let _live = money::LiveForTest::settled(&control.support);
+    control.recovery_startup(current_unix_seconds());
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
         assert_eq!(
@@ -2582,7 +2588,8 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
         let _live = money::LiveForTest::settled(&control.support);
         let mut cancelled = false;
         let result = control.cycle_changing(|_| {
-            if cancelled || !money_resume::pending_for_test(&control.support) {
+            if cancelled || !money_resume::pending_for_test(&control.support)
+                || !money::store::custody_checkpoint_for_test(&control.support) {
                 return;
             }
             assert!(money_resume::pending_for_test(&control.support));
@@ -5257,8 +5264,15 @@ fn p2a_initial_post_holds_versionless_before_intent_and_acks_supported_control()
     let _live = money::LiveForTest::settled(&control.support);
     let posted = unknown_recovery::PostedEntityForTest::new();
     control.cycle();
-    let supported = posted.take().expect("real finalized supported wire body");
+    let mut supported = posted.take().expect("real finalized supported wire body");
     drop(posted);
+    // An independent supported ordinary control does not reuse the completed
+    // literal's consumed historical-emission permit.
+    supported.usage_accounting_contract = None;
+    supported.removed_request_count = None;
+    supported.removed_usage = None;
+    supported.telemetry_owned_complete = None;
+    supported.snapshot_fingerprint = crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &supported);
     assert!(crate::snapshot_client::snapshot_ack_body_witness_version(&supported).unwrap().is_some());
     control.recovery_startup(current_unix_seconds());
     let mut index = control.saved();

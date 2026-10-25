@@ -6,6 +6,7 @@ use super::super::claude_request_census::{
     MAX_CLAUDE_REQUEST_CENSUS_HASHES as MAX_HASHES,
     MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES as MAX_BYTES,
 };
+use super::hex_bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -220,14 +221,7 @@ impl std::fmt::Display for QueryKey {
         }
     }
 }
-fn hex_bytes(bytes: &[u8]) -> String {
-    use std::fmt::Write;
-    let mut text = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        write!(text, "{byte:02x}").unwrap();
-    }
-    text
-}
+
 #[derive(Debug, Clone, Eq)]
 struct Slot {
     key: QueryKey,
