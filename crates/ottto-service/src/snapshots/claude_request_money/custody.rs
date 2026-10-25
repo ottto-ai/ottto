@@ -18,12 +18,19 @@ use value::Value;
 pub(super) const CONTROL: &str = "control";
 pub(super) const EVER: &str = "ever-indexed";
 
-// Standard queries are reconstructed from their carrier. Only independent
-// offer/entity/control bindings retain their own spelling.
+// Standard queries share fixed descriptors. Only independent live bindings
+// own names and entity metadata; ordinary P1 slots retain one descriptor pointer.
+#[derive(Debug, Clone)]
+struct QueryKey(std::sync::Arc<BoundKey>);
+#[derive(Debug, Clone)]
+struct BoundKey {
+    name: QueryName,
+    entity: Option<Box<CompactEntity>>,
+}
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-enum QueryKey {
+enum QueryName {
     Standard(u8),
-    Binding(Box<BindingKey>),
+    Binding(BindingKey),
 }
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 enum BindingKey {
@@ -44,10 +51,32 @@ impl QueryKey {
         "hold:",
         "unbuilt:",
     ];
+    fn standard(code: usize) -> Self {
+        static STANDARD: [std::sync::OnceLock<std::sync::Arc<BoundKey>>; 10] =
+            [const { std::sync::OnceLock::new() }; 10];
+        Self(
+            STANDARD[code]
+                .get_or_init(|| {
+                    std::sync::Arc::new(BoundKey {
+                        name: QueryName::Standard(code as u8),
+                        entity: None,
+                    })
+                })
+                .clone(),
+        )
+    }
+    fn shared_resident_bound() -> usize {
+        // Charge all descriptors once per ledger, including Arc headers and
+        // static cells. Actual initialization is lazy; this is conservative.
+        Self::PREFIXES.len()
+            * (std::mem::size_of::<std::sync::OnceLock<std::sync::Arc<BoundKey>>>()
+                + 2 * std::mem::size_of::<usize>()
+                + std::mem::size_of::<BoundKey>())
+    }
     fn new(key: String) -> Self {
         for (code, prefix) in Self::PREFIXES.iter().enumerate() {
             if key.starts_with(prefix) {
-                return Self::Standard(code as u8);
+                return Self::standard(code);
             }
         }
         for (code, prefix) in BINDING_PREFIXES.iter().enumerate() {
@@ -56,26 +85,49 @@ impl QueryKey {
                 .and_then(super::super::claude_request_census::decode_fingerprint)
                 .filter(|hash| format!("{prefix}{}", hex_bytes(hash)) == key)
             {
-                return Self::Binding(Box::new(BindingKey::Digest(code as u8, hash)));
+                return Self(std::sync::Arc::new(BoundKey {
+                    name: QueryName::Binding(BindingKey::Digest(code as u8, hash)),
+                    entity: None,
+                }));
             }
         }
-        Self::Binding(Box::new(BindingKey::Text(key)))
+        Self(std::sync::Arc::new(BoundKey {
+            name: QueryName::Binding(BindingKey::Text(key)),
+            entity: None,
+        }))
+    }
+    fn name(&self) -> &QueryName {
+        &self.0.name
+    }
+    fn entity(&self) -> Option<&CompactEntity> {
+        self.0.entity.as_deref()
+    }
+    fn with_entity(mut self, entity: Option<Box<EntityBinding>>) -> Option<Self> {
+        if let Some(entity) = entity {
+            if !matches!(self.name(), QueryName::Binding(_)) {
+                return None;
+            }
+            std::sync::Arc::make_mut(&mut self.0).entity =
+                Some(Box::new(CompactEntity::from(*entity)));
+        }
+        Some(self)
     }
     fn starts_with(&self, prefix: &str) -> bool {
-        match self {
-            Self::Standard(p) => Self::PREFIXES[*p as usize].starts_with(prefix),
-            Self::Binding(k) => match k.as_ref() {
-                BindingKey::Digest(p, _) => BINDING_PREFIXES[*p as usize].starts_with(prefix),
-                BindingKey::Text(k) => k.starts_with(prefix),
-            },
+        match self.name() {
+            QueryName::Standard(p) => Self::PREFIXES[*p as usize].starts_with(prefix),
+            QueryName::Binding(BindingKey::Digest(p, _)) => {
+                BINDING_PREFIXES[*p as usize].starts_with(prefix)
+            }
+            QueryName::Binding(BindingKey::Text(k)) => k.starts_with(prefix),
         }
     }
     fn capacity(&self) -> usize {
-        match self {
-            Self::Standard(_) => 0,
-            Self::Binding(k) => {
-                std::mem::size_of::<BindingKey>()
-                    + match k.as_ref() {
+        match self.name() {
+            QueryName::Standard(_) => 0,
+            QueryName::Binding(name) => {
+                2 * std::mem::size_of::<usize>()
+                    + std::mem::size_of::<BoundKey>()
+                    + match name {
                         BindingKey::Text(k) => k.capacity(),
                         _ => 0,
                     }
@@ -83,16 +135,16 @@ impl QueryKey {
         }
     }
     fn len(&self) -> usize {
-        match self {
-            Self::Standard(p) => Self::PREFIXES[*p as usize].len(),
-            Self::Binding(k) => match k.as_ref() {
-                BindingKey::Digest(p, _) => BINDING_PREFIXES[*p as usize].len() + 64,
-                BindingKey::Text(k) => k.len(),
-            },
+        match self.name() {
+            QueryName::Standard(p) => Self::PREFIXES[*p as usize].len(),
+            QueryName::Binding(BindingKey::Digest(p, _)) => {
+                BINDING_PREFIXES[*p as usize].len() + 64
+            }
+            QueryName::Binding(BindingKey::Text(k)) => k.len(),
         }
     }
     fn expand(&self, carrier: &str, path: Option<&str>) -> String {
-        let Self::Standard(prefix) = self else {
+        let QueryName::Standard(prefix) = self.name() else {
             return self.to_string();
         };
         let telemetry = carrier.strip_prefix("telemetry:");
@@ -116,19 +168,34 @@ impl QueryKey {
         }
     }
 }
+// Identity and sort order belong to the query, not its optional live payload.
+impl Ord for QueryKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.name().cmp(other.name())
+    }
+}
+impl PartialOrd for QueryKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl PartialEq for QueryKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.name() == other.name()
+    }
+}
+impl Eq for QueryKey {}
 impl PartialEq<str> for QueryKey {
     fn eq(&self, key: &str) -> bool {
-        match self {
-            Self::Standard(prefix) => key.starts_with(Self::PREFIXES[*prefix as usize]),
-            Self::Binding(binding) => match binding.as_ref() {
-                BindingKey::Text(text) => text == key,
-                BindingKey::Digest(prefix, digest) => {
-                    key.strip_prefix(BINDING_PREFIXES[*prefix as usize])
-                        .and_then(super::super::claude_request_census::decode_fingerprint)
-                        .as_ref()
-                        == Some(digest)
-                }
-            },
+        match self.name() {
+            QueryName::Standard(prefix) => key.starts_with(Self::PREFIXES[*prefix as usize]),
+            QueryName::Binding(BindingKey::Text(text)) => text == key,
+            QueryName::Binding(BindingKey::Digest(prefix, digest)) => {
+                key.strip_prefix(BINDING_PREFIXES[*prefix as usize])
+                    .and_then(super::super::claude_request_census::decode_fingerprint)
+                    .as_ref()
+                    == Some(digest)
+            }
         }
     }
 }
@@ -144,14 +211,12 @@ impl PartialEq<String> for QueryKey {
 }
 impl std::fmt::Display for QueryKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Standard(p) => f.write_str(Self::PREFIXES[*p as usize]),
-            Self::Binding(k) => match k.as_ref() {
-                BindingKey::Digest(p, hash) => {
-                    write!(f, "{}{}", BINDING_PREFIXES[*p as usize], hex_bytes(hash))
-                }
-                BindingKey::Text(k) => f.write_str(k),
-            },
+        match self.name() {
+            QueryName::Standard(p) => f.write_str(Self::PREFIXES[*p as usize]),
+            QueryName::Binding(BindingKey::Digest(p, hash)) => {
+                write!(f, "{}{}", BINDING_PREFIXES[*p as usize], hex_bytes(hash))
+            }
+            QueryName::Binding(BindingKey::Text(k)) => f.write_str(k),
         }
     }
 }
@@ -163,11 +228,17 @@ fn hex_bytes(bytes: &[u8]) -> String {
     }
     text
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Eq)]
 struct Slot {
     key: QueryKey,
     value: Value,
-    entity: Option<Box<CompactEntity>>,
+}
+impl PartialEq for Slot {
+    fn eq(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.value == other.value
+            && self.key.entity() == other.key.entity()
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -733,9 +804,9 @@ impl Custody {
             carrier
                 .slots()
                 .filter(move |slot| {
-                    let fixed = match &slot.key {
-                        QueryKey::Standard(code) => QueryKey::PREFIXES[*code as usize],
-                        QueryKey::Binding(_) => return true,
+                    let fixed = match slot.key.name() {
+                        QueryName::Standard(code) => QueryKey::PREFIXES[*code as usize],
+                        QueryName::Binding(_) => return true,
                     };
                     fixed.starts_with(prefix) || prefix.starts_with(fixed)
                 })
@@ -859,8 +930,8 @@ impl Custody {
             )
         {
             if !slot
-                .entity
-                .as_ref()
+                .key
+                .entity()
                 .is_some_and(|e| e.context.as_ref() == context)
             {
                 continue;
@@ -1080,12 +1151,14 @@ impl Custody {
         }
         let mut key = key;
         key.shrink_to_fit();
+        let Some(key) = QueryKey::new(key).with_entity(entity) else {
+            return Insert::Refused;
+        };
         let previous = self.replace(
             &a,
             Some(Slot {
                 value: compact,
-                key: QueryKey::new(key),
-                entity: entity.map(|entity| Box::new(CompactEntity::from(*entity))),
+                key,
             }),
         );
         let prior_path = self
@@ -1164,7 +1237,9 @@ impl Custody {
         self.hashes = self.entries().map(|(_, value)| value.hashes()).sum();
     }
     pub(crate) fn resident_bytes(&self, deadline: Instant) -> Option<usize> {
-        let mut bytes = std::mem::size_of::<Self>() + self.ever.capacity() * 32;
+        let mut bytes = std::mem::size_of::<Self>()
+            + self.ever.capacity() * 32
+            + QueryKey::shared_resident_bound();
         use crate::heap_layout_bound::{Counter, HeapLayoutBound};
         for (key, carrier) in self.entries() {
             if Instant::now() >= deadline {
@@ -1227,7 +1302,7 @@ impl Custody {
                         }
                     }
                 }
-                if let Some(entity) = &slot.entity {
+                if let Some(entity) = slot.key.entity() {
                     bytes += std::mem::size_of::<CompactEntity>()
                         + entity.root.capacity()
                         + entity.member.capacity()
@@ -1479,7 +1554,8 @@ impl Serialize for SlotWire<'_> {
         use serde::ser::SerializeStruct;
         let slot = self.slot;
         let mut out = s.serialize_struct("Field", 2)?;
-        let rendered = matches!(slot.key, QueryKey::Binding(_)).then(|| slot.key.to_string());
+        let rendered =
+            matches!(slot.key.name(), QueryName::Binding(_)).then(|| slot.key.to_string());
         let key = rendered.as_deref().unwrap_or("");
         let binding = if key.starts_with("offer:") {
             key.rsplit_once(':').map(|(_, fingerprint)| fingerprint)
@@ -1496,7 +1572,7 @@ impl Serialize for SlotWire<'_> {
             out.serialize_field("binding", binding)?;
         }
 
-        if let Some(entity) = &slot.entity {
+        if let Some(entity) = slot.key.entity() {
             out.serialize_field("entity", entity)?;
         }
         struct FieldValue<'a>(&'a Slot, Option<&'a Slot>);
@@ -2072,20 +2148,14 @@ fn decoded_slot(wire: WireSlot, current: Option<&Slot>) -> Option<Slot> {
         ),
         WireValue::Memo(value) => {
             return Some(Slot {
-                key: QueryKey::new(wire.key),
+                key: QueryKey::new(wire.key).with_entity(wire.entity)?,
                 value: Value::Memo(Box::new(value)),
-                entity: wire
-                    .entity
-                    .map(|entity| Box::new(CompactEntity::from(*entity))),
             })
         }
     };
     Some(Slot {
         value: Value::from_record(&wire.key, value),
-        key: QueryKey::new(wire.key),
-        entity: wire
-            .entity
-            .map(|entity| Box::new(CompactEntity::from(*entity))),
+        key: QueryKey::new(wire.key).with_entity(wire.entity)?,
     })
 }
 impl Custody {
@@ -2480,7 +2550,9 @@ impl Custody {
         let mut parts = BTreeMap::<&str, usize>::new();
         parts.insert(
             "globals",
-            std::mem::size_of::<Self>() + self.ever.capacity() * 32,
+            std::mem::size_of::<Self>()
+                + self.ever.capacity() * 32
+                + QueryKey::shared_resident_bound(),
         );
         for (key, carrier) in self.entries() {
             *parts.entry("carrier_keys").or_default() += carrier.key_heap_bytes(key);
@@ -2554,7 +2626,7 @@ impl Custody {
                     }
                     _ => {}
                 }
-                if let Some(entity) = &slot.entity {
+                if let Some(entity) = slot.key.entity() {
                     *parts.entry("bindings").or_default() += std::mem::size_of::<CompactEntity>()
                         + entity.root.capacity()
                         + entity.member.capacity()
@@ -2941,10 +3013,7 @@ impl Custody {
         slot.is_some_and(|slot| {
             slot.key == key
                 && slot.value.view().matches(value)
-                && slot
-                    .entity
-                    .as_deref()
-                    .is_some_and(|saved| saved.matches(entity))
+                && slot.key.entity().is_some_and(|saved| saved.matches(entity))
         })
     }
     pub(super) fn insert_entity(
@@ -3062,6 +3131,45 @@ impl Custody {
 #[cfg(test)]
 mod compact_layout_tests {
     use super::*;
+    #[test]
+    fn rebinding_a_cloned_query_keeps_the_original_payload_and_query_identity() {
+        let binding = |body: &str| {
+            Box::new(EntityBinding {
+                root: "root".into(),
+                member: "member".into(),
+                context: "context".into(),
+                body: body.into(),
+            })
+        };
+        let key = format!("adopt:member:v1:{}", "ab".repeat(32));
+        let original = QueryKey::new(key.clone())
+            .with_entity(Some(binding("original")))
+            .unwrap();
+        let updated = original
+            .clone()
+            .with_entity(Some(binding("updated")))
+            .unwrap();
+        assert_eq!(original, updated);
+        assert_eq!(original.cmp(&updated), std::cmp::Ordering::Equal);
+        assert_eq!(original.to_string(), key);
+        assert!(original.entity().unwrap().matches(&binding("original")));
+        assert!(updated.entity().unwrap().matches(&binding("updated")));
+        let value = || Value::from_record("adopt:member:v1:test", Record::money_debt([1; 32], 0));
+        assert_ne!(
+            Slot {
+                key: original,
+                value: value()
+            },
+            Slot {
+                key: updated,
+                value: value()
+            }
+        );
+        assert!(QueryKey::new("mh:/fixture".into())
+            .with_entity(Some(binding("invalid")))
+            .is_none());
+    }
+
     #[test]
     fn compact_layout_round_trip_and_refused_replacement_keep_exact_custody() {
         for text in [
