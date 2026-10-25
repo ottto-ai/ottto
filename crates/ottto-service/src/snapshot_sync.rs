@@ -8658,6 +8658,17 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             );
         }
     }
+    let request_owned_activity = identity_evidence.as_ref().map(|evidence| {
+        let ownership =
+            crate::snapshots::claude_request_identity::TranscriptOwnership::after_census(
+                index, &disposition,
+            );
+        crate::snapshots::claude_request_identity::stage_request_owned_activity(
+            &scan_result.snapshots,
+            evidence,
+            &ownership,
+        )
+    });
     // E2 bodies are final before any identity owner runs: contract 5, D1 and
     // the account hash then tag the rows that upload (donor #699 order).
     // Gate off this only counts, so the page is unchanged.
@@ -8693,6 +8704,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
                 std::mem::take(&mut disposition.request_groupings),
                 &ownership,
             );
+        if let Some(activity) = request_owned_activity {
+            crate::snapshots::claude_request_identity::publish_request_owned_activity(
+                &scan_result.snapshots,
+                activity,
+            );
+        }
     }
     let qualification = match &identity_evidence {
         Some(evidence) => crate::snapshots::claude_request_accounts::apply_with_shared_index(

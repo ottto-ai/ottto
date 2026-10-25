@@ -2754,12 +2754,11 @@ pub(crate) fn apply_scan(
     reported: BTreeMap<String, Grouping>,
 ) -> ScanOutcome {
     static NONE: Duplicates = BTreeMap::new();
-    apply_scan_with_ownership(
-        snapshots,
-        evidence,
-        reported,
-        &TranscriptOwnership { duplicates: &NONE },
-    )
+    let ownership = TranscriptOwnership { duplicates: &NONE };
+    let activity = stage_request_owned_activity(snapshots, evidence, &ownership);
+    let outcome = apply_scan_with_ownership(snapshots, evidence, reported, &ownership);
+    publish_request_owned_activity(snapshots, activity);
+    outcome
 }
 
 /// Tag every eligible Claude item of this pass. Runs before D1, which leaves
@@ -2785,16 +2784,84 @@ pub(crate) fn apply_scan_with_ownership(
     outcome
 }
 
-fn publish_request_owned_activity(
+/// Bounded validated activity, kept only across final twin removal/tagging.
+#[derive(Default)]
+pub(crate) struct RequestOwnedActivity(
+    BTreeMap<String, Vec<crate::desktop_recent::RecentActivity>>,
+);
+
+pub(crate) fn stage_request_owned_activity(
+    items: &[SnapshotItem],
+    evidence: &ScanEvidence<'_>,
+    ownership: &TranscriptOwnership<'_>,
+) -> RequestOwnedActivity {
+    let mut page = RequestOwnedActivity::default();
+    if !super::claude_request_money::e2::enabled() {
+        return page;
+    }
+    for item in items {
+        if item.claude_money.is_none()
+            || !item
+                .claude_usage_occurrences
+                .values()
+                .any(|occurrence| occurrence.desktop_request)
+        {
+            continue;
+        }
+        if item
+            .model_usage
+            .iter()
+            .chain(
+                item.usage_buckets
+                    .iter()
+                    .flat_map(|bucket| &bucket.model_usage),
+            )
+            .any(|row| !local_subscription(row))
+        {
+            continue;
+        }
+        page.0
+            .entry(item.source_session_id.clone())
+            .or_default()
+            .push(collect_request_owned_activity(item, evidence, ownership));
+    }
+    page
+}
+
+pub(crate) fn publish_request_owned_activity(
+    items: &[SnapshotItem],
+    mut page: RequestOwnedActivity,
+) {
+    if page.0.is_empty() {
+        return;
+    }
+    for item in items {
+        if !super::claude_history_upgrade::is_request_owned_literal(item) {
+            continue;
+        }
+        #[cfg(not(test))]
+        let collector = COLLECTOR;
+        #[cfg(test)]
+        let collector = cycle_contract(true);
+        if item.provenance.collector != collector {
+            continue;
+        }
+        for activity in page.0.remove(&item.source_session_id).into_iter().flatten() {
+            crate::desktop_recent::publish(activity);
+        }
+    }
+}
+
+fn collect_request_owned_activity(
     item: &SnapshotItem,
     evidence: &ScanEvidence<'_>,
     ownership: &TranscriptOwnership<'_>,
-) {
+) -> crate::desktop_recent::RecentActivity {
     let Some(fold) = item.claude_money.as_deref() else {
-        return;
+        return Default::default();
     };
     let Some(root) = owner_root(item) else {
-        return;
+        return Default::default();
     };
     let original = match evidence.native_originals {
         Some(originals) => originals.get(&item.source_session_id),
@@ -2861,7 +2928,7 @@ fn publish_request_owned_activity(
             identity,
         );
     }
-    crate::desktop_recent::publish(activity);
+    activity
 }
 
 fn tag_item(
@@ -2906,7 +2973,6 @@ fn tag_item(
         normalize_activity(item);
         let tagged = apply_grouped(item, grouping);
         if matches!(tagged, Ok(Tagged::Sent { .. })) {
-            publish_request_owned_activity(item, evidence, ownership);
             return Some(tagged);
         }
         let fallback = item
@@ -2919,9 +2985,6 @@ fn tag_item(
         IDENTITY_COUNTS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let grouping = request_owned_grouping(item, Some(&fallback))?;
         let tagged = apply_grouped(item, grouping);
-        if tagged.is_ok() {
-            publish_request_owned_activity(item, evidence, ownership);
-        }
         return Some(tagged);
     }
     let root = owner_root(item)?;

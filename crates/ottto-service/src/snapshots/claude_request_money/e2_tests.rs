@@ -856,12 +856,22 @@ fn tag_owned(mut items: Vec<SnapshotItem>, index: &ScanIndex) -> Vec<SnapshotIte
     let trace = ClaudeTraceOwnershipLoadReport::default();
     let evidence = claude_request_identity::ScanEvidence::new(&api, &trace, BTreeSet::new(), None);
     claude_request_identity::reconcile_request_accounts(&mut items, &evidence);
+    let disposition = crate::snapshots::ClaudeUsageAuthorityDisposition::default();
+    let ownership = claude_request_identity::TranscriptOwnership::after_census(index, &disposition);
+    let activity =
+        claude_request_identity::stage_request_owned_activity(&items, &evidence, &ownership);
     let withheld = finish_page(&mut items, index, TelemetryRead::Loaded);
     assert!(
         withheld.is_empty(),
         "identity doubt must never withhold money"
     );
-    let outcome = claude_request_identity::apply_scan(&mut items, &evidence, BTreeMap::new());
+    let outcome = claude_request_identity::apply_scan_with_ownership(
+        &mut items,
+        &evidence,
+        BTreeMap::new(),
+        &ownership,
+    );
+    claude_request_identity::publish_request_owned_activity(&items, activity);
     assert_eq!(outcome.sent, items.len());
     assert_eq!(outcome.ineligible, 0);
     items
@@ -1769,5 +1779,67 @@ fn e2_identity_desktop_request_still_publishes_validated_recent_activity() {
             Some(event)
         );
         cleanup(&[&path]);
+    });
+}
+
+#[test]
+fn e2_identity_recent_desktop_activity_survives_discarded_twin_in_both_orders() {
+    with_enabled(|| {
+        for reverse in [false, true] {
+            let cli = root_file("identity-activity-cli-twin");
+            let desktop_path = root_file("identity-activity-desktop-twin");
+            let index = ScanIndex::default();
+            let older = parse(
+                &cli,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), line("old-cli", &at(1), 10)],
+            );
+            let now = time::OffsetDateTime::now_utc()
+                .replace_nanosecond(0)
+                .unwrap();
+            let event = now - time::Duration::seconds(2);
+            let clock = event
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            let mut desktop = line("recent-twin", &clock, 20);
+            desktop["entrypoint"] = json!("claude-desktop");
+            let mut recent = parse(
+                &desktop_path,
+                Some(t0()),
+                &index,
+                &[org_marker(ORG_A), desktop],
+            );
+            let collected = now
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap();
+            recent.collected_at = collected.clone();
+            let account = "e".repeat(64);
+            recent.session_account_evidence = Some(crate::snapshots::SessionAccountEvidence {
+                provider: "anthropic",
+                account_identifier_hash: Some(account.clone()),
+                provider_workspace_hash: Some(org_hash(ORG_A)),
+                identity_hash_scheme: "provider-sha256:v1",
+                evidence_source: "claude_desktop_original:v1",
+                identity_disposition: Some("complete"),
+                source_created_at: Some(clock),
+            });
+            let mut items = if reverse {
+                vec![recent, older]
+            } else {
+                vec![older, recent]
+            };
+            for item in &mut items {
+                item.collected_at = collected.clone();
+            }
+            let items = tag_owned(items, &index);
+            assert_eq!(items.len(), 1);
+            assert_eq!((items[0].request_count, items[0].input_tokens), (2, 30));
+            assert_eq!(
+                crate::desktop_recent::saved().at(&account, &org_hash(ORG_A)),
+                Some(event)
+            );
+            cleanup(&[&cli, &desktop_path]);
+        }
     });
 }
