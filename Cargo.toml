@@ -49,3 +49,8 @@ ureq = { version = "2", default-features = false, features = ["gzip", "json"] }
 webpki-roots = "1.0.10"
 zeroize = { version = "1", features = ["alloc"] }
 zstd = { version = "0.13", default-features = false, features = ["experimental"] }
+
+# Optimise dependencies (not workspace crates) in test builds; debug
+# assertions and overflow checks stay on.
+[profile.test.package."*"]
+opt-level = 2
