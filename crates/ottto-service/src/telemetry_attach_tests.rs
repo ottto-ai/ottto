@@ -166,6 +166,41 @@ fn held_not_attachable_is_silent_even_for_a_conflicting_key() {
 }
 
 #[test]
+fn missing_request_keys_cannot_attach_or_become_side_calls() {
+    let rows = [Row("", Some(10)), Row("", Some(99))];
+    let duplicates = BTreeSet::new();
+    for holder_kind in 0..3 {
+        let mut events = 0;
+        let counts = join(
+            SessionReport {
+                rows: &rows,
+                complete: false,
+                duplicate_keys: &duplicates,
+            },
+            |_| match holder_kind {
+                0 => Holders::One(()),
+                1 => Holders::None,
+                _ => Holders::Many,
+            },
+            |_, _| panic!("missing key must veto compatibility"),
+            |event| {
+                assert!(matches!(
+                    event,
+                    Attachment::Disclosed {
+                        reason: DisclosureReason::Incompatible,
+                        ..
+                    }
+                ));
+                events += 1;
+            },
+        );
+        assert_eq!(events, 2);
+        assert_eq!(counts.disclosed, 2);
+        assert_eq!(counts.matched + counts.unheld, 0);
+    }
+}
+
+#[test]
 fn empty_report_preserves_reader_completeness() {
     let duplicates = BTreeSet::new();
     for complete in [false, true] {
@@ -284,4 +319,21 @@ fn claude_report_borrows_rows_and_keeps_reader_health_without_rereading() {
     ] {
         assert!(read.session_report(root).unwrap().rows.is_empty(), "{root}");
     }
+    let counts = join(
+        read.session_report("no-request").unwrap(),
+        |_| Holders::One(()),
+        |_, _| panic!("legacy missing-id row must not reach compatibility"),
+        |event| {
+            assert!(matches!(
+                event,
+                Attachment::Disclosed {
+                    reason: DisclosureReason::Incompatible,
+                    ..
+                }
+            ))
+        },
+    );
+    assert_eq!(counts.disclosed, 1);
+    assert_eq!(counts.matched + counts.unheld, 0);
+    assert!(!counts.complete);
 }

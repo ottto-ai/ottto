@@ -8,6 +8,8 @@
 use std::collections::BTreeSet;
 
 pub trait ReportedRequest {
+    /// Native request identity within the report's scope. Empty keys are
+    /// disclosed as incompatible, never attached or offered as side calls.
     fn request_key(&self) -> &str;
     fn reported_cost_micros(&self) -> Option<u64>;
 }
@@ -84,7 +86,9 @@ where
         if matches!(holder, Holders::HeldNotAttachable) {
             continue;
         }
-        let reason = if report.duplicate_keys.contains(key) {
+        let reason = if key.is_empty() {
+            DisclosureReason::Incompatible
+        } else if report.duplicate_keys.contains(key) {
             DisclosureReason::DuplicateReport
         } else {
             match holder {
