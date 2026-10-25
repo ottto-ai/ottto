@@ -308,10 +308,13 @@ fn with_bootstrap_deferred(
 /// Carry a newer refused-body conflict even when the frozen upload delta is
 /// empty. New conflicts were already counted by bootstrap/main upload; this
 /// adds only older, untransmitted debt from the current source universe.
+/// A later traversal's proven unchanged cooldown is counted and disclosed,
+/// but leaves settlement to the normal clean-traversal boundary.
 fn with_retained_refusal_conflicts(
     result: ResumableUploadResult,
     index: &ScanIndex,
     progress: &SnapshotUploadProgress,
+    reoffer_now: u64,
 ) -> ResumableUploadResult {
     let retained = index
         .current_snapshot_fingerprint_refs()
@@ -321,14 +324,25 @@ fn with_retained_refusal_conflicts(
                     .permanent_rejections
                     .get(*fingerprint)
                     .is_some_and(|refusal| {
-                        progress
-                            .quarantined_fingerprints
-                            .get(*fingerprint)
-                            .is_some_and(|record| {
-                                record.disposition == SnapshotQuarantineDisposition::RetryPending
-                                    && record.upload_body_witness.as_deref()
-                                        == Some(refusal.body_witness.as_str())
-                            })
+                        // The I/O view also holds due records waiting for
+                        // budget. Only a still-future reservation grants the
+                        // settlement exception; at D that debt blocks again.
+                        !(index.reason_reoffer_conflict_is_deferred(
+                            fingerprint,
+                            &refusal.body_witness,
+                        ) && refusal
+                            .reoffer
+                            .and_then(reason_reoffer::RefusalReoffer::retry_after)
+                            .is_some_and(|deadline| deadline > reoffer_now))
+                            && progress
+                                .quarantined_fingerprints
+                                .get(*fingerprint)
+                                .is_some_and(|record| {
+                                    record.disposition
+                                        == SnapshotQuarantineDisposition::RetryPending
+                                        && record.upload_body_witness.as_deref()
+                                            == Some(refusal.body_witness.as_str())
+                                })
                     })
         })
         .collect::<BTreeSet<_>>();
@@ -362,11 +376,16 @@ const _: () = assert!(
 ///   in its upload ledger (an accepted, quarantined or refused body or
 ///   accepted cache evidence; a generation or replay claim alone is saved
 ///   before any upload, so it is not evidence); a quarantined (`.corrupt.`)
-///   sibling of this index; or the re-emission seen-marker.
+///   sibling of this index; or the re-emission seen-marker. Also, when the
+///   history is not `Moved`, an unscoped pre-scoping `claude_code-scan-index*`
+///   beside `destinations/` (SOURCE h732 C3): it names no destination, so it
+///   is not a move, but this Mac did index history, so a cutoff keeps that
+///   history owed, list-gated and paced instead of resent ungated.
 /// - `Moved`: only a Claude bootstrap completed for another destination or
 ///   recorded by a legacy state, or a Claude index, ledger or quarantined
-///   copy another destination or a legacy layout left in the support
-///   directory (an interrupted bootstrap before a re-pair); unless a claim
+///   copy another destination's directory holds (an interrupted bootstrap
+///   before a re-pair). A leftover is another destination only when it sits
+///   under a different namespace (I-r3-1); unless a claim
 ///   recorded a different-user cutoff, which keeps that history excluded by
 ///   the cutoff, as before.
 ///
@@ -410,6 +429,10 @@ fn claude_prior_history(
             Err(error) => error.kind() != std::io::ErrorKind::NotFound,
         }
     };
+    // Only a different namespace's directory is another destination. An
+    // unscoped legacy `claude_code-scan-index*` beside `destinations/` names
+    // no destination; it is usually this Mac's own pre-scoping index, so it
+    // must not hold history as a move (I-r3-1). It is `Here` evidence below.
     let other_destination = || {
         let prefix = format!("{slug}-scan-index");
         let own = index_path.parent();
@@ -427,15 +450,13 @@ fn claude_prior_history(
                     Err(error) => error.kind() != std::io::ErrorKind::NotFound,
                 }
         };
-        let snapshots = support_dir.join("snapshots");
-        holds_claude_state(&snapshots)
-            || match std::fs::read_dir(snapshots.join("destinations")) {
-                Ok(mut destinations) => destinations.any(|destination| match destination {
-                    Ok(destination) => holds_claude_state(&destination.path()),
-                    Err(_) => true,
-                }),
-                Err(error) => error.kind() != std::io::ErrorKind::NotFound,
-            }
+        match std::fs::read_dir(support_dir.join("snapshots").join("destinations")) {
+            Ok(mut destinations) => destinations.any(|destination| match destination {
+                Ok(destination) => holds_claude_state(&destination.path()),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
     };
     // Fails closed: only a positively missing marker is absent (h695 N2).
     let seen_marker = || match std::fs::symlink_metadata(
@@ -467,8 +488,25 @@ fn claude_prior_history(
         .contains_key(slug)
         || backfill_state.completed_parser_versions.contains_key(slug)
         || backfill_state.completed_replay_revisions.contains_key(slug);
+    // SOURCE h732 C3: a pre-scoping daemon's unscoped index. An unreadable
+    // directory fails closed; a missing one is empty.
+    let unscoped_legacy_index = || {
+        let prefix = format!("{slug}-scan-index");
+        match std::fs::read_dir(support_dir.join("snapshots")) {
+            Ok(mut entries) => entries.any(|entry| match entry {
+                Ok(entry) => entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with(&prefix)),
+                Err(_) => true,
+            }),
+            Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+        }
+    };
     if !other_user_cutoff && (earlier_bootstrap || other_destination()) {
         PriorHistory::Moved
+    } else if unscoped_legacy_index() {
+        PriorHistory::Here
     } else {
         PriorHistory::None
     }
@@ -553,13 +591,14 @@ fn exclude_held_effective_body_witness_revision(
 /// Commit a `Completed` upload that left local holds. Every uploaded entity was
 /// accepted or unchanged; only the held revisions are unsettled.
 ///
-/// A hold that the same traversal could still change (`progress_blocking`,
-/// which includes any RetryPending authority family) keeps the conservative
-/// partial commit and marks the sweep unsettled, so the generation needs one
-/// clean follow-up. Otherwise every hold is non-progressing: held keys keep
-/// their committed revision, every other key commits as the no-hold save
-/// would, and the traversal may settle. The caller keeps backfill and replay
-/// completion pending, and the durable hold disclosure keeps health red.
+/// A hold that owes a clean follow-up (`progress_blocking`) keeps the
+/// conservative partial commit and marks the sweep unsettled, so the
+/// generation needs one clean follow-up. Otherwise every hold is
+/// non-progressing (account deferrals and bound authority holds, including
+/// bound RetryPending families under the path-(a) bridge): held keys keep their
+/// committed revision, every other key commits as the no-hold save would, and
+/// the traversal may settle. The caller keeps backfill and replay completion
+/// pending, and the durable hold disclosure keeps health red.
 ///
 /// A non-progressing hold in a Claude family that retains authority evidence
 /// but has no committed entry to restore, as after a historical replay reset,
@@ -603,7 +642,9 @@ fn commit_completed_with_local_holds(
 struct LocalHoldSettlement {
     /// Sessions held locally on this page.
     held_entity_count: usize,
-    /// RetryPending Claude authority families anywhere in the index.
+    /// RetryPending Claude authority families anywhere in the index. They keep
+    /// full completion (backfill, replay) pending, but since the path-(a)
+    /// bridge they no longer make an unrelated page progress-blocking.
     retry_pending_family_count: usize,
     held_fingerprints: BTreeSet<String>,
     account_deferred_fingerprints: BTreeSet<String>,
@@ -648,13 +689,17 @@ impl LocalHoldSettlement {
             retry_pending_family_count,
             held_fingerprints,
             account_deferred_fingerprints,
-            progress_blocking: retry_pending_family_count > 0
-                || !progress_blocking_held_fingerprints.is_empty(),
+            progress_blocking: !progress_blocking_held_fingerprints.is_empty(),
         }
     }
 
     fn any(&self) -> bool {
         self.retry_pending_family_count > 0 || self.held_entity_count > 0
+    }
+
+    /// Whether this page itself held any entity.
+    fn page_held(&self) -> bool {
+        self.held_entity_count > 0
     }
 }
 
@@ -679,8 +724,10 @@ fn settle_completed_upload(
     upload_progress: &SnapshotUploadProgress,
     holds: &LocalHoldSettlement,
 ) -> UploadIndexSettlement {
-    if !holds.any() {
-        let fully_settled = upload_settled_without_account_holds(&index, true);
+    if !holds.page_held() {
+        // RetryPending debt elsewhere settles this page as a no-hold page
+        // would, and only keeps full completion pending.
+        let fully_settled = upload_settled_without_account_holds(&index, !holds.any());
         return UploadIndexSettlement {
             index,
             fully_settled,
@@ -715,9 +762,10 @@ static CHECKPOINTED_PAGES_SETTLED_WITH_TERMINAL_BOUND_HOLDS: std::sync::atomic::
 /// entities keep replay pending and owe a clean follow-up. A validated
 /// permanent refusal settles transport and traversal; its separate health
 /// still discloses the rejected usage. Its holds settle exactly as on a
-/// `Completed` page: when every hold is non-progressing (no RetryPending
-/// family anywhere) and restorable, held keys keep their committed revision
-/// and the traversal may settle; backfill and replay stay pending.
+/// `Completed` page: when every hold on this page is non-progressing and
+/// restorable, held keys keep their committed revision and the traversal may
+/// settle; backfill and replay stay pending. A RetryPending family elsewhere
+/// keeps only full completion pending (path-(a) bridge).
 fn settle_checkpointed_upload(
     index: ScanIndex,
     committed_index: &ScanIndex,
@@ -726,7 +774,7 @@ fn settle_checkpointed_upload(
     resolved_permanent_rejections: bool,
 ) -> UploadIndexSettlement {
     let terminal_bound_holds = resolved_permanent_rejections
-        && holds.any()
+        && holds.page_held()
         && !holds.progress_blocking
         && index.locally_held_keys_restorable(
             committed_index,
@@ -741,7 +789,7 @@ fn settle_checkpointed_upload(
             &holds.held_fingerprints,
             &holds.account_deferred_fingerprints,
         )
-    } else if holds.any() {
+    } else if holds.page_held() {
         let mut accepted_fingerprints = upload_progress.accepted_fingerprints.clone();
         accepted_fingerprints.retain(|fingerprint| !holds.held_fingerprints.contains(fingerprint));
         let mut server_quarantine = upload_progress.quarantined_fingerprints.clone();
@@ -750,7 +798,7 @@ fn settle_checkpointed_upload(
     } else {
         index
     };
-    let settled = resolved_permanent_rejections && (!holds.any() || terminal_bound_holds);
+    let settled = resolved_permanent_rejections && (!holds.page_held() || terminal_bound_holds);
     if !settled {
         index.mark_bounded_sweep_unsettled_by(if resolved_permanent_rejections {
             UnsettledUploadCause::RejectedWithHolds
@@ -1454,7 +1502,7 @@ impl SnapshotUploadProgress {
             return false;
         }
         let current = index
-            .current_snapshot_fingerprint_refs()
+            .eligible_snapshot_fingerprint_refs()
             .collect::<BTreeSet<_>>();
         let latest = reason_reoffer::latest_valid_deadline(scope.now);
         let counts = &mut self.reason_reoffer_counts;
@@ -1519,6 +1567,49 @@ impl SnapshotUploadProgress {
             );
         }
         changed
+    }
+
+    /// Runtime-only exact-body cooldown view (fingerprint -> refused body
+    /// witness) of this prepared cycle: a retained exact-body RetryPending
+    /// conflict whose refusal holds a validated daily re-offer reservation
+    /// and no lease this cycle. Without that lease the exact body cannot be
+    /// sent, so its ordinary retry timer alone must not re-read an unchanged
+    /// file. Due records waiting for budget stay in the view. Missing,
+    /// malformed or classified extensions grant nothing. Bounded by the
+    /// refusal ledger; the reservation remains the sole durable schedule.
+    fn reason_reoffer_cooldowns(&self, now: u64) -> BTreeMap<String, String> {
+        use reason_reoffer::RefusalReoffer;
+        let latest = reason_reoffer::latest_valid_deadline(now);
+        self.permanent_rejections
+            .iter()
+            .filter(|(fingerprint, refusal)| {
+                refusal.reason == crate::upload_receipts::RejectedUsageReason::Other
+                    && matches!(
+                        refusal.reoffer,
+                        Some(
+                            RefusalReoffer::OriginalPair { .. }
+                                | RefusalReoffer::LegacyOther { .. }
+                        )
+                    )
+                    && refusal
+                        .reoffer
+                        .and_then(RefusalReoffer::retry_after)
+                        .is_some_and(|retry_after| retry_after <= latest)
+                    && !self.active_reason_reoffers.contains_key(*fingerprint)
+                    && !self.active_quarantine_retries.contains(*fingerprint)
+                    && !self.accepted_fingerprints.contains(*fingerprint)
+                    && self
+                        .quarantined_fingerprints
+                        .get(*fingerprint)
+                        .is_some_and(|record| {
+                            record.disposition == SnapshotQuarantineDisposition::RetryPending
+                                && self.active_quarantine_witness.as_ref() == Some(&record.witness)
+                                && record.upload_body_witness.as_deref()
+                                    == Some(refusal.body_witness.as_str())
+                        })
+            })
+            .map(|(fingerprint, refusal)| (fingerprint.clone(), refusal.body_witness.clone()))
+            .collect()
     }
 
     /// Reserve the next logical offer before any scan or upload can use it.
@@ -2086,7 +2177,9 @@ impl SnapshotUploadProgress {
         let indexed = index
             .files
             .keys()
-            .map(|key| cache_head_index_key(key))
+            .map(String::as_str)
+            .chain(index.decode_held_file_keys())
+            .map(cache_head_index_key)
             .collect::<BTreeSet<_>>();
         let before = self.pending_cache_heads.len();
         self.pending_cache_heads
@@ -2257,10 +2350,20 @@ impl SnapshotUploadProgress {
                     .map(|file| ((file.clone(), item.snapshot_fingerprint.clone()), item))
             })
             .collect::<BTreeMap<_, _>>();
+        let opaque_files = index
+            .decode_held_file_keys()
+            .map(cache_head_index_key)
+            .collect::<BTreeSet<_>>();
         self.pending_cache_heads.retain(|file, pending| {
+            if opaque_files.contains(file) {
+                return true;
+            }
             let Some((index_key, entry)) = current_files.get(file) else {
                 return !census_complete;
             };
+            if index.decode_holds_file(index_key) {
+                return true;
+            }
             // Neither held absence nor a changed aggregate alone certifies
             // enrichment. Rebinding comes from the current admitted raw item.
             if entry.source_file_fingerprint != pending.source_file_fingerprint
@@ -2298,9 +2401,12 @@ impl SnapshotUploadProgress {
                 .get(*index_key)
                 .is_some_and(|entities| {
                     entities.iter().all(|entity| {
-                        pending.settled_entities.contains(entity)
-                            || (self.accepted_fingerprints.contains(entity)
-                                && !index.quarantined_snapshot_fingerprints.contains_key(entity))
+                        !index.decode_holds_entity(entity)
+                            && (pending.settled_entities.contains(entity)
+                                || (self.accepted_fingerprints.contains(entity)
+                                    && !index
+                                        .quarantined_snapshot_fingerprints
+                                        .contains_key(entity)))
                     })
                 });
             !(all_siblings_settled
@@ -2564,6 +2670,27 @@ fn save_index_and_publish_manifest(
         );
     }
     Ok(())
+}
+
+// Exercise the real durable-save/publication boundary from decoder rescans.
+#[cfg(test)]
+pub(crate) fn decode_hold_manifest_published_for_test(
+    index: &mut ScanIndex,
+    path: &Path,
+    source: SnapshotSource,
+    complete: bool,
+) -> Result<bool> {
+    let namespace = "lenient-decode-rescan";
+    save_index_and_publish_manifest(
+        index,
+        path,
+        namespace,
+        source,
+        complete,
+        "2026-01-01T00:00:00Z",
+        "2026-10-22T00:00:00Z",
+    )?;
+    Ok(cached_source_manifest(namespace, source).is_some())
 }
 
 // Test-only empty-ACK/shed boundary; invokes the real locked partial save.
@@ -3176,6 +3303,7 @@ struct SyncCounts {
     ownership_incomplete_file_count: u64,
     snapshot_unproven_terminal_count: u64,
     snapshot_superseded_terminal_count: u64,
+    cooldown_conflict_deferred: usize,
     zero_snapshot_confirmed_count: u64,
     zero_snapshot_usage_evidence_count: u64,
     dropped_usage_record_count: u64,
@@ -3343,6 +3471,7 @@ impl SyncCounts {
             ownership_incomplete_file_count: scan_result.ownership_incomplete_file_count as u64,
             snapshot_unproven_terminal_count: 0,
             snapshot_superseded_terminal_count: 0,
+            cooldown_conflict_deferred: 0,
             zero_snapshot_confirmed_count: scan_result.zero_snapshot_confirmed_count as u64,
             zero_snapshot_usage_evidence_count: scan_result.zero_snapshot_usage_evidence_count
                 as u64,
@@ -3366,6 +3495,24 @@ impl SyncCounts {
         }
     }
 
+    fn terminal_census_line(&self, source: &str) -> String {
+        format!(
+            "snapshot terminal_census source={source} census_complete={} scanned_files={} \
+             uploaded={} unproven_terminal={} superseded_terminal={} \
+             ownership_incomplete_files={} zero_snapshot_usage_evidence_files={} \
+             dropped_usage_records={} cooldown_conflict_deferred={}",
+            self.census_complete,
+            self.scanned_file_count,
+            self.uploaded_count,
+            self.snapshot_unproven_terminal_count,
+            self.snapshot_superseded_terminal_count,
+            self.ownership_incomplete_file_count,
+            self.zero_snapshot_usage_evidence_count,
+            self.dropped_usage_record_count,
+            self.cooldown_conflict_deferred,
+        )
+    }
+
     fn with_snapshot_terminal_counts(mut self, index: &ScanIndex) -> Self {
         if let Some((held, refused, live, protected)) = index.request_owned_menu_projection() {
             if let Ok(mut status) = REQUEST_MONEY_MENU.lock() {
@@ -3386,6 +3533,7 @@ impl SyncCounts {
                 });
             }
         }
+        self.cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
         self.snapshot_unproven_terminal_count = index.snapshot_unproven_terminal_count() as u64;
         self.snapshot_superseded_terminal_count = index.snapshot_superseded_terminal_count() as u64;
         // Mirror #389's disclosed-loss convention: terminal unproven entities
@@ -4392,6 +4540,11 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         peak_context_fill_tokens: item.peak_context_fill_tokens,
         first_turn_context_tokens: item.first_turn_context_tokens,
         last_turn_context_tokens: item.last_turn_context_tokens,
+        // Copied, never dropped: a retry that lost the windows would settle as
+        // UNCHANGED (they are outside every hash) and never deliver them.
+        first_turn_context_window_tokens: item.first_turn_context_window_tokens,
+        peak_context_fill_window_tokens: item.peak_context_fill_window_tokens,
+        last_turn_context_window_tokens: item.last_turn_context_window_tokens,
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
         compaction_events: item.compaction_events.clone(),
@@ -5800,8 +5953,7 @@ fn prepare_sync_source(
     });
     // Absent, quarantined or undecodable: every file would come back new. The
     // load origin decides it (StateMissing M3); an empty saved index counts too.
-    let claude_index_loaded_fresh = load_origin != crate::snapshots::ScanIndexLoadOrigin::Loaded
-        || (index.generation == 0 && index.files.is_empty());
+    let claude_index_loaded_fresh = load_origin.is_fresh(&index);
     if index_path.exists()
         && upload_progress.prune_pending_cache_head_orphans_from_loaded_index(&index)
     {
@@ -5851,6 +6003,11 @@ fn prepare_sync_source(
             support_dir,
         )
     });
+    if let Some(prior) = prior_claude_history {
+        crate::snapshots::note_prior_history_unverified(
+            prior == crate::snapshots::PriorHistory::Unverified,
+        );
+    }
     let replay = current_historical_replay(source);
     let replay_generation = if context_curve_enabled {
         let curve_derivation_revision = context_curve_derivation_revision(source)
@@ -5990,6 +6147,12 @@ fn prepare_sync_source(
     let committed_index = index.clone();
     let reoffer_paths =
         index.activate_reason_reoffer_retries(upload_progress.active_reason_reoffers.clone());
+    // A replay re-reads everything and neither re-offers nor defers.
+    index.activate_reason_reoffer_cooldowns(if historical_replay_pending {
+        BTreeMap::new()
+    } else {
+        upload_progress.reason_reoffer_cooldowns(reoffer_now)
+    });
     upload_progress.reselect_pending_cache_heads(&mut index, cache_observations_enabled);
     let mut watcher_hints = crate::snapshot_watcher::take_pending_snapshot_paths(source);
     // Leased unchanged files join the same bounded, revalidated hint queue.
@@ -6454,11 +6617,15 @@ async fn finish_sync_source_resume(
                 return Err(reason.into());
             }
         };
+        #[cfg(test)]
+        tests::permanent_finish_pipeline_tests::reason_reoffer_pipeline_tests::record_evidence_stats(&stats);
         if let Ok(counts) = serde_json::to_string(&stats) {
             eprintln!(
-                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} counts={counts}",
+                "local snapshot sync: claude local evidence duration_ms={} cache_creation_rejected_interpretations_total={} full_rearm_suppressed={} full_rearm_skipped_invalid_unchanged={} counts={counts}",
                 evidence_started.elapsed().as_millis(),
-                crate::snapshots::claude_api_cache_creation_rejection_count()
+                crate::snapshots::claude_api_cache_creation_rejection_count(),
+                stats.full_rearm_suppression.full_rearm_suppressed,
+                stats.full_rearm_suppression.full_rearm_skipped_invalid_unchanged
             );
         }
         if let Ok(counts) = serde_json::to_string(&stats.context_file_birth) {
@@ -6920,6 +7087,9 @@ async fn finish_sync_source_resume(
         // obligation survives until both cache settlement and index save.
         upload_progress.save(&upload_progress_path)?;
     }
+    upload_progress
+        .reason_reoffer_counts
+        .cooldown_conflict_deferred = index.reason_reoffer_cooldown_deferred_count();
     // One logical offer per leased refusal: its next deadline is at least
     // this first transmission + 24 h, and durable before it. A failed save
     // sends nothing.
@@ -7253,6 +7423,7 @@ async fn finish_sync_source_resume(
                     with_bootstrap_deferred(result, bootstrap_deferred),
                     &index,
                     &upload_progress,
+                    reason_reoffer::now_unix_seconds(),
                 )
             })
         };
@@ -8428,6 +8599,12 @@ pub struct ClaudeLocalEvidenceStats {
     pub own_request_unknown_root_count: usize,
     pub duplicate_census: crate::snapshots::ClaudeDuplicateCensusCounts,
     pub first_proof_hold: crate::snapshots::ClaudeFirstProofHoldCounts,
+    /// RetryPending families whose returning root retains a retirement
+    /// tombstone, separate from all other RetryPending causes. Local only.
+    pub returning_family_grown_held: usize,
+    /// Fix 1's skipped full re-arms; absent from the line while empty.
+    #[serde(skip_serializing_if = "crate::snapshots::ClaudeFullRearmSuppressionCounts::is_empty")]
+    pub full_rearm_suppression: crate::snapshots::ClaudeFullRearmSuppressionCounts,
     /// How this pass's Claude context scalars were decided (proof or file
     /// birth rule) and why any were withheld. Local only, never uploaded.
     /// Logged on its own line; kept out of this struct's serialized form so
@@ -8955,6 +9132,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         ..Default::default()
     };
     let mut api_read = crate::claude_local_otel::ClaudeApiEvidenceRead::default();
+    let mut full_rearm_evidence_complete = true;
     let api_load = match prepared.as_mut() {
         Some(read) => read.take_api_for_sessions(support_dir, &session_ids),
         None => crate::claude_local_otel::ClaudeApiEvidenceRead::load(support_dir, session_ids),
@@ -8971,7 +9149,10 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             );
             api_read = evidence;
         }
-        Err(_) => stats.effort_evidence_load_failed = true,
+        Err(_) => {
+            stats.effort_evidence_load_failed = true;
+            full_rearm_evidence_complete = false;
+        }
     }
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
@@ -8995,11 +9176,12 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
                 )
                 .is_empty();
             // Contract 5 must tell absent evidence from failed evidence.
-            if !paired
-                && emission_permitted
-                && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
+            if !paired && !crate::claude_local_otel::claude_sidecars_absent(support_dir, session_id)
             {
-                identity_unhealthy_roots.insert(session_id.clone());
+                full_rearm_evidence_complete = false;
+                if emission_permitted {
+                    identity_unhealthy_roots.insert(session_id.clone());
+                }
             }
             paired
         })
@@ -9046,6 +9228,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             stats.trace_incomplete_root_count += 1;
         }
         if !api.health.is_complete() || !trace.is_complete() {
+            full_rearm_evidence_complete = false;
             if let Some(rows) = api.evidence.remove(&root_session_id) {
                 veto_api_rows.insert(root_session_id.clone(), rows);
             }
@@ -9073,6 +9256,7 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             stats.exact_request_set_root_count += 1;
         } else {
             stats.request_set_mismatch_root_count += 1;
+            full_rearm_evidence_complete = false;
             stats.api_only_request_count += api_request_ids.difference(&trace_request_ids).count();
             stats.trace_only_request_count +=
                 trace_request_ids.difference(&api_request_ids).count();
@@ -9115,6 +9299,9 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     } else {
         Vec::new()
     };
+    if !full_rearm_evidence_complete {
+        index.note_claude_full_rearm_evidence_gap(&scan_result.census_window_end);
+    }
     let mut disposition = crate::snapshots::apply_claude_reported_usage_to_scan_with_comparison(
         scan_result,
         &api_report,
@@ -9312,8 +9499,10 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
         })
         .count();
     stats.duplicate_census = disposition.duplicate_census;
+    stats.full_rearm_suppression = disposition.full_rearm_suppression;
     stats.context_file_birth = disposition.context_file_birth.clone();
     let census_withheld = index.account_claude_usage_authority_census_health(scan_result);
+    stats.returning_family_grown_held = index.claude_returning_family_grown_held_count();
     stats.first_proof_hold = crate::snapshots::ClaudeFirstProofHoldCounts {
         census_withheld_retry_pending_family_count: if request_owned_live {
             index.request_money_v1_pending_count()
@@ -9325,10 +9514,12 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
     if census_withheld {
         // These revisions were fully readable, but uploading them would demote
         // a previously proven usage authority. Keep the census non-terminal
-        // until a complete family pass reconstructs the exact witness.
+        // until a complete family pass reconstructs the exact witness. The
+        // debt alone does not mark the sweep unsettled (path-(a) bridge): each
+        // held revision settles or blocks on its own page, and full completion
+        // stays pending while any RetryPending family remains.
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
-        index.mark_bounded_sweep_unsettled_by(UnsettledUploadCause::AuthorityCensusWithheld);
     }
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
@@ -9341,6 +9532,11 @@ async fn try_apply_claude_local_evidence_to_scan_resume(
             &api_report,
             &trace_report,
             scan_result.census_complete,
+            &crate::snapshots::claude_request_money::coverage::InterimFamilyCoverage {
+                census_complete: scan_result.census_complete,
+                fence_invalid: disposition.duplicate_census.census_invalid,
+                authority_retry: index.claude_usage_authority_pending_count() > 0,
+            },
         );
     }
     Ok((disposition, census_withheld, stats))
@@ -10989,6 +11185,9 @@ fn report_status_with_fresh_relay_token(
         receipt_window_days,
         manifest_source,
     )?;
+    // Keep non-blocking cooldown debt beside the terminal census counters on
+    // every report, even when the re-offer work summary is unchanged/quiet.
+    eprintln!("{}", status.counts.terminal_census_line(source.api_slug()));
     let diagnostic = status.counts.local_codex_diagnostics;
     let request = collector_status_request(
         &destination_namespace,
@@ -12721,6 +12920,49 @@ mod tests {
             "due retry also survives actual finalizer no-op selection"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn opaque_file_decode_hold_keeps_pending_cache_head_custody() {
+        let root = cache_effective_wire_fixture_root();
+        let mut index = ScanIndex::default();
+        let mut result = crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::Codex,
+            std::slice::from_ref(&root),
+            &mut index,
+            "2026-09-30T10:05:00Z",
+            crate::snapshots::BACKFILL_WINDOW_DAYS,
+            MAX_BACKFILL_FILES_PER_SOURCE,
+            true,
+        )
+        .unwrap();
+        finalize_scan_after_policy(SnapshotSource::Codex, &mut result, &mut index);
+        let item = result.snapshots.remove(0);
+        let mut progress = test_upload_progress();
+        progress
+            .record_pending_cache_head(&item, &cache_head_file_groups(&index), true)
+            .unwrap();
+        let path = root.join("index.json");
+        index.save(&path).unwrap();
+        let key = index.files.keys().next().unwrap().clone();
+        let mut value = serde_json::to_value(&index).unwrap();
+        value["files"][&key]["size_bytes"] = serde_json::json!([]);
+        value["unknown_padding"] = serde_json::json!("p".repeat(8192));
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let loaded = ScanIndex::load(&path).unwrap();
+        assert_eq!(
+            loaded.decode_held_file_keys().collect::<Vec<_>>(),
+            vec![key.as_str()]
+        );
+        assert!(!progress.prune_pending_cache_head_orphans_from_loaded_index(&loaded));
+        assert_eq!(progress.pending_cache_heads.len(), 1);
+        progress.retire_pending_cache_heads(&loaded, &[], &BTreeSet::new(), true, &BTreeMap::new());
+        assert_eq!(
+            progress.pending_cache_heads.len(),
+            1,
+            "opaque absence cannot settle a cache-head obligation"
+        );
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -19597,6 +19839,21 @@ mod tests {
     ) -> SyncCounts {
         let root = test_dir(fixture_name);
         std::fs::create_dir_all(&root).expect("create empty Claude scan root");
+        // A RetryPending family is present on disk: a raw-complete census
+        // retires a wholly absent one (path-(a) bridge), so its debt would
+        // no longer withhold anything.
+        for (family_index, (disposition, _)) in dispositions.iter().enumerate() {
+            if *disposition == "retry_pending" {
+                let session = format!("root-{family_index}");
+                std::fs::write(
+                    root.join(format!("{session}.jsonl")),
+                    format!(
+                        "{{\"timestamp\":\"2026-06-01T09:00:00Z\",\"type\":\"assistant\",\"sessionId\":\"{session}\",\"requestId\":\"req_{session}\",\"message\":{{\"model\":\"claude-haiku-4-5\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":10}}}}}}\n"
+                    ),
+                )
+                .expect("write the held family's present member");
+            }
+        }
         let mut index = claude_usage_authority_index(dispositions);
         let mut scan = crate::snapshots::scan_source_roots(
             SnapshotSource::ClaudeCode,
@@ -19933,6 +20190,54 @@ mod tests {
                 .as_deref(),
             Some("held-old")
         );
+    }
+
+    /// Path-(a) bridge: RetryPending debt elsewhere settles a page without
+    /// local holds as no debt would and keeps only full completion pending; a
+    /// second cause beside the debt (a retryable server conflict) still marks
+    /// the sweep.
+    #[test]
+    fn retry_pending_debt_elsewhere_marks_the_sweep_only_with_a_second_cause() {
+        let committed = claude_index_with(serde_json::json!({}));
+        let debt_only = LocalHoldSettlement {
+            held_entity_count: 0,
+            retry_pending_family_count: 1,
+            held_fingerprints: BTreeSet::new(),
+            account_deferred_fingerprints: BTreeSet::new(),
+            progress_blocking: false,
+        };
+        let progress = test_upload_progress();
+        let completed =
+            settle_completed_upload(committed.clone(), &committed, &progress, &debt_only);
+        assert!(!completed.index.bounded_sweep_had_unsettled_upload());
+        assert!(completed
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        assert!(
+            !completed.fully_settled,
+            "the debt keeps completion pending"
+        );
+        let rejected =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, true);
+        assert!(!rejected.index.bounded_sweep_had_unsettled_upload());
+        assert!(rejected
+            .index
+            .bounded_sweep_unsettled_cause_names()
+            .is_empty());
+        assert!(!rejected.fully_settled);
+        let deferred =
+            settle_checkpointed_upload(committed.clone(), &committed, &progress, &debt_only, false);
+        assert!(
+            deferred.index.bounded_sweep_had_unsettled_upload(),
+            "a retryable server conflict beside the debt still marks the sweep"
+        );
+        assert_eq!(
+            deferred.index.bounded_sweep_unsettled_cause_names(),
+            ["deferred_conflict"],
+            "the second cause names itself; the debt names nothing"
+        );
+        assert!(!deferred.fully_settled);
     }
 
     /// Diagnostics only: every settlement path that marks the sweep unsettled

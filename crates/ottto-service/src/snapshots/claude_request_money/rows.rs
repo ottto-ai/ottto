@@ -21,6 +21,7 @@ use crate::claude_local_otel::telemetry_tail::event_unix;
 use crate::claude_local_otel::ClaudeLocalOtelEvidence;
 use std::cmp::Ordering;
 use std::sync::Arc;
+use std::time::Instant;
 
 /// The style strings of the unreadable marker (never a real style).
 const UNREADABLE: (&str, &str, &str) = ("\u{1f}unreadable", "", "");
@@ -165,14 +166,21 @@ pub(crate) fn rows_bound(rows: usize) -> usize {
 impl ClaudeRootRows {
     /// The live load's rows of `root`: None when any is refused or
     /// unreadable (strict like the live reducer), with the refused count.
-    pub(crate) fn from_live(rows: &[ClaudeLocalOtelEvidence], root: &str) -> (Option<Self>, u64) {
+    pub(crate) fn from_live(
+        rows: &[ClaudeLocalOtelEvidence],
+        root: &str,
+        deadline: Instant,
+    ) -> (Option<Self>, u64) {
         let mut header = ClaudeFactsHeader {
             session: root.to_owned(),
             ..ClaudeFactsHeader::default()
         };
         let mut facts = Vec::with_capacity(rows.len());
         let mut refused = 0_u64;
-        for row in rows {
+        for (at, row) in rows.iter().enumerate() {
+            if at % 1024 == 0 && Instant::now() >= deadline {
+                return (None, 0);
+            }
             match row_fact(row, root, &mut header) {
                 Some((_, fact)) if fact.style == UNREADABLE_STYLE => refused += 1,
                 Some(fact) => facts.push(fact),
@@ -196,8 +204,17 @@ impl ClaudeRootRows {
     /// The rows a telemetry record's facts hold, sharing its hash buffer.
     /// None unless the record is complete and every row readable (not
     /// retired, not over budget, no refused line).
+    #[cfg(test)]
     pub(crate) fn from_record<'a>(
         record: impl Into<super::custody::RecordRef<'a>>,
+    ) -> Option<Self> {
+        let record = record.into();
+        Self::from_record_by(record, Instant::now() + std::time::Duration::from_secs(30))
+    }
+
+    pub(crate) fn from_record_by<'a>(
+        record: impl Into<super::custody::RecordRef<'a>>,
+        deadline: Instant,
     ) -> Option<Self> {
         let record = record.into();
         if record.retired().is_some() || record.over_budget() {
@@ -209,7 +226,10 @@ impl ClaudeRootRows {
         }
         let count = record.request_hashes().len();
         let mut decoded = Vec::with_capacity(count);
-        for _ in 0..count {
+        for at in 0..count {
+            if at % 1024 == 0 && Instant::now() >= deadline {
+                return None;
+            }
             let fact = facts.next_fact()?;
             if fact.style == UNREADABLE_STYLE {
                 return None;

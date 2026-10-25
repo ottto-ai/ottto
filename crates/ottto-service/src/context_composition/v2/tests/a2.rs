@@ -52,8 +52,8 @@ fn full_budget() -> AuditRun {
     AuditRun::with_budget(AUDIT_BYTES_PER_DAY, BTreeMap::new())
 }
 
-/// A file read whole by the install run (live at install), then appended
-/// and read forward: eligible for the audit.
+/// A file created after the install, so its first run reads it whole as
+/// new bytes; appended and read forward, it is eligible for the audit.
 fn whole_file(env: &Env, name: &str, now: OffsetDateTime) -> PathBuf {
     let cwd = env.cwd();
     let path = env.root.join(format!("p/{name}.jsonl"));
@@ -68,7 +68,11 @@ fn audit_rereads_a_whole_file_and_keeps_matching_numbers() {
     let now = base_now();
     let path = whole_file(&env, "a", now);
     let first = env.run(Source::Claude, now, None);
-    assert!(first.bytes_repair > 0, "read whole at install");
+    assert_eq!(
+        (first.bytes_new, first.bytes_repair),
+        (fs::metadata(&path).unwrap().len(), 0),
+        "read whole as new bytes"
+    );
     append_records(&path, &claude_turn(&env.cwd(), now.date(), 2));
     let second = env.run(Source::Claude, now + time::Duration::hours(1), None);
     assert!(second.bytes_new > 0);
@@ -235,7 +239,7 @@ fn audit_stays_within_budget_and_rotates_through_every_file() {
 
 #[test]
 fn audit_never_samples_files_counted_from_the_middle_or_changed() {
-    let env = Env::new("composition-a2-audit-eligible");
+    let env = Env::uninstalled("composition-a2-audit-eligible");
     let now = base_now();
     let cwd = env.cwd();
     // Old at install: counting starts at its end, so it is never sampled.
@@ -248,6 +252,7 @@ fn audit_never_samples_files_counted_from_the_middle_or_changed() {
         .unwrap()
         .set_modified(old_time)
         .unwrap();
+    env.run(Source::Claude, now - time::Duration::days(1), None);
     let live = whole_file(&env, "live", now);
     env.run(Source::Claude, now, None);
     append_records(&old, &claude_turn(&cwd, now.date(), 2));
@@ -587,10 +592,12 @@ fn health_carries_worker_counters_even_for_a_killed_run() {
 
 #[test]
 fn run_counts_waiting_full_reads_and_backlog_growth() {
-    let env = Env::new("composition-a2-backlog");
+    let env = Env::uninstalled("composition-a2-backlog");
     let now = base_now();
     let path = whole_file(&env, "a", now);
-    // No repair budget at install: the live file waits for its full read.
+    env.run(Source::Claude, now - time::Duration::days(1), None);
+    earlier_build_install_backlog(&env, Source::Claude, &[&path]);
+    // No repair budget: the earlier build's backlog waits for its full read.
     let stats = env.run_with(Source::Claude, now, None, 0, &mut FolderResolver::default());
     assert_eq!(stats.full_read_waiting_files, 1);
     assert_eq!(
@@ -820,9 +827,11 @@ fn health_for_another_destination_is_dropped_unsent() {
 
 #[test]
 fn backlog_counts_a_waiting_file_at_its_current_size() {
-    let env = Env::new("composition-a2-backlog-growth");
+    let env = Env::uninstalled("composition-a2-backlog-growth");
     let now = base_now();
     let path = whole_file(&env, "a", now);
+    env.run(Source::Claude, now - time::Duration::days(1), None);
+    earlier_build_install_backlog(&env, Source::Claude, &[&path]);
     let run = |hours: i64| {
         env.run_with(
             Source::Claude,
@@ -1163,8 +1172,9 @@ fn run_health_token_caps_an_oversized_response_without_retry() {
         while Instant::now() < until {
             if let Ok((mut socket, _)) = listener.accept() {
                 seen += 1;
-                // Darwin inherits the listener's nonblocking mode. The cap
-                // fixture must wait for the request under its existing timeout.
+                // macOS may inherit O_NONBLOCK from the listener. The
+                // request can arrive after accept; honor the read timeout
+                // rather than racing that arrival with WouldBlock.
                 socket.set_nonblocking(false).unwrap();
                 socket
                     .set_read_timeout(Some(Duration::from_secs(1)))

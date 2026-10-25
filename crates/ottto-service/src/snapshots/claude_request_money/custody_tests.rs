@@ -85,6 +85,7 @@ pub(in crate::snapshots) fn admit_m4(ledger: &mut ClaudeLedger, index: &ScanInde
                     [5; 32],
                     now,
                     ClaudeFamilyMemo {
+                        published: None,
                         removed_requests: 2,
                         removed_tokens: 3,
                         snapshot: 1,
@@ -223,6 +224,7 @@ fn captured_epoch_does_not_acknowledge_a_later_field_mutation() {
             [3; 32],
             30,
             ClaudeFamilyMemo {
+                published: None,
                 removed_requests: 1,
                 removed_tokens: 2,
                 snapshot: 3,
@@ -342,6 +344,7 @@ fn alias_promotion_copies_then_retires_only_after_its_receipt() {
             [4; 32],
             100,
             ClaudeFamilyMemo {
+                published: None,
                 removed_requests: 1,
                 removed_tokens: 2,
                 snapshot: 3,
@@ -660,6 +663,7 @@ fn recovery_requires_a_verified_current_rebuild_of_unchanged_files() {
 
 #[test]
 fn packed_history_accounting_is_exact_and_duplicates_do_not_dirty() {
+    let scratch = crate::test_scratch::ScratchDir::new("custody-accounting-save");
     let mut ledger = ClaudeLedger::new_for_test();
     for number in 0..1000 {
         stored(
@@ -674,8 +678,7 @@ fn packed_history_accounting_is_exact_and_duplicates_do_not_dirty() {
             );
         }
     }
-    while ledger
-        .take_save(Instant::now() + Duration::from_secs(60))
+    while store::save_page_for_test(&scratch, &mut ledger, &mut store::WriterState::default())
         .is_some()
     {}
     assert_eq!(ledger.dirty_shards(), 0);
@@ -787,7 +790,9 @@ fn valid_recovery_restart_preserves_progress_and_does_not_resurrect_cleared_fiel
         "a valid restart does not rewrite all custody shards"
     );
     assert!(restarted
-        .take_save(Instant::now() + Duration::from_secs(60))
+        .take_save(store::policy_for_test(
+            Instant::now() + Duration::from_secs(60)
+        ))
         .is_none());
 }
 
@@ -972,7 +977,7 @@ fn recovery_takes_current_empty_parse_capture_without_a_snapshot_item() {
     // Stale captures and the confirmed-empty marker are insufficient.
     ClaudeResponseCapture::begin(&path)
         .unwrap()
-        .deposit(key.into(), "a".repeat(64));
+        .deposit(Path::new(key), &"a".repeat(64));
     page();
     store::with_ledger_for_test(&support, |ledger| {
         assert!(ledger.census().rebuild_needed(key));
@@ -990,7 +995,7 @@ fn recovery_takes_current_empty_parse_capture_without_a_snapshot_item() {
     // The same no-snapshot page must consume a current opened parse's capture.
     ClaudeResponseCapture::begin(&path)
         .unwrap()
-        .deposit(key.into(), "b".repeat(64));
+        .deposit(Path::new(key), &"b".repeat(64));
     page();
     store::with_ledger_for_test(&support, |ledger| {
         assert_eq!(

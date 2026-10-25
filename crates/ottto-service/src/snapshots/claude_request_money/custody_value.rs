@@ -108,6 +108,7 @@ impl Value {
                 requests: memo.removed_requests,
                 tokens: memo.removed_tokens,
                 snapshot: memo.snapshot,
+                published: memo.published,
                 ambiguous: false,
             }));
         }
@@ -261,6 +262,7 @@ impl<'a> RecordRef<'a> {
                     removed_requests: v.requests,
                     removed_tokens: v.tokens,
                     snapshot: v.snapshot,
+                    published: v.published,
                 },
             )),
             Kind::Evidence(v) => v.family_memo(),
@@ -310,6 +312,7 @@ impl<'a> RecordRef<'a> {
                                 removed_requests: value.requests,
                                 removed_tokens: value.tokens,
                                 snapshot: value.snapshot,
+                                published: value.published,
                             },
                         ))
                     && record.window() == value.observed
@@ -342,6 +345,7 @@ impl<'a> RecordRef<'a> {
                     removed_requests: value.requests,
                     removed_tokens: value.tokens,
                     snapshot: value.snapshot,
+                    published: value.published,
                 },
             ),
         }

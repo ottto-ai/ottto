@@ -10,6 +10,15 @@
 //! read-only recovery input. Missing, damaged or older custody requires a fresh
 //! verified traversal before literal offers; unknown history closes synthetic
 //! work. Only changed shards are rewritten, in bounded slices.
+//! Only changed shards are rewritten. Saves are coalesced (at most one per
+//! `SAVE_MIN_INTERVAL`, each at most `SAVE_BYTES_PER_PAGE`) and capped per
+//! UTC day at `SAVE_DAILY_BYTES` of attempted bytes (data shards, both metas
+//! and every retry), counted in `write-budget.json` before each physical
+//! attempt. Separate `save-budget.json` tickets pre-admit producer saves.
+//! Both survive restart and retain the maximum seen day. Past the cap, dirty state
+//! stays resident (within the ledger's bound) until the next day; a crash
+//! then loses only unsaved progress, which errs toward rereading and
+//! rewriting.
 //!
 //! Crash order (Sol R3-2), one rule: when the telemetry certificate went to
 //! zero, a meta whose certificates are all ZERO is written as its own write
@@ -45,9 +54,11 @@ use super::super::claude_request_census::{
     RECORD_RESIDENT_OVERHEAD_BYTES, SWEEP_KEY_PREFIX,
 };
 use super::custody::{Custody, CONTROL};
-use super::{ClaudeFamilyMemo, JsonlBatch, JsonlOutcome, ShadowReservation};
+use super::{
+    ClaudeFamilyMemo, ClaudeFamilyPublication, JsonlBatch, JsonlOutcome, ShadowReservation,
+};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -73,10 +84,21 @@ pub(crate) const LEDGER_MAX_RECORDS: usize = 65_536;
 pub(crate) const LEDGER_RESIDENT_BOUND_BYTES: usize = LEDGER_MAX_RECORDS
     * RECORD_RESIDENT_OVERHEAD_BYTES
     + 2 * MAX_CLAUDE_REQUEST_CENSUS_SERIALIZED_BYTES;
-/// Dirty shard bytes one page serializes. A shard larger than this is never
-/// one page's work: it stays dirty (counted) and no certificate is written
+/// Dirty shard bytes one save serializes. A shard larger than this is never
+/// one save's work: it stays dirty (counted) and no certificate is written
 /// over it; the load refuses a file larger than this as damage.
-const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
+pub(crate) const SAVE_BYTES_PER_PAGE: usize = 8 * 1024 * 1024;
+/// At most one save this often (plus the first of a process).
+pub(crate) const SAVE_MIN_INTERVAL: Duration = Duration::from_secs(30 * 60);
+/// Attempted save bytes per UTC day.
+pub(crate) const SAVE_DAILY_BYTES: usize = 64 * 1024 * 1024;
+/// The day's attempted save bytes, beside the shards.
+const SAVE_BUDGET_FILE: &str = "save-budget.json";
+/// Physical attempted shard writes, charged on the writer's UTC clock.
+const WRITE_BUDGET_FILE: &str = "write-budget.json";
+/// Ledger-owned identity/high-water metadata, independent of replaceable
+/// day counters. Fresh migration is allowed only before this durable witness.
+const QUOTA_WITNESS_FILE: &str = "ledger-identity.json";
 /// The load waits this long, in steps, for each shard's admission; then it
 /// gives up without losing custody; ordinary collection permits a later retry.
 const LOAD_ADMIT_ATTEMPTS: u32 = 100;
@@ -135,6 +157,43 @@ pub(crate) struct ClaudeLedger {
     live_refused: bool,
     pub(super) metadata_cursor: String,
     pub(super) metadata_checkpoint: bool,
+    /// Bounded housekeeping resumes after this family key.
+    pub(crate) family_cursor: String,
+    /// First deferred comparison on the next page (scheduling only).
+    pub(crate) deferred_compare_cursor: usize,
+    /// When this process last took a save (None: not yet).
+    last_save: Option<Instant>,
+    /// The UTC day (`yyyymmdd`) of `save_bytes_today`.
+    save_day: u64,
+    /// Save bytes attempted on `save_day` (persisted before each save).
+    pub(crate) save_bytes_today: u64,
+    /// Non-refundable quota credit persisted by the writer before use.
+    save_credit: usize,
+    credit_pending: bool,
+    /// Why the last page took no save while shards were dirty.
+    pub(crate) save_held: Option<SaveHeld>,
+    /// Families with a row in a batch whose result has not come back (process
+    /// memory): none of them is "unchanged" until it does.
+    in_flight: BTreeMap<String, u32>,
+}
+
+/// Why a page with dirty shards took no save.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SaveHeld {
+    /// The last save is younger than `SAVE_MIN_INTERVAL`.
+    Interval,
+    /// The day's `SAVE_DAILY_BYTES` would be passed.
+    DailyCap,
+    CreditPending,
+}
+
+/// What one page's save may take: the UTC day and the coalescing interval.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SavePolicy<'a> {
+    pub(crate) support_dir: &'a Path,
+    pub(crate) deadline: Instant,
+    pub(crate) utc_day: u64,
+    pub(crate) min_interval: Duration,
 }
 
 fn custody_key(key: &str) -> bool {
@@ -152,6 +211,15 @@ impl ClaudeLedger {
             oversized_shards: 0,
             load_damaged: false,
             message_cursor: String::new(),
+            family_cursor: String::new(),
+            deferred_compare_cursor: 0,
+            last_save: None,
+            save_day: 0,
+            save_bytes_today: 0,
+            save_credit: 0,
+            credit_pending: false,
+            save_held: None,
+            in_flight: BTreeMap::new(),
             synthetic_cursor: String::new(),
             pending_checkpoint: None,
             barrier_needed: dirty,
@@ -175,6 +243,29 @@ impl ClaudeLedger {
             self.shard_bytes[shard_of(key)] +=
                 super::custody::serialized_len(key) + super::custody::serialized_len(&value) + 2;
         }
+    }
+
+    /// The families of a handed-off batch's rows.
+    pub(crate) fn note_in_flight<'k>(&mut self, keys: impl Iterator<Item = &'k str>) {
+        for key in keys {
+            *self.in_flight.entry(key.to_owned()).or_default() += 1;
+        }
+    }
+
+    /// A batch's result came back (or it was never queued).
+    pub(crate) fn settle_in_flight<'k>(&mut self, keys: impl Iterator<Item = &'k str>) {
+        for key in keys {
+            if let Some(count) = self.in_flight.get_mut(key) {
+                *count -= 1;
+                if *count == 0 {
+                    self.in_flight.remove(key);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn in_flight(&self, key: &str) -> bool {
+        self.in_flight.contains_key(key)
     }
 
     pub(crate) fn census(&self) -> &Custody {
@@ -363,23 +454,48 @@ impl ClaudeLedger {
         self.dirty.iter().filter(|dirty| **dirty).count()
     }
 
-    /// Serialize the dirty shards of this page's bounded save. The data
-    /// shards come in a fair rotation up to `SAVE_BYTES_PER_PAGE`. A zero
-    /// meta (every certificate 0) rides first when a certificate went to
-    /// zero; the current meta rides last only when no data shard stays
-    /// dirty. None when nothing is dirty, its buffers are not admitted or the
-    /// page deadline passes while serializing (everything stays dirty). The
+    /// Serialize the dirty shards of this page's save, when one is due
+    /// (`SAVE_MIN_INTERVAL` since this process's last) and the day's
+    /// `SAVE_DAILY_BYTES` has room. A zero meta (every certificate 0) rides
+    /// first when a certificate went to zero; the data shards come in a fair
+    /// rotation up to `SAVE_BYTES_PER_PAGE` and the day's room; the current
+    /// meta rides last only when no data shard stays dirty. Its bytes count
+    /// as attempted when it is taken, whatever happens to them. None when
+    /// nothing is dirty or due, its buffers are not admitted or the page
+    /// deadline passes while serializing (everything stays dirty). The
     /// deadline is checked before every record, so the walk stops within one
     /// record's serialization of it (at most `SAVE_BYTES_PER_PAGE`).
     pub(crate) fn take_save(
         &mut self,
-        deadline: Instant,
+        policy: SavePolicy<'_>,
     ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
-        if Instant::now() >= deadline || writer().is_none() {
+        self.save_held = None;
+        if Instant::now() >= policy.deadline || self.dirty_shards() == 0 || writer().is_none() {
             return None;
         }
+        if self
+            .last_save
+            .is_some_and(|last| last.elapsed() < policy.min_interval)
+        {
+            self.save_held = Some(SaveHeld::Interval);
+            return None;
+        }
+        if policy.utc_day > self.save_day {
+            self.save_day = policy.utc_day;
+            self.save_bytes_today = 0;
+            self.save_credit = 0;
+        }
+        if self.save_credit == 0 {
+            self.request_credit(policy.support_dir, policy.utc_day);
+            return None;
+        }
+        let room = SAVE_BYTES_PER_PAGE.min(self.save_credit);
+        // The day's room, not the save's bound, decides what stays dirty.
+        let day_bound = room < SAVE_BYTES_PER_PAGE;
+        let meta_bytes = self.shard_bytes[META] + 2;
+        let zero_first = self.meta_debt;
+        let mut bytes = usize::from(zero_first) * meta_bytes;
         let mut selected = vec![false; DATA_SHARDS];
-        let mut bytes = 0_usize;
         let mut next_save = self.next_save;
         self.oversized_shards = 0;
         for step in 0..DATA_SHARDS {
@@ -392,7 +508,7 @@ impl ClaudeLedger {
                 self.oversized_shards += 1;
                 continue;
             }
-            if bytes + need > SAVE_BYTES_PER_PAGE {
+            if bytes + need > room {
                 break;
             }
             selected[shard] = true;
@@ -400,11 +516,16 @@ impl ClaudeLedger {
             next_save = (shard + 1) % DATA_SHARDS;
         }
         let data_left = (0..DATA_SHARDS).any(|shard| self.dirty[shard] && !selected[shard]);
-        let zero_first = self.meta_debt;
-        let meta_last = self.dirty[META] && !data_left;
-        let metas = usize::from(zero_first) + usize::from(meta_last);
-        bytes += metas * (self.shard_bytes[META] + 2);
-        if !selected.contains(&true) && metas == 0 {
+        let meta_last = self.dirty[META] && !data_left && bytes + meta_bytes <= room;
+        bytes += usize::from(meta_last) * meta_bytes;
+        // A zero meta goes before any data shard, or nothing goes.
+        if bytes > room || !selected.contains(&true) && !zero_first && !meta_last {
+            if day_bound {
+                // A shard cannot use the remaining credit. Abandon it without
+                // refund and ask the writer for a fresh, durable reservation.
+                self.save_credit = 0;
+                self.request_credit(policy.support_dir, policy.utc_day);
+            }
             return None;
         }
         let reservation = ShadowReservation::admit(bytes)?;
@@ -421,7 +542,7 @@ impl ClaudeLedger {
         }
         if !buffers.is_empty() {
             for (key, record) in self.census.entries() {
-                if Instant::now() >= deadline {
+                if Instant::now() >= policy.deadline {
                     return None;
                 }
                 if key == CONTROL {
@@ -434,7 +555,7 @@ impl ClaudeLedger {
         }
         let mut zero = zero_first.then(|| open(self.shard_bytes[META]));
         let mut current = meta_last.then(|| open(self.shard_bytes[META]));
-        if Instant::now() >= deadline {
+        if Instant::now() >= policy.deadline {
             return None;
         }
         if let Some(buffer) = current.as_mut() {
@@ -448,6 +569,10 @@ impl ClaudeLedger {
             buffer.push(b'}');
             buffer
         };
+        // Credit was synced on the writer thread before the producer saw
+        // it. Queued/dropped saves and restart never refund that reservation.
+        self.save_credit -= bytes;
+        self.last_save = Some(Instant::now());
         let mut save = ClaudeLedgerSave::default();
         for (shard, buffer) in buffers {
             self.dirty[shard] = false;
@@ -465,6 +590,17 @@ impl ClaudeLedger {
         }
         self.next_save = next_save;
         Some((save, reservation))
+    }
+
+    fn request_credit(&mut self, support_dir: &Path, day: u64) {
+        if self.credit_pending {
+            self.save_held = Some(SaveHeld::CreditPending);
+        } else if self.save_bytes_today >= SAVE_DAILY_BYTES as u64 {
+            self.save_held = Some(SaveHeld::DailyCap);
+        } else if submit(Job::Reserve(support_dir.to_path_buf(), day)).is_ok() {
+            self.credit_pending = true;
+            self.save_held = Some(SaveHeld::CreditPending);
+        }
     }
 
     /// A batch that did not reach the disk: its shards are dirty again (a
@@ -531,13 +667,22 @@ impl ClaudeLedgerSave {
     }
 }
 
-/// A family memo that moves only when its rows were written.
+/// A family memo that moves only when its batch was published (written,
+/// flushed and synced): its scheduling time and publication always, its
+/// money basis only from a complete body.
 #[derive(Debug, Clone)]
 pub(crate) struct PendingMemo {
     pub(crate) key: String,
-    pub(crate) revision: [u8; 32],
+    /// A complete body's union revision and money (the next removal
+    /// basis); None keeps the stored basis.
+    pub(crate) basis: Option<([u8; 32], ClaudeFamilyMemo)>,
     pub(crate) observed_unix: u64,
-    pub(crate) memo: ClaudeFamilyMemo,
+    pub(crate) published: ClaudeFamilyPublication,
+    /// The batch carries a row of the family (else it was unchanged).
+    pub(crate) row: bool,
+    /// Pre-admitted unreached family. The writer renders its deadline row
+    /// and computes the full canonical digest before publication/ack.
+    pub(crate) deferred: Option<(String, super::FamilyCensus)>,
 }
 
 /// One page's batch for the writer.
@@ -554,10 +699,13 @@ pub(crate) struct WriteJob {
 /// What the writer did with one batch.
 pub(crate) struct WriteResult {
     pub(crate) jsonl: JsonlOutcome,
-    pub(crate) memos: Vec<PendingMemo>,
+    pub(crate) memos: VecDeque<PendingMemo>,
+    ack_started: bool,
     failed_shards: Vec<usize>,
     /// The meta shard was not written (with its debt flag).
     meta_unwritten: Option<bool>,
+    /// The writer's time on the batch.
+    pub(crate) writer_us: u64,
 }
 
 type PendingCheckpoint = (
@@ -576,6 +724,8 @@ type CheckpointPayload = (
 );
 
 enum Job {
+    Reserve(PathBuf, u64),
+    Wake,
     Load(PathBuf),
     Write(Box<WriteJob>),
     Flush(SyncSender<()>),
@@ -586,6 +736,11 @@ enum Job {
     },
     Checkpoint(Box<CheckpointPayload>, ShadowReservation),
     Recovery(Box<dyn FnOnce() + Send>, Arc<Mutex<ShadowReservation>>),
+    #[cfg(test)]
+    Pause(SyncSender<()>, Receiver<()>),
+    /// A restart of the writer's state of a directory (a new process).
+    #[cfg(test)]
+    Restart(PathBuf),
 }
 
 enum Slot {
@@ -598,7 +753,51 @@ enum Slot {
 }
 
 static LEDGERS: Mutex<BTreeMap<PathBuf, Slot>> = Mutex::new(BTreeMap::new());
-static RESULTS: Mutex<BTreeMap<PathBuf, Vec<WriteResult>>> = Mutex::new(BTreeMap::new());
+#[derive(Clone, Copy)]
+struct Credit {
+    day: u64,
+    reserved: u64,
+    bytes: usize,
+}
+static CREDITS: Mutex<BTreeMap<PathBuf, Credit>> = Mutex::new(BTreeMap::new());
+
+/// Only the writer (and synchronous store fixtures) calls this. Charge an
+/// entire <=8 MiB ticket before granting it. Unspent ticket bytes are lost
+/// on restart, so accounting is deliberately conservative.
+fn reserve_credit(support_dir: &Path, day: u64) -> Credit {
+    let dir = support_dir.join(LEDGER_DIR);
+    let ((saved_day, saved_bytes), (write_day, written)) = load_counters(&dir, day);
+    let max_day = saved_day.max(write_day);
+    let used = if day > saved_day { 0 } else { saved_bytes }.max(if day > write_day {
+        0
+    } else {
+        written
+    });
+    let amount = SAVE_BYTES_PER_PAGE.min(SAVE_DAILY_BYTES.saturating_sub(used as usize));
+    let total = used.saturating_add(amount as u64);
+    let granted = day >= max_day
+        && amount > 0
+        && std::fs::create_dir_all(&dir).is_ok()
+        && write_atomic(
+            &dir.join(SAVE_BUDGET_FILE),
+            format!("{{\"day\":{day},\"bytes\":{total}}}").as_bytes(),
+        );
+    Credit {
+        day: max_day.max(day),
+        reserved: if granted {
+            total
+        } else {
+            SAVE_DAILY_BYTES as u64
+        },
+        bytes: if granted { amount } else { 0 },
+    }
+}
+
+pub(super) fn wake_writer() {
+    let _ = submit(Job::Wake);
+}
+
+static RESULTS: Mutex<BTreeMap<PathBuf, VecDeque<WriteResult>>> = Mutex::new(BTreeMap::new());
 struct Writer {
     sender: Mutex<SyncSender<Job>>,
     thread: std::thread::JoinHandle<()>,
@@ -760,11 +959,22 @@ pub(crate) fn acquire(support_dir: &Path) -> ClaudeLedgerAcquire {
 /// Hand a page's batch to the writer. On a full outbox the batch comes back
 /// and its shards are dirty again.
 pub(crate) fn submit_batch(ledger: &mut ClaudeLedger, job: WriteJob) -> Result<(), Box<WriteJob>> {
-    let submitted = submit(Job::Write(Box::new(job)));
-    match submitted {
+    ledger.note_in_flight(
+        job.memos
+            .iter()
+            .filter(|memo| memo.row)
+            .map(|memo| memo.key.as_str()),
+    );
+    match submit(Job::Write(Box::new(job))) {
         Ok(()) => Ok(()),
         Err(Job::Write(job)) => {
             super::owe_coverage(&job.support_dir, job.jsonl.now, false);
+            ledger.settle_in_flight(
+                job.memos
+                    .iter()
+                    .filter(|memo| memo.row)
+                    .map(|memo| memo.key.as_str()),
+            );
             if let Some(save) = &job.save {
                 let failed = save
                     .shards
@@ -793,34 +1003,116 @@ pub(crate) fn submit_unledgered(job: WriteJob) -> Result<(), Box<WriteJob>> {
     }
 }
 
-/// The writer's results for `support_dir` since the last call, applied to
-/// its ledger: unwritten shards are dirty again; memos come back to the
-/// caller, which moves the published ones.
-pub(crate) fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) -> Vec<WriteResult> {
-    let results = RESULTS
-        .lock()
-        .ok()
-        .and_then(|mut results| results.remove(support_dir))
-        .unwrap_or_default();
-    for result in &results {
-        ledger.restore(&result.failed_shards, result.meta_unwritten);
+/// Results retain FIFO custody until each memo is acknowledged. In-flight
+/// suppression is released only for the memo actually returned to the caller.
+pub(crate) enum Acknowledgement {
+    Outcome(JsonlOutcome, u64),
+    Memo(PendingMemo, bool),
+}
+
+pub(crate) fn consume_results_until(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    deadline: Instant,
+    apply: impl FnMut(&mut ClaudeLedger, Acknowledgement),
+) {
+    consume_results_while(support_dir, ledger, || Instant::now() < deadline, apply);
+}
+
+fn consume_results_while(
+    support_dir: &Path,
+    ledger: &mut ClaudeLedger,
+    mut within_deadline: impl FnMut() -> bool,
+    mut apply: impl FnMut(&mut ClaudeLedger, Acknowledgement),
+) {
+    if !within_deadline() {
+        return;
     }
-    results
+    if let Some(credit) = CREDITS
+        .try_lock()
+        .ok()
+        .and_then(|mut credits| credits.remove(support_dir))
+    {
+        ledger.credit_pending = false;
+        if credit.day >= ledger.save_day {
+            ledger.save_day = credit.day;
+            ledger.save_bytes_today = credit.reserved;
+            ledger.save_credit = credit.bytes;
+        }
+    }
+    let Ok(mut all_results) = RESULTS.try_lock() else {
+        return;
+    };
+    let Some(results) = all_results.get_mut(support_dir) else {
+        return;
+    };
+    while within_deadline() {
+        let Some(result) = results.front_mut() else {
+            break;
+        };
+        if !result.ack_started {
+            // At most SHARDS (257), independent of the number of memos.
+            ledger.restore(&result.failed_shards, result.meta_unwritten);
+            result.ack_started = true;
+            apply(
+                ledger,
+                Acknowledgement::Outcome(result.jsonl, result.writer_us),
+            );
+        }
+        if !within_deadline() {
+            break;
+        }
+        if let Some(memo) = result.memos.pop_front() {
+            if memo.row {
+                ledger.settle_in_flight(std::iter::once(memo.key.as_str()));
+            }
+            apply(ledger, Acknowledgement::Memo(memo, result.jsonl.published));
+        } else {
+            let _ = results.pop_front();
+        }
+    }
+    if results.is_empty() {
+        all_results.remove(support_dir);
+    }
+}
+
+/// Store-only fixtures discard publications but settle normal save outcomes.
+#[cfg(test)]
+fn take_results(support_dir: &Path, ledger: &mut ClaudeLedger) {
+    consume_results_while(support_dir, ledger, || true, |_, _| {});
 }
 
 fn run_writer(receiver: Receiver<Job>) {
     // Per support directory: shards whose last write failed (no sweep
-    // advance is written over them), and whether a debt-carrying meta failed
-    // (no data shard is written until one lands).
+    // advance is written over them), whether a debt-carrying meta failed
+    // (no data shard is written until one lands), and its run marker.
     let mut failed = BTreeMap::<PathBuf, WriterState>::new();
     let mut recovered = BTreeSet::new();
-    while let Ok(job) = receiver.recv() {
+    loop {
+        let job = match receiver.try_recv() {
+            Ok(job) => job,
+            Err(TryRecvError::Empty) => {
+                super::persist_coverage_debt();
+                match receiver.recv() {
+                    Ok(job) => job,
+                    Err(_) => break,
+                }
+            }
+            Err(TryRecvError::Disconnected) => break,
+        };
         match job {
             Job::Recovery(operation, allocation) => {
                 let queued = allocation.lock().unwrap().bytes();
                 operation();
                 QUEUED_BYTES.fetch_sub(queued, Ordering::AcqRel);
             }
+            Job::Reserve(dir, _observed_day) => {
+                let credit = reserve_credit(&dir, super::utc_day(writer_unix()));
+                if let Ok(mut credits) = CREDITS.lock() {
+                    credits.insert(dir, credit);
+                }
+            }
+            Job::Wake => super::persist_coverage_debt(),
             Job::Load(support_dir) => {
                 let ledger = load(&support_dir);
                 if let Ok(mut ledgers) = LEDGERS.lock() {
@@ -847,10 +1139,11 @@ fn run_writer(receiver: Receiver<Job>) {
                 }
                 let bytes = job.queued_bytes();
                 let failed = failed.entry(job.support_dir.clone()).or_default();
+                let lost_ack = job.jsonl.fault == super::PageFault::LostAck;
                 let (support_dir, result) = write(*job, failed);
                 QUEUED_BYTES.fetch_sub(bytes, Ordering::AcqRel);
-                if let Ok(mut results) = RESULTS.lock() {
-                    results.entry(support_dir).or_default().push(result);
+                if let (false, Ok(mut results)) = (lost_ack, RESULTS.lock()) {
+                    results.entry(support_dir).or_default().push_back(result);
                 }
             }
             Job::Checkpoint(payload, allocation) => {
@@ -867,8 +1160,18 @@ fn run_writer(receiver: Receiver<Job>) {
                 let _ = entered.send(());
                 let _ = release.recv();
             }
+            #[cfg(test)]
+            Job::Pause(ready, resume) => {
+                let _ = ready.send(());
+                let _ = resume.recv();
+            }
             Job::Flush(done) => {
+                super::persist_coverage_debt();
                 let _ = done.send(());
+            }
+            #[cfg(test)]
+            Job::Restart(support_dir) => {
+                failed.remove(&support_dir);
             }
         }
     }
@@ -942,13 +1245,15 @@ pub(super) fn write_atomic(path: &Path, bytes: &[u8]) -> bool {
         .is_ok()
 }
 
-/// What the writer remembers of one directory's failed writes.
+/// What the writer remembers of one directory: its failed writes and its
+/// run.
 #[derive(Debug, Default)]
 pub(crate) struct WriterState {
     failed: BTreeSet<usize>,
     /// A meta carrying debt failed: until one lands, no data shard (and no
     /// meta advance) is written, whichever batch it comes in.
     debt_unwritten: bool,
+    run_days: Option<(u64, u64)>,
 }
 
 fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) {
@@ -972,23 +1277,86 @@ fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) 
                     failed: 1,
                     ..JsonlOutcome::default()
                 },
-                memos: job.memos,
+                memos: job.memos.into(),
+                ack_started: false,
+                writer_us: 0,
                 failed_shards,
                 meta_unwritten,
             },
         );
     }
+    let started = Instant::now();
     let WriteJob {
         support_dir,
         pending_intent,
-        jsonl,
-        memos,
+        mut jsonl,
+        mut memos,
         save,
         reservations,
     } = job;
-    let jsonl = super::write_jsonl(&support_dir, &jsonl);
+    if memos.iter().any(|memo| memo.deferred.is_some()) {
+        let empty = ClaudeLedger::empty(false);
+        let mut ignored = super::ClaudeRequestMoneyShadowCounts::default();
+        for memo in &mut memos {
+            if let Some((root, state)) = memo.deferred.take() {
+                jsonl.families.push(super::failure_rows(
+                    &root,
+                    "deadline",
+                    state,
+                    jsonl.now,
+                    jsonl.coverage.snapshot,
+                    &empty,
+                    &mut ignored,
+                ));
+            }
+        }
+    }
+    let ready = match failed.run_days {
+        Some((first, last)) if jsonl.now >= first && jsonl.now <= last => true,
+        previous => {
+            let recovered = previous.is_some() || super::note_unclean_run(&support_dir, jsonl.now);
+            let days = previous.map_or(
+                (jsonl.now / 86_400 * 86_400, jsonl.now + 86_400),
+                |(first, last)| (first.min(jsonl.now), last.max(jsonl.now + 86_400)),
+            );
+            if recovered && super::open_run_marker(&support_dir, days) {
+                failed.run_days = Some(days);
+                true
+            } else {
+                false
+            }
+        }
+    };
+    let outcome = if ready {
+        super::write_jsonl(&support_dir, &mut jsonl)
+    } else {
+        super::owe_coverage(&support_dir, jsonl.now, true);
+        super::JsonlOutcome {
+            failed: 1,
+            ..Default::default()
+        }
+    };
+    for (memo, family) in memos
+        .iter_mut()
+        .filter(|memo| memo.row)
+        .zip(&mut jsonl.families)
+    {
+        memo.published.digest = super::semantic_digest(family);
+        if !family.row.coverage_complete {
+            memo.basis = None;
+        }
+    }
+    let save_failed = !ready || jsonl.fault == super::PageFault::SaveFailure;
+    let jsonl = outcome;
     let (failed_shards, meta_unwritten) = save.map_or((Vec::new(), None), |save| {
-        write_save(&support_dir.join(LEDGER_DIR), &save, failed)
+        if save_failed {
+            (
+                save.shards.iter().map(|(shard, _)| *shard).collect(),
+                Some(save.meta_debt),
+            )
+        } else {
+            write_save(&support_dir.join(LEDGER_DIR), &save, failed)
+        }
     });
     if (jsonl.published || (jsonl.sealed > 0 && jsonl.failed == 0))
         && failed_shards.is_empty()
@@ -1012,9 +1380,11 @@ fn write(mut job: WriteJob, failed: &mut WriterState) -> (PathBuf, WriteResult) 
     }
     let result = WriteResult {
         jsonl,
-        memos,
+        memos: memos.into(),
+        ack_started: false,
         failed_shards,
         meta_unwritten,
+        writer_us: started.elapsed().as_micros() as u64,
     };
     drop(reservations);
     (support_dir, result)
@@ -1033,7 +1403,7 @@ fn write_save(
     let mut meta_unwritten = None;
     let mut blocked = money_io!(Mutate, std::fs::create_dir_all(dir)).is_err();
     if let Some(meta) = &save.meta_first {
-        if blocked || !write_atomic(&shard_path(dir, META), meta) {
+        if blocked || !write_shard(dir, META, meta) {
             blocked = true;
             meta_unwritten = Some(save.meta_debt);
             state.debt_unwritten |= save.meta_debt;
@@ -1044,7 +1414,7 @@ fn write_save(
     // An earlier batch's debt is not on disk yet: nothing goes before it.
     blocked |= state.debt_unwritten;
     for (shard, bytes) in &save.shards {
-        if !blocked && write_atomic(&shard_path(dir, *shard), bytes) {
+        if !blocked && write_shard(dir, *shard, bytes) {
             state.failed.remove(shard);
         } else {
             state.failed.insert(*shard);
@@ -1052,12 +1422,50 @@ fn write_save(
         }
     }
     if let Some(meta) = &save.meta_last {
-        if blocked || !state.failed.is_empty() || !write_atomic(&shard_path(dir, META), meta) {
+        if blocked || !state.failed.is_empty() || !write_shard(dir, META, meta) {
             // A zero meta that failed before keeps its debt flag.
             meta_unwritten.get_or_insert(false);
         }
     }
     (unwritten, meta_unwritten)
+}
+
+/// A write-day counter is separate from ticket reservations. Every physical
+/// attempt (including both metas and failed retries) is charged before IO.
+/// A delayed save uses the day of each shard's actual attempt. A clock behind
+/// either persisted high-water day blocks writes and cannot create new credit.
+fn write_shard(dir: &Path, shard: usize, bytes: &[u8]) -> bool {
+    let day = super::utc_day(writer_unix());
+    let ((ticket_day, _), (write_day, written)) = load_counters(dir, day);
+    if day < ticket_day.max(write_day) {
+        return false;
+    }
+    let used = if day > write_day { 0 } else { written };
+    let Some(total) = used
+        .checked_add(bytes.len() as u64)
+        .filter(|total| *total <= SAVE_DAILY_BYTES as u64)
+    else {
+        return false;
+    };
+    if !write_atomic(
+        &dir.join(WRITE_BUDGET_FILE),
+        format!("{{\"day\":{day},\"bytes\":{total}}}").as_bytes(),
+    ) {
+        return false;
+    }
+    write_atomic(&shard_path(dir, shard), bytes)
+}
+
+fn writer_unix() -> u64 {
+    #[cfg(test)]
+    if let Some(now) = WRITE_CLOCK.with(|clock| clock.borrow_mut().pop_front()) {
+        return now;
+    }
+    super::now_unix()
+}
+#[cfg(test)]
+thread_local! {
+    static WRITE_CLOCK: std::cell::RefCell<std::collections::VecDeque<u64>> = const { std::cell::RefCell::new(std::collections::VecDeque::new()) };
 }
 
 /// Loads given up because their admission never came (process memory).
@@ -1200,6 +1608,7 @@ fn load_capped(support_dir: &Path, max_records: usize) -> Option<ClaudeLedger> {
         ledger.barrier_needed = true;
     }
     ledger.recount_shards();
+    (ledger.save_day, ledger.save_bytes_today) = load_budget(&dir);
     Some(ledger)
 }
 
@@ -1268,6 +1677,125 @@ fn recover_legacy(support_dir: &Path, ledger: &mut ClaudeLedger) -> Option<bool>
     Some(unknown)
 }
 
+/// The day's attempted save bytes a save persisted (none: (0, 0)).
+fn load_budget(dir: &Path) -> (u64, u64) {
+    load_counter(dir, SAVE_BUDGET_FILE)
+}
+
+/// Reads and repairs accounting only on the serialized writer (or store
+/// fixtures). Missing accounting initializes fresh only on the first ledger
+/// migration; later loss and damaged accounting quarantine one day. Persist
+/// that date once: tomorrow
+/// must not become a new hold. Both retain the valid sibling's high-water day.
+fn load_counter(dir: &Path, name: &str) -> (u64, u64) {
+    let counters = load_counters(dir, super::utc_day(super::now_unix()));
+    if name == SAVE_BUDGET_FILE {
+        counters.0
+    } else {
+        counters.1
+    }
+}
+
+type Counter = (u64, u64);
+
+fn load_counters(dir: &Path, day: u64) -> (Counter, Counter) {
+    #[derive(serde::Deserialize)]
+    struct Budget {
+        day: u64,
+        bytes: u64,
+    }
+    enum ReadCounter {
+        Valid(Counter),
+        Missing,
+        Damaged,
+    }
+    let read = |name: &str| {
+        let path = dir.join(name);
+        match std::fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => ReadCounter::Missing,
+            Ok(meta) if meta.file_type().is_file() && meta.len() <= 256 => {
+                std::fs::File::open(path)
+                    .ok()
+                    .and_then(|file| {
+                        let mut bytes = Vec::with_capacity(257);
+                        file.take(257).read_to_end(&mut bytes).ok()?;
+                        (bytes.len() <= 256)
+                            .then(|| serde_json::from_slice::<Budget>(&bytes).ok())?
+                    })
+                    .map_or(ReadCounter::Damaged, |budget| {
+                        ReadCounter::Valid((budget.day, budget.bytes.min(SAVE_DAILY_BYTES as u64)))
+                    })
+            }
+            _ => ReadCounter::Damaged,
+        }
+    };
+    // Read both before repairing either: a valid sibling's high-water day
+    // survives clock rollback, and first initialization cannot hide damage.
+    let mut saved = read(SAVE_BUDGET_FILE);
+    let mut written = read(WRITE_BUDGET_FILE);
+    let witness = read(QUOTA_WITNESS_FILE);
+    let first_initialization = matches!(witness, ReadCounter::Missing);
+    let valid_day = |counter: &ReadCounter| match counter {
+        ReadCounter::Valid((day, _)) => *day,
+        _ => 0,
+    };
+    let high_day = day
+        .max(valid_day(&saved))
+        .max(valid_day(&written))
+        .max(valid_day(&witness));
+    let exhausted = (high_day, SAVE_DAILY_BYTES as u64);
+    let persist = |name: &str, value: Counter| {
+        std::fs::create_dir_all(dir).is_ok()
+            && write_atomic(
+                &dir.join(name),
+                format!("{{\"day\":{},\"bytes\":{}}}", value.0, value.1).as_bytes(),
+            )
+    };
+    if matches!(witness, ReadCounter::Damaged) {
+        // Repair counters before repairing a damaged identity: a crash at
+        // either point cannot reinterpret corruption as a first migration.
+        if !persist(SAVE_BUDGET_FILE, exhausted) || !persist(WRITE_BUDGET_FILE, exhausted) {
+            return (exhausted, exhausted);
+        }
+        saved = ReadCounter::Valid(exhausted);
+        written = ReadCounter::Valid(exhausted);
+    }
+    // Persist first initialization and each new maximum day BEFORE any
+    // fresh counter/ticket/write. A crash here can only lose today's credit.
+    if !matches!(witness, ReadCounter::Valid((seen, _)) if seen == high_day)
+        && !persist(QUOTA_WITNESS_FILE, (high_day, 0))
+    {
+        return (exhausted, exhausted);
+    }
+    if day < valid_day(&witness) {
+        return (exhausted, exhausted);
+    }
+    let repair = |name: &str, counter| match counter {
+        ReadCounter::Valid(value) => value,
+        _ => {
+            let initial = (
+                high_day,
+                if first_initialization && matches!(counter, ReadCounter::Missing) {
+                    0
+                } else {
+                    SAVE_DAILY_BYTES as u64
+                },
+            );
+            // Do not publish a reset before the atomic file and directory
+            // sync succeed. Failure remains closed and is retried next read.
+            if persist(name, initial) {
+                initial
+            } else {
+                (high_day, SAVE_DAILY_BYTES as u64)
+            }
+        }
+    };
+    (
+        repair(SAVE_BUDGET_FILE, saved),
+        repair(WRITE_BUDGET_FILE, written),
+    )
+}
+
 /// Wait until the writer has done everything handed to it so far.
 pub(crate) fn flush() {
     let _ = flush_acknowledged();
@@ -1303,6 +1831,29 @@ fn flush_acknowledged_by(deadline: Instant) -> bool {
         .is_ok()
 }
 
+/// Block the writer so a fixture can fill its bounded outbox deterministically.
+#[cfg(test)]
+pub(crate) struct PausedWriter(SyncSender<()>);
+#[cfg(test)]
+impl Drop for PausedWriter {
+    fn drop(&mut self) {
+        let _ = self.0.send(());
+    }
+}
+#[cfg(test)]
+pub(crate) fn pause_for_test() -> PausedWriter {
+    let (ready, entered) = sync_channel(0);
+    let (resume, wait) = sync_channel(0);
+    writer()
+        .expect("writer")
+        .lock()
+        .unwrap()
+        .send(Job::Pause(ready, wait))
+        .unwrap_or_else(|_| panic!("pause writer"));
+    entered.recv().unwrap();
+    PausedWriter(resume)
+}
+
 /// Forget the in-memory ledger of `support_dir` (a restart): the next page
 /// loads it from disk.
 #[cfg(test)]
@@ -1314,6 +1865,30 @@ pub(crate) fn forget_for_test(support_dir: &Path) {
     if let Ok(mut results) = RESULTS.lock() {
         results.remove(support_dir);
     }
+}
+
+/// A new process for `support_dir`: its ledger, results, latched coverage
+/// debt, granted credit and the writer's memory of it are forgotten (the
+/// next write checks the run marker again). Once it returns the writer has
+/// nothing left to write into `support_dir`, so a fixture may replace it.
+#[cfg(test)]
+pub(crate) fn restart_for_test(support_dir: &Path) {
+    forget_for_test(support_dir);
+    {
+        // Parked, the writer runs no idle pass that could re-latch the debt
+        // (or heal its marker) between the snapshot and this removal.
+        let _paused = pause_for_test();
+        super::forget_owed_coverage_for_test(support_dir);
+        if let Ok(mut credits) = CREDITS.lock() {
+            credits.remove(support_dir);
+        }
+    }
+    if let Some(sender) = writer() {
+        if let Ok(sender) = sender.lock() {
+            let _ = sender.send(Job::Restart(support_dir.to_path_buf()));
+        }
+    }
+    flush();
 }
 
 /// A restart that reloads the saved ledger before the next page (the page
@@ -1360,6 +1935,53 @@ impl ClaudeLedger {
     }
 }
 
+#[cfg(test)]
+fn test_budget_dir() -> &'static Path {
+    Box::leak(
+        std::env::temp_dir()
+            .join(format!(
+                "ottto-save-budget-{}-{:?}",
+                std::process::id(),
+                super::next_snapshot()
+            ))
+            .into_boxed_path(),
+    )
+}
+
+#[cfg(test)]
+fn credit_for_test(ledger: &mut ClaudeLedger, policy: SavePolicy<'_>) {
+    if ledger.save_credit == 0 && ledger.save_bytes_today < SAVE_DAILY_BYTES as u64 {
+        let credit = reserve_credit(policy.support_dir, policy.utc_day);
+        ledger.save_day = credit.day;
+        ledger.save_bytes_today = credit.reserved;
+        ledger.save_credit = credit.bytes;
+    }
+}
+
+/// Prime asynchronous durable credit for direct synchronous page fixtures.
+/// Production pages only request credit and continue; they never wait.
+#[cfg(test)]
+pub(crate) fn prime_credit_for_test(support_dir: &Path, day: u64) {
+    if let ClaudeLedgerAcquire::Ready(mut ledger) = acquire(support_dir) {
+        if ledger.save_credit == 0 && !ledger.credit_pending {
+            ledger.request_credit(support_dir, day);
+        }
+        drop(ledger);
+        flush();
+    }
+}
+
+/// A save every call, on today's budget.
+#[cfg(test)]
+pub(crate) fn policy_for_test(deadline: Instant) -> SavePolicy<'static> {
+    SavePolicy {
+        support_dir: test_budget_dir(),
+        deadline,
+        utc_day: super::utc_day(super::now_unix()),
+        min_interval: Duration::ZERO,
+    }
+}
+
 /// One page's bounded save of `ledger`, written synchronously (the writer's
 /// crash order); `failed` is the writer's memory of the directory. Returns
 /// (shards in the save, the meta went first, shards not written).
@@ -1369,7 +1991,26 @@ pub(crate) fn save_page_for_test(
     ledger: &mut ClaudeLedger,
     failed: &mut WriterState,
 ) -> Option<(usize, bool, usize)> {
-    let (save, _reservation) = ledger.take_save(Instant::now() + Duration::from_secs(60))?;
+    let policy = SavePolicy {
+        support_dir,
+        ..policy_for_test(Instant::now() + Duration::from_secs(60))
+    };
+    flush();
+    take_results(support_dir, ledger);
+    if !ledger.credit_pending {
+        credit_for_test(ledger, policy);
+    }
+    let taken = ledger.take_save(policy).or_else(|| {
+        if !ledger.credit_pending {
+            return None;
+        }
+        // A partially spent ticket may not fit the next indivisible shard.
+        // Model the production next page, after the writer grants new credit.
+        flush();
+        take_results(support_dir, ledger);
+        ledger.take_save(policy)
+    });
+    let (save, _reservation) = taken?;
     let (unwritten, meta) = write_save(&support_dir.join(LEDGER_DIR), &save, failed);
     ledger.restore(&unwritten, meta);
     Some((save.shards(), save.meta_first.is_some(), unwritten.len()))
@@ -1401,9 +2042,9 @@ pub(crate) fn shard_path_for_test(support_dir: &Path, key: &str) -> PathBuf {
 
 #[cfg(test)]
 pub(crate) fn take_save_for_test(ledger: &mut ClaudeLedger) -> Option<ClaudeLedgerSave> {
-    ledger
-        .take_save(Instant::now() + Duration::from_secs(60))
-        .map(|(save, _reservation)| save)
+    let policy = policy_for_test(Instant::now() + Duration::from_secs(60));
+    credit_for_test(ledger, policy);
+    ledger.take_save(policy).map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
@@ -1411,7 +2052,9 @@ pub(crate) fn take_save_by_for_test(
     ledger: &mut ClaudeLedger,
     deadline: Instant,
 ) -> Option<ClaudeLedgerSave> {
-    ledger.take_save(deadline).map(|(save, _reservation)| save)
+    let policy = policy_for_test(deadline);
+    credit_for_test(ledger, policy);
+    ledger.take_save(policy).map(|(save, _reservation)| save)
 }
 
 #[cfg(test)]
@@ -1583,6 +2226,7 @@ pub(super) fn checkpoint_receipt_until(
         support_dir,
         ledger,
         &mut super::ClaudeRequestMoneyShadowCounts::default(),
+        deadline,
     );
     if !ledger.barrier_needed
         && ledger.custody_epoch == ledger.durable_custody_epoch
@@ -1601,7 +2245,12 @@ pub(super) fn checkpoint_receipt_until(
     let saved = if ledger.dirty_shards() == 0 {
         ShadowReservation::admit(0).map(|reservation| (ClaudeLedgerSave::default(), reservation))
     } else {
-        ledger.take_save(deadline)
+        ledger.take_save(SavePolicy {
+            support_dir,
+            deadline,
+            utc_day: super::utc_day(writer_unix()),
+            min_interval: Duration::ZERO,
+        })
     };
     let Some((save, reservation)) = saved else {
         return MoneyReceipt::Refused;
@@ -2186,6 +2835,7 @@ mod refused_intent_tests {
                     support_dir: support.clone(),
                     pending_intent: None,
                     jsonl: super::super::JsonlBatch {
+                        fault: super::super::PageFault::None,
                         now,
                         families: Vec::new(),
                         coverage: super::super::CoverageRow::owed(now),
@@ -2235,12 +2885,18 @@ mod refused_intent_tests {
         let blocked = shard_path_for_test(&support, key).with_extension("json.tmp");
         money_io!(Mutate, std::fs::create_dir_all(&blocked)).unwrap();
         let (save, funds) = ledger
-            .take_save(Instant::now() + Duration::from_secs(2))
+            .take_save(SavePolicy {
+                support_dir: &scratch,
+                deadline: Instant::now() + Duration::from_secs(2),
+                utc_day: super::super::utc_day(writer_unix()),
+                min_interval: Duration::ZERO,
+            })
             .unwrap();
         let job = WriteJob {
             support_dir: support.clone(),
             pending_intent: None,
             jsonl: super::super::JsonlBatch {
+                fault: super::super::PageFault::None,
                 now: 1_790_000_000,
                 families: Vec::new(),
                 coverage: super::super::CoverageRow::owed(1_790_000_000),
@@ -2341,6 +2997,7 @@ mod refused_intent_tests {
             support_dir: support.clone(),
             pending_intent: None,
             jsonl: super::super::JsonlBatch {
+                fault: super::super::PageFault::None,
                 now: 1_790_000_000,
                 families: Vec::new(),
                 coverage: super::super::CoverageRow::owed(1_790_000_000),
@@ -2348,9 +3005,16 @@ mod refused_intent_tests {
             },
             memos: vec![PendingMemo {
                 key: key.clone(),
-                revision,
+                basis: Some((revision, memo)),
                 observed_unix: 1_790_000_000,
-                memo,
+                published: ClaudeFamilyPublication {
+                    utc_day: super::super::utc_day(1_790_000_000),
+                    digest: 0,
+                    epoch: 1,
+                    attempted: 1_790_000_000,
+                },
+                row: true,
+                deferred: None,
             }],
             save: None,
             reservations: Vec::new(),
@@ -2373,5 +3037,513 @@ mod refused_intent_tests {
             Some((&revision, memo))
         );
         super::super::forget_owed_coverage_for_test(&support);
+    }
+}
+
+#[cfg(test)]
+mod bounded_save_tests {
+    use super::*;
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn deferred_deadline_row_gets_full_digest_and_no_basis_before_ack() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-deferred-deadline");
+        let now = super::super::now_unix();
+        let snapshot = 123;
+        let root = "unreached-root";
+        let state = super::super::FamilyCensus::Unknown(
+            super::super::coverage::CensusReason::StrongViewUnavailable,
+        );
+        let memo = PendingMemo {
+            key: super::super::family_key(root),
+            basis: None,
+            observed_unix: 0,
+            published: super::super::ClaudeFamilyPublication {
+                utc_day: super::super::utc_day(now),
+                digest: 0,
+                epoch: 1,
+                attempted: now,
+            },
+            row: true,
+            deferred: Some((root.to_owned(), state.clone())),
+        };
+        let reservation = ShadowReservation::admit(super::super::FAMILY_BYTES).unwrap();
+        let job = WriteJob {
+            pending_intent: None,
+            support_dir: scratch.to_path_buf(),
+            jsonl: JsonlBatch {
+                now,
+                fault: super::super::PageFault::None,
+                families: Vec::with_capacity(1),
+                coverage: super::super::CoverageRow {
+                    snapshot,
+                    page_families: 1,
+                    families: 1,
+                    failed: 1,
+                    ..super::super::CoverageRow::owed(now)
+                },
+                buffer_bytes: 0,
+            },
+            memos: vec![memo],
+            save: None,
+            reservations: vec![reservation],
+        };
+        let (_, result) = write(job, &mut WriterState::default());
+        assert!(result.jsonl.published);
+        assert_eq!(result.jsonl.rows, 2);
+        let memo = &result.memos[0];
+        assert!(memo.deferred.is_none());
+        assert!(memo.basis.is_none());
+        assert_eq!(memo.observed_unix, 0, "unreached turn remains first");
+        let mut expected = super::super::failure_rows(
+            root,
+            "deadline",
+            state,
+            now,
+            snapshot,
+            &ClaudeLedger::empty(false),
+            &mut Default::default(),
+        );
+        assert_eq!(
+            memo.published.digest,
+            super::super::semantic_digest(&mut expected)
+        );
+        let bytes = std::fs::read_to_string(scratch.join("diagnostics").join(format!(
+            "claude-request-money-shadow-{}.jsonl",
+            super::super::day_stamp(now).unwrap()
+        )))
+        .unwrap();
+        let rows = bytes
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(rows[0]["p1_reasons"], serde_json::json!(["deadline"]));
+        assert_eq!(rows[0]["old_available"], false);
+        assert_eq!(rows[0]["coverage_complete"], false);
+        assert_eq!(rows[0]["grains"], 0);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn queued_or_dropped_save_reservation_survives_restart_and_corruption_seals_day() {
+        let dir = std::env::temp_dir().join(format!(
+            "ottto-budget-reserve-{}",
+            super::super::next_snapshot()
+        ));
+        let mut ledger = ClaudeLedger::empty(true);
+        let policy = SavePolicy {
+            support_dir: &dir,
+            ..policy_for_test(Instant::now() + Duration::from_secs(30))
+        };
+        credit_for_test(&mut ledger, policy);
+        let (save, reservation) = ledger.take_save(policy).expect("reserved save");
+        let charged = ledger.save_bytes_today;
+        assert!(charged >= save.bytes() as u64 && charged <= SAVE_DAILY_BYTES as u64);
+        drop((save, reservation, ledger)); // crash before outbox or acknowledgement
+        assert_eq!(load_budget(&dir.join(LEDGER_DIR)).1, charged);
+        let bytes = format!(
+            "{{\"day\":{},\"bytes\":{SAVE_DAILY_BYTES}}}",
+            policy.utc_day
+        );
+        assert!(write_atomic(
+            &dir.join(LEDGER_DIR).join(SAVE_BUDGET_FILE),
+            bytes.as_bytes()
+        ));
+        let mut resumed = ClaudeLedger::empty(true);
+        (resumed.save_day, resumed.save_bytes_today) = load_budget(&dir.join(LEDGER_DIR));
+        assert!(resumed.take_save(policy).is_none());
+        assert_eq!(resumed.save_held, Some(SaveHeld::DailyCap));
+        assert!(write_atomic(
+            &dir.join(LEDGER_DIR).join(SAVE_BUDGET_FILE),
+            b"broken"
+        ));
+        assert_eq!(
+            load_budget(&dir.join(LEDGER_DIR)).1,
+            SAVE_DAILY_BYTES as u64
+        );
+        println!("MONEY_P1B_IO reserved_bytes={charged} save_cap={SAVE_BYTES_PER_PAGE} daily_cap={SAVE_DAILY_BYTES} restart_refund=0");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn acknowledgement_deadline_keeps_fifo_custody_and_applies_each_memo_once() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-ack-deadline");
+        let keys = (0..4096)
+            .map(|at| super::super::family_key(&format!("ack-{at}")))
+            .collect::<Vec<_>>();
+        let mut ledger = ClaudeLedger::new_for_test();
+        let old_basis = ClaudeFamilyMemo {
+            removed_tokens: 42,
+            ..Default::default()
+        };
+        ledger.insert(
+            keys[3].clone(),
+            ClaudeRequestCensusRecord::family_record([7; 32], 5, old_basis),
+        );
+        let memos = keys
+            .iter()
+            .enumerate()
+            .map(|(at, key)| PendingMemo {
+                key: key.clone(),
+                basis: None,
+                observed_unix: 2,
+                published: ClaudeFamilyPublication {
+                    utc_day: 20261024,
+                    digest: at as u64,
+                    epoch: 8,
+                    attempted: 2,
+                },
+                row: true,
+                deferred: None,
+            })
+            .collect();
+        ledger.note_in_flight(keys.iter().map(String::as_str));
+        RESULTS.lock().unwrap().insert(
+            scratch.to_path_buf(),
+            VecDeque::from([WriteResult {
+                jsonl: JsonlOutcome {
+                    published: true,
+                    rows: 4097,
+                    ..Default::default()
+                },
+                memos,
+                ack_started: false,
+                failed_shards: Vec::new(),
+                meta_unwritten: None,
+                writer_us: 1,
+            }]),
+        );
+        let expired = Instant::now();
+        consume_results_until(&scratch, &mut ledger, expired, |_, _| {
+            panic!("expired ack must not enter")
+        });
+        assert!(expired.elapsed() <= super::super::PAGE_MAX_ELAPSED + Duration::from_millis(25));
+        assert!(keys.iter().all(|key| ledger.in_flight(key)));
+        let applied = std::cell::Cell::new(0_usize);
+        let mut outcomes = 0;
+        let mut counts = super::super::ClaudeRequestMoneyShadowCounts::default();
+        let mut apply = |ledger: &mut ClaudeLedger, event| match event {
+            Acknowledgement::Outcome(jsonl, _) => {
+                assert!(jsonl.published);
+                outcomes += 1;
+            }
+            Acknowledgement::Memo(memo, published) => {
+                assert!(published);
+                assert_eq!(
+                    memo.key,
+                    keys[applied.get()],
+                    "acknowledgements remain FIFO"
+                );
+                super::super::apply_published_memo(ledger, memo, &mut counts);
+                applied.set(applied.get() + 1);
+            }
+        };
+        consume_results_while(&scratch, &mut ledger, || applied.get() < 3, &mut apply);
+        assert_eq!(applied.get(), 3);
+        assert!(keys[..3].iter().all(|key| !ledger.in_flight(key)));
+        assert!(keys[3..].iter().all(|key| ledger.in_flight(key)));
+        let (_, basis) = ledger.get(&keys[3]).unwrap().family_memo().unwrap();
+        assert_eq!(basis.removed_tokens, 42);
+        assert!(
+            basis.published.is_none(),
+            "pending ack cannot advance its old basis/publication"
+        );
+        consume_results_until(
+            &scratch,
+            &mut ledger,
+            Instant::now() + Duration::from_secs(1),
+            &mut apply,
+        );
+        assert_eq!(applied.get(), keys.len());
+        assert!(keys.iter().all(|key| !ledger.in_flight(key)));
+        assert_eq!(
+            outcomes, 1,
+            "resuming a result must not duplicate its outcome counts"
+        );
+        assert_eq!(counts.family_memos_withheld, 0);
+        let (_, basis) = ledger.get(&keys[3]).unwrap().family_memo().unwrap();
+        assert_eq!(basis.removed_tokens, 42);
+        assert_eq!(basis.published.unwrap().digest, 3);
+        assert_eq!(
+            ledger.get(&keys[3]).unwrap().window(),
+            5,
+            "a later no-capture acknowledgement cannot roll back a newer consumed turn"
+        );
+        assert!(!RESULTS.lock().unwrap().contains_key(&*scratch));
+        println!("MONEY_P1B_ACK memos=4096 expired_applied=0 interrupted_applied=3 resumed_applied={} outcomes={outcomes} pending=0", applied.get());
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn physical_writer_charges_midnight_delays_and_blocks_clock_rollback() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-write-day");
+        let dir = scratch.join(LEDGER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let yesterday = super::super::utc_day(midnight - 1);
+        let set = |name: &str, day, bytes| {
+            assert!(write_atomic(
+                &dir.join(name),
+                format!("{{\"day\":{day},\"bytes\":{bytes}}}").as_bytes()
+            ))
+        };
+        set(SAVE_BUDGET_FILE, yesterday, SAVE_DAILY_BYTES);
+        set(WRITE_BUDGET_FILE, yesterday, SAVE_DAILY_BYTES - 2);
+        let save = ClaudeLedgerSave {
+            shards: vec![(0, b"{}".to_vec()), (1, b"{}".to_vec())],
+            ..Default::default()
+        };
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight - 1, midnight].into());
+        let mut state = WriterState::default();
+        let (failed, _) = write_save(&dir, &save, &mut state);
+        assert!(failed.is_empty());
+        assert_eq!(load_counter(&dir, WRITE_BUDGET_FILE), (today, 2));
+        // This queued prior-day save cannot spend today's physically used cap.
+        set(WRITE_BUDGET_FILE, today, SAVE_DAILY_BYTES - 2);
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight, midnight].into());
+        let (failed, _) = write_save(&dir, &save, &mut WriterState::default());
+        assert_eq!(failed, vec![1]);
+        assert_eq!(
+            load_counter(&dir, WRITE_BUDGET_FILE),
+            (today, SAVE_DAILY_BYTES as u64)
+        );
+        // Drop all writer memory: both counters still prevent rollback credit.
+        assert_eq!(reserve_credit(&scratch, yesterday).bytes, 0);
+        WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight - 1].into());
+        assert!(!write_shard(&dir, 2, b"{}"));
+        assert!(!shard_path(&dir, 2).exists());
+        assert_eq!(
+            load_counter(&dir, WRITE_BUDGET_FILE),
+            (today, SAVE_DAILY_BYTES as u64)
+        );
+        assert!(WRITE_CLOCK.with(|clock| clock.borrow().is_empty()));
+        println!("MONEY_P1B_PHYSICAL daily_cap={SAVE_DAILY_BYTES} midnight_day_bytes=2 exhausted_bytes={} rollback_grant=0", load_counter(&dir, WRITE_BUDGET_FILE).1);
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn broken_or_deleted_accounting_preserves_siblings_and_exhausts_initialized_day() {
+        for missing in [false, true] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-quota-load");
+            let mut ledger = ClaudeLedger::new_for_test();
+            let key = "fam:valid-sibling";
+            let record = ClaudeRequestCensusRecord::family_record(
+                [1; 32],
+                super::super::now_unix(),
+                Default::default(),
+            );
+            ledger.insert(key.to_owned(), record.clone());
+            assert_eq!(
+                save_page_for_test(&scratch, &mut ledger, &mut WriterState::default())
+                    .unwrap()
+                    .2,
+                0
+            );
+            let path = scratch.join(LEDGER_DIR).join(SAVE_BUDGET_FILE);
+            if missing {
+                std::fs::remove_file(path).unwrap();
+            } else {
+                std::fs::write(path, b"broken").unwrap();
+            }
+            let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
+            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert!(!loaded.load_damaged);
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
+            // Exercise the actual async writer request, not just the parser.
+            assert!(submit(Job::Reserve(scratch.to_path_buf(), loaded.save_day)).is_ok());
+            flush();
+            take_results(&scratch, &mut loaded);
+            assert_eq!(loaded.save_credit, 0);
+            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
+        }
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn quota_quarantine_is_persisted_once_then_recovers_the_next_day() {
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let tomorrow = super::super::utc_day(midnight + 86_400);
+        // Upgrade with no counters, corrupt either counter, and lost save
+        // accounting all preserve siblings and recover without intervention.
+        for (name, damaged) in [
+            (None, false),
+            (Some(WRITE_BUDGET_FILE), false),
+            (Some(WRITE_BUDGET_FILE), true),
+            (Some(SAVE_BUDGET_FILE), true),
+            (Some(SAVE_BUDGET_FILE), false),
+        ] {
+            let scratch = crate::test_scratch::ScratchDir::new("money-quota-next-day");
+            let dir = scratch.join(LEDGER_DIR);
+            let key = "fam:upgrade-sibling";
+            let record =
+                ClaudeRequestCensusRecord::family_record([1; 32], midnight, Default::default());
+            let mut ledger = ClaudeLedger::new_for_test();
+            ledger.insert(key.to_owned(), record.clone());
+            assert_eq!(
+                save_page_for_test(&scratch, &mut ledger, &mut WriterState::default())
+                    .unwrap()
+                    .2,
+                0
+            );
+            // Model an actual pre-witness upgrade, not deletion after use.
+            std::fs::remove_file(dir.join(QUOTA_WITNESS_FILE)).unwrap();
+            for counter in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
+                if name.is_none() || name == Some(counter) {
+                    let path = dir.join(counter);
+                    if damaged {
+                        std::fs::write(path, b"broken").unwrap();
+                    } else {
+                        std::fs::remove_file(path).unwrap();
+                    }
+                }
+            }
+            assert_eq!(
+                reserve_credit(&scratch, today).bytes,
+                if damaged { 0 } else { SAVE_BYTES_PER_PAGE }
+            );
+            let held = load_counters(&dir, today);
+            if damaged {
+                assert!(
+                    held.0 .1 == SAVE_DAILY_BYTES as u64 || held.1 .1 == SAVE_DAILY_BYTES as u64
+                );
+            } else {
+                assert_eq!(held.0 .0, today);
+                assert!(
+                    held.0 .1 >= SAVE_BYTES_PER_PAGE as u64 && held.0 .1 < SAVE_DAILY_BYTES as u64
+                );
+                assert!(held.1 .1 < SAVE_DAILY_BYTES as u64);
+            }
+            assert_eq!(load(&scratch).unwrap().get(key), Some((&record).into()));
+            if name != Some(SAVE_BUDGET_FILE) {
+                WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight].into());
+                assert_eq!(write_shard(&dir, META, b"{}"), !damaged);
+            }
+            // Reopening tomorrow must see yesterday's persisted hold, not
+            // synthesize another exhausted current-day counter.
+            let persisted = load_counters(&dir, today);
+            assert_eq!(load_counters(&dir, tomorrow), persisted);
+            let credit = reserve_credit(&scratch, tomorrow);
+            assert_eq!((credit.day, credit.bytes), (tomorrow, SAVE_BYTES_PER_PAGE));
+            WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight + 86_400].into());
+            assert!(write_shard(&dir, META, b"{}"));
+            assert_eq!(load_counters(&dir, tomorrow).1, (tomorrow, 2));
+            assert_eq!(
+                reserve_credit(&scratch, today).bytes,
+                0,
+                "rollback cannot reset repaired accounting"
+            );
+            assert_eq!(load(&scratch).unwrap().get(key), Some((&record).into()));
+        }
+        println!("MONEY_P1B_QUOTA_RECOVERY upgrade_hold_days=0 corrupt_hold_days=1 missing_save_hold_days=0 next_day_ticket={} rollback_grant=0", SAVE_BYTES_PER_PAGE);
+    }
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn deleting_both_counters_after_spending_never_grants_repeat_credit() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-quota-deletion");
+        let dir = scratch.join(LEDGER_DIR);
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let tomorrow = super::super::utc_day(midnight + 86_400);
+        let key = "fam:deletion-sibling";
+        let record =
+            ClaudeRequestCensusRecord::family_record([3; 32], midnight, Default::default());
+        let mut ledger = ClaudeLedger::new_for_test();
+        ledger.insert(key.to_owned(), record.clone());
+        assert_eq!(
+            save_page_for_test(&scratch, &mut ledger, &mut WriterState::default())
+                .unwrap()
+                .2,
+            0
+        );
+        assert!(dir.join(QUOTA_WITNESS_FILE).exists());
+        // Spend the remainder after the first non-refundable save ticket.
+        while reserve_credit(&scratch, today).bytes > 0 {}
+        for _ in 0..3 {
+            for name in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
+                std::fs::remove_file(dir.join(name)).unwrap();
+            }
+            restart_for_test(&scratch);
+            let loaded = load(&scratch).unwrap();
+            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert_eq!(reserve_credit(&scratch, today).bytes, 0);
+            assert_eq!(
+                load_counters(&dir, today),
+                (
+                    (today, SAVE_DAILY_BYTES as u64),
+                    (today, SAVE_DAILY_BYTES as u64)
+                )
+            );
+            WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight].into());
+            assert!(!write_shard(&dir, 0, b"{}"));
+        }
+        assert_eq!(
+            reserve_credit(&scratch, tomorrow).bytes,
+            SAVE_BYTES_PER_PAGE
+        );
+        // The ledger witness retains the maximum day even if BOTH counters
+        // disappear and the wall clock rolls back.
+        for name in [SAVE_BUDGET_FILE, WRITE_BUDGET_FILE] {
+            std::fs::remove_file(dir.join(name)).unwrap();
+        }
+        restart_for_test(&scratch);
+        assert_eq!(reserve_credit(&scratch, today).bytes, 0);
+        assert_eq!(reserve_credit(&scratch, tomorrow).bytes, 0);
+        let later = super::super::utc_day(midnight + 2 * 86_400);
+        assert_eq!(reserve_credit(&scratch, later).bytes, SAVE_BYTES_PER_PAGE);
+        println!("MONEY_P1B_QUOTA_DELETION restarts=3 same_day_extra_tickets=0 rollback_grant=0 next_day_ticket={SAVE_BYTES_PER_PAGE}");
+    }
+
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn quota_repair_keeps_sibling_high_water_and_failed_repairs_closed() {
+        let scratch = crate::test_scratch::ScratchDir::new("money-quota-repair-rollback");
+        let dir = scratch.join(LEDGER_DIR);
+        std::fs::create_dir_all(&dir).unwrap();
+        let midnight = super::super::now_unix() / 86_400 * 86_400;
+        let today = super::super::utc_day(midnight);
+        let tomorrow = super::super::utc_day(midnight + 86_400);
+        assert!(write_atomic(
+            &dir.join(SAVE_BUDGET_FILE),
+            format!("{{\"day\":{tomorrow},\"bytes\":123}}").as_bytes()
+        ));
+        std::fs::write(dir.join(WRITE_BUDGET_FILE), b"broken").unwrap();
+        let repaired = load_counters(&dir, today);
+        assert_eq!(
+            repaired,
+            ((tomorrow, 123), (tomorrow, SAVE_DAILY_BYTES as u64))
+        );
+        assert_eq!(reserve_credit(&scratch, today).bytes, 0);
+        assert_eq!(reserve_credit(&scratch, tomorrow).bytes, 0);
+        let later = super::super::utc_day(midnight + 2 * 86_400);
+        assert_eq!(reserve_credit(&scratch, later).bytes, SAVE_BYTES_PER_PAGE);
+        #[cfg(unix)]
+        {
+            // An existing but unreadable entry is damage, not upgrade absence.
+            std::fs::remove_file(dir.join(WRITE_BUDGET_FILE)).unwrap();
+            std::os::unix::fs::symlink(dir.join("absent-target"), dir.join(WRITE_BUDGET_FILE))
+                .unwrap();
+            assert_eq!(reserve_credit(&scratch, later).bytes, 0);
+            assert_eq!(
+                load_counters(&dir, later).1,
+                (later, SAVE_DAILY_BYTES as u64)
+            );
+        }
+        // A failed atomic repair cannot be treated as a fresh allowance.
+        std::fs::write(dir.join(WRITE_BUDGET_FILE), b"broken").unwrap();
+        let staged = dir.join(WRITE_BUDGET_FILE).with_extension("json.tmp");
+        std::fs::create_dir(&staged).unwrap();
+        assert_eq!(reserve_credit(&scratch, later).bytes, 0);
+        assert_eq!(
+            std::fs::read(dir.join(WRITE_BUDGET_FILE)).unwrap(),
+            b"broken"
+        );
+        std::fs::remove_dir(staged).unwrap();
+        assert_eq!(reserve_credit(&scratch, later).bytes, 0);
+        assert_eq!(
+            load_counters(&dir, later).1,
+            (later, SAVE_DAILY_BYTES as u64)
+        );
     }
 }

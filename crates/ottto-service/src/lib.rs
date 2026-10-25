@@ -31,6 +31,7 @@ pub mod detected_uses;
 mod external_scheduler_attribution;
 #[cfg(unix)]
 pub(crate) mod fd_guard;
+mod instruction_inventory;
 pub mod keychain;
 mod launch_events;
 pub mod legacy_service;
@@ -1511,6 +1512,19 @@ impl LocalDaemon {
         Ok(())
     }
 
+    /// True when this Mac is bound to an account but has no usable setup run:
+    /// no setup-run binding is left, or Ottto's latest authoritative answer
+    /// for the binding was terminal (an ended run or a refused device
+    /// credential). Sign-in may then start a fresh claim over the bound
+    /// account; completing it for the same user replaces the binding.
+    pub(crate) fn connected_setup_run_needs_reconnect(&self) -> Result<bool, LocalApiError> {
+        if self.connection_for_authorized_client()?.is_none() {
+            return Ok(true);
+        }
+        let state = self.state()?;
+        Ok(latest_setup_run_read_rejection(&state.local_health_events).is_some())
+    }
+
     /// Clear a recorded setup-run read rejection after a successful read
     /// that started with the current binding. Only the rejection that was
     /// already current when the read started is cleared: reads of one
@@ -2659,6 +2673,36 @@ fn local_health_source_for_status(
     source: &SourceHealth,
     projection_revision: u64,
 ) -> LocalHealthSourceV1 {
+    let snapshot_source = match source.source {
+        SourceKind::ClaudeCode => snapshots::SnapshotSource::ClaudeCode,
+        SourceKind::Codex => snapshots::SnapshotSource::Codex,
+        SourceKind::Pi => snapshots::SnapshotSource::Pi,
+    };
+    if snapshots::scan_index_rebuild_paused(snapshot_source) {
+        return LocalHealthSourceV1 {
+            source_id: format!("src_{}", source_slug(&source.source)),
+            app: source.source.clone(),
+            state: LocalHealthSourceState::RepairRequired,
+            authority: LocalHealthAuthority::Runtime,
+            authority_at: current_rfc3339_timestamp(),
+            projection_revision: projection_revision.saturating_sub(1),
+            blocking_reason: Some(snapshots::SCAN_INDEX_REBUILD_LOOP_CODE.to_string()),
+            next_action: Some("review_scan_index_repair".to_string()),
+            // The automatic retry time is the guard's own witness stamp plus
+            // seven days; a user Repair may run one gated rebuild sooner.
+            // A refused override (SI-718-O1) names its code; the source and
+            // its index stay as they were.
+            clear_condition: Some(format!(
+                "successful compatible scan-index load after a user Repair (one gated rebuild per 24 h) or the automatic retry{}{}; preserve the index and quarantine witnesses, never delete the index",
+                snapshots::scan_index_rebuild_auto_retry_at(snapshot_source)
+                    .map(|at| format!(" (auto_retry_at={at})"))
+                    .unwrap_or_default(),
+                snapshots::scan_index_rebuild_override_refusal(snapshot_source)
+                    .map(|code| format!(" (override_refused={code})"))
+                    .unwrap_or_default()
+            )),
+        };
+    }
     let has_verify_attention =
         source.last_verified_at.is_some() && has_verification_failure_problem(source);
     let authority = if source.last_verified_at.is_some() {
@@ -5380,6 +5424,128 @@ mod tests {
         assert_eq!(status.sources.len(), 1);
         assert_eq!(status.sources[0].source, SourceKind::Codex);
         assert_eq!(status.sources[0].state, SourceState::Healthy);
+    }
+
+    #[test]
+    fn rebuild_loop_pause_is_a_server_visible_canonical_source_blocker() {
+        use snapshots::{ScanIndex, SnapshotSource};
+        let daemon = daemon().with_account(account("user_1", "ron@example.com"));
+        let mut sibling = codex_health();
+        sibling.source = SourceKind::Pi;
+        sibling.descriptor = source_descriptor(&SourceKind::Pi);
+        daemon
+            .update_sources(TOKEN, vec![codex_health(), sibling])
+            .unwrap();
+        let scratch = crate::test_scratch::ScratchDir::new("rebuild-loop-source-health");
+        let path = scratch.as_ref().join("index.json");
+        std::fs::write(&path, b"{").unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Quarantined);
+        let original = b"{ ";
+        std::fs::write(&path, original).unwrap();
+        let error = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("scan_index_rebuild_loop"));
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let status = daemon.status(TOKEN).unwrap();
+        let health = status.canonical_health.unwrap();
+        let source = health
+            .sources
+            .iter()
+            .find(|s| s.app == SourceKind::Codex)
+            .unwrap();
+        assert_eq!(source.state, LocalHealthSourceState::RepairRequired);
+        assert_eq!(
+            source.blocking_reason.as_deref(),
+            Some("scan_index_rebuild_loop")
+        );
+        assert_eq!(source.authority, LocalHealthAuthority::Runtime);
+        assert!(source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .contains("never delete the index"));
+        // The automatic retry time rides in the existing clear_condition:
+        // seven days after the quarantine witness this pause read.
+        let retry_at = source
+            .clear_condition
+            .as_deref()
+            .unwrap()
+            .split_once("auto_retry_at=")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(at, _)| at)
+            .expect("clear_condition names auto_retry_at");
+        let retry_at =
+            time::OffsetDateTime::parse(retry_at, &time::format_description::well_known::Rfc3339)
+                .unwrap();
+        let week_out = time::OffsetDateTime::now_utc() + time::Duration::days(7);
+        assert!((retry_at - week_out).abs() < time::Duration::minutes(5));
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.clear_condition.contains("auto_retry_at=")));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Pi)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
+        assert!(health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"
+                && b.severity == LocalHealthSeverity::Blocking));
+        assert_ne!(health.overall.state, LocalHealthOverallState::Healthy);
+        // This is the same typed payload upload_local_health_projection posts.
+        let wire = serde_json::to_value(&health).unwrap();
+        assert!(wire["sources"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["blocking_reason"] == "scan_index_rebuild_loop"));
+        assert!(wire["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|b| b["code"] == "scan_index_rebuild_loop"));
+
+        // Reviewed repair restores a compatible index; the next actual load
+        // clears only this source's runtime pause without a daemon restart.
+        std::fs::write(&path, serde_json::to_vec(&ScanIndex::default()).unwrap()).unwrap();
+        let (_, origin) = ScanIndex::load_for_snapshot_source_with_origin(
+            &path,
+            SnapshotSource::Codex,
+            scratch.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(origin, snapshots::ScanIndexLoadOrigin::Loaded);
+        let health = daemon.status(TOKEN).unwrap().canonical_health.unwrap();
+        assert!(!health
+            .blockers
+            .iter()
+            .any(|b| b.code == "scan_index_rebuild_loop"));
+        assert_eq!(
+            health
+                .sources
+                .iter()
+                .find(|s| s.app == SourceKind::Codex)
+                .unwrap()
+                .state,
+            LocalHealthSourceState::Healthy
+        );
     }
 
     #[test]

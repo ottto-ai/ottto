@@ -1,7 +1,7 @@
 //! Local-only, content-free witnesses of actual traversal decisions.
 //! No paths, identities, arbitrary strings, persisted fields or extra scans.
 use super::{
-    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ScanIndex,
+    disappearance_diagnostics, rfc3339_unix_seconds, CensusGates, ClaudeAbsenceCounters, ScanIndex,
     ScanTraversalCheckpoint, ScanTraversalCounts, SnapshotSource, UnsettledUploadCause,
 };
 use serde::Serialize;
@@ -28,6 +28,10 @@ struct Previous {
     counts: ScanTraversalCounts,
 }
 
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
 #[derive(Serialize)]
 pub(super) struct Starting {
     event: &'static str,
@@ -46,6 +50,22 @@ pub(super) struct Starting {
     pub(super) rearmed_index_files: usize,
     pub(super) carried_pending_families: usize,
     pub(super) carried_index_files: usize,
+    /// Fix 2: stale families whose pending came from a full-rearm window,
+    /// how many of them were carried, the files of the rest re-read whole,
+    /// and the families and files the per-deadline cap kept without reparse.
+    /// Omitted while zero, so every other start row keeps its bytes.
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_carried_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_rearmed_files: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) rearm_window_rearmed_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_rearm_capped_families: usize,
+    #[serde(skip_serializing_if = "is_zero")]
+    pub(super) stale_rearm_capped_files: usize,
     disappearance_process_totals_v1: disappearance_diagnostics::Totals,
 }
 
@@ -90,6 +110,12 @@ impl Starting {
             rearmed_index_files: 0,
             carried_pending_families: 0,
             carried_index_files: 0,
+            rearm_window_families: 0,
+            rearm_window_carried_families: 0,
+            rearm_window_rearmed_files: 0,
+            rearm_window_rearmed_families: 0,
+            stale_rearm_capped_families: 0,
+            stale_rearm_capped_files: 0,
         }
     }
 
@@ -113,6 +139,7 @@ pub(super) fn retiring(
     traversal: &ScanTraversalCheckpoint,
     raw_complete: bool,
     unsettled_causes: u16,
+    absence: Option<(ClaudeAbsenceCounters, bool)>,
     gates: CensusGates,
 ) {
     #[derive(Serialize)]
@@ -127,6 +154,29 @@ pub(super) fn retiring(
         unsettled_causes: Vec<&'static str>,
         counts: &'a ScanTraversalCounts,
         disappearance_process_totals_v1: disappearance_diagnostics::Totals,
+        /// Claude only: path-(a) absence retirement process totals (SOURCE
+        /// Rounds 11-13, COST names), and the index's tombstone uncertainty
+        /// fence.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_retry_pending_retired: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_hits: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        retirements_refused: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tombstone_decode_drops: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstones_cleared: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_capacity_refusals: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_uncertain: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        tombstone_fence_raised_on_upgrade: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        absent_family_tombstone_aged_out: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fence_lowering_skipped_scratch_fallback: Option<u64>,
     }
     let reason = if raw_complete {
         if gates.clean_followup {
@@ -151,6 +201,20 @@ pub(super) fn retiring(
             unsettled_causes: UnsettledUploadCause::names(unsettled_causes),
             counts: &traversal.counts,
             disappearance_process_totals_v1: disappearance_diagnostics::snapshot(source),
+            absent_retry_pending_retired: absence.map(|(counts, _)| counts.absent_families_retired),
+            absent_family_tombstone_hits: absence.map(|(counts, _)| counts.tombstone_hits),
+            retirements_refused: absence.map(|(counts, _)| counts.retirements_refused),
+            tombstone_decode_drops: absence.map(|(counts, _)| counts.tombstone_decode_drops),
+            absent_family_tombstones_cleared: absence.map(|(counts, _)| counts.tombstones_cleared),
+            absent_family_tombstone_capacity_refusals: absence
+                .map(|(counts, _)| counts.tombstone_capacity_refusals),
+            absent_family_tombstone_uncertain: absence.map(|(_, uncertain)| uncertain),
+            tombstone_fence_raised_on_upgrade: absence
+                .map(|(counts, _)| counts.tombstone_fence_raised_on_upgrade),
+            absent_family_tombstone_aged_out: absence
+                .map(|(counts, _)| counts.absent_family_tombstone_aged_out),
+            fence_lowering_skipped_scratch_fallback: absence
+                .map(|(counts, _)| counts.fence_lowering_skipped_scratch_fallback),
         },
     );
 }
@@ -845,6 +909,21 @@ mod tests {
                     index.traversal.as_ref().unwrap(),
                     true,
                     u16::MAX,
+                    // `false` is the longer spelling of the fence state.
+                    (source == SnapshotSource::ClaudeCode).then_some((
+                        ClaudeAbsenceCounters {
+                            absent_families_retired: u64::MAX,
+                            tombstone_hits: u64::MAX,
+                            retirements_refused: u64::MAX,
+                            tombstone_decode_drops: u64::MAX,
+                            tombstones_cleared: u64::MAX,
+                            tombstone_capacity_refusals: u64::MAX,
+                            tombstone_fence_raised_on_upgrade: u64::MAX,
+                            absent_family_tombstone_aged_out: u64::MAX,
+                            fence_lowering_skipped_scratch_fallback: u64::MAX,
+                        },
+                        false,
+                    )),
                     CensusGates {
                         clean_followup: true,
                         ..Default::default()
@@ -862,5 +941,128 @@ mod tests {
             );
             assert_complete_max_row(rows[0].clone());
         }
+    }
+    // SOURCE Round 13 F3: the Claude retiring row names every absence total
+    // and the fence state with their values (Round 15: and the upgrade fence
+    // count; Round 16, SOURCE h733: the aged-out tombstone and refused-drain
+    // counts); other sources omit them all.
+    #[test]
+    fn claude_retiring_rows_publish_the_absence_totals_and_fence_state() {
+        const NAMES: [&str; 10] = [
+            "absent_retry_pending_retired",
+            "absent_family_tombstone_hits",
+            "retirements_refused",
+            "tombstone_decode_drops",
+            "absent_family_tombstones_cleared",
+            "absent_family_tombstone_capacity_refusals",
+            "absent_family_tombstone_uncertain",
+            "tombstone_fence_raised_on_upgrade",
+            "absent_family_tombstone_aged_out",
+            "fence_lowering_skipped_scratch_fallback",
+        ];
+        for source in [
+            SnapshotSource::Codex,
+            SnapshotSource::ClaudeCode,
+            SnapshotSource::Pi,
+        ] {
+            for uncertain in [false, true] {
+                let mut index = ScanIndex::default();
+                ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
+                let (_, rows) = capture(|| {
+                    retiring(
+                        source,
+                        7,
+                        index.traversal.as_ref().unwrap(),
+                        true,
+                        0,
+                        (source == SnapshotSource::ClaudeCode).then_some((
+                            ClaudeAbsenceCounters {
+                                absent_families_retired: 1,
+                                tombstone_hits: 2,
+                                retirements_refused: 3,
+                                tombstone_decode_drops: 4,
+                                tombstones_cleared: 5,
+                                tombstone_capacity_refusals: 6,
+                                tombstone_fence_raised_on_upgrade: 8,
+                                absent_family_tombstone_aged_out: 9,
+                                fence_lowering_skipped_scratch_fallback: 10,
+                            },
+                            uncertain,
+                        )),
+                        CensusGates::default(),
+                    )
+                });
+                assert_eq!(rows.len(), 1);
+                let counts = &rows[0]["counts"];
+                if source == SnapshotSource::ClaudeCode {
+                    for (name, value) in NAMES.iter().zip(1..) {
+                        if *name == "absent_family_tombstone_uncertain" {
+                            assert_eq!(counts[*name], json!(uncertain), "{name}");
+                        } else {
+                            assert_eq!(counts[*name], json!(value), "{name}");
+                        }
+                    }
+                } else {
+                    for name in NAMES {
+                        assert!(counts.get(name).is_none(), "{source:?}: {name}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Fix 2's start counts are omitted while zero, so every other start row
+    /// keeps its bytes, and at maximum width the row stays within budget.
+    #[test]
+    fn full_rearm_window_start_counts_are_omitted_at_zero_and_bounded() {
+        const FIELDS: [&str; 6] = [
+            "rearm_window_families",
+            "rearm_window_carried_families",
+            "rearm_window_rearmed_files",
+            "rearm_window_rearmed_families",
+            "stale_rearm_capped_families",
+            "stale_rearm_capped_files",
+        ];
+        let source = SnapshotSource::ClaudeCode;
+        let mut index = ScanIndex::default();
+        ensure_bounded_traversal(source, &[], &mut index, T0, BACKFILL_WINDOW_DAYS);
+        let (_, rows) = capture(|| Starting::capture(source, &index, T1, true, 1).emit(source));
+        for field in FIELDS {
+            assert!(rows[0]["counts"].get(field).is_none(), "{field}");
+        }
+
+        index.generation = u64::MAX;
+        index.traversal.as_mut().unwrap().counts = max_traversal_counts();
+        let mut starting = Starting::capture(source, &index, T1, true, u8::MAX);
+        starting.context_matches = false;
+        starting.prior_unsettled_upload = false;
+        starting.prior_unsettled_causes = UnsettledUploadCause::names(u16::MAX);
+        starting.retry_due = Some(false);
+        starting.stale_pending_families = usize::MAX;
+        starting.rearmed_index_files = usize::MAX;
+        starting.carried_pending_families = usize::MAX;
+        starting.carried_index_files = usize::MAX;
+        starting.rearm_window_families = usize::MAX;
+        starting.rearm_window_carried_families = usize::MAX;
+        starting.rearm_window_rearmed_files = usize::MAX;
+        starting.rearm_window_rearmed_families = usize::MAX;
+        starting.stale_rearm_capped_families = usize::MAX;
+        starting.stale_rearm_capped_files = usize::MAX;
+        starting.disappearance_process_totals_v1 = disappearance_diagnostics::Totals::maximum();
+        let previous = starting.previous.as_mut().unwrap();
+        previous.window_unix_seconds = Some(u64::MAX);
+        previous.pending_directories = usize::MAX;
+        previous.pending_candidates = usize::MAX;
+        previous.retry_attempt = u8::MAX;
+        previous.retry_not_before_unix_seconds = Some(u64::MAX);
+        previous.watcher_overflow = false;
+        previous.retryable_problems = false;
+        previous.unsettled_residue = false;
+        let (_, rows) = capture(|| starting.emit(source));
+        assert_eq!(rows.len(), 1);
+        for field in FIELDS {
+            assert_eq!(rows[0]["counts"][field], json!(usize::MAX), "{field}");
+        }
+        assert_complete_max_row(rows[0].clone());
     }
 }

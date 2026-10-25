@@ -1514,6 +1514,9 @@ pub(crate) fn forget(support: &Path) {
 }
 
 impl crate::snapshots::ClaudeHistoryEmissionItem for Entity {
+    fn request_owned_literal(&self) -> bool {
+        self.literal
+    }
     fn source_file_fingerprint(&self) -> Option<&str> {
         self.source_fingerprint.as_deref()
     }
@@ -2028,21 +2031,24 @@ fn encode(request: &SnapshotBatchRequest, head_cas: bool) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
-/// The production LiteralGuard has not yet been composed into this branch.
-/// Fail closed until owner B supplies it; this is NOT a second implementation
-/// of that guard. Tests below exercise the integration's required contract.
+/// Reuse owner B's current LiteralGuard for the complete immutable batch.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum LiteralPermit {
     Permit,
     DenyAll,
     Unavailable,
 }
-pub(super) fn current_literal_guard(_index: &ScanIndex, _m: &Manifest) -> LiteralPermit {
+pub(super) fn current_literal_guard(index: &ScanIndex, m: &Manifest) -> LiteralPermit {
     #[cfg(test)]
     if let Some(permit) = TEST_LITERAL_GUARD.with(std::cell::Cell::get) {
         return permit;
     }
-    LiteralPermit::Unavailable
+    let guard = index.claude_literal_guard(&m.entities);
+    if m.entities.iter().all(|entity| guard.permits(entity)) {
+        LiteralPermit::Permit
+    } else {
+        LiteralPermit::DenyAll
+    }
 }
 #[cfg(test)]
 thread_local! { static TEST_LITERAL_GUARD: std::cell::Cell<Option<LiteralPermit>> = const { std::cell::Cell::new(None) }; }

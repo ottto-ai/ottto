@@ -837,6 +837,31 @@ impl Custody {
                 })
         })
     }
+    pub(crate) fn records_with_prefix_after<'a>(
+        &'a self,
+        prefix: &'a str,
+        after: &'a str,
+    ) -> impl Iterator<Item = (String, RecordRef<'a>)> + 'a {
+        let mut nearest = std::collections::BinaryHeap::new();
+        for (key, record) in self
+            .records_with_prefix(prefix)
+            .filter(|(key, _)| key.as_str() > after)
+        {
+            if nearest.len() < 256 {
+                nearest.push(KeyedRecord(key, record));
+            } else if nearest
+                .peek()
+                .is_some_and(|last: &KeyedRecord<'_>| key < last.0)
+            {
+                nearest.pop();
+                nearest.push(KeyedRecord(key, record));
+            }
+        }
+        nearest
+            .into_sorted_vec()
+            .into_iter()
+            .map(|item| (item.0, item.1))
+    }
     pub(crate) fn records_after<'a>(
         &'a self,
         cursor: &'a str,
@@ -1547,6 +1572,8 @@ struct Sweep {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Memo {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    published: Option<super::super::claude_request_census::ClaudeFamilyPublication>,
     #[serde(with = "digest_wire")]
     revision: [u8; 32],
     observed: u64,
@@ -3276,6 +3303,7 @@ mod compact_layout_tests {
                     [4; 32],
                     7,
                     super::super::super::claude_request_census::ClaudeFamilyMemo {
+                        published: None,
                         removed_requests: 2,
                         removed_tokens: 3,
                         snapshot: 4,
