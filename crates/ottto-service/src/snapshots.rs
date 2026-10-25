@@ -23221,6 +23221,9 @@ pub(crate) struct OwnedSourceScan {
     resource_probe: crate::local_resource_diagnostics::Probe,
     sampling: Option<sampled_scan::Context>,
     source: SnapshotSource,
+    /// Configured scan roots, for a Codex census close that starts the next
+    /// generation in the same page (G1 carry).
+    roots: Vec<PathBuf>,
     index: ScanIndex,
     collected_at: String,
     backfill_window_days: u64,
@@ -24241,6 +24244,7 @@ impl OwnedSourceScan {
             resource_probe,
             sampling: None,
             source,
+            roots: roots.to_vec(),
             index: owned_index,
             collected_at: collected_at.to_owned(),
             backfill_window_days,
@@ -24403,6 +24407,7 @@ impl OwnedSourceScan {
             mut sampling,
             index: mut index_storage,
             source,
+            roots,
             collected_at,
             backfill_window_days,
             file_limit,
@@ -27916,6 +27921,7 @@ impl OwnedSourceScan {
                     );
                 }
                 let mut terminal_native_traversal = None;
+                let mut carried_next_generation = Vec::new();
                 if (raw_census_complete
                     && codex_legacy_join_baselines.is_empty()
                     && !pending_finalization.iter().any(|pending| {
@@ -27958,6 +27964,23 @@ impl OwnedSourceScan {
                         raw_census_complete,
                         &census_window_end,
                     );
+                    // G1 carry: the closing generation's waiting re-reads
+                    // (watcher hints, budget-deferred re-reads, growth past
+                    // its window end) are next-generation evidence. Hand them
+                    // to the next generation as members rather than dropping
+                    // them; they never re-enter the generation closing here.
+                    carried_next_generation = index
+                        .traversal
+                        .as_ref()
+                        .filter(|_| source == SnapshotSource::Codex)
+                        .map_or_else(Vec::new, |traversal| {
+                            traversal
+                                .pending_candidates
+                                .iter()
+                                .filter(|candidate| !candidate.census_member)
+                                .map(|candidate| candidate.path.clone())
+                                .collect::<Vec<_>>()
+                        });
                     index.traversal = None;
                     index.resume_after_path = None;
                     index.resume_upper_bound_path = None;
@@ -28013,6 +28036,23 @@ impl OwnedSourceScan {
                 }
                 if !index.decode_holds.is_empty() {
                     index.mark_bounded_sweep_unsettled();
+                }
+                // Only a settled close starts the next generation in this
+                // page. A partially settled sweep (including a decode hold
+                // just marked) keeps its marker for the clean follow-up the
+                // next page starts, and that walk re-reads the stale files.
+                if !carried_next_generation.is_empty() && !index.bounded_sweep_had_unsettled_upload
+                {
+                    ensure_bounded_traversal(
+                        source,
+                        &roots,
+                        index,
+                        &collected_at,
+                        backfill_window_days,
+                    );
+                    if let Some(next) = index.traversal.as_mut() {
+                        enqueue_watcher_hints(source, next, &carried_next_generation, false);
+                    }
                 }
                 if source == SnapshotSource::ClaudeCode {
                     seal_claude_complete_rebuild_read(
@@ -29410,6 +29450,7 @@ impl OwnedSourceScan {
             resource_probe,
             sampling,
             source,
+            roots,
             index: index_storage,
             collected_at,
             backfill_window_days,
@@ -82359,7 +82400,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
 crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
-crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
+crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, roots, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass, continuation_ticket);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
 crate::heap_layout_bound::fields!(PiUsageDedupState; message, message_end, paired_digests);
 crate::heap_layout_bound::fields!(RowKey; model, selector_hash, reasoning_effort, auth_mode, billing_channel, billing_provider, gateway_provider, model_provider, subscription_product);

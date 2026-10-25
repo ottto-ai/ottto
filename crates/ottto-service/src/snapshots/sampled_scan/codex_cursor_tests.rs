@@ -3445,7 +3445,9 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
         let mut index = ScanIndex::default();
         let mut page_number = 0_u64;
         let mut closed = None;
+        let mut closing_token = None;
         while page_number < bound {
+            closing_token = census_token(&index);
             let hints = if page_number == 0 {
                 Vec::new()
             } else {
@@ -3477,7 +3479,15 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
                 counters(&cache)
             )
         });
-        assert!(index.traversal.is_none(), "the closed generation retired");
+        // The closed generation retired. Re-reads still waiting then were
+        // carried into the next generation, each as a census member of it.
+        if let Some(traversal) = &index.traversal {
+            assert_ne!(census_token(&index), closing_token, "a new generation");
+            assert!(traversal
+                .pending_candidates
+                .iter()
+                .all(|candidate| candidate.census_member));
+        }
         assert_eq!(
             counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified),
             1
@@ -3533,6 +3543,145 @@ fn growing_generation_with_large_file_closes_within_bounded_pages() {
         })
         .collect::<BTreeMap<_, _>>();
     assert_eq!(expected.len(), sessions.len());
+    assert_eq!(latest, expected);
+}
+
+/// G1 carry: a census that closes while a re-read is still waiting hands it
+/// to the next generation as a member instead of dropping it. Two small
+/// files, one full read per page. Page 0 reads one (X) and defers the other
+/// (Y). X then grows and is hinted with its retained state gone: a re-read,
+/// not a member. Page 1 reads the member Y first, the budget defers X, and the
+/// census closes with X waiting. The closed generation never takes X back;
+/// the next one holds it as a member and reads it exactly once, and the
+/// published totals equal a fresh full read (no byte lost, none twice).
+#[test]
+fn census_close_carries_a_waiting_reread_into_the_next_generation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const SESSIONS: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777721",
+        "019fa111-2222-7333-8444-777777777722",
+    ];
+    let fixture = ScanRoot::with_sessions(&[(SESSIONS[0], 4), (SESSIONS[1], 4)]);
+    let small = fixture.len(SESSIONS[0]);
+    assert_eq!(fixture.len(SESSIONS[1]), small);
+    // One full read per page, and a grown file still fits alone.
+    let singleton = small + small / 2;
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        for item in &scan.snapshots {
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+    };
+    let waiting = |index: &ScanIndex, path: &Path| {
+        index.traversal.as_ref().and_then(|traversal| {
+            traversal
+                .pending_candidates
+                .iter()
+                .find(|pending| pending.path == path)
+                .map(|pending| (pending.census_member, pending.watcher_hint))
+        })
+    };
+    with_test_limits(2048, singleton, 64, || {
+        let (index, scan) = hinted_page(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+        );
+        record(&scan);
+        assert!(!scan.census_complete, "one file is deferred");
+        let [x, y] = if waiting(&index, &fixture.file(SESSIONS[0])).is_some() {
+            [SESSIONS[1], SESSIONS[0]]
+        } else {
+            [SESSIONS[0], SESSIONS[1]]
+        };
+        let (x_path, y_path) = (fixture.file(x), fixture.file(y));
+        assert_eq!(waiting(&index, &y_path), Some((true, false)));
+        assert_eq!(waiting(&index, &x_path), None, "X was read");
+        let first = census_token(&index).expect("first generation");
+
+        fixture.append(x, &token_line(5));
+        assert!(fixture.len(x) <= singleton);
+        cache.clear();
+        let (index, scan) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&x_path),
+        );
+        record(&scan);
+        assert!(
+            scan.census_complete,
+            "the member was read and the census closed: {}",
+            counters(&cache)
+        );
+        assert!(scan
+            .snapshots
+            .iter()
+            .all(|item| item.source_session_id != x));
+        assert!(counter(&cache, |c| c.deferred_next_generation) >= 1);
+        // Carried, not dropped: a member of a new generation, still a hint.
+        let second = census_token(&index).expect("the next generation started");
+        assert_ne!(second, first);
+        assert_eq!(waiting(&index, &x_path), Some((true, true)));
+        assert_eq!(waiting(&index, &y_path), None);
+
+        let mut index = index;
+        let mut x_reads = 0;
+        let mut closed = false;
+        for page_number in 2..6 {
+            assert_eq!(census_token(&index).as_deref(), Some(second.as_str()));
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            record(&scan);
+            x_reads += scan
+                .snapshots
+                .iter()
+                .filter(|item| item.source_session_id == x)
+                .count();
+            if scan.census_complete {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the next generation closed: {}", counters(&cache));
+        assert_eq!(x_reads, 1, "read exactly once in the next generation");
+        assert_eq!(
+            index.files[&local_index_key(&x_path)].size_bytes,
+            fixture.len(x)
+        );
+    });
+    let (_, fresh) = page(&fixture, ScanIndex::default(), None);
+    let expected = fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(expected.len(), SESSIONS.len());
     assert_eq!(latest, expected);
 }
 
