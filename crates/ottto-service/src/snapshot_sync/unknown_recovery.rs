@@ -952,6 +952,20 @@ pub(crate) fn initialized(support: &Path) -> bool {
     })
 }
 
+/// A newly parsed path can join an UNKNOWN component only after its identity
+/// evidence is known. Preserve its pre-parse tuple even while it is permitted.
+/// This is bookkeeping, not an emission hold or a history reservation.
+pub(crate) fn needs_preparse_tuples(support: &Path) -> bool {
+    let Ok(catalogs) = CATALOGS.lock() else {
+        return true;
+    };
+    catalogs.get(support).is_some_and(|catalog| {
+        catalog.loading.is_some()
+            || catalog.fault
+            || catalog.entries.iter().any(|manifest| !manifest.ack_saved)
+    })
+}
+
 pub(crate) fn blocked_file(support: &Path, key: &str, root: Option<&str>) -> bool {
     let Ok(catalogs) = CATALOGS.lock() else {
         return true;

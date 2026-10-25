@@ -36768,10 +36768,21 @@ impl ScanIndex {
             &key,
             candidate.size_bytes,
         );
-        // Changed/fresh/settled probes use the same single reservation as an
-        // owed probe. Carry that already-earned permit to the emission seam;
-        // it cannot authorize another file or an immutable UNKNOWN replay.
-        if matches!(decision, HistoryDecision::NotOwed) && page.owns_money_probe(&key) {
+        // A fresh path can reveal a held logical identity only after parsing.
+        // Save the tuple now: record() installs a provisional fingerprint, which
+        // is not a prior upload tuple and has no finalized activity witness.
+        // A None hold neither blocks this candidate nor reserves history.
+        let preserve_for_unknown = self
+            .active_request_money_support_dir
+            .as_deref()
+            .is_some_and(|support| {
+                claude_request_money::request_owned_live(support)
+                    && crate::snapshot_sync::unknown_recovery::needs_preparse_tuples(support)
+            });
+        // Changed/fresh/settled probes keep their one original reservation too.
+        if matches!(decision, HistoryDecision::NotOwed)
+            && (page.owns_money_probe(&key) || preserve_for_unknown)
+        {
             self.gate_claude_history_candidate(candidate, None);
         }
         decision
