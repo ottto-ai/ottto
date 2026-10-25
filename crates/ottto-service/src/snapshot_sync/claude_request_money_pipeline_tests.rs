@@ -1484,7 +1484,12 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // regression `money_p1b_slow_native_scan_page_is_admitted_and_builds`
     // proves the families are built and written.
     assert_eq!(native_counts.refused_deadline, 0, "long native Full with small money work is admitted: {native_counts:?}");
-    assert!(native_counts.captures_taken > 0, "{native_counts:?}");
+    // MONEY round 3: a page takes only the captures of the families it
+    // reaches and purges the rest (an unreached family costs only its
+    // deadline row). This page received capture work, and every capture is
+    // either taken or purged.
+    assert!(native_counts.captures_taken + native_counts.captures_purged > 0, "{native_counts:?}");
+    assert!(money::capture::keys_for_test(&native_support).is_empty(), "no capture outlives its page: {native_counts:?}");
     assert!(u128::from(native_counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{native_counts:?}");
     let native_rows = money_jsonl_rows(&native_support);
     let native_page = native_rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now - 1).unwrap();
