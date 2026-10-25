@@ -37321,6 +37321,19 @@ fn ensure_bounded_traversal(
                         now >= deadline
                             || deadline > now.saturating_add(UNHEALTHY_SCAN_RETRY_MAX_SECONDS)
                     })
+                    // A family's own due retry must run on this cycle, even
+                    // while the terminal traversal's hourly timer waits.
+                    // Only bound RetryPending debt wakes it; terminal holds
+                    // keep their disposition. The fresh start still applies
+                    // the per-family acceptance and scheduled-replay guards.
+                    || (source == SnapshotSource::ClaudeCode
+                        && index.claude_usage_authority_quarantine.iter().any(|(root, record)| {
+                            record.disposition == ClaudeUsageAuthorityQuarantineDisposition::RetryPending
+                                && record.retry_after_unix_seconds <= now
+                                && index.claude_usage_family_witnesses.get(root).is_some_and(|witness| {
+                                    claude_usage_authority_preserves_pending(record, witness)
+                                })
+                        }))
             }
             // A malformed or backwards observation clock must not turn the
             // durable red witness into a permanent fence. Retrying remains

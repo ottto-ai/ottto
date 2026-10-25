@@ -2246,6 +2246,9 @@ fn scoped_retry_accept_member(index: &mut ScanIndex, key: &str) -> CandidateFile
     entry.last_snapshot_fingerprint = Some(format!("{:x}", group.finalize()));
     let mut candidate = test_candidate(PathBuf::from(key));
     candidate.source_file_fingerprint = entry.source_file_fingerprint.clone();
+    // Native candidates also carry a nonempty legacy digest. An empty
+    // fixture digest would make a re-armed old-version entry migrate.
+    candidate.legacy_source_file_fingerprint = entry.source_file_fingerprint.clone();
     candidate.size_bytes = entry.size_bytes;
     candidate.modified_unix_seconds = entry.modified_unix_seconds;
     candidate.modified_unix_nanos = entry.modified_unix_nanos.unwrap();
@@ -2434,6 +2437,26 @@ fn scoped_unhealthy_retry_runs_overdue_holds_next_cycle_and_preserves_terminal_h
         return;
     }
     let mut fixture = scoped_retry_fixture(9, 32, false);
+    fixture
+        .index
+        .traversal
+        .as_mut()
+        .unwrap()
+        .unhealthy_retry_not_before_unix_seconds =
+        rfc3339_unix_seconds(CARRY_RETRY).map(|now| now + UNHEALTHY_SCAN_RETRY_MAX_SECONDS);
+    // Control: neither the traversal nor a family's own retry is due yet.
+    let before_wait = serde_json::to_value(&fixture.index).unwrap();
+    let (_, rows) = crate::local_resource_diagnostics::capture(|| {
+        ensure_bounded_traversal(
+            SnapshotSource::ClaudeCode,
+            &[],
+            &mut fixture.index,
+            CARRY_RETRY,
+            BACKFILL_WINDOW_DAYS,
+        );
+    });
+    assert!(!rows.iter().any(|row| row["counts"]["event"] == "starting"));
+    assert_eq!(serde_json::to_value(&fixture.index).unwrap(), before_wait);
     for record in fixture.index.claude_usage_authority_quarantine.values_mut() {
         record.retry_after_unix_seconds = 0;
     }
