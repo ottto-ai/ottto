@@ -172,17 +172,14 @@ impl HistoryFixture {
     }
 
     fn cycle(&self, collected_at: &str, cycle: HistoryCycle<'_>) -> HistoryOutcome {
-        self.cycle_with_scan(collected_at, cycle, |_, _| None)
+        self.cycle_with_scan(collected_at, cycle, |_| {})
     }
 
     fn cycle_with_scan(
         &self,
         collected_at: &str,
         cycle: HistoryCycle<'_>,
-        before_evidence: impl FnOnce(
-            &mut crate::snapshots::SourceScanResult,
-            &ScanIndex,
-        ) -> Option<PreparedClaudeLocalEvidence>,
+        before_evidence: impl FnOnce(&mut crate::snapshots::SourceScanResult),
     ) -> HistoryOutcome {
         let destination = cycle.destination.unwrap_or(HISTORY_DESTINATION);
         let index_path = self.index_path_for(cycle.destination);
@@ -248,14 +245,9 @@ impl HistoryFixture {
             true,
         )
         .expect("scan Claude page");
-        let prepared = before_evidence(&mut scan, &index);
-        let (mut disposition, _, _) = apply_claude_local_evidence_to_scan_with_prepared(
-            &self.support,
-            &mut scan,
-            &mut index,
-            None,
-            prepared,
-        );
+        before_evidence(&mut scan);
+        let (mut disposition, _, _) =
+            apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -2355,7 +2347,7 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
             let outcome = fixture.cycle_with_scan(
                 &format!("2026-08-02T{hour:02}:00:00Z"),
                 E2_HISTORY_UPGRADE,
-                |scan, _| {
+                |scan| {
                     let twins = scan
                         .snapshots
                         .iter_mut()
@@ -2368,7 +2360,6 @@ fn e2_refused_twins_keep_prior_tuple_and_stay_owed_while_siblings_settle() {
                             .expect("parsed native row")
                             .evidence_ref = Some(0);
                     }
-                    None
                 },
             );
             assert!(!outcome.uploaded.contains(refused));
@@ -2609,7 +2600,7 @@ fn e2_unhealthy_root_holds_owed_agent_history_too() {
 }
 
 #[test]
-fn e2_repaired_between_permissive_and_strict_read_stays_owed_until_next_page() {
+fn e2_repaired_between_attachment_and_strict_read_stays_owed_until_next_page() {
     let fixture = HistoryFixture::new("e2-history-repair-during-read");
     let baseline = fixture.baseline();
     let root = HISTORY_SESSIONS[0];
@@ -2620,16 +2611,17 @@ fn e2_repaired_between_permissive_and_strict_read_stays_owed_until_next_page() {
     let healthy = std::fs::read(&api_path).unwrap();
     std::fs::write(&api_path, "{bad\n").unwrap();
     with_e2_history(&fixture, || {
-        let held =
-            fixture.cycle_with_scan("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE, |scan, index| {
-                let prepared =
-                    PreparedClaudeLocalEvidence::load(&fixture.support, &scan.snapshots, index);
-                assert!(!prepared.api.session_report(root).unwrap().complete);
-                // Production's prepared reader retains the failed initial health;
-                // strict validation rereads this repaired generation afterwards.
-                std::fs::write(&api_path, healthy).unwrap();
-                Some(prepared)
+        let held = fixture.cycle_with_scan("2026-08-02T09:00:00Z", E2_HISTORY_UPGRADE, |scan| {
+            assert!(!scan.snapshots.is_empty());
+            let path = api_path.clone();
+            E2_AFTER_API_ATTACH.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    // Repair only after the canonical initial decode has
+                    // actually reached attachment, before strict validation.
+                    std::fs::write(path, healthy).unwrap();
+                }));
             });
+        });
         assert_eq!(held.uploaded.len(), 2);
         assert!(!held.uploaded.contains(root));
         e2_history_assert_prior_tuple(

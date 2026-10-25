@@ -8407,6 +8407,14 @@ fn apply_claude_local_evidence_to_scan_with_comparison(
     .expect("ordinary or logical comparison evidence fixture has no resource refusal")
 }
 
+// Test-only file repair at the real attachment/strict-read boundary. It
+// changes no reader verdict or accumulator and has no production state.
+#[cfg(test)]
+thread_local! {
+    static E2_AFTER_API_ATTACH: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn try_apply_claude_local_evidence_to_scan_with_comparison(
     support_dir: &Path,
     scan_result: &mut SourceScanResult,
@@ -8485,6 +8493,12 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    #[cfg(test)]
+    E2_AFTER_API_ATTACH.with(|hook| {
+        if let Some(after_attach) = hook.borrow_mut().take() {
+            after_attach();
+        }
+    });
     let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
