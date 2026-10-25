@@ -438,10 +438,7 @@ impl ClaudeLedger {
             return None;
         }
         if let Some(buffer) = current.as_mut() {
-            let (_, control) = self
-                .census
-                .entries()
-                .find(|(key, _)| key.as_str() == CONTROL)?;
+            let (_, control) = self.census.entries().find(|(key, _)| *key == CONTROL)?;
             push_entry(buffer, CONTROL, &control);
         }
         if let Some(buffer) = zero.as_mut() {

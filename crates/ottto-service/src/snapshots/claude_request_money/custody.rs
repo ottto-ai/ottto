@@ -327,7 +327,7 @@ impl Delivery {
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct FileCustody {
-    path: Option<String>,
+    path: Option<Box<str>>,
     rebuild_owed: bool,
     current_m: Option<Box<Slot>>,
     live: Option<Box<FileLive>>,
@@ -469,8 +469,8 @@ pub(super) struct Control {
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Custody {
-    files: BTreeMap<String, FileCustody>,
-    telemetry: BTreeMap<String, TelemetryCustody>,
+    files: BTreeMap<Box<str>, FileCustody>,
+    telemetry: BTreeMap<Box<str>, TelemetryCustody>,
     control: Control,
     ever: Vec<[u8; 32]>,
     bytes: usize,
@@ -620,7 +620,10 @@ impl Custody {
             }
             if field == "memo" {
                 let root = key.strip_prefix("fam:")?;
-                if self.telemetry.contains_key(&format!("telemetry:{root}")) {
+                if self
+                    .telemetry
+                    .contains_key::<str>(format!("telemetry:{root}").as_str())
+                {
                     return Some(telemetry_address(root, field, key));
                 }
             }
@@ -682,12 +685,16 @@ impl Custody {
                 .map(|slot| slot.value.view());
         }
         let slot = if a.carrier.starts_with("file:") {
-            self.files.get(&a.carrier)?.slots().find(|slot| {
-                slot.key == key || key.starts_with("hold:body:") && slot.key.starts_with("hold:")
-            })
+            self.files
+                .get::<str>(a.carrier.as_ref())?
+                .slots()
+                .find(|slot| {
+                    slot.key == key
+                        || key.starts_with("hold:body:") && slot.key.starts_with("hold:")
+                })
         } else {
             self.telemetry
-                .get(&a.carrier)?
+                .get::<str>(a.carrier.as_ref())?
                 .slots()
                 .find(|slot| slot.key == key)
         };
@@ -696,7 +703,7 @@ impl Custody {
     pub(crate) fn message_path(&self, query: &str) -> Option<&str> {
         let path = query.strip_prefix("mh:")?;
         self.files
-            .get(&format!("file:{}", digest(path)))?
+            .get::<str>(format!("file:{}", digest(path)).as_str())?
             .path
             .as_deref()
     }
@@ -803,11 +810,11 @@ impl Custody {
     pub(super) fn offer_count_for(&self, owner: &str) -> usize {
         if let Some(root) = owner.strip_prefix("synthetic:") {
             self.telemetry
-                .get(&format!("telemetry:{root}"))
+                .get::<str>(format!("telemetry:{root}").as_str())
                 .map_or(0, |carrier| carrier.delivery.offers.len())
         } else {
             self.files
-                .get(&format!("file:{}", digest(owner)))
+                .get::<str>(format!("file:{}", digest(owner)).as_str())
                 .map_or(0, |carrier| carrier.delivery.offers.len())
         }
     }
@@ -882,11 +889,14 @@ impl Custody {
     }
     fn slot_mut(&mut self, a: &Address) -> Option<&mut Option<Box<Slot>>> {
         if a.carrier.starts_with("file:") {
-            let file = self.files.entry(a.carrier.clone()).or_default();
+            let file = self
+                .files
+                .entry(a.carrier.clone().into_boxed_str())
+                .or_default();
             file.field(&a.field)
         } else {
             self.telemetry
-                .entry(a.carrier.clone())
+                .entry(a.carrier.clone().into_boxed_str())
                 .or_default()
                 .field(&a.field)
         }
@@ -907,11 +917,15 @@ impl Custody {
         }
         if a.field == "offer" {
             let delivery = if a.carrier.starts_with("file:") {
-                &mut self.files.entry(a.carrier.clone()).or_default().delivery
+                &mut self
+                    .files
+                    .entry(a.carrier.clone().into_boxed_str())
+                    .or_default()
+                    .delivery
             } else {
                 &mut self
                     .telemetry
-                    .entry(a.carrier.clone())
+                    .entry(a.carrier.clone().into_boxed_str())
                     .or_default()
                     .delivery
             };
@@ -924,12 +938,12 @@ impl Custody {
                 delivery.offers.push(slot);
                 delivery.offers.sort_by(|a, b| a.key.cmp(&b.key));
             }
-            if let Some(file) = self.files.get_mut(&a.carrier) {
+            if let Some(file) = self.files.get_mut::<str>(a.carrier.as_ref()) {
                 if file.live.as_deref().is_some_and(FileLive::is_empty) {
                     file.live = None;
                 }
             }
-            if let Some(file) = self.telemetry.get_mut(&a.carrier) {
+            if let Some(file) = self.telemetry.get_mut::<str>(a.carrier.as_ref()) {
                 if file.live.as_deref().is_some_and(TelemetryLive::is_empty) {
                     file.live = None;
                 }
@@ -937,12 +951,12 @@ impl Custody {
             return old;
         }
         let old = std::mem::replace(self.slot_mut(a)?, slot.map(Box::new)).map(|slot| *slot);
-        if let Some(file) = self.files.get_mut(&a.carrier) {
+        if let Some(file) = self.files.get_mut::<str>(a.carrier.as_ref()) {
             if file.live.as_deref().is_some_and(FileLive::is_empty) {
                 file.live = None;
             }
         }
-        if let Some(file) = self.telemetry.get_mut(&a.carrier) {
+        if let Some(file) = self.telemetry.get_mut::<str>(a.carrier.as_ref()) {
             if file.live.as_deref().is_some_and(TelemetryLive::is_empty) {
                 file.live = None;
             }
@@ -959,27 +973,27 @@ impl Custody {
         }
         let value = if key == CONTROL {
             Some(Carrier::Control(&self.control))
-        } else if let Some(file) = self.files.get(key) {
+        } else if let Some(file) = self.files.get::<str>(key) {
             Some(Carrier::File(file))
         } else {
-            self.telemetry.get(key).map(Carrier::Telemetry)
+            self.telemetry.get::<str>(key).map(Carrier::Telemetry)
         };
         value.map_or((0, 0), |value| (entry_bytes(key, &value), value.hashes()))
     }
     fn prune_empty(&mut self, a: &Address) {
         if self
             .files
-            .get(&a.carrier)
+            .get::<str>(a.carrier.as_ref())
             .is_some_and(|file| file.slots().next().is_none())
         {
-            self.files.remove(&a.carrier);
+            self.files.remove::<str>(a.carrier.as_ref());
         }
         if self
             .telemetry
-            .get(&a.carrier)
+            .get::<str>(a.carrier.as_ref())
             .is_some_and(|file| file.slots().next().is_none())
         {
-            self.telemetry.remove(&a.carrier);
+            self.telemetry.remove::<str>(a.carrier.as_ref());
         }
     }
     pub(crate) fn insert(&mut self, key: String, value: Record) -> Insert {
@@ -1024,8 +1038,8 @@ impl Custody {
             return Insert::Stored;
         }
         let exists = a.carrier == CONTROL
-            || self.files.contains_key(&a.carrier)
-            || self.telemetry.contains_key(&a.carrier);
+            || self.files.contains_key::<str>(a.carrier.as_ref())
+            || self.telemetry.contains_key::<str>(a.carrier.as_ref());
         if !exists && self.record_count() >= super::store::LEDGER_MAX_RECORDS {
             return Insert::Refused;
         }
@@ -1033,11 +1047,11 @@ impl Custody {
             return Insert::Refused;
         }
         if a.field == "offer" && self.get(&key).is_none() {
-            let count = if let Some(file) = self.files.get(&a.carrier) {
+            let count = if let Some(file) = self.files.get::<str>(a.carrier.as_ref()) {
                 file.delivery.offers.len()
             } else {
                 self.telemetry
-                    .get(&a.carrier)
+                    .get::<str>(a.carrier.as_ref())
                     .map_or(0, |file| file.delivery.offers.len())
             };
             if count >= 2 || self.offers >= super::MAX_MONEY_OFFERS_PER_CONTEXT {
@@ -1047,7 +1061,7 @@ impl Custody {
         let (before, hashes) = self.carrier_size(&a.carrier);
         let mut compact = Value::from_record(&key, value);
         if let Value::Seen(seen) = &mut compact {
-            let current = if let Some(file) = self.files.get(&a.carrier) {
+            let current = if let Some(file) = self.files.get::<str>(a.carrier.as_ref()) {
                 if a.field == "watch:m" {
                     file.current_m.as_deref()
                 } else {
@@ -1055,7 +1069,7 @@ impl Custody {
                 }
             } else {
                 self.telemetry
-                    .get(&a.carrier)
+                    .get::<str>(a.carrier.as_ref())
                     .and_then(|file| file.current.as_deref())
             };
             if let Some(current) = current.filter(|current| {
@@ -1076,11 +1090,11 @@ impl Custody {
         );
         let prior_path = self
             .files
-            .get(&a.carrier)
+            .get::<str>(a.carrier.as_ref())
             .and_then(|file| file.path.clone());
         if let Some(path) = &a.path {
-            if let Some(file) = self.files.get_mut(&a.carrier) {
-                file.path = Some(path.clone());
+            if let Some(file) = self.files.get_mut::<str>(a.carrier.as_ref()) {
+                file.path = Some(path.clone().into_boxed_str());
             }
         }
         let (after, next_hashes) = self.carrier_size(&a.carrier);
@@ -1091,7 +1105,7 @@ impl Custody {
             .saturating_add(next_hashes);
         if bytes > MAX_BYTES - 1024 * 1024 || total_hashes > MAX_HASHES {
             self.replace(&a, previous);
-            if let Some(file) = self.files.get_mut(&a.carrier) {
+            if let Some(file) = self.files.get_mut::<str>(a.carrier.as_ref()) {
                 file.path = prior_path;
             }
             if !exists {
@@ -1156,10 +1170,11 @@ impl Custody {
             if Instant::now() >= deadline {
                 return None;
             }
-            bytes += key.capacity() + carrier.inline_bytes() + carrier.spare_slot_bytes();
+            bytes +=
+                carrier.key_heap_bytes(key) + carrier.inline_bytes() + carrier.spare_slot_bytes();
             if let Carrier::File(file) = carrier {
                 bytes += usize::from(file.live.is_some()) * std::mem::size_of::<FileLive>();
-                bytes += file.path.as_ref().map_or(0, String::capacity)
+                bytes += file.path.as_deref().map_or(0, str::len)
                     + file
                         .logical
                         .as_ref()
@@ -1227,26 +1242,18 @@ impl Custody {
         }
         Some(bytes)
     }
-    pub(super) fn entries(&self) -> impl Iterator<Item = (&String, Carrier<'_>)> {
-        static CONTROL_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-        static EVER_KEY: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    pub(super) fn entries(&self) -> impl Iterator<Item = (&str, Carrier<'_>)> {
         self.files
             .iter()
-            .map(|(key, file)| (key, Carrier::File(file)))
+            .map(|(key, file)| (key.as_ref(), Carrier::File(file)))
             .chain(
                 self.telemetry
                     .iter()
-                    .map(|(key, file)| (key, Carrier::Telemetry(file))),
+                    .map(|(key, file)| (key.as_ref(), Carrier::Telemetry(file))),
             )
             .chain([
-                (
-                    CONTROL_KEY.get_or_init(|| CONTROL.into()),
-                    Carrier::Control(&self.control),
-                ),
-                (
-                    EVER_KEY.get_or_init(|| EVER.into()),
-                    Carrier::Ever(&self.ever),
-                ),
+                (CONTROL, Carrier::Control(&self.control)),
+                (EVER, Carrier::Ever(&self.ever)),
             ])
     }
 }
@@ -1338,13 +1345,19 @@ impl<'a> Carrier<'a> {
         };
         spare * std::mem::size_of::<Slot>()
     }
+    fn key_heap_bytes(&self, key: &str) -> usize {
+        match self {
+            Self::File(_) | Self::Telemetry(_) => key.len(),
+            _ => 0,
+        }
+    }
     fn inline_bytes(&self) -> usize {
         match self {
             Self::File(_) => {
-                (std::mem::size_of::<String>() + std::mem::size_of::<FileCustody>()) * 3 / 2
+                (std::mem::size_of::<Box<str>>() + std::mem::size_of::<FileCustody>()) * 3 / 2
             }
             Self::Telemetry(_) => {
-                (std::mem::size_of::<String>() + std::mem::size_of::<TelemetryCustody>()) * 3 / 2
+                (std::mem::size_of::<Box<str>>() + std::mem::size_of::<TelemetryCustody>()) * 3 / 2
             }
             Self::Control(_) => std::mem::size_of::<Control>(),
             Self::Ever(_) => 0,
@@ -2130,11 +2143,11 @@ impl Custody {
                     {
                         return None;
                     }
-                    if self.files.contains_key(&key) {
+                    if self.files.contains_key::<str>(key.as_ref()) {
                         return None;
                     }
                     let file = FileCustody {
-                        path: wire.path,
+                        path: wire.path.map(String::into_boxed_str),
                         rebuild_owed: wire.rebuild_owed?,
                         current_m,
                         live: {
@@ -2160,12 +2173,12 @@ impl Custody {
                     if !file.slots().all(|slot| slot.key.len() <= 4096) {
                         return None;
                     }
-                    self.files.insert(key.clone(), file);
+                    self.files.insert(key.clone().into_boxed_str(), file);
                 }
                 "telemetry" if key.starts_with("telemetry:") => {
                     let current = decode(wire.current, None)?;
                     let seen_r = decode(wire.seen_r, current.as_deref())?;
-                    if self.telemetry.contains_key(&key) {
+                    if self.telemetry.contains_key::<str>(key.as_ref()) {
                         return None;
                     }
                     let mut telemetry = TelemetryCustody {
@@ -2188,7 +2201,8 @@ impl Custody {
                     {
                         telemetry.live = None;
                     }
-                    self.telemetry.insert(key.clone(), telemetry);
+                    self.telemetry
+                        .insert(key.clone().into_boxed_str(), telemetry);
                 }
                 "control" if key == CONTROL => {
                     if wire.fields.len() > 16 {
@@ -2242,11 +2256,11 @@ impl Custody {
         let (bytes, hashes) = self.carrier_size(&key);
         let entry_offers = self
             .files
-            .get(&key)
+            .get::<str>(key.as_ref())
             .map(|file| file.delivery.offers.len())
             .or_else(|| {
                 self.telemetry
-                    .get(&key)
+                    .get::<str>(key.as_ref())
                     .map(|file| file.delivery.offers.len())
             })
             .unwrap_or(0);
@@ -2264,8 +2278,8 @@ impl Custody {
             && self.record_count() <= max_records
             && self.offers <= super::MAX_MONEY_OFFERS_PER_CONTEXT;
         if !valid {
-            self.files.remove(&key);
-            self.telemetry.remove(&key);
+            self.files.remove::<str>(key.as_ref());
+            self.telemetry.remove::<str>(key.as_ref());
             if key == CONTROL || key == EVER {
                 if key == CONTROL {
                     self.control = Control::default();
@@ -2308,11 +2322,12 @@ impl Custody {
         birth: Option<Birth>,
     ) -> bool {
         let key = format!("file:{}", digest(path));
-        if !self.files.contains_key(&key) && self.record_count() >= super::store::LEDGER_MAX_RECORDS
+        if !self.files.contains_key::<str>(key.as_ref())
+            && self.record_count() >= super::store::LEDGER_MAX_RECORDS
         {
             return false;
         }
-        if self.files.get(&key).is_some_and(|file| {
+        if self.files.get::<str>(key.as_ref()).is_some_and(|file| {
             file.path.as_deref() == Some(path)
                 && file.logical.as_ref() == Some(&(root.clone(), member.clone()))
                 && file.birth == birth
@@ -2321,7 +2336,7 @@ impl Custody {
             return true;
         }
         let (before, _) = self.carrier_size(&key);
-        let file = self.files.entry(key.clone()).or_default();
+        let file = self.files.entry(key.clone().into_boxed_str()).or_default();
         let previous = (
             file.path.replace(path.into()),
             file.logical.replace((root, member)),
@@ -2332,13 +2347,13 @@ impl Custody {
         file.indexed = true;
         let (after, _) = self.carrier_size(&key);
         if self.bytes.saturating_sub(before).saturating_add(after) > MAX_BYTES - 1024 * 1024 {
-            let file = self.files.get_mut(&key).unwrap();
+            let file = self.files.get_mut::<str>(key.as_ref()).unwrap();
             file.path = previous.0;
             file.logical = previous.1;
             file.birth = previous.2;
             file.indexed = previous.3;
             if file.slots().next().is_none() && file.path.is_none() {
-                self.files.remove(&key);
+                self.files.remove::<str>(key.as_ref());
             }
             return false;
         }
@@ -2359,7 +2374,7 @@ impl Custody {
         self.control.recovery
             && self
                 .files
-                .get(&format!("file:{}", digest(path)))
+                .get::<str>(format!("file:{}", digest(path)).as_str())
                 .map_or(true, |file| {
                     file.rebuild_owed
                         || file
@@ -2371,7 +2386,7 @@ impl Custody {
     pub(super) fn rebuilt(&mut self, path: &str) -> bool {
         let key = format!("file:{}", digest(path));
         let before = self.carrier_size(&key).0;
-        let Some(file) = self.files.get_mut(&key) else {
+        let Some(file) = self.files.get_mut::<str>(key.as_ref()) else {
             return false;
         };
         if !file.rebuild_owed {
@@ -2410,7 +2425,7 @@ impl Custody {
                 return false;
             }
             self.files
-                .get(&format!("file:{}", digest(path)))
+                .get::<str>(format!("file:{}", digest(path)).as_str())
                 .is_some_and(|file| {
                     !file.rebuild_owed
                         && file.current_m.as_ref().is_some_and(|slot| {
@@ -2468,13 +2483,13 @@ impl Custody {
             std::mem::size_of::<Self>() + self.ever.capacity() * 32,
         );
         for (key, carrier) in self.entries() {
-            *parts.entry("carrier_keys").or_default() += key.capacity();
+            *parts.entry("carrier_keys").or_default() += carrier.key_heap_bytes(key);
             *parts.entry("map_slots").or_default() += carrier.inline_bytes();
             *parts.entry("field_slots").or_default() += carrier.spare_slot_bytes();
             match carrier {
                 Carrier::File(file) => {
                     *parts.entry("physical_paths").or_default() +=
-                        file.path.as_ref().map_or(0, String::capacity);
+                        file.path.as_deref().map_or(0, str::len);
                     *parts.entry("live_metadata").or_default() += usize::from(file.live.is_some())
                         * std::mem::size_of::<FileLive>()
                         + file
@@ -2554,8 +2569,8 @@ impl Custody {
         let old_telemetry =
             2 * std::mem::size_of::<Option<Box<Slot>>>() + std::mem::size_of::<TelemetryLive>();
         let removed = self.telemetry.len()
-            * ((std::mem::size_of::<String>() + old_telemetry) * 3 / 2
-                - (std::mem::size_of::<String>() + std::mem::size_of::<TelemetryCustody>()) * 3
+            * ((std::mem::size_of::<Box<str>>() + old_telemetry) * 3 / 2
+                - (std::mem::size_of::<Box<str>>() + std::mem::size_of::<TelemetryCustody>()) * 3
                     / 2);
         eprintln!("MONEY_OFF_LAYOUT total={total} parts={} file_count={} telemetry_count={} file_bytes={} telemetry_bytes={} slot_bytes={} p1_record_bytes={} removed_inline_telemetry_bytes={removed} pre_lazy_telemetry_resident={}",
             serde_json::to_string(&parts).unwrap(), self.files.len(), self.telemetry.len(), std::mem::size_of::<FileCustody>(), std::mem::size_of::<TelemetryCustody>(), std::mem::size_of::<Slot>(), std::mem::size_of::<Record>(), total + removed);
@@ -2649,7 +2664,7 @@ impl Custody {
         birth: Option<Birth>,
     ) -> bool {
         self.files
-            .get(&format!("file:{}", digest(path)))
+            .get::<str>(format!("file:{}", digest(path)).as_str())
             .is_some_and(|file| {
                 file.path.as_deref() == Some(path)
                     && file
@@ -2678,17 +2693,17 @@ impl Custody {
                     && file
                         .path
                         .as_ref()
-                        .is_some_and(|path| !index.files.contains_key(path))
+                        .is_some_and(|path| !index.files.contains_key::<str>(path.as_ref()))
             })
-            .map(|(carrier, _)| carrier.clone())
+            .map(|(carrier, _)| carrier.to_string())
             .take(256)
             .collect::<Vec<_>>();
         for carrier in vanished {
             let before = self.carrier_size(&carrier).0;
-            let file = self.files.get_mut(&carrier)?;
+            let file = self.files.get_mut::<str>(carrier.as_ref())?;
             file.indexed = false;
             if file.slots().next().is_none() {
-                self.files.remove(&carrier);
+                self.files.remove::<str>(carrier.as_ref());
             }
             let after = self.carrier_size(&carrier).0;
             self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
@@ -2737,13 +2752,13 @@ impl Custody {
             let root = carrier.strip_prefix("telemetry:")?;
             primaries
                 .entry(format!("fam:{root}"))
-                .or_insert((carrier.clone(), (u64::MAX, String::new())));
+                .or_insert((carrier.to_string(), (u64::MAX, String::new())));
         }
         for (carrier, file) in &self.files {
             if file
                 .path
                 .as_ref()
-                .is_some_and(|path| index.files.contains_key(path))
+                .is_some_and(|path| index.files.contains_key::<str>(path.as_ref()))
             {
                 for slot in [file.adoption.as_deref(), file.memo.as_deref()]
                     .into_iter()
@@ -2761,7 +2776,7 @@ impl Custody {
                     if !belongs {
                         primaries.entry(slot.key.to_string()).or_insert((
                             format!("file:detached:{}", digest(slot.key.to_string().as_str())),
-                            (u64::MAX, carrier.clone()),
+                            (u64::MAX, carrier.to_string()),
                         ));
                     }
                 }
@@ -2784,10 +2799,10 @@ impl Custody {
             }))
             .filter_map(|(old, slot)| {
                 let (target, _) = primaries.get(slot.key.to_string().as_str())?;
-                if target == old {
+                if target.as_str() == old.as_ref() {
                     return None;
                 }
-                Some((String::clone(old), String::clone(target), Slot::clone(slot)))
+                Some((old.to_string(), String::clone(target), Slot::clone(slot)))
             })
             .take(257)
             .collect::<Vec<_>>();
@@ -2801,11 +2816,11 @@ impl Custody {
             } else {
                 "adoption"
             };
-            let existing = if let Some(file) = self.files.get(&target) {
+            let existing = if let Some(file) = self.files.get::<str>(target.as_ref()) {
                 file.slots().find(|candidate| candidate.key == slot.key)
             } else {
                 self.telemetry
-                    .get(&target)
+                    .get::<str>(target.as_ref())
                     .and_then(|file| file.slots().find(|candidate| candidate.key == slot.key))
             };
             if field == "memo"
@@ -2847,8 +2862,8 @@ impl Custody {
                 Some(current) => slot.value.window() > current.value.window(),
             };
             if replace {
-                if !self.files.contains_key(&target)
-                    && !self.telemetry.contains_key(&target)
+                if !self.files.contains_key::<str>(target.as_ref())
+                    && !self.telemetry.contains_key::<str>(target.as_ref())
                     && self.record_count() >= super::store::LEDGER_MAX_RECORDS
                 {
                     return Some((changes, false));
@@ -2883,14 +2898,14 @@ impl Custody {
                     path: None,
                 };
                 self.replace(&address, None);
-                if self.files.get(&old).is_some_and(|file| {
+                if self.files.get::<str>(old.as_ref()).is_some_and(|file| {
                     file.slots().next().is_none()
                         && file
                             .path
                             .as_ref()
-                            .map_or(true, |path| !index.files.contains_key(path))
+                            .map_or(true, |path| !index.files.contains_key::<str>(path.as_ref()))
                 }) {
-                    self.files.remove(&old);
+                    self.files.remove::<str>(old.as_ref());
                 }
                 let after = self.carrier_size(&old).0;
                 self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
@@ -2916,11 +2931,11 @@ impl Custody {
         } else {
             format!("file:{}", digest(owner))
         };
-        let slot = if let Some(file) = self.files.get(&carrier) {
+        let slot = if let Some(file) = self.files.get::<str>(carrier.as_ref()) {
             file.adoption.as_ref()
         } else {
             self.telemetry
-                .get(&carrier)
+                .get::<str>(carrier.as_ref())
                 .and_then(|file| file.adoption.as_ref())
         };
         slot.is_some_and(|slot| {
@@ -2944,11 +2959,11 @@ impl Custody {
         } else {
             format!("file:{}", digest(owner))
         };
-        let old = if let Some(file) = self.files.get(&carrier) {
+        let old = if let Some(file) = self.files.get::<str>(carrier.as_ref()) {
             file.adoption.as_ref()
         } else {
             self.telemetry
-                .get(&carrier)
+                .get::<str>(carrier.as_ref())
                 .and_then(|file| file.adoption.as_ref())
         };
         if old.is_some_and(|slot| slot.key != key) {
@@ -3001,7 +3016,7 @@ impl Custody {
         let Some(address) = self.address(key) else {
             return false;
         };
-        if let Some(file) = self.files.get(&address.carrier) {
+        if let Some(file) = self.files.get::<str>(address.carrier.as_ref()) {
             file.delivery.slots().next().is_none()
                 && file
                     .adoption
@@ -3164,7 +3179,7 @@ mod compact_layout_tests {
         let mut decoded = Custody::default();
         for (key, carrier) in custody.entries() {
             assert!(decoded.absorb_entry(
-                key.clone(),
+                key.to_owned(),
                 &serde_json::to_string(&carrier).unwrap(),
                 65536
             ));
@@ -3194,7 +3209,12 @@ mod compact_layout_tests {
             Insert::Stored
         );
         let telemetry_carrier = format!("telemetry:{}", &telemetry_key[5..]);
-        let carrier = Carrier::Telemetry(decoded.telemetry.get(&telemetry_carrier).unwrap());
+        let carrier = Carrier::Telemetry(
+            decoded
+                .telemetry
+                .get::<str>(telemetry_carrier.as_str())
+                .unwrap(),
+        );
         let mut restarted = Custody::default();
         assert!(restarted.absorb_entry(
             telemetry_carrier,
