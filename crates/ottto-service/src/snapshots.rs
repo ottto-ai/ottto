@@ -43305,6 +43305,8 @@ impl ScanIndex {
         held: &BTreeSet<String>,
         reparse_held: &BTreeSet<String>,
     ) -> ScanIndex {
+        self.claude_money_birth_store
+            .preserve_missing_from(&previous.claude_money_birth_store);
         let empty_advances = self.claude_empty_map_advances(previous);
         let held_keys = self.locally_held_keys(held);
         let placeholders =
