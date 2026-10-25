@@ -3012,7 +3012,9 @@ async fn build_slice(
 
     let mut traces = BTreeMap::<String, BTreeMap<u64, String>>::new();
     for &root in &roots {
-        traces.insert(root.to_owned(), BTreeMap::new());
+        if live {
+            traces.insert(root.to_owned(), BTreeMap::new());
+        }
         if let Some(trace_rows) = trace_report.evidence.get(root) {
             let mut collected = BTreeMap::new();
             for row in trace_rows {
@@ -3047,6 +3049,9 @@ async fn build_slice(
             update_unbuilt_lifecycle(index, ledger, &BTreeSet::new(), now, deadline)
                 .ok_or("memory")?;
     }
+
+    // A missing aggregate is a routing invalidation, not a complete trace.
+    traces.retain(|root, _| trace_report.evidence.contains_key(root));
 
     // Page hashes (units and rows), collisions by full id.
     let mut first_id = BTreeMap::<u64, &str>::new();

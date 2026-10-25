@@ -698,7 +698,7 @@ impl ClaudeLedgerScope {
                     "unbuilt:", key,
                 ))
                 .is_some_and(|record| {
-                    record.window() == super::claude_request_money::UNBUILT_RELEASED
+                    record.window() & super::claude_request_money::UNBUILT_RELEASED != 0
                 });
             files.push(((*key).to_owned(), debt, birth, released));
         }
