@@ -1848,7 +1848,9 @@ const CENSUS_SHADOW_WORST_BYTES: usize = 6178;
 /// load and the compare-and-swap reader. Compare every other persisted field.
 #[test]
 fn census_numeric_overflow_is_isolated_from_load_and_cas() {
+    use crate::snapshots::claude_request_census::duplicate_rebuild_test_support as bound;
     for enabled in [false, true] {
+        let _clock = bound::set_now(N3_T0);
         let _shadow_mode =
             crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
         let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
@@ -1886,8 +1888,18 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
                 .unwrap()
                 .replace(&format!("\"{marker}\""), &raw);
             let mut loaded = census_load(&scratch, name, &json);
+            let high_water = if name.starts_with("shadow") { N3_T0 } else { 0 };
+            assert_eq!(
+                loaded.claude_census_rebuild_wall_high_water, high_water,
+                "{name}: only a closed N3 guard observes the fixed wall clock"
+            );
             let mut actual = serde_json::to_value(&loaded).unwrap();
             let mut expected = expected.clone();
+            if high_water != 0 {
+                // The new N3 clock metadata belongs to the closed guard too;
+                // keep it in the full-index comparison at its exact value.
+                expected["claude_census_rebuild_wall_high_water"] = serde_json::json!(high_water);
+            }
             for key in ["claude_request_census", "claude_request_census_shadow"] {
                 actual.as_object_mut().unwrap().remove(key);
                 expected.as_object_mut().unwrap().remove(key);
@@ -1926,6 +1938,10 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
                 .save(&scratch.join(format!("{name}.json")))
                 .expect("CAS accepts the same malformed shadow");
             assert_eq!(loaded.generation, 8);
+            assert_eq!(
+                loaded.claude_census_rebuild_wall_high_water, high_water,
+                "{name}: CAS saves preserve the wall maximum"
+            );
         }
     }
 }
