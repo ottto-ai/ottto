@@ -2655,6 +2655,20 @@ fn census_duplicate_rows(index: &serde_json::Value, key: &str) -> String {
     format!("{{{rows}}}")
 }
 
+/// Reintroduce the fixture's duplicate over the current saved checkpoint.
+/// A save removes duplicate census rows; all persisted guard/witness state,
+/// files, generation and other fields must survive the next corruption event.
+fn census_rebuild_repeat_duplicate(path: &Path, original: &ScanIndex, key: &str) {
+    let mut saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let rows = census_duplicate_rows(&serde_json::to_value(original).unwrap(), key);
+    saved["claude_request_census"] = serde_json::json!("DUPLICATE_CENSUS_FIXTURE");
+    let raw = serde_json::to_string(&saved)
+        .unwrap()
+        .replace("\"DUPLICATE_CENSUS_FIXTURE\"", &rows);
+    std::fs::write(path, raw).unwrap();
+}
+
 const N3_T0: u64 = 1_790_000_000;
 const N3_DAY: u64 = 86_400;
 /// MONEY 724h P2: a grant's read span, and how long a rearm stamp counts
@@ -4842,6 +4856,7 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
             if restart {
                 bound::restart();
             }
+            census_rebuild_repeat_duplicate(&path, &original, &key);
             let clock = bound::set_now(back + 60);
             let mut index = ScanIndex::load(&path).unwrap();
             assert_eq!(bound::witness(&index), N3_T0, "{case}: saved as kept");
@@ -4859,6 +4874,7 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
 
             let forward = N3_T0 + 60;
             let _clock = bound::set_now(forward);
+            census_rebuild_repeat_duplicate(&path, &original, &key);
             let mut index = ScanIndex::load(&path).unwrap();
             assert_eq!(
                 bound::attempts(&index, &key),
@@ -4973,6 +4989,7 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
             if restart {
                 bound::restart();
             }
+            census_rebuild_repeat_duplicate(&path, &original, &key);
             let clock = bound::set_now(N3_T0 + 7 * N3_DAY + 60);
             let mut index = ScanIndex::load(&path).unwrap();
             persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
@@ -4992,6 +5009,7 @@ fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
             }
             let reopened = witness + 7 * N3_DAY + 60;
             let _clock = bound::set_now(reopened);
+            census_rebuild_repeat_duplicate(&path, &original, &key);
             let mut index = ScanIndex::load(&path).unwrap();
             assert_eq!(bound::attempts(&index, &key), vec![reopened], "{case}");
             persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
