@@ -11943,7 +11943,7 @@ fn claude_family_request_ids_are_disjoint(pending: &ClaudeAccountFamilyPendingWi
             }
         }
     }
-    union.len() as u128 == expected
+    expected > 0 && union.len() as u128 == expected
 }
 
 fn claude_account_request_id_set_fingerprint(hashes: &BTreeSet<String>) -> String {
@@ -42710,6 +42710,9 @@ impl ScanIndex {
     }
 
     fn retire_committed_claude_account_pending_windows(&mut self) {
+        if !claude_accepted_ledger_is_current(self) {
+            return;
+        }
         let candidates = self
             .claude_account_family_pending
             .iter()
@@ -61615,10 +61618,11 @@ mod tests {
             index
                 .files
                 .insert(key.clone(), manifest_index_entry(Some("fixture")));
+            let fingerprint = format!("{:x}", Sha256::digest(key.as_bytes()));
             index
                 .file_snapshot_fingerprints
-                .insert(key.clone(), BTreeSet::from([key.clone()]));
-            index.accepted_snapshot_fingerprints.insert(key);
+                .insert(key, BTreeSet::from([fingerprint.clone()]));
+            index.accepted_snapshot_fingerprints.insert(fingerprint);
         }
         index
     }
@@ -61936,8 +61940,13 @@ mod tests {
                     held.accepted_snapshot_fingerprints.clear();
                 }
                 "retry" => {
+                    let fingerprint = held.file_snapshot_fingerprints[&key]
+                        .iter()
+                        .next()
+                        .unwrap()
+                        .clone();
                     held.quarantined_snapshot_fingerprints.insert(
-                        key.clone(),
+                        fingerprint,
                         snapshot_quarantine_record(SnapshotSource::ClaudeCode),
                     );
                 }
