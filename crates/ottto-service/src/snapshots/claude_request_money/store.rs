@@ -118,7 +118,7 @@ fn shard_of(key: &str) -> usize {
     if key == CONTROL || key.starts_with(SWEEP_KEY_PREFIX) {
         META
     } else {
-        usize::from(Sha256::digest(key.as_bytes())[0])
+        usize::from(ring::digest::digest(&ring::digest::SHA256, key.as_bytes()).as_ref()[0])
     }
 }
 
@@ -185,6 +185,8 @@ pub(crate) enum SaveHeld {
     /// The day's `SAVE_DAILY_BYTES` would be passed.
     DailyCap,
     CreditPending,
+    /// Bounded serialization yielded before producing a complete save.
+    Deadline,
 }
 
 /// What one page's save may take: the UTC day and the coalescing interval.
@@ -470,7 +472,11 @@ impl ClaudeLedger {
         policy: SavePolicy<'_>,
     ) -> Option<(ClaudeLedgerSave, ShadowReservation)> {
         self.save_held = None;
-        if Instant::now() >= policy.deadline || self.dirty_shards() == 0 || writer().is_none() {
+        if Instant::now() >= policy.deadline {
+            self.save_held = Some(SaveHeld::Deadline);
+            return None;
+        }
+        if self.dirty_shards() == 0 || writer().is_none() {
             return None;
         }
         if self
@@ -543,6 +549,7 @@ impl ClaudeLedger {
         if !buffers.is_empty() {
             for (key, record) in self.census.entries() {
                 if Instant::now() >= policy.deadline {
+                    self.save_held = Some(SaveHeld::Deadline);
                     return None;
                 }
                 if key == CONTROL {
@@ -556,6 +563,7 @@ impl ClaudeLedger {
         let mut zero = zero_first.then(|| open(self.shard_bytes[META]));
         let mut current = meta_last.then(|| open(self.shard_bytes[META]));
         if Instant::now() >= policy.deadline {
+            self.save_held = Some(SaveHeld::Deadline);
             return None;
         }
         if let Some(buffer) = current.as_mut() {
@@ -2280,6 +2288,13 @@ pub(super) fn checkpoint_receipt_until(
     let Some((save, reservation)) = saved else {
         // Credit is prepaid asynchronously on this same writer. Waiting for
         // its durable ticket is pending work, not a custody failure.
+        #[cfg(test)]
+        eprintln!(
+            "money_checkpoint_no_save held={:?} dirty={} oversized={}",
+            ledger.save_held,
+            ledger.dirty_shards(),
+            ledger.oversized_shards
+        );
         return if ledger.save_held == Some(SaveHeld::CreditPending) {
             MoneyReceipt::Pending
         } else {
@@ -2702,6 +2717,36 @@ pub(crate) fn stall_writer_for_test() -> WriterStallForTest {
 #[cfg(test)]
 mod refused_intent_tests {
     use super::*;
+    #[test]
+    #[serial_test::serial(claude_request_money_shadow)]
+    fn checkpoint_deadline_preserves_dirty_custody_without_a_phantom_pending_receipt() {
+        let support = std::env::temp_dir().join(format!(
+            "ottto-money-checkpoint-deadline-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut ledger = ClaudeLedger::empty(false);
+        assert!(ledger.put_money(
+            "due:deadline".into(),
+            ClaudeRequestCensusRecord::money_debt([9; 32], 0)
+        ));
+        let dirty = ledger.dirty_shards();
+        let epoch = ledger.custody_epoch;
+        assert_eq!(
+            checkpoint_receipt_until(&support, &mut ledger, Instant::now()),
+            MoneyReceipt::Refused
+        );
+        assert_eq!(ledger.save_held, Some(SaveHeld::Deadline));
+        assert_eq!(ledger.dirty_shards(), dirty);
+        assert_eq!(ledger.custody_epoch, epoch);
+        assert_ne!(ledger.durable_custody_epoch, epoch);
+        assert!(ledger.get("due:deadline").is_some());
+        assert!(!support.join(LEDGER_DIR).exists());
+    }
+
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
     fn completed_recovery_payload_keeps_payment_until_receiver_cancellation() {

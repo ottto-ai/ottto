@@ -33,3 +33,16 @@ keys are excluded. Visits stay within the key count funded by scope admission.
 A caller-thread I/O receipt asserts zero filesystem operations, independently
 of the asynchronous writer, so the walk spends none of the page read budget.
 The original lost-debt and undecided verdict assertions remain.
+
+Logical alias grouping now stays consistent from scope lookup through family
+construction and capture routing when a full entity body is needed. The ordinary
+OFF path keeps physical membership and its original admission. An OFF-prepared
+finish revalidates its mode before entering the immediate future, so a mode
+transition cannot consume captures into an unowned asynchronous continuation.
+
+UNKNOWN expiry releases retained custody without shortening server Retry-After.
+The expiry control now checks no second POST at 24 hours under a 48-hour floor,
+then advances beyond both boundaries and requires an ordinary second POST.
+Deferred publication lookup avoids redundant address construction when no primary
+bindings exist. Key and shard digests use the same SHA-256 bytes through the
+existing native implementation; persisted encoding and all quota caps remain.

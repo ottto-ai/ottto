@@ -1537,6 +1537,7 @@ fn family_files<'i>(
     root: &str,
     items: &[&SnapshotItem],
     deadline: Instant,
+    owned_body: bool,
 ) -> Option<FamilyFiles<'i>> {
     let mut member_keys = BTreeMap::<(String, String), Vec<String>>::new();
     let mut indexed_members = BTreeMap::<String, BTreeSet<String>>::new();
@@ -1548,7 +1549,12 @@ fn family_files<'i>(
         if !index.files.contains_key(*key) {
             continue;
         }
-        let Some((root, member)) = claude_index_path_family_member(Path::new(key)) else {
+        let member = if owned_body {
+            logical_family_member(index, key)
+        } else {
+            claude_index_path_family_member(Path::new(key))
+        };
+        let Some((root, member)) = member else {
             continue;
         };
         indexed_members
@@ -1562,18 +1568,20 @@ fn family_files<'i>(
     }
     let mut groups = BTreeSet::new();
     for item in items {
-        let Some([key]) = member_keys
-            .get(&(root.to_owned(), item.source_session_id.clone()))
-            .map(Vec::as_slice)
-        else {
+        let Some(keys) = member_keys.get(&(root.to_owned(), item.source_session_id.clone())) else {
             continue;
         };
-        if let Some(group) = index
-            .files
-            .get_key_value(key)
-            .and_then(|(key, _)| claude_request_ledger::claude_project_group(key))
-        {
-            groups.insert(group);
+        if !owned_body && keys.len() != 1 {
+            continue;
+        }
+        for key in keys {
+            if let Some(group) = index
+                .files
+                .get_key_value(key)
+                .and_then(|(key, _)| claude_request_ledger::claude_project_group(key))
+            {
+                groups.insert(group);
+            }
         }
     }
     Some(FamilyFiles {
@@ -2569,7 +2577,14 @@ async fn build_page_with_coverage(
         // Then this family's own members, captures and scope, in that order:
         // its captures' message records precede its scope's debt.
         let family = match (files, claimed) {
-            (Some(files), Some(_)) => family_files(index, files, root, items, body_deadline),
+            (Some(files), Some(_)) => family_files(
+                index,
+                files,
+                root,
+                items,
+                body_deadline,
+                live || collect_entities,
+            ),
             _ => None,
         };
         let mut family_captures = BTreeMap::new();
@@ -2627,7 +2642,7 @@ async fn build_page_with_coverage(
                     family_captures.insert(
                         (
                             root.to_owned(),
-                            if collect_entities {
+                            if live || collect_entities {
                                 item.source_file_fingerprint.clone().unwrap_or_default()
                             } else {
                                 item.source_session_id.clone()
@@ -3133,6 +3148,7 @@ async fn build_slice(
     end: &mut PageEnd<'_>,
     counts: &mut ClaudeRequestMoneyShadowCounts,
 ) -> Result<(ClaudeRequestBody, [u8; 32], ClaudeMoneyTotals, u64), &'static str> {
+    let owned_body = live || owned_body;
     let mut deadline = end.deadline;
     let now = end.now;
     let roots = BTreeSet::from([root]);

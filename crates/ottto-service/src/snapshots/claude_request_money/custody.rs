@@ -8,7 +8,6 @@ use super::super::claude_request_census::{
 };
 use super::hex_bytes;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::time::Instant;
 
@@ -570,7 +569,7 @@ struct Address {
     path: Option<String>,
 }
 fn digest(value: &str) -> String {
-    format!("{:x}", Sha256::digest(value.as_bytes()))
+    hex_bytes(ring::digest::digest(&ring::digest::SHA256, value.as_bytes()).as_ref())
 }
 fn file_address(id: &str, field: &str, query: &str, path: Option<String>) -> Address {
     Address {
@@ -760,6 +759,27 @@ impl Custody {
         self.address(key).map(|a| a.carrier)
     }
     pub(crate) fn get(&self, key: &str) -> Option<RecordRef<'_>> {
+        if !self.primary_bindings {
+            if let Some(root) = key.strip_prefix("fam:") {
+                // Same file-first precedence as address(), without constructing
+                // an Address and looking up the detached carrier twice for
+                // every deferred-row comparison and publication receipt.
+                if let Some(slot) = self
+                    .files
+                    .get::<str>(format!("file:{key}").as_str())
+                    .and_then(|file| file.memo.as_deref())
+                    .filter(|slot| slot.key == key)
+                {
+                    return Some(slot.value.view());
+                }
+                return self
+                    .telemetry
+                    .get::<str>(format!("telemetry:{root}").as_str())
+                    .and_then(|file| file.memo.as_deref())
+                    .filter(|slot| slot.key == key)
+                    .map(|slot| slot.value.view());
+            }
+        }
         if let Some(root) = key.strip_prefix("ever:") {
             let root = super::super::claude_request_census::decode_fingerprint(root)?;
             return self.ever.binary_search(&root).ok().map(|_| {

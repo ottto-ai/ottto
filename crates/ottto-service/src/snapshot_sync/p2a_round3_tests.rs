@@ -5241,6 +5241,16 @@ fn p2a_unknown_retry_after_crossing_deadline_expires_without_replay() {
     assert!(unknown_recovery::active_for_test(&control.support).is_empty());
     assert_eq!(
         control.server.raw_batches.lock().unwrap().len(),
+        1,
+        "UNKNOWN expiry does not shorten the server's 48-hour Retry-After floor"
+    );
+    {
+        let after_floor = attempt.deadline.max(attempt.not_before).saturating_add(1);
+        let _clock = money::PageClockForTest::new(&control.support, after_floor);
+        control.cycle();
+    }
+    assert_eq!(
+        control.server.raw_batches.lock().unwrap().len(),
         2,
         "expiry releases only UNKNOWN; the next POST is an ordinary gated offer"
     );

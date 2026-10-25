@@ -582,9 +582,17 @@ fn the_continuation_pass_charges_no_g7() {
     assert_eq!(cache.side_ledger().len(), 0, "nothing charged");
     assert_eq!(
         index.charge_codex_parent_side_read(&fixture.key(), at, 1_000, &cache, &pass(true)),
-        Some(1),
-        "the ordinary control"
+        crate::heap_layout_bound::layout_supported().then_some(1),
+        "the ordinary control follows native heap-layout support"
     );
+    if !crate::heap_layout_bound::layout_supported() {
+        assert_eq!(
+            cache.side_ledger().len(),
+            0,
+            "unsupported layout writes nothing"
+        );
+        assert_eq!(index.codex_parent_side_requests[&fixture.key()], request);
+    }
 }
 
 /// Stage 1 S1-a (§7 exclusion: side due): the production continuation pass

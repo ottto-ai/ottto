@@ -6804,6 +6804,15 @@ fn finish_sync_source(
     }
     #[cfg(test)]
     money_resume::before_immediate_for_test();
+    // A preparation made while OFF owns no async money graph. If authority
+    // changed at this boundary, collect again through the live owner rather
+    // than poll and abandon a future that can consume its native captures.
+    if source_money_resume(preparation.source, support_dir) {
+        return Err(crate::source_rotation::LocalRefusal(
+            "request money scheduling checkpoint pending",
+        )
+        .into());
+    }
     let fallback = preparation.source == SnapshotSource::ClaudeCode
         && crate::snapshots::claude_request_money::store::live_refused(support_dir);
     let result = money_resume::immediate(finish_sync_source_resume(
