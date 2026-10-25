@@ -91,6 +91,19 @@ EOF_SPEC
   rm -f "$case_dir/$file.tmp"
 }
 
+# pr_checks <file> <suite> [<spec>]...: check_runs with <spec>s plus a success
+# for each required Linux check ("Public surface checks", "Rust advisory
+# audit", "Dependency review") in <suite>, so a case only spells out the checks
+# it is about.
+pr_checks() {
+  local file="$1" suite="$2"
+  shift 2
+  check_runs "$file" "$@" \
+    "91|Public surface checks|completed|success|$suite" \
+    "92|Rust advisory audit|completed|success|$suite" \
+    "93|Dependency review|completed|success|$suite"
+}
+
 # workflow_runs [<suite>|<event>[|<pr>|<base>|<head-owner>]]...
 # <pr> defaults to 7 and <base> to main; an empty <pr> leaves pull_requests
 # empty, as GitHub does for fork PR runs. <head-owner> defaults to example.
@@ -140,6 +153,10 @@ expect_no_log() {
   fi
 }
 
+expect_output() {
+  grep -F -q -- "$1" "$case_dir/out" || fail "output lacks: $1"
+}
+
 expect_count() {
   local got
   got="$(grep -c -F -- "$1" "$case_dir/log" || true)"
@@ -151,8 +168,8 @@ MERGE_CALL="gh pr merge 7 --squash --match-head-commit $SHA"
 new_case draft-pending-then-green
 pr_json pr OPEN true "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks.1 "10|Rust contracts|in_progress||500"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks.1 500 "10|Rust contracts|in_progress||500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 0 7
 expect_log "gh pr ready 7"
 expect_count "sleep 60" 1
@@ -161,7 +178,7 @@ expect_log "$MERGE_CALL"
 new_case ready-pr-does-not-call-ready
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 0 --repo example/repo 7
 expect_no_log "gh pr ready"
 expect_no_log "sleep"
@@ -170,7 +187,7 @@ expect_log "$MERGE_CALL"
 new_case conflicting-refused
 pr_json pr OPEN true "$SHA" CONFLICTING
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 3 7
 expect_no_log "gh pr ready"
 expect_no_log "gh pr merge"
@@ -179,7 +196,7 @@ new_case conflict-appears-while-waiting
 pr_json pr.1 OPEN false "$SHA" MERGEABLE
 pr_json pr OPEN false "$SHA" CONFLICTING
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|queued||500"
+pr_checks checks 500 "10|Rust contracts|queued||500"
 run_guard 3 7
 expect_no_log "gh pr merge"
 
@@ -193,7 +210,7 @@ expect_no_log "gh pr merge"
 new_case skipped-is-not-ready
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|skipped|500"
+pr_checks checks 500 "10|Rust contracts|completed|skipped|500"
 run_guard 6 --timeout 120 7
 expect_count "sleep 60" 2
 expect_no_log "gh pr merge"
@@ -201,7 +218,7 @@ expect_no_log "gh pr merge"
 new_case neutral-is-not-ready
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|neutral|500"
+pr_checks checks 500 "10|Rust contracts|completed|neutral|500"
 run_guard 6 --timeout 0 7
 expect_no_log "sleep"
 expect_no_log "gh pr merge"
@@ -211,7 +228,9 @@ pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
 check_runs checks "11|Public surface checks|completed|success|500" \
   "12|Rust contracts (Mac deferred: draft)|completed|success|500" \
-  "13|Rust tests (Linux)|completed|success|500"
+  "13|Rust tests (Linux)|completed|success|500" \
+  "15|Rust advisory audit|completed|success|500" \
+  "16|Dependency review|completed|success|500"
 run_guard 6 --timeout 60 7
 expect_count "sleep 60" 1
 expect_no_log "gh pr merge"
@@ -219,7 +238,7 @@ expect_no_log "gh pr merge"
 new_case dispatch-green-is-not-evidence
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "600|workflow_dispatch" "700|push"
-check_runs checks "20|Rust contracts|completed|success|600" \
+pr_checks checks 700 "20|Rust contracts|completed|success|600" \
   "21|Rust contracts|completed|success|700"
 run_guard 6 --timeout 60 7
 expect_no_log "gh pr merge"
@@ -227,7 +246,7 @@ expect_no_log "gh pr merge"
 new_case failure-is-red
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|failure|500"
+pr_checks checks 500 "10|Rust contracts|completed|failure|500"
 run_guard 4 7
 expect_no_log "sleep"
 expect_no_log "gh pr merge"
@@ -235,7 +254,7 @@ expect_no_log "gh pr merge"
 new_case rerun-success-after-failure
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|failure|500" \
+pr_checks checks 500 "10|Rust contracts|completed|failure|500" \
   "14|Rust contracts|completed|success|500"
 run_guard 0 7
 expect_log "$MERGE_CALL"
@@ -243,7 +262,7 @@ expect_log "$MERGE_CALL"
 new_case rerun-in-progress-after-success
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500" \
+pr_checks checks 500 "10|Rust contracts|completed|success|500" \
   "14|Rust contracts|in_progress||500"
 run_guard 6 --timeout 60 7
 expect_no_log "gh pr merge"
@@ -253,7 +272,7 @@ pr_json pr.1 OPEN false "$SHA" UNKNOWN
 pr_json pr.2 OPEN false "$SHA" UNKNOWN
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 0 7
 expect_count "sleep 60" 1
 expect_log "$MERGE_CALL"
@@ -262,7 +281,7 @@ new_case head-moved
 pr_json pr.1 OPEN false "$SHA" MERGEABLE
 pr_json pr OPEN false "$NEW_SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 5 7
 expect_no_log "gh pr merge"
 
@@ -276,7 +295,7 @@ expect_no_log "gh pr merge"
 new_case merge-failure
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 echo 1 > "$case_dir/merge_exit"
 run_guard 7 7
 expect_log "$MERGE_CALL"
@@ -284,43 +303,107 @@ expect_log "$MERGE_CALL"
 new_case custom-interval
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request"
-check_runs checks "10|Rust contracts|queued||500"
+pr_checks checks 500 "10|Rust contracts|queued||500"
 run_guard 6 --interval 90 --timeout 180 7
 expect_count "sleep 90" 2
 
 new_case other-pr-run-is-not-evidence
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request|8|main"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 6 --timeout 0 7
 expect_no_log "gh pr merge"
 
 new_case other-base-run-is-not-evidence
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request|7|release"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 6 --timeout 0 7
 expect_no_log "gh pr merge"
 
 new_case fork-pr-run-without-links
 pr_json pr OPEN false "$SHA" MERGEABLE contributor
 workflow_runs "500|pull_request||main|contributor"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 0 7
 expect_log "$MERGE_CALL"
 
 new_case fork-run-from-other-repo-is-not-evidence
 pr_json pr OPEN false "$SHA" MERGEABLE contributor
 workflow_runs "500|pull_request||main|someone-else"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 6 --timeout 0 7
 expect_no_log "gh pr merge"
 
 new_case same-repo-run-without-links-is-not-evidence
 pr_json pr OPEN false "$SHA" MERGEABLE
 workflow_runs "500|pull_request||main|example"
-check_runs checks "10|Rust contracts|completed|success|500"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
 run_guard 6 --timeout 0 7
+expect_no_log "gh pr merge"
+
+new_case linux-surface-red
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+check_runs checks "10|Rust contracts|completed|success|500" \
+  "11|Public surface checks|completed|failure|500" \
+  "12|Rust advisory audit|completed|success|500" \
+  "13|Dependency review|completed|success|500"
+run_guard 4 7
+expect_output '"Public surface checks" concluded failure'
+expect_no_log "sleep"
+expect_no_log "gh pr merge"
+
+new_case red-does-not-wait-for-pending-mac
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+check_runs checks "10|Rust contracts|in_progress||500" \
+  "11|Public surface checks|completed|success|500" \
+  "12|Rust advisory audit|completed|cancelled|500" \
+  "13|Dependency review|completed|success|500"
+run_guard 4 7
+expect_output '"Rust advisory audit" concluded cancelled'
+expect_no_log "sleep"
+expect_no_log "gh pr merge"
+
+new_case advisory-pending-with-mac-green-waits
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+check_runs checks "10|Rust contracts|completed|success|500" \
+  "11|Public surface checks|completed|success|500" \
+  "12|Rust advisory audit|queued||500" \
+  "13|Dependency review|completed|success|500"
+run_guard 6 --timeout 60 7
+expect_count "sleep 60" 1
+expect_output '"Rust advisory audit" pending'
+expect_no_log "gh pr merge"
+
+new_case missing-dependency-review-waits
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+check_runs checks "10|Rust contracts|completed|success|500" \
+  "11|Public surface checks|completed|success|500" \
+  "12|Rust advisory audit|completed|success|500"
+run_guard 6 --timeout 0 7
+expect_output '"Dependency review" missing'
+expect_no_log "gh pr merge"
+
+new_case informational-check-failure-does-not-block
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+pr_checks checks 500 "10|Rust contracts|completed|success|500" \
+  "14|Rust tests (Linux)|completed|failure|500"
+run_guard 0 7
+expect_log "$MERGE_CALL"
+
+new_case more-than-one-page-is-not-judged
+pr_json pr OPEN false "$SHA" MERGEABLE
+workflow_runs "500|pull_request"
+pr_checks checks 500 "10|Rust contracts|completed|success|500"
+jq '.total_count = 150' "$case_dir/checks" > "$case_dir/checks.next"
+mv "$case_dir/checks.next" "$case_dir/checks"
+run_guard 6 --timeout 0 7
+expect_output "more than one page"
 expect_no_log "gh pr merge"
 
 new_case short-interval-rejected

@@ -41,12 +41,15 @@ them. Small prose, cosmetic or purely mechanical changes may skip with a reason.
 ## Merging
 
 Merge only with `scripts/pr_merge_when_mac_green.sh <pr>`. It marks a draft
-ready, waits until the macOS `Rust contracts` job of the pull-request run on the
-PR's head commit passed, and then squash-merges exactly that head
-(`--match-head-commit`). It refuses a PR with merge conflicts: rebase onto
-`main`, regenerate `PUBLIC_EXPORT_MANIFEST.json`, and push first. `gh pr checks`
-exit 0 and a Linux green are not Mac evidence, and a manually started
-(`workflow_dispatch`) run tests the branch head, not the merge with `main`.
+ready, waits until the four Public CI (`ci.yml`) checks of the pull-request run
+on the PR's head commit passed (macOS `Rust contracts`; Linux `Public surface
+checks`, `Rust advisory audit` and `Dependency review`), and then squash-merges
+exactly that head (`--match-head-commit`); other checks are informational.
+`main`'s ruleset also requires `Rust contracts`. The script refuses a PR with
+merge conflicts: rebase onto `main` and push first. `gh pr checks` exit 0 is not
+evidence, no Linux job stands in for the macOS `Rust contracts` job, and a
+manually started (`workflow_dispatch`) run tests the branch head, not the merge
+with `main`.
 
 ## Credential Store Tests
 
