@@ -913,8 +913,7 @@ impl SnapshotBatchResponse {
                     return Err(anyhow!("legacy snapshot response accepted count mismatch"));
                 }
                 if request.snapshots.iter().any(|item| {
-                    item.usage_accounting_contract.as_deref()
-                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
+                    crate::snapshots::claude_request_money::is_request_owned_literal(item)
                         || item.context_curve.is_some()
                         || item.session_account_evidence.is_some()
                         || item.cache_observations.is_some()

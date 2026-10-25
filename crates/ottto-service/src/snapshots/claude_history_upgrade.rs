@@ -263,6 +263,9 @@ pub(crate) enum HistoryHold {
     Latched,
     /// This page's history budget is spent.
     Budget,
+    /// This page could not read Claude telemetry (E2 gate on): an upgrade
+    /// would settle on transcript estimates for good, so it waits.
+    TelemetryUnread,
 }
 
 impl HistoryHold {
@@ -275,6 +278,7 @@ impl HistoryHold {
             Self::MoveNotFull => "move_not_full",
             Self::Latched => "latched",
             Self::Budget => "budget",
+            Self::TelemetryUnread => "telemetry_unread",
         }
     }
 }
@@ -301,6 +305,42 @@ pub(crate) enum HistoryDecision {
     /// ordinary body emits, literal items are removed, and the file does not
     /// stamp the active revision.
     LiteralDenied,
+}
+
+/// Indexed Claude member files present under two or more paths (path
+/// twins), by member id, with their indexed sizes. One sorted borrowed pass;
+/// only twin groups are kept.
+fn claude_path_twin_groups(
+    files: &BTreeMap<String, super::ScanIndexEntry>,
+) -> BTreeMap<String, Vec<(String, u64)>> {
+    let mut members = files
+        .iter()
+        .filter_map(|(key, entry)| {
+            let member = super::claude_index_path_member_ref(std::path::Path::new(key))?;
+            Some((
+                (member.root, member.subagent_stem),
+                key.as_str(),
+                entry.size_bytes,
+            ))
+        })
+        .collect::<Vec<_>>();
+    members.sort_unstable();
+    members
+        .chunk_by(|left, right| left.0 == right.0)
+        .filter(|group| group.len() > 1)
+        .map(|group| {
+            let (root, stem) = group[0].0;
+            let member = match stem {
+                Some(stem) => format!("{root}_{stem}"),
+                None => root.to_owned(),
+            };
+            let keys = group
+                .iter()
+                .map(|(_, key, size)| ((*key).to_owned(), *size))
+                .collect();
+            (member, keys)
+        })
+        .collect()
 }
 
 /// The `history_emission_denied` reason of a literal-only denial.
@@ -410,9 +450,16 @@ pub(crate) struct HistoryPage {
     /// Subagent members held as listed only through their family root, while
     /// the root file is absent (StateMissing M1, SOURCE d680b524).
     pub(super) family_closure_root_absent_excluded: u64,
+    /// E2: the path twins (same Claude member file under another project
+    /// directory, with indexed sizes) of the owed candidate being decided.
+    /// Its reservation takes them too, both or neither.
+    staged_twins: Option<(String, Vec<(String, u64)>)>,
+    /// E2: this page's indexed path-twin groups by member, built once on the
+    /// page's first owed candidate. Only members with two or more paths.
+    twin_index: Option<BTreeMap<String, Vec<(String, u64)>>>,
 }
 
-crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded);
+crate::heap_layout_bound::fields!(HistoryPage; files, bytes, reserved, owed, permitted, denied, listed_literal_roots, family_closure_root_absent_excluded, staged_twins, twin_index);
 
 impl HistoryPage {
     /// Reserve this page's budget for one file. A file reserved earlier on
@@ -437,15 +484,34 @@ impl HistoryPage {
         if self.reserved.contains(index_key) {
             return true;
         }
-        if self.files >= super::body_witness_adoption_page_budget()
-            || (self.bytes.saturating_add(size_bytes) > super::body_witness_adoption_byte_budget()
-                && !(first_file && self.files == 0))
+        // E2 path twins settle as one entity, so they are reserved as one
+        // group: a twin held only by this budget would hold its sibling's
+        // body too, page after page. A page's first group passes the file
+        // count (never the bytes), so a pair always fits within two pages.
+        let twins = match self.staged_twins.take() {
+            Some((key, twins)) if key == index_key => twins,
+            _ => Vec::new(),
+        };
+        let twins = twins
+            .into_iter()
+            .filter(|(key, _)| !self.reserved.contains(key))
+            .collect::<Vec<_>>();
+        let files = 1 + twins.len();
+        let bytes = twins
+            .iter()
+            .fold(size_bytes, |sum, (_, size)| sum.saturating_add(*size));
+        let page_empty = self.files == 0;
+        if (self.files.saturating_add(files) > super::body_witness_adoption_page_budget()
+            && !(files > 1 && page_empty))
+            || (self.bytes.saturating_add(bytes) > super::body_witness_adoption_byte_budget()
+                && !(first_file && page_empty))
         {
             return false;
         }
-        self.files += 1;
-        self.bytes = self.bytes.saturating_add(size_bytes);
+        self.files += files;
+        self.bytes = self.bytes.saturating_add(bytes);
         self.reserved.insert(index_key.to_owned());
+        self.reserved.extend(twins.into_iter().map(|(key, _)| key));
         true
     }
 
@@ -591,19 +657,23 @@ impl HistoryEmission {
         else {
             return true;
         };
-        gated.held.is_none()
-            && !(gated.literal_denied
-                && item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT))
+        gated.held.is_none() && !(gated.literal_denied && is_request_owned_literal(item))
     }
 
     /// Recheck the stop latch at the emission seam: a fold can latch after a
     /// candidate was permitted. A literal-denied file is ordinary sync, not
     /// an upgrade, and is not held.
     pub(super) fn hold_permitted_for_latch(&mut self) -> usize {
+        self.hold_permitted(HistoryHold::Latched)
+    }
+
+    /// Hold every permitted upgrade of this cycle under `hold`. A
+    /// literal-denied file is ordinary sync, not an upgrade, and is not held.
+    fn hold_permitted(&mut self, hold: HistoryHold) -> usize {
         let mut held = 0;
         for gated in self.files.values_mut() {
             if gated.held.is_none() && !gated.literal_denied {
-                gated.held = Some(HistoryHold::Latched);
+                gated.held = Some(hold);
                 held += 1;
             }
         }
@@ -611,8 +681,45 @@ impl HistoryEmission {
     }
 }
 
-fn is_request_owned_literal(item: &super::SnapshotItem) -> bool {
+impl super::ScanIndex {
+    /// E2: stage the indexed path twins of owed candidate `index_key` for
+    /// this page's budget reservation (`HistoryPage::reserve`).
+    pub(super) fn stage_claude_history_twins(&self, index_key: &str, page: &mut HistoryPage) {
+        let groups = page
+            .twin_index
+            .get_or_insert_with(|| claude_path_twin_groups(&self.files));
+        let twins = super::claude_index_path_family_member(std::path::Path::new(index_key))
+            .and_then(|(_, member)| groups.get(&member))
+            .map(|keys| {
+                keys.iter()
+                    .filter(|(key, _)| key != index_key)
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        page.staged_twins = Some((index_key.to_owned(), twins));
+    }
+
+    /// E2: this page's Claude telemetry read failed. Every permitted owed
+    /// upgrade is held (`telemetry_unread`) before the emission seam, so it
+    /// emits nothing, keeps its upload tuple and stays owed: delayed, never
+    /// settled on estimates. Returns how many files were held.
+    pub(crate) fn hold_claude_history_for_unread_telemetry(&mut self) -> usize {
+        self.claude_history_emission
+            .hold_permitted(HistoryHold::TelemetryUnread)
+    }
+}
+
+/// The one predicate for a request-owned literal body (gate, emitter, upload
+/// batcher, ACK validation).
+pub(crate) fn is_request_owned_literal(item: &super::SnapshotItem) -> bool {
     item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT)
+}
+
+/// The Claude family root a request-owned literal body uploads with; `None`
+/// for every other body. Typed: no serialization.
+pub(crate) fn request_owned_family_root(item: &super::SnapshotItem) -> Option<&str> {
+    is_request_owned_literal(item).then(|| super::claude_snapshot_family_root_ref(item))
 }
 
 /// True when `revision`'s row denies listed (or, while the list is paused,
@@ -1772,5 +1879,132 @@ mod tests {
             );
         });
         assert_eq!(later.len(), 1);
+    }
+
+    fn twin_index(sizes: &[(&str, u64)]) -> super::super::ScanIndex {
+        let mut index = super::super::ScanIndex::default();
+        for (key, size) in sizes {
+            let mut entry = super::super::tests::manifest_index_entry(None);
+            entry.size_bytes = *size;
+            index.files.insert((*key).to_owned(), entry);
+        }
+        index
+    }
+
+    const TWIN_A: &str = "/h/.claude/projects/-a/11111111-1111-4111-8111-111111111111.jsonl";
+    const TWIN_B: &str = "/h/slot/projects/-b/11111111-1111-4111-8111-111111111111.jsonl";
+    const OTHER: &str = "/h/.claude/projects/-a/22222222-2222-4222-8222-222222222222.jsonl";
+    const AGENT: &str =
+        "/h/.claude/projects/-a/11111111-1111-4111-8111-111111111111/subagents/agent-x.jsonl";
+
+    /// E2 path twins: a pair is reserved both or neither, and a page's first
+    /// group passes the file count, so under a budget of one or two files a
+    /// pair held by another file's reservation settles on the next page.
+    #[test]
+    fn path_twins_reserve_both_or_neither_and_settle_within_two_pages() {
+        let index = twin_index(&[(TWIN_A, 10), (TWIN_B, 12), (OTHER, 5), (AGENT, 7)]);
+        let list = installed("");
+        let owed = |page: &mut HistoryPage, key: &str, size: u64| {
+            index.stage_claude_history_twins(key, page);
+            decide(HistoryKind::Owed, &inputs(&list, false, 2), page, key, size)
+        };
+        let mut staged = HistoryPage::default();
+        index.stage_claude_history_twins(TWIN_A, &mut staged);
+        assert_eq!(
+            staged.staged_twins,
+            Some((TWIN_A.to_owned(), vec![(TWIN_B.to_owned(), 12)])),
+            "same member file under another project; the agent and other sessions are not twins"
+        );
+        index.stage_claude_history_twins(OTHER, &mut staged);
+        assert_eq!(staged.staged_twins, Some((OTHER.to_owned(), Vec::new())));
+        for budget in [1, 2] {
+            super::super::with_body_witness_adoption_page_budget(budget, || {
+                // Page 1: another owed file takes the page first.
+                let mut page = HistoryPage::default();
+                assert_eq!(owed(&mut page, OTHER, 5), HistoryDecision::Owed);
+                assert_eq!(
+                    owed(&mut page, TWIN_A, 10),
+                    HistoryDecision::Held(HistoryHold::Budget),
+                    "budget {budget}: a twin is never reserved without its sibling"
+                );
+                assert_eq!(
+                    owed(&mut page, TWIN_B, 12),
+                    HistoryDecision::Held(HistoryHold::Budget),
+                    "budget {budget}: neither twin is reserved"
+                );
+                assert_eq!((page.files, page.bytes), (1, 5));
+                // Page 2: the settled file is no longer owed; the pair goes first.
+                let mut page = HistoryPage::default();
+                assert_eq!(owed(&mut page, TWIN_A, 10), HistoryDecision::Owed);
+                assert_eq!(owed(&mut page, TWIN_B, 12), HistoryDecision::Owed);
+                assert_eq!((page.files, page.bytes), (2, 22), "budget {budget}");
+                assert_eq!(page.permitted, 2);
+            });
+        }
+        // Bytes stay strict even for a page's first group.
+        super::super::with_body_witness_adoption_byte_budget(21, || {
+            let mut page = HistoryPage::default();
+            assert_eq!(
+                owed(&mut page, TWIN_B, 12),
+                HistoryDecision::Held(HistoryHold::Budget)
+            );
+            assert!(page.reserved.is_empty());
+        });
+        // A single file keeps the previous rule exactly (no group exception).
+        super::super::with_body_witness_adoption_page_budget(1, || {
+            let mut page = HistoryPage::default();
+            assert!(page.reserve(OTHER, 5));
+            assert!(!page.reserve(AGENT, 7));
+            assert!(
+                page.reserve(OTHER, 5),
+                "a reserved file is not charged twice"
+            );
+        });
+    }
+
+    /// E2: a failed telemetry read holds every permitted owed upgrade of the
+    /// cycle (it stays owed), never a held or literal-denied file's state.
+    #[test]
+    fn unread_telemetry_holds_permitted_upgrades_only() {
+        let mut index = super::super::ScanIndex::default();
+        let gated = |held, literal_denied| GatedHistory {
+            index_key: "k".into(),
+            held,
+            literal_denied,
+            previous: None,
+            local: BTreeSet::new(),
+        };
+        let files = &mut index.claude_history_emission.files;
+        files.insert("permitted".into(), gated(None, false));
+        files.insert("budget".into(), gated(Some(HistoryHold::Budget), false));
+        files.insert("denied".into(), gated(None, true));
+        assert_eq!(index.hold_claude_history_for_unread_telemetry(), 1);
+        let emission = &index.claude_history_emission;
+        assert_eq!(
+            emission.held("permitted"),
+            Some(HistoryHold::TelemetryUnread)
+        );
+        assert_eq!(emission.held("budget"), Some(HistoryHold::Budget));
+        assert_eq!(emission.held("denied"), None);
+        assert!(emission.literal_denied("denied"));
+        assert_eq!(HistoryHold::TelemetryUnread.as_str(), "telemetry_unread");
+    }
+
+    /// One literal owner: the predicate and the family root are typed reads
+    /// of the item (no serialization), `None` for every other body.
+    #[test]
+    fn request_owned_family_root_is_typed_and_literal_only() {
+        let mut item = crate::snapshots::tests::sample_session_artifact_item();
+        item.attribution_facts.clear();
+        item.source_session_id = "root-1_agent-x".into();
+        assert!(!is_request_owned_literal(&item));
+        assert_eq!(request_owned_family_root(&item), None);
+        item.usage_accounting_contract = Some("session_exclusive_reported_usage:v1".into());
+        assert_eq!(request_owned_family_root(&item), None);
+        item.usage_accounting_contract = Some(REQUEST_OWNED_USAGE_CONTRACT.into());
+        assert!(is_request_owned_literal(&item));
+        assert_eq!(request_owned_family_root(&item), Some("root-1"));
+        item.source_session_id = "root-1".into();
+        assert_eq!(request_owned_family_root(&item), Some("root-1"));
     }
 }

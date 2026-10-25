@@ -7006,7 +7006,7 @@ fn finish_sync_source(
     let projected_pending_head_file_witnesses =
         upload_progress.pending_cache_head_file_witnesses(&index);
     let mut accepted = 0;
-    let upload_result = upload_resumable_batches_with_body_witness_partitioned(
+    let upload_result = upload_resumable_batches_with_literal_families(
         &scan_result.snapshots,
         source.api_slug(),
         &mut upload_progress,
@@ -7015,6 +7015,7 @@ fn finish_sync_source(
         snapshot_upload_body_witness,
         |snapshot| Some(snapshot.source_session_id.as_str()),
         |snapshot| legacy_reconciliation_pending.contains(&snapshot.snapshot_fingerprint),
+        crate::snapshots::claude_request_money::request_owned_family_root,
         &mut inplace_retry,
         |snapshots| {
             // A first Codex/Claude scan can spend several minutes parsing local
@@ -8440,6 +8441,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
             full_rearm_evidence_complete = false;
         }
     }
+    let telemetry_read_failed = stats.effort_evidence_load_failed;
     let usage_roots = claude_evidence_root_session_ids(&scan_result.snapshots)
         .into_iter()
         .chain(crate::snapshots::claude_pending_family_session_ids(index))
@@ -8604,6 +8606,24 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
     if let Some(comparison) = comparison {
         comparison.retire_native_fold_owner();
     }
+    // E2 bodies are final before any identity owner runs: contract 5, D1 and
+    // the account hash then tag the rows that upload (donor #699 order).
+    // Gate off this only counts, so the page is unchanged.
+    crate::snapshots::claude_request_money::e2::finish_page(
+        &mut scan_result.snapshots,
+        index,
+        if telemetry_read_failed {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Failed
+        } else {
+            crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
+        },
+    );
+    if telemetry_read_failed && crate::snapshots::claude_request_money::e2::enabled() {
+        // No owed history file settles on estimates because this page could
+        // not read telemetry: the emission seam drops its bodies, keeps its
+        // upload tuple, and it stays owed for a later page.
+        index.hold_claude_history_for_unread_telemetry();
+    }
     if let Some(evidence) = &identity_evidence {
         // Contract 5 first: D1 below leaves new-collector items untouched. The
         // rebuild above has just settled this pass's duplicate census.
@@ -8699,22 +8719,9 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    crate::snapshots::claude_request_money::e2::finish_page(
-        &mut scan_result.snapshots,
-        index,
-        if stats.effort_evidence_load_failed {
-            crate::snapshots::claude_request_money::e2::TelemetryRead::Failed
-        } else {
-            crate::snapshots::claude_request_money::e2::TelemetryRead::Loaded
-        },
-    );
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
-    crate::snapshots::claude_request_money::advance_telemetry_page(
-        support_dir,
-        &scan_result.snapshots,
-    );
     crate::snapshots::claude_request_money::shadow_page(
         support_dir,
         &scan_result.snapshots,
@@ -9320,6 +9327,33 @@ fn snapshot_packing_json_length<T: Serialize + ?Sized>(item: &T) -> serde_json::
     Ok(length.bytes)
 }
 
+/// Cut one request-owned family (root first) into consecutive groups that
+/// each fit one batch: at most `SNAPSHOT_BATCH_LIMIT` bodies and
+/// `SNAPSHOT_BATCH_MAX_BYTES`, one batch class. A family that fits stays one
+/// group. A single body over the byte bound is its own group and meets the
+/// existing request preflight.
+fn literal_family_groups(members: Vec<(usize, usize, bool)>) -> Vec<Vec<(usize, usize, bool)>> {
+    let mut groups = Vec::new();
+    let mut group = Vec::<(usize, usize, bool)>::new();
+    let mut bytes = 2usize;
+    for member in members {
+        if !group.is_empty()
+            && (group.len() == SNAPSHOT_BATCH_LIMIT
+                || bytes.saturating_add(member.1) > SNAPSHOT_BATCH_MAX_BYTES
+                || group[0].2 != member.2)
+        {
+            groups.push(std::mem::take(&mut group));
+            bytes = 2;
+        }
+        bytes = bytes.saturating_add(member.1);
+        group.push(member);
+    }
+    if !group.is_empty() {
+        groups.push(group);
+    }
+    groups
+}
+
 #[allow(clippy::too_many_arguments)]
 fn upload_resumable_batches_with_body_witness_partitioned<
     T,
@@ -9339,6 +9373,57 @@ fn upload_resumable_batches_with_body_witness_partitioned<
     session_id: SessionId,
     batch_class: BatchClass,
     inplace_retry: &mut InplaceRetryBudget,
+    upload: Upload,
+    persist: Persist,
+) -> Result<ResumableUploadResult>
+where
+    T: Clone + Serialize,
+    Fingerprint: Fn(&T) -> &str,
+    BodyWitness: Fn(&T) -> String,
+    SessionId: Fn(&T) -> Option<&str>,
+    BatchClass: Fn(&T) -> bool,
+    Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
+    Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
+{
+    upload_resumable_batches_with_literal_families(
+        items,
+        poison_scope,
+        progress,
+        accepted,
+        fingerprint,
+        body_witness,
+        session_id,
+        batch_class,
+        |_| None,
+        inplace_retry,
+        upload,
+        persist,
+    )
+}
+
+/// `literal_family` names the family root of a request-owned literal body
+/// (`None` for every other body); see `literal_family_groups`.
+#[allow(clippy::too_many_arguments)]
+fn upload_resumable_batches_with_literal_families<
+    T,
+    Fingerprint,
+    BodyWitness,
+    SessionId,
+    BatchClass,
+    LiteralFamily,
+    Upload,
+    Persist,
+>(
+    items: &[T],
+    poison_scope: &str,
+    progress: &mut SnapshotUploadProgress,
+    accepted: &mut u64,
+    fingerprint: Fingerprint,
+    body_witness: BodyWitness,
+    session_id: SessionId,
+    batch_class: BatchClass,
+    literal_family: LiteralFamily,
+    inplace_retry: &mut InplaceRetryBudget,
     mut upload: Upload,
     mut persist: Persist,
 ) -> Result<ResumableUploadResult>
@@ -9348,6 +9433,7 @@ where
     BodyWitness: Fn(&T) -> String,
     SessionId: Fn(&T) -> Option<&str>,
     BatchClass: Fn(&T) -> bool,
+    LiteralFamily: Fn(&T) -> Option<&str>,
     Upload: FnMut(Vec<T>) -> Result<crate::snapshot_client::SnapshotBatchResponse>,
     Persist: FnMut(&mut SnapshotUploadProgress) -> Result<()>,
 {
@@ -9453,32 +9539,31 @@ where
     }
     let mut deferred_validation_error = None;
     let mut batches = VecDeque::new();
+    // Request-owned literal bodies travel with their Claude family (early-t7
+    // Q1). A family that fits one batch is packed whole; a larger one is cut
+    // into consecutive batch-sized groups, root first, never refused. Each
+    // group still settles by its own exact entity ACKs. Without literal items
+    // (gate off) every group is one item and packing is the previous order.
     let mut groups = Vec::<Vec<(usize, usize, bool)>>::new();
-    let mut literal_families = BTreeMap::<String, Vec<(usize, usize, bool)>>::new();
+    let mut literal_families = BTreeMap::<&str, Vec<(usize, usize, bool)>>::new();
     for (index, body_length, _) in pending_by_fingerprint.into_values() {
-        let item_batch_class = batch_class(&items[index]);
-        let literal = crate::snapshots::claude_request_money::e2::enabled()
-            && serde_json::to_value(&items[index])
-                .ok()
-                .is_some_and(|value| {
-                    value
-                        .get("usage_accounting_contract")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-                });
-        let item = (index, body_length.saturating_add(1), item_batch_class);
-        if literal {
-            let member = session_id(&items[index])
-                .ok_or_else(|| anyhow!("request-owned body lacks session identity"))?;
-            let root = member
-                .split_once("_agent-")
-                .map_or(member, |(root, _)| root);
-            literal_families.entry(root.into()).or_default().push(item);
-        } else {
-            groups.push(vec![item]);
+        let item = (
+            index,
+            body_length.saturating_add(1),
+            batch_class(&items[index]),
+        );
+        match literal_family(&items[index]) {
+            Some(root) => literal_families.entry(root).or_default().push(item),
+            None => groups.push(vec![item]),
         }
     }
-    groups.extend(literal_families.into_values());
+    for (root, mut members) in literal_families {
+        members.sort_by_key(|(index, _, _)| {
+            let member = session_id(&items[*index]);
+            (member != Some(root), member)
+        });
+        groups.extend(literal_family_groups(members));
+    }
     let mut batch = Vec::new();
     let mut batch_bytes = 2usize;
     let mut current_batch_class = None;
@@ -9487,15 +9572,6 @@ where
             .iter()
             .fold(0usize, |sum, (_, bytes, _)| sum.saturating_add(*bytes));
         let group_class = group[0].2;
-        if group.len() > 1
-            && (group.len() > SNAPSHOT_BATCH_LIMIT
-                || group_bytes.saturating_add(2) > SNAPSHOT_BATCH_MAX_BYTES
-                || group.iter().any(|(_, _, class)| *class != group_class))
-        {
-            return Err(anyhow!(
-                "request-owned family cannot fit one snapshot batch"
-            ));
-        }
         if !batch.is_empty()
             && (batch.len() + group.len() > SNAPSHOT_BATCH_LIMIT
                 || batch_bytes.saturating_add(group_bytes) > SNAPSHOT_BATCH_MAX_BYTES
@@ -9552,18 +9628,7 @@ where
         let inplace_wait = attempt.as_ref().err().and_then(|error| {
             inplace_retry.admit(error, inplace_retry_failed_after(attempt_started))
         });
-        let literal_batch = indices.iter().any(|index| {
-            serde_json::to_value(&items[*index])
-                .ok()
-                .is_some_and(|value| {
-                    value
-                        .get("usage_accounting_contract")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
-                })
-        });
         match attempt {
-            Err(error) if literal_batch && inplace_wait.is_none() => return Err(error),
             Ok(SnapshotPageOutcome::Disabled(reason)) => {
                 return Ok(ResumableUploadResult::Disabled(reason));
             }
@@ -15011,6 +15076,11 @@ mod tests {
     mod packing_count_tests {
         use super::*;
         include!("snapshot_sync/packing_count_tests.rs");
+    }
+
+    mod e2_upload_tests {
+        use super::*;
+        include!("snapshot_sync/e2_upload_tests.rs");
     }
 
     #[derive(Clone, Serialize)]
