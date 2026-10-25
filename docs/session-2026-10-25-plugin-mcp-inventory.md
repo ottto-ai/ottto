@@ -6,10 +6,13 @@ rows with `disabled: true`; cached files without matching app configuration do
 not create rows. Existing manually configured servers take precedence.
 
 Claude Code discovery joins `plugins/installed_plugins.json` installation paths
-with `enabledPlugins` settings from the same user or managed account directory.
+with `enabledPlugins` settings from the same user or registered account directory.
 `settings.local.json` overrides `settings.json` within that directory. Runtime
-names use `plugin_<plugin>_<server>`. A plugin enabled in any inspected account
-keeps the machine/app inventory row active.
+names use `plugin_<plugin>_<server>`. Account roots use the existing registered-slot
+decoder, including customer-owned paths outside the managed folder. Stale or
+unregistered folders are not inspected; an unreadable registry grants no account
+roots. A plugin enabled in any registered account keeps the machine/app inventory
+row active.
 
 Codex discovery joins explicit `[plugins."name@marketplace"]` enablement with
 that plugin's version directory in `plugins/cache/marketplace/name`. No active
@@ -35,6 +38,7 @@ overlap between the MCP row and capability row requires product semantics review
 this change does not combine or remove either category.
 
 Validation covers installed/enabled, installed/disabled, cache-only and missing
-cases, account-directory isolation and aggregation, version selection, inline
+cases, registered-account isolation/aggregation, stale folders and unreadable registries,
+version selection, inline
 and referenced manifests, wire state, and explicit MCP configuration precedence.
 No backend or wire schema change, runtime installation, or release is included.

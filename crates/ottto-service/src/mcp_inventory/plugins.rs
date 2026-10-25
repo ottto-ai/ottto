@@ -2,6 +2,7 @@
 //! deserializing: these rows report names/state and must never launch a server.
 
 use super::{ConfiguredServer, Transport};
+use ottto_core::{FileClaudeConfigSlotSettingsStore, CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME};
 use serde::de::IgnoredAny;
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -101,9 +102,20 @@ struct InstalledPlugins {
 
 pub(super) fn discover_claude(home: &Path) -> Vec<ConfiguredServer> {
     let mut dirs = vec![home.join(".claude")];
-    dirs.extend(child_dirs(
-        &home.join("Library/Application Support/Ottto/claude-accounts"),
-    ));
+    // Use the same registration decoder as transcript discovery, not a glob
+    // of managed folders (which also contain unregistered/reusable roots).
+    // Keep synthetic-home discovery isolated from the operator's real slots.
+    let support = if std::env::var_os("HOME").as_deref().map(Path::new) == Some(home) {
+        ottto_core::default_support_dir()
+    } else {
+        home.join("Library/Application Support/Ottto")
+    };
+    let store =
+        FileClaudeConfigSlotSettingsStore::new(support.join(CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME));
+    // A failed registry read grants no account roots; user config remains.
+    dirs.extend(store.registered_config_dirs().unwrap_or_default());
+    dirs.sort();
+    dirs.dedup();
     let mut servers: BTreeMap<String, ConfiguredServer> = BTreeMap::new();
     for dir in dirs {
         let installed = read::<InstalledPlugins>(&dir.join("plugins/installed_plugins.json"))
@@ -368,15 +380,39 @@ mod tests {
     }
 
     #[test]
-    fn claude_account_slots_require_their_own_install_and_enable_entries() {
+    fn claude_only_registered_account_slots_can_enable_aggregated_row() {
         let f = Fixture::new();
         f.claude(&f.0.join(".claude"), Some(false), true);
-        let slot =
-            f.0.join("Library/Application Support/Ottto/claude-accounts/slot-a");
+        let stale =
+            f.0.join("Library/Application Support/Ottto/claude-accounts/stale");
+        f.claude(&stale, Some(true), true);
+        assert_row(&discover_claude(&f.0), "plugin_ottto-ask_ottto-ask", true);
+        let slot = f.0.join("customer-owned-login");
+        let store = FileClaudeConfigSlotSettingsStore::new(
+            f.0.join("Library/Application Support/Ottto")
+                .join(CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME),
+        );
+        store
+            .register_path(1, slot.to_string_lossy().into_owned())
+            .unwrap();
         f.claude(&slot, Some(true), false);
         assert_row(&discover_claude(&f.0), "plugin_ottto-ask_ottto-ask", true);
         f.claude(&slot, Some(true), true);
         assert_row(&discover_claude(&f.0), "plugin_ottto-ask_ottto-ask", false);
+    }
+
+    #[test]
+    fn claude_unreadable_registry_cannot_reenable_disabled_user_plugin() {
+        let f = Fixture::new();
+        f.claude(&f.0.join(".claude"), Some(false), true);
+        let slot =
+            f.0.join("Library/Application Support/Ottto/claude-accounts/stale");
+        f.claude(&slot, Some(true), true);
+        let registry =
+            f.0.join("Library/Application Support/Ottto")
+                .join(CLAUDE_CONFIG_SLOT_SETTINGS_FILE_NAME);
+        std::fs::write(registry, "not a registry").unwrap();
+        assert_row(&discover_claude(&f.0), "plugin_ottto-ask_ottto-ask", true);
     }
 
     #[test]
