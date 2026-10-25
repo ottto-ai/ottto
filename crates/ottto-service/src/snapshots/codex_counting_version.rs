@@ -467,7 +467,7 @@ pub(super) fn prepare_moved_evidence(
     absence_coverage: bool,
 ) {
     index.codex_counting_moved_evidence.clear();
-    // A loaded, committed ACK of either version absorbs the diagnostic record.
+    // A loaded, committed carrier of either version absorbs the diagnostic record.
     // Do not remove it on a mere selection or absence: the move may span scans.
     if !index.codex_counting_evicted_legacy.is_empty() {
         // Borrow at most 256 hashes. Walk the index once, rather than once per
@@ -477,6 +477,15 @@ pub(super) fn prepare_moved_evidence(
             .owners
             .iter()
             .collect::<BTreeSet<_>>();
+        // A restored tombstone is also a committed carrier. Absorb before
+        // absence GC below: losing that restored carrier to GC later must not
+        // be attributed to the earlier cap eviction.
+        pending.retain(|owner| {
+            !index
+                .codex_counting_tombstones
+                .get(*owner)
+                .is_some_and(|tombstone| tombstone.evidence != AckEvidence::None)
+        });
         for entry in index.files.values() {
             if AckEvidence::of_view(Some(entry)) != AckEvidence::None {
                 if let Some(owner) = proven_owner(entry) {

@@ -1082,3 +1082,39 @@ fn evicted_legacy_diagnostic_history_is_bounded_lenient_and_charged() {
     }
     fs::remove_dir_all(acked.root).unwrap();
 }
+
+#[test]
+fn restored_tombstone_absorbs_old_eviction_correlation_before_absence_gc() {
+    let _cutover = codex_counting_version::TestCutover::set(CUTOVER);
+    let owner = codex_protected_owner(SESSION);
+    let mut index = ScanIndex::default();
+    evict_counting_owner(&mut index, &owner, None);
+    assert!(!index.codex_counting_evicted_legacy.is_empty());
+    // Another carrier was later retired successfully, restoring Legacy
+    // evidence. A later healthy absence collection is a different loss cause.
+    index.codex_counting_tombstones.insert(
+        owner.clone(),
+        codex_counting_version::CountingTombstone {
+            evidence: AckEvidence::LegacyAcked,
+            retired_in: "g1".into(),
+            created_unix_ms: None,
+        },
+    );
+    codex_counting_version::prepare_moved_evidence(&mut index, &BTreeMap::new(), true);
+    assert!(
+        !index.codex_counting_tombstones.contains_key(&owner),
+        "absence GC ran"
+    );
+    assert!(
+        index.codex_counting_evicted_legacy.is_empty(),
+        "restored carrier absorbed old loss before GC"
+    );
+    let mut accumulator = SnapshotAccumulator::new(SnapshotSource::Codex);
+    codex_counting_version::configure(&mut accumulator, AckEvidence::None, Some(CUTOVER));
+    apply_codex_line(&header(POST), &mut accumulator);
+    assert!(accumulator.codex_counting_v2());
+    assert!(!codex_counting_version::evicted_legacy_selected_v2(
+        &accumulator,
+        &index
+    ));
+}
