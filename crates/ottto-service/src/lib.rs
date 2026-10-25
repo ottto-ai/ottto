@@ -47,6 +47,7 @@ pub mod otlp_relay;
 pub(crate) mod provider_calls;
 pub mod provider_daily_reference;
 pub(crate) mod quota_credit_model;
+mod relay_auth;
 mod retry_tls;
 pub mod session_attribution;
 pub mod snapshot_audit;

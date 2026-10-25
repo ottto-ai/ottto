@@ -454,6 +454,7 @@ struct CloudSessionScanFinalizeAckV1 {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RelayTokenAuthorizationRejected {
     pub status: u16,
+    pub suppressed: bool,
 }
 
 impl std::fmt::Display for RelayTokenAuthorizationRejected {
@@ -1638,6 +1639,15 @@ pub struct SnapshotApiClient {
 }
 
 impl SnapshotApiClient {
+    pub(crate) fn relay_auth_binding(
+        &self,
+        device: &LocalDeviceBinding,
+        secret: &str,
+        source: SnapshotSource,
+    ) -> [u8; 32] {
+        crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
+    }
+
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
         self.api_base_url == expected
     }
@@ -1789,6 +1799,12 @@ impl SnapshotApiClient {
         timeout: Duration,
         response_cap: Option<usize>,
     ) -> Result<String> {
+        let mut probe = crate::relay_auth::Probe::begin(
+            &self.api_base_url,
+            device,
+            device_secret,
+            source.api_slug(),
+        )?;
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id
@@ -1801,7 +1817,11 @@ impl SnapshotApiClient {
             .send_json(relay_token_request_payload(device, source.api_slug()))
             .map_err(|error| match error {
                 ureq::Error::Status(status @ (401 | 403), _response) => {
-                    anyhow::Error::new(RelayTokenAuthorizationRejected { status })
+                    probe.reject(status);
+                    anyhow::Error::new(RelayTokenAuthorizationRejected {
+                        status,
+                        suppressed: false,
+                    })
                 }
                 ureq::Error::Status(status, response) => {
                     anyhow::Error::new(UploadFailureDiagnostics::http(
@@ -1824,6 +1844,7 @@ impl SnapshotApiClient {
             None => response.into_json().map_err(anyhow::Error::from),
         }
         .map_err(|error| anyhow!("parse relay token response failed: {error}"))?;
+        probe.success();
         Ok(response.token)
     }
 
@@ -1843,41 +1864,17 @@ impl SnapshotApiClient {
             ));
         }
         let (agent, timeout) = bounded_snapshot_deadline_agent(budget.deadline()?)?;
-        let url = self.api_url(&format!(
-            "/api/v1/telemetry/devices/{}/relay-token",
-            device.device_id
-        ));
-        let response = agent
-            .post(&url)
-            .timeout(timeout)
-            .set("Accept", "application/json")
-            .set("X-Ottto-Device-Secret", device_secret)
-            .send_json(relay_token_request_payload(device, source.api_slug()))
-            .map_err(|error| match error {
-                ureq::Error::Status(status @ (401 | 403), _) => {
-                    anyhow::Error::new(RelayTokenAuthorizationRejected { status })
-                }
-                ureq::Error::Status(status, response) => {
-                    anyhow::Error::new(UploadFailureDiagnostics::http(
-                        "relay token request",
-                        "relay_token",
-                        status,
-                        &response,
-                    ))
-                }
-                other => anyhow::Error::new(UploadFailureDiagnostics::transport(
-                    "relay token request",
-                    "relay_token",
-                    &other,
-                )),
-            })?;
-        let response =
-            require_cloud_session_success(response, "relay token request", "relay_token")?;
-        let token: RelayTokenResponse =
-            bounded_response_json(response, crate::snapshot_retry::TOKEN_RESPONSE_BYTES)?;
+        let token = self.issue_relay_token_with_agent(
+            &agent,
+            device,
+            device_secret,
+            source,
+            timeout,
+            Some(crate::snapshot_retry::TOKEN_RESPONSE_BYTES),
+        )?;
         budget.remaining(Instant::now())?;
         validate()?;
-        Ok(token.token)
+        Ok(token)
     }
 
     pub(crate) fn get_activity_hint_bounded(
@@ -2415,6 +2412,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -2438,6 +2436,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -2710,6 +2709,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -2736,6 +2736,7 @@ impl SnapshotApiClient {
             Err(ureq::Error::Status(code @ (401 | 403), _response)) => {
                 Err(anyhow::Error::new(RelayTokenAuthorizationRejected {
                     status: code,
+                    suppressed: false,
                 }))
             }
             Err(ureq::Error::Status(code @ (400 | 422), _response)) => {
@@ -3105,8 +3106,8 @@ fn bounded_snapshot_deadline_agent(deadline: Instant) -> Result<(ureq::Agent, Du
         .resolver(crate::net_resilience::deadline_fallback_resolver(
             dns_timeout,
         ))
-        .tls_connector(connector)
-        .build();
+        .tls_connector(connector);
+    let agent = crate::retry_tls::guard_unit_test_egress(agent).build();
     Ok((agent, request_timeout))
 }
 
@@ -3246,6 +3247,16 @@ mod tests {
     use super::*;
     use crate::snapshots::{CODEX_SNAPSHOT_PARSER_VERSION, SNAPSHOT_SCHEMA_VERSION};
     use std::io::Read;
+
+    #[test]
+    fn bounded_unit_test_agent_refuses_production_before_dns_or_tls() {
+        let (agent, _) =
+            bounded_snapshot_deadline_agent(Instant::now() + Duration::from_secs(5)).unwrap();
+        let error = agent.get("https://api.ottto.net").call().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unit tests may only send HTTP requests to loopback fixtures"));
+    }
 
     #[test]
     fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
@@ -3617,7 +3628,10 @@ mod tests {
 
     #[test]
     fn relay_token_authorization_rejected_downcasts_separately() {
-        let err = anyhow::Error::new(RelayTokenAuthorizationRejected { status: 403 });
+        let err = anyhow::Error::new(RelayTokenAuthorizationRejected {
+            status: 403,
+            suppressed: false,
+        });
         let rejected = err
             .downcast_ref::<RelayTokenAuthorizationRejected>()
             .expect("RelayTokenAuthorizationRejected must downcast from anyhow::Error");
