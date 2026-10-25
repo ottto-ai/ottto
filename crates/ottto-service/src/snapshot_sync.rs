@@ -4244,6 +4244,11 @@ fn retry_ordinary_owned(item: &SnapshotItem) -> Option<SnapshotItem> {
         peak_context_fill_tokens: item.peak_context_fill_tokens,
         first_turn_context_tokens: item.first_turn_context_tokens,
         last_turn_context_tokens: item.last_turn_context_tokens,
+        // Copied, never dropped: a retry that lost the windows would settle as
+        // UNCHANGED (they are outside every hash) and never deliver them.
+        first_turn_context_window_tokens: item.first_turn_context_window_tokens,
+        peak_context_fill_window_tokens: item.peak_context_fill_window_tokens,
+        last_turn_context_window_tokens: item.last_turn_context_window_tokens,
         compaction_count: item.compaction_count,
         compaction_timestamps: item.compaction_timestamps.clone(),
         compaction_events: item.compaction_events.clone(),
