@@ -2333,6 +2333,7 @@ mod tests {
         // Verify that genuinely unknown commands do NOT match the allowlist.
         let cmd = LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: false,
         };
 
         let is_allowed = matches!(

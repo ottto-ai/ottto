@@ -64,6 +64,8 @@ mod codex_context_window_tests;
 #[cfg(test)]
 mod codex_counting_lifecycle_tests;
 #[cfg(test)]
+mod codex_counting_rss_tests;
+#[cfg(test)]
 mod codex_counting_v2_tests;
 mod codex_counting_version;
 mod codex_file_join;
