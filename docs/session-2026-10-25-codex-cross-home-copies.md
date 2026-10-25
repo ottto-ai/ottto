@@ -12,21 +12,17 @@ precision agreement, and update/token progress that does not regress. Every copy
 is compared with every earlier copy, so timestamp tolerances cannot chain. Real
 collisions remain scoped, and cannot reappear as total-only fallback snapshots.
 
-Cross-home rollouts additionally require identical native headers and complete
-byte-prefix agreement. The collector parses the longest complete rollout once,
-then uses its existing alias acknowledgement boundary for every physical copy.
-Divergent copies, changed files, incomplete records and un-replayed saved tier
-authority remain withheld. Capture validation covers every contributing home.
-No metadata maximum substitutes for parsed usage, and no subscription identity
-is inferred merely from registration of a transcript root.
+The measured failure has stale state/projection metadata in several homes and a
+single remaining rollout per logical thread. Its file keeps the existing native
+parser and upload acknowledgement path. Multiple physical rollouts for one owner
+in different homes retain the existing strict alias guard; metadata compatibility
+alone cannot prove their content, pricing authority or subscription ownership.
 
-Prefix comparison yields after bounded chunks and charges the existing read
-budget. Proof that cannot fit that budget stays strict; this change does not
-increase scan caps or relax unreadable/retry gates. Reduction and alias-parser
-failures must still clear in a genuinely clean traversal before census can finish.
+No scan cap, wire format or retry gate changes. Reduction and alias-parser errors
+must still clear in a genuinely clean traversal before census can finish.
 
 Synthetic crate regressions cover five homes, 46 threads with copied progress,
-26 creation-clock differences, identity/refusal boundaries, common alias
+26 creation-clock differences, identity/refusal boundaries, upload
 acknowledgement and a clean follow-up census. Validation receipts are recorded
 in the pull request. No installed-runtime or production convergence is claimed
 by this source change.

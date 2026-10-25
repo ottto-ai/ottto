@@ -217,12 +217,10 @@ pub(in crate::snapshots) struct GroupBoot {
     receipt_scope: String,
     legacy_expected: BTreeMap<String, String>,
     evidence: codex_counting_version::AckEvidence,
-    copy_proof: Option<codex_root_copies::CopyProof>,
-    copied: bool,
 }
 crate::heap_layout_bound::fields!(GroupBoot; group, key, identified, stamps, headers, plan,
     probes, probed, ordered, admitted, probe_bound, probe_limit_bound, own_page, probe_allowance,
-    charge, previous_receipts, receipt_scope, legacy_expected, evidence, copy_proof, copied);
+    charge, previous_receipts, receipt_scope, legacy_expected, evidence);
 
 impl GroupBoot {
     pub(in crate::snapshots) fn new(group: Group, index: &ScanIndex) -> Self {
@@ -273,8 +271,6 @@ impl GroupBoot {
             receipt_scope,
             legacy_expected,
             evidence,
-            copy_proof: None,
-            copied: false,
         }
     }
 
@@ -339,62 +335,6 @@ impl GroupBoot {
                 // change under the read (TOCTOU), never proof debt (R1-M3).
                 None => Boot::Strict,
             };
-        }
-        let cross_home = self
-            .group
-            .members
-            .iter()
-            .any(|member| member_home(&member.scan_root) != self.group.home);
-        if cross_home && self.plan.is_none() {
-            // Cross-home files may share a logical thread, but cannot be joined
-            // as additive segments. Require identical native headers and prove
-            // every shorter file is a complete byte prefix of the selected one.
-            if self
-                .headers
-                .iter()
-                .any(|header| header.digest != self.headers[0].digest)
-            {
-                return Boot::Strict;
-            }
-            let Some(proof) = self
-                .copy_proof
-                .get_or_insert_with(|| {
-                    codex_root_copies::CopyProof::new(&self.group.members).expect("nonempty group")
-                })
-                .step(
-                    &self.group.members,
-                    &mut self.probe_allowance,
-                    &mut self.charge,
-                )
-                .ok()
-            else {
-                return Boot::Strict;
-            };
-            if !proof {
-                return Boot::Pending;
-            }
-            let winner = self.copy_proof.as_ref().expect("copy proof").winner;
-            // An older member's saved tier authority is not re-derived by the
-            // selected parser. Keep that stronger history strict until it can
-            // be independently replayed, rather than silently clearing it.
-            if self.group.members.iter().enumerate().any(|(i, member)| {
-                i != winner
-                    && self
-                        .previous_receipts
-                        .get(&local_index_key(&member.path))
-                        .is_some_and(|(receipt, required)| *required || receipt.is_some())
-            }) {
-                return Boot::Strict;
-            }
-            let mut order = (0..n).filter(|i| *i != winner).collect::<Vec<_>>();
-            order.push(winner);
-            self.plan = Some(GroupPlan {
-                order,
-                plans: vec![MemberPlan::default(); n],
-                ordinal: false,
-            });
-            self.ordered = true;
-            self.copied = true;
         }
         if self.plan.is_none() {
             let keys = self
@@ -608,7 +548,6 @@ impl GroupBoot {
             receipt_scope,
             legacy_expected,
             evidence,
-            copied,
             ..
         } = self;
         let plan = plan.ok_or(GroupEnd::Strict)?;
@@ -631,15 +570,7 @@ impl GroupBoot {
                     .map_or_else(String::new, |h| h.digest().to_owned())
             })
             .collect::<Vec<_>>();
-        let first_position = if copied {
-            members.len().saturating_sub(1)
-        } else {
-            0
-        };
-        let (Some(first), Some(last)) = (
-            members.get(first_position).cloned(),
-            members.last().cloned(),
-        ) else {
+        let (Some(first), Some(last)) = (members.first().cloned(), members.last().cloned()) else {
             return Err(GroupEnd::Strict);
         };
         if stamps.len() != members.len() {
@@ -673,7 +604,7 @@ impl GroupBoot {
         .map_err(|_| GroupEnd::Strict)?;
         let v2 = group_counting_is_v2(&parser.accumulator);
         let mut join = Box::new(StreamProof::new(group.owner.clone(), v2, plan.plans));
-        join.begin_member(first_position);
+        join.begin_member(0);
         let previous = previous_receipts
             .get(&local_index_key(&first.path))
             .cloned()
@@ -709,7 +640,7 @@ impl GroupBoot {
                 members,
                 stamps,
                 digests,
-                current: first_position,
+                current: 0,
                 finished: false,
                 previous_receipts,
                 receipt_scope,

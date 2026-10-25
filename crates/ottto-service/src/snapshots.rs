@@ -24387,9 +24387,9 @@ impl OwnedSourceScan {
                             || group.members.iter().any(|member| {
                                 repurposed_protected_paths.contains(&local_index_key(&member.path))
                             })
-                            || codex_title_metadata
-                                .identity_conflicts
-                                .contains(&group.owner)
+                            || owners
+                                .get(&group.owner)
+                                .is_some_and(|homes| homes.len() > 1)
                             || group.members.len() < 2
                         {
                             census.ownership_incomplete_file_count += group.members.len();

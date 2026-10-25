@@ -3983,7 +3983,7 @@ impl SharedCache {
         };
         let key = group.key.clone();
         let owner = group.owner.clone();
-        let boot = group.stamps.get(group.current).cloned();
+        let boot = group.stamps.first().cloned();
         let counting = group_counting_view(&group.members, index);
         let members = group
             .members

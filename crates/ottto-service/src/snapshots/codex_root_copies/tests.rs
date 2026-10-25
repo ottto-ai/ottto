@@ -17,6 +17,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(count: usize) -> Self {
+        Self::build(count, false)
+    }
+    fn build(count: usize, physical_copies: bool) -> Self {
         let home = temp_dir("codex-cross-root-copies");
         let roots = (0..5)
             .map(|i| home.join(format!("home-{i}/sessions")))
@@ -35,7 +38,7 @@ impl Fixture {
             let history =
                 Connection::open(root.parent().unwrap().join("thread_history_1.sqlite")).unwrap();
             history.execute_batch("CREATE TABLE thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER, next_rollout_ordinal INTEGER);").unwrap();
-            // Default home is empty; four slot homes contain copied prefixes.
+            // Default home is empty; four slot homes retain copied metadata.
             // The highest-progress home sorts FIRST, exercising older-last load.
             if i == 0 {
                 continue;
@@ -56,7 +59,9 @@ impl Fixture {
                     .iter()
                     .map(|row| row.to_string() + "\n")
                     .collect::<String>();
-                fs::write(&path, &bytes).unwrap();
+                if i == 1 || physical_copies {
+                    fs::write(&path, &bytes).unwrap();
+                }
                 let created = 1_790_848_800_000_i64 + if j < 26 { (i as i64) * 75 } else { 0 };
                 db.execute("INSERT INTO threads VALUES (?1, 'same', ?2, 0, ?3, ?4, 'gpt-5.2', ?5, 'user', NULL)",
                     rusqlite::params![id, turns*100, created, 1_790_848_800_000_i64+turns as i64*60_000, path.to_str().unwrap()]).unwrap();
@@ -124,10 +129,16 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
             let path = Path::new(row.rollout_path.as_deref().unwrap());
             let (bound, extent) = metadata.thread_extent_for_path(id, path);
             assert_eq!(bound.unwrap(), row);
-            assert_eq!(
-                extent.unwrap().next_byte_offset,
-                fs::metadata(path).unwrap().len()
-            );
+            assert!(extent.unwrap().next_byte_offset > 0);
+            assert!(path.starts_with(root));
+            if root == &fixture.roots[1] {
+                assert_eq!(
+                    extent.unwrap().next_byte_offset,
+                    fs::metadata(path).unwrap().len()
+                );
+            } else {
+                assert!(!path.exists(), "older homes retain metadata only");
+            }
         }
     }
     let (mut index, mut scan) = fixture.scan(ScanIndex::default());
@@ -136,10 +147,11 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
     assert_eq!(scan.ownership_incomplete_file_count, 0);
     assert_eq!(scan.unreadable_path_count, 0);
     assert!(!scan.snapshots.is_empty());
-    scan.codex_joining_validator()
-        .unwrap()
-        .validate(&scan.snapshots)
-        .unwrap();
+    assert_eq!(
+        scan.snapshots.len(),
+        46,
+        "one physical file per logical thread"
+    );
     finalize_scan_after_policy(SnapshotSource::Codex, &mut scan, &mut index);
     scan.finish_codex_capture_boundary(&mut index);
     let by_id = scan.snapshots.iter().fold(
@@ -167,14 +179,14 @@ fn five_roots_46_copied_threads_recover_census_and_count_each_once() {
         index.committable_subset(&ScanIndex::default(), &BTreeSet::new(), &BTreeMap::new());
     assert!(
         unacknowledged.files.is_empty(),
-        "lost upload ACK cannot checkpoint any alias"
+        "lost upload ACK cannot checkpoint any file"
     );
     let settled = index.committable_subset(&ScanIndex::default(), &accepted, &BTreeMap::new());
     let (_, again) = fixture.scan(settled);
     assert!(again.census_complete, "{again:?}");
     assert!(
         again.snapshots.is_empty(),
-        "acknowledged aliases do not upload again"
+        "acknowledged sessions do not upload again"
     );
 }
 
@@ -257,11 +269,6 @@ fn synthetic_reduction_and_alias_failures_are_retryable_not_hidden_by_copy_recov
 #[test]
 fn stale_metadata_in_four_homes_with_one_physical_rollout_completes() {
     let fixture = Fixture::new(1);
-    for root in &fixture.roots[2..] {
-        let row =
-            &fixture.metadata().root_sidecars[root.parent().unwrap()].threads[&fixture.ids[0]];
-        fs::remove_file(row.rollout_path.as_ref().unwrap()).unwrap();
-    }
     let metadata = fixture.metadata();
     assert!(metadata.identity_conflicts.is_empty());
     assert_eq!(metadata.state_threads[&fixture.ids[0]].tokens_used, 400);
@@ -272,13 +279,10 @@ fn stale_metadata_in_four_homes_with_one_physical_rollout_completes() {
 }
 
 #[test]
-fn identical_headers_do_not_authorize_divergent_copied_body_records() {
-    let fixture = Fixture::new(1);
+fn multiple_physical_homes_remain_strict_without_independent_alias_proof() {
+    let fixture = Fixture::build(1, true);
     let metadata = fixture.metadata();
-    let row = &metadata.root_sidecars[fixture.roots[2].parent().unwrap()].threads[&fixture.ids[0]];
-    let path = row.rollout_path.as_ref().unwrap();
-    let body = fs::read_to_string(path).unwrap();
-    fs::write(path, body.replace("r-1", "q-1")).unwrap();
+    assert!(metadata.identity_conflicts.is_empty());
     let (index, scan) = fixture.scan(ScanIndex::default());
     assert!(!scan.census_complete);
     assert!(scan.snapshots.is_empty());
@@ -291,5 +295,8 @@ fn identical_headers_do_not_authorize_divergent_copied_body_records() {
             .projection(scan.unreadable_path_count as u64),
     )
     .unwrap();
-    assert_eq!(causes["counts"][5], 1);
+    assert_eq!(
+        causes["counts"][5], 4,
+        "unchanged guard refuses each cross-home file group"
+    );
 }
