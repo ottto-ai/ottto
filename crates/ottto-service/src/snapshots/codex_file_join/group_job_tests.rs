@@ -1366,6 +1366,7 @@ fn group_with_legacy_tee_is_byte_charged() {
             artifacts: false,
             context_curve: false,
             index: &previous,
+            paged: false,
         })
         .unwrap();
     assert!(job.group.as_ref().unwrap().tee.is_some());
@@ -1515,6 +1516,7 @@ fn group_overflow_evicts_at_most_overflow_plus_one_entry() {
             artifacts: false,
             context_curve: false,
             index: &previous,
+            paged: false,
         })
         .unwrap();
     let no_scope = |_: &CandidateFile| None;

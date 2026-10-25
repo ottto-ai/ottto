@@ -175,7 +175,7 @@ fn side_scope_is_versioned_and_distinct_from_any_scan_scope() {
 
 #[test]
 fn over_cap_is_main_codex_file_cap() {
-    let cap = max_jsonl_file_bytes(SnapshotSource::Codex);
+    let cap = MAX_CODEX_JSONL_FILE_BYTES;
     assert!(!codex_parent_over_cap(cap));
     assert!(codex_parent_over_cap(cap + 1));
 }

@@ -551,3 +551,319 @@ fn the_exit_rows_write_the_record_or_the_tombstone_in_both_stores() {
     assert_eq!(index.codex_parent_side_requests[&fixture.key()], before);
     assert!(index.codex_parent_side.is_empty());
 }
+
+/// FC1 (#656): [`settled_page`] that also returns page 1's snapshot count,
+/// for the labeled precondition lines.
+fn settled_page_counted(fixture: &Root) -> (ScanIndex, Arc<sampled_scan::SharedCache>, usize) {
+    let cache = Arc::new(sampled_scan::SharedCache::default());
+    let (index, first) = page(fixture, ScanIndex::default(), &cache, Some(pass(true)));
+    assert!(!first.snapshots.is_empty(), "page 1 parsed P");
+    assert!(
+        index.codex_parent_side.is_empty(),
+        "P is not live: no record"
+    );
+    (index, cache, first.snapshots.len())
+}
+
+/// FC1 (#656) F1: #660's due singleton term composed with FC1's admission.
+/// A settled, unchanged P over the scaled unpaged limit (and over the
+/// singleton) is main's Skip, and its side request is not due: `NotDue`, no
+/// side read, no G7 ledger entry, the request and the side records as they
+/// were, no snapshot, and the same main state, side fields and snapshots
+/// (complete comparator) as main's twin, where P is under the unpaged limit
+/// and over the singleton. The positive control, on its own identical P and
+/// cache at the default limits, side-reads P.
+#[test]
+fn fc1_side_requested_settled_parent_over_the_unpaged_limit_is_not_due() {
+    let fixture = Root::new(3, b"");
+    let len = fixture.at().size;
+    let (settled, cache, first) = settled_page_counted(&fixture);
+    let request = request_for(&fixture, len);
+    let mut requested = settled.clone();
+    requested
+        .codex_parent_side_requests
+        .insert(fixture.key(), request);
+
+    // Arm A: the scaled limits, no request: main skips the settled P.
+    let (_, arm_a) = with_test_unpaged_limit(len - 1, || {
+        sampled_scan::codex_cursor::with_test_limits(1 << 20, len - 2, 64, || {
+            page(&fixture, settled.clone(), &cache, Some(pass(true)))
+        })
+    });
+    assert!(
+        arm_a.snapshots.is_empty(),
+        "arm A: main skips the settled P"
+    );
+    assert_eq!(arm_a.oversized_file_count, 0, "arm A");
+    eprintln!(
+        "FC1_F1 precondition=pass page1_snapshots={first} p_side_records={} arm_a_snapshots={} arm_a_oversized={}",
+        settled.codex_parent_side.len(),
+        arm_a.snapshots.len(),
+        arm_a.oversized_file_count
+    );
+
+    let not_due = |arm: &str, index: &ScanIndex, scan: &SourceScanResult, counts: &Counts| {
+        assert_eq!(counts.side_reads_started, 0, "{arm}: {counts:?}");
+        assert!(counts.side_not_due >= 1, "{arm}: {counts:?}");
+        assert!(
+            ledger_entry(&cache, &fixture).is_none(),
+            "{arm}: no G7 entry"
+        );
+        assert_eq!(
+            index.codex_parent_side_requests.get(&fixture.key()),
+            Some(&request),
+            "{arm}: the request as inserted"
+        );
+        assert_eq!(
+            index.codex_parent_side, settled.codex_parent_side,
+            "{arm}: side records unchanged"
+        );
+        assert!(scan.snapshots.is_empty(), "{arm}: no snapshot for P");
+    };
+
+    // Arm D, main's twin: over the singleton, under the unpaged limit.
+    let ((twin_index, twin), twin_counts) =
+        sampled_scan::codex_cursor::with_test_limits(1 << 20, len - 2, 64, || {
+            observe(|| page(&fixture, requested.clone(), &cache, Some(pass(true))))
+        });
+    not_due("arm D", &twin_index, &twin, &twin_counts);
+    eprintln!(
+        "FC1_F1 arm=D side_reads_started={} side_not_due={} snapshots={}",
+        twin_counts.side_reads_started,
+        twin_counts.side_not_due,
+        twin.snapshots.len()
+    );
+
+    // Arm C, treated: over the singleton and the unpaged limit.
+    let ((treated_index, treated), treated_counts) = with_test_unpaged_limit(len - 1, || {
+        sampled_scan::codex_cursor::with_test_limits(1 << 20, len - 2, 64, || {
+            observe(|| page(&fixture, requested.clone(), &cache, Some(pass(true))))
+        })
+    });
+    not_due("arm C", &treated_index, &treated, &treated_counts);
+    assert_eq!(treated.oversized_file_count, 0, "arm C");
+    assert_eq!(
+        main_state(&treated_index),
+        main_state(&twin_index),
+        "arm C: main state as main's twin"
+    );
+    assert_eq!(
+        treated_index.codex_parent_side_requests,
+        twin_index.codex_parent_side_requests
+    );
+    assert_eq!(
+        treated_index.codex_parent_side,
+        twin_index.codex_parent_side
+    );
+    assert_eq!(
+        treated_index.codex_parent_side_generation,
+        twin_index.codex_parent_side_generation
+    );
+    super::codex_paged_admission_tests::assert_snapshots_identical(
+        &treated.snapshots,
+        &twin.snapshots,
+        "F1 arm C vs main's twin (arm D)",
+    );
+    eprintln!(
+        "FC1_F1 arm=C side_reads_started={} side_not_due={} snapshots={} oversized={} parity=pass",
+        treated_counts.side_reads_started,
+        treated_counts.side_not_due,
+        treated.snapshots.len(),
+        treated.oversized_file_count
+    );
+
+    // Arm B, the positive control: its own identical P and cache, default
+    // limits (the singleton is over P's length), the same request.
+    let control_fixture = Root::new(3, b"");
+    assert_eq!(control_fixture.at().size, len, "an identical P");
+    let (control_settled, control_cache, _) = settled_page_counted(&control_fixture);
+    let mut control_requested = control_settled;
+    control_requested
+        .codex_parent_side_requests
+        .insert(control_fixture.key(), request_for(&control_fixture, len));
+    let ((control_index, _), control_counts) = observe(|| {
+        page(
+            &control_fixture,
+            control_requested,
+            &control_cache,
+            Some(pass(true)),
+        )
+    });
+    assert_eq!(control_counts.side_reads_started, 1, "{control_counts:?}");
+    assert_eq!(control_counts.side_reads_ended, 1, "{control_counts:?}");
+    assert_eq!(control_counts.side_records_written, 1, "{control_counts:?}");
+    let entry = ledger_entry(&control_cache, &control_fixture).expect("G7 created the entry");
+    assert_eq!(entry.tag, LedgerTag::Removed);
+    assert!(
+        !control_index
+            .codex_parent_side_requests
+            .contains_key(&control_fixture.key()),
+        "the request was cured"
+    );
+    eprintln!(
+        "FC1_F1 control=pass side_reads_started={} side_reads_ended={} side_records_written={}",
+        control_counts.side_reads_started,
+        control_counts.side_reads_ended,
+        control_counts.side_records_written
+    );
+    eprintln!(
+        "FC1_F1_COMPLETE precondition=pass arm_d_not_due={} arm_c_not_due={} parity=pass control_side_reads_started={}",
+        twin_counts.side_not_due, treated_counts.side_not_due, control_counts.side_reads_started
+    );
+}
+
+/// FC1 (#656) F2's seam hook: counts each call for `path` and, on the first,
+/// appends `growth` to it (the same inode, so the opened handle's fresh fstat
+/// sees it).
+fn growth_hook(
+    path: PathBuf,
+    growth: Vec<u8>,
+    fires: std::rc::Rc<std::cell::Cell<u64>>,
+) -> impl FnMut(&Path) + 'static {
+    move |candidate: &Path| {
+        if candidate == path.as_path() {
+            fires.set(fires.get() + 1);
+            if fires.get() == 1 {
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&growth)
+                    .unwrap();
+            }
+        }
+    }
+}
+
+/// FC1 (#656) F2: #660's G4a growth guard before the G7 charge, with FC1's
+/// admission on the same page. A settled P whose request is due at stamp time
+/// (P at the singleton, at the unpaged limit) is side-planned, which turns
+/// main's Skip into a parse: the `CODEX_BEFORE_PARSE` seam, which a Skip
+/// never reaches (arm A), fires once for P and grows it past both limits.
+/// The fresh extent then exits at G4a: no side read, no G7 ledger entry, the
+/// request and side records as they were, no snapshot, no requeue. The
+/// positive control (own identical P and cache, same limits, no growth)
+/// side-reads P.
+#[test]
+fn fc1_side_planned_parent_grown_past_both_limits_exits_at_g4a_before_g7() {
+    let fixture = Root::new(3, b"");
+    let len = fixture.at().size;
+    let (singleton, unpaged) = (len, len);
+    let (settled, cache, first) = settled_page_counted(&fixture);
+    let growth = token(4);
+    let request = request_for(&fixture, len);
+    let mut requested = settled.clone();
+    requested
+        .codex_parent_side_requests
+        .insert(fixture.key(), request);
+    let scaled = |run: &mut dyn FnMut()| {
+        with_test_unpaged_limit(unpaged, || {
+            sampled_scan::codex_cursor::with_test_limits(1 << 20, singleton, 64, run)
+        })
+    };
+
+    // Arm A: the same limits and hook, no request: main's Skip never
+    // reaches the seam.
+    let fires_a = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut arm_a = None;
+    scaled(&mut || {
+        arm_a = Some(with_codex_before_parse(
+            growth_hook(fixture.file(), growth.clone(), std::rc::Rc::clone(&fires_a)),
+            || page(&fixture, settled.clone(), &cache, Some(pass(true))),
+        ));
+    });
+    let (_, arm_a) = arm_a.expect("arm A ran");
+    assert_eq!(
+        fires_a.get(),
+        0,
+        "arm A: main's Skip never reaches the seam"
+    );
+    assert!(
+        arm_a.snapshots.is_empty(),
+        "arm A: main skips the settled P"
+    );
+    assert_eq!(fixture.at().size, len, "arm A grew nothing");
+    eprintln!(
+        "FC1_F2 precondition=pass page1_snapshots={first} p_side_records={} arm_a_snapshots={} arm_a_hook_fires={}",
+        settled.codex_parent_side.len(),
+        arm_a.snapshots.len(),
+        fires_a.get()
+    );
+
+    // Arm G, treated: the side plan reaches the seam once; P grows past both
+    // limits before the fresh extent.
+    let deferred = cache.counters_for_test().deferred;
+    let fires_g = std::rc::Rc::new(std::cell::Cell::new(0));
+    let mut arm_g = None;
+    scaled(&mut || {
+        arm_g = Some(with_codex_before_parse(
+            growth_hook(fixture.file(), growth.clone(), std::rc::Rc::clone(&fires_g)),
+            || observe(|| page(&fixture, requested.clone(), &cache, Some(pass(true)))),
+        ));
+    });
+    let ((after, treated), counts) = arm_g.expect("arm G ran");
+    assert_eq!(
+        fires_g.get(),
+        1,
+        "arm G: the side plan turned Skip into a parse once"
+    );
+    let grown = fixture.at().size;
+    assert!(grown > singleton, "grown {grown} > singleton {singleton}");
+    assert!(grown > unpaged, "grown {grown} > unpaged limit {unpaged}");
+    assert_eq!(counts.side_reads_started, 0, "{counts:?}");
+    assert_eq!(counts.side_reads_ended, 0, "{counts:?}");
+    assert_eq!(counts.side_not_due, 0, "due at stamp time: {counts:?}");
+    assert!(ledger_entry(&cache, &fixture).is_none(), "G7 not reached");
+    assert_eq!(
+        after.codex_parent_side_requests.get(&fixture.key()),
+        Some(&request),
+        "the request as inserted"
+    );
+    assert_eq!(
+        after.codex_parent_side, settled.codex_parent_side,
+        "side records unchanged"
+    );
+    assert!(treated.snapshots.is_empty(), "no snapshot for P");
+    assert_eq!(cache.counters_for_test().deferred, deferred, "no requeue");
+    eprintln!(
+        "FC1_F2 arm=G hook_fires={} grown={grown} singleton={singleton} unpaged={unpaged} side_reads_started={} side_not_due={} snapshots={}",
+        fires_g.get(),
+        counts.side_reads_started,
+        counts.side_not_due,
+        treated.snapshots.len()
+    );
+
+    // Arm B, the positive control: its own identical P and cache, the same
+    // limits, no hook.
+    let control_fixture = Root::new(3, b"");
+    assert_eq!(control_fixture.at().size, len, "an identical P");
+    let (control_settled, control_cache, _) = settled_page_counted(&control_fixture);
+    let mut control_requested = control_settled;
+    control_requested
+        .codex_parent_side_requests
+        .insert(control_fixture.key(), request_for(&control_fixture, len));
+    let mut control_counts = None;
+    scaled(&mut || {
+        let (_, counts) = observe(|| {
+            page(
+                &control_fixture,
+                control_requested.clone(),
+                &control_cache,
+                Some(pass(true)),
+            )
+        });
+        control_counts = Some(counts);
+    });
+    let control_counts = control_counts.expect("arm B ran");
+    assert_eq!(control_counts.side_reads_started, 1, "{control_counts:?}");
+    eprintln!(
+        "FC1_F2 control=pass side_reads_started={}",
+        control_counts.side_reads_started
+    );
+    eprintln!(
+        "FC1_F2_COMPLETE precondition=pass arm_a_hook_fires={} arm_g_hook_fires={} grown={grown} control_side_reads_started={}",
+        fires_a.get(),
+        fires_g.get(),
+        control_counts.side_reads_started
+    );
+}

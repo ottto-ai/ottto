@@ -82,6 +82,8 @@ mod claude_response_compaction_tests;
 mod claude_response_records;
 #[cfg(test)]
 mod claude_thinking_tokens_tests;
+#[cfg(test)]
+mod codex_paged_admission_tests;
 mod codex_usage_occurrence;
 mod context_curve;
 mod session_start;
@@ -2643,11 +2645,11 @@ fn codex_parent_side_scope() -> crate::transcript_acquisition::Scope {
     ]))
 }
 
-/// U1a-2a: P is over main's Codex file cap, so no side record is kept for it.
-/// The same predicate main's cap sites use.
+/// U1a-2a: P is over main's 2 GiB Codex cap (the unpaged limit). The side
+/// path keeps no record for it, as on main, where such P was never read.
 #[cfg_attr(not(test), allow(dead_code))] // first production caller is the fence
 fn codex_parent_over_cap(len: u64) -> bool {
-    len > max_jsonl_file_bytes(SnapshotSource::Codex)
+    len > MAX_CODEX_JSONL_FILE_BYTES
 }
 
 /// U1a-2a: the pacing a covering side record keeps after its request is
@@ -19316,6 +19318,9 @@ pub(in crate::snapshots) struct CodexParentCensus<'a> {
     /// False for the empty view of an invalid or missing census: every
     /// lookup is the baseline `Absent` refusal and never touches the slot.
     available: bool,
+    /// The scan can page an over-limit parent (`ReadAdmission::Bounded`), so
+    /// its size is no `Oversize` cap witness. False fails closed.
+    paged: bool,
 }
 
 impl<'a> CodexParentCensus<'a> {
@@ -19328,6 +19333,16 @@ impl<'a> CodexParentCensus<'a> {
             scan_roots,
             paths,
             available: true,
+            paged: false,
+        }
+    }
+
+    /// The same view for a paged scan.
+    #[cfg(test)]
+    pub(in crate::snapshots) fn paged(self) -> Self {
+        Self {
+            paged: true,
+            ..self
         }
     }
 }
@@ -19355,6 +19370,9 @@ pub(in crate::snapshots) struct CodexParentIdentities {
     /// (N1): the diagnostics then omit `parent_restarts_in_scope` instead of
     /// reporting a fabricated count.
     parent_restarts: Option<u64>,
+    /// The page's `codex_read_admission` is `Bounded`: copied into every
+    /// census view (`CodexParentCensus::paged`). False until `admit`.
+    paged: bool,
 }
 
 struct CodexParentProbeSlot {
@@ -19362,7 +19380,7 @@ struct CodexParentProbeSlot {
     probe: CodexParentProbe,
 }
 crate::heap_layout_bound::fields!(CodexParentProbeSlot; session_id, probe);
-crate::heap_layout_bound::fields!(CodexParentIdentities; census_valid, last, parents_applied, restart_budget_spent, parent_restarts);
+crate::heap_layout_bound::fields!(CodexParentIdentities; census_valid, last, parents_applied, restart_budget_spent, parent_restarts, paged);
 
 impl CodexParentIdentities {
     pub(in crate::snapshots) fn new(
@@ -19376,7 +19394,14 @@ impl CodexParentIdentities {
             parents_applied: false,
             restart_budget_spent: false,
             parent_restarts: None,
+            paged: false,
         }
+    }
+
+    /// Takes the main loop's own admission, so a parent is a size witness
+    /// exactly where the scan could not page it.
+    pub(in crate::snapshots) fn admit(&mut self, admission: ReadAdmission) {
+        self.paged = admission == ReadAdmission::Bounded;
     }
 
     pub(in crate::snapshots) fn census_valid(&self) -> bool {
@@ -19393,11 +19418,13 @@ impl CodexParentIdentities {
                 scan_roots: &traversal.scan_roots,
                 paths: &traversal.codex_rollout_paths,
                 available: true,
+                paged: self.paged,
             },
             None => CodexParentCensus {
                 scan_roots: &[],
                 paths: &NO_CODEX_CENSUS,
                 available: false,
+                paged: self.paged,
             },
         }
     }
@@ -19520,8 +19547,8 @@ fn codex_parent_census_matches<'a>(
 }
 
 /// The shared tail of every parent open: scan root, no-follow metadata,
-/// regular-file and size checks, `open_candidate_file`. Returns the path for
-/// the window test.
+/// regular-file check, a `Bounded` (identity-sample) open, then the size
+/// check on that descriptor. Returns the path for the window test.
 fn codex_parent_open_match(
     census: CodexParentCensus<'_>,
     found: CodexCensusMatch<'_>,
@@ -19545,9 +19572,6 @@ fn codex_parent_open_match(
     if !metadata.is_file() || metadata.file_type().is_symlink() {
         return Err(NotRegular);
     }
-    if metadata.len() > max_jsonl_file_bytes(SnapshotSource::Codex) {
-        return Err(Oversize);
-    }
     let modified_unix_seconds = metadata
         .modified()
         .ok()
@@ -19569,7 +19593,18 @@ fn codex_parent_open_match(
         legacy_config_reconciliation_required: false,
         opened_object_identity: String::new(),
     };
-    let file = open_candidate_file(SnapshotSource::Codex, &mut candidate).map_err(|_| Absent)?;
+    // Identity samples only: the parent's bytes are never read here, so the
+    // open takes no size cap. The cap witness is decided on the same
+    // descriptor whose identity is returned (no stat/open race).
+    let file = open_candidate_file_admitted(
+        SnapshotSource::Codex,
+        &mut candidate,
+        ReadAdmission::Bounded,
+    )
+    .map_err(|_| Absent)?;
+    if codex_parent_file_cap_held(&census, candidate.size_bytes) {
+        return Err(Oversize);
+    }
     Ok((candidate.path, candidate.opened_object_identity, file))
 }
 
@@ -21889,7 +21924,14 @@ fn validated_codex_parent_ownership_ledgers(
     if wanted.is_empty() {
         return BTreeMap::new();
     }
-    // The file is dropped at once, as PR-1 drops it per ledger.
+    // The file is dropped at once, as PR-1 drops it per ledger. Validation
+    // reads only identity samples and requires exact identity equality with a
+    // persisted `scan_complete` ledger, so size adds no proof here: the view
+    // is paged even on an unsampled or unsupported-layout scan.
+    let census = CodexParentCensus {
+        paged: true,
+        ..census
+    };
     let opened = codex_parent_census_matches(census, &wanted)
         .into_iter()
         .map(|found| {
@@ -22398,6 +22440,13 @@ impl ScanIndex {
         side: Option<(&sampled_scan::SharedCache, u128)>,
     ) -> bool {
         use sampled_scan::side_ledger::{LedgerEntry, LedgerTag};
+        // FC1 (#656): main never reads a Codex parent over its 2 GiB cap, so
+        // it never writes side state for one. A paged read of such a parent
+        // writes none either: no record, generation or lifecycle event. The
+        // extent is the certified held FD's stamp (at or after the commit).
+        if codex_parent_over_cap(parse.parsed.extent()) {
+            return false;
+        }
         if parse.unsealed && parse.verdict == SideVerdict::Settled {
             return false;
         }
@@ -23139,6 +23188,8 @@ struct OwnedActiveFile {
     /// U1a-2a (row 16): present while this file is P's side read. Every
     /// main write on its path is gated; it ends at the side exit.
     side_origin: Option<SideOrigin>,
+    /// How this file's handles may be read, decided at its first open.
+    admission: ReadAdmission,
 }
 #[allow(clippy::large_enum_variant)] // One active context moves between native collection steps.
 pub(crate) enum OwnedSourceScanStep {
@@ -23804,6 +23855,8 @@ impl OwnedSourceScan {
                         census_unix_seconds,
                         backfill_window_days,
                         &index.files,
+                        // Claude-only preflight: whole-file reads keep the cap.
+                        ReadAdmission::Unpaged,
                     )
                     .map(|(candidate, _)| candidate)
                 })
@@ -23934,6 +23987,8 @@ impl OwnedSourceScan {
                     census_unix_seconds,
                     backfill_window_days,
                     &index.files,
+                    // Claude family reparse: whole-file reads keep the cap.
+                    ReadAdmission::Unpaged,
                 ) {
                     identified_candidates.push(opened.0);
                 }
@@ -24166,6 +24221,7 @@ impl OwnedSourceScan {
         let index = &mut index_storage;
         // L-5: a resumed step re-probes everything it needs.
         codex_parent_identities.begin_step();
+        codex_parent_identities.admit(codex_read_admission(source, sampling.is_some()));
         // PR-P: once per page, on a selecting page (discovery done), before any
         // candidate is classified: apply the namespace's parent witnesses and
         // decide the restart budget.
@@ -24643,8 +24699,14 @@ impl OwnedSourceScan {
                     if boot.probe_bound {
                         context.cache.note_probe_bound();
                     }
+                    // Samples only (memo/parked match): no size cap.
                     let live_file = boot.live().and_then(|(live, _)| {
-                        open_candidate_file(SnapshotSource::Codex, &mut live.clone()).ok()
+                        open_candidate_file_admitted(
+                            SnapshotSource::Codex,
+                            &mut live.clone(),
+                            ReadAdmission::Bounded,
+                        )
+                        .ok()
                     });
                     let memo_key =
                         sampled_scan::codex_cursor::memo_key(&context.namespace, &boot.key);
@@ -24700,7 +24762,7 @@ impl OwnedSourceScan {
                         );
                         pending!();
                     }
-                    match context.cache.cursor_plan(
+                    match forced_plan(context.cache.cursor_plan(
                         &mut codex_page,
                         sampled_scan::codex_cursor::Limits::current(),
                         expected,
@@ -24709,7 +24771,7 @@ impl OwnedSourceScan {
                         &context.namespace,
                         &boot.key,
                         sampled_scan::codex_cursor::census_token(index).as_deref(),
-                    ) {
+                    )) {
                         sampled_scan::codex_cursor::StartPlan::Singleton => {}
                         sampled_scan::codex_cursor::StartPlan::Cursor => paged = true,
                         sampled_scan::codex_cursor::StartPlan::Unpaged => {
@@ -24738,12 +24800,66 @@ impl OwnedSourceScan {
                         }
                     }
                 }
-                // No group byte or member cap (R1-M4): a group larger than
-                // the singleton budget pages through the cursor; without one
+                // No group byte cap (R1-M4): a group larger than the
+                // singleton budget pages through the cursor; without one
                 // (unsupported layout, uncached scan) it is read in one page
-                // like main's unpaged read: each member at most
-                // `MAX_CODEX_JSONL_FILE_BYTES`, the group's total uncapped
-                // (R2-N7, disclosed).
+                // like main's unpaged read, the group's total uncapped
+                // (R2-N7, disclosed). R-b: a non-paged group with a member
+                // over the unpaged limit at identify is never read. A member
+                // that grows past it after identify is refused on its own
+                // descriptor at its body open (`GroupEnd::Strict`).
+                if !paged {
+                    let group_admission = codex_read_admission(source, sampling.is_some());
+                    let overruns = boot
+                        .group
+                        .members
+                        .iter()
+                        .filter_map(|member| {
+                            refuse_unpaged_overrun_len(
+                                source,
+                                group_admission,
+                                member.size_bytes,
+                                false,
+                            )
+                        })
+                        .collect::<Vec<_>>();
+                    if overruns.contains(&Overrun::Requeue) {
+                        // A contradiction with the plan: the group waits for a
+                        // later page's plan, never an in-page read.
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.cursor_note_deferred();
+                        }
+                        scanned_file_count = scanned_file_count.saturating_sub(members);
+                        sampled_scan::codex_cursor::requeue_members(
+                            index,
+                            &codex_selected_flags,
+                            &boot.group.members,
+                        );
+                        pending!();
+                    }
+                    if !overruns.is_empty() {
+                        // As the open-time refusal: the over-limit members are
+                        // counted, never read; the group is strict debt.
+                        census.oversized_file_count += overruns.len();
+                        scanned_file_count = scanned_file_count.saturating_sub(overruns.len());
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.cursor_unwait(&context.namespace, &boot.key);
+                        }
+                        codex_file_join::disclose_strict(
+                            &boot.group.owner,
+                            &boot.group.members,
+                            sampled_scan::codex_cursor::DisclosureTargets {
+                                census: &mut census,
+                                residue_index_keys: &mut residue_index_keys,
+                                residue_blocked_session_ids: &mut residue_blocked_session_ids,
+                                codex_state_only_blocked_session_ids:
+                                    &mut codex_state_only_blocked_session_ids,
+                                pending_finalization: &mut pending_finalization,
+                            },
+                        );
+                        pending!();
+                    }
+                }
                 let owner = boot.group.owner.clone();
                 let group_members = boot.group.members.clone();
                 let boot_key = boot.key.clone();
@@ -24754,6 +24870,7 @@ impl OwnedSourceScan {
                     artifacts: artifacts_enabled,
                     context_curve: context_curve_enabled,
                     index,
+                    paged,
                 });
                 let Ok(mut job) = job else {
                     // Round 4 (L1): no lease exists yet; a waiter it left is
@@ -25139,11 +25256,73 @@ impl OwnedSourceScan {
                 }) {
                     // Native finish compares the reopened descriptor to the captured
                     // identity, so replacement during fallback cannot publish.
-                    let reopened = open_candidate_file(source, &mut active.candidate.clone());
-                    let Ok(file) = reopened else {
-                        census.record_unreadable(UnreadableCause::OpenRead, 1);
-                        pending!();
+                    let mut reopened_candidate = active.candidate.clone();
+                    let reopened = open_candidate_file_admitted(
+                        source,
+                        &mut reopened_candidate,
+                        active.admission,
+                    );
+                    let file = match reopened {
+                        Ok(file) => file,
+                        // Only the unpaged size refusal (as at open) counts
+                        // as oversized; every other failure, under either
+                        // admission, is a read failure as on main.
+                        Err(error)
+                            if unpaged_size_refused(
+                                source,
+                                active.admission,
+                                &error,
+                                reopened_candidate.size_bytes,
+                            ) =>
+                        {
+                            census.oversized_file_count += 1;
+                            scanned_file_count = scanned_file_count.saturating_sub(1);
+                            pending!();
+                        }
+                        Err(_) => {
+                            census.record_unreadable(UnreadableCause::OpenRead, 1);
+                            pending!();
+                        }
                     };
+                    // The replay below reads the whole file in this page, as
+                    // on main. R-c checks the reopened descriptor before any
+                    // parser exists: over the unpaged limit a `Bounded` file
+                    // is requeued to the cursor (the retained entry was
+                    // consumed at selection, so the next plan is a full read:
+                    // `Cursor`, `Defer` or `Fenced`, never this replay) and an
+                    // `Unpaged` one is counted oversized. This is a length
+                    // check, not a byte cap against concurrent growth.
+                    let overrun = refuse_unpaged_overrun(
+                        source,
+                        active.admission,
+                        &file,
+                        0,
+                        active.cursor.is_some(),
+                    );
+                    match overrun {
+                        Some(Overrun::Requeue) => {
+                            drop(file);
+                            if let Some(context) = sampling.as_ref() {
+                                context.cache.cursor_note_deferred();
+                            }
+                            scanned_file_count = scanned_file_count.saturating_sub(1);
+                            sampled_scan::codex_cursor::requeue(
+                                index,
+                                &codex_selected_flags,
+                                &active.candidate,
+                            );
+                            pending!();
+                        }
+                        Some(Overrun::Oversized) => {
+                            // As the open-time refusal: counted, not scanned.
+                            census.oversized_file_count += 1;
+                            scanned_file_count = scanned_file_count.saturating_sub(1);
+                            pending!();
+                        }
+                        None => {}
+                    }
+                    #[cfg(test)]
+                    note_test_parser_construction();
                     let Ok(mut parser) = sampled_scan::new_source_parser(
                         file,
                         &active.candidate,
@@ -25504,6 +25683,7 @@ impl OwnedSourceScan {
                     hold_offset: _,
                     group,
                     side_origin,
+                    admission: _,
                 } = *active;
                 if let Some(mut group) = group {
                     codex_legacy_join_baselines.extend(group.take_legacy_baselines());
@@ -25657,7 +25837,17 @@ impl OwnedSourceScan {
                     if let Some(cause) = sampled_revalidation_cause(
                         current_scope.as_ref() == Some(&acquisition.scope),
                         || {
-                            drop(open_candidate_file(source, &mut current_path)?);
+                            // An identity compare only: Codex takes no size cap.
+                            let admission = if source == SnapshotSource::Codex {
+                                ReadAdmission::Bounded
+                            } else {
+                                ReadAdmission::Unpaged
+                            };
+                            drop(open_candidate_file_admitted(
+                                source,
+                                &mut current_path,
+                                admission,
+                            )?);
                             Ok(current_path.opened_object_identity
                                 == candidate.opened_object_identity)
                         },
@@ -27664,6 +27854,8 @@ impl OwnedSourceScan {
                 &claude_title_metadata,
                 claude_effort_support_dir_ref,
             );
+            let admission = codex_read_admission(source, sampling.is_some());
+            let oversized_before = census.oversized_file_count;
             let Some((mut candidate, opened_file)) = open_and_identify_scan_candidate(
                 source,
                 candidate,
@@ -27671,7 +27863,16 @@ impl OwnedSourceScan {
                 census_unix_seconds,
                 backfill_window_days,
                 &index.files,
+                admission,
             ) else {
+                // A sampled Codex scan refuses an over-limit object only when
+                // the cursor is unavailable (unsupported layout): disclose it.
+                if let Some(context) = sampling.as_ref().filter(|_| {
+                    source == SnapshotSource::Codex
+                        && census.oversized_file_count > oversized_before
+                }) {
+                    codex_page.disclose_disabled(&context.cache);
+                }
                 pending!();
             };
             if preflight_source_file_fingerprint
@@ -28304,6 +28505,8 @@ impl OwnedSourceScan {
                     .retain_target_metadata(bytes, capture_credit.expect("funded target input"))?;
             }
 
+            #[cfg(test)]
+            note_test_parser_construction();
             let mut parser = match sampled_scan::new_source_parser(
                 opened_file,
                 &candidate,
@@ -28654,6 +28857,7 @@ impl OwnedSourceScan {
                 hold_offset: None,
                 group: None,
                 side_origin,
+                admission,
             });
             if let Some(context) = sampling
                 .as_ref()
@@ -28700,7 +28904,7 @@ impl OwnedSourceScan {
                     active_file = Some(active);
                     pending!();
                 }
-                let defer = match context.cache.cursor_plan(
+                let defer = match forced_plan(context.cache.cursor_plan(
                     &mut codex_page,
                     sampled_scan::codex_cursor::Limits::current(),
                     expected,
@@ -28709,7 +28913,7 @@ impl OwnedSourceScan {
                     &context.namespace,
                     &local_index_key(&active.candidate.path),
                     sampled_scan::codex_cursor::census_token(index).as_deref(),
-                ) {
+                )) {
                     sampled_scan::codex_cursor::StartPlan::Singleton => false,
                     sampled_scan::codex_cursor::StartPlan::Unpaged => {
                         // Layout-unsupported build: the cursor is off as a
@@ -28786,6 +28990,47 @@ impl OwnedSourceScan {
                         &active.candidate,
                     );
                     pending!();
+                }
+            }
+            // R-a: the one runtime refusal before a non-cursor read starts.
+            // The read begins at the plan's own start: the sealed offset for
+            // `Unchanged`/`Tail`, 0 for a full or unsampled read. Before
+            // `record_mode`, which counts only reads that actually happen.
+            if active.cursor.is_none() {
+                let start = active
+                    .parser
+                    .reader
+                    .acquisition
+                    .as_ref()
+                    .map_or(0, crate::transcript_acquisition::ReadPlan::start_offset);
+                match refuse_unpaged_overrun(
+                    source,
+                    active.admission,
+                    active.parser.reader.reader.get_ref(),
+                    start,
+                    false,
+                ) {
+                    Some(Overrun::Requeue) => {
+                        // The cursor exists: the next plan pages this file.
+                        if let Some(context) = sampling.as_ref() {
+                            context.cache.cursor_note_deferred();
+                        }
+                        scanned_file_count = scanned_file_count.saturating_sub(1);
+                        sampled_scan::codex_cursor::requeue(
+                            index,
+                            &codex_selected_flags,
+                            &active.candidate,
+                        );
+                        pending!();
+                    }
+                    Some(Overrun::Oversized) => {
+                        // As the open-time refusal: counted, never read, and
+                        // the observed key and prior body are untouched.
+                        census.oversized_file_count += 1;
+                        scanned_file_count = scanned_file_count.saturating_sub(1);
+                        pending!();
+                    }
+                    None => {}
                 }
             }
             if let Some((context, (mode, audit_due))) = sampling.as_mut().zip(planned_mode) {
@@ -29806,8 +30051,16 @@ impl OwnedJsonlParser {
         // terminal loss rather than a reason to discard the whole file forever.
         recognized_usage_drop_count =
             recognized_usage_drop_count.saturating_add(report.over_line_cap_count);
-        let observed_after_read = opened_object_identity(source, reader.get_mut())
-            .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
+        // An identity compare after the read: Codex takes no size cap, so a
+        // cursor job whose file grew past it reaches its grant check below.
+        let revalidation_admission = if source == SnapshotSource::Codex {
+            ReadAdmission::Bounded
+        } else {
+            ReadAdmission::Unpaged
+        };
+        let observed_after_read =
+            opened_object_identity_admitted(source, reader.get_mut(), revalidation_admission)
+                .with_context(|| format!("revalidate opened JSONL {}", path.display()))?;
         // A cursor job read only up to its frozen extent; appended bytes
         // belong to the next tail, so its object may have grown. Only a job
         // whose prefix certificate passed against the held FD carries
@@ -37841,11 +38094,214 @@ fn effective_backfill_window_days(requested_backfill_window_days: u64) -> u64 {
     requested_backfill_window_days.min(BACKFILL_WINDOW_DAYS)
 }
 
+/// Discovery cap. Codex has none: its reads are bounded per opened handle by
+/// [`ReadAdmission`] (paged cursor, budgeted tail, or identity samples), and
+/// an unpaged handle still refuses above [`unpaged_read_limit`] at open. This
+/// removes a refusal; no limit is raised.
 fn max_jsonl_file_bytes(source: SnapshotSource) -> u64 {
+    match source {
+        SnapshotSource::Codex => u64::MAX,
+        SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
+    }
+}
+
+/// The most an opened handle may hold when it can be read to EOF in one
+/// page: today's per-source file caps, unchanged.
+fn unpaged_read_limit(source: SnapshotSource) -> u64 {
+    #[cfg(test)]
+    if let Some(limit) = TEST_UNPAGED_LIMIT.with(std::cell::Cell::get) {
+        return limit;
+    }
     match source {
         SnapshotSource::Codex => MAX_CODEX_JSONL_FILE_BYTES,
         SnapshotSource::ClaudeCode | SnapshotSource::Pi => MAX_JSONL_FILE_BYTES,
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_UNPAGED_LIMIT: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// A scaled unpaged limit for tests only; production values never change.
+#[cfg(test)]
+fn with_test_unpaged_limit<T>(limit: u64, run: impl FnOnce() -> T) -> T {
+    // Restores the enclosing limit, so an unscaled oracle can nest.
+    struct Reset(Option<u64>);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_UNPAGED_LIMIT.with(|slot| slot.set(self.0));
+        }
+    }
+    let _reset = Reset(TEST_UNPAGED_LIMIT.with(|slot| slot.replace(Some(limit))));
+    run()
+}
+
+/// A Codex object this long can only be read through the paged cursor.
+fn codex_paged_only(len: u64) -> bool {
+    len > unpaged_read_limit(SnapshotSource::Codex)
+}
+
+/// How an opened handle may be read. Decided at open, stored on the active
+/// file, never widened later. This is admission routing, not a budget proof:
+/// every body read still goes through the page, layout, cursor and accounting
+/// gates.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReadAdmission {
+    /// The handle may be read to EOF within one page, so the per-source
+    /// unpaged limit applies (Codex 2 GiB, Claude/Pi 256 MiB). It is checked
+    /// at open and, for Codex, again where a non-cursor read starts
+    /// (`refuse_unpaged_overrun`). It is not enforced on the read itself: a
+    /// file that grows past the limit during an in-page read is read on, and
+    /// only the finish identity check fails (pre-existing).
+    Unpaged,
+    /// Codex only, on a sampled scan with a validated layout. No size limit
+    /// at open; identity-only uses take samples (at most 2 x 4 KiB). Bodies
+    /// are read by the P1 cursor, as a tail within the page plan's singleton
+    /// budget, or, for the protected-tier fallback (O7), as the whole-file
+    /// in-page replay main already runs. Wherever a non-cursor read starts,
+    /// `refuse_unpaged_overrun` checks the descriptor against the unpaged
+    /// limit and requeues above it, so at or below it routing is main's.
+    /// That check is a length check, not a byte cap against concurrent
+    /// growth, and not a total memory bound (as for `Unpaged`).
+    Bounded,
+}
+
+/// `Bounded` iff the source is Codex, the scan is sampled (so the cursor
+/// exists) and the native layout is validated (so its accounting holds).
+fn codex_read_admission(source: SnapshotSource, sampled: bool) -> ReadAdmission {
+    #[cfg(test)]
+    if let Some(admission) = TEST_FORCED_ADMISSION.with(std::cell::Cell::get) {
+        return admission;
+    }
+    if source == SnapshotSource::Codex && sampled && crate::heap_layout_bound::layout_supported() {
+        ReadAdmission::Bounded
+    } else {
+        ReadAdmission::Unpaged
+    }
+}
+
+/// The one 2 GiB parent rule (P1 and U1a): a parent this long is an
+/// `Oversize` cap witness only where the scan cannot page it. `len` must come
+/// from the opened descriptor whose identity is used.
+pub(in crate::snapshots) fn codex_parent_file_cap_held(
+    census: &CodexParentCensus<'_>,
+    len: u64,
+) -> bool {
+    !census.paged && codex_paged_only(len)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_FORCED_ADMISSION: std::cell::Cell<Option<ReadAdmission>> =
+        const { std::cell::Cell::new(None) };
+    static TEST_FORCED_PLAN: std::cell::Cell<Option<sampled_scan::codex_cursor::StartPlan>> =
+        const { std::cell::Cell::new(None) };
+    /// Parser constructions on the scan paths, for zero-parse controls.
+    static TEST_PARSER_CONSTRUCTIONS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Forces the main-loop and group page plans (and optionally the admission)
+/// so tests can drive the runtime refusals into a contradiction.
+#[cfg(test)]
+fn with_test_forced_routing<T>(
+    plan: Option<sampled_scan::codex_cursor::StartPlan>,
+    admission: Option<ReadAdmission>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            TEST_FORCED_PLAN.with(|slot| slot.set(None));
+            TEST_FORCED_ADMISSION.with(|slot| slot.set(None));
+        }
+    }
+    TEST_FORCED_PLAN.with(|slot| slot.set(plan));
+    TEST_FORCED_ADMISSION.with(|slot| slot.set(admission));
+    let _reset = Reset;
+    run()
+}
+
+/// Identity in production; the forced plan under `with_test_forced_routing`.
+fn forced_plan(
+    plan: sampled_scan::codex_cursor::StartPlan,
+) -> sampled_scan::codex_cursor::StartPlan {
+    #[cfg(test)]
+    if let Some(forced) = TEST_FORCED_PLAN.with(std::cell::Cell::get) {
+        return forced;
+    }
+    plan
+}
+
+#[cfg(test)]
+fn note_test_parser_construction() {
+    TEST_PARSER_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+fn take_test_parser_constructions() -> u64 {
+    TEST_PARSER_CONSTRUCTIONS.with(|count| count.replace(0))
+}
+
+/// The one open-time size refusal (S2 and the O7 reopen): only an `Unpaged`
+/// open refuses on size, with `InvalidData`, and `len` is the opened
+/// descriptor's length (`open_candidate_file_admitted` refreshes it before
+/// the cap). Every other open failure is not a size refusal.
+fn unpaged_size_refused(
+    source: SnapshotSource,
+    admission: ReadAdmission,
+    error: &std::io::Error,
+    len: u64,
+) -> bool {
+    admission == ReadAdmission::Unpaged
+        && error.kind() == std::io::ErrorKind::InvalidData
+        && len > unpaged_read_limit(source)
+}
+
+/// Why a non-cursor read must not start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Overrun {
+    /// The cursor exists: requeue so the next plan pages the file.
+    Requeue,
+    /// Paging is unavailable here: count the file as oversized.
+    Oversized,
+}
+
+/// The one runtime refusal, called wherever a non-cursor read starts. A Codex
+/// handle whose remaining bytes exceed the unpaged limit is never read in a
+/// page; Claude/Pi routing is unchanged. The caller never reads on `Some`.
+fn refuse_unpaged_overrun_len(
+    source: SnapshotSource,
+    admission: ReadAdmission,
+    remaining: u64,
+    cursor: bool,
+) -> Option<Overrun> {
+    if source != SnapshotSource::Codex || cursor || remaining <= unpaged_read_limit(source) {
+        return None;
+    }
+    Some(match admission {
+        ReadAdmission::Bounded => Overrun::Requeue,
+        ReadAdmission::Unpaged => Overrun::Oversized,
+    })
+}
+
+/// [`refuse_unpaged_overrun_len`] on a held descriptor's current length.
+fn refuse_unpaged_overrun(
+    source: SnapshotSource,
+    admission: ReadAdmission,
+    file: &File,
+    start_offset: u64,
+    cursor: bool,
+) -> Option<Overrun> {
+    if source != SnapshotSource::Codex || cursor {
+        return None;
+    }
+    // An unreadable length is refused like an over-limit one: never read.
+    let remaining = file.metadata().map_or(u64::MAX, |metadata| {
+        metadata.len().saturating_sub(start_offset)
+    });
+    refuse_unpaged_overrun_len(source, admission, remaining, cursor)
 }
 
 /// Resolve one operator-configured root before discovery. A configured root
@@ -37913,8 +38369,21 @@ fn open_candidate_file(
     source: SnapshotSource,
     candidate: &mut CandidateFile,
 ) -> std::io::Result<File> {
+    open_candidate_file_admitted(source, candidate, ReadAdmission::Unpaged)
+}
+
+/// [`open_candidate_file`] under an explicit admission. The size check is
+/// taken on the opened descriptor, so a file that grew past the limit after
+/// discovery is refused as oversized, not as an open error.
+fn open_candidate_file_admitted(
+    source: SnapshotSource,
+    candidate: &mut CandidateFile,
+    admission: ReadAdmission,
+) -> std::io::Result<File> {
     let mut file = open_candidate_beneath_root(candidate)?;
-    candidate.opened_object_identity = opened_object_identity(source, &mut file)?;
+    candidate.size_bytes = file.metadata()?.len();
+    candidate.opened_object_identity =
+        opened_object_identity_admitted(source, &mut file, admission)?;
     let metadata = file.metadata()?;
     let modified = metadata.modified().ok();
     candidate.size_bytes = metadata.len();
@@ -37936,8 +38405,9 @@ fn open_and_identify_scan_candidate(
     census_unix_seconds: Option<u64>,
     backfill_window_days: u64,
     files: &BTreeMap<String, ScanIndexEntry>,
+    admission: ReadAdmission,
 ) -> Option<(CandidateFile, File)> {
-    let opened_file = match open_candidate_file(source, &mut candidate) {
+    let opened_file = match open_candidate_file_admitted(source, &mut candidate, admission) {
         Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if claude_absence_is_removal(source, &candidate.path) {
@@ -37960,10 +38430,7 @@ fn open_and_identify_scan_candidate(
             }
             return None;
         }
-        Err(error)
-            if error.kind() == std::io::ErrorKind::InvalidData
-                && candidate.size_bytes > max_jsonl_file_bytes(source) =>
-        {
+        Err(error) if unpaged_size_refused(source, admission, &error, candidate.size_bytes) => {
             census.oversized_file_count += 1;
             return None;
         }
@@ -38080,6 +38547,28 @@ fn open_candidate_beneath_root(candidate: &CandidateFile) -> std::io::Result<Fil
 }
 
 fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::Result<String> {
+    opened_object_identity_admitted(source, file, ReadAdmission::Unpaged)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Bytes the identity samples read, for the sparse-fixture read budgets.
+    static TEST_IDENTITY_BYTES_READ: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn take_test_identity_bytes_read() -> u64 {
+    TEST_IDENTITY_BYTES_READ.with(|bytes| bytes.replace(0))
+}
+
+/// [`opened_object_identity`] under an explicit admission: the size cap
+/// applies only to an `Unpaged` handle. The identity bytes are the same for
+/// both admissions, so `OPENED_OBJECT_IDENTITY_VERSION` is unchanged.
+fn opened_object_identity_admitted(
+    source: SnapshotSource,
+    file: &mut File,
+    admission: ReadAdmission,
+) -> std::io::Result<String> {
     file.seek(SeekFrom::Start(0))?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
@@ -38088,7 +38577,7 @@ fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::R
             "snapshot candidate is not a regular file",
         ));
     }
-    if metadata.len() > max_jsonl_file_bytes(source) {
+    if admission == ReadAdmission::Unpaged && metadata.len() > unpaged_read_limit(source) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "snapshot candidate exceeds source file cap",
@@ -38111,10 +38600,14 @@ fn opened_object_identity(source: SnapshotSource, file: &mut File) -> std::io::R
     }
     let mut sample = vec![0_u8; FILE_CONTENT_SAMPLE_BYTES];
     let first_len = file.read(&mut sample)?;
+    #[cfg(test)]
+    TEST_IDENTITY_BYTES_READ.with(|bytes| bytes.set(bytes.get() + first_len as u64));
     update_length_prefixed(&mut digest, &sample[..first_len]);
     if metadata.len() > FILE_CONTENT_SAMPLE_BYTES as u64 {
         file.seek(SeekFrom::End(-(FILE_CONTENT_SAMPLE_BYTES as i64)))?;
         let last_len = file.read(&mut sample)?;
+        #[cfg(test)]
+        TEST_IDENTITY_BYTES_READ.with(|bytes| bytes.set(bytes.get() + last_len as u64));
         update_length_prefixed(&mut digest, &sample[..last_len]);
     }
     let identity = format!("{:x}", digest.finalize());
@@ -51742,7 +52235,17 @@ mod tests {
 
     #[test]
     fn codex_allows_larger_streaming_transcripts_than_other_sources() {
-        assert!(max_jsonl_file_bytes(SnapshotSource::Codex) > MAX_JSONL_FILE_BYTES);
+        // Codex: no discovery cap; the unpaged handle limit is unchanged.
+        assert_eq!(max_jsonl_file_bytes(SnapshotSource::Codex), u64::MAX);
+        assert_eq!(
+            unpaged_read_limit(SnapshotSource::Codex),
+            MAX_CODEX_JSONL_FILE_BYTES,
+        );
+        assert_eq!(
+            unpaged_read_limit(SnapshotSource::ClaudeCode),
+            MAX_JSONL_FILE_BYTES,
+        );
+        assert_eq!(unpaged_read_limit(SnapshotSource::Pi), MAX_JSONL_FILE_BYTES);
         assert_eq!(
             max_jsonl_file_bytes(SnapshotSource::ClaudeCode),
             MAX_JSONL_FILE_BYTES,
@@ -76603,6 +77106,7 @@ mod tests {
             parents_applied: false,
             restart_budget_spent: false,
             parent_restarts: None,
+            paged: false,
         };
         let (old_identity, fresh) = ids.probe(census, parent_id);
         assert!(fresh && old_identity.is_ok());
@@ -76739,6 +77243,7 @@ mod tests {
             parents_applied: false,
             restart_budget_spent: false,
             parent_restarts: None,
+            paged: false,
         };
 
         // A UUID-shaped parent is kept: a 36-byte id and a 64-byte identity.
@@ -81662,7 +82167,7 @@ crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized
     codex_parent_ledger_identity_used, codex_parent_resolution_pending, codex_parent_ownership_ledger,
     codex_parent_unresolvable, codex_parent_ledger_unusable, codex_parent_ledger_consulted,
     codex_parent_prefix_decided, codex_parent_proof_used, codex_parent_proof_refusal);
-crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin);
+crate::heap_layout_bound::fields!(OwnedActiveFile; comparison_target, sampling, candidate, decision, previous_snapshot_fingerprint, previous_upload_body_witness, projection_adoption_required, source_file_fingerprint, parser, aliases, applied_receipts, cursor, charged_bytes, hold_offset, group, side_origin, admission);
 crate::heap_layout_bound::fields!(OwnedJsonlParser; reader, accumulator, source, apply_line, recognized_usage_drop_count, positive_recognized_usage_count, positive_usage_evidence, claude_opened_birth);
 crate::heap_layout_bound::fields!(OwnedSourceScan; native_comparison, resource_probe, sampling, source, index, collected_at, backfill_window_days, file_limit, artifacts_enabled, context_curve_enabled, claude_request_identity_capture, claude_effort_support_dir, codex_title_metadata, claude_title_metadata, state_census_complete, sidecar_census_complete, codex_turn_traces, codex_parent_identities, codex_parent_ownership_ledgers, census_window_end, discovered_file_count, census_unix_seconds, census, snapshots, scanned_file_count, scanned_session_count, semantic_noop_count, history_upgrade, codex_state_only_blocked_session_ids, codex_parent_resolution_retry_required, residue_index_keys, settled_residue_index_keys, residue_blocked_session_ids, pending_finalization, claude_authority_preflight, forced_claude_family_reparses, identified_candidates, active_file, codex_join_inventory, codex_join_prepared, codex_join_groups, codex_join_active, codex_join_completed, codex_legacy_join_baselines, codex_page, codex_selected_flags, codex_side_pass);
 crate::heap_layout_bound::fields!(PendingIndexFinalization; sampled_audit_verified, codex_pending_recovery, index_key, source_file_fingerprint, previous_snapshot_fingerprint, previous_upload_body_witness, parse_complete, diagnostic_reason, parsed_snapshot_count, effective_upload_body_witness_revision);
@@ -81768,6 +82273,7 @@ inline_scan_enum!(ClaudeCompactionKind; Self::LegacySummary,Self::CurrentBoundar
 inline_scan_enum!(SnapshotQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal,Self::SupersededTerminal);
 inline_scan_enum!(ClaudeUsageAuthorityQuarantineDisposition; Self::RetryPending,Self::UnprovenTerminal);
 inline_scan_enum!(SnapshotSource; Self::Pi,Self::Codex,Self::ClaudeCode);
+inline_scan_enum!(ReadAdmission; Self::Unpaged,Self::Bounded);
 inline_scan_enum!(CodexOwnershipBoundary; Self::Undetermined,Self::AllLocal,Self::AwaitingLegacyTrigger,
     Self::AwaitingParentPrefix,Self::Ordinal { start: _ },Self::NativeCreatedThread,Self::AmbiguousFork);
 
@@ -82000,7 +82506,8 @@ mod census_unreadable_tests {
             &mut census,
             None,
             30,
-            &BTreeMap::new()
+            &BTreeMap::new(),
+            ReadAdmission::Unpaged,
         )
         .is_none());
         assert_eq!(
