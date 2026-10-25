@@ -783,6 +783,10 @@ pub(crate) struct ClaudeRequestMoneyShadowCounts {
     pub(crate) native_us: u64,
     pub(crate) writer_us: u64,
     pub(crate) result_apply_us: u64,
+    /// Admission's unchecked pass (grouping by root and sizing over the
+    /// index keys): a documented known limit, charged to money time.
+    /// Receipt only.
+    pub(crate) admission_us: u64,
     /// Time through common setup, before the first family's own inputs
     /// and body (its stop is a fixed reserve before that family's floor).
     pub(crate) family_setup_us: u64,
@@ -1455,6 +1459,87 @@ fn schedule_order(left: &(&str, String, u64), right: &(&str, String, u64)) -> st
     left.2.cmp(&right.2).then_with(|| left.1.cmp(&right.1))
 }
 
+/// One keyed root's schedule entry, ordered by `schedule_order`.
+struct ScheduleTurn<'r>((&'r str, String, u64));
+
+impl PartialEq for ScheduleTurn<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for ScheduleTurn<'_> {}
+
+impl PartialOrd for ScheduleTurn<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ScheduleTurn<'_> {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        schedule_order(&self.0, &other.0)
+    }
+}
+
+/// The oldest `NEXT_PAGE_FAMILIES` captured and uncaptured roots keyed so
+/// far, each in a bounded max-heap updated per keyed root. The head of a
+/// complete schedule (oldest turns) or a cut-off one (captured roots first)
+/// is among these at most twice `NEXT_PAGE_FAMILIES` entries.
+#[derive(Default)]
+struct ScheduleHead<'r> {
+    captured: std::collections::BinaryHeap<ScheduleTurn<'r>>,
+    uncaptured: std::collections::BinaryHeap<ScheduleTurn<'r>>,
+}
+
+impl<'r> ScheduleHead<'r> {
+    /// Keeps `entry` while it is among the oldest of its kind. Returns the
+    /// entry that cannot be in the head (`entry` or the one it displaces).
+    fn push(
+        &mut self,
+        entry: (&'r str, String, u64),
+        captured: bool,
+    ) -> Option<(&'r str, String, u64)> {
+        let kept = if captured {
+            &mut self.captured
+        } else {
+            &mut self.uncaptured
+        };
+        if kept.len() < capture::NEXT_PAGE_FAMILIES {
+            kept.push(ScheduleTurn(entry));
+            return None;
+        }
+        let mut newest = kept.peek_mut()?;
+        Some(if schedule_order(&entry, &newest.0).is_lt() {
+            std::mem::replace(&mut newest.0, entry)
+        } else {
+            entry
+        })
+    }
+
+    /// The head in its order (a cut-off schedule ranks captured roots
+    /// first) and the kept entries it leaves for the rest of the schedule.
+    #[allow(clippy::type_complexity)]
+    fn finish(self, cut_off: bool) -> (Vec<(&'r str, String, u64)>, Vec<(&'r str, String, u64)>) {
+        let mut kept = self
+            .captured
+            .into_iter()
+            .map(|turn| (false, turn.0))
+            .chain(self.uncaptured.into_iter().map(|turn| (cut_off, turn.0)))
+            .collect::<Vec<_>>();
+        kept.sort_by(|left, right| {
+            left.0
+                .cmp(&right.0)
+                .then_with(|| schedule_order(&left.1, &right.1))
+        });
+        let rest = kept.split_off(kept.len().min(capture::NEXT_PAGE_FAMILIES));
+        (
+            kept.into_iter().map(|(_, entry)| entry).collect(),
+            rest.into_iter().map(|(_, entry)| entry).collect(),
+        )
+    }
+}
+
 /// After family zero: key the roots scheduling did not reach and order the
 /// page after the reserved turns (`head`, which keep their places; with
 /// every root keyed this is the full schedule order). Charged to money time
@@ -1784,6 +1869,7 @@ fn shadow_page_body(
         return refuse(&end, None, index, snapshots.len(), counts);
     };
     // Each root's snapshots, grouped in the one admission pass over them.
+    let admitting = Instant::now();
     let mut items_by_root = BTreeMap::<&str, Vec<&SnapshotItem>>::new();
     for item in snapshots {
         items_by_root
@@ -1821,6 +1907,7 @@ fn shadow_page_body(
                 + tail_fixed_memory(&ClaudeTelemetryTailBudget::default()),
         );
     counts.admission_bytes = admission.saturating_add(root_funds.bytes()) as u64;
+    counts.admission_us = admitting.elapsed().as_micros() as u64;
     let Some(base) = ShadowReservation::admit(admission) else {
         counts.refused_budget = 1;
         purge_captures(&scope_key, &mut counts);
@@ -1872,12 +1959,20 @@ fn shadow_page_body(
             .copied()
             .filter(|root| !captured_roots.contains(root)),
     );
+    // The oldest turns are kept as roots are keyed; the reserved slots
+    // receive them, with no pass over the keyed roots after the stop.
+    let reserved = roots.len().min(capture::NEXT_PAGE_FAMILIES);
     let mut order = Vec::with_capacity(roots.len());
+    order.resize_with(reserved, || ("", String::new(), 0));
+    let mut oldest = ScheduleHead::default();
+    let mut keyed = 0;
     for root in unkeyed.by_ref() {
-        order.push(schedule_entry(&scope_key, ledger, root));
+        keyed += 1;
+        let entry = schedule_entry(&scope_key, ledger, root);
+        order.extend(oldest.push(entry, captured_roots.contains(root)));
         #[cfg(test)]
         if faulted(PageFault::ScheduleStall)
-            && order.len() == SCHEDULE_STALL_AFTER.with(std::cell::Cell::get).max(1)
+            && keyed == SCHEDULE_STALL_AFTER.with(std::cell::Cell::get).max(1)
         {
             // Scheduling used everything up to the setup stop.
             while Instant::now() < setup_deadline {
@@ -1890,18 +1985,14 @@ fn shadow_page_body(
     }
     // A cut-off schedule ranks the captured roots it keyed first: family
     // zero and the other reserved turns then hold the captured bodies.
-    let cut_off = order.len() < roots.len();
-    let head_order = |left: &(&str, String, u64), right: &(&str, String, u64)| {
-        let uncaptured = |entry: &(&str, String, u64)| cut_off && !captured_roots.contains(entry.0);
-        uncaptured(left)
-            .cmp(&uncaptured(right))
-            .then_with(|| schedule_order(left, right))
-    };
-    let head = order.len().min(capture::NEXT_PAGE_FAMILIES);
-    if order.len() > head {
-        order.select_nth_unstable_by(head - 1, head_order);
+    let (head_turns, displaced) = oldest.finish(keyed < roots.len());
+    let head = head_turns.len();
+    // Fewer roots keyed than reserved slots: nothing follows the slots.
+    order.truncate(order.len() - (reserved - head));
+    for (slot, entry) in order.iter_mut().zip(head_turns) {
+        *slot = entry;
     }
-    order[..head].sort_by(head_order);
+    order.extend(displaced);
     let mut schedule_complete = false;
     let capture_turns = order[..head]
         .iter()
@@ -4696,5 +4787,94 @@ mod digest_deadline_tests {
         DIGEST_WRITES_FOR_TEST.with(|left| left.set(None));
         assert_eq!((rows.row.observed_unix, rows.row.snapshot), (10, 100));
         assert_eq!(semantic_digest(&mut rows), before);
+    }
+}
+
+#[cfg(test)]
+mod schedule_head_tests {
+    use super::*;
+
+    /// The old head selection over the whole keyed prefix.
+    fn select_nth_head<'r>(
+        mut order: Vec<(&'r str, String, u64)>,
+        captured: &BTreeSet<&str>,
+        cut_off: bool,
+    ) -> Vec<(&'r str, String, u64)> {
+        let head_order = |left: &(&str, String, u64), right: &(&str, String, u64)| {
+            let uncaptured = |entry: &(&str, String, u64)| cut_off && !captured.contains(entry.0);
+            uncaptured(left)
+                .cmp(&uncaptured(right))
+                .then_with(|| schedule_order(left, right))
+        };
+        let head = order.len().min(capture::NEXT_PAGE_FAMILIES);
+        if order.len() > head {
+            order.select_nth_unstable_by(head - 1, head_order);
+        }
+        order.truncate(head);
+        order.sort_by(head_order);
+        order
+    }
+
+    /// MONEY round 5: the incrementally kept head equals the old whole-prefix
+    /// selection on random keyed prefixes, with equal-turn ties, captured
+    /// and uncaptured roots, complete and cut-off schedules; the entries it
+    /// leaves are exactly the rest.
+    #[test]
+    fn schedule_head_equals_select_nth_on_random_prefixes() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move |bound: u64| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state % bound
+        };
+        let roots = (0..400)
+            .map(|at| format!("root-{at:03}"))
+            .collect::<Vec<_>>();
+        for case in 0..300 {
+            let len = match case % 4 {
+                0 => next(capture::NEXT_PAGE_FAMILIES as u64 + 1) as usize,
+                _ => next(roots.len() as u64 + 1) as usize,
+            };
+            let turns = [1, 3, 50, 1 << 40][case % 4];
+            let captured_share = next(5);
+            let mut picked = roots.iter().map(String::as_str).collect::<Vec<_>>();
+            for at in (1..picked.len()).rev() {
+                picked.swap(at, next(at as u64 + 1) as usize);
+            }
+            picked.truncate(len);
+            let captured = picked
+                .iter()
+                .copied()
+                .filter(|_| next(4) < captured_share)
+                .collect::<BTreeSet<_>>();
+            // Captured roots are keyed first, as on a page.
+            picked.sort_by_key(|root| !captured.contains(root));
+            let entries = picked
+                .iter()
+                .map(|root| (*root, family_key(root), next(turns)))
+                .collect::<Vec<_>>();
+            for cut_off in [false, true] {
+                let mut oldest = ScheduleHead::default();
+                let mut rest = Vec::new();
+                for entry in entries.iter().cloned() {
+                    let is_captured = captured.contains(entry.0);
+                    rest.extend(oldest.push(entry, is_captured));
+                }
+                let (head, displaced) = oldest.finish(cut_off);
+                rest.extend(displaced);
+                let expected = select_nth_head(entries.clone(), &captured, cut_off);
+                assert_eq!(head, expected, "case {case} cut_off {cut_off}");
+                let mut all = head
+                    .iter()
+                    .chain(&rest)
+                    .map(|entry| entry.0)
+                    .collect::<Vec<_>>();
+                all.sort_unstable();
+                let mut keyed = picked.clone();
+                keyed.sort_unstable();
+                assert_eq!(all, keyed, "case {case}: every keyed root is kept once");
+            }
+        }
     }
 }
