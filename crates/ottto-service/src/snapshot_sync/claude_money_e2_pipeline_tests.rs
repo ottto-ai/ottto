@@ -11,6 +11,9 @@ use serde_json::json;
 const ROOT: &str = "1338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const COPY: &str = "2338a80a-f36e-4cbc-a5bb-50fc66430ba5";
 const AT: &str = "2026-08-02T07:00:10Z";
+fn with_e2<T>(f: impl FnOnce() -> T) -> T {
+    crate::snapshots::with_max_gated_claude_revision(3, || e2::with_enabled(f))
+}
 fn nanos(at: &str) -> i128 {
     OffsetDateTime::parse(at, &Rfc3339)
         .unwrap()
@@ -110,11 +113,18 @@ impl Corpus {
     fn raw(
         &self,
         scanner: &E2ScanFixture,
-        index: ScanIndex,
+        mut index: ScanIndex,
         limit: usize,
         sampled: bool,
         hints: &[PathBuf],
     ) -> Page {
+        index.activate_upload_context("e2-synthetic-destination".into());
+        index.activate_effective_upload_body_witness_revision(if e2::enabled() {
+            3
+        } else {
+            effective_upload_body_witness_revision(SnapshotSource::ClaudeCode)
+        });
+        index.adopt_effective_upload_body_witness_revision_monotonically();
         let (index, scan, modes) = scanner.scan(
             std::slice::from_ref(&self.root),
             &self.support,
@@ -441,7 +451,7 @@ fn e2_pipeline_dark_matches_fold_absent_publication_and_selection() {
 
 #[test]
 fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-modes");
         let path = c.root(ROOT, &line(ROOT, "copied", "2026-08-02T06:58:00Z", 10));
         let scanner = E2ScanFixture::default();
@@ -507,7 +517,7 @@ fn e2_pipeline_full_tail_unchanged_eviction_and_restart_are_cumulative() {
 }
 
 fn mutation_case(kind: &str) {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-{kind}"));
         let contents = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11)
             + &line(ROOT, "r1", AT, 10)
@@ -580,7 +590,7 @@ fn e2_pipeline_inode_replacement_matches_full() {
 
 #[test]
 fn e2_pipeline_page_boundary_matches_single_page_bodies() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-pages");
         c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.agent(0, &line(ROOT, "agent-0", AT, 11));
@@ -617,7 +627,7 @@ fn e2_pipeline_page_boundary_matches_single_page_bodies() {
 
 #[test]
 fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-move-copy");
         let original = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         let scanner = E2ScanFixture::default();
@@ -655,7 +665,7 @@ fn e2_pipeline_birth_store_survives_save_reload_move_then_copy() {
 }
 
 fn twins(reverse: bool) {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new(if reverse {
             "e2-pipeline-twins-reverse"
         } else {
@@ -716,7 +726,7 @@ fn e2_pipeline_twins_copy_discovered_first() {
 
 #[test]
 fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-hold");
         let original = c.write_at(
             &format!("a/{ROOT}.jsonl"),
@@ -768,7 +778,7 @@ fn e2_pipeline_off_page_twin_hold_preserves_complete_history() {
 
 #[test]
 fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-delete");
         let original = c.write_at(
             &format!("a/{ROOT}.jsonl"),
@@ -798,7 +808,7 @@ fn e2_pipeline_deleted_original_leaves_one_count_after_restart() {
 
 #[test]
 fn e2_pipeline_one_branch_removes_copied_prefix_only() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch");
         c.root(ROOT, &line(ROOT, "r1", AT, 10));
         c.write_at(
@@ -871,7 +881,7 @@ fn e2_pipeline_one_branch_removes_copied_prefix_only() {
 
 #[test]
 fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-side-calls");
         c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.agent(0, &line(ROOT, "agent", AT, 20));
@@ -916,7 +926,7 @@ fn e2_pipeline_side_call_uses_trace_named_agent_and_counts_root_fallback() {
 
 #[test]
 fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-quiet-otel");
         let path = c.root(ROOT, &line(ROOT, "root", AT, 10));
         let scanner = E2ScanFixture::default();
@@ -970,7 +980,7 @@ fn e2_pipeline_quiet_otel_only_change_replaces_estimate_without_count_growth() {
 
 #[test]
 fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-side-other-page");
         let root = c.root(ROOT, &line(ROOT, "root", AT, 10));
         c.agent(0, &line(ROOT, "agent", AT, 20));
@@ -1033,7 +1043,7 @@ fn e2_pipeline_trace_named_agent_on_another_page_is_not_published_on_root() {
 
 #[test]
 fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-retry");
         let prefix = line(ROOT, "copied", "2026-08-02T06:58:00Z", 11);
         let a = line(ROOT, "conflict", AT, 2);
@@ -1048,7 +1058,7 @@ fn e2_pipeline_transport_restart_and_partial_ack_keep_exact_literal_fields() {
             .snapshots
             .iter()
             .find(|s| s.source_session_id == ROOT)
-            .unwrap();
+            .expect("resolver-conflict root must reach literal emission with its disclosure");
         assert_eq!(root.removed_request_count, Some(1));
         assert_eq!(root.resolver_conflict_count, Some(1));
         assert_eq!(root.telemetry_owned_complete, Some(false));
@@ -1167,7 +1177,7 @@ fn family_corpus(c: &mut Corpus, count: usize, model_padding: usize) {
     }
 }
 fn family_count_case(count: usize) {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-family-{count}"));
         family_corpus(&mut c, count, 0);
         let mut p = ready(
@@ -1214,7 +1224,7 @@ fn e2_pipeline_real_family_51() {
 
 #[test]
 fn e2_pipeline_real_family_crosses_two_mib_root_first() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-family-bytes");
         // Search input model length, never mutate an emitted body to pad it.
         // Each arm opens and parses actual root+three-agent JSONL, joins, emits and
@@ -1271,7 +1281,7 @@ fn e2_pipeline_real_family_crosses_two_mib_root_first() {
 
 #[test]
 fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-branch-no-new-reply");
         c.root(ROOT, &line(ROOT, "original", AT, 10));
         let scanner = E2ScanFixture::default();
@@ -1320,7 +1330,7 @@ fn e2_pipeline_branch_copy_without_new_reply_keeps_original_totals_only() {
 }
 
 fn restored_twins(reverse: bool, equal: bool) {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new(&format!("e2-pipeline-restored-{reverse}-{equal}"));
         let (a, b) = if reverse {
             ("z-original", "a-copy")
@@ -1385,7 +1395,7 @@ fn e2_pipeline_restored_twins_equal_birth_reverse() {
 
 #[test]
 fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-delayed-move");
         let old = c.root(ROOT, &line(ROOT, "r1", AT, 10));
         let scanner = E2ScanFixture::default();
@@ -1414,7 +1424,7 @@ fn e2_pipeline_deletion_reload_then_later_move_keeps_birth() {
 
 #[test]
 fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
-    e2::with_enabled(|| {
+    with_e2(|| {
         let mut c = Corpus::new("e2-pipeline-twin-byte-hold");
         c.write_at(
             &format!("a/{ROOT}.jsonl"),
@@ -1427,8 +1437,7 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             "2026-08-02T07:03:00Z",
         );
         let scanner = E2ScanFixture::default();
-        let mut old = ScanIndex::default();
-        old.activate_effective_upload_body_witness_revision(1);
+        let old = ScanIndex::default();
         let mut first = ready(&c, &scanner, old, 100, false);
         literal(&first);
         assert_eq!(total(&first), 2);
@@ -1440,7 +1449,13 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             .record_accepted_snapshot_fingerprints(&progress.accepted_fingerprints);
         let mut prior = c.reload(&mut first.index);
         let before = prior.current_snapshot_fingerprints();
-        prior.activate_effective_upload_body_witness_revision(2);
+        prior.activate_effective_upload_body_witness_revision(3);
+        for key in prior.files.keys().cloned().collect::<Vec<_>>() {
+            assert!(
+                prior.re_owe_effective_upload_body_witness_revision(&key, 2),
+                "existing production re-owe keeps this family due"
+            );
+        }
         let committed = prior.clone();
         let mut held =
             crate::snapshots::e2_pipeline_scan_fixture::with_history_byte_limit(1, || {
