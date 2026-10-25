@@ -455,7 +455,7 @@ pub(crate) struct HistoryPage {
     /// Its reservation takes them too, both or neither.
     staged_twins: Option<(String, Vec<(String, u64)>)>,
     /// E2: this page's indexed path-twin groups by member, built once on the
-    /// page's first owed candidate. Only members with two or more paths.
+    /// page's first parsed candidate. Only members with two or more paths.
     twin_index: Option<BTreeMap<String, Vec<(String, u64)>>>,
 }
 
@@ -682,8 +682,8 @@ impl HistoryEmission {
 }
 
 impl super::ScanIndex {
-    /// E2: stage the indexed path twins of owed candidate `index_key` for
-    /// this page's budget reservation (`HistoryPage::reserve`).
+    /// E2: stage the births of every indexed path twin before the candidate
+    /// folds; owed candidates also reserve their twins through HistoryPage.
     pub(super) fn stage_claude_history_twins(&mut self, index_key: &str, page: &mut HistoryPage) {
         if page.twin_index.is_none() {
             self.claude_money_birth_store.begin_page();

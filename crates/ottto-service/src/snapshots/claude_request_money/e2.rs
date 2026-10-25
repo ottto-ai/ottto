@@ -497,8 +497,8 @@ impl FileFold {
 
     /// Confirm or undo the held pre-birth skip. A partial copy is skipped only
     /// with a writer certificate from the file's OWN post-birth lines; an
-    /// all-pre-birth file only with a PROVEN earlier original (stored birth,
-    /// deterministic equal-birth order), so two restored twins can never
+    /// all-pre-birth file also needs known response writers and a PROVEN
+    /// earlier original (stored birth, deterministic equal-birth order), so twins never
     /// delete each other. Everything else counts and discloses.
     pub(in crate::snapshots) fn finish_native(&mut self, context: Option<&ReadContext<'_>>) {
         if self.money_birth.uncertain_root() {
@@ -511,6 +511,7 @@ impl FileFold {
         // two live all-pre-birth paths exactly one is skipped, whatever role
         // (an equal-birth owner can lose to its twin).
         let needs_original = self.first_own.is_none()
+            || matches!(self.role, Role::Twin)
             || context.is_some_and(|context| {
                 session_member(context.path).is_some_and(|member| context.has_twins(&member))
             });

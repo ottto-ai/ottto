@@ -56,10 +56,12 @@ fn entry() -> ScanIndexEntry {
 }
 fn parse(path: &Path, birth: Option<i128>, index: &ScanIndex, lines: &[Value]) -> SnapshotItem {
     let mut a = SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
-    let opened = fs::File::open(path).unwrap().metadata().unwrap();
-    a.claude_file_birth = ClaudeFileBirth::observe(path, Some(&opened));
+    let opened = fs::File::open(path).and_then(|file| file.metadata()).ok();
+    a.claude_file_birth = ClaudeFileBirth::observe(path, opened.as_ref());
     if let Some(birth) = birth {
         a.claude_file_birth.set_birth_for_test(birth);
+    } else {
+        a.claude_file_birth.forget_birth_for_test();
     }
     for value in lines {
         apply_claude_code_line(value, &mut a);
@@ -362,6 +364,11 @@ fn e2_path_twins_attach_the_row_once() {
     let copy = root_file("twin-b");
     let mut index = ScanIndex::default();
     let own = parse_and_remember(&first, t0(), &mut index, &[line("r", &at(1), 10)]);
+    index.files.insert(local_index_key(&copy), entry());
+    stage_twins(
+        &mut index,
+        &[(&first, t0()), (&copy, t0() + 60_000_000_000)],
+    );
     let twin = parse(
         &copy,
         Some(t0() + 60_000_000_000),
@@ -880,10 +887,7 @@ fn e2_first_ever_restored_root_twins_stage_before_either_fold() {
         index.files.insert(local_index_key(&early), entry());
         index.files.insert(local_index_key(&later), entry());
         assert!(index.claude_money_birth_store.is_empty());
-        let mut paths = vec![
-            (&early as &Path, t0()),
-            (&later as &Path, t0() + 5_000_000_000),
-        ];
+        let mut paths: Vec<(&Path, i128)> = vec![(&early, t0()), (&later, t0() + 5_000_000_000)];
         if reverse {
             paths.reverse();
         }

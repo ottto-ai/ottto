@@ -47,6 +47,7 @@ impl BirthIdentity {
     }
     fn covers(self, current: ClaudeOpenedBirth) -> bool {
         self.inode != 0
+            && u32::try_from(current.size).is_ok()
             && self.inode == current.inode
             && u64::from(self.device) == current.device
             && current.size >= u64::from(self.size)
@@ -607,6 +608,23 @@ mod tests {
         println!("F1C_COUNT_SIZE birth_identity_bytes={} transient_probe_bytes={} opened_metadata_bytes={} claude_file_birth_bytes={}",
             std::mem::size_of::<BirthIdentity>(), std::mem::size_of::<(LocationKey, u8)>(),
             std::mem::size_of::<ClaudeOpenedBirth>(), std::mem::size_of::<crate::snapshots::claude_context_file_birth::ClaudeFileBirth>());
+    }
+
+    #[test]
+    fn legacy_birth_codecs_keep_minima_without_inventing_generation_witnesses() {
+        let mut store = BirthStore::default();
+        store.record_observation("s", "A", 100);
+        let encoded: String = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+        let bytes = URL_SAFE_NO_PAD.decode(encoded).unwrap();
+        for (version, len) in [(b"CMB1", bytes.len() - 8), (b"CMB2", bytes.len())] {
+            let mut legacy = bytes[..len].to_vec();
+            legacy[..4].copy_from_slice(version);
+            let restored: BirthStore =
+                serde_json::from_value(serde_json::json!(URL_SAFE_NO_PAD.encode(legacy))).unwrap();
+            assert_eq!(restored.observed_birth("s", "A"), Some(100));
+            assert_eq!(restored.effective_cutoff("s", "A"), Some(100));
+            assert!(!restored.witnessed(location_key("A")));
+        }
     }
 
     #[test]

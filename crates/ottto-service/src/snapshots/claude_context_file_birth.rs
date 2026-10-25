@@ -290,6 +290,8 @@ impl ClaudeFileBirth {
         if first_own_sequence.is_some() {
             self.writer.certified()
         } else {
+            // Restored all-pre-birth files have no own run. Require a known
+            // version on EVERY response, never a header or inherited version.
             self.all_response_writers.certified()
         }
     }
@@ -1206,6 +1208,7 @@ impl ClaudeFileBirth {
     pub(crate) fn forget_birth_for_test(&mut self) {
         if self.root_with_birth() {
             self.scope = ClaudeBirthScope::RootUnknownBirth;
+            self.opened.birth = 0;
         }
     }
 
