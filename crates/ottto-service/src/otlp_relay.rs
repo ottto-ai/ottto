@@ -697,14 +697,14 @@ fn local_otlp_export_response(
 ) -> LocalExportResponse {
     match capture_local_evidence(source, request, support_dir) {
         Ok(()) => otlp_export_success(request),
-        Err(error) if crate::claude_local_otel::is_undecodable_body(&error) => {
+        Err(LocalCaptureFailure::Undecodable) => {
             relay_log!("local Claude OTLP reduction could not decode a request body");
             json_export_response(
                 400,
                 json!({"error":"bad_request","message":"OTLP body could not be decoded"}),
             )
         }
-        Err(_error) => {
+        Err(LocalCaptureFailure::NotStored) => {
             relay_log!("local Claude OTLP evidence could not be stored");
             json_export_response(
                 500,
@@ -714,31 +714,64 @@ fn local_otlp_export_response(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCaptureFailure {
+    /// The body (or its content encoding) could not be decoded.
+    Undecodable,
+    /// The body decoded but the reduced evidence could not be stored.
+    NotStored,
+}
+
 fn capture_local_evidence(
     source: SnapshotSource,
     request: &HttpRequest,
     support_dir: &Path,
-) -> Result<()> {
-    if source != SnapshotSource::ClaudeCode {
+) -> std::result::Result<(), LocalCaptureFailure> {
+    if source != SnapshotSource::ClaudeCode
+        || !matches!(request.path.as_str(), "/v1/logs" | "/v1/traces")
+    {
         return Ok(());
     }
+    let body = decoded_request_body(request).ok_or(LocalCaptureFailure::Undecodable)?;
     let content_type = request_content_type(request);
-    match request.path.as_str() {
+    let captured = if request.path == "/v1/logs" {
         // Claude Code transcripts do not persist the applied effort tier, so
         // the official per-request log carries it.
-        "/v1/logs" => crate::claude_local_otel::capture_claude_api_request_logs(
+        crate::claude_local_otel::capture_claude_api_request_logs(support_dir, &body, content_type)
+    } else {
+        crate::claude_local_otel::capture_claude_llm_request_traces(
             support_dir,
-            &request.body,
+            &body,
             content_type,
         )
-        .map(drop),
-        "/v1/traces" => crate::claude_local_otel::capture_claude_llm_request_traces(
-            support_dir,
-            &request.body,
-            content_type,
-        )
-        .map(drop),
-        _ => Ok(()),
+    };
+    match captured {
+        Ok(_) => Ok(()),
+        Err(error) if crate::claude_local_otel::is_undecodable_body(&error) => {
+            Err(LocalCaptureFailure::Undecodable)
+        }
+        Err(_) => Err(LocalCaptureFailure::NotStored),
+    }
+}
+
+/// The request body with its OTLP content encoding removed. OTLP/HTTP allows
+/// gzip; the inflated size keeps the same cap as a raw body.
+fn decoded_request_body(request: &HttpRequest) -> Option<std::borrow::Cow<'_, [u8]>> {
+    let encoding = request
+        .headers
+        .get("content-encoding")
+        .map(|value| value.trim().to_ascii_lowercase());
+    match encoding.as_deref() {
+        None | Some("") | Some("identity") => Some(std::borrow::Cow::Borrowed(&request.body)),
+        Some("gzip") => {
+            let mut inflated = Vec::new();
+            flate2::read::GzDecoder::new(request.body.as_slice())
+                .take(MAX_OTLP_BODY_BYTES as u64 + 1)
+                .read_to_end(&mut inflated)
+                .ok()?;
+            (inflated.len() <= MAX_OTLP_BODY_BYTES).then_some(std::borrow::Cow::Owned(inflated))
+        }
+        Some(_) => None,
     }
 }
 
@@ -2437,5 +2470,39 @@ mod tests {
         let body: serde_json::Value =
             serde_json::from_slice(&response.body).expect("JSON error body");
         assert_eq!(body["error"], "local_capture_failed");
+    }
+
+    #[test]
+    fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
+        use std::io::Write as _;
+        let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder
+            .write_all(CLAUDE_API_REQUEST_LOG)
+            .expect("compress fixture");
+        let mut request = otlp_post(
+            "/v1/logs",
+            "application/json",
+            &encoder.finish().expect("finish gzip"),
+        );
+        request
+            .headers
+            .insert("content-encoding".to_string(), "gzip".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_export_success(&response, "application/json", b"{}");
+        let evidence = crate::claude_local_otel::load_claude_effort_evidence(
+            &support_dir,
+            ["retired-forward-session".to_string()],
+        )
+        .expect("gzip evidence loads");
+        assert_eq!(evidence["retired-forward-session"].len(), 1);
+
+        request
+            .headers
+            .insert("content-encoding".to_string(), "br".to_string());
+        let response =
+            local_otlp_export_response(SnapshotSource::ClaudeCode, &request, &support_dir);
+        assert_eq!(response.status, 400);
     }
 }

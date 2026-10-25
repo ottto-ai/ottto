@@ -20,12 +20,15 @@ telemetry with no consumer.
   - accepted (Claude evidence stored, or a signal/source with no local
     consumer): `200` with an empty OTLP export response in the request's
     encoding (`{}` JSON, or an empty `application/x-protobuf` body);
-  - Claude body the reducer cannot decode: `400` (non-retryable);
+  - Claude body the reducer cannot decode, or an unsupported content
+    encoding: `400` (non-retryable). Gzip bodies are inflated locally under
+    the same 25 MiB cap; before, a gzip body failed local reduction silently;
   - decoded Claude evidence that could not be stored (I/O, evidence cap):
     `500` (non-retryable). Before, both failures were hidden behind the
     server's `200`.
 - `claude_local_otel` marks decode failures (`is_undecodable_body`) so the
-  relay can tell them apart from storage failures. Evidence format, location,
+  relay can tell them apart from storage failures; the relay maps both into a
+  typed `LocalCaptureFailure`. Evidence format, location,
   caps and readers are unchanged.
 - `net_resilience`: the OTLP agent rebuild flag is gone with the agent. The
   sync-stall watchdog keeps its remaining truthful evidence: agent-status
@@ -40,12 +43,13 @@ telemetry with no consumer.
 - Claude Code exporter configuration, the relay listener, `/healthz`,
   `/control`, `/whoami`, `/local-health`.
 - Relay-token issuance for snapshot uploads and other upload paths.
-- Setup verification markers in `control.rs` (separate flow, not raw
-  forwarding).
+- Setup verification markers in `control.rs` (synthetic markers, not raw
+  agent forwarding). They still post to the retired route and report success
+  on its disabled answer; that is a separate follow-up.
 
 ## Validation
 
 Focused synthetic tests in `otlp_relay.rs`: relayed Claude log and trace
-evidence equals direct capture; exports without a local consumer store nothing
+evidence equals direct capture; gzip exports are inflated and captured; exports without a local consumer store nothing
 and get an empty success; malformed bodies get `400`; storage failure gets
 `500`. Package Clippy compiled the changed files cleanly; tests run in CI.
