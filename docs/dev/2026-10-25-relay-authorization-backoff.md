@@ -8,11 +8,12 @@ starts an equal-jitter exponential wait: initially 2.5–5 minutes, eventually
 3–6 hours. One probe runs per rejected binding at a time. Successful exchanges
 clear rejection state; no tokens are cached beyond their existing lifetime.
 
-The local-health path keeps its existing terminal setup-run refresh hold. A
-suppressed relay request does not refresh setup credentials. A real rejected
-probe may refresh once and, on success, retry once without resetting the device
-rejection streak. Local scans, quota/account checks and their scheduling keep
-running. The existing reconnect-required health classification remains typed.
+The local-health path keeps its existing terminal setup-run refresh hold. Each
+rejected probe grants one setup refresh opportunity, including when another
+caller observed the rejection first. A successful refresh admits one retry
+without resetting the device rejection streak or granting another refresh.
+Concurrent initial rejections count as one wave. Local scans, quota/account
+checks and their scheduling keep running. The existing reconnect-required health classification remains typed.
 
 Unit-test builds reject every non-loopback HTTP destination before DNS or TLS.
 This includes default production URLs used by background threads after a test

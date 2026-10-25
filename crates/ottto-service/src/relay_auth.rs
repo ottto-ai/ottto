@@ -107,7 +107,7 @@ impl Gate {
         key: Key,
         now: Instant,
         probe_id: u64,
-    ) -> Result<(), RelayTokenAuthorizationRejected> {
+    ) -> Result<(bool, bool), RelayTokenAuthorizationRejected> {
         if let Some(held) = self.rejected.get_mut(&key) {
             if held.probing.is_some() || (!held.retry_after_refresh && now < held.until) {
                 return Err(RelayTokenAuthorizationRejected {
@@ -115,17 +115,32 @@ impl Gate {
                     suppressed: true,
                 });
             }
+            let refresh_allowed = !held.retry_after_refresh;
             held.probing = Some(probe_id);
             held.retry_after_refresh = false;
             held.refresh_available = false;
             // A probe's transport/429/503 failure keeps the auth cadence without
             // changing the caller's existing transient-error handling.
             held.until = now + wait(held.failures, random());
+            return Ok((false, refresh_allowed));
         }
-        Ok(())
+        Ok((true, true))
     }
 
-    fn reject(&mut self, key: Key, status: u16, now: Instant, random: u64) {
+    fn reject(
+        &mut self,
+        key: Key,
+        status: u16,
+        now: Instant,
+        random: u64,
+        initial: bool,
+        refresh_allowed: bool,
+    ) {
+        // Requests already in flight before the first rejection belong to one
+        // initial wave. Late results cannot advance or reset its probe ladder.
+        if initial && self.rejected.contains_key(&key) {
+            return;
+        }
         let failures = self
             .rejected
             .get(&key)
@@ -147,7 +162,7 @@ impl Gate {
                 failures,
                 until: now + wait(failures, random),
                 probing: None,
-                refresh_available: true,
+                refresh_available: refresh_allowed,
                 retry_after_refresh: false,
             },
         );
@@ -159,6 +174,8 @@ impl Gate {
 pub(crate) struct Probe {
     key: Key,
     id: u64,
+    initial: bool,
+    refresh_allowed: bool,
     finished: bool,
 }
 impl Probe {
@@ -170,13 +187,15 @@ impl Probe {
         static NEXT_PROBE: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
         let key = binding_key(api_base, device, secret);
-        gate()
+        let (initial, refresh_allowed) = gate()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .admit(key, Instant::now(), id)?;
         Ok(Self {
             key,
             id,
+            initial,
+            refresh_allowed,
             finished: false,
         })
     }
@@ -184,7 +203,14 @@ impl Probe {
         gate()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .reject(self.key, status, Instant::now(), random());
+            .reject(
+                self.key,
+                status,
+                Instant::now(),
+                random(),
+                self.initial,
+                self.refresh_allowed,
+            );
         self.finished = true;
     }
     pub(crate) fn success(&mut self) {
@@ -253,7 +279,7 @@ mod tests {
         let key = [1; 32];
         let now = Instant::now();
         gate.admit(key, now, 1).unwrap();
-        gate.reject(key, 401, now, 0);
+        gate.reject(key, 401, now, 0, true, true);
         let until = gate.rejected[&key].until;
         for _ in 0..100 {
             assert!(gate.admit(key, now, 1).unwrap_err().suppressed);
@@ -261,7 +287,7 @@ mod tests {
         assert!(gate.admit(key, until, 2).is_ok());
         assert!(gate.admit(key, until, 2).unwrap_err().suppressed);
         assert!(!gate.rejected[&key].refresh_available);
-        gate.reject(key, 401, until, 0);
+        gate.reject(key, 401, until, 0, false, true);
         assert_eq!(gate.rejected[&key].failures, 2);
         assert!(gate.rejected[&key].refresh_available);
     }
@@ -271,7 +297,7 @@ mod tests {
         let original = key("http://127.0.0.1", "device", 1, "secret", Some("run"));
         let mut gate = Gate::default();
         let now = Instant::now();
-        gate.reject(original, 401, now, 0);
+        gate.reject(original, 401, now, 0, true, true);
         for changed in [
             key("http://127.0.0.1", "new-device", 1, "secret", Some("run")),
             key("http://127.0.0.1", "device", 2, "secret", Some("run")),
@@ -284,17 +310,43 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_initial_rejections_count_as_one_wave() {
+        let mut gate = Gate::default();
+        let key = [42; 32];
+        let now = Instant::now();
+        for id in 1..=16 {
+            assert_eq!(gate.admit(key, now, id).unwrap(), (true, true));
+        }
+        for _ in 0..16 {
+            gate.reject(key, 401, now, 0, true, true);
+        }
+        assert_eq!(gate.rejected[&key].failures, 1);
+        assert_eq!(gate.rejected[&key].until - now, BASE / 2);
+        let until = gate.rejected[&key].until;
+        assert_eq!(gate.admit(key, until, 17).unwrap(), (false, true));
+        gate.reject(key, 401, until, 0, false, true);
+        assert_eq!(gate.rejected[&key].failures, 2);
+        // An even later result from the initial wave cannot change this round.
+        gate.reject(key, 401, until, 0, true, true);
+        assert_eq!(gate.rejected[&key].failures, 2);
+    }
+
+    #[test]
     fn setup_refresh_retry_preserves_the_rejection_streak() {
         let key = [93; 32];
         let now = Instant::now();
-        gate().lock().unwrap().reject(key, 401, now, 0);
+        gate().lock().unwrap().reject(key, 401, now, 0, true, true);
         assert!(take_setup_refresh(key));
         assert!(!take_setup_refresh(key));
         retry_after_setup_refresh(key);
         gate().lock().unwrap().admit(key, now, 1).unwrap();
         assert!(gate().lock().unwrap().admit(key, now, 2).is_err());
-        gate().lock().unwrap().reject(key, 401, now, 0);
+        gate()
+            .lock()
+            .unwrap()
+            .reject(key, 401, now, 0, false, false);
         let state = gate().lock().unwrap().rejected[&key];
+        assert!(!state.refresh_available);
         assert_eq!(state.failures, 2);
         assert_eq!(state.until - now, BASE);
         assert!(gate().lock().unwrap().admit(key, now, 3).is_err());
@@ -387,6 +439,7 @@ mod http_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn relay_401_is_shared_across_clients_sources_bounded_otlp_and_control() {
         let backend = Backend::start(vec![401, 401]);
         let client =
@@ -489,7 +542,8 @@ mod http_tests {
         std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref());
         let backend = Backend::start(vec![401, 200]);
         let client = SnapshotApiClient::new(&backend.base);
-        let device = device();
+        let mut device = device();
+        device.device_id = "relay-generation-only-fixture".into();
         let store = FileDeviceStore::default();
         for credential_generation in [1, 2] {
             store
@@ -509,6 +563,7 @@ mod http_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn changed_secret_retries_immediately_and_success_clears_the_rejection() {
         let backend = Backend::start(vec![401, 200, 200, 200]);
         let client = SnapshotApiClient::new(&backend.base);
@@ -536,6 +591,7 @@ mod http_tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn relay_429_and_503_preserve_transient_diagnostics_and_do_not_latch() {
         let backend = Backend::start(vec![429, 503, 200]);
         let client = SnapshotApiClient::new(&backend.base);
