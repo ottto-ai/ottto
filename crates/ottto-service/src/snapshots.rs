@@ -31524,18 +31524,22 @@ fn claude_native_delay_for_test(path: &Path) {
 ///
 /// It prepares exactly the files the product's own capture eligibility
 /// admits now: every file before the scope's first page, then only what the
-/// plan the last page installed allows (complete or fallback). A page that
-/// left its scope without a plan fails the probe instead of being modelled.
+/// plan the last page installed allows (complete or fallback). A scope paged
+/// without a plan (a page refused before planning, or a closed plan) fails
+/// the probe instead of being modelled.
 #[cfg(test)]
 pub(crate) fn prepare_money_finalizers_for_test(
     support: &Path,
     index: &ScanIndex,
 ) -> impl FnOnce() {
-    assert_ne!(
-        claude_request_money::capture::plan_allows_capture_for_test(support),
-        Some(false),
-        "the last page installed no capture plan (complete or fallback): the next parse captures nothing optional"
-    );
+    match claude_request_money::capture::plan_allows_capture_for_test(support) {
+        // Never paged: every file is eligible.
+        None => {}
+        Some(true) => {}
+        Some(false) => panic!(
+            "the scope has paged without a capture plan (complete or fallback): the next parse captures nothing optional"
+        ),
+    }
     let prepared = index
         .files
         .iter()

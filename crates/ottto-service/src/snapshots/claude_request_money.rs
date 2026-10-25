@@ -1417,6 +1417,10 @@ fn shadow_page_body(
     started: Instant,
 ) -> ClaudeRequestMoneyShadowCounts {
     let scope_key = shadow_scope(support_dir);
+    // From this page on the scope is paged: a refusal before the plan
+    // leaves the scope failing closed, never back to its first-page
+    // all-eligible capture (MONEY decision).
+    capture::mark_paged(&scope_key);
     // `clock.deadline` is `started` plus the money budget capture left, so
     // these are the same offsets in money time: optional work stops at
     // 150 ms, closing at 240 ms, 10 ms for the handoff.
@@ -1907,43 +1911,40 @@ fn shadow_page_body(
     // This only selects optional captures; it grants no publication or
     // coverage evidence. Reached turns yield to deferred turns on a Full
     // reread, without changing native file order or retaining old captures.
-    if order.len() > capture::NEXT_PAGE_FAMILIES {
-        // `order` is sorted by this page's starting turns and only consumed
-        // turns moved (to `now`), so its first 64 unconsumed entries are the
-        // oldest 64 after this page: the fallback's O(64) selection.
-        let fallback = order
-            .iter()
-            .enumerate()
-            .filter(|(position, _)| consumed.binary_search(position).is_err())
-            .take(capture::NEXT_PAGE_FAMILIES)
-            .map(|(_, (_, key, turn))| (key.as_str(), *turn, true))
-            .chain(consumed.iter().map(|&position| {
-                let (_, key, turn) = &order[position];
-                (key.as_str(), *turn, false)
-            }));
-        // The plan may use the closing budget up to the save's slice; its
-        // walk is bounded by its funds (the capture ceiling).
-        let installed = capture::plan_next_page(
-            &scope_key,
-            order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
-            fallback,
-            end.close_deadline
-                .checked_sub(Duration::from_millis(10))
-                .expect("closing reserve"),
-        );
-        if let Some(failure) = installed.failure() {
-            counts.plan_install_failed = 1;
-            *match failure {
-                capture::PlanFailure::Deadline => &mut counts.plan_install_failed_deadline,
-                capture::PlanFailure::Funds => &mut counts.plan_install_failed_funds,
-                capture::PlanFailure::Lock => &mut counts.plan_install_failed_lock,
-            } = 1;
-        }
-        counts.fallback_plan_installed =
-            u64::from(matches!(installed, capture::PlanInstall::Fallback(_)));
-    } else {
-        capture::plan_all_families(&scope_key);
+    // A page of at most 64 families makes them all eligible.
+    // `order` is sorted by this page's starting turns and only consumed
+    // turns moved (to `now`), so its first 64 unconsumed entries are the
+    // oldest 64 after this page: the fallback's O(64) selection.
+    let fallback = order
+        .iter()
+        .enumerate()
+        .filter(|(position, _)| consumed.binary_search(position).is_err())
+        .take(capture::NEXT_PAGE_FAMILIES)
+        .map(|(_, (_, key, turn))| (key.as_str(), *turn, true))
+        .chain(consumed.iter().map(|&position| {
+            let (_, key, turn) = &order[position];
+            (key.as_str(), *turn, false)
+        }));
+    // The plan may use the closing budget up to the save's slice; its
+    // walk is bounded by its funds (the capture ceiling).
+    let installed = capture::plan_next_page(
+        &scope_key,
+        order.iter().map(|(_, key, turn)| (key.as_str(), *turn)),
+        fallback,
+        end.close_deadline
+            .checked_sub(Duration::from_millis(10))
+            .expect("closing reserve"),
+    );
+    if let Some(failure) = installed.failure() {
+        counts.plan_install_failed = 1;
+        *match failure {
+            capture::PlanFailure::Deadline => &mut counts.plan_install_failed_deadline,
+            capture::PlanFailure::Funds => &mut counts.plan_install_failed_funds,
+            capture::PlanFailure::Lock => &mut counts.plan_install_failed_lock,
+        } = 1;
     }
+    counts.fallback_plan_installed =
+        u64::from(matches!(installed, capture::PlanInstall::Fallback(_)));
     let page_complete = incomplete == 0 && telemetry_certified(ledger) && holder_view.complete();
     counts.coverage_complete = u64::from(page_complete);
     let page = CoverageRow {

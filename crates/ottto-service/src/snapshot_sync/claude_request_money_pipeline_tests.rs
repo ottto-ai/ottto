@@ -1214,6 +1214,9 @@ fn money_shadow_seal_needs_its_false_row() {
 fn money_shadow_late_page_publishes_only_refused_coverage() {
     let response = census_pipeline_window("2026-08-02T07:00:00Z");
     let (fixture, index, scan) = money_armed_scan("money-shadow-late-hand-off");
+    // Never paged: every file is eligible.
+    assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), None);
+    assert!(index.files.keys().all(|key| money::capture::capture_eligible_for_test(std::path::Path::new(key))));
     money::set_page_fault_for_test(money::PageFault::LateAtHandOff);
     let counts = money::shadow_page_at(
         &fixture.support,
@@ -1242,6 +1245,16 @@ fn money_shadow_late_page_publishes_only_refused_coverage() {
     });
     assert_eq!(memos, Some(0));
     assert_eq!(money::reserved_for_test(), 0);
+    // MONEY round 2: the refused first page left its scope paged without a
+    // plan. The next parse captures nothing optional, and the finalizer
+    // probe refuses to model it instead of treating it as never paged.
+    assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(false));
+    assert!(!index.files.is_empty());
+    assert!(index.files.keys().all(|key| !money::capture::capture_eligible_for_test(std::path::Path::new(key))));
+    assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+    })).is_err(), "the probe asserts on a paged scope without a plan");
+    money::disable_shadow_for_test(&fixture.support);
 }
 
 /// Finding 8, whole cycle: from one saved state (a populated ledger saved
@@ -2053,6 +2066,102 @@ fn money_p1b_failed_plan_installs_fallback_and_captures_prior_incomplete_familie
             a.len(), b.len(), failed.plan_install_failed, failed.fallback_plan_installed, captured_by_page[2].len(),
             captured_by_page[2].intersection(&incomplete_after_1).count(), c.len(), captured_by_page[2].intersection(&b).count());
         money::set_page_fault_for_test(money::PageFault::None);
+        money::disable_shadow_for_test(&fixture.support);
+    }
+}
+
+/// MONEY round 2: plan state is scope-wide. Two native pages A and B of one
+/// scope list different families. After A -> B, the next Full parse of A
+/// captures exactly A's planned families and builds them, never what A built
+/// first, whether acknowledgements arrive ("ack"), arrive only after the
+/// three pages ("lag": the writer is parked) or never ("lost").
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_scope_wide_plan_keeps_page_a_through_page_b() {
+    for ack_mode in ["ack", "lag", "lost"] {
+        let family_count = 2 * money::capture::NEXT_PAGE_FAMILIES + 8;
+        let fixture = PipelineFixture::new("money-p1b-plan-a-b-a");
+        for session in PIPELINE_SESSIONS {
+            std::fs::remove_file(fixture.root.join(format!("{session}.jsonl"))).unwrap();
+        }
+        let roots = [fixture.root.clone(), fixture.base.join("projects-b")];
+        std::fs::create_dir_all(&roots[1]).unwrap();
+        let mut families = [BTreeSet::new(), BTreeSet::new()];
+        for (page, root) in roots.iter().enumerate() {
+            for at in 0..family_count {
+                let session = format!("{page:04x}{at:04x}-1234-4567-890a-123456789abc");
+                std::fs::write(root.join(format!("{session}.jsonl")),
+                    pipeline_transcript_line(&session, &format!("req-{page}-{at}"), 7)).unwrap();
+                families[page].insert(crate::snapshots::claude_request_census::family_key(&session));
+            }
+        }
+        let family_of_file = |file: &str| crate::snapshots::claude_request_census::family_key(
+            std::path::Path::new(file).file_stem().unwrap().to_str().unwrap());
+        let scan = |root: &std::path::Path, index: &mut ScanIndex| crate::snapshots::scan_source_roots_with_test_limit(
+            SnapshotSource::ClaudeCode, std::slice::from_ref(&root.to_path_buf()), index,
+            "2026-08-02T08:00:00Z", 183, 4096, true).unwrap();
+        money::enable_shadow_for_test(&fixture.support);
+        money::store::prime_credit_for_test(&fixture.support, 0);
+        money::set_page_fault_for_test(if ack_mode == "lost" { money::PageFault::LostAck } else { money::PageFault::None });
+        let paused = (ack_mode == "lag").then(money::store::pause_for_test);
+        let now = census_pipeline_window("2026-08-02T08:00:00Z");
+        let mut captured = Vec::new();
+        let mut consumed = Vec::new();
+        let mut planned = Vec::new();
+        for (step, page) in [0_usize, 1, 0].into_iter().enumerate() {
+            let mut index = ScanIndex::default(); // every page is genuinely Full
+            let full = scan(&roots[page], &mut index);
+            assert_eq!(full.scanned_file_count, family_count);
+            let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &index);
+            money::capture::purge_scope_for_test(&fixture.support);
+            money::capture::begin_page(&fixture.support);
+            replay();
+            captured.push(money::capture::keys_for_test(&fixture.support).iter()
+                .map(|(file, _)| family_of_file(file)).collect::<BTreeSet<_>>());
+            let counts = money::shadow_page_ready_for_test(&fixture.support, &full.snapshots, &index,
+                &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+                &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), full.census_complete,
+                now + step as u64);
+            assert_eq!(counts.refused_deadline + counts.refused_budget, 0, "{ack_mode} step {step}: {counts:?}");
+            assert_eq!(counts.plan_install_failed, 0, "{ack_mode} step {step}: {counts:?}");
+            assert_eq!(counts.families, family_count as u64);
+            if ack_mode != "lag" {
+                money::store::flush();
+            }
+            // A family whose capture this page consumed carries the page's
+            // turn in the plan.
+            let built = families[page].iter()
+                .filter(|key| money::capture::plan_turn_for_test(&fixture.support, key) == Some(now + step as u64))
+                .cloned().collect::<BTreeSet<_>>();
+            assert_eq!(counts.families - counts.families_unbuilt, built.len() as u64, "{ack_mode} step {step}: {counts:?}");
+            consumed.push(built);
+            planned.push(money::capture::planned_families_for_test(&fixture.support).expect("a page installs a plan")
+                .intersection(&families[page]).cloned().collect::<BTreeSet<_>>());
+        }
+        drop(paused);
+        money::store::flush();
+        money::set_page_fault_for_test(money::PageFault::None);
+        let first_a = &consumed[0];
+        assert_eq!(captured[0], families[0], "{ack_mode}: the first page captures every file");
+        assert_eq!(first_a.len(), money::capture::NEXT_PAGE_FAMILIES, "{ack_mode}");
+        assert_eq!(planned[0].len(), money::capture::NEXT_PAGE_FAMILIES, "{ack_mode}");
+        assert!(planned[0].is_disjoint(first_a), "{ack_mode}");
+        assert_eq!(captured[1], families[1], "{ack_mode}: another native page's families stay eligible");
+        assert_eq!(consumed[1].len(), money::capture::NEXT_PAGE_FAMILIES, "{ack_mode}");
+        assert_eq!(planned[1].len(), money::capture::NEXT_PAGE_FAMILIES, "{ack_mode}");
+        // A -> B -> A: B's plan kept A's.
+        assert!(captured[2].is_disjoint(first_a),
+            "{ack_mode}: A's first builds were re-targeted: {:?}", captured[2].intersection(first_a).count());
+        assert_eq!(captured[2], planned[0], "{ack_mode}: the second parse of A captures exactly A's plan");
+        assert_eq!(consumed[2], planned[0], "{ack_mode}: and builds it, in A's turn order");
+        let never_built = families[0].iter().filter(|key| !first_a.contains(*key) && !consumed[2].contains(*key))
+            .cloned().collect::<BTreeSet<_>>();
+        assert_eq!(never_built.len(), family_count - 2 * money::capture::NEXT_PAGE_FAMILIES);
+        assert!(never_built.is_subset(&planned[2]), "{ack_mode}: A's next plan starts with its unbuilt families");
+        assert_eq!(money::reserved_for_test(), 0);
+        println!("MONEY_P1B_PLAN_A_B_A ack_mode={ack_mode} families_per_page={family_count} a1_built={} b_captured={} a2_captured={} a2_planned_captured={} a2_rebuilt_first={} a2_built={}",
+            first_a.len(), captured[1].len(), captured[2].len(), captured[2].intersection(&planned[0]).count(),
+            captured[2].intersection(first_a).count(), consumed[2].len());
         money::disable_shadow_for_test(&fixture.support);
     }
 }
