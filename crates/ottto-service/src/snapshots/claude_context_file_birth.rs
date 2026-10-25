@@ -145,6 +145,10 @@ impl ClaudeFileBirth {
         Some(at? < birth.checked_sub(slack)?)
     }
 
+    pub(in crate::snapshots) fn matches_path(&self, path: &Path) -> bool {
+        self.path_key_hash == stable_hash(&local_index_key(path))
+    }
+
     pub(in crate::snapshots) fn birth_nanos(&self) -> Option<i128> {
         match self.scope {
             ClaudeBirthScope::Root(birth) => Some(birth),

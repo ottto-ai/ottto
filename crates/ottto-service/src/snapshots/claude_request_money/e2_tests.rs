@@ -56,7 +56,7 @@ fn published(
     index: &ScanIndex,
 ) -> Vec<SnapshotItem> {
     attach_page(&mut items, api, index);
-    with_enabled(|| finish_page(&mut items));
+    with_enabled(|| finish_page(&mut items, index));
     items
 }
 fn birth() -> i128 {
@@ -281,7 +281,7 @@ fn e2_dark_preserves_every_upload_byte_and_fingerprint() {
     let fingerprint = got.snapshot_fingerprint.clone();
     let mut items = vec![got];
     attach_page(&mut items, &rows("r", 10), &index);
-    finish_page(&mut items);
+    finish_page(&mut items, &index);
     assert_eq!(
         crate::canonical_json::canonicalize(&before).unwrap(),
         crate::canonical_json::canonicalize(&serde_json::to_value(&items[0]).unwrap()).unwrap()

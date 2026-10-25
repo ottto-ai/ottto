@@ -472,7 +472,7 @@ pub(crate) fn attach_page(
 
 /// DARK comparison happens after today's authoritative body fold. Only the
 /// explicit gate permits mutation; one summed entity is emitted for path twins.
-pub(crate) fn finish_page(items: &mut Vec<SnapshotItem>) {
+pub(crate) fn finish_page(items: &mut Vec<SnapshotItem>, index: &ScanIndex) {
     let mut by_session = BTreeMap::<String, (ClaudeEntityBody, ClaudeMoneyTokens, u64)>::new();
     for item in items.iter() {
         let Some(fold) = item.claude_money.as_deref() else {
@@ -500,6 +500,34 @@ pub(crate) fn finish_page(items: &mut Vec<SnapshotItem>) {
             fold.unmatched_1h,
             0,
         );
+    }
+    if enabled() {
+        let keys = index.files.keys().chain(
+            index
+                .traversal
+                .as_ref()
+                .into_iter()
+                .flat_map(|t| t.observed_index_keys.iter()),
+        );
+        for key in keys {
+            let Some((_, member)) = claude_index_path_family_member(Path::new(key)) else {
+                continue;
+            };
+            let Some((entity, _, _)) = by_session.get_mut(&member) else {
+                continue;
+            };
+            if Path::new(key).is_file()
+                && !items.iter().any(|item| {
+                    item.source_session_id == member
+                        && item
+                            .claude_money
+                            .as_ref()
+                            .is_some_and(|fold| fold.money_birth.matches_path(Path::new(key)))
+                })
+            {
+                entity.held = true; // never publish one path over complete twin history
+            }
+        }
     }
     for (entity, old, requests) in by_session.values() {
         let (new, new_requests) = entity.totals();
@@ -588,3 +616,33 @@ crate::heap_layout_bound::fields!(ClaudeMoneyTokens; input, output, cache_read, 
 #[cfg(test)]
 #[path = "e2_tests.rs"]
 mod tests;
+
+/// A selected path twin pulls its complete family into this existing native
+/// page's forced-family path. No parser/scope/identity bump is involved.
+pub(in crate::snapshots) fn selected_twin_roots<'a>(
+    paths: impl Iterator<Item = &'a Path>,
+    index: &ScanIndex,
+) -> BTreeSet<String> {
+    let selected = paths
+        .filter_map(claude_index_path_family_member)
+        .map(|(root, member)| (member, root))
+        .collect::<BTreeMap<_, _>>();
+    let mut seen = BTreeMap::<String, BTreeSet<&str>>::new();
+    for key in index.files.keys().chain(
+        index
+            .traversal
+            .as_ref()
+            .into_iter()
+            .flat_map(|t| t.observed_index_keys.iter()),
+    ) {
+        if let Some((_, member)) = claude_index_path_family_member(Path::new(key)) {
+            if selected.contains_key(&member) {
+                seen.entry(member).or_default().insert(key);
+            }
+        }
+    }
+    seen.into_iter()
+        .filter(|(_, keys)| keys.len() > 1)
+        .filter_map(|(member, _)| selected.get(&member).cloned())
+        .collect()
+}

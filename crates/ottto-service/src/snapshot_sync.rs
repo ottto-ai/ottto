@@ -8692,7 +8692,7 @@ fn try_apply_claude_local_evidence_to_scan_with_comparison(
         scan_result.census_complete = false;
         scan_result.scan_cap_hit = true;
     }
-    crate::snapshots::claude_request_money::e2::finish_page(&mut scan_result.snapshots);
+    crate::snapshots::claude_request_money::e2::finish_page(&mut scan_result.snapshots, index);
     // P1 per-request money, shadow only: reads this page's final items, the
     // index and the rows loaded above; writes only its own ledger, through
     // its writer thread after this page. Never fails or changes the page.
@@ -9448,7 +9448,7 @@ where
                 .is_some_and(|value| {
                     value
                         .get("usage_accounting_contract")
-                        .and_then(Value::as_str)
+                        .and_then(serde_json::Value::as_str)
                         == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
                 });
         let item = (index, body_length.saturating_add(1), item_batch_class);
@@ -9543,7 +9543,7 @@ where
                 .is_some_and(|value| {
                     value
                         .get("usage_accounting_contract")
-                        .and_then(Value::as_str)
+                        .and_then(serde_json::Value::as_str)
                         == Some(crate::snapshots::claude_request_money::REQUEST_OWNED_CONTRACT)
                 })
         });

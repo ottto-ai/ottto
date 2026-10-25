@@ -17961,8 +17961,24 @@ impl SnapshotAccumulator {
                 if attribution { 4 } else { 2 },
                 collected_at.len(),
             )?)?;
+        // E keeps aggregate grains and the rare skipped/ambiguous sequence
+        // sets; reserve their worst case before the finish releases input.
+        let money_output = size_of::<claude_request_money::e2::FileFold>()
+            .checked_add(current_selector)?
+            .checked_add(responses.checked_mul(2)?)?
+            .checked_add(resolved.checked_mul(per_response)?.checked_mul(2)?)?
+            .checked_add(resolved.checked_mul(
+                2 * tree_node_bytes::<
+                    (
+                        claude_request_money::body::ClaudeLiveKey,
+                        Option<claude_request_money::body::ClaudeRequestUsageOrigin>,
+                    ),
+                    claude_request_money::body::ClaudeGrainSide,
+                >()? + 2 * tree_node_bytes::<u64, ()>()?,
+            )?)?;
         let mut out = crate::heap_layout_bound::Counter::new(limit);
         for bytes in [
+            money_output,
             size_of::<ParsedJsonlFile>(),
             size_of::<SnapshotItem>(), // `vec![item]`
             responses,
@@ -24295,6 +24311,14 @@ impl OwnedSourceScan {
                     forced_claude_family_reparses.insert(root_session_id.clone());
                 }
             }
+        }
+        if source == SnapshotSource::ClaudeCode && claude_request_money::e2::enabled() {
+            forced_claude_family_reparses.extend(claude_request_money::e2::selected_twin_roots(
+                identified_candidates
+                    .iter()
+                    .map(|candidate| candidate.path.as_path()),
+                &index,
+            ));
         }
         if !forced_claude_family_reparses.is_empty() {
             let already_identified = identified_candidates
