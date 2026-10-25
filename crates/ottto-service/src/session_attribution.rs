@@ -1490,6 +1490,10 @@ fn push_fact(
     push_labeled_fact(facts, field, value, None, None, kind, strength, context);
 }
 
+// X_out (#665): `snapshots.rs`'s `fact_limit_scratch_bound` charges each of
+// a fact's `field`, `kind` and `strength` at `FACT_LITERAL_BYTES` (64). Pass
+// only `'static` literals of at most 64 bytes for them (the longest today is
+// 22); a longer or dynamic one needs that constant raised first.
 #[allow(clippy::too_many_arguments)]
 fn push_labeled_fact(
     facts: &mut Vec<SessionAttributionFact>,

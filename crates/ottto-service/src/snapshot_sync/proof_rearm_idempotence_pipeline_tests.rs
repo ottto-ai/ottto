@@ -1806,3 +1806,31 @@ fn c1a_first_proof_hold_counts_encoding_is_bounded() {
         );
     }
 }
+
+/// The dedicated returning-family count remains on the Claude counts line
+/// at zero and at the maximum integer, without changing the existing nested
+/// 176-byte first-proof or 589-byte duplicate-census bounds.
+#[test]
+fn returning_family_grown_held_census_line_encoding_is_bounded() {
+    for count in [0, 1, usize::MAX] {
+        let stats = crate::snapshot_sync::ClaudeLocalEvidenceStats {
+            returning_family_grown_held: count,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&stats).unwrap();
+        let mut without = serde_json::to_value(&stats).unwrap();
+        let value = without
+            .as_object_mut()
+            .unwrap()
+            .remove("returning_family_grown_held")
+            .unwrap();
+        assert_eq!(value, serde_json::json!(count));
+        let baseline = serde_json::to_string(&without).unwrap();
+        assert!(
+            line.len() - baseline.len() <= 51,
+            "line grew by {} bytes",
+            line.len() - baseline.len()
+        );
+        assert!(line.len() <= 4096, "{} bytes", line.len());
+    }
+}

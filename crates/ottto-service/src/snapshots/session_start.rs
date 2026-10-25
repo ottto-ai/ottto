@@ -31,6 +31,13 @@ use std::io;
 use std::path::Path;
 
 pub(crate) const MAX_OPENING_FILES: usize = 64;
+/// `start_config_fingerprint`: the first 16 hex digits of
+/// `context_file_counts::salted_content_hash` (64-hex SHA-256), copied exactly.
+const CONFIG_FINGERPRINT_LEN: usize = 16;
+/// An opening file's `path_hash`: `session_attribution::opaque_hmac_id`, i.e.
+/// "<key version>:" + URL-safe unpadded base64 of the 32-byte HMAC-SHA256 (43).
+const PATH_HASH_LEN: usize =
+    crate::session_attribution::SESSION_ATTRIBUTION_HMAC_KEY_VERSION.len() + 1 + 43;
 /// Retained capacity of the whole in-window state, charged with the daemon's
 /// heap model (`heap_layout_bound`). Held instruction text (for path matching,
 /// 2x the largest seen) gets half; tracked files, calls, blobs and their keys
@@ -1314,9 +1321,56 @@ impl SessionStartState {
             let mut material = b"config:".to_vec();
             material.extend_from_slice(&digest.to_bytes());
             let hash = crate::context_file_counts::salted_content_hash(salt, &material);
-            start.start_config_fingerprint = Some(hash[..16].to_string());
+            start.start_config_fingerprint = Some(hash[..CONFIG_FINGERPRINT_LEN].to_string());
         }
         start.into_measured()
+    }
+
+    /// X_out family U2 (#665, c22 amendment 2): an upper bound on the heap the
+    /// boxed `finish` output owns, read from this state without consuming it.
+    /// Moved strings (`client_version`, each file's `tool` and `repo_path`) are
+    /// charged at their resident capacity, `ext` (a <= 8-byte key suffix) at
+    /// its key's suffix, and `path_hash` / the config fingerprint at their
+    /// fixed output length (`PATH_HASH_LEN` at most doubled by `format!`'s
+    /// growth; `CONFIG_FINGERPRINT_LEN` exact). Every tracked file is charged,
+    /// not only the <= 64 `finish` keeps. `None` past `limit`.
+    pub(super) fn finished_heap_bound(
+        &self,
+        attribution: bool,
+        device_salt: bool,
+        limit: usize,
+    ) -> Option<usize> {
+        use std::mem::{align_of, size_of};
+        // The `Box` slot, charged as `heap_layout_bound` charges it.
+        let mut bytes = size_of::<SnapshotSessionStart>()
+            .checked_add(align_of::<SnapshotSessionStart>())?
+            .checked_add(self.client_version.as_ref().map_or(0, String::capacity))?;
+        // `finish` collects the arrived files (amortized growth from 4, so a
+        // power-of-two capacity) and maps them into candidates, which std may
+        // do in that same allocation: charge the larger of the two.
+        let files = self.files.len();
+        let collected = if files == 0 {
+            0
+        } else {
+            files.checked_next_power_of_two()?.max(4)
+        };
+        let in_place = collected.checked_mul(size_of::<(String, usize, OpeningFileState)>())?;
+        let fresh = files
+            .min(MAX_OPENING_FILES)
+            .checked_mul(size_of::<OpeningFileCandidate>())?;
+        bytes = bytes.checked_add(in_place.max(fresh))?;
+        let path_hash = if attribution { 2 * PATH_HASH_LEN } else { 0 };
+        for (key, file) in &self.files {
+            bytes = bytes
+                .checked_add(file.tool.capacity())?
+                .checked_add(file.repo_path.as_ref().map_or(0, String::capacity))?
+                .checked_add(extension(key).map_or(0, str::len))?
+                .checked_add(path_hash)?;
+        }
+        if device_salt && self.config_digest.is_some() {
+            bytes = bytes.checked_add(CONFIG_FINGERPRINT_LEN)?;
+        }
+        (bytes <= limit).then_some(bytes)
     }
 
     /// Path matching saw only part of the injected instruction text (its
@@ -1563,8 +1617,6 @@ pub(crate) enum StartVerdict {
 /// client version only). Measured when the item carries any start value the
 /// server stores besides the client version and the config fingerprint; the
 /// server calls the same start "measured". Reads only the item: no file IO.
-// The composition reader is the first caller; it is wired separately.
-#[allow(dead_code)]
 pub(crate) fn session_start_verdict(item: &super::SnapshotItem) -> StartVerdict {
     let Some(start) = item.session_start.as_deref() else {
         return StartVerdict::NotMeasured;
@@ -1784,6 +1836,60 @@ mod tests {
             json!({"type": "assistant", "requestId": "r3", "message": {"id": "m3", "role": "assistant", "model": "claude-fable-5-1",
                 "usage": usage(0, 400, 2), "content": [{"type": "text", "text": "done"}]}}),
         ]
+    }
+
+    /// X_out family U2 (#665, c22 amendment 2): the observed-input bound
+    /// covers the boxed start `finish` builds, and the two fixed-length derived
+    /// ids have exactly the length the bound charges.
+    #[test]
+    fn finished_heap_bound_covers_the_finished_start() {
+        let dir = crate::test_scratch::ScratchDir::new("session-start-u2-bound");
+        let context = attribution_context(&dir);
+        let common: Value = serde_json::from_str(CLAUDE_COMMON).unwrap();
+        let mut accumulator = super::super::SnapshotAccumulator::new(SnapshotSource::ClaudeCode);
+        for mut line in claude_fixture_lines() {
+            for (key, value) in common.as_object().expect("common fields") {
+                line[key] = value.clone();
+            }
+            super::super::apply_claude_code_line(&line, &mut accumulator);
+        }
+        accumulator.finalize_claude_responses();
+        let state = (*accumulator.session_start).clone();
+        assert!(!state.files.is_empty());
+        let bound = state
+            .finished_heap_bound(true, true, usize::MAX)
+            .expect("bound");
+        assert_eq!(state.finished_heap_bound(true, true, bound - 1), None);
+        let start = state
+            .finish(
+                true,
+                accumulator.first_turn_context_tokens,
+                CLAUDE_PARTS_METHOD,
+                Some(&context),
+                Some(&SALT),
+            )
+            .expect("start");
+        assert!(!start.file_candidates.is_empty());
+        for candidate in &start.file_candidates {
+            let hash = candidate.path_hash.as_ref().expect("path hash");
+            assert_eq!(hash.len(), PATH_HASH_LEN);
+            assert!(hash.capacity() <= 2 * PATH_HASH_LEN, "{}", hash.capacity());
+        }
+        let fingerprint = start
+            .start_config_fingerprint
+            .as_ref()
+            .expect("fingerprint");
+        assert_eq!(
+            (fingerprint.len(), fingerprint.capacity()),
+            (CONFIG_FINGERPRINT_LEN, CONFIG_FINGERPRINT_LEN)
+        );
+        if crate::heap_layout_bound::layout_supported() {
+            let boxed = Box::new(start);
+            let finished = crate::heap_layout_bound::completed_bound(&boxed, usize::MAX)
+                .expect("finished bound")
+                - std::mem::size_of::<Box<SnapshotSessionStart>>();
+            assert!(finished <= bound, "{finished} > {bound}");
+        }
     }
 
     #[test]

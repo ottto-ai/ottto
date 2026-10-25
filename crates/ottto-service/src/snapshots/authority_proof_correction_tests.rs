@@ -589,14 +589,16 @@ fn pre_change_decoder_rejects_the_declared_v2_contract_and_rebuilds() {
     .unwrap();
     assert!(dropped.get("proof_correction").is_none());
 
-    // The old loader's invalid branch is the unchanged shared helper.
+    // The old loader's invalid branch used this shared quarantine helper.
     let scratch = crate::test_scratch::ScratchDir::new("proof-correction-old-reader");
     let path = scratch.join("index.json");
     index.save(&path).unwrap();
     let encoded_index_bytes = fs::metadata(&path).unwrap().len();
     let files = index.files.len();
     let accepted_entities = index.accepted_snapshot_fingerprints.len();
-    let rebuilt = quarantine_invalid_scan_index(&path).unwrap();
+    let rebuilt =
+        quarantine_invalid_scan_index(&path, "decode", None, None, None, SystemTime::now())
+            .unwrap();
     assert!(!path.exists());
     assert!(rebuilt.files.is_empty());
     for slot in 0..2 {
@@ -2564,6 +2566,9 @@ fn apc_without_unbound_record(index: &ScanIndex) -> Value {
             .source_file_fingerprint
             .clear();
     }
+    // Every loaded or saved index carries the tombstone marker (SOURCE
+    // Round 13 F1).
+    expected.claude_retired_family_tombstones_initialized = true;
     // Empty maps are omitted by ScanIndex's persisted representation.
     serde_json::to_value(expected).unwrap()
 }
@@ -2589,6 +2594,27 @@ fn load_drops_unbound_authority_record_and_keeps_index() {
     assert_eq!(loaded.snapshot_unproven_terminal_count(), 1);
     assert_eq!(loaded.snapshot_superseded_terminal_count(), 1);
     assert_eq!(serde_json::to_value(loaded).unwrap(), expected);
+}
+
+#[test]
+fn contained_unbound_authority_record_does_not_latch_claude_reemission_stop() {
+    let scratch = crate::test_scratch::ScratchDir::new("authority-load-no-rebuild-stop");
+    let index = apc_unbound_fixture();
+    let path = scratch.join("index.json");
+    fs::write(&path, serde_json::to_vec(&index).unwrap()).unwrap();
+    let marker = ReemissionExclusions::seen_marker_path(&scratch);
+    fs::create_dir_all(marker.parent().unwrap()).unwrap();
+    fs::write(marker, "").unwrap();
+    let loaded =
+        ScanIndex::load_for_snapshot_source(&path, SnapshotSource::ClaudeCode, &scratch).unwrap();
+    assert!(path.exists(), "the index was kept, not quarantined");
+    assert_eq!(loaded.generation, 29);
+    assert_eq!(
+        serde_json::to_value(loaded).unwrap(),
+        apc_without_unbound_record(&index)
+    );
+    assert!(!claude_reemission_stop_latched());
+    assert_eq!(claude_reemission_stop_reason(), "none");
 }
 
 /// SOURCE F1: an existing orphan fails closed for its one record at save, in

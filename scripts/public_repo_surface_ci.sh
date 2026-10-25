@@ -2,11 +2,14 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/public_repo_temp_cleanup.sh
+source "$SCRIPT_DIR/public_repo_temp_cleanup.sh"
 DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 REPO_ROOT="$DEFAULT_REPO_ROOT"
 STAGED_OUTPUT_DIR=""
 KEEP_TEMP=0
 TMP_DIR=""
+script_completed=0
 
 usage() {
   cat <<'USAGE'
@@ -35,11 +38,18 @@ require_command() {
 }
 
 cleanup() {
+  local status=$?
+  # Bash 3.2 can report status 0 here after a nounset abort.
+  if [[ "$status" -eq 0 && "${script_completed:-0}" -ne 1 ]]; then
+    echo "public-surface-ci: exited before completion" >&2
+    status=1
+  fi
   if [[ -n "$TMP_DIR" && "$KEEP_TEMP" -eq 0 ]]; then
-    rm -rf "$TMP_DIR"
+    public_repo_remove_temp_dir "public-surface-ci" "$TMP_DIR" || true
   elif [[ -n "$TMP_DIR" ]]; then
     echo "public-surface-ci: kept temporary checkout at $TMP_DIR"
   fi
+  exit "$status"
 }
 trap cleanup EXIT
 
@@ -61,6 +71,7 @@ while [[ "$#" -gt 0 ]]; do
       ;;
     -h|--help)
       usage
+      script_completed=1
       exit 0
       ;;
     *)
@@ -156,6 +167,30 @@ run_step() {
   (cd "$REPO_ROOT" && "$@")
 }
 
+# PUBLIC_EXPORT_MANIFEST.json is derived from the commit tree
+# (scripts/public_repo_manifest.sh) and must not be committed. A staged bundle
+# carries its generated copy at the root; it must still match its files and the
+# derived manifest.
+check_root_manifest() {
+  if [[ -n "$STAGED_OUTPUT_DIR" ]]; then
+    if [[ -f PUBLIC_EXPORT_MANIFEST.json ]]; then
+      bash scripts/public_repo_manifest_check.sh
+      bash scripts/public_repo_manifest.sh --compare PUBLIC_EXPORT_MANIFEST.json
+    else
+      echo "public-surface-ci: staged output has no root manifest; the self-export check covers it"
+    fi
+    return
+  fi
+  bash scripts/public_repo_manifest.sh --guard
+}
+
+check_self_export_matches_tree() {
+  if ! git diff --quiet HEAD --; then
+    fail "tracked files differ from HEAD; commit or stash them before comparing the self-exported manifest"
+  fi
+  bash scripts/public_repo_manifest.sh --compare dist/public-export/ottto/PUBLIC_EXPORT_MANIFEST.json
+}
+
 run_step "validate public schemas and generated registry" \
   bash -c 'jq empty connectors/registry.generated.json schemas/*.schema.json'
 run_step "shellcheck public scripts" bash -c 'shellcheck scripts/*.sh'
@@ -167,9 +202,11 @@ run_step "test public export bundle" bash scripts/test_public_repo_export_bundle
 run_step "test public bootstrap plan" bash scripts/test_public_repo_bootstrap_plan.sh
 run_step "test public cutover closeout" bash scripts/test_public_repo_cutover_closeout.sh
 run_step "test public manifest check" bash scripts/test_public_repo_manifest_check.sh
-run_step "run public manifest check" bash scripts/public_repo_manifest_check.sh
+run_step "test public manifest derivation" bash scripts/test_public_repo_manifest.sh
+run_step "check root manifest is derived from the commit tree" check_root_manifest
 run_step "test public skeleton check" bash scripts/test_public_repo_skeleton_check.sh
 run_step "test public secret scan" bash scripts/test_public_repo_secret_scan.sh
+run_step "test public temp cleanup" bash scripts/test_public_repo_temp_cleanup.sh
 run_step "test public contract check" bash scripts/test_public_repo_contract_check.sh
 run_step "test macOS release gate" bash scripts/test_macos_release_gate.sh
 run_step "test macOS installer channel policy" bash scripts/test_macos_installer_channel_policy.sh
@@ -191,6 +228,7 @@ run_step "test CycloneDX SBOM generator" bash scripts/test_cyclonedx_sbom.sh
 run_step "generate self-exported public bundle" bash scripts/public_repo_export_bundle.sh --force
 run_step "verify self-exported manifest" \
   bash scripts/public_repo_manifest_check.sh --staged-output dist/public-export/ottto
+run_step "verify self-exported manifest matches commit tree" check_self_export_matches_tree
 run_step "verify public skeleton" \
   bash -c 'PUBLIC_SKELETON_REPO_ROOT=dist/public-export/ottto scripts/public_repo_skeleton_check.sh'
 run_step "scan self-exported public bundle" \
@@ -199,3 +237,4 @@ run_step "verify self-exported public contracts" \
   bash scripts/public_repo_contract_check.sh --staged-output dist/public-export/ottto
 
 echo "public-surface-ci: completed public surface checks at $REPO_ROOT"
+script_completed=1

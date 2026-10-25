@@ -617,7 +617,227 @@ fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
     }
 }
 
+/// StateMissing M1 (SOURCE d680b524) through the real `prepare_sync_source`
+/// and `finish_sync_source`, the synthetic backend recording every offered
+/// body. Beside the fixture's own session, family `R` has a root transcript
+/// and subagent files `agents`; a first cycle sends everything. Then `R.jsonl`
+/// is removed, the list is installed naming `R_<listed_member>`, or `R`
+/// itself when `listed_member` is `None`, and the saved
+/// index is corrupted, so the next load quarantines it and every file comes
+/// back new (prior history). Returns the bodies the rebuilt cycle offered and
+/// the local diagnostics it recorded.
+fn rootless_family_real_pipeline(
+    name: &str,
+    agents: &[&str],
+    listed_member: Option<&str>,
+) -> Option<(Vec<serde_json::Value>, Vec<serde_json::Value>)> {
+    const FAMILY: &str = "2558a80a-f36e-4cbc-a5bb-50fc66430ba5";
+    if !crate::heap_layout_bound::layout_supported() {
+        writeln!(
+            std::io::stderr().lock(),
+            "{name}: supported_positive=UNEXECUTED layout_supported=false"
+        )
+        .unwrap();
+        return None;
+    }
+    let fixture = IdentityPipelineHome::new();
+    let project = fixture.home.join(".claude/projects/-synthetic-repo");
+    let at = (OffsetDateTime::now_utc() - TimeDuration::minutes(170))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&Rfc3339)
+        .unwrap();
+    let line = |agent: Option<&str>| {
+        let request = agent.unwrap_or("root");
+        serde_json::json!({"timestamp": at, "type": "assistant", "sessionId": FAMILY,
+            "agentId": agent, "isSidechain": agent.is_some(),
+            "requestId": format!("req_{request}"), "message": {"id": format!("m_{request}"),
+            "model": "claude-haiku-4-5", "usage": {"input_tokens": 10, "output_tokens": 1}}})
+        .to_string()
+            + "\n"
+    };
+    let root_file = project.join(format!("{FAMILY}.jsonl"));
+    std::fs::write(&root_file, line(None)).unwrap();
+    let subagents = project.join(FAMILY).join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    for agent in agents {
+        std::fs::write(subagents.join(format!("{agent}.jsonl")), line(Some(agent))).unwrap();
+    }
+    let _enabled = crate::snapshots::claude_native_comparison::enable_for_test();
+    let cadence = IdentityPipelineCadence::new();
+    let support = fixture.base.join(format!("{name}-support"));
+    let secrets = fixture.base.join(format!("{name}-secrets"));
+    std::fs::create_dir_all(support.join("snapshots")).unwrap();
+    std::fs::create_dir_all(&secrets).unwrap();
+    let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
+    let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
+    let server = FinishServer::new(FinishOutcome::Accept);
+    let _api = EnvVarGuard::set_str("OTTTO_API_BASE_URL", &server.url);
+    let device = LocalDeviceBinding {
+        device_id: format!("{name}-device"),
+        machine_id: Some("otm_test".into()),
+        sources: vec!["claude_code".into()],
+    };
+    FileDeviceStore::default().save(&device).unwrap();
+    std::fs::write(
+        secrets.join(OTTTO_RELAY_DEVICE_SECRET_ACCOUNT),
+        "device-secret",
+    )
+    .unwrap();
+    write_native_bootstrap_sidecars(&fixture, &support);
+    let client = SnapshotApiClient::new(server.url.clone());
+    let daemon = test_daemon("otm_test");
+    let mut transport = crate::net_resilience::TransportCycleOutcome::default();
+    let mut retry = live_snapshot_retry::LiveRetryOwner::closed();
+    let collection = || AgentStatusCollection {
+        snapshots: vec![test_agent_status(SourceKind::ClaudeCode)],
+        source_health_snapshot: test_agent_status(SourceKind::ClaudeCode),
+        codex_scan_homes: Vec::new(),
+        codex_home_bindings: Vec::new(),
+    };
+    let mut cycle = || {
+        cadence.next_due_cycle();
+        let frame = crate::agent_status_refresh::with_test_collection(collection(), || {
+            prepare_sync_source(
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                daemon.snapshot_scan_account_witness().unwrap(),
+                false,
+            )
+        })
+        .unwrap()
+        .expect("real due preparation");
+        let (preparation, index, scan) = collect_native_preparation_with_rotation(frame, false);
+        let index_path = preparation.index_path.clone();
+        let result = crate::agent_status_refresh::with_test_collection(collection(), || {
+            finish_sync_source(
+                preparation,
+                index,
+                scan,
+                &client,
+                &device,
+                "device-secret",
+                SnapshotSource::ClaudeCode,
+                "otm_test",
+                &fixture.home,
+                &support,
+                &daemon,
+                &mut transport,
+                &mut retry,
+            )
+        });
+        assert!(result.is_ok(), "{name}: {result:?}");
+        index_path
+    };
+    let index_path = cycle();
+    {
+        let mut offered = server.offered.lock().unwrap();
+        for agent in agents {
+            let id = format!("{FAMILY}_{agent}");
+            assert!(
+                offered
+                    .iter()
+                    .any(|item| item["source_session_id"] == id.as_str()),
+                "{name}: the first cycle sends {agent}"
+            );
+        }
+        offered.clear();
+    }
+    std::fs::remove_file(&root_file).unwrap();
+    let listed = listed_member.map_or_else(|| FAMILY.to_owned(), |stem| format!("{FAMILY}_{stem}"));
+    std::fs::write(
+        support.join("snapshots/claude_code-reemission-exclusions.txt"),
+        format!("# synthetic\n{:x}\n", Sha256::digest(listed.as_bytes())),
+    )
+    .unwrap();
+    std::fs::write(&index_path, b"{not json").unwrap();
+    let ((), lines) = crate::local_resource_diagnostics::capture(|| {
+        cycle();
+    });
+    let offered = server.offered.lock().unwrap().clone();
+    let family_offers = offered
+        .iter()
+        .filter_map(|item| item["source_session_id"].as_str())
+        .filter(|id| id.starts_with(FAMILY))
+        .collect::<Vec<_>>();
+    assert!(
+        family_offers.is_empty(),
+        "{name}: no body of the listed family is offered: {family_offers:?}"
+    );
+    assert!(
+        offered
+            .iter()
+            .any(|item| item["source_session_id"] == IDENTITY_PIPELINE_ROOT),
+        "{name}: the unlisted session's history is still offered"
+    );
+    Some((offered, lines))
+}
+
+/// The members the history gate held only through a listed family root
+/// whose root file is absent, as the real cycle's diagnostics recorded them.
+fn root_absent_family_closure_count(lines: &[serde_json::Value]) -> u64 {
+    lines
+        .iter()
+        .filter(|line| line["stage"] == "claude_reemission_family_closure_root_absent_excluded")
+        .map(|line| {
+            line["counts"]["claude_reemission_family_closure_root_absent_excluded"]
+                .as_u64()
+                .unwrap()
+        })
+        .sum()
+}
+
+/// SOURCE d680b524 (a), real prepare/finish: the list names only
+/// `R_agent-a`, `R.jsonl` is gone. No sibling is offered, whether traversal
+/// decides it after agent-a (`agent-b`) or before it (`agent-0`); the sibling
+/// counts once (agent-a is listed by its own line).
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
+    for (sibling, name) in [
+        ("agent-b", "rootless-member-after"),
+        ("agent-0", "rootless-member-before"),
+    ] {
+        let Some((_, lines)) =
+            rootless_family_real_pipeline(name, &["agent-a", sibling], Some("agent-a"))
+        else {
+            return;
+        };
+        assert_eq!(root_absent_family_closure_count(&lines), 1, "{name}");
+    }
+}
+
+/// SOURCE d680b524 (b), real prepare/finish: the list names the root `R`,
+/// `R.jsonl` is gone and only subagent files remain. None is offered, and
+/// each counts as held through the absent root.
+#[test]
+#[serial]
+#[serial(source_cadences)]
+#[serial(client_report)]
+fn rootless_family_root_list_offers_no_subagent_through_the_real_pipeline() {
+    let Some((_, lines)) =
+        rootless_family_real_pipeline("rootless-root-listed", &["agent-a", "agent-b"], None)
+    else {
+        return;
+    };
+    assert_eq!(root_absent_family_closure_count(&lines), 2);
+}
+
 // Same real finish fixture; the new tests own only a test-thread observer.
 pub(crate) mod prior_index_lifetime_tests {
     include!("prior_index_lifetime_tests.rs");
+}
+
+// Same real prepare/finish pipeline; owns a test-thread re-offer clock.
+pub(crate) mod reason_reoffer_pipeline_tests {
+    include!("reason_reoffer_pipeline_tests.rs");
 }

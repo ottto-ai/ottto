@@ -238,6 +238,19 @@ fn c1b_liveness(run: &C1bRun) -> Vec<C1bLiveness> {
     run.windows.iter().map(C1bWindow::liveness).collect()
 }
 
+/// This control measures C1b alone. Fix 2's window/cap has separate pipeline
+/// coverage below and intentionally keeps eligible unwitnessed families too.
+fn c1b_without_full_rearm_window(fixture: &RearmFixture) {
+    c1a_edit_index(fixture, |saved| {
+        let progress = saved
+            .get_mut("claude_full_rearm_progress")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("the preceding full re-arm recorded progress");
+        progress.remove("full_rearm_window");
+        progress.remove("full_rearm_window_next");
+    });
+}
+
 /// T0/T1, the unrelated-red-window shape: an unrelated session turns the
 /// 08:10 window red. BASE re-arms every family parsed there at each retry
 /// start, so the unchanged witnessed family is re-read at 08:20 and 08:30
@@ -257,8 +270,8 @@ fn c1b_unrelated_red_window_carries_unchanged_family_at_retry() {
     }
     let _source_manifests = SourceManifestTestGuard::new();
     let family = rearm_family_sessions().len() as u64;
-    let fix = c1b_red_chain("c1b-red-window", "fix", |_| {});
-    let base = c1b_base_red_chain("c1b-red-window-base", |_| {});
+    let fix = c1b_red_chain("c1b-red-window", "fix", c1b_without_full_rearm_window);
+    let base = c1b_base_red_chain("c1b-red-window-base", c1b_without_full_rearm_window);
     let [_, _, retry, repaired, quiet] = &fix.windows;
     let [_, _, base_retry, base_repaired, _] = &base.windows;
     // Preconditions on BASE: both retries re-arm and re-read the family, and
@@ -633,4 +646,504 @@ fn c1b_unfunded_carry_takes_the_base_path_through_the_fold() {
     assert_eq!(fix.heads_after, base.heads_after);
     assert_eq!(fix.witness_after, base.witness_after);
     assert_eq!(fix.family_pending_after, base.family_pending_after);
+}
+
+// Path-(a) bridge, corrected option (ii): a RetryPending authority family
+// keeps its hold and quarantine and withholds the census, but authority debt
+// alone no longer marks the bounded sweep unsettled. A same-context red retry
+// may therefore carry unrelated, unchanged, witnessed families, while the
+// held family itself is never carried, every other cause still marks the
+// sweep, and the contract-5 latch and the unchanged-proof skip keep their
+// meaning.
+
+/// The unrelated terminal session's accepted head.
+fn c1b_terminal_head(index: &ScanIndex) -> Option<String> {
+    let suffix = format!("{REARM_TERMINAL}.jsonl");
+    let key = index
+        .files
+        .keys()
+        .find(|key| key.ends_with(&suffix))
+        .expect("the unrelated terminal session is indexed");
+    index.files[key].last_snapshot_fingerprint.clone()
+}
+
+struct C1bHeldRun {
+    red: C1bWindow,
+    retry: C1bWindow,
+    marked_after_red: bool,
+    record_after_red: Option<crate::snapshots::ClaudeAuthorityRecordForTest>,
+    record_after_retry: Option<crate::snapshots::ClaudeAuthorityRecordForTest>,
+    head_before: Option<String>,
+    head_after: Option<String>,
+}
+
+/// The red chain with the unrelated terminal session made a RetryPending
+/// authority family before the red window: its new revision is read there and
+/// held. `before_retry` runs between the red window and its retry.
+fn c1b_held_retry_chain(
+    case: &'static str,
+    arm: &str,
+    before_retry: impl FnOnce(&RearmFixture),
+) -> C1bHeldRun {
+    let fixture = c1a_fixture(case);
+    let closing = c1b_generation(&fixture, arm, (8, 0));
+    assert!(closing.census_complete, "{arm}: the first census completes");
+    assert!(closing.fence_after && closing.proven, "{arm}");
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    let head_before = c1b_terminal_head(&index);
+    index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
+    index.save(&fixture.index_path).unwrap();
+    RearmFixture::append(&c1b_sibling_path(&fixture), "not-json\n");
+    RearmFixture::append(
+        &c1b_terminal_path(&fixture),
+        &rearm_transcript_line(REARM_TERMINAL, None, "req_terminal_2", 1),
+    );
+    let red = c1b_generation(&fixture, arm, (8, 10));
+    assert!(red.red && !red.census_complete, "{arm}: the window is red");
+    let saved = ScanIndex::load(&fixture.index_path).unwrap();
+    let marked_after_red = saved.bounded_sweep_had_unsettled_upload();
+    let record_after_red = saved.claude_authority_record_for_test(REARM_TERMINAL);
+    before_retry(&fixture);
+    let retry = c1b_generation(&fixture, arm, (8, 20));
+    let saved = ScanIndex::load(&fixture.index_path).unwrap();
+    C1bHeldRun {
+        red,
+        retry,
+        marked_after_red,
+        record_after_red,
+        record_after_retry: saved.claude_authority_record_for_test(REARM_TERMINAL),
+        head_before,
+        head_after: c1b_terminal_head(&saved),
+    }
+}
+
+/// SOURCE, SI P2 and COST: an authority-only hold beside an unrelated
+/// unchanged witnessed family. The red window holds the RetryPending family's
+/// new revision without marking the sweep, so the same-context retry carries
+/// the witnessed family (not read) while the held family is never carried: it
+/// is read, held and kept exactly as the BASE arm does, its body is never
+/// accepted, and its quarantine keeps its failure count and binding.
+#[test]
+#[serial(source_manifests)]
+fn c1b_retry_pending_family_beside_witnessed_family_carries_only_the_witnessed_one() {
+    if !c1a_layout_supported("c1b_retry_pending_beside_witnessed") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len();
+    let fix = c1b_held_retry_chain("c1b-held-beside-witnessed", "fix", |_| {});
+    let base = {
+        let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
+        c1b_held_retry_chain("c1b-held-beside-witnessed-base", "base", |_| {})
+    };
+    for (arm, run) in [("fix", &fix), ("base", &base)] {
+        // FLIPS on the pre-bridge head: authority debt marked every page.
+        assert!(!run.marked_after_red, "{arm}: authority debt alone");
+        let record = run.record_after_red.as_ref().expect("held family");
+        assert!(
+            !record.terminal && record.bound_to_retained_witness,
+            "{arm}"
+        );
+        assert_eq!(record.failed_reconstruction_count, 2, "{arm}");
+        let kept = run.record_after_retry.as_ref().expect("still quarantined");
+        assert!(!kept.terminal && kept.bound_to_retained_witness, "{arm}");
+        assert_eq!(
+            (
+                kept.failed_reconstruction_count,
+                &kept.member_source_file_fingerprints
+            ),
+            (
+                record.failed_reconstruction_count,
+                &record.member_source_file_fingerprints
+            ),
+            "{arm}: no extra failure, same binding"
+        );
+        assert_eq!(run.head_after, run.head_before, "{arm}: never accepted");
+        assert!(run.retry.red, "{arm}: the retry ends red again");
+    }
+    let start = fix.retry.start.as_ref().expect("a retry start");
+    let base_start = base.retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.reason, "terminal_unhealthy_retry");
+    assert_eq!(base_start.reason, start.reason);
+    assert_eq!(
+        start.carried_pending_families,
+        Some(1),
+        "the witnessed family"
+    );
+    assert_eq!(fix.retry.family_reads, 0, "the carried family is not read");
+    assert_eq!(base.retry.family_reads, family, "BASE re-reads it");
+    assert_eq!(
+        fix.retry.parsed.contains(REARM_TERMINAL),
+        base.retry.parsed.contains(REARM_TERMINAL),
+        "the held family takes BASE's path"
+    );
+    assert_eq!(fix.red, base.red, "the red window is BASE's");
+    assert_eq!(fix.retry.liveness(), base.retry.liveness());
+}
+
+/// COST: the held family itself (its root and every member) is never carried.
+/// Its RetryPending record, bound to its retained witness, is written after
+/// the red window; the retry start carries nothing and equals BASE's.
+#[test]
+#[serial(source_manifests)]
+fn c1b_retry_pending_family_is_never_carried() {
+    if !c1a_layout_supported("c1b_retry_pending_never_carried") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let hold = |fixture: &RearmFixture| {
+        let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+        let members = RearmFixture::family_keys(&index)
+            .into_iter()
+            .map(|(session, key)| {
+                let revision = index.files[&key].source_file_fingerprint.clone();
+                assert!(!revision.is_empty(), "the red window read {session}");
+                (session, revision)
+            })
+            .collect();
+        index.bind_retry_pending_claude_authority_for_test(REARM_ROOT, members);
+        index.save(&fixture.index_path).unwrap();
+    };
+    let fix = c1b_red_chain("c1b-held-family", "fix", hold);
+    let base = c1b_base_red_chain("c1b-held-family-base", hold);
+    let (retry, base_retry) = (&fix.windows[2], &base.windows[2]);
+    let start = retry.start.as_ref().expect("a retry start");
+    assert_eq!(start.carried_pending_families, Some(0), "never carried");
+    assert_eq!(retry.start, base_retry.start, "the start is BASE's");
+    assert_eq!(retry.family_reads, base_retry.family_reads);
+    assert_eq!(retry.parsed, base_retry.parsed);
+    assert!(retry.retry_pending && base_retry.retry_pending);
+}
+
+/// COST: authority debt beside another cause on an ordinary red retry,
+/// outside Fix 2's full-rearm-window exception. An unsettled mark already
+/// left by another producer stays set; the retry carries nothing and re-reads
+/// the witnessed family as BASE does.
+#[test]
+#[serial(source_manifests)]
+fn c1b_retry_pending_debt_beside_an_existing_mark_keeps_base_rearm() {
+    if !c1a_layout_supported("c1b_retry_pending_existing_mark") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mark = |fixture: &RearmFixture| {
+        c1a_edit_index(fixture, |saved| {
+            assert!(
+                saved.get("traversal").is_some(),
+                "the red retry retains its walk"
+            );
+            assert!(
+                saved.get("claude_stale_family_carry").is_none(),
+                "no carry is retained yet"
+            );
+            // This test predates Fix 2: select the ordinary C1b retry, whose
+            // prior unsettled mark remains authoritative. The companion
+            // test below retains the window and checks Fix 2's exception.
+            let progress = saved
+                .get_mut("claude_full_rearm_progress")
+                .and_then(serde_json::Value::as_object_mut)
+                .expect("the preceding full re-arm recorded its progress");
+            assert!(
+                progress.remove("full_rearm_window").is_some(),
+                "explicitly leave Fix 2's window"
+            );
+            progress.remove("full_rearm_window_next");
+            saved.insert(
+                "bounded_sweep_had_unsettled_upload".to_owned(),
+                serde_json::json!(true),
+            );
+        });
+    };
+    let run = c1b_held_retry_chain("c1b-held-existing-mark", "fix", mark);
+    let start = run.retry.start.as_ref().expect("a retry start");
+    assert_eq!(
+        start.carried_pending_families,
+        Some(0),
+        "nothing is carried"
+    );
+    assert_eq!(run.retry.family_reads, rearm_family_sessions().len());
+    assert!(run
+        .record_after_retry
+        .is_some_and(|record| !record.terminal));
+}
+
+/// Fix 2's exception remains active beside #705 authority debt and another
+/// producer's unsettled mark: carry only the unchanged witnessed family,
+/// retain the held family's proof debt, and match BASE's liveness/acceptance.
+#[test]
+#[serial(source_manifests)]
+fn c1b_retry_pending_debt_beside_a_mark_in_a_full_rearm_window_keeps_fix2_carry() {
+    if !c1a_layout_supported("c1b_held_mark_full_rearm_window") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let mark = |fixture: &RearmFixture| {
+        c1a_edit_index(fixture, |saved| {
+            assert!(
+                saved
+                    .get("claude_full_rearm_progress")
+                    .and_then(|progress| progress.get("full_rearm_window"))
+                    .is_some(),
+                "retain Fix 2's full-rearm window"
+            );
+            saved.insert(
+                "bounded_sweep_had_unsettled_upload".to_owned(),
+                serde_json::json!(true),
+            );
+            // An unchanged, not-yet-due authority record normally skips its
+            // transcript. Give this arm an independent parser-upgrade read
+            // obligation so it also proves that a real held-family read is
+            // never carried or accepted. Keep its revision, witness, retry
+            // deadline and failure budget intact.
+            let terminal_key = saved["files"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .find(|key| key.ends_with(&format!("{REARM_TERMINAL}.jsonl")))
+                .expect("the held terminal is indexed")
+                .clone();
+            let revision = saved["files"][&terminal_key]["source_file_fingerprint"].clone();
+            let dispositions = saved
+                .entry("terminal_jsonl_dispositions".to_owned())
+                .or_insert_with(|| serde_json::json!({}))
+                .as_object_mut()
+                .unwrap();
+            assert!(dispositions
+                .insert(
+                    terminal_key,
+                    serde_json::json!({
+                        "source_file_fingerprint": revision,
+                        "parser_generation": "previous-parser-generation",
+                        "loss": {}
+                    }),
+                )
+                .is_none());
+        });
+    };
+    let fix = c1b_held_retry_chain("c1b-held-mark-full-window", "fix", mark);
+    let base = {
+        let _base = crate::snapshots::KeepStaleClaudeFamilyRearmForTest::new();
+        c1b_held_retry_chain("c1b-held-mark-full-window-base", "base", mark)
+    };
+    assert_eq!(
+        fix.retry.start.as_ref().unwrap().carried_pending_families,
+        Some(1)
+    );
+    assert_eq!(
+        base.retry.start.as_ref().unwrap().carried_pending_families,
+        Some(0)
+    );
+    assert_eq!(fix.retry.family_reads, 0, "the unchanged family is carried");
+    assert_eq!(base.retry.family_reads, rearm_family_sessions().len());
+    for (arm, run) in [("fix", &fix), ("base", &base)] {
+        assert!(
+            !run.marked_after_red,
+            "{arm}: authority debt itself never marks the sweep"
+        );
+        assert!(
+            run.retry.parsed.contains(REARM_TERMINAL),
+            "{arm}: the held family is read"
+        );
+        let before = run
+            .record_after_red
+            .as_ref()
+            .expect("authority debt before retry");
+        let after = run
+            .record_after_retry
+            .as_ref()
+            .expect("authority debt remains");
+        assert!(!after.terminal && after.bound_to_retained_witness, "{arm}");
+        assert_eq!(
+            after.failed_reconstruction_count,
+            before.failed_reconstruction_count
+        );
+        assert_eq!(
+            after.member_source_file_fingerprints,
+            before.member_source_file_fingerprints
+        );
+        assert_eq!(
+            run.head_after, run.head_before,
+            "{arm}: the held revision is never accepted"
+        );
+        assert!(
+            run.retry.red && !after.terminal,
+            "{arm}: the terminal family stays RetryPending"
+        );
+    }
+    assert_eq!(fix.retry.liveness(), base.retry.liveness());
+}
+
+/// SI P1: after a contract change, a full re-arm terminal with one
+/// RetryPending family keeps the contract-5 latch (and with it C1a's and
+/// C1b's skips off) although that debt no longer marks the sweep. Once the
+/// hold is released, the next clean terminal clears it.
+#[test]
+#[serial(source_manifests)]
+fn c1a_contract_latch_survives_a_full_rearm_terminal_with_retry_pending_debt() {
+    if !c1a_layout_supported("c1a_latch_retry_pending_debt") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len();
+    let fixture = c1a_fixture("c1a-latch-retry-pending-debt");
+    let closing = c1a_window(&c1a_generation(&fixture, "fix", (8, 0)));
+    assert!(closing.census_complete && closing.full_rearm && closing.fence_after);
+    assert_eq!(c1a_latch(&fixture), (c1a_collector(), false));
+    c1a_edit_index(&fixture, |saved| {
+        saved.remove("claude_request_identity_contract");
+        saved.remove("claude_request_identity_contract_changed");
+    });
+    let mut index = ScanIndex::load(&fixture.index_path).unwrap();
+    index.insert_retry_pending_claude_authority_for_test(REARM_TERMINAL);
+    index.save(&fixture.index_path).unwrap();
+    c1a_full_rearm_due(&fixture);
+    let held = c1a_window(&c1a_generation(&fixture, "fix", (8, 10)));
+    assert_eq!(held.family_reads, family);
+    assert!(!held.census_complete, "the census stays withheld");
+    let saved = ScanIndex::load(&fixture.index_path).unwrap();
+    assert!(saved
+        .claude_authority_record_for_test(REARM_TERMINAL)
+        .is_some_and(|record| !record.terminal && record.bound_to_retained_witness));
+    // FLIPS on the pre-bridge head: the debt marked the sweep.
+    assert!(!saved.bounded_sweep_had_unsettled_upload());
+    assert_eq!(
+        c1a_latch(&fixture),
+        (c1a_collector(), true),
+        "authority debt keeps the latch"
+    );
+    c1a_edit_index(&fixture, |saved| {
+        for field in [
+            "claude_usage_authority_quarantine",
+            "claude_usage_family_witnesses",
+        ] {
+            saved[field]
+                .as_object_mut()
+                .expect("a persisted map")
+                .remove(REARM_TERMINAL);
+        }
+    });
+    let cleared = c1a_window(&c1a_generation(&fixture, "fix", (8, 20)));
+    assert!(cleared.census_complete);
+    assert_eq!(
+        c1a_latch(&fixture),
+        (c1a_collector(), false),
+        "the next clean terminal clears it"
+    );
+}
+
+/// Fix 2's clean follow-up: the red 08:10 window, the full-rearm window the
+/// 08:00 full re-arm opened, instead finished needing a clean follow-up (a
+/// page of it settled partially), so the 08:20 start is a fresh walk.
+fn fix2_clean_followup(fixture: &RearmFixture) {
+    c1a_edit_index(fixture, |saved| {
+        assert!(
+            saved
+                .get("claude_full_rearm_progress")
+                .and_then(|progress| progress.get("full_rearm_window"))
+                .is_some(),
+            "the 08:10 start opened a full-rearm window"
+        );
+        saved.remove("traversal");
+        saved.insert(
+            "bounded_sweep_had_unsettled_upload".to_owned(),
+            serde_json::json!(true),
+        );
+    });
+}
+
+/// Fix 2, real pipeline: the clean follow-up after the full-rearm window
+/// carries the unchanged witnessed family, where BASE re-arms every stale
+/// family. Unwitnessed sessions keep the re-arm, nothing is credited (the
+/// census stays invalid while the fence stays closed), the accepted heads and
+/// the witness never change, and every window's liveness equals BASE.
+#[test]
+#[serial(source_manifests)]
+fn fix2_clean_followup_after_full_rearm_carries_unchanged_family() {
+    if !c1a_layout_supported("fix2_clean_followup") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let family = rearm_family_sessions().len() as u64;
+    let fix = c1b_red_chain("fix2-clean-followup", "fix", fix2_clean_followup);
+    let base = c1b_base_red_chain("fix2-clean-followup-base", fix2_clean_followup);
+    let [_, _, followup, repaired, _] = &fix.windows;
+    let [_, _, base_followup, _, _] = &base.windows;
+    let start = followup.start.as_ref().expect("a follow-up start");
+    let base_start = base_followup.start.as_ref().expect("a follow-up start");
+    assert_eq!(start.reason, base_start.reason);
+    assert_ne!(
+        start.reason, "terminal_unhealthy_retry",
+        "a clean follow-up"
+    );
+    assert_eq!(
+        start.stale_pending_families,
+        base_start.stale_pending_families
+    );
+    // Preconditions on BASE: the clean follow-up re-reads the family.
+    assert_eq!(base_followup.family_reads as u64, family);
+    assert_eq!(base_start.carried_pending_families, Some(0));
+    // FLIPS: the unchanged family is carried, not re-read.
+    assert_eq!(followup.family_reads, 0, "the carried family is not read");
+    assert!(
+        followup.parsed.contains(REARM_TERMINAL),
+        "unwitnessed: BASE"
+    );
+    assert_eq!(start.carried_pending_families, Some(1));
+    assert_eq!(start.carried_index_files, Some(family));
+    assert_eq!(
+        start.rearmed_index_files.map(|files| files + family),
+        base_start.rearmed_index_files,
+        "every other stale family keeps the BASE re-arm"
+    );
+    assert_eq!(
+        c1b_liveness(&fix),
+        c1b_liveness(&base),
+        "liveness is BASE's"
+    );
+    assert!(repaired.census_complete && repaired.fence_before && repaired.fence_after);
+    assert!(
+        repaired.census_invalid,
+        "no credit: the census stays invalid"
+    );
+    assert_eq!(
+        fix.heads_after, fix.heads_after_red,
+        "accepted heads unchanged"
+    );
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(
+        fix.witness_after, fix.witness_after_red,
+        "witness unchanged"
+    );
+    assert_eq!(fix.witness_after, base.witness_after);
+}
+
+/// Control, SI I3: a late API row gives the root's requests account evidence
+/// before the clean follow-up, so the sidecar-inclusive selection of every
+/// member changes (M1) and the family is re-read exactly as BASE's re-arm
+/// does. Every window's liveness equals BASE.
+#[test]
+#[serial(source_manifests)]
+fn fix2_late_api_row_rereads_the_family_like_base() {
+    if !c1a_layout_supported("fix2_late_api_row") {
+        return;
+    }
+    let _source_manifests = SourceManifestTestGuard::new();
+    let between = |fixture: &RearmFixture| {
+        fix2_clean_followup(fixture);
+        c1a_late_account_row(fixture);
+    };
+    let fix = c1b_red_chain("fix2-late-api-row", "fix", between);
+    let base = c1b_base_red_chain("fix2-late-api-row-base", between);
+    let family = rearm_family_sessions().len();
+    assert_eq!(
+        fix.windows[2].family_reads, family,
+        "M1 re-selects every member"
+    );
+    assert_eq!(base.windows[2].family_reads, family);
+    assert_eq!(c1b_liveness(&fix), c1b_liveness(&base));
+    for (window, base_window) in fix.windows.iter().zip(&base.windows).skip(3) {
+        assert_eq!(window.family_reads, base_window.family_reads);
+    }
+    assert_eq!(fix.heads_after, base.heads_after);
+    assert_eq!(fix.witness_after, base.witness_after);
 }

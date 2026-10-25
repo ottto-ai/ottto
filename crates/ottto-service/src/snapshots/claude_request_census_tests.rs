@@ -1182,7 +1182,11 @@ fn census_retired_record_survives_an_unchanged_reparse() {
         .record_for_test(&key)
         .expect("record")
         .clone();
-    assert_eq!(retired.retired_for_test(), Some(1), "retired at the terminal");
+    assert_eq!(
+        retired.retired_for_test(),
+        Some(1),
+        "retired at the terminal"
+    );
     let hashes = index.claude_request_census_for_test().totals_for_test().0;
     index
         .files
@@ -1694,7 +1698,9 @@ fn census_numeric_overflow_is_isolated_from_load_and_cas() {
     let scratch = crate::test_scratch::ScratchDir::new("census-overflow");
     let mut base = census_index_json(serde_json::json!({}));
     base["generation"] = serde_json::json!(7);
-    let expected = base.clone();
+    let mut expected = base.clone();
+    // Every loaded index carries the tombstone marker (SOURCE Round 13 F1).
+    expected["claude_retired_family_tombstones_initialized"] = serde_json::json!(true);
     for (name, field, raw) in [
         ("field", "claude_request_census", "1e400".to_owned()),
         (
@@ -2109,6 +2115,17 @@ fn census_sequence_index_preserves_serde_compatibility_and_isolates_evidence() {
         serde_json::json!(false),
         serde_json::json!([]),
         serde_json::json!({}),
+        // U1a-2a (#660): the side/proof fields after the parent ledgers
+        // (`serde(skip)` RAM fields take no slot).
+        serde_json::json!({}),
+        serde_json::json!({}),
+        serde_json::json!(0),
+        serde_json::json!(0),
+        serde_json::json!({}),
+        serde_json::Value::Null,
+        serde_json::Value::Null,
+        serde_json::json!(0),
+        serde_json::json!(""),
         serde_json::json!({}),
         serde_json::json!({}),
         serde_json::json!({}),
@@ -2245,7 +2262,9 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
             .save(&scratch.join(format!("{field}.json")))
             .expect("CAS isolates optional duplicates");
     }
-    // Required index fields retain their previous duplicate-field behavior.
+    // Required duplicate fields are ambiguous. Refuse without replacing the
+    // original witness; optional census duplicates above still invalidate only
+    // their evidence.
     let base = serde_json::to_string(&census_index_json(serde_json::json!({}))).unwrap();
     let path = scratch.join("duplicate-files.json");
     std::fs::write(
@@ -2253,10 +2272,21 @@ fn census_duplicate_optional_fields_invalidate_only_the_ambiguous_evidence() {
         format!("{},\"files\":{{}}}}", base.strip_suffix('}').unwrap()),
     )
     .unwrap();
-    let loaded = ScanIndex::load(&path).unwrap();
+    let bytes = std::fs::read(&path).unwrap();
     assert!(
-        !path.exists(),
-        "ordinary index corruption is still quarantined"
+        ScanIndex::load(&path).is_err(),
+        "ambiguous files field refuses"
     );
-    assert!(loaded.files.is_empty());
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "refusal preserves the original index"
+    );
+    assert!(
+        !std::fs::read_dir(&scratch)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .any(|entry| entry.file_name().to_string_lossy().contains(".corrupt.")),
+        "refusal never quarantines"
+    );
 }

@@ -675,6 +675,7 @@ impl ApcFixture {
                     ApcUpload::Shed => Err(anyhow::Error::new(UploadShed {
                         status: 503,
                         retry_after: Some(Duration::from_secs(60)),
+                        code: None,
                     })),
                     ApcUpload::PermanentRejection | ApcUpload::RetryableRejection => {
                         let response = crate::snapshot_client::SnapshotBatchResponse {
@@ -2559,14 +2560,21 @@ fn retry_pending_family_reproved_at_withheld_native_terminal_reloads_without_qua
     fixture.append_family_request(Some(APC_AGENTS[0]), "req_recovered", 4);
     for number in 0..APC_MAX_PAGES {
         let page = fixture.page(&format!("2026-08-02T10:{number:02}:00Z"), ApcUpload::Accept);
+        // Select the native terminal that sees the RetryPending record; the
+        // ordinary census before its fold must then be withheld (before the
+        // path-(a) bridge through the sweep mark, since then through the debt
+        // itself), so only the native fold can re-prove the family.
         let target = fixture.native_terminal_seen.get()
-            && !fixture.census_before_fold.get()
             && page.record_before().is_some_and(|record| !record.terminal);
         if !target {
             fixture.assert_durable(&page, 10);
             continue;
         }
         assert!(number > 0);
+        assert!(
+            !fixture.census_before_fold.get(),
+            "the ordinary census before the native fold is withheld"
+        );
         assert!(page.parsed.is_disjoint(&apc_family_sessions()));
         let before = page.record_before().unwrap();
         assert!(before.bound_to_retained_witness);
@@ -2712,4 +2720,161 @@ fn controlled_unbound_record_rearms_its_family_and_reforms_bound() {
         return;
     }
     panic!("the re-armed family is re-read within two bounded generations");
+}
+
+/// SOURCE/COST/SI Round 12 tombstone, proving case. A proven family is held
+/// RetryPending (unhealthy evidence), every member is removed, and a
+/// raw-complete census retires it as absent: the record goes, the tombstone
+/// and the proven witness stay. The members return while the evidence is
+/// still unhealthy: they are read through the authority path, never as new
+/// files, held with nothing offered, and a bounded RetryPending record
+/// re-forms against the same witness. Once the evidence is healthy again,
+/// the ordinary parser rebuilds every member from the CURRENT sidecar rows,
+/// the record resolves, the reported bodies are offered and accepted, and the
+/// tombstone clears with that settled proof.
+#[test]
+#[serial(source_manifests)]
+fn returning_family_is_held_until_it_reproves_then_reoffered_and_untombstoned() {
+    let _manifests = SourceManifestTestGuard::new();
+    let fixture = ApcFixture::new("patha-tombstone-reproves", false);
+    let established = fixture.establish();
+    let family = apc_family_sessions();
+    // A restart after the in-process baseline: retirement needs verified
+    // history (SOURCE Round 11 guard b) and a clear re-emission latch.
+    crate::snapshots::forget_claude_unverified_history_indexes_for_test();
+    crate::snapshots::restart_claude_reemission_stop_for_test();
+    // Every page is a whole traversal, so all members share one page.
+    fixture.page_files.set(16);
+    let mut hour = 10;
+    let mut pages_until = |label: &str, done: &dyn Fn(&ApcPage) -> bool| -> Vec<ApcPage> {
+        let mut pages = Vec::new();
+        for number in 0..2 * APC_MAX_PAGES {
+            let page = fixture.page(
+                &format!("2026-08-02T{hour:02}:{number:02}:00Z"),
+                ApcUpload::Accept,
+            );
+            assert_eq!(
+                fixture.quarantined_index_count(),
+                0,
+                "{label}: the saved index always reloads"
+            );
+            let finished = done(&page);
+            pages.push(page);
+            if finished {
+                hour += 1;
+                return pages;
+            }
+        }
+        panic!("PRECONDITION_NOT_REACHED: {label}");
+    };
+
+    // 1. Unhealthy evidence holds the family RetryPending on its changed root.
+    let api = fixture.sidecar_path("claude-code-effort");
+    let healthy_api = std::fs::read(&api).expect("read the healthy API sidecar");
+    fixture.corrupt_api_sidecar();
+    ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 0));
+    pages_until("a RetryPending hold", &|page| {
+        page.record()
+            .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
+    });
+
+    // 2. Every member is removed; a raw-complete census retires the family.
+    let members = std::iter::once(None)
+        .chain(APC_AGENTS.iter().map(|agent| Some(*agent)))
+        .map(|agent| {
+            let path = fixture.member_path(agent);
+            let bytes = std::fs::read(&path).expect("read the member transcript");
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+    for (path, _) in &members {
+        std::fs::remove_file(path).expect("remove the family member");
+    }
+    let retired = pages_until("the absent family retires", &|page| {
+        page.record().is_none() && page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    });
+    let retired = retired.last().expect("retiring page");
+    assert_eq!(
+        retired
+            .index
+            .claude_usage_family_witness_digest_for_test(APC_ROOT)
+            .as_deref(),
+        Some(established.proven.as_str()),
+        "the tombstone keeps the proven witness"
+    );
+    assert!(ApcFixture::family_keys(&retired.index).is_empty());
+
+    // 3. The members return under unhealthy evidence: held, nothing offered.
+    for (path, bytes) in &members {
+        std::fs::write(path, bytes).expect("restore the family member");
+    }
+    let hits_before = crate::snapshots::claude_absence_counters_for_test().tombstone_hits;
+    let held = pages_until("the returning family is held", &|page| {
+        page.record()
+            .is_some_and(|record| !record.terminal && record.bound_to_retained_witness)
+    });
+    let mut parsed = BTreeSet::new();
+    for page in &held {
+        parsed.extend(page.parsed.intersection(&family).cloned());
+        assert!(
+            family
+                .iter()
+                .all(|session| !page.offered_bodies.contains_key(session)),
+            "nothing is offered before the proof"
+        );
+    }
+    assert_eq!(
+        parsed, family,
+        "every returning member is read, never skipped"
+    );
+    let record = held.last().unwrap().record().unwrap();
+    assert_eq!(record.proven_witness_fingerprint, established.proven);
+    assert_eq!(record.failed_reconstruction_count, 1);
+    assert_eq!(
+        record
+            .member_source_file_fingerprints
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        family
+    );
+    assert!(held
+        .last()
+        .unwrap()
+        .index
+        .claude_family_tombstoned_for_test(APC_ROOT));
+    assert!(
+        crate::snapshots::claude_absence_counters_for_test().tombstone_hits > hits_before,
+        "the return is counted"
+    );
+
+    // 4. Healthy evidence again: the next changed revision re-proves from
+    // the current sidecar rows, and the reported bodies are re-offered.
+    std::fs::write(&api, &healthy_api).expect("repair the API sidecar");
+    ApcFixture::append(&fixture.member_path(None), &apc_note_line(APC_ROOT, 1));
+    let reproved = pages_until("the returning family re-proves", &|page| {
+        page.record().is_none()
+            && family
+                .iter()
+                .all(|session| page.offered_bodies.contains_key(session))
+    });
+    let page = reproved.last().unwrap();
+    for item in page
+        .scan
+        .snapshots
+        .iter()
+        .filter(|item| family.contains(&item.source_session_id))
+    {
+        assert_eq!(item.usage_accounting_contract.as_deref(), APC_REPORTED);
+        assert!(page.uploaded.contains(&item.snapshot_fingerprint));
+    }
+    assert_eq!(ApcFixture::family_keys(&page.index).len(), family.len());
+
+    // 5. The settled proof cleared the tombstone; the family stays settled.
+    let cleared = pages_until("the tombstone clears", &|page| {
+        !page.index.claude_family_tombstoned_for_test(APC_ROOT)
+    });
+    let last = cleared.last().unwrap();
+    assert!(last.record().is_none());
+    assert_eq!(ApcFixture::family_keys(&last.index).len(), family.len());
 }
