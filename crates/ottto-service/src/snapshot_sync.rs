@@ -21589,6 +21589,9 @@ mod tests {
     }
 
     include!("snapshot_sync/request_identity_pipeline_tests.rs");
+    mod money_e2_bench_tests {
+        include!("snapshot_sync/money_e2_bench_tests.rs");
+    }
     pub(super) mod permanent_finish_pipeline_tests {
         include!("snapshot_sync/permanent_finish_pipeline_tests.rs");
     }

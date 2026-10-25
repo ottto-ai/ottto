@@ -6,6 +6,31 @@ on:
     branches:
       - main
   workflow_dispatch:
+    inputs:
+      money_e2_bench:
+        description: Run the MONEY Design E2 benchmark (M4-sized fixture; reference, dark and gate-on arms)
+        type: boolean
+        default: false
+      money_e2_bench_scale:
+        description: E2 benchmark fixture counts scale, (0, 1]; only 1 can pass the gate
+        type: string
+        default: "1"
+      money_e2_bench_bytes_scale:
+        description: E2 benchmark bytes-per-line scale, (0, 1]; only 1 can pass the gate
+        type: string
+        default: "1"
+      money_e2_bench_rounds:
+        description: E2 benchmark counterbalanced rounds (each runs all three arms)
+        type: string
+        default: "3"
+      money_e2_bench_reference:
+        description: Pre-E2 reference commit (default merge-base of the branch and origin/main)
+        type: string
+        default: ""
+      money_e2_bench_structure_on_stub:
+        description: With a stub E2 hook, still run every arm to check the harness (the job still fails)
+        type: boolean
+        default: false
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -16,6 +41,7 @@ permissions:
 
 jobs:
   rust:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     name: Rust contracts
     timeout-minutes: 40
     runs-on: macos-15
@@ -92,6 +118,7 @@ jobs:
         run: cargo test --manifest-path crates/Cargo.toml --locked -p ottto-connector-testkit --test first_party_sources
 
   public-surface:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     name: Public surface checks
     timeout-minutes: 30
     runs-on: ubuntu-24.04
@@ -123,7 +150,7 @@ jobs:
 
   dependency-review:
     name: Dependency review
-    if: github.event_name == 'pull_request'
+    if: ${{ github.event_name == 'pull_request' && !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     timeout-minutes: 10
     runs-on: ubuntu-latest
     permissions:
@@ -141,6 +168,7 @@ jobs:
           fail-on-severity: moderate
 
   rust-advisories:
+    if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.money_e2_bench) }}
     name: Rust advisory audit
     timeout-minutes: 10
     runs-on: ubuntu-24.04
@@ -163,3 +191,253 @@ jobs:
       - name: Connector advisory audit
         run: cargo audit --deny warnings
         working-directory: crates
+
+  money-e2-bench:
+    name: Money E2 benchmark
+    # Manual dispatch only (workflow_dispatch with money_e2_bench=true), never
+    # on a pull request or push. Public repository, standard runner, no cache
+    # save. Fails closed: green only with the live E2 hook, the full M4 shape
+    # and every target met. Expected ~2-2.5 h at full shape.
+    if: github.event_name == 'workflow_dispatch' && inputs.money_e2_bench
+    timeout-minutes: 300
+    runs-on: macos-15
+    env:
+      RUSTUP_TOOLCHAIN: "1.95.0"
+      BENCH_SCALE: ${{ inputs.money_e2_bench_scale }}
+      BENCH_BYTES_SCALE: ${{ inputs.money_e2_bench_bytes_scale }}
+      BENCH_ROUNDS: ${{ inputs.money_e2_bench_rounds }}
+      BENCH_REFERENCE: ${{ inputs.money_e2_bench_reference }}
+      BENCH_STRUCTURE_ON_STUB: ${{ inputs.money_e2_bench_structure_on_stub }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          persist-credentials: false
+          # The reference arm builds a second, pre-E2 commit of this history.
+          fetch-depth: 0
+          path: candidate
+      - run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      - name: Runner receipt
+        run: |
+          set -euo pipefail
+          sw_vers
+          sysctl -n machdep.cpu.brand_string hw.ncpu hw.memsize
+          df -h "$RUNNER_TEMP"
+          rustc -V
+          git -C candidate rev-parse HEAD | tee "$RUNNER_TEMP/e2-candidate-sha.txt"
+      - name: Build the candidate benchmark
+        working-directory: candidate
+        run: |
+          set -euo pipefail
+          # One optimized test build (the shipped release profile); every
+          # mode below execs it directly in a fresh process. Both builds share
+          # one target directory, so dependencies compile once.
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          cargo test -p ottto-service --lib --locked --release --no-run --message-format=json > "$RUNNER_TEMP/e2-build-candidate.jsonl"
+          python3 -c 'import json,sys,shutil; bins=[r["executable"] for r in map(json.loads, open(sys.argv[1])) if r.get("reason")=="compiler-artifact" and r.get("executable")]; assert len(bins)==1, bins; shutil.copy2(bins[0], sys.argv[2])' "$RUNNER_TEMP/e2-build-candidate.jsonl" "$RUNNER_TEMP/bench-candidate"
+      - name: E2 hook (fails closed without the live hook)
+        run: |
+          set -euo pipefail
+          bench="$RUNNER_TEMP/bench-candidate"
+          test_name="$("$bench" --list --ignored 2>/dev/null | sed -n 's/^\(.*money_e2_bench_receipt\): test$/\1/p')"
+          [ -n "$test_name" ]
+          echo "$test_name" > "$RUNNER_TEMP/e2-test-name.txt"
+          OTTTO_E2_BENCH_MODE=hook "$bench" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 | tee "$RUNNER_TEMP/e2-hook.log"
+          state="$(sed -n 's/^MONEY_E2_BENCH_HOOK \(.*\)$/\1/p' "$RUNNER_TEMP/e2-hook.log")"
+          echo "$state" > "$RUNNER_TEMP/e2-hook.txt"
+          if [ "$state" != live ]; then
+            echo "::error::MONEY_E2_BENCH hook not live (state=${state:-missing}): this build does not expose the E2 bench seam, so no receipt from it can pass"
+            [ "$BENCH_STRUCTURE_ON_STUB" = true ] || exit 1
+            echo "Structure check on a stub hook: every arm runs, then the gate step fails."
+          fi
+      - name: Build the pre-E2 reference
+        run: |
+          set -euo pipefail
+          cd candidate
+          ref="${BENCH_REFERENCE:-$(git merge-base HEAD origin/main)}"
+          git rev-parse "$ref^{commit}" | tee "$RUNNER_TEMP/e2-reference-sha.txt"
+          git worktree add --detach "$RUNNER_TEMP/reference" "$ref"
+          # The candidate's benchmark file, with the pre-E2 hook, in the
+          # reference tree (included from snapshot_sync's tests if absent).
+          python3 - "$PWD" "$RUNNER_TEMP/reference" <<'PY'
+          import pathlib, sys
+          cand, ref = map(pathlib.Path, sys.argv[1:3])
+          rel = "crates/ottto-service/src/snapshot_sync/money_e2_bench_tests.rs"
+          text = (cand / rel).read_text()
+          begin, end = "// MONEY_E2_BENCH_HOOK_BEGIN", "// MONEY_E2_BENCH_HOOK_END"
+          assert text.count(begin) == 1 and text.count(end) == 1, "hook markers"
+          head, rest = text.split(begin)
+          tail = rest.split(end)[1]
+          (ref / rel).write_text(head + "use reference_hook as e2_hook;" + tail)
+          sync = ref / "crates/ottto-service/src/snapshot_sync.rs"
+          source = sync.read_text()
+          if "snapshot_sync/money_e2_bench_tests.rs" not in source:
+              anchor = '    include!("snapshot_sync/request_identity_pipeline_tests.rs");\n'
+              assert source.count(anchor) == 1, "reference include anchor"
+              sync.write_text(source.replace(anchor, anchor + '    mod money_e2_bench_tests {\n        include!("snapshot_sync/money_e2_bench_tests.rs");\n    }\n'))
+          PY
+          cd "$RUNNER_TEMP/reference"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/target"
+          cargo test -p ottto-service --lib --locked --release --no-run --message-format=json > "$RUNNER_TEMP/e2-build-reference.jsonl"
+          python3 -c 'import json,sys,shutil; bins=[r["executable"] for r in map(json.loads, open(sys.argv[1])) if r.get("reason")=="compiler-artifact" and r.get("executable")]; assert len(bins)==1, bins; shutil.copy2(bins[0], sys.argv[2])' "$RUNNER_TEMP/e2-build-reference.jsonl" "$RUNNER_TEMP/bench-reference"
+          df -h "$RUNNER_TEMP"
+      - name: Prepare the M4-shaped corpus
+        run: |
+          set -euo pipefail
+          need="$(python3 -c 'import sys; print(int(18.86e9 * float(sys.argv[1]) * float(sys.argv[2]) * 1.1 + 4 * 2**30))' "$BENCH_SCALE" "$BENCH_BYTES_SCALE")"
+          free="$(df -k "$RUNNER_TEMP" | awk 'NR==2 {print $4 * 1024}')"
+          echo "corpus needs ~$need bytes, $free free"
+          if [ "$free" -lt "$need" ]; then
+            echo "::error::not enough disk for the E2 corpus ($free free, $need needed)"
+            exit 1
+          fi
+          export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench"
+          mkdir -p "$OTTTO_E2_BENCH_ROOT"
+          OTTTO_E2_BENCH_MODE=prepare OTTTO_E2_BENCH_SCALE="$BENCH_SCALE" OTTTO_E2_BENCH_BYTES_SCALE="$BENCH_BYTES_SCALE" \
+            "$RUNNER_TEMP/bench-candidate" "$(cat "$RUNNER_TEMP/e2-test-name.txt")" --exact --ignored --nocapture --test-threads 1 2>&1 \
+            | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+          du -sh "$OTTTO_E2_BENCH_ROOT"
+          df -h "$RUNNER_TEMP"
+      - name: Arms (reference, dark, gate on; counterbalanced)
+        run: |
+          set -euo pipefail
+          export OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench"
+          test_name="$(cat "$RUNNER_TEMP/e2-test-name.txt")"
+          run_arm() {
+            local arm="$1" round="$2" bin="$RUNNER_TEMP/bench-candidate"
+            [ "$arm" = reference ] && bin="$RUNNER_TEMP/bench-reference"
+            # Each run is a fresh process with an empty state directory; the
+            # corpus is shared and restored after the largest-file appends.
+            OTTTO_E2_BENCH_MODE=arm OTTTO_E2_BENCH_ARM="$arm" OTTTO_E2_BENCH_TAG="$arm-$round" \
+              OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-arm-$arm-$round.json" \
+              "$bin" "$test_name" --exact --ignored --nocapture --test-threads 1 2>&1 \
+              | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+            rm -rf "$OTTTO_E2_BENCH_ROOT/runs/$arm-$round"
+          }
+          for round in $(seq 0 $((BENCH_ROUNDS - 1))); do
+            if [ $((round % 2)) -eq 0 ]; then order="reference dark on"; else order="on dark reference"; fi
+            for arm in $order; do run_arm "$arm" "$round"; done
+          done
+      - name: Switch-on reread probe (revision 2 to 3)
+        run: |
+          set -euo pipefail
+          OTTTO_E2_BENCH_ROOT="$RUNNER_TEMP/e2-bench" OTTTO_E2_BENCH_MODE=reread OTTTO_E2_BENCH_OUTPUT="$RUNNER_TEMP/e2-reread.json" \
+            "$RUNNER_TEMP/bench-candidate" "$(cat "$RUNNER_TEMP/e2-test-name.txt")" --exact --ignored --nocapture --test-threads 1 2>&1 \
+            | tee -a "$RUNNER_TEMP/e2-bench.log" | grep -E '^(MONEY_E2_BENCH|test result: ok\. 1 passed)'
+      - name: Gate (HANDOFF section 6 marks; fails closed)
+        run: |
+          set -euo pipefail
+          cp "$RUNNER_TEMP/e2-bench/manifest.json" "$RUNNER_TEMP/e2-manifest.json"
+          python3 - "$RUNNER_TEMP" <<'PY'
+          import json, pathlib, statistics, sys
+          root = pathlib.Path(sys.argv[1])
+          read = lambda name: json.loads((root / name).read_text())
+          manifest = read("e2-manifest.json")
+          hook = (root / "e2-hook.txt").read_text().strip()
+          arms = {a: [json.loads(p.read_text()) for p in sorted(root.glob(f"e2-arm-{a}-*.json"))] for a in ("reference", "dark", "on")}
+          candidate = arms["dark"] + arms["on"]
+          reread = read("e2-reread.json")
+          MIB = 1 << 20
+          med = lambda values: statistics.median(values) if values else None
+          def per_arm(f):
+              return {a: med([f(r) for r in runs]) for a, runs in arms.items()}
+          def ratio(values, arm):
+              return values[arm] / values["reference"] if values[arm] is not None and values["reference"] else None
+          wall = per_arm(lambda r: r["traversal"]["wall_us"])
+          cpu = per_arm(lambda r: r["traversal"]["cpu_us"])
+          rss = per_arm(lambda r: r["max_rss_bytes"])
+          steady = per_arm(lambda r: r["phys_footprint_steady_bytes"])
+          peak = per_arm(lambda r: r["phys_footprint_peak_bytes"])
+          index = per_arm(lambda r: r["index_bytes"] or 0)
+          rss_ref = [r["max_rss_bytes"] for r in arms["reference"]]
+          # Peak RSS of identical code moved ~6% between processes in the
+          # stub proof run, so "not worse" allows max(2 MiB, twice the
+          # reference spread, 5% of the reference median).
+          rss_tolerance = max(2 * MIB, 2 * (max(rss_ref) - min(rss_ref)), 0.05 * statistics.median(rss_ref)) if rss_ref else None
+          fold = [r["traversal"]["e2"].get("fold_us", 0) / r["traversal"]["e2"]["responses"]
+                  for r in candidate if r["traversal"]["e2"].get("responses")]
+          finalize_ms = [f["e2"].get("fold_us", 0) / 1000 for r in candidate for f in r["finishes"] if f["e2"].get("responses")]
+          expected = manifest["expected"]
+          counters = [{k: r["traversal"]["e2"].get(k, 0) for k in ("responses", "copy_skipped", "disclosed", "unmatched_1h", "dark_unexplained")} | {"tag": r["tag"]} for r in candidate]
+          pages = {a: [p["wall_us"] for r in runs for p in r["page_receipts"]] for a, runs in arms.items()}
+          def spread(values):
+              values = sorted(values)
+              return {"p50": values[len(values) // 2], "p95": values[min(len(values) - 1, int(len(values) * 0.95))], "max": values[-1]} if values else None
+          reread_page_wall = med([p["wall_us"] for p in reread["page_receipts"]]) or 0
+          reread_hours = reread["pages"] * (reread["sync_interval_s"] + reread_page_wall / 1e6) / 3600
+          digests = {a: sorted({r["uploads"]["fingerprint_digest"] for r in runs}) for a, runs in arms.items()}
+          result = {
+              "candidate_sha": (root / "e2-candidate-sha.txt").read_text().strip(),
+              "reference_sha": (root / "e2-reference-sha.txt").read_text().strip(),
+              "hook": hook,
+              "fixture": manifest,
+              "runs": {a: [r["tag"] for r in runs] for a, runs in arms.items()},
+              "traversal_pages": per_arm(lambda r: r["pages"]),
+              "page_wall_us": {a: spread(v) for a, v in pages.items()},
+              "traversal_wall_us": wall,
+              "traversal_cpu_us_net_of_backend": cpu,
+              "wall_ratio": {a: ratio(wall, a) for a in ("dark", "on")},
+              "cpu_ratio": {a: ratio(cpu, a) for a in ("dark", "on")},
+              "cpu_ratio_on_vs_dark": cpu["on"] / cpu["dark"] if cpu["on"] and cpu["dark"] else None,
+              "max_rss_bytes": rss,
+              "max_rss_tolerance_bytes": rss_tolerance,
+              "phys_footprint_steady_bytes": steady,
+              "phys_footprint_peak_bytes": peak,
+              "index_bytes": index,
+              "index_bytes_delta": {a: index[a] - index["reference"] for a in ("dark", "on") if index[a] is not None and index["reference"] is not None},
+              "fold_us_per_response": fold,
+              "largest_native_finalize_ms": finalize_ms,
+              "counters": counters,
+              "expected_counters": expected,
+              "uploads": {a: [r["uploads"] | {"tag": r["tag"]} for r in runs] for a, runs in arms.items()},
+              "upload_fingerprint_digests": digests,
+              "dark_uploads_equal_reference": digests["dark"] == digests["reference"] and len(digests["dark"]) == 1,
+              "reread": {k: reread[k] for k in ("revision", "files", "stamped_files", "bytes", "pages", "wall_us", "cpu_us", "sync_interval_s", "max_rss_bytes")} | {
+                  "page_wall_us_median": reread_page_wall, "projected_hours": reread_hours},
+          }
+          def within(value, limit):
+              return value is not None and value <= limit
+          targets = {
+              "hook_live": hook == "live" and bool(candidate) and all(r["hook"] == "live" for r in candidate),
+              "reference_is_pre_e2_build": bool(arms["reference"]) and all(r["hook"] == "reference" for r in arms["reference"]),
+              "full_m4_shape": bool(manifest["full_shape_counts"] and manifest["full_shape_bytes"]),
+              "e2_counters_measured": bool(fold) and len(fold) == len(candidate) and bool(finalize_ms),
+              "counters_match_fixture": bool(candidate) and all(c[k] == expected[k] for c in counters for k in ("responses", "copy_skipped", "disclosed")),
+              "gate_effective": bool(arms["on"]) and all(r["uploads"]["literal_items"] > 0 for r in arms["on"])
+                  and all(r["uploads"]["literal_items"] == 0 for r in arms["dark"] + arms["reference"]),
+              "fold_us_per_response_le_1": within(med(fold), 1.0),
+              "largest_native_finalize_le_50ms": within(max(finalize_ms) if finalize_ms else None, 50.0),
+              "page_wall_le_5pct": all(within(ratio(wall, a), 1.05) for a in ("dark", "on")),
+              "page_cpu_le_5pct": all(within(ratio(cpu, a), 1.05) for a in ("dark", "on")),
+              "peak_rss_not_worse": rss_tolerance is not None and all(within(rss[a], rss["reference"] + rss_tolerance) for a in ("dark", "on")),
+              "phys_footprint_le_2mib": all(within(steady[a], steady["reference"] + 2 * MIB) for a in ("dark", "on") if steady["reference"] is not None) and steady["reference"] is not None,
+              # Dark must not change what is uploaded: the same snapshot
+              # fingerprints as the pre-E2 reference, stable across rounds.
+              "dark_uploads_equal_reference": result["dark_uploads_equal_reference"],
+              "reread_le_6h": reread["pages"] > 0 and reread_hours <= 6.0,
+          }
+          result["targets"] = targets
+          result["verdict"] = "pass" if all(targets.values()) else "fail"
+          (root / "e2-summary.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("MONEY_E2_BENCH_SUMMARY " + json.dumps({k: result[k] for k in result if k not in ("fixture", "uploads", "counters")}, sort_keys=True))
+          print("MONEY_E2_BENCH_TARGETS " + json.dumps(targets, sort_keys=True))
+          if hook != "live":
+              print("::error::MONEY_E2_BENCH hook not live: the receipt cannot pass")
+          if not all(targets.values()):
+              print("::error::MONEY_E2_BENCH failed: " + ", ".join(k for k, ok in targets.items() if not ok))
+              sys.exit(1)
+          print("MONEY_E2_BENCH verdict=pass")
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: money-e2-bench-receipts
+          retention-days: 30
+          if-no-files-found: ignore
+          path: |
+            ${{ runner.temp }}/e2-*.json
+            ${{ runner.temp }}/e2-*.txt
+            ${{ runner.temp }}/e2-*.log
+            ${{ runner.temp }}/e2-bench/manifest.json
