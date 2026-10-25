@@ -34,6 +34,7 @@ pub(crate) use claude_context_file_birth::{
     ClaudeFileBirth, ClaudeFileBirthVerdict, ClaudeVetoApiRows,
 };
 mod claude_history_upgrade;
+mod codex_root_copies;
 #[cfg(test)]
 pub(crate) use claude_history_upgrade::{
     local_count as history_local_count, with_max_gated_claude_revision,
@@ -14159,8 +14160,14 @@ fn claude_usage_is_progressive_after(current: &UsageTotals, previous: &UsageTota
 struct CodexTitleMetadata {
     local_diagnostics: CodexScanDiagnostics,
     titles: BTreeMap<String, CodexTitleCandidate>,
+    /// Merged maximum for state-only fallback; never use for file binding.
+    /// Registered files must use `thread_extent_for_path` and their own home.
     state_threads: BTreeMap<String, CodexStateThread>,
+    /// Merged maximum for metadata summaries; never use for file binding.
     rollout_extents: BTreeMap<String, CodexRolloutExtent>,
+    /// File-binding evidence stays with the home that supplied it. A merged
+    /// usage high-water mark must never seed another copy's creation proof.
+    root_sidecars: BTreeMap<PathBuf, codex_root_copies::RootSidecar>,
     /// Canonical session ids whose trusted Codex state row declares
     /// `thread_source=agent_created_thread`. This is deliberately separate
     /// from generic spawn edges: the state declaration is an ownership
@@ -15985,8 +15992,8 @@ impl SnapshotAccumulator {
         self.codex_path_sidecar_candidates = identities
             .into_iter()
             .map(|identity| {
-                let thread = metadata.state_threads.get(identity.as_str());
-                let rollout_extent = metadata.rollout_extents.get(identity.as_str()).copied();
+                let (thread, rollout_extent) =
+                    metadata.thread_extent_for_path(identity.as_str(), path);
                 let parent = metadata
                     .family_position(identity.as_str())
                     .map(|(parent, _, _)| parent);
@@ -27035,7 +27042,11 @@ impl OwnedSourceScan {
                 }
                 if source == SnapshotSource::Codex {
                     for snapshot in parsed.iter_mut() {
-                        apply_codex_state_evidence(snapshot, &codex_title_metadata);
+                        apply_codex_state_evidence(
+                            snapshot,
+                            &codex_title_metadata,
+                            &candidate.path,
+                        );
                     }
                     for snapshot in &parsed {
                         if snapshot.usage_accounting_contract.as_deref()
@@ -29469,9 +29480,20 @@ fn claude_authority_preflight_fingerprint(
         .then(|| candidate.source_file_fingerprint.clone())
 }
 
-fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata) {
+fn apply_codex_state_evidence(item: &mut SnapshotItem, metadata: &CodexTitleMetadata, path: &Path) {
     let source_session_id = resolve_codex_identity(item.source_session_id.as_str());
-    let Some(thread) = metadata.state_threads.get(source_session_id.as_str()) else {
+    if metadata
+        .identity_conflicts
+        .contains(source_session_id.as_str())
+    {
+        return;
+    }
+    // Parsed usage and its recorded state total must describe the same home.
+    // A missing file in a stale home cannot inflate the parsed file's evidence.
+    let Some(thread) = metadata
+        .thread_extent_for_path(source_session_id.as_str(), path)
+        .0
+    else {
         return;
     };
     if thread.tokens_used == 0 {
@@ -35226,13 +35248,20 @@ impl CodexTitleMetadata {
 
     fn path_sidecar_fingerprint_for(&self, path: &Path, reduction_only: bool) -> String {
         if let Some(identity) = self.identity_from_path_evidence(path) {
-            return self.session_sidecar_fingerprint_for(identity.as_str(), reduction_only);
+            return self.session_sidecar_fingerprint_in(
+                identity.as_str(),
+                reduction_only,
+                Some(path),
+            );
         }
         let parts = codex_session_id_candidates_from_path(path)
             .into_iter()
             .flat_map(|identity| {
-                let fingerprint =
-                    self.session_sidecar_fingerprint_for(identity.as_str(), reduction_only);
+                let fingerprint = self.session_sidecar_fingerprint_in(
+                    identity.as_str(),
+                    reduction_only,
+                    Some(path),
+                );
                 [identity, fingerprint]
             })
             .collect::<Vec<_>>();
@@ -35267,25 +35296,56 @@ impl CodexTitleMetadata {
 
     #[cfg(test)]
     fn session_sidecar_fingerprint(&self, source_session_id: &str) -> String {
-        self.session_sidecar_fingerprint_for(source_session_id, false)
+        self.session_sidecar_fingerprint_in(source_session_id, false, None)
     }
 
-    fn session_sidecar_fingerprint_for(
+    fn thread_extent_for_path(
+        &self,
+        identity: &str,
+        path: &Path,
+    ) -> (Option<&CodexStateThread>, Option<CodexRolloutExtent>) {
+        if let Some((_, sidecar)) = self
+            .root_sidecars
+            .iter()
+            .filter(|(root, _)| path.starts_with(root))
+            .max_by_key(|(root, _)| root.components().count())
+        {
+            return (
+                sidecar.threads.get(identity),
+                sidecar.extents.get(identity).copied(),
+            );
+        }
+        (
+            self.state_threads.get(identity),
+            self.rollout_extents.get(identity).copied(),
+        )
+    }
+
+    fn session_sidecar_fingerprint_in(
         &self,
         source_session_id: &str,
         reduction_only: bool,
+        path: Option<&Path>,
     ) -> String {
         let source_session_id = resolve_codex_identity(source_session_id);
         let title = (!reduction_only)
             .then(|| self.titles.get(source_session_id.as_str()))
             .flatten();
-        let thread = self.state_threads.get(source_session_id.as_str());
+        let (thread, extent) = path.map_or_else(
+            || {
+                (
+                    self.state_threads.get(source_session_id.as_str()),
+                    self.rollout_extents
+                        .get(source_session_id.as_str())
+                        .copied(),
+                )
+            },
+            |path| self.thread_extent_for_path(source_session_id.as_str(), path),
+        );
         let decoration = (!reduction_only).then_some(thread).flatten();
-        let extent = (!reduction_only)
-            .then(|| self.rollout_extents.get(source_session_id.as_str()))
-            .flatten();
+        let extent = (!reduction_only).then_some(extent).flatten();
         let family = self.family_position(source_session_id.as_str());
-        sha256_hex(&[
+        let fingerprint = sha256_hex(&[
             "codex_session_sidecar:v4",
             source_session_id.as_str(),
             if self
@@ -35358,7 +35418,15 @@ impl CodexTitleMetadata {
                 .map(|(_, _, depth)| *depth)
                 .unwrap_or_default()
                 .to_string(),
-        ])
+        ]);
+        // A per-home row can stay byte-identical while another home's row
+        // creates a collision. Invalidate paused ownership decisions as well
+        // as fresh parsing; census flags alone are not cursor dependencies.
+        if self.identity_conflicts.contains(source_session_id.as_str()) {
+            sha256_hex(&["codex_identity_conflict:v1", &fingerprint])
+        } else {
+            fingerprint
+        }
     }
 
     fn load_from_roots(roots: &[PathBuf]) -> Self {
@@ -35391,12 +35459,14 @@ impl CodexTitleMetadata {
                 local_index_key(&codex_dir).as_str(),
             );
             let thread_conflicts_before = metadata.identity_conflicts.len();
+            let mut root_sidecar = codex_root_copies::RootSidecar::default();
             let state_census = load_codex_sqlite_state_threads(
                 &state_path,
-                &mut metadata.state_threads,
+                &mut root_sidecar.threads,
                 &mut metadata.identity_conflicts,
                 &mut metadata.local_diagnostics.identity_conflict_taxonomy,
             );
+            codex_root_copies::merge_threads(&mut metadata, &codex_dir, &root_sidecar.threads);
             metadata.local_diagnostics.state_threads.observe_root(
                 &state_census,
                 metadata.identity_conflicts.len() != thread_conflicts_before,
@@ -35438,9 +35508,10 @@ impl CodexTitleMetadata {
             let history_conflicts_before = metadata.identity_conflicts.len();
             let history_census = load_codex_rollout_extents(
                 &history_path,
-                &mut metadata.rollout_extents,
+                &mut root_sidecar.extents,
                 &mut metadata.identity_conflicts,
             );
+            codex_root_copies::merge_extents(&mut metadata, &root_sidecar.extents);
             metadata.local_diagnostics.rollout_extents.observe_root(
                 &history_census,
                 metadata.identity_conflicts.len() != history_conflicts_before,
@@ -35454,6 +35525,9 @@ impl CodexTitleMetadata {
                 metadata.sidecar_census_incomplete = true;
             }
 
+            metadata
+                .root_sidecars
+                .insert(codex_dir.clone(), root_sidecar);
             let index_path = codex_dir.join("session_index.jsonl");
             legacy_sidecar_parts.push(sidecar_stat_fingerprint(&index_path));
             let index_conflicts_before = metadata.identity_conflicts.len();
@@ -35485,6 +35559,14 @@ impl CodexTitleMetadata {
                 metadata.spawn_parent_conflicts.insert(child);
             }
         }
+        // A collision found by a later root/loader must also withhold any
+        // earlier total-only fallback, even if no rollout can be opened.
+        metadata
+            .state_threads
+            .retain(|id, _| !metadata.identity_conflicts.contains(id));
+        metadata
+            .rollout_extents
+            .retain(|id, _| !metadata.identity_conflicts.contains(id));
         metadata.count_identity_conflict_scope();
         metadata.legacy_sidecar_fingerprint = sha256_hex_owned(&legacy_sidecar_parts);
         metadata
@@ -45569,6 +45651,16 @@ mod tests {
             .state_threads
             .get_mut(all_local_child)
             .expect("all-local child state row")
+            .created_at = Some("2026-08-26T15:02:00Z".to_string());
+        // File binding reads the home's row; keep this fixture override in sync
+        // with its merged row without changing the expected ownership proof.
+        metadata
+            .root_sidecars
+            .get_mut(&codex_dir)
+            .expect("loaded Codex home")
+            .threads
+            .get_mut(all_local_child)
+            .expect("all-local child home row")
             .created_at = Some("2026-08-26T15:02:00Z".to_string());
         assert_ne!(metadata.session_sidecar_fingerprint(child), without_edge);
         assert!(metadata.state_created_threads.contains(child));
@@ -82217,7 +82309,7 @@ crate::heap_layout_bound::fields!(CodexPathSidecarCandidate; identity, recorded_
 crate::heap_layout_bound::fields!(CodexRolloutExtent; next_byte_offset, next_ordinal);
 crate::heap_layout_bound::fields!(CodexStateThread; title, tokens_used, archived, created_at, updated_at, model, rollout_path);
 crate::heap_layout_bound::fields!(CodexTitleCandidate; title, source);
-crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
+crate::heap_layout_bound::fields!(CodexTitleMetadata; local_diagnostics, titles, state_threads, rollout_extents, root_sidecars, state_created_threads, spawn_parents, spawn_parent_conflicts, identity_conflicts, state_census_incomplete, sidecar_census_incomplete, state_census_unscoped_incomplete, sidecar_census_unscoped_incomplete, created_thread_census_unscoped_incomplete, legacy_sidecar_fingerprint, legacy_config_file_present);
 crate::heap_layout_bound::fields!(CodexTurnTraceMap; priority_turns, incomplete);
 crate::heap_layout_bound::fields!(ParsedJsonlFile; snapshots, report, recognized_usage_drop_count, claude_compaction_unlinked_parent_count,
     ownership_incomplete_file_count, zero_snapshot_usage_evidence, dropped_usage_record_count,
