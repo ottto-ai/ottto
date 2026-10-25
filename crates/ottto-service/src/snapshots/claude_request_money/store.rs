@@ -3464,7 +3464,13 @@ mod bounded_save_tests {
                 );
                 assert!(held.1 .1 < SAVE_DAILY_BYTES as u64);
             }
-            assert_eq!(load(&scratch).unwrap().get(key), Some((&record).into()));
+            assert_eq!(
+                load(&scratch)
+                    .unwrap()
+                    .get(key)
+                    .map(|value| value.to_owned_record()),
+                Some(record.clone())
+            );
             if name != Some(SAVE_BUDGET_FILE) {
                 WRITE_CLOCK.with(|clock| *clock.borrow_mut() = [midnight].into());
                 assert_eq!(write_shard(&dir, META, b"{}"), !damaged);
@@ -3483,9 +3489,15 @@ mod bounded_save_tests {
                 0,
                 "rollback cannot reset repaired accounting"
             );
-            assert_eq!(load(&scratch).unwrap().get(key), Some((&record).into()));
+            assert_eq!(
+                load(&scratch)
+                    .unwrap()
+                    .get(key)
+                    .map(|value| value.to_owned_record()),
+                Some(record.clone())
+            );
         }
-        println!("MONEY_P1B_QUOTA_RECOVERY upgrade_hold_days=0 corrupt_hold_days=1 missing_save_hold_days=0 next_day_ticket={} rollback_grant=0", SAVE_BYTES_PER_PAGE);
+        println!("MONEY_P1B_QUOTA_RECOVERY upgrade_hold_days=0 corrupt_hold_days=1 missing_save_hold_days=0 next_day_ticket={SAVE_BYTES_PER_PAGE} rollback_grant=0");
     }
     #[test]
     #[serial_test::serial(claude_request_money_shadow)]
