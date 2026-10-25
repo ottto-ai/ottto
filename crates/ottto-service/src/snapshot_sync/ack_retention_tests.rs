@@ -496,7 +496,10 @@ fn default_unsettled_ack_budget_has_bounded_persisted_and_heap_size() {
     assert!(loaded.admit_ack_batch(1).is_err());
     assert!(std::fs::metadata(&path).unwrap().len() <= 2 * 1024 * 1024);
     if crate::heap_layout_bound::layout_supported() {
-        let bound = crate::heap_layout_bound::bound(&loaded, 8 * 1024 * 1024)
+        // This is a completed persisted ledger, not a per-line parser check.
+        // Compose per-element counters so 4096 entries do not exhaust the
+        // short traversal's 4096 visits before the byte bound is measured.
+        let bound = crate::heap_layout_bound::completed_bound(&loaded, 8 * 1024 * 1024)
             .expect("hash state including conservative whole-node tree pricing fits 8 MiB");
         eprintln!(
             "upload_ack_debt_bound entities={capacity} heap_bound={bound} serialized_bytes={}",
