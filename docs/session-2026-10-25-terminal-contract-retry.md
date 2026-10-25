@@ -80,3 +80,10 @@ owning file and unrelated files over seven due cycles. They cover restarts
 before outcomes, repeated server conflicts, actual post-read checkpoint-write
 failures, stale index merges, same-generation CAS restoration and malformed
 claim metadata, while preserving the retained identity and ACK fixture.
+
+
+A legacy absent body witness is unknown, so learning its first exact body does
+not erase a contract-origin counter. Budget merges conservatively bind that
+unknown witness to the learned body, while two different known bodies retain
+the existing independent-pair behavior. A separate real-scanner conflict case
+covers the absent-body migration and its two-acquisition bound.

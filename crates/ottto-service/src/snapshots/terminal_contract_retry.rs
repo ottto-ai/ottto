@@ -177,7 +177,11 @@ pub(crate) fn merge_claims(
     let Some(claims) = other.contract_retry_claims else {
         return false;
     };
-    if record.upload_body_witness != other.upload_body_witness {
+    // A missing legacy body is unknown, not proof that this is a new pair.
+    if record.upload_body_witness.is_some()
+        && other.upload_body_witness.is_some()
+        && record.upload_body_witness != other.upload_body_witness
+    {
         return false;
     }
     if record.reconstruction_contract < other.reconstruction_contract {
@@ -193,16 +197,19 @@ pub(crate) fn merge_claims(
         return false;
     }
     let before = record.clone();
+    if record.upload_body_witness.is_none() {
+        record.upload_body_witness = other.upload_body_witness.clone();
+    }
     let previous = record.contract_retry_claims;
     record.contract_retry_claims = Some(previous.unwrap_or(0).max(claims));
-    if previous.is_none_or(|n| n < claims)
+    if previous.map_or(true, |n| n < claims)
         && record.disposition == SnapshotQuarantineDisposition::RetryPending
     {
         record.retry_after_unix_seconds = record
             .retry_after_unix_seconds
             .max(other.retry_after_unix_seconds);
     }
-    if previous.is_none_or(|n| n <= claims)
+    if previous.map_or(true, |n| n <= claims)
         && other.disposition == SnapshotQuarantineDisposition::UnprovenTerminal
         && record.disposition != SnapshotQuarantineDisposition::SupersededTerminal
     {

@@ -1850,19 +1850,17 @@ impl SnapshotUploadProgress {
             .active_quarantine_witness
             .clone()
             .expect("upload progress always has an active quarantine witness");
-        let existing = self
+        let budget = self
             .quarantined_fingerprints
             .get(fingerprint)
             .filter(|record| {
-                record.witness == witness
-                    && record.upload_body_witness.as_deref() == Some(body_witness)
+                record.upload_body_witness.as_deref() == Some(body_witness)
+                    || (record.upload_body_witness.is_none()
+                        && record.contract_retry_claims.is_some())
             });
-        let contract_retry_claims = self
-            .quarantined_fingerprints
-            .get(fingerprint)
-            .filter(|record| record.upload_body_witness.as_deref() == Some(body_witness))
-            .and_then(|record| record.contract_retry_claims);
-        let reconstruction_contract = existing.map_or(
+        let existing = budget.filter(|record| record.witness == witness);
+        let contract_retry_claims = budget.and_then(|record| record.contract_retry_claims);
+        let reconstruction_contract = budget.map_or(
             crate::snapshots::terminal_contract_retry::current_contract(),
             |record| {
                 record

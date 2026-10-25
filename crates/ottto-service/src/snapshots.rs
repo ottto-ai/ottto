@@ -42073,7 +42073,7 @@ impl ScanIndex {
             && self
                 .terminal_contract_retries
                 .get(fingerprint)
-                .is_none_or(|owner| owner == key)
+                .map_or(true, |owner| owner == key)
             && !self.reason_reoffer_cooldown_defers(fingerprint)
     }
 

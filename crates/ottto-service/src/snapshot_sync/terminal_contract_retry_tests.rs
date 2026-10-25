@@ -726,8 +726,23 @@ enum InterruptedOutcome {
     SaveFailure,
 }
 
-fn contract_read_cap(outcome: InterruptedOutcome) {
+fn contract_read_cap(outcome: InterruptedOutcome, unbound_body: bool) {
     let fixture = ReadBudgetFixture::new();
+    if unbound_body {
+        let (mut index, mut progress) = fixture.retained.load();
+        index
+            .quarantined_snapshot_fingerprints
+            .get_mut(&fixture.fingerprint)
+            .unwrap()
+            .upload_body_witness = None;
+        progress
+            .quarantined_fingerprints
+            .get_mut(&fixture.fingerprint)
+            .unwrap()
+            .upload_body_witness = None;
+        index.save(&fixture.retained.index_path).unwrap();
+        progress.save(&fixture.retained.progress_path).unwrap();
+    }
     with_contract(2, || {
         let (mut index, mut progress) = fixture.retained.load();
         assert!(progress.prepare_quarantine_retries(&index.quarantined_snapshot_fingerprints));
@@ -848,15 +863,15 @@ fn contract_read_cap(outcome: InterruptedOutcome) {
 
 #[test]
 fn terminal_contract_restart_before_outcome_allows_one_more_paced_source_read() {
-    contract_read_cap(InterruptedOutcome::Restart);
+    contract_read_cap(InterruptedOutcome::Restart, false);
 }
 #[test]
 fn terminal_contract_repeated_conflicts_cap_actual_source_reads_at_two() {
-    contract_read_cap(InterruptedOutcome::Conflict);
+    contract_read_cap(InterruptedOutcome::Conflict, false);
 }
 #[test]
 fn terminal_contract_failed_outcome_save_caps_actual_source_reads_at_two() {
-    contract_read_cap(InterruptedOutcome::SaveFailure);
+    contract_read_cap(InterruptedOutcome::SaveFailure, false);
 }
 
 #[test]
@@ -999,4 +1014,9 @@ fn terminal_contract_next_version_starts_a_distinct_paced_budget() {
         assert!(!progress.prepare_quarantine_retries(&BTreeMap::new()));
         assert!(progress.active_quarantine_retries.is_empty());
     });
+}
+
+#[test]
+fn terminal_contract_legacy_unknown_body_conflicts_keep_the_two_source_read_cap() {
+    contract_read_cap(InterruptedOutcome::Conflict, true);
 }
