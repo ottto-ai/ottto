@@ -36,7 +36,8 @@
 //!   clock passes that stamp. A grant found spent stays spent in its process,
 //!   in the same working index too, until a new counted attempt. A stamp is
 //!   only ever raised, never lowered by a refusal on backward time, so the
-//!   latest stamp (and the witness) never falls.
+//!   latest stamp (and the witness) never falls: a lost guard's closure keeps
+//!   its saved witness, and an identity revoke the removed key's latest stamp.
 //! - A persisted rearm is counted again on the first load of each process, or
 //!   when this process already started its parse. A bounded sweep that has not
 //!   reached the key yet does not spend an attempt. A grant authorizes a read
@@ -812,7 +813,14 @@ pub(super) fn apply(index: &mut ScanIndex, priors_refused: bool, priors_seen: bo
         guard.closed_at = Some(UNSTAMPED);
     }
     if guard.closed_at == Some(UNSTAMPED) {
-        guard.closed_at = Some(now);
+        // Condition 3: a lost guard's closure keeps its saved witness (a
+        // malformed one, `u64::MAX`, is no stamp), so a reconstruction on
+        // backward time never lowers the latest stamp.
+        guard.closed_at = Some(if witness == u64::MAX {
+            now
+        } else {
+            now.max(witness)
+        });
     }
     // MONEY 724h condition 3: behind the guard's latest persisted stamp the
     // wall clock went backward. That time is no new authority: no grant is
@@ -1114,10 +1122,16 @@ pub(crate) fn revoke_for_identity(
     }
     // The key's slot moves to `r`: tracked keys and revokes share the cap.
     let now = now_unix();
-    guard.keys.remove(&id);
+    // Condition 3: the revoke keeps the removed key's latest stamp, so the
+    // guard's latest stamp never falls with it.
+    let latest = guard
+        .keys
+        .remove(&id)
+        .and_then(|tracked| tracked.attempts.iter().max().copied())
+        .unwrap_or(0);
     let revoked = guard.revoked.entry(id.clone()).or_default();
     revoked.tokens.push(token);
-    raise(&mut revoked.at, now);
+    raise(&mut revoked.at, now.max(latest));
     guard.identity_revoked = guard.identity_revoked.saturating_add(1);
     raise(&mut guard.identity_revoked_at, now);
     guard.unsaved.keys.insert(key.to_owned());

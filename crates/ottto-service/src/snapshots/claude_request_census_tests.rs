@@ -4625,6 +4625,146 @@ fn census_duplicate_rebuild_backward_refusal_keeps_the_latest_stamp() {
     }
 }
 
+/// MONEY 724h condition 3, autoreview: a guard lost with its saved witness
+/// ahead of the wall clock (thirty days ahead here) is reconstructed closed
+/// from that witness, never from the backward clock. The save keeps the
+/// witness, so a reload one window later, still behind it, refuses the
+/// duplicate key; only one window past the witness is it granted. In one
+/// process and across a restart; OFF and ON.
+#[test]
+fn census_duplicate_rebuild_lost_guard_keeps_a_future_witness() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants,
+    };
+    let rearmed = (
+        CandidateDecision::Parse,
+        Some(CandidateParseReason::Rearmed),
+    );
+    let refused = (CandidateDecision::Skip, None);
+    let witness = N3_T0 + 30 * N3_DAY;
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for restart in [false, true] {
+            let case = format!("shadow={enabled} restart={restart}");
+            bound::restart();
+            let scratch =
+                crate::test_scratch::ScratchDir::new("census-rebuild-lost-future-witness");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let fingerprint = original.files[&key].source_file_fingerprint.clone();
+            let path = scratch.join("index.json");
+            // The guard (`"n"`) is gone; only its witness is left.
+            let raw = census_duplicate_rebuild_raw(&original, &key, Some(serde_json::json!({})));
+            let shadow = r#""claude_request_census_shadow":{"n":{}}"#;
+            assert_eq!(raw.matches(shadow).count(), 1, "{case}");
+            std::fs::write(
+                &path,
+                raw.replace(
+                    shadow,
+                    &format!(r#""claude_request_census_shadow":{{"nw":{witness}}}"#),
+                ),
+            )
+            .unwrap();
+
+            let clock = bound::set_now(N3_T0);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert!(bound::closed(&index), "{case}: lost, never fresh");
+            assert_eq!(bound::witness(&index), witness, "{case}: kept");
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}"
+            );
+            index.save(&path).unwrap();
+            drop(clock);
+
+            // One window after the load, still behind the witness.
+            if restart {
+                bound::restart();
+            }
+            let clock = bound::set_now(N3_T0 + 7 * N3_DAY + 60);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(bound::witness(&index), witness, "{case}: saved as kept");
+            assert!(bound::attempts(&index, &key).is_empty(), "{case}");
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                refused,
+                "{case}: no new authority behind the witness"
+            );
+            index.save(&path).unwrap();
+            drop(clock);
+
+            // One window past the witness.
+            if restart {
+                bound::restart();
+            }
+            let reopened = witness + 7 * N3_DAY + 60;
+            let _clock = bound::set_now(reopened);
+            let mut index = ScanIndex::load(&path).unwrap();
+            assert_eq!(bound::attempts(&index, &key), vec![reopened], "{case}");
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(
+                census_rebuild_decision(&index, &key, &fingerprint),
+                rearmed,
+                "{case}"
+            );
+        }
+    }
+}
+
+/// MONEY 724h condition 3, autoreview: identity work revoking an earlier
+/// checkpoint's key that holds the guard's latest stamp, with the wall clock
+/// behind it, keeps that stamp in the revoke: the witness never falls, in the
+/// working index and after its save and a reload still behind. The identity
+/// path still wins: the key is revoked. In one process and across a restart;
+/// OFF and ON.
+#[test]
+fn census_duplicate_rebuild_identity_revoke_keeps_the_latest_stamp() {
+    use crate::snapshots::claude_request_census::{
+        duplicate_rebuild_test_support as bound, persist_duplicate_rebuild_grants, SourceRearm,
+    };
+    for enabled in [false, true] {
+        let _mode = crate::snapshots::claude_request_census::d2_shadow_mode_for_test(enabled);
+        for restart in [false, true] {
+            let case = format!("shadow={enabled} restart={restart}");
+            bound::restart();
+            let scratch = crate::test_scratch::ScratchDir::new("census-rebuild-revoke-high-water");
+            let (_root, original, key) = census_duplicate_rebuild_fixture(&scratch);
+            let path = scratch.join("index.json");
+            std::fs::write(&path, census_rebuild_form_raw(&original, &key, "earlier")).unwrap();
+            let clock = bound::set_now(N3_T0);
+            let mut index = ScanIndex::load(&path).unwrap();
+            persist_duplicate_rebuild_grants(&mut index, &path).unwrap();
+            assert_eq!(bound::attempts(&index, &key), vec![N3_T0], "{case}");
+            drop(clock);
+
+            let back = N3_T0 - 60;
+            let clock = bound::set_now(back);
+            census_identity_clear(
+                &mut index,
+                &key,
+                SourceRearm::Identity("identity_contract:revoke-high-water"),
+            );
+            assert!(
+                bound::revoked(&index, &key),
+                "{case}: the identity path wins"
+            );
+            assert_eq!(bound::witness(&index), N3_T0, "{case}: never lowered");
+            index.save(&path).unwrap();
+            drop(clock);
+
+            if restart {
+                bound::restart();
+            }
+            let _clock = bound::set_now(back + 30);
+            let index = ScanIndex::load(&path).unwrap();
+            assert!(bound::revoked(&index, &key), "{case}");
+            assert_eq!(bound::witness(&index), N3_T0, "{case}: saved as kept");
+        }
+    }
+}
+
 /// MONEY 724h condition 3: backward time never frees budget or shrinks a
 /// stamp's window. Two reads at real times 60 s and 1 d + 60 s; the wall
 /// clock then runs three days behind for a while (no third read: both
