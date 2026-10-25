@@ -1543,6 +1543,7 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
         literal(&first);
         assert_eq!(total(&first), 2);
         let prior = settle(&c, &old, first, &mut progress);
+        assert_eq!(progress.accepted_fingerprints.len(), 1);
         // A fresh index's first page records the identity contract, which
         // re-arms every family file for one re-read. Consume that one-time
         // re-read on an ordinary page, so the byte-limited page below has no
@@ -1555,7 +1556,6 @@ fn e2_pipeline_twin_byte_budget_hold_preserves_accepted_complete_history() {
             1,
             "hold starts from one complete accepted family body"
         );
-        assert_eq!(progress.accepted_fingerprints.len(), 1);
         prior.activate_effective_upload_body_witness_revision(3);
         for key in prior.files.keys().cloned().collect::<Vec<_>>() {
             assert!(
