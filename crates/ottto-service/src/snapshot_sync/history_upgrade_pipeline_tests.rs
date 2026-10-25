@@ -238,6 +238,23 @@ impl HistoryFixture {
         .expect("scan Claude page");
         let (mut disposition, _, _) =
             apply_claude_local_evidence_to_scan(&self.support, &mut scan, &mut index);
+        // A future revision-3 gate fixture offers literal bodies before the
+        // production veto/finalizer and settles only exact acknowledged bodies.
+        if cycle.mint_literal || cycle.revision == 3 {
+            let copies = scan
+                .snapshots
+                .iter()
+                .map(|item| {
+                    let mut copy = item.clone();
+                    copy.usage_accounting_contract =
+                        Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
+                    copy.snapshot_fingerprint =
+                        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &copy);
+                    copy
+                })
+                .collect::<Vec<_>>();
+            scan.snapshots.extend(copies);
+        }
         index.veto_claude_history_emission(SnapshotSource::ClaudeCode, &mut scan.snapshots);
         let deferred_accounts = index.bind_session_accounts_with_mixed(
             SnapshotSource::ClaudeCode,
@@ -292,21 +309,6 @@ impl HistoryFixture {
             &mut scan,
             &disposition,
         );
-        if cycle.mint_literal {
-            let copies = scan
-                .snapshots
-                .iter()
-                .map(|item| {
-                    let mut copy = item.clone();
-                    copy.usage_accounting_contract =
-                        Some(crate::snapshots::REQUEST_OWNED_USAGE_CONTRACT.into());
-                    copy.snapshot_fingerprint =
-                        crate::snapshots::snapshot_fingerprint(SnapshotSource::ClaudeCode, &copy);
-                    copy
-                })
-                .collect::<Vec<_>>();
-            scan.snapshots.extend(copies);
-        }
         index.retain_claude_history_emission_permitted(&mut scan.snapshots);
         let mut uploaded = BTreeSet::new();
         let mut uploaded_literal = BTreeSet::new();
@@ -335,6 +337,19 @@ impl HistoryFixture {
         )
         .expect("in-process upload");
         assert_eq!(result, ResumableUploadResult::Completed);
+        if cycle.revision == 3 {
+            let bindings = scan.snapshots.iter().flat_map(|item| {
+                index.files.iter().filter_map(move |(key, entry)|
+                    if item.source_file_fingerprint.as_deref() == Some(entry.source_file_fingerprint.as_str()) {
+                        Some((key.clone(), entry.source_file_fingerprint.clone(), item.clone()))
+                    } else { None })
+            }).collect::<Vec<_>>();
+            for (key, revision, item) in bindings {
+                crate::snapshots::claude_request_money::record_logical_member(&mut index, &key, &revision, &item);
+            }
+            index.stamp_request_money_acks(&scan.snapshots, &progress.accepted_fingerprints,
+                &progress.accepted_body_witnesses);
+        }
         let settlement = match cycle.upload {
             PipelineUpload::ServerDeferred => {
                 settle_checkpointed_upload(index, &committed_index, &progress, &holds, false)

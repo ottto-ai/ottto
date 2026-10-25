@@ -547,6 +547,9 @@ pub(crate) struct Custody {
     bytes: usize,
     hashes: usize,
     offers: usize,
+    // Derived in-memory hint only. Shadow-only memos have direct carriers;
+    // avoid walking every other family when no primary bindings can exist.
+    primary_bindings: bool,
 }
 impl Default for Custody {
     fn default() -> Self {
@@ -558,6 +561,7 @@ impl Default for Custody {
             bytes: 0,
             hashes: 0,
             offers: 0,
+            primary_bindings: false,
         };
         store.recount_globals();
         store
@@ -642,6 +646,18 @@ impl Custody {
             } else {
                 "adoption"
             };
+            if !self.primary_bindings {
+                if field == "memo" {
+                    let root = key.strip_prefix("fam:")?;
+                    if self
+                        .telemetry
+                        .contains_key::<str>(format!("telemetry:{root}").as_str())
+                    {
+                        return Some(telemetry_address(root, field, key));
+                    }
+                }
+                return Some(file_address(key, field, key, None));
+            }
             // Primary identity is assigned by bind_file / bind_entity. Reads
             // during a promotion overlap prefer the successor's binding.
             let found = self
@@ -1193,6 +1209,7 @@ impl Custody {
         }
         let mut key = key;
         key.shrink_to_fit();
+        let has_entity = entity.is_some();
         let Some(key) = QueryKey::new(key).with_entity(entity) else {
             return Insert::Refused;
         };
@@ -1233,6 +1250,7 @@ impl Custody {
         }
         self.bytes = bytes;
         self.hashes = total_hashes;
+        self.primary_bindings |= has_entity;
         Insert::Stored
     }
     pub(crate) fn take(&mut self, key: &str) -> Option<Record> {
@@ -1262,6 +1280,12 @@ impl Custody {
         let _ = self.take(key);
     }
     fn recount_globals(&mut self) {
+        self.primary_bindings = self.files.values().any(|file| {
+            file.logical.is_some() || file.slots().any(|slot| slot.key.entity().is_some())
+        }) || self
+            .telemetry
+            .values()
+            .any(|file| file.slots().any(|slot| slot.key.entity().is_some()));
         self.offers = self
             .files
             .values()
@@ -2472,6 +2496,7 @@ impl Custody {
             return false;
         }
         self.bytes = self.bytes.saturating_sub(before).saturating_add(after);
+        self.primary_bindings = true;
         true
     }
     pub(super) fn semantic_records(&self) -> impl Iterator<Item = (String, RecordRef<'_>)> {

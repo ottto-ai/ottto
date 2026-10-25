@@ -1593,10 +1593,9 @@ fn preflight_witnesses(support: &Path, request: &SnapshotBatchRequest) -> Result
         return Ok(());
     }
     money::store::refuse_live(support);
-    crate::local_resource_diagnostics::traversal_point(
-        "claude_request_money_recovery_witness_hold",
-        "claude_code",
-        &serde_json::json!({"missing_version":hold.missing,"unsupported_version":hold.unsupported}),
+    crate::local_resource_diagnostics::claude_money_recovery_witness_hold(
+        hold.missing,
+        hold.unsupported,
     );
     Err(hold.into())
 }

@@ -1898,6 +1898,37 @@ pub(crate) fn shadow_page_at(
     )
 }
 
+/// Explicit full-body shadow fixture: production OFF pages keep main's
+/// singleton behavior; future union coverage is supplied and funded here.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn full_shadow_page_for_test(
+    support_dir: &Path,
+    snapshots: &[SnapshotItem],
+    index: &ScanIndex,
+    api: &ClaudeLocalOtelLoadReport,
+    trace: &ClaudeTraceOwnershipLoadReport,
+    census_complete: bool,
+    now: u64,
+) -> ClaudeRequestMoneyShadowCounts {
+    store::prime_credit_for_test(support_dir, utc_day(now));
+    let mut output = PageBodies::default();
+    crate::snapshot_sync::money_resume::drive_for_test(build_page_with_coverage(
+        support_dir,
+        snapshots,
+        index,
+        api,
+        trace,
+        &coverage::CoveredForTest,
+        census_complete,
+        now,
+        Instant::now(),
+        false,
+        true,
+        &mut output,
+    ))
+}
+
 /// Money time at which common setup stops (with no capture time).
 #[cfg(test)]
 pub(crate) fn setup_stop_for_test() -> Duration {
@@ -1949,9 +1980,23 @@ async fn build_page_at(
     live: bool,
     output: &mut PageBodies,
 ) -> ClaudeRequestMoneyShadowCounts {
-    let coverage = coverage::InterimFamilyCoverage {
+    let interim = coverage::InterimFamilyCoverage {
         census_complete,
         ..Default::default()
+    };
+    let coverage: &dyn FamilyCoverage = &interim;
+    // Synthetic transport/body controls supply the future strong-view adapter
+    // explicitly. Live activation alone still uses the fail-closed interim view.
+    #[cfg(test)]
+    let coverage: &dyn FamilyCoverage = if SETTLED_TEST_DIRS
+        .lock()
+        .expect("settled test scopes")
+        .iter()
+        .any(|dir| dir == support_dir)
+    {
+        &coverage::CoveredForTest
+    } else {
+        coverage
     };
     build_page_with_coverage(
         support_dir,
@@ -1959,7 +2004,7 @@ async fn build_page_at(
         index,
         api_report,
         trace_report,
-        &coverage,
+        coverage,
         census_complete,
         now,
         Instant::now(),
@@ -2124,6 +2169,15 @@ async fn build_page_with_coverage(
             .or_default()
             .push(item);
     }
+    if live {
+        // Empty parses have no SnapshotItem. They still need a scheduled
+        // capture turn to rebuild message custody after a damaged ledger.
+        for key in &index.confirmed_empty_files {
+            if let Some(root) = selection::logical_family_root_ref(index, key) {
+                items_by_root.entry(root).or_default();
+            }
+        }
+    }
     let roots = &items_by_root;
     // Admit only page indexes, scope, claims and fixed buffers. Family rows
     // and scratch wait for their turn; the writer streams deferred rows.
@@ -2194,6 +2248,33 @@ async fn build_page_with_coverage(
     );
     counts.result_apply_us = applying.elapsed().as_micros() as u64;
     let mut applied_rest = false;
+    if live && ledger.recovering() {
+        for key in capture::captured_index_keys(&scope_key) {
+            if Instant::now() >= setup_deadline {
+                break;
+            }
+            if !index.confirmed_empty_files.contains(&key) {
+                continue;
+            }
+            let Some(entry) = index.files.get(&key) else {
+                continue;
+            };
+            if let Some(capture) =
+                capture::take_capture(&scope_key, &key, &entry.source_file_fingerprint)
+            {
+                counts.captures_taken += 1;
+                note_message_record(
+                    ledger,
+                    index,
+                    &key,
+                    &entry.source_file_fingerprint,
+                    &capture,
+                    true,
+                    &mut counts,
+                );
+            }
+        }
+    }
     if std::mem::take(&mut ledger.load_damaged) {
         counts.ledger_load_damaged = 1;
         drop_certificate(ledger);
@@ -2483,7 +2564,7 @@ async fn build_page_with_coverage(
                 else {
                     continue;
                 };
-                if !live && keys.len() != 1 {
+                if !(live || collect_entities) && keys.len() != 1 {
                     continue;
                 }
                 let Some(key) = keys
@@ -3036,7 +3117,7 @@ async fn build_slice(
         member_keys
             .get(&(root.to_owned(), member.to_owned()))
             .and_then(|keys| {
-                if live {
+                if live || owned_body {
                     keys.iter()
                         .min_by_key(|key| selection::primary_order(index, key))
                         .cloned()
@@ -3289,7 +3370,7 @@ async fn build_slice(
             .collect();
         let empty = BTreeSet::new();
         let members = indexed_members.get(root).unwrap_or(&empty);
-        let total = if live {
+        let total = if live || owned_body {
             members.len()
                 + items
                     .iter()
@@ -6632,11 +6713,15 @@ pub(crate) fn scheduled_reoffers(index: &ScanIndex, items: &[SnapshotItem]) -> B
         .collect()
 }
 
+#[cfg(test)]
+static SETTLED_TEST_DIRS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
 /// Scoped live activation for synthetic callers only. Production still needs
 /// the compiled gate; kill files retain their precedence in tests too.
 #[cfg(test)]
 #[allow(dead_code)]
 pub(crate) struct LiveForTest {
+    settled: bool,
     _policy: super::claude_history_upgrade::MaxGatedForTest,
     support: PathBuf,
     inserted: bool,
@@ -6645,6 +6730,17 @@ pub(crate) struct LiveForTest {
 #[cfg(test)]
 #[allow(dead_code)]
 impl LiveForTest {
+    /// Explicit settled-census fixture for positive body/transport controls.
+    /// Production and `new` retain InterimFamilyCoverage.
+    pub(crate) fn settled(support: &Path) -> Self {
+        let mut scope = Self::new(support);
+        let mut dirs = SETTLED_TEST_DIRS.lock().expect("settled test scopes");
+        scope.settled = !dirs.iter().any(|dir| dir == support);
+        if scope.settled {
+            dirs.push(support.to_path_buf());
+        }
+        scope
+    }
     pub(crate) fn new(support: &Path) -> Self {
         let shadow_was_enabled = shadow_enabled(support);
         enable_shadow_for_test(support);
@@ -6654,6 +6750,7 @@ impl LiveForTest {
             dirs.push(support.to_path_buf());
         }
         Self {
+            settled: false,
             _policy: super::claude_history_upgrade::MaxGatedForTest::new(3),
             support: support.to_path_buf(),
             inserted,
@@ -6664,6 +6761,12 @@ impl LiveForTest {
 #[cfg(test)]
 impl Drop for LiveForTest {
     fn drop(&mut self) {
+        if self.settled {
+            SETTLED_TEST_DIRS
+                .lock()
+                .expect("settled test scopes")
+                .retain(|dir| dir != &self.support);
+        }
         if self.inserted {
             // Release this synthetic owner's parked future and recovery graph
             // even when an assertion unwinds before its normal closeout.
@@ -7204,7 +7307,12 @@ fn synthetic_carrier(root: &str, collected_at: &str) -> SnapshotItem {
         removed_usage: None,
         telemetry_owned_complete: None,
         usage_accounting_contract: None,
-        session_account_evidence: None,
+        // Synthetic money bodies have no original creator. Declare that
+        // evaluated missing state, exactly as the native Claude parser does;
+        // it conveys no identity/ownership but has the supported v7 witness.
+        session_account_evidence: Some(
+            super::ClaudeTitleMetadata::default().session_account_evidence(root),
+        ),
         claude_usage_request_ids: BTreeSet::new(),
         claude_usage_occurrences: BTreeMap::new(),
         cache_observations: None,
@@ -7572,7 +7680,10 @@ mod scheduling_reconciliation_tests {
         store::reload_for_test(&scratch).unwrap();
         let mut index = ScanIndex::default();
         let item = crate::snapshots::tests::sample_session_artifact_item();
-        let key = "/fixture/.claude/projects/group/member.jsonl".to_owned();
+        let key = format!(
+            "/fixture/.claude/projects/group/{}.jsonl",
+            item.source_session_id
+        );
         index.files.insert(
             key.clone(),
             serde_json::from_value(serde_json::json!({

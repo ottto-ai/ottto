@@ -1,3 +1,5 @@
+// Positive body/transport fixtures explicitly supply settled strong coverage;
+// the production InterimFamilyCoverage adapter remains fail closed.
 use crate::snapshots::claude_request_money as money;
 
 fn p2a_scan(root: &Path, support: &Path, index: &mut ScanIndex) -> SourceScanResult {
@@ -52,7 +54,7 @@ fn p2a_support(home: &Path) -> PathBuf {
 fn p2a_adoption_strict_bytes_floor_and_covering_ack_partial_rollback() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-adoption", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let previous = index.clone();
     // Unlike legacy admission, revision 3 has no first-file byte exception.
     let denied =
@@ -182,7 +184,7 @@ fn p2a_adoption_strict_bytes_floor_and_covering_ack_partial_rollback() {
 fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-pause", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let scan = p2a_scan(&root, &support, &mut index);
     for state in [1, 2, 3, 6] {
         crate::snapshot_sync::money_resume::drive_for_test(
@@ -204,6 +206,11 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
         );
     }
     money::note_route_pause(&support, &index, true);
+    // The real pause is asynchronous. Complete its durable writer receipt
+    // before this fixture simulates a restart; no assertion is relaxed.
+    money::store::with_ledger_for_test(&support, |ledger| {
+        assert!(money::store::checkpoint_for_test(&support, ledger));
+    }).unwrap();
     money::store::reload_for_test(&support).unwrap();
     assert!(money::adoption_paused(&support, &index));
     money::note_route_pause(&support, &index, false);
@@ -271,7 +278,7 @@ fn p2a_adoption_pause_resume_and_consumed_evidence_stays_local() {
 fn p2a_real_scan_union_partial_files_primary_promotion_and_project_refusal() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-union-promotion", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let original = root.join("aaaaaaaa-bbbb-4ccc-8ddd-000000000000.jsonl");
     let copy = root.join("99999999-bbbb-4ccc-8ddd-000000000000.jsonl");
     fs::copy(&original, &copy).unwrap();
@@ -478,7 +485,7 @@ fn p2a_gate_off_reconciliation_prunes_local_selection_metadata() {
 fn p2a_known_union_selects_complete_group_before_small_page_boundary() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-union-page", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let original = root.join("aaaaaaaa-bbbb-4ccc-8ddd-000000000000.jsonl");
     fs::copy(
         original,
@@ -530,7 +537,7 @@ fn p2a_known_union_selects_complete_group_before_small_page_boundary() {
 fn p2a_held_new_alias_discovery_survives_partial_index_rollback() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-union-discovery", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let previous = index.clone();
     let original = root.join("aaaaaaaa-bbbb-4ccc-8ddd-000000000000.jsonl");
     let alias = root.join("00000000-bbbb-4ccc-8ddd-000000000000.jsonl");
@@ -632,7 +639,7 @@ fn p2a_union_resolves_pair_copies_before_request_conflicts_and_keeps_idless_line
         let (home, root, mut index) =
             claude_context_backfill_fixture(&format!("p2a-pair-{name}"), 1);
         let support = p2a_support(&home);
-        let _live = money::LiveForTest::new(&support);
+        let _live = money::LiveForTest::settled(&support);
         let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
         let original = root.join(format!("{session}.jsonl"));
         let alias = root.join("99999999-bbbb-4ccc-8ddd-000000000000.jsonl");
@@ -705,7 +712,7 @@ fn p2a_union_resolves_pair_copies_before_request_conflicts_and_keeps_idless_line
 fn p2a_alias_representative_is_global_and_retained_telemetry_uses_logical_root() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-global-holder", 2);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let a = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
     let b = "aaaaaaaa-bbbb-4ccc-8ddd-000000000001";
     let a_path = root.join(format!("{a}.jsonl"));
@@ -807,7 +814,7 @@ fn p2a_alias_representative_is_global_and_retained_telemetry_uses_logical_root()
 fn p2a_protected_alias_keeps_ordinary_body_without_new_custody_hold() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-protected-alias", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
     fs::write(
         support.join("snapshots/claude_code-reemission-exclusions.txt"),
@@ -849,7 +856,7 @@ fn p2a_protected_alias_keeps_ordinary_body_without_new_custody_hold() {
 fn p2a_root_telemetry_does_not_move_an_inactive_child_past_the_account_cutoff() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-member-activity", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let session = "aaaaaaaa-bbbb-4ccc-8ddd-000000000000";
     let child_path = root
         .join(session)
@@ -917,6 +924,7 @@ fn p2a_root_telemetry_does_not_move_an_inactive_child_past_the_account_cutoff() 
 #[test]
 #[serial_test::serial(claude_request_money_shadow)]
 fn p2a_shadow_duplicate_files_complete_one_logical_family_and_publish_its_memo() {
+    let _policy = crate::snapshots::claude_history_upgrade::MaxGatedForTest::new(3);
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-shadow-logical-coverage", 1);
     let support = p2a_support(&home);
     money::enable_shadow_for_test(&support);
@@ -932,7 +940,18 @@ fn p2a_shadow_duplicate_files_complete_one_logical_family_and_publish_its_memo()
         3,
         "root, physical copy and logical child"
     );
-    let counts = money::shadow_page_at(
+    // Register the future collector's logical memberships without enabling
+    // live emission. The ordinary OFF shadow remains covered separately.
+    let bindings = scan.snapshots.iter().flat_map(|item| {
+        index.files.iter().filter_map(move |(key, entry)|
+            if item.source_file_fingerprint.as_deref() == Some(entry.source_file_fingerprint.as_str()) {
+                    Some((key.clone(), entry.source_file_fingerprint.clone(), item.clone()))
+                } else { None })
+    }).collect::<Vec<_>>();
+    for (key, revision, item) in bindings {
+        money::record_logical_member(&mut index, &key, &revision, &item);
+    }
+    let counts = money::full_shadow_page_for_test(
         &support,
         &scan.snapshots,
         &index,
@@ -988,7 +1007,7 @@ fn p2a_bootstrap_union_debt_obeys_adoption_pause_and_budgets() {
         let (home, root, mut index) =
             claude_context_backfill_fixture("p2a-union-bootstrap-stop", 1);
         let support = p2a_support(&home);
-        let _live = money::LiveForTest::new(&support);
+        let _live = money::LiveForTest::settled(&support);
         let original = root.join("aaaaaaaa-bbbb-4ccc-8ddd-000000000000.jsonl");
         fs::copy(
             original,
@@ -1066,7 +1085,7 @@ fn p2a_real_index_rebuild_latch_blocks_bootstrap_and_due_ratio_probe() {
                 let (home, root, mut index) =
                     claude_context_backfill_fixture("p2a-rebuild-latch", 1);
                 let support = p2a_support(&home);
-                let _live = money::LiveForTest::new(&support);
+                let _live = money::LiveForTest::settled(&support);
                 let mut discovered = p2a_scan(&root, &support, &mut index);
                 finalize_scan_after_policy(SnapshotSource::ClaudeCode, &mut discovered, &mut index);
                 for entry in index.files.values_mut() {
@@ -1168,7 +1187,7 @@ fn p2a_empty_files_settle_locally_once_without_stamping_stripped_or_prior_bodies
     )
     .unwrap();
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let mut index = ScanIndex::default();
     let mut scan = p2a_scan(&root, &support, &mut index);
     assert_eq!(scan.scanned_file_count, 1);
@@ -1340,7 +1359,7 @@ fn p2a_index_hold_retry_obeys_cadence_allowance_and_code_changes() {
 fn p2a_below_floor_adoption_does_not_skip_a_new_transcript_request() {
     let (home, root, mut index) = claude_context_backfill_fixture("p2a-floor-new-request", 1);
     let support = p2a_support(&home);
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     for activity in index.snapshot_activity_at.values_mut() {
         *activity = Some("2026-04-30T23:59:59Z".into());
     }

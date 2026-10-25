@@ -2205,3 +2205,90 @@ fn money_review_retry_cannot_resend_the_same_body_without_a_new_lease() {
         }
     }
 }
+
+#[test]
+#[serial_test::serial(client_report)]
+fn unsent_witness_hold_preserves_acked_sibling_and_durable_retry_body() {
+    let _guard = SNAPSHOT_SYNC_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let scratch = crate::test_scratch::ScratchDir::new("unsent-witness-caller");
+    let path = scratch.join("progress.json");
+    let mut snapshots = items(2);
+    snapshots.sort_by_key(|item| item.snapshot_fingerprint.clone());
+    let first = snapshots[0].snapshot_fingerprint.clone();
+    let mut ledger = progress();
+    let namespace = ledger.destination_namespace_hash.clone();
+    let witness = ledger.active_quarantine_witness.clone().unwrap();
+    let mut accepted = 0;
+    let result = upload_resumable_batches_with_body_witness_partitioned(
+        &snapshots,
+        "claude_code",
+        &mut ledger,
+        &mut accepted,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |item| Some(item.source_session_id.as_str()),
+        |item| item.snapshot_fingerprint == first,
+        &mut InplaceRetryBudget::default(),
+        None,
+        |batch| {
+            if batch[0].snapshot_fingerprint == first {
+                Ok(response(&batch, 0))
+            } else {
+                Err(unknown_recovery::WitnessHold {
+                    missing: 1,
+                    unsupported: 0,
+                }
+                .into())
+            }
+        },
+        |progress| progress.save(&path),
+    )
+    .unwrap();
+    assert_eq!(result, ResumableUploadResult::Deferred { count: 1 });
+    assert_eq!(accepted, 1);
+    let restored = SnapshotUploadProgress::load(&path, &namespace, witness).unwrap();
+    let acked = &snapshots[0].snapshot_fingerprint;
+    let held = &snapshots[1].snapshot_fingerprint;
+    assert!(restored.accepted_fingerprints.contains(acked));
+    assert_eq!(
+        restored.accepted_body_witnesses[acked],
+        snapshot_upload_body_witness(&snapshots[0])
+    );
+    assert!(!restored.accepted_fingerprints.contains(held));
+    assert_eq!(
+        restored.quarantined_fingerprints[held]
+            .upload_body_witness
+            .as_deref(),
+        Some(snapshot_upload_body_witness(&snapshots[1]).as_str())
+    );
+    assert_eq!(restored.quarantined_fingerprints.len(), 1);
+
+    let mut unsaved = progress();
+    let error = upload_resumable_batches_with_body_witness(
+        &snapshots[1..],
+        "claude_code",
+        &mut unsaved,
+        &mut 0,
+        |item| item.snapshot_fingerprint.as_str(),
+        snapshot_upload_body_witness,
+        |_| {
+            Err(unknown_recovery::WitnessHold {
+                missing: 1,
+                unsupported: 0,
+            }
+            .into())
+        },
+        |_| Err(anyhow!("injected hold save failure")),
+    )
+    .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<SnapshotLocalStateRejected>()
+            .unwrap()
+            .operation,
+        "save unsupported recovery witness hold"
+    );
+}

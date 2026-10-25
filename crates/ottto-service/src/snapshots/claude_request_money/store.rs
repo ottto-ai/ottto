@@ -2636,6 +2636,8 @@ impl Drop for WriterStallForTest {
 }
 #[cfg(test)]
 pub(crate) fn stall_writer_for_test() -> WriterStallForTest {
+    // The seam owns a newly admitted command, not capacity left by another test.
+    flush();
     let (entered, wait) = sync_channel(1);
     let (release, paused) = sync_channel(1);
     let guard = WriterStallForTest(release);
@@ -2873,9 +2875,16 @@ mod refused_intent_tests {
         );
         let blocked = shard_path_for_test(&support, key).with_extension("json.tmp");
         money_io!(Mutate, std::fs::create_dir_all(&blocked)).unwrap();
+        let policy = SavePolicy {
+            support_dir: &support,
+            deadline: Instant::now() + Duration::from_secs(2),
+            utc_day: super::super::utc_day(writer_unix()),
+            min_interval: Duration::ZERO,
+        };
+        credit_for_test(&mut ledger, policy);
         let (save, funds) = ledger
             .take_save(SavePolicy {
-                support_dir: &scratch,
+                support_dir: &support,
                 deadline: Instant::now() + Duration::from_secs(2),
                 utc_day: super::super::utc_day(writer_unix()),
                 min_interval: Duration::ZERO,
@@ -2916,6 +2925,15 @@ mod refused_intent_tests {
         ledger.put_money(
             "dirty:fixture".into(),
             ClaudeRequestCensusRecord::money_debt([1; 32], 0),
+        );
+        credit_for_test(
+            &mut ledger,
+            SavePolicy {
+                support_dir: &scratch,
+                deadline: Instant::now() + Duration::from_secs(2),
+                utc_day: super::super::utc_day(writer_unix()),
+                min_interval: Duration::ZERO,
+            },
         );
         assert!(!checkpoint(&scratch, &mut ledger));
         flush();
@@ -3012,6 +3030,12 @@ mod refused_intent_tests {
             snapshot: 7,
             ..Default::default()
         };
+        let publication = ClaudeFamilyPublication {
+            utc_day: super::super::utc_day(1_790_000_000),
+            digest: 0,
+            epoch: 1,
+            attempted: 1_790_000_000,
+        };
         let stalled = stall_writer_for_test();
         let job = WriteJob {
             support_dir: support.clone(),
@@ -3027,12 +3051,7 @@ mod refused_intent_tests {
                 key: key.clone(),
                 basis: Some((revision, memo)),
                 observed_unix: 1_790_000_000,
-                published: ClaudeFamilyPublication {
-                    utc_day: super::super::utc_day(1_790_000_000),
-                    digest: 0,
-                    epoch: 1,
-                    attempted: 1_790_000_000,
-                },
+                published: publication,
                 row: true,
                 deferred: None,
             }],
@@ -3047,6 +3066,10 @@ mod refused_intent_tests {
         assert!(checkpoint_for_test(&support, &mut ledger));
         release.join().unwrap();
         assert_eq!(ledger.dirty_shards(), 0);
+        let memo = ClaudeFamilyMemo {
+            published: Some(publication),
+            ..memo
+        };
         assert_eq!(
             ledger.get(&key).unwrap().family_memo(),
             Some((&revision, memo))
@@ -3367,7 +3390,10 @@ mod bounded_save_tests {
                 std::fs::write(path, b"broken").unwrap();
             }
             let mut loaded = load(&scratch).expect("quota damage is independent of ledger decode");
-            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert_eq!(
+                loaded.get(key).map(|value| value.to_owned_record()),
+                Some(record.clone())
+            );
             assert!(!loaded.load_damaged);
             assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
             // Exercise the actual async writer request, not just the parser.
@@ -3375,7 +3401,10 @@ mod bounded_save_tests {
             flush();
             take_results(&scratch, &mut loaded);
             assert_eq!(loaded.save_credit, 0);
-            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert_eq!(
+                loaded.get(key).map(|value| value.to_owned_record()),
+                Some(record.clone())
+            );
             assert_eq!(loaded.save_bytes_today, SAVE_DAILY_BYTES as u64);
         }
     }
@@ -3486,7 +3515,10 @@ mod bounded_save_tests {
             }
             restart_for_test(&scratch);
             let loaded = load(&scratch).unwrap();
-            assert_eq!(loaded.get(key), Some((&record).into()));
+            assert_eq!(
+                loaded.get(key).map(|value| value.to_owned_record()),
+                Some(record.clone())
+            );
             assert_eq!(reserve_credit(&scratch, today).bytes, 0);
             assert_eq!(
                 load_counters(&dir, today),

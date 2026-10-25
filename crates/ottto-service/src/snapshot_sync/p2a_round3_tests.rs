@@ -1,3 +1,5 @@
+// Positive body/transport fixtures explicitly supply settled strong coverage;
+// the production InterimFamilyCoverage adapter remains fail closed.
 // Live P2a through the actual prepare -> rotation -> finish -> selected save.
 // Sibling conservation fixtures remain independently owned and unchanged.
 thread_local! {
@@ -85,7 +87,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
         .unwrap();
         let _support = EnvVarGuard::set_path("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", &support);
         let _secrets = EnvVarGuard::set_path(OTTTO_SECRET_FALLBACK_DIR_ENV, &secrets);
-        let _live = money::LiveForTest::new(&support);
+        let _live = money::LiveForTest::settled(&support);
         let _replay_guard =
             unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
         p2a_initialize_custody(&support);
@@ -565,7 +567,7 @@ fn p2a_real_prepare_finish_ack_refusal_hold_and_failed_cas_restart() {
 fn p2a_status_projection_clears_acceptance_and_fences_idle_scopes() {
     use crate::snapshots::claude_request_money as money;
     let support = test_dir("p2a-menu");
-    let _live = money::LiveForTest::new(&support);
+    let _live = money::LiveForTest::settled(&support);
     let account = [7; 32];
     scope_request_money_menu(&support, "destination-a".into(), account);
     *REQUEST_MONEY_MENU.lock().unwrap() = Some(RequestMoneyMenuStatus {
@@ -824,7 +826,12 @@ impl P2aControl {
         use crate::snapshots::claude_request_money as money;
         let mut retained = None;
         for attempt in 0..32 {
-            change(attempt);
+            // Inject new input at entry and each retained finish boundary.
+            // A pending prepare has not captured/frozen native inputs yet;
+            // mutating there would change the first epoch before it exists.
+            if attempt == 0 || retained.is_some() || money_resume::pending_for_test(&self.support) {
+                change(attempt);
+            }
             self.cadence.next_due_cycle();
             // Isolate the durable money pause from HTTP backoff, whose own
             // behavior is covered elsewhere. This represents a due retry.
@@ -979,7 +986,7 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                 format!("{:x}\n", Sha256::digest(IDENTITY_PIPELINE_ROOT.as_bytes())),
             )
             .unwrap();
-            let _live = live.then(|| money::LiveForTest::new(&control.support));
+            let _live = live.then(|| money::LiveForTest::settled(&control.support));
             let before = control.offers().len();
             match cause {
                 "real_change" => {
@@ -1034,7 +1041,9 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                     assert_eq!(event["counts"]["cause_unavailable"], 0, "{event}");
                 }
             }
-            let history_vetoed = cause == "rebuild" || live && cause == "real_change";
+            // SOURCE's released revision-3 row permits a listed genuine
+            // change's ordinary body. Only unchanged rebuilt history is held.
+            let history_vetoed = cause == "rebuild";
             if history_vetoed {
                 assert_eq!(
                     cause_count, 0,
@@ -1052,14 +1061,14 @@ fn p2a_protected_change_alias_rebuild_real_upload_never_mints_money() {
                     .all(|entry| entry.effective_upload_body_witness_revision != 3));
                 continue;
             }
-            // Revision 2 permits genuine changes; a newly discovered alias is
-            // fresh under both rows. The alias still resolves to the protected
+            // Both released rows permit genuine ordinary changes; a newly
+            // discovered alias is fresh under both rows. The alias still resolves to the protected
             // logical family at the money boundary: retain the actual-POST,
             // positive cause-counter and no-new-money controls for that case.
             if live {
                 assert!(
                     cause_count > 0,
-                    "protected fresh alias is counted at its actual POST boundary"
+                    "protected ordinary offer is counted at its actual POST boundary"
                 );
             } else {
                 assert_eq!(
@@ -1217,7 +1226,7 @@ fn p2a_protected_quiet_authority_receipts_equal_v1_and_keep_debt() {
             progress.save(&progress_path).unwrap();
             saved.retain_quarantined_fingerprints(&progress.quarantined_fingerprints);
             saved.save(&control.index_path).unwrap();
-            let _live = live.then(|| money::LiveForTest::new(&control.support));
+            let _live = live.then(|| money::LiveForTest::settled(&control.support));
             control.restart();
             let offered = control.offers().len();
             let (parsed, _) = control.cycle();
@@ -1415,7 +1424,7 @@ fn p2a_cost_published_jsonl_matches_wire_and_withholds_unpriced_unattributed() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for held in [false, true] {
         let control = P2aControl::new(FinishOutcome::Accept);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         write_native_bootstrap_sidecars(&control.fixture, &control.support);
         p2a_control_api_rows(&control, |rows| {
             if held {
@@ -1502,7 +1511,7 @@ fn p2a_priced_side_call_then_zero_token_transcript_retains_accepted_cost_and_hol
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     write_native_bootstrap_sidecars(&control.fixture, &control.support);
     p2a_control_api_rows(&control, |rows| {
         let mut side = rows[0].clone();
@@ -1568,7 +1577,7 @@ fn p2a_sidecars_only_real_maturity_restart_and_first_transcript_keep_entity() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     write_native_bootstrap_sidecars(&control.fixture, &control.support);
     let transcript = std::fs::read(control.transcript()).unwrap();
     std::fs::remove_file(control.transcript()).unwrap();
@@ -1644,7 +1653,7 @@ fn p2a_bad_first_adoption_slice_over_good_history_restarts_and_recovers() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::MoneyHeld);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = OffsetDateTime::now_utc().unix_timestamp() as u64;
     let clock = money::PageClockForTest::new(&control.support, now);
     control.recovery_startup(now);
@@ -1764,7 +1773,7 @@ fn p2a_cap_exhausted_after_post_preserves_real_server_hold_across_restart() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::MoneyHeld);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let support = control.support.clone();
     *control.server.before_post.lock().unwrap() = Some(Box::new(move || {
         money::store::with_ledger_for_test(&support, |ledger| {
@@ -1826,7 +1835,7 @@ fn p2a_failed_route_pause_checkpoint_then_reload_stays_closed() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::MoneyRouteUnavailable);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let support = control.support.clone();
     let route_shard = Arc::new(Mutex::new(None::<PathBuf>));
     let blocked = route_shard.clone();
@@ -1922,7 +1931,7 @@ fn p2a_accepted_a_restored_older_b_message_only_real_reoffers_settle_loser() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for restart in [false, true] {
         let mut control = P2aControl::new(FinishOutcome::Accept);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let lines = std::fs::read_to_string(control.transcript())
             .unwrap()
             .lines()
@@ -2058,7 +2067,7 @@ fn p2a_continuously_changing_evidence_finishes_frozen_epoch_then_next_epoch() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::new(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     control.recovery_startup(current_unix_seconds());
     let mut sequence = 0;
     let mut counts = Vec::new();
@@ -2139,7 +2148,7 @@ fn p2a_checkpoint_resume_revalidates_selected_state_protection_and_live_gate() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for reason in ["selected index", "protection list", "live custody"] {
         let control = P2aControl::new(FinishOutcome::Accept);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let mut changed = false;
         let result = control.cycle_changing(|_| {
             if !changed && money_resume::pending_for_test(&control.support) {
@@ -2191,7 +2200,7 @@ fn p2a_enabling_live_between_finish_entry_and_evidence_yields_without_panicking_
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::new(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let kill = control.support.join("claude-request-owned-live.off");
     std::fs::write(&kill, b"").unwrap();
     let toggled = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -2234,7 +2243,7 @@ fn p2a_synchronous_audit_mode_never_yields_or_mutates_live_money_custody() {
         return;
     }
     let control = P2aControl::new(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let mut index = ScanIndex::default();
     let mut scan = crate::snapshots::scan_source_roots_with_test_limit(
         SnapshotSource::ClaudeCode,
@@ -2305,7 +2314,7 @@ fn p2a_full_ledger_releases_live_finish_and_continues_ordinary_collection() {
     // owns its carrier; only the new physical file below needs admission.
     money::enable_shadow_for_test(&control.support);
     control.cycle();
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
         let vacant = money::store::LEDGER_MAX_RECORDS - ledger.census().record_count();
@@ -2414,7 +2423,7 @@ fn p2a_actual_cap_metadata_recovery_finishes_literal_and_survives_restart() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::new(FinishOutcome::Accept);
     control.cycle();
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     money::store::reload_for_test(&control.support).unwrap();
     money::store::with_ledger_for_test(&control.support, |ledger| {
         assert_eq!(
@@ -2508,7 +2517,7 @@ fn p2a_preboxing_memory_refusal_releases_finish_then_collects_ordinary() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::new(FinishOutcome::Accept);
     control.cycle();
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let held = Arc::new(Mutex::new(None));
     let injected = held.clone();
     money_resume::set_before_start_for_test(move || {
@@ -2570,7 +2579,7 @@ fn p2a_parked_finish_releases_on_disabled_source_credential_exit_and_account_res
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for reason in ["disabled source", "credential exit", "account reset"] {
         let control = P2aControl::new(FinishOutcome::Accept);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let mut cancelled = false;
         let result = control.cycle_changing(|_| {
             if cancelled || !money_resume::pending_for_test(&control.support) {
@@ -2652,7 +2661,7 @@ fn p2a_live_page_large_ack_history_resource_receipt() {
         control.accepted_history = history;
         control.resource_receipt = !settlement_only;
         control.settlement_receipt = settlement_only;
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         control.cycle();
         assert!(!money_resume::pending_for_test(&control.support));
         let offers = control.offers();
@@ -2737,7 +2746,7 @@ fn p2a_settlement_admission_refusal_keeps_exact_debt_after_ack_and_restart() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::new(FinishOutcome::Accept);
     control.cycle();
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let (result, receipts) = crate::retry_allocation_probe::measure_money_settlements(|| {
         crate::retry_allocation_probe::refuse_money_settlement_for_test(|| control.cycle_result())
     });
@@ -2858,7 +2867,7 @@ fn p2a_unknown_lost_commit_and_no_commit_exact_replay_restart() {
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     for lost in [FinishOutcome::LostCommitted, FinishOutcome::LostUncommitted] {
         let mut control = P2aControl::with_recovery_evidence(lost);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle_deferred();
@@ -2968,7 +2977,7 @@ fn p2a_unknown_late_revision_deny_contract_releases_without_post_charge() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -3068,7 +3077,7 @@ fn p2a_unknown_pause_installed_after_counter_commit_is_current_before_post() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
@@ -3187,7 +3196,7 @@ fn p2a_unknown_saved_replay_ack_cannot_cover_newer_same_body_debt() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for newer_revision in [false, true] {
         let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         {
             let _clock = money::PageClockForTest::new(&control.support, now);
@@ -3271,7 +3280,7 @@ fn p2a_denied_original_literal_cannot_create_an_authorized_replay_intent() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let denied = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::DenyAll);
     control.cycle_deferred();
     assert!(control.server.raw_batches.lock().unwrap().is_empty());
@@ -3316,7 +3325,7 @@ fn p2a_completed_finish_keeps_catalog_and_quiet_privacy_cycles_ready() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     control.cycle();
     assert!(
         unknown_recovery::initialized(&control.support),
@@ -3359,7 +3368,7 @@ fn p2a_unsent_metadata_admission_splits_then_resumes_exact_captures() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let original = std::fs::read_to_string(control.transcript()).unwrap();
     let parent = control.transcript().parent().unwrap().to_path_buf();
     let mut expected = BTreeSet::new();
@@ -3422,7 +3431,7 @@ fn p2a_full_batch_custody_checkpoints_acks_then_admits_the_next_offer() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let capture = unknown_recovery::PostedEntityForTest::new();
     control.cycle();
     // cycle().1 is the pre-finalization scan. Clone the actual finalized wire
@@ -3662,7 +3671,7 @@ fn p2a_unknown_account_change_after_restart_retires_bytes_with_same_device_crede
     };
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
     control.daemon = test_daemon("otm_test").with_account(account("first"));
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -3721,7 +3730,7 @@ fn p2a_unknown_expiry_releases_only_unknown_and_does_not_rearm_lineage() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -3774,7 +3783,7 @@ fn p2a_unknown_live_off_retires_existing_payload_before_ordinary_networking() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let _clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -3854,7 +3863,7 @@ fn p2a_unknown_restart_expiry_precedes_cycle_network_with_disabled_source_or_mis
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for missing_binding in [false, true] {
         let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle_deferred();
@@ -3937,7 +3946,7 @@ fn p2a_unknown_new_list_and_revision_downgrade_guard_contract_send_none() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for downgrade in [false, true] {
         let control = P2aControl::with_recovery_evidence(FinishOutcome::LostCommitted);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle_deferred();
@@ -4056,7 +4065,7 @@ fn p2a_unknown_mixed_batch_new_list_sends_none_unrelated_work_continues() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
     let sibling = "22222222-2222-4222-8222-222222222222";
@@ -4129,7 +4138,7 @@ fn p2a_unknown_new_filename_alias_cannot_escape_family_custody() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -4194,7 +4203,7 @@ fn p2a_unknown_root_hold_survives_a_body_without_a_physical_fingerprint() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let _clock = money::PageClockForTest::new(&control.support, now);
     control.cycle_deferred();
@@ -4236,7 +4245,7 @@ fn p2a_unknown_cross_family_request_and_message_dependents_stay_scoped_after_res
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     for message_only in [false, true] {
         let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         if message_only {
@@ -4368,7 +4377,7 @@ fn p2a_unknown_physical_three_replays_exhaustion_and_normal_return() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
@@ -4422,7 +4431,7 @@ fn p2a_unknown_current_stop_and_live_off_latches_deny_each_replay() {
     for stop in [true, false] {
         crate::snapshots::restart_claude_reemission_stop_for_test();
         let control = P2aControl::with_recovery_evidence(FinishOutcome::LostCommitted);
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         control.cycle_deferred();
@@ -4490,7 +4499,7 @@ fn p2a_unknown_http_outcome_table_never_splits_and_honors_retry_after() {
             status,
             retry_after: 7200,
         });
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         let now = current_unix_seconds();
         let clock = money::PageClockForTest::new(&control.support, now);
         if matches!(status, 429 | 503) {
@@ -4562,7 +4571,7 @@ fn p2a_unknown_shed_blocks_unrelated_snapshot_posts_at_the_cycle_boundary() {
             status,
             retry_after: 7200,
         });
-        let _live = money::LiveForTest::new(&control.support);
+        let _live = money::LiveForTest::settled(&control.support);
         clear_shed_streak(SnapshotSource::ClaudeCode);
         control.cycle_shed(Duration::from_secs(7200));
         let original = std::fs::read_to_string(control.transcript()).unwrap();
@@ -4625,7 +4634,7 @@ fn p2a_unknown_cancel_after_counter_commit_consumes_slot_for_next_owner() {
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let _guard = unknown_recovery::guard_for_test(unknown_recovery::LiteralPermit::Permit);
     let control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
@@ -4703,7 +4712,7 @@ fn p2a_unknown_parked_capture_cannot_post_after_original_deadline() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let mut clock = Some(money::PageClockForTest::new(&control.support, now));
     let mut expired = false;
@@ -4758,7 +4767,7 @@ fn p2a_unknown_known_ack_pending_selected_save_does_not_collide_with_fresh_offer
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let _reset = P2aConflictReset;
     P2A_INDEX_CONFLICT.with(|state| *state.borrow_mut() = Some(control.index_path.clone()));
     assert!(
@@ -4834,7 +4843,7 @@ fn p2a_unknown_validated_nonstored_ack_exits_into_ordinary_disposition() {
             } else {
                 outcome
             });
-            let _live = money::LiveForTest::new(&control.support);
+            let _live = money::LiveForTest::settled(&control.support);
             let now = current_unix_seconds();
             {
                 let _clock = money::PageClockForTest::new(&control.support, now);
@@ -4918,7 +4927,7 @@ fn p2a_unknown_literal_version_skew_preserves_its_independent_backoff() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
@@ -5004,7 +5013,7 @@ fn p2a_unknown_partial_200_records_only_covering_siblings() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     let sibling = "22222222-2222-4222-8222-222222222222";
     let original = std::fs::read_to_string(control.transcript()).unwrap();
@@ -5095,7 +5104,7 @@ fn p2a_unknown_last_replay_saved_ack_failed_selection_stays_known_at_expiry() {
     }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let mut control = P2aControl::with_recovery_evidence(FinishOutcome::LostUncommitted);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let _reset = P2aConflictReset;
     let now = current_unix_seconds();
     for elapsed in [0, 300, 3600] {
@@ -5191,7 +5200,7 @@ fn p2a_unknown_retry_after_crossing_deadline_expires_without_replay() {
         status: 429,
         retry_after: 172800,
     });
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let now = current_unix_seconds();
     {
         let _clock = money::PageClockForTest::new(&control.support, now);
@@ -5245,7 +5254,7 @@ fn p2a_initial_post_holds_versionless_before_intent_and_acks_supported_control()
     if !crate::heap_layout_bound::layout_supported() { return; }
     let _native = crate::snapshots::claude_native_comparison::enable_for_test();
     let control = P2aControl::with_recovery_evidence(FinishOutcome::Accept);
-    let _live = money::LiveForTest::new(&control.support);
+    let _live = money::LiveForTest::settled(&control.support);
     let posted = unknown_recovery::PostedEntityForTest::new();
     control.cycle();
     let supported = posted.take().expect("real finalized supported wire body");

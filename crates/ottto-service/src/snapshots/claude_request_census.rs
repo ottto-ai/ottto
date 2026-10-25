@@ -3562,7 +3562,12 @@ pub(super) fn repair_money_selection_loss(index: &mut ScanIndex) {
     }
     let mut reowe = Vec::new();
     for (key, entry) in &index.files {
-        if super::claude_index_path_member_ref(std::path::Path::new(key)).is_none() {
+        let path = std::path::Path::new(key);
+        let native_codex = path.file_name().and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("rollout-"))
+            && path.components().any(|part| matches!(part,
+                std::path::Component::Normal(name) if name == "sessions" || name == "archived_sessions"));
+        if native_codex || super::claude_index_path_member_ref(path).is_none() {
             continue;
         }
         // Empty physical files settle locally without an entity or

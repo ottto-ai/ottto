@@ -552,6 +552,9 @@ impl ClaudeLedgerScope {
         page_roots: &BTreeSet<&str>,
         deadline: Instant,
     ) -> Option<Self> {
+        if page_groups.is_empty() && page_roots.is_empty() {
+            return Some(Self::default());
+        }
         let files = ClaudeScopeFiles::walk(index, page_roots, deadline)?;
         let mut scope = Self::default();
         for (group, keys) in &files.groups {

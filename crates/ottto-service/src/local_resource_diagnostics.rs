@@ -405,6 +405,15 @@ pub(crate) fn claude_reemission_stop_latched(reminder: bool, counts: &impl Seria
     };
     traversal_point(stage, "claude_code", counts);
 }
+/// Unsent recovery bodies whose witness cannot receive an exact ACK.
+/// Counts only: no body, path, account or provider identity is collected.
+pub(crate) fn claude_money_recovery_witness_hold(missing: u64, unsupported: u64) {
+    traversal_point(
+        "claude_request_money_recovery_witness_hold",
+        "claude_code",
+        &serde_json::json!({"missing_version":missing,"unsupported_version":unsupported}),
+    );
+}
 fn traversal_point(stage: &'static str, source: &str, counts: &impl Serialize) {
     emit(&Record {
         schema_version: SCHEMA_VERSION,

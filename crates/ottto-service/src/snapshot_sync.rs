@@ -2071,8 +2071,16 @@ impl SnapshotUploadProgress {
             .quarantined_fingerprints
             .get_mut(fingerprint)
             .expect("retry inserted");
-        let progress_limit = reason_reoffer::now_unix_seconds()
-            .saturating_add(crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2));
+        let now = reason_reoffer::now_unix_seconds();
+        let rollback = crate::snapshots::SNAPSHOT_QUARANTINE_RETRY_SECONDS.saturating_mul(2);
+        // The retained server hold has its own bounded cadence (up to seven
+        // days); an ordinary twelve-hour clamp must not hide a due transient
+        // retry behind its older hold deadline. Match the load validator.
+        let delay_bound = previous.as_ref().map_or(rollback, |(hold, _)| {
+            let base = hold.base_seconds(now.saturating_add(rollback));
+            base.saturating_add(base / 4).saturating_add(rollback)
+        });
+        let progress_limit = now.saturating_add(delay_bound);
         let not_before = not_before.min(progress_limit);
         record.retry_after_unix_seconds = not_before;
         if let Some((hold, deadline)) = previous {
@@ -7196,7 +7204,7 @@ async fn finish_sync_source_resume(
                 },
                 |progress| {
                     progress.save(&upload_progress_path)?;
-                    if source_money_resume(source, support_dir) {
+                    if recovery_binding.is_some() {
                         unknown_recovery::ack_saved(support_dir, progress)
                             .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
                     }
@@ -7212,7 +7220,7 @@ async fn finish_sync_source_resume(
                 ensure_authority()?;
                 continue;
             }
-            if source_money_resume(source, support_dir) {
+            if recovery_binding.is_some() {
                 unknown_recovery::discard_unsaved_acks(support_dir);
                 unknown_recovery::outcomes(support_dir).await?;
             }
@@ -7400,7 +7408,7 @@ async fn finish_sync_source_resume(
                         &upload_progress_path,
                     );
                     progress.save(&upload_progress_path)?;
-                    if source_money_resume(source, support_dir) {
+                    if recovery_binding.is_some() {
                         unknown_recovery::ack_saved(support_dir, progress)
                             .inspect_err(|error| unknown_recovery::faulted(support_dir, error))?;
                     }
@@ -7444,7 +7452,9 @@ async fn finish_sync_source_resume(
         }
         break result;
     };
-    if source_money_resume(source, support_dir) {
+    // Earlier authorized ACKs still belong to this finish even when an unsent
+    // witness hold switched future collection to ordinary emission.
+    if recovery_binding.is_some() {
         unknown_recovery::discard_unsaved_acks(support_dir);
         unknown_recovery::outcomes(support_dir).await?;
     }
@@ -7715,7 +7725,7 @@ async fn finish_sync_source_resume(
                 &scan_result.snapshots,
             );
         }
-        if source_money_resume(source, support_dir) && recovery_ack_durable {
+        if recovery_binding.is_some() && recovery_ack_durable {
             if let Err(error) = unknown_recovery::resolve_saved(
                 support_dir,
                 saved,

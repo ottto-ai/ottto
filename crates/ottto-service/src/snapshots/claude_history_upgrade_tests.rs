@@ -89,12 +89,57 @@ fn settle(
     scan: &mut SourceScanResult,
     index: &mut ScanIndex,
 ) -> ScanIndex {
+    // These are SOURCE policy fixtures for a future revision-3 collector.
+    // Model its literal offer before the real finalization veto, then the
+    // exact ACK/stamp seam; ordinary finalization must never stamp revision 3.
+    if index.active_effective_upload_body_witness_revision == 3
+        && !scan.snapshots.iter().any(|item| {
+            item.usage_accounting_contract.as_deref() == Some(REQUEST_OWNED_USAGE_CONTRACT)
+        })
+    {
+        mint_request_owned_copies(&mut scan.snapshots);
+    }
     finalize_scan_after_policy(SnapshotSource::ClaudeCode, scan, index);
+    let bindings = scan
+        .snapshots
+        .iter()
+        .flat_map(|item| {
+            index.files.iter().filter_map(move |(key, entry)| {
+                if item.source_file_fingerprint.as_deref()
+                    == Some(entry.source_file_fingerprint.as_str())
+                {
+                    Some((
+                        key.clone(),
+                        entry.source_file_fingerprint.clone(),
+                        item.clone(),
+                    ))
+                } else {
+                    None
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    if index.active_effective_upload_body_witness_revision == 3 {
+        for (key, revision, item) in bindings {
+            claude_request_money::record_logical_member(index, &key, &revision, &item);
+        }
+    }
     let accepted = scan
         .snapshots
         .iter()
         .map(|item| item.snapshot_fingerprint.clone())
         .collect();
+    let bodies = scan
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.snapshot_fingerprint.clone(),
+                snapshot_upload_body_witness(item),
+            )
+        })
+        .collect();
+    index.stamp_request_money_acks(&scan.snapshots, &accepted, &bodies);
     let mut settled = index.committable_subset(previous, &accepted, &BTreeMap::new());
     let path = home.join("scan-index.json");
     settled.save(&path).unwrap();
@@ -1141,6 +1186,7 @@ fn malformed_move_hold_stays_held_with_an_intact_cutoff_after_bootstrap() {
 
 #[test]
 fn held_revision_three_file_reaches_neither_initial_nor_resend_emission() {
+    let _policy = super::claude_history_upgrade::MaxGatedForTest::new(3);
     let (_home, root, mut index) = families("history-gate-money-held", 1);
     let support = support("history-gate-money-held-support");
     fs::write(
