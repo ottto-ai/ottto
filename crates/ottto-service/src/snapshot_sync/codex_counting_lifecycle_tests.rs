@@ -97,14 +97,19 @@ fn counting_transition_capture_and_failed_upload_select_whole_entries() {
     progress.accepted_fingerprints.insert(control_item.snapshot_fingerprint.clone());
     progress.accepted_body_witnesses.insert(control_item.snapshot_fingerprint.clone(), snapshot_upload_body_witness(control_item));
     progress.save(&progress_path).unwrap();
-    let group_items = result.snapshots.iter().filter(|item| item.source_session_id == owner).cloned().collect::<Vec<_>>();
     let mut accepted_count = 0;
-    let outcome = upload_resumable_batches_with_body_witness(&group_items, &unique_poison_scope(),
+    let outcome = upload_resumable_batches_with_body_witness(&result.snapshots, &unique_poison_scope(),
         &mut progress, &mut accepted_count,
         |item: &SnapshotItem| item.snapshot_fingerprint.as_str(), snapshot_upload_body_witness,
-        |_| Err(anyhow!("synthetic upload failure after the control ACK")),
+        |items| {
+            assert!(items.iter().all(|item| item.source_session_id == owner),
+                "the durable control ACK suppresses its upload");
+            Err(anyhow!("synthetic upload failure after the control ACK"))
+        },
         |progress| progress.save(&progress_path));
     assert!(outcome.is_err());
+    assert!(progress.accepted_fingerprints.contains(&control_item.snapshot_fingerprint),
+        "full-cycle input retains the settled control ACK during pruning");
     checkpoint_partial_snapshot_index(&working, &committed, &progress, &result.snapshots,
         None, &BTreeSet::new(), &index_path, &progress_path, || Ok(())).unwrap();
     let loaded = ScanIndex::load(&index_path).unwrap();
