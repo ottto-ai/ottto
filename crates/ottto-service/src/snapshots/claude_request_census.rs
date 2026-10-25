@@ -7010,10 +7010,26 @@ mod phase_b_tests {
         }
         prepare_safety_checkpoint(&mut index);
         let checkpoint = serde_json::to_vec_pretty(&index).unwrap();
-        let ((counts, workspace, admission), allocation) =
+        // COST caps additional D2 bytes. These two native file-map copies
+        // exist on main too: census adds no ScanIndexEntry fields. Measure
+        // their actual requested live bytes separately, but keep them inside
+        // the full allocator audit and alive across join/checkpoint decode.
+        // In particular, main's counting-owner slot must not become D2 debt.
+        let files = std::mem::take(&mut index.files);
+        let clone_with_main_files = || {
+            let (mut copy, census) = crate::retry_allocation_probe::measure(|| index.clone());
+            let (main_files, main) = crate::retry_allocation_probe::measure(|| files.clone());
+            copy.files = main_files;
+            (
+                copy,
+                usize::try_from(main.requested_live).unwrap(),
+                census.requested_peak_with_overlap + main.requested_peak_with_overlap,
+            )
+        };
+        let ((counts, workspace, admission, main_files_baseline, preparation_peak), allocation) =
             crate::retry_allocation_probe::measure_caller_thread(|| {
-                let old = index.clone();
-                let working = index.clone();
+                let (old, old_main, old_preparation) = clone_with_main_files();
+                let (working, working_main, working_preparation) = clone_with_main_files();
                 let (join, workspace) = crate::retry_allocation_probe::measure(|| {
                     ClaudeRequestCensusJoin::new(&working, 7, &BTreeSet::new())
                 });
@@ -7025,8 +7041,25 @@ mod phase_b_tests {
                     MAX_CLAUDE_REQUEST_CENSUS_HASHES
                 );
                 assert_eq!(old.claude_request_census.records().count(), FILES);
-                (counts, workspace.requested_peak_with_overlap, admission)
+                assert_eq!(old.files.len(), FILES);
+                assert_eq!(working.files.len(), FILES);
+                (
+                    counts,
+                    workspace.requested_peak_with_overlap,
+                    admission,
+                    old_main + working_main,
+                    old_preparation + working_preparation,
+                )
             });
+        index.files = files;
+        // No baseline credit during copy construction: its upper bound must
+        // be below the measured peak, which therefore occurs with BOTH full
+        // native maps alive. Decode's native map remains charged in full.
+        assert!(allocation.requested_peak_with_overlap > preparation_peak);
+        let additional_peak = allocation
+            .requested_peak_with_overlap
+            .checked_sub(main_files_baseline)
+            .unwrap();
         let (refused_by, limit, requested) = admission.refusal_receipt();
         assert!(matches!(
             admission.refused_by(),
@@ -7046,9 +7079,11 @@ mod phase_b_tests {
             workspace <= 64 * 1024 * 1024,
             "workspace receipt: {workspace}"
         );
+        eprintln!("FIX3_PHASE_B_SCALE_BASELINE raw_peak_bytes={} main_files_baseline_bytes={main_files_baseline} additional_peak_bytes={additional_peak} preparation_peak_upper_bytes={preparation_peak} entry_inline_bytes={} baseline_scope=two_main_native_files_clones decoded_files_charged=true census_and_checkpoint_overlap_charged=true",
+            allocation.requested_peak_with_overlap, std::mem::size_of::<ScanIndexEntry>());
         assert!(
-            allocation.requested_peak_with_overlap <= 128 * 1024 * 1024,
-            "additional peak receipt: {}",
+            additional_peak <= 128 * 1024 * 1024,
+            "additional peak receipt: {additional_peak}; raw={} main_files_baseline={main_files_baseline}",
             allocation.requested_peak_with_overlap
         );
         assert_eq!(counts.shadow_healthy_terminals_attempted, 1);
