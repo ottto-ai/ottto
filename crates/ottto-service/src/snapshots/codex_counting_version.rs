@@ -109,15 +109,15 @@ impl AckEvidence {
     }
 }
 
-/// At most this many retired owners keep counting evidence (at most about 150
-/// bytes each in heap and on disk: a 64-byte owner hash, the retiring
-/// generation's census timestamp and the evidence; about 150 KiB when full).
-/// A full map first drops V2-only evidence, which can change a resumed job's
-/// view but never a decision, then the oldest Legacy evidence retired in an
-/// earlier traversal generation (disclosed residual: that owner's moved file,
-/// if any, has gone a full walk unparsed). Legacy evidence of the current
-/// generation is never evicted: the retirement is refused and the entry keeps
-/// its own evidence until the next generation frees a slot.
+/// At most this many retired owners keep counting evidence. The conservative
+/// `tree_nodes` heap charge is about 1 MiB at capacity (including key/timestamp
+/// buffers), not the serialized payload size or a measured RSS bound.
+/// Overflow prefers V2-only evidence, then intrinsically Legacy pre-cutover
+/// headers, then earlier-generation Legacy evidence. While inactive, known
+/// oldest creation times go first within the Legacy class; unknown times are
+/// most protected. Generation age alone proves no successful walk or absence.
+/// Current-generation Legacy evidence that might be post-cutover is retained:
+/// if no safer slot exists, refuse retirement until a later generation.
 pub(super) const MAX_COUNTING_TOMBSTONES: usize = 1024;
 
 /// Counting evidence of a retired, unprotected entry, keyed by its owner hash
@@ -130,6 +130,11 @@ pub(super) struct CountingTombstone {
     pub(super) evidence: AckEvidence,
     /// `census_window_end` of the traversal generation that retired the entry.
     pub(super) retired_in: String,
+    /// Immutable owning-header timestamp, learned from the existing inventory.
+    /// Missing in older state or after a removal before header observation.
+    /// Unknown must never count as proof that an owner predates the cutover.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) created_unix_ms: Option<i64>,
 }
 
 /// The first valid owner a complete parse proved for this entry. An invalid
@@ -183,51 +188,65 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
             // V2-only evidence never selects a different version.
             return true;
         }
-        // V2-only evidence first; then Legacy evidence retired in an earlier
-        // traversal generation, oldest first: a full later walk has passed it
-        // unabsorbed, so its owner was most likely deleted, not moved.
-        let mut earlier = tombstones
+        let cutover = cutover_unix_ms();
+        // Order by safety class, then creation time while inactive, then
+        // retirement generation and owner for deterministic ties. Unknown
+        // timestamps sort last. Rewritten owners cannot free a slot.
+        let mut evictable = tombstones
             .iter()
-            .filter(|(_, tombstone)| {
-                tombstone.evidence == AckEvidence::LegacyAcked && tombstone.retired_in != retired_in
+            .filter(|(owner, _)| !retired.iter().any(|(rewritten, _)| rewritten == *owner))
+            .filter_map(|(owner, tombstone)| {
+                let class = if tombstone.evidence != AckEvidence::LegacyAcked {
+                    0
+                } else if cutover.is_some_and(|cutover| {
+                    tombstone
+                        .created_unix_ms
+                        .is_some_and(|created| created < cutover)
+                }) {
+                    1
+                } else if tombstone.retired_in != retired_in {
+                    2
+                } else {
+                    return None;
+                };
+                let created = cutover
+                    .is_none()
+                    .then_some(tombstone.created_unix_ms)
+                    .flatten();
+                Some((
+                    class,
+                    tombstone.created_unix_ms.is_none(),
+                    created,
+                    &tombstone.retired_in,
+                    owner,
+                ))
             })
-            .map(|(owner, tombstone)| (tombstone.retired_in.as_str(), owner.as_str()))
             .collect::<Vec<_>>();
-        earlier.sort_unstable();
-        let evictable = tombstones
-            .iter()
-            .filter(|(_, tombstone)| tombstone.evidence != AckEvidence::LegacyAcked)
-            .map(|(owner, _)| owner.as_str())
-            .chain(earlier.into_iter().map(|(_, owner)| owner))
-            // Never an owner this retirement is about to (re)write.
-            .filter(|owner| !retired.iter().any(|(rewritten, _)| rewritten == owner))
-            .take(short)
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
+        evictable.sort_unstable();
         if evictable.len() < short {
-            // Only this generation's Legacy evidence: a burst still in flight.
             return false;
         }
-        let mut legacy_evicted = 0usize;
-        for owner in evictable {
-            if tombstones
-                .remove(&owner)
-                .is_some_and(|tombstone| tombstone.evidence == AckEvidence::LegacyAcked)
-            {
-                legacy_evicted += 1;
-            }
+        let evictable = evictable
+            .into_iter()
+            .take(short)
+            .map(|(class, _, _, _, owner)| (class, owner.clone()))
+            .collect::<Vec<_>>();
+        let mut counts = [0usize; 3];
+        for (class, owner) in evictable {
+            tombstones.remove(&owner);
+            counts[class] += 1;
         }
-        if legacy_evicted > 0 {
-            eprintln!(
-                "ottto-service: Codex counting tombstones full; evicted {legacy_evicted} \
-                 earlier-generation Legacy owner(s)"
-            );
-        }
+        eprintln!(
+            "ottto-service: Codex counting tombstones full; evicted v2_only={} \
+             pre_cutover_legacy={} earlier_generation_legacy={}",
+            counts[0], counts[1], counts[2]
+        );
     }
     for (owner, evidence) in retired {
         let tombstone = tombstones.entry(owner).or_insert(CountingTombstone {
             evidence: AckEvidence::None,
             retired_in: String::new(),
+            created_unix_ms: None,
         });
         tombstone.evidence = tombstone.evidence.combine(evidence);
         tombstone.retired_in.clone_from(&retired_in);
@@ -235,12 +254,78 @@ pub(super) fn tombstone_before_retire(index: &mut ScanIndex, key: &str) -> bool 
     true
 }
 
+/// Header completeness covers the resolved roster, not unresolved configured
+/// roots. Reuse the ordinary reconciliation health signal (which includes
+/// root-resolution failures) plus current directory witnesses. No re-listing.
+pub(super) fn absence_coverage_complete(
+    index: &ScanIndex,
+    inventory: &codex_file_join::HeaderInventory,
+) -> bool {
+    inventory.complete
+        && index.legacy_unresolved_root_file_witnesses.is_empty()
+        && index.traversal.as_ref().is_some_and(|traversal| {
+            !traversal.counts.has_errors()
+                && !traversal.watcher_hint_seen
+                && traversal.pending_directories.is_empty()
+                && !traversal.scan_roots.is_empty()
+                && traversal
+                    .scan_roots
+                    .iter()
+                    .all(|root| inventory.directories.contains(root))
+                && inventory.directories.local_diagnostic_counts().0
+                && inventory.directories.moved_directories().is_empty()
+        })
+}
+
+/// Reuse decoded owning headers for existing retired owners. A missing old
+/// path has no timestamp in ScanIndexEntry; keep it unknown until inventoried
+/// at its new path. For conflicting aliases the latest timestamp wins, and
+/// any unknown header prevents claiming an intrinsically Legacy owner.
+pub(super) fn note_inventory_created(
+    index: &mut ScanIndex,
+    inventory: &codex_file_join::HeaderInventory,
+) {
+    if !inventory.complete || index.codex_counting_tombstones.is_empty() {
+        return;
+    }
+    let mut created_by_owner = BTreeMap::<String, Option<i64>>::new();
+    for header in &inventory.headers {
+        let owner = codex_protected_owner(&header.owner);
+        if !index.codex_counting_tombstones.contains_key(&owner) {
+            continue;
+        }
+        created_by_owner
+            .entry(owner)
+            .and_modify(|created| {
+                *created = match (*created, header.created_unix_ms) {
+                    (Some(a), Some(b)) => Some(a.max(b)),
+                    _ => None,
+                };
+            })
+            .or_insert(header.created_unix_ms);
+    }
+    for (owner, created) in created_by_owner {
+        let tombstone = index
+            .codex_counting_tombstones
+            .get_mut(&owner)
+            .expect("existing owner");
+        tombstone.created_unix_ms = match (tombstone.created_unix_ms, created) {
+            (Some(a), Some(b)) => Some(a.max(b)),
+            (_, created) => created,
+        };
+    }
+}
+
 /// Free tombstone slots, whatever the cutover, from the index state this page
 /// loaded: an owner whose live, proven entry already carries at least the
-/// same evidence, or an owner absent from a complete inventory of a later
-/// traversal generation than the one that retired it (a fresh full walk, so a
-/// rename in flight during the retiring generation's walk cannot drop it).
-fn collect_tombstones(index: &mut ScanIndex, owners: &BTreeMap<String, String>, complete: bool) {
+/// same evidence, or an owner absent from a later traversal generation with
+/// explicit complete configured-root coverage and fresh directory witnesses.
+/// A rename in flight during the retiring generation cannot prove absence.
+fn collect_tombstones(
+    index: &mut ScanIndex,
+    owners: &BTreeMap<String, String>,
+    absence_coverage: bool,
+) {
     if index.codex_counting_tombstones.is_empty() {
         return;
     }
@@ -267,7 +352,7 @@ fn collect_tombstones(index: &mut ScanIndex, owners: &BTreeMap<String, String>, 
             let absorbed = live.get(owner.as_str()).is_some_and(|evidence| {
                 *evidence != AckEvidence::None && evidence.combine(tombstone.evidence) == *evidence
             });
-            let absent = complete
+            let absent = absence_coverage
                 && !present.contains(owner)
                 && census.is_some_and(|census| census != tombstone.retired_in);
             absorbed || absent
@@ -287,10 +372,10 @@ fn collect_tombstones(index: &mut ScanIndex, owners: &BTreeMap<String, String>, 
 pub(super) fn prepare_moved_evidence(
     index: &mut ScanIndex,
     owners: &BTreeMap<String, String>,
-    complete: bool,
+    absence_coverage: bool,
 ) {
     index.codex_counting_moved_evidence.clear();
-    collect_tombstones(index, owners, complete);
+    collect_tombstones(index, owners, absence_coverage);
     if cutover_unix_ms().is_none() {
         return;
     }
@@ -542,4 +627,4 @@ impl crate::heap_layout_bound::HeapLayoutBound for AckEvidence {
     }
 }
 
-crate::heap_layout_bound::fields!(CountingTombstone; evidence, retired_in);
+crate::heap_layout_bound::fields!(CountingTombstone; evidence, retired_in, created_unix_ms);

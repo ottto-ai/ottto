@@ -24600,10 +24600,13 @@ impl OwnedSourceScan {
                             )
                         })
                         .collect::<BTreeMap<_, _>>();
+                    let absence_coverage =
+                        codex_counting_version::absence_coverage_complete(index, inventory);
+                    codex_counting_version::note_inventory_created(index, inventory);
                     codex_counting_version::prepare_moved_evidence(
                         index,
                         &current_owners,
-                        inventory.complete,
+                        absence_coverage,
                     );
                     let mut repurposed_protected_paths = BTreeSet::new();
                     let mut missing_protected_owners = BTreeSet::new();
@@ -27895,6 +27898,11 @@ impl OwnedSourceScan {
                 // This keeps the map a subset of `files`, which is the whole bound it
                 // needs.
                 index.prune_terminal_jsonl_dispositions();
+                // Retirements on this page can already have a moved header in
+                // the inventory, even while that file's parse is deferred.
+                if let Some(inventory) = codex_join_inventory.as_ref() {
+                    codex_counting_version::note_inventory_created(index, inventory);
+                }
                 if source == SnapshotSource::Codex
                     && traversal_discovery_done
                     && traversal_healthy
