@@ -1049,6 +1049,10 @@ fn forward_otlp_request(source: SnapshotSource, request: &HttpRequest) -> Result
     // ordinary rotation as well as a cross-account claim, so every relay
     // admission stays fenced until the local binding is fully promoted.
     relay_admission_ready()?;
+    let device = FileDeviceStore::default()
+        .load()?
+        .ok_or_else(|| anyhow!("relay device binding is missing"))?;
+    require_source_allowed(&device, source)?;
     let api_base_url = current_api_base_url();
     let relay_token = cached_relay_token(&api_base_url, source)?;
     let response = send_otlp_request(&api_base_url, &relay_token, request)?;
@@ -1224,13 +1228,26 @@ fn issue_relay_token(api_base_url: &str, source: SnapshotSource) -> Result<Strin
     request_relay_token(api_base_url, &device, &device_secret, source)
 }
 
+fn require_source_allowed(device: &LocalDeviceBinding, source: SnapshotSource) -> Result<()> {
+    if !device
+        .sources
+        .iter()
+        .any(|allowed| allowed == source.api_slug())
+    {
+        return Err(anyhow!("relay source is not registered for this device"));
+    }
+    Ok(())
+}
+
 pub(crate) fn request_relay_token(
     api_base_url: &str,
     device: &LocalDeviceBinding,
     device_secret: &str,
     source: SnapshotSource,
 ) -> Result<String> {
-    let mut probe = crate::relay_auth::Probe::begin(api_base_url, device, device_secret)?;
+    require_source_allowed(device, source)?;
+    let mut probe =
+        crate::relay_auth::Probe::begin(api_base_url, device, device_secret, source.api_slug())?;
     let url = format!(
         "{}/api/v1/telemetry/devices/{}/relay-token",
         api_base_url.trim_end_matches('/'),
@@ -1648,6 +1665,63 @@ mod tests {
         LocalAccountBinding, LocalAccountOrganization, LocalAccountState, LocalAccountUser,
         MachineIdentity, OperatingSystem,
     };
+
+    #[test]
+    #[serial_test::serial]
+    fn ungranted_source_is_refused_before_a_cached_token_can_forward() {
+        struct Env(Option<std::ffi::OsString>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value),
+                    None => std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"),
+                }
+            }
+        }
+        let support = crate::test_scratch::ScratchDir::new("relay-source-grant");
+        let _restore = Env(std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"));
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref());
+        FileDeviceStore::default()
+            .save(&LocalDeviceBinding {
+                device_id: "only-codex".into(),
+                machine_id: None,
+                sources: vec!["codex".into()],
+            })
+            .unwrap();
+        let base = "http://127.0.0.1:1/ungranted-source";
+        FileConnectionStore::default()
+            .save(&ottto_core::LocalConnectionBinding {
+                setup_run_id: "source-check".into(),
+                setup_run_token_expires_at: "2099-01-01T00:00:00Z".into(),
+                machine_id: None,
+                claim_code: None,
+                api_base_url: base.into(),
+            })
+            .unwrap();
+        let key = RelayTokenCacheKey {
+            api_base_url: base.into(),
+            source: "claude_code",
+        };
+        relay_token_cache().lock().unwrap().insert(
+            key.clone(),
+            CachedRelayToken {
+                token: "synthetic".into(),
+                refresh_after: SystemTime::now() + Duration::from_secs(60),
+            },
+        );
+        let request = HttpRequest {
+            method: "POST".into(),
+            path: "/v1/metrics".into(),
+            headers: BTreeMap::new(),
+            body: vec![],
+        };
+        let error = match forward_otlp_request(SnapshotSource::ClaudeCode, &request) {
+            Err(error) => error,
+            Ok(_) => panic!("ungranted source must not forward"),
+        };
+        assert!(error.to_string().contains("not registered"));
+        relay_token_cache().lock().unwrap().remove(&key);
+    }
 
     #[test]
     fn relay_token_request_never_follows_redirects_or_reaches_a_host_logger() {
@@ -2581,6 +2655,7 @@ mod tests {
         // Verify that genuinely unknown commands do NOT match the allowlist.
         let cmd = LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: false,
         };
 
         let is_allowed = matches!(

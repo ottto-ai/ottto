@@ -3997,6 +3997,9 @@ pub enum LocalControlCommand {
     Status {
         #[serde(default)]
         refresh_agent_status: bool,
+        /// Explicit doctor recovery; ordinary status reads do not reset backoff.
+        #[serde(default, skip_serializing_if = "is_false")]
+        retry_relay_authorization: bool,
     },
     /// Read the daemon's bounded, privacy-safe snapshot upload receipt ring.
     Receipts {
@@ -5036,6 +5039,28 @@ fn redact_diagnostic_for_backend(mut diagnostic: AgentStatusDiagnostic) -> Agent
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_retry_relay_authorization_is_additive_and_explicit() {
+        let legacy = serde_json::json!({"command":"status", "refresh_agent_status":false});
+        let command: LocalControlCommand = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(
+            command,
+            LocalControlCommand::Status {
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
+            }
+        );
+        assert_eq!(serde_json::to_value(command).unwrap(), legacy);
+        let doctor = LocalControlCommand::Status {
+            refresh_agent_status: false,
+            retry_relay_authorization: true,
+        };
+        assert_eq!(
+            serde_json::to_value(doctor).unwrap()["retry_relay_authorization"],
+            true
+        );
+    }
 
     #[test]
     fn cli_exit_codes_are_stable() {

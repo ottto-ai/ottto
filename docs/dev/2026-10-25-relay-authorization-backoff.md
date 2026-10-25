@@ -2,7 +2,7 @@
 
 Relay-token authorization rejections now share an in-memory gate across snapshot,
 bounded retry, OTLP relay and control requests. The binding includes the device,
-credential generation, a digest of its secret, API destination and setup-run
+credential generation, a digest of its secret, API destination, source and setup-run
 binding. New credentials or a reattach admit an immediate attempt. HTTP 401/403
 starts an equal-jitter exponential wait: initially 2.5–5 minutes, eventually
 3–6 hours. One probe runs per rejected binding at a time. Successful exchanges
@@ -13,6 +13,8 @@ rejected probe grants one setup refresh opportunity, including when another
 caller observed the rejection first. A successful refresh admits one retry
 without resetting the device rejection streak or granting another refresh,
 including when that refresh replaces the setup-run id.
+Each source shares its gate across callers; a source-specific 401 never pauses
+another source. OTLP also rejects sources absent from the local device grants.
 Concurrent initial rejections count as one wave. Local scans, quota/account
 checks and their scheduling keep running. The existing reconnect-required health classification remains typed.
 
@@ -26,3 +28,11 @@ Regression coverage exercises shared suppression across callers and sources,
 probe admission, changed credential keys, success reset, transient 429/503
 classification, setup refresh and test-only egress rejection. Broad workspace
 checks remain CI's responsibility.
+
+Round 2 corrects refresh handover ownership: a new setup-run key starts with no
+in-flight probe marker, while an existing destination key keeps its own marker.
+An authorized connect, doctor or non-dry-run repair clears auth retry state,
+including the terminal setup-refresh hold, even for unchanged credentials.
+Doctor sends the additive optional status flag `retry_relay_authorization: true`;
+ordinary status omits its default false value and never resets backoff. Existing
+clients and polling retain their request shape and behavior.

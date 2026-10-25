@@ -37,7 +37,12 @@ fn gate() -> &'static Mutex<Gate> {
 /// test backends cannot inherit another destination's rejection. A new device,
 /// generation or secret always gets immediate admission. Only digests live in
 /// the gate; no identifier or credential is logged or persisted.
-pub(crate) fn binding_key(api_base: &str, device: &LocalDeviceBinding, secret: &str) -> Key {
+pub(crate) fn binding_key(
+    api_base: &str,
+    device: &LocalDeviceBinding,
+    secret: &str,
+    source: &str,
+) -> Key {
     let generation = FileDeviceStore::default()
         .load_with_credential_generation()
         .ok()
@@ -59,6 +64,7 @@ pub(crate) fn binding_key(api_base: &str, device: &LocalDeviceBinding, secret: &
         generation,
         secret,
         setup_run.as_deref(),
+        source,
     )
 }
 
@@ -68,6 +74,7 @@ fn key(
     generation: u64,
     secret: &str,
     setup_run: Option<&str>,
+    source: &str,
 ) -> Key {
     let mut digest = Sha256::new();
     digest.update(b"ottto:relay-auth-gate:v1");
@@ -77,6 +84,7 @@ fn key(
         &generation.to_le_bytes(),
         &Sha256::digest(secret.as_bytes()),
         setup_run.unwrap_or_default().as_bytes(),
+        source.as_bytes(),
     ] {
         digest.update((part.len() as u64).to_le_bytes());
         digest.update(part);
@@ -187,10 +195,11 @@ impl Probe {
         api_base: &str,
         device: &LocalDeviceBinding,
         secret: &str,
+        source: &str,
     ) -> Result<Self, RelayTokenAuthorizationRejected> {
         static NEXT_PROBE: AtomicU64 = AtomicU64::new(1);
         let id = NEXT_PROBE.fetch_add(1, Ordering::Relaxed);
-        let key = binding_key(api_base, device, secret);
+        let key = binding_key(api_base, device, secret, source);
         let (initial, refresh_allowed) = gate()
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -266,11 +275,26 @@ pub(crate) fn retry_after_setup_refresh(previous_key: Key, refreshed_key: Key) {
     // A refresh may replace the setup-run id. That is still the same recovery
     // attempt, not an explicit user reattach: carry its consumed refresh and
     // rejection ladder to the exact binding the retry will use.
-    let refreshed = gate.rejected.entry(refreshed_key).or_insert(previous);
+    let refreshed = gate.rejected.entry(refreshed_key).or_insert(Rejected {
+        // A permit belongs to its original key. A copied marker has no owner
+        // that can release it; preserve a marker only when this key owns it.
+        probing: None,
+        ..previous
+    });
     refreshed.failures = refreshed.failures.max(previous.failures);
     refreshed.until = refreshed.until.max(previous.until);
     refreshed.refresh_available = false;
     refreshed.retry_after_refresh = true;
+}
+
+/// An authorized explicit recovery action retries even unchanged credentials.
+/// Ordinary status polling never calls this.
+pub(crate) fn reset() {
+    gate()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .rejected
+        .clear();
 }
 
 /// Success clears only the binding whose request actually succeeded.
@@ -287,6 +311,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[serial_test::serial]
     fn rejects_until_deadline_and_coalesces_probe_and_setup_refresh() {
         let mut gate = Gate::default();
         let key = [1; 32];
@@ -306,16 +331,52 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn device_generation_secret_and_reattach_get_immediate_admission() {
-        let original = key("http://127.0.0.1", "device", 1, "secret", Some("run"));
+        let original = key(
+            "http://127.0.0.1",
+            "device",
+            1,
+            "secret",
+            Some("run"),
+            "codex",
+        );
         let mut gate = Gate::default();
         let now = Instant::now();
         gate.reject(original, 401, now, 0, true, true);
         for changed in [
-            key("http://127.0.0.1", "new-device", 1, "secret", Some("run")),
-            key("http://127.0.0.1", "device", 2, "secret", Some("run")),
-            key("http://127.0.0.1", "device", 1, "new-secret", Some("run")),
-            key("http://127.0.0.1", "device", 1, "secret", Some("new-run")),
+            key(
+                "http://127.0.0.1",
+                "new-device",
+                1,
+                "secret",
+                Some("run"),
+                "codex",
+            ),
+            key(
+                "http://127.0.0.1",
+                "device",
+                2,
+                "secret",
+                Some("run"),
+                "codex",
+            ),
+            key(
+                "http://127.0.0.1",
+                "device",
+                1,
+                "new-secret",
+                Some("run"),
+                "codex",
+            ),
+            key(
+                "http://127.0.0.1",
+                "device",
+                1,
+                "secret",
+                Some("new-run"),
+                "codex",
+            ),
         ] {
             assert_ne!(changed, original);
             gate.admit(changed, now, 3).unwrap();
@@ -323,6 +384,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn concurrent_initial_rejections_count_as_one_wave() {
         let mut gate = Gate::default();
         let key = [42; 32];
@@ -345,6 +407,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn setup_refresh_retry_preserves_the_rejection_streak() {
         let key = [93; 32];
         let now = Instant::now();
@@ -367,6 +430,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn refreshed_setup_run_inherits_rejections_and_consumed_refresh() {
         let old = [94; 32];
         let new = [95; 32];
@@ -391,6 +455,23 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn refresh_preserves_a_probe_owned_by_the_existing_destination_key() {
+        let old = [96; 32];
+        let new = [97; 32];
+        let now = Instant::now();
+        gate().lock().unwrap().reject(old, 401, now, 0, true, true);
+        gate().lock().unwrap().reject(new, 401, now, 0, true, true);
+        let until = gate().lock().unwrap().rejected[&new].until;
+        gate().lock().unwrap().admit(new, until, 77).unwrap();
+        retry_after_setup_refresh(old, new);
+        assert_eq!(gate().lock().unwrap().rejected[&new].probing, Some(77));
+        clear(old);
+        clear(new);
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn waits_grow_to_three_to_six_hours() {
         let mut previous = Duration::ZERO;
         for failures in 1..30 {
@@ -477,7 +558,7 @@ mod http_tests {
 
     #[test]
     #[serial_test::serial]
-    fn relay_401_is_shared_across_clients_sources_bounded_otlp_and_control() {
+    fn relay_401_is_shared_across_clients_bounded_otlp_and_control_for_one_source() {
         let backend = Backend::start(vec![401, 401]);
         let client =
             SnapshotApiClient::new(&backend.base).with_bounded_retry_loopback_http_for_test();
@@ -494,7 +575,7 @@ mod http_tests {
         );
         for _ in 0..5 {
             let error = SnapshotApiClient::new(&backend.base)
-                .issue_relay_token(&device, secret, SnapshotSource::Pi)
+                .issue_relay_token(&device, secret, SnapshotSource::Codex)
                 .unwrap_err();
             assert!(
                 error
@@ -537,7 +618,7 @@ mod http_tests {
                 .suppressed
         );
         assert_eq!(backend.calls(), 1);
-        let key = client.relay_auth_binding(&device, secret);
+        let key = client.relay_auth_binding(&device, secret, SnapshotSource::Codex);
         assert!(take_setup_refresh(key));
         assert!(!take_setup_refresh(key));
         expire(key);
@@ -560,6 +641,116 @@ mod http_tests {
         assert!(take_setup_refresh(key));
         assert!(!take_setup_refresh(key));
         clear(key);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn refresh_deadline_probe_on_old_key_cannot_park_the_recovered_device() {
+        struct Env(Option<std::ffi::OsString>);
+        impl Drop for Env {
+            fn drop(&mut self) {
+                match self.0.take() {
+                    Some(value) => std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", value),
+                    None => std::env::remove_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"),
+                }
+            }
+        }
+        let support = crate::test_scratch::ScratchDir::new("relay-probe-handover");
+        let _restore = Env(std::env::var_os("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR"));
+        std::env::set_var("OTTTO_LOCAL_PLATFORM_SUPPORT_DIR", support.as_ref());
+        let backend = Backend::start(vec![401, 200, 200]);
+        let client = SnapshotApiClient::new(&backend.base);
+        let device = device();
+        let connection = |run: &str| ottto_core::LocalConnectionBinding {
+            setup_run_id: run.into(),
+            setup_run_token_expires_at: "2099-01-01T00:00:00Z".into(),
+            machine_id: None,
+            claim_code: None,
+            api_base_url: backend.base.clone(),
+        };
+        let store = FileConnectionStore::default();
+        store.save(&connection("old-run")).unwrap();
+        assert!(client
+            .issue_relay_token(&device, "same", SnapshotSource::Codex)
+            .is_err());
+        let old = client.relay_auth_binding(&device, "same", SnapshotSource::Codex);
+        assert!(take_setup_refresh(old));
+        // The deadline expires while setup refresh is in flight. A second
+        // worker owns an old-key probe until after the refresh hands over.
+        expire(old);
+        let old_probe = Probe::begin(&backend.base, &device, "same", "codex").unwrap();
+        assert!(gate().lock().unwrap().rejected[&old].probing.is_some());
+        store.save(&connection("new-run")).unwrap();
+        let new = client.relay_auth_binding(&device, "same", SnapshotSource::Codex);
+        retry_after_setup_refresh(old, new);
+        assert!(gate().lock().unwrap().rejected[&new].probing.is_none());
+        client
+            .issue_relay_token(&device, "same", SnapshotSource::Codex)
+            .unwrap();
+        drop(old_probe);
+        client
+            .issue_relay_token(&device, "same", SnapshotSource::Codex)
+            .unwrap();
+        assert_eq!(backend.calls(), 3, "recovered device performs HTTP again");
+        clear(old);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn source_rejection_does_not_pause_another_sources_uploads() {
+        let backend = Backend::start(vec![401, 200, 200]);
+        let client = SnapshotApiClient::new(&backend.base);
+        let device = device(); // only codex and pi are granted
+        let error = client
+            .issue_relay_token(&device, "same", SnapshotSource::ClaudeCode)
+            .unwrap_err();
+        assert!(
+            !error
+                .downcast_ref::<RelayTokenAuthorizationRejected>()
+                .unwrap()
+                .suppressed
+        );
+        client
+            .issue_relay_token(&device, "same", SnapshotSource::Codex)
+            .unwrap();
+        let held = client
+            .issue_relay_token(&device, "same", SnapshotSource::ClaudeCode)
+            .unwrap_err();
+        assert!(
+            held.downcast_ref::<RelayTokenAuthorizationRejected>()
+                .unwrap()
+                .suppressed
+        );
+        client
+            .issue_relay_token(&device, "same", SnapshotSource::Codex)
+            .unwrap();
+        assert_eq!(backend.calls(), 3);
+        clear(client.relay_auth_binding(&device, "same", SnapshotSource::ClaudeCode));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn otlp_refuses_ungranted_source_without_http_or_an_auth_latch() {
+        let backend = Backend::start(vec![200]);
+        let device = device();
+        assert!(crate::otlp_relay::request_relay_token(
+            &backend.base,
+            &device,
+            "same",
+            SnapshotSource::ClaudeCode
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("not registered"));
+        assert_eq!(backend.calls(), 0);
+        crate::otlp_relay::request_relay_token(
+            &backend.base,
+            &device,
+            "same",
+            SnapshotSource::Codex,
+        )
+        .unwrap();
+        assert_eq!(backend.calls(), 1);
     }
 
     #[test]
@@ -611,7 +802,7 @@ mod http_tests {
         client
             .issue_relay_token(&device, "new", SnapshotSource::Codex)
             .unwrap();
-        let old = client.relay_auth_binding(&device, "old");
+        let old = client.relay_auth_binding(&device, "old", SnapshotSource::Codex);
         expire(old);
         client
             .issue_relay_token(&device, "old", SnapshotSource::Codex)

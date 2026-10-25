@@ -511,6 +511,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -555,6 +556,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -664,6 +666,7 @@ mod tests {
             client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
         };
         let mut stream = UnixStream::connect(&path).expect("connect socket");
@@ -749,6 +752,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -826,6 +830,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
             Duration::from_millis(500),
@@ -880,6 +885,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -951,6 +957,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )
@@ -983,6 +990,7 @@ mod tests {
             client_install_owner: None,
             command: LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
         };
         let mut stream = UnixStream::connect(&path).expect("connect socket");
@@ -1058,6 +1066,7 @@ mod tests {
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         )

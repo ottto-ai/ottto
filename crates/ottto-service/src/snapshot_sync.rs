@@ -4542,8 +4542,8 @@ fn upload_local_health_projection_reporting(
     // The binding this pass's requests are for, captured before any of them.
     // A failure is recorded against it, never against a setup run attached
     // while a request was in flight.
-    let binding = setup_run_refresh_binding(device, device_secret);
-    let relay_binding = client.relay_auth_binding(device, device_secret);
+    let binding = setup_run_refresh_binding(device, device_secret, source);
+    let relay_binding = client.relay_auth_binding(device, device_secret, source);
     if let Some(held) = setup_run_refresh_hold_for(&binding) {
         // No request at all while held: the last `AuthRejected` upload event
         // stays the latest one, so local health keeps reporting the rejection.
@@ -4589,7 +4589,7 @@ fn upload_local_health_projection_reporting(
             }
             crate::relay_auth::retry_after_setup_refresh(
                 relay_binding,
-                client.relay_auth_binding(device, device_secret),
+                client.relay_auth_binding(device, device_secret, source),
             );
             match upload_local_health_projection_with(
                 client,
@@ -4674,7 +4674,11 @@ fn setup_run_refresh_hold() -> &'static Mutex<Option<SetupRunRefreshHold>> {
 
 /// Digest of what a reattach or credential change replaces: the device id and
 /// secret, and the persisted setup run and API base. Kept in memory only.
-fn setup_run_refresh_binding(device: &LocalDeviceBinding, device_secret: &str) -> [u8; 32] {
+fn setup_run_refresh_binding(
+    device: &LocalDeviceBinding,
+    device_secret: &str,
+    source: SnapshotSource,
+) -> [u8; 32] {
     let mut digest = Sha256::new();
     digest.update(b"ottto:setup-run-refresh-hold:v1\0");
     digest.update(device.device_id.as_bytes());
@@ -4684,6 +4688,7 @@ fn setup_run_refresh_binding(device: &LocalDeviceBinding, device_secret: &str) -
         &snapshot_api_base_url(),
         device,
         device_secret,
+        source.api_slug(),
     ));
     if let Some(connection) = FileConnectionStore::default().load().ok().flatten() {
         digest.update(b"\0");
@@ -4761,6 +4766,12 @@ fn note_setup_run_refresh_failed(binding: &[u8; 32], terminal: bool) {
             ),
         }
     }
+}
+
+/// Explicit recovery only: also release the local-health terminal refresh hold.
+pub(crate) fn reset_relay_authorization_backoff() {
+    crate::relay_auth::reset();
+    clear_setup_run_refresh_hold();
 }
 
 fn clear_setup_run_refresh_hold() {
@@ -17360,7 +17371,7 @@ mod tests {
                     "token, refresh, rejected retry"
                 );
                 assert!(!crate::relay_auth::take_setup_refresh(
-                    client.relay_auth_binding(&device, "device-secret")
+                    client.relay_auth_binding(&device, "device-secret", SnapshotSource::Codex)
                 ));
                 let held = upload_local_health_projection_reporting(
                     &client,

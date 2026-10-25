@@ -1103,6 +1103,7 @@ fn is_long_running_command(command: &LocalControlCommand) -> bool {
         command,
         LocalControlCommand::Status {
             refresh_agent_status: true,
+            ..
         } | LocalControlCommand::AgentStatusRefresh { .. }
             | LocalControlCommand::AgentContext { .. }
             | LocalControlCommand::AgentCosts { .. }
@@ -2153,6 +2154,7 @@ fn local_command(command: Command) -> LocalControlCommand {
     match command {
         Command::Status(args) => LocalControlCommand::Status {
             refresh_agent_status: args.refresh_agent_status,
+            retry_relay_authorization: false,
         },
         Command::Receipts(args) => LocalControlCommand::Receipts {
             limit: args.limit,
@@ -2162,9 +2164,11 @@ fn local_command(command: Command) -> LocalControlCommand {
         Command::Apps(args) => match args.command {
             None => LocalControlCommand::Status {
                 refresh_agent_status: false,
+                retry_relay_authorization: false,
             },
             Some(AppsCommand::Detect(_)) => LocalControlCommand::Status {
                 refresh_agent_status: true,
+                retry_relay_authorization: false,
             },
             Some(AppsCommand::Status(args)) => LocalControlCommand::AgentStatusRefresh {
                 source: Some(args.app.into()),
@@ -2231,6 +2235,7 @@ fn local_command(command: Command) -> LocalControlCommand {
         },
         Command::Doctor(_) => LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: true,
         },
         Command::Fix(args) => LocalControlCommand::Repair {
             source: args.selected_source(),
@@ -2701,6 +2706,7 @@ mod tests {
         for command in [
             LocalControlCommand::Status {
                 refresh_agent_status: true,
+                retry_relay_authorization: false,
             },
             LocalControlCommand::AgentStatusRefresh {
                 source: None,
@@ -2758,6 +2764,7 @@ mod tests {
         // long-running worst case.
         let plain_status = LocalControlCommand::Status {
             refresh_agent_status: false,
+            retry_relay_authorization: false,
         };
         assert!(!is_long_running_command(&plain_status));
         assert_eq!(
@@ -4753,7 +4760,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: false
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
             }
         );
     }
@@ -4767,7 +4775,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: true
+                refresh_agent_status: true,
+                retry_relay_authorization: false,
             }
         );
     }
@@ -4839,7 +4848,8 @@ mod tests {
         assert_eq!(
             invocation.request.command,
             LocalControlCommand::Status {
-                refresh_agent_status: false
+                refresh_agent_status: false,
+                retry_relay_authorization: false,
             }
         );
     }

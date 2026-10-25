@@ -1632,8 +1632,13 @@ pub struct SnapshotApiClient {
 }
 
 impl SnapshotApiClient {
-    pub(crate) fn relay_auth_binding(&self, device: &LocalDeviceBinding, secret: &str) -> [u8; 32] {
-        crate::relay_auth::binding_key(&self.api_base_url, device, secret)
+    pub(crate) fn relay_auth_binding(
+        &self,
+        device: &LocalDeviceBinding,
+        secret: &str,
+        source: SnapshotSource,
+    ) -> [u8; 32] {
+        crate::relay_auth::binding_key(&self.api_base_url, device, secret, source.api_slug())
     }
 
     pub(crate) fn matches_api_base(&self, expected: &str) -> bool {
@@ -1787,7 +1792,12 @@ impl SnapshotApiClient {
         timeout: Duration,
         response_cap: Option<usize>,
     ) -> Result<String> {
-        let mut probe = crate::relay_auth::Probe::begin(&self.api_base_url, device, device_secret)?;
+        let mut probe = crate::relay_auth::Probe::begin(
+            &self.api_base_url,
+            device,
+            device_secret,
+            source.api_slug(),
+        )?;
         let url = self.api_url(&format!(
             "/api/v1/telemetry/devices/{}/relay-token",
             device.device_id

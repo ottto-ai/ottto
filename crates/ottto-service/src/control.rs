@@ -852,7 +852,12 @@ fn handle_command(
     match command {
         LocalControlCommand::Status {
             refresh_agent_status,
+            retry_relay_authorization,
         } => {
+            if retry_relay_authorization {
+                require_authorized_local_client(daemon, &authorization)?;
+                crate::snapshot_sync::reset_relay_authorization_backoff();
+            }
             if refresh_agent_status {
                 if let Some(source) = status_refresh_quota_source.as_ref().filter(|_| {
                     FileCodexAccountSlotSettingsStore::default().background_quota_refresh_allowed()
@@ -4089,6 +4094,7 @@ fn repair_source(
     if dry_run {
         return Ok(plan);
     }
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     if let Some(plan) = scan_index_rebuild_override_repair(daemon, authorization, &source, &plan) {
         return Ok(plan);
     }
@@ -5218,6 +5224,7 @@ fn auth_start(
     authorization: &RequestAuthorization,
 ) -> Result<AuthStartResponse, LocalApiError> {
     let status = status_for(daemon, authorization)?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     // A connected Mac whose setup run Ottto no longer accepts can only recover
     // through a fresh claim: Verify and `ottto doctor` tell the user to sign
     // in, so refusing here would dead-end them. The claim keeps the bound
@@ -6470,7 +6477,7 @@ fn probe_pruned_device_credential_authority(
         .ok_or(LocalApiError::StatePoisoned)?;
     let body = relay_token_request_payload(&pending.device, source);
     let mut probe =
-        crate::relay_auth::Probe::begin(&api_base_url, &pending.device, candidate_secret)
+        crate::relay_auth::Probe::begin(&api_base_url, &pending.device, candidate_secret, source)
             .map_err(|held| relay_auth_local_error(&url, held.status))?;
     match backend_post_json::<serde_json::Value>(
         &url,
@@ -8299,6 +8306,7 @@ fn setup_run(
     api_base_url: Option<String>,
 ) -> Result<serde_json::Value, LocalApiError> {
     let status = status_for(daemon, authorization)?;
+    crate::snapshot_sync::reset_relay_authorization_backoff();
     let mut connection = daemon.connection_for_authorized_client()?;
     let api_base_url = validated_api_base_url(api_base_url.as_deref().or_else(|| {
         connection
@@ -13137,8 +13145,9 @@ pub(crate) fn request_source_relay_token(
         api_base_url,
         &format!("/api/v1/telemetry/devices/{}/relay-token", device.device_id),
     );
-    let mut probe = crate::relay_auth::Probe::begin(api_base_url, device, device_secret)
-        .map_err(|held| relay_auth_local_error(&url, held.status))?;
+    let mut probe =
+        crate::relay_auth::Probe::begin(api_base_url, device, device_secret, source_slug(source))
+            .map_err(|held| relay_auth_local_error(&url, held.status))?;
     let response = crate::retry_tls::credential_agent()
         .post(&url)
         .set("Accept", "application/json")
@@ -20124,6 +20133,42 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
+    fn explicit_doctor_retries_unchanged_credentials_but_status_and_untrusted_requests_do_not() {
+        let device = LocalDeviceBinding {
+            device_id: "doctor-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/doctor-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
+        for (retry, token, ok) in [
+            (false, "token", true),
+            (true, "wrong", false),
+            (true, "token", true),
+        ] {
+            let response = handle_request(
+                &daemon(),
+                LocalControlRequest {
+                    request_id: "doctor-reset".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    token: Some(token.into()),
+                    client_kind: Some(LocalClientKind::Cli),
+                    client_install_owner: None,
+                    command: LocalControlCommand::Status {
+                        refresh_agent_status: false,
+                        retry_relay_authorization: retry,
+                    },
+                },
+            );
+            assert_eq!(response.ok, ok);
+            let admitted = crate::relay_auth::Probe::begin(base, &device, "same", "codex");
+            assert_eq!(admitted.is_ok(), retry && ok);
+        }
+    }
+
+    #[test]
     fn handles_authenticated_status_request() {
         let response = handle_request(
             &daemon(),
@@ -20135,6 +20180,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -20190,6 +20236,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -21758,6 +21805,7 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn repeated_auth_start_reuses_unexpired_pending_claim() {
         // Daemon with an in-flight, far-future claim: auth_start must return
         // the SAME claim (idempotent re-trigger) without minting a new one —
@@ -21784,6 +21832,7 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn auth_start_on_connected_daemon_does_not_create_competing_claim() {
         let daemon = daemon();
         daemon
@@ -21806,6 +21855,14 @@ for line in sys.stdin:
             )
             .expect("connect account");
 
+        let device = LocalDeviceBinding {
+            device_id: "connect-retry-fixture".into(),
+            machine_id: None,
+            sources: vec!["codex".into()],
+        };
+        let base = "http://127.0.0.1:1/connect-retry-fixture";
+        let mut rejected = crate::relay_auth::Probe::begin(base, &device, "same", "codex").unwrap();
+        rejected.reject(401);
         let error = auth_start(&daemon, &RequestAuthorization::Token("token".to_string()))
             .expect_err("connected auth start must be explicit");
         assert!(matches!(
@@ -21814,9 +21871,14 @@ for line in sys.stdin:
                 if message.contains("already connected") && message.contains("ottto logout")
         ));
         assert!(daemon.pending_auth_claim_snapshot().unwrap().is_none());
+        assert!(
+            crate::relay_auth::Probe::begin(base, &device, "same", "codex").is_ok(),
+            "explicit connect retries unchanged device credentials"
+        );
     }
 
     #[test]
+    #[serial]
     fn verify_of_ended_setup_run_lets_sign_in_reconnect_the_connected_mac() {
         const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
         let _guard = lock_backend_test_env();
@@ -24118,6 +24180,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -24170,6 +24233,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
@@ -24861,6 +24925,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
             Some(LocalClientPeer::trusted_for_tests()),
@@ -24882,6 +24947,7 @@ for line in sys.stdin:
                 client_install_owner: None,
                 command: LocalControlCommand::Status {
                     refresh_agent_status: false,
+                    retry_relay_authorization: false,
                 },
             },
         );
