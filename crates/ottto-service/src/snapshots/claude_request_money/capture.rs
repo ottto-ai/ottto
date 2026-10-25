@@ -652,6 +652,17 @@ impl Funds {
     }
 }
 
+/// Holds the whole capture ceiling until dropped (no capture or plan funds).
+#[cfg(test)]
+pub(crate) struct CeilingHoldForTest(#[allow(dead_code)] Funds);
+
+#[cfg(test)]
+pub(crate) fn hold_capture_ceiling_for_test() -> CeilingHoldForTest {
+    let mut funds = Funds::default();
+    assert!(funds.spend(CAPTURE_CEILING_BYTES - capture_reserved()));
+    CeilingHoldForTest(funds)
+}
+
 impl Drop for Funds {
     fn drop(&mut self) {
         CAPTURE_RESERVED.fetch_sub(self.held, Ordering::AcqRel);
@@ -1124,6 +1135,19 @@ struct Entry {
 /// Waiting captures by (scope, index key).
 static STORE: Mutex<BTreeMap<(PathBuf, String), Entry>> = Mutex::new(BTreeMap::new());
 
+/// The index keys `scope` holds captures for: on a Full parse, the files of
+/// the planned families. Bounded by the capture funds.
+pub(crate) fn captured_index_keys(scope: &Path) -> Vec<String> {
+    let Ok(store) = STORE.lock() else {
+        return Vec::new();
+    };
+    store
+        .keys()
+        .filter(|(entry_scope, _)| entry_scope == scope)
+        .map(|(_, key)| key.clone())
+        .collect()
+}
+
 /// The capture of the parse at `index_key` with `fingerprint`, removed from
 /// the store. None when it was never captured, expired or is of another
 /// revision (then it stays for its own revision's page); a refused capture
@@ -1167,6 +1191,13 @@ pub(crate) fn set_panic_for_test(panic: bool) {
 pub(crate) fn purge_scope_for_test(scope: &Path) {
     if let Ok(mut store) = STORE.lock() {
         store.retain(|(entry_scope, _), _| entry_scope != scope);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn retain_for_test(scope: &Path, keep: impl Fn(&str) -> bool) {
+    if let Ok(mut store) = STORE.lock() {
+        store.retain(|(entry_scope, key), _| entry_scope != scope || keep(key));
     }
 }
 

@@ -1505,7 +1505,12 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // regression `money_p1b_slow_native_scan_page_is_admitted_and_builds`
     // proves the families are built and written.
     assert_eq!(native_counts.refused_deadline, 0, "long native Full with small money work is admitted: {native_counts:?}");
-    assert!(native_counts.captures_taken > 0, "{native_counts:?}");
+    // MONEY round 3: a page takes only the captures of the families it
+    // reaches and purges the rest (an unreached family costs only its
+    // deadline row). This page received capture work, and every capture is
+    // either taken or purged.
+    assert!(native_counts.captures_taken + native_counts.captures_purged > 0, "{native_counts:?}");
+    assert!(money::capture::keys_for_test(&native_support).is_empty(), "no capture outlives its page: {native_counts:?}");
     assert!(u128::from(native_counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{native_counts:?}");
     let native_rows = money_jsonl_rows(&native_support);
     let native_page = native_rows.iter().find(|row| row["row"] == "page" && row["observed_unix"] == now - 1).unwrap();
@@ -1577,6 +1582,8 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     // when its close budget ran out), never none and never the old one.
     assert_eq!(counts.plan_install_failed, counts.fallback_plan_installed, "{counts:?}");
     assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(true), "{counts:?}");
+    // The capture plan this admitted page left for the next Full parse.
+    let planned_after_first = money::capture::planned_families_for_test(&fixture.support);
     // Reproduce a native Full rearm. It uses fresh current captures, not the
     // old page's consumed capture or a cached completed money body.
     money::capture::begin_page(&fixture.support);
@@ -1601,16 +1608,41 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
     }).collect::<BTreeSet<_>>();
     let captured_deferred = captured_roots.intersection(&pending_capture_families).count();
     let captured_deadline = captured_roots.intersection(&deadline_families).count();
-    assert!(captured_deferred > 0, "Full capture plan must include prior incomplete capture turns");
+    if captured_deferred == 0 {
+        let pending_keys = armed.snapshots.iter().map(|item| item.attribution_facts.iter()
+            .find(|fact| fact.field == "root_session_ref").map(|fact| fact.value.as_str()).unwrap_or(&item.source_session_id))
+            .filter(|root| pending_capture_families.contains(&money::hashed_id_for_test(root)))
+            .map(crate::snapshots::claude_request_census::family_key).collect::<BTreeSet<_>>();
+        let plan_shape = |plan: &Option<BTreeSet<String>>| plan.as_ref().map(|plan| (plan.len(), plan.intersection(&pending_keys).count()));
+        let captured_rows = first_families.iter().filter(|row| captured_roots.contains(row["family"].as_str().unwrap()))
+            .map(|row| format!("{}:{}:{}", row["family"], row["category"], row["p1_reasons"])).collect::<Vec<_>>();
+        panic!("Full capture plan must include prior incomplete capture turns: captures={} plan_after_first(eligible,pending)={:?} plan_now={:?} work={:?} captured_rows={captured_rows:?} first_counts={counts:?}",
+            following_captures.len(), plan_shape(&planned_after_first),
+            plan_shape(&money::capture::planned_families_for_test(&fixture.support)), money::capture::work_for_test(&fixture.support));
+    }
     assert_eq!(captured_deferred, following_captures.len(),
         "every following capture must target a prior incomplete family, rather than repeat an already built one");
     let (following, following_elapsed) = run(&reread, &following_index, now + 1);
     assert_eq!(following.refused_deadline, 0, "{following:?}");
-    let next_rows = money_jsonl_rows(&fixture.support);
-    let next_snapshot = next_rows.iter().filter(|row| row["row"] == "page")
-        .map(|row| row["snapshot"].as_u64().unwrap()).max().unwrap();
-    let next_families = next_rows.iter().filter(|row| row["row"] == "family" && row["snapshot"] == next_snapshot).collect::<Vec<_>>();
+    // Unchanged deadline rows are suppressed; every emitted row follows the
+    // page's schedule.
+    let schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert_eq!(schedule.len() as u64, following.families, "{following:?}");
+    let scheduled_at = schedule.iter().enumerate().map(|(at, family)| (family.as_str(), at)).collect::<BTreeMap<_, _>>();
+    let page_families = |snapshot_rows: &[serde_json::Value]| {
+        let snapshot = snapshot_rows.iter().filter(|row| row["row"] == "page")
+            .map(|row| row["snapshot"].as_u64().unwrap()).max().unwrap();
+        snapshot_rows.iter().filter(|row| row["row"] == "family" && row["snapshot"] == snapshot).cloned().collect::<Vec<_>>()
+    };
+    let next_families = page_families(&money_jsonl_rows(&fixture.support));
+    let positions = next_families.iter().map(|row| scheduled_at[row["family"].as_str().unwrap()]).collect::<Vec<_>>();
+    assert!(positions.windows(2).all(|pair| pair[0] < pair[1]), "family rows follow the page's schedule: {positions:?}");
+    // Real money allowance, no injected clock: the first scheduled family
+    // always has its own setup and body window.
+    assert!(pending_capture_families.contains(&schedule[0]), "prior incomplete capture turns go first: {}", schedule[0]);
     let next_first = next_families.first().unwrap();
+    assert_eq!(next_first["family"], schedule[0].as_str(), "the first scheduled family is attempted and written: {next_first}");
     assert!(pending_capture_families.contains(next_first["family"].as_str().unwrap()), "prior incomplete capture turns go first: {next_first}");
     let progressed = next_families.iter().filter(|row| pending_capture_families.contains(row["family"].as_str().unwrap()) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
@@ -1620,15 +1652,221 @@ fn money_p1b_full_page_thousands_of_reads_preserves_live_body() {
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
     assert!(built > 0, "the next Full page must build money bodies, not merely change failure reason: {following:?}");
     assert!(following.families_unbuilt < following.families, "{following:?}");
+    assert!(u128::from(following.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{following:?}");
     let deadline_built = next_families.iter().filter(|row| deadline_families.contains(row["family"].as_str().unwrap()) &&
         row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0) &&
         !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
-    let (skip, skip_elapsed) = run(&reread, &following_index, now + 2);
+    // Extra progress probe: a second fresh Full rearm on an injected page
+    // clock, so the schedule and its bodies are checked beyond what one real
+    // allowance fits.
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &following_index);
+    money::capture::purge_scope_for_test(&fixture.support);
+    money::capture::begin_page(&fixture.support);
+    replay();
+    let probe_captures = money::capture::keys_for_test(&fixture.support);
+    assert!(!probe_captures.is_empty(), "progress probe is Full with captures, not Skip");
+    assert!(probe_captures.iter().all(|(key, _)| pending_capture_families.contains(&money::hashed_id_for_test(
+        std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))),
+        "every probe capture must target a prior incomplete family");
+    money::set_next_page_budget_for_test(std::time::Duration::from_secs(3600));
+    let probe = money::shadow_page_ready_for_test(&fixture.support, &reread.snapshots, &following_index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), reread.census_complete, now + 2);
+    money::store::flush();
+    assert_eq!(probe.refused_deadline, 0, "{probe:?}");
+    let probe_schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert!(pending_capture_families.contains(&probe_schedule[0]), "prior incomplete capture turns go first: {}", probe_schedule[0]);
+    assert!(probe_schedule.iter().take(money::capture::NEXT_PAGE_FAMILIES).all(|family| pending_capture_families.contains(family)),
+        "every scheduled body turn is a prior incomplete family");
+    let probe_families = page_families(&money_jsonl_rows(&fixture.support));
+    let probe_progressed = probe_families.iter().filter(|row| pending_capture_families.contains(row["family"].as_str().unwrap()) &&
+        !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
+    assert!(probe_progressed > 0, "{probe:?}");
+    let probe_built = probe_families.iter().filter(|row| pending_capture_families.contains(row["family"].as_str().unwrap()) &&
+        row["category"] != "unbuilt" && row["members_built"].as_u64().is_some_and(|members| members > 0) &&
+        !row["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline")).count();
+    assert!(probe_built > 0, "{probe:?}");
+    assert!(probe.families_unbuilt < probe.families, "{probe:?}");
+    // MONEY round 4: a planned Full page whose scheduling is cut off at the
+    // setup stop after one root still builds a freshly captured, prior
+    // incomplete family zero within the real allowance.
+    let replay = crate::snapshots::prepare_money_finalizers_for_test(&fixture.support, &following_index);
+    money::capture::purge_scope_for_test(&fixture.support);
+    money::capture::begin_page(&fixture.support);
+    replay();
+    let stalled_captured = money::capture::keys_for_test(&fixture.support).iter()
+        .map(|(key, _)| money::hashed_id_for_test(std::path::Path::new(key).file_stem().unwrap().to_str().unwrap()))
+        .collect::<BTreeSet<_>>();
+    assert!(!stalled_captured.is_empty(), "the stalled page is Full with captures");
+    money::set_page_fault_for_test(money::PageFault::ScheduleStall);
+    let (stalled, stalled_elapsed) = run(&reread, &following_index, now + 3);
+    money::set_page_fault_for_test(money::PageFault::None);
+    assert_eq!(stalled.refused_deadline, 0, "{stalled:?}");
+    assert_eq!(stalled.families_keyed_after_first, stalled.families - 1, "scheduling was cut off after one root: {stalled:?}");
+    assert!(u128::from(stalled.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{stalled:?}");
+    let stalled_schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert_eq!(stalled_schedule.len() as u64, stalled.families, "{stalled:?}");
+    assert!(stalled_captured.contains(&stalled_schedule[0]) && pending_capture_families.contains(&stalled_schedule[0]),
+        "family zero is a captured prior incomplete family: {}", stalled_schedule[0]);
+    let stalled_families = page_families(&money_jsonl_rows(&fixture.support));
+    let stalled_first = stalled_families.iter().find(|row| row["family"] == stalled_schedule[0].as_str())
+        .unwrap_or_else(|| panic!("family zero is written: {stalled:?}"));
+    assert!(stalled_first["category"] != "unbuilt" && stalled_first["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !stalled_first["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "family zero is built: {stalled_first}");
+    let (skip, skip_elapsed) = run(&reread, &following_index, now + 4);
     assert_eq!(skip.refused_deadline, 0, "{skip:?}");
     assert_eq!(skip.families_unbuilt, skip.families, "without fresh finalizers, Skip cannot recover a body: {skip:?}");
     assert_eq!(money::reserved_for_test(), 0);
-    println!("MONEY_P1B_FULL admitted_finalizer_probe=true plan_install_failed={} fallback_plan_installed={} first_captures={} reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_captures={} next_captured_deferred={} next_captured_deadline={} next_deadline_built={} next_apply_us={} next_progressed={} next_built={} next_unbuilt={} next_wall_us={} skip_unbuilt={} skip_wall_us={}",
-        counts.plan_install_failed, counts.fallback_plan_installed, counts.captures_taken, armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, deadline_built, following.result_apply_us, progressed, built, following.families_unbuilt, following_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros());
+    println!("MONEY_P1B_FULL admitted_finalizer_probe=true plan_install_failed={} fallback_plan_installed={} first_captures={} reads={} families={} unbuilt={} deferred_deadline={} peak_transient={} wall_us={} total_wall_us={} deadline_us=250000 ci_tolerance_us={} capture_us={} capture_input={} capture_comparisons={} deadline_families={} pending_capture_families={} next_type=Full next_clock=real next_captures={} next_captured_deferred={} next_captured_deadline={} next_real_built={} next_real_unbuilt={} next_deadline_built={} next_progressed={} next_apply_us={} next_setup_us={} next_money_us={} next_wall_us={} probe_clock=injected probe_captures={} probe_progressed={} probe_built={} probe_unbuilt={} stalled_keyed_after_first={} stalled_unbuilt={} stalled_money_us={} stalled_wall_us={} skip_unbuilt={} skip_wall_us={} index_files={} admission_us={} next_admission_us={} stalled_admission_us={}",
+        counts.plan_install_failed, counts.fallback_plan_installed, counts.captures_taken, armed.snapshots.len(), counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.admitted_peak_bytes, counts.elapsed_us, elapsed.as_micros(), MONEY_P1B_CI_SCHEDULING_TOLERANCE.as_micros(), capture_us, input, comparisons, deadline_families.len(), pending_capture_families.len(), following_captures.len(), captured_deferred, captured_deadline, built, following.families_unbuilt, deadline_built, progressed, following.result_apply_us, following.family_setup_us, following.money_us, following_elapsed.as_micros(), probe_captures.len(), probe_progressed, probe_built, probe.families_unbuilt, stalled.families_keyed_after_first, stalled.families_unbuilt, stalled.money_us, stalled_elapsed.as_micros(), skip.families_unbuilt, skip_elapsed.as_micros(),
+        following_index.files.len(), counts.admission_us, following.admission_us, stalled.admission_us);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Fixed setup that spends the whole body window cannot defer every family:
+/// the first scheduled family is still attempted. Deadline rows follow the
+/// schedule even when deferred comparisons resume from a rotated cursor.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_setup_overrun_still_attempts_first_scheduled_family() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-setup-overrun");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let dense = (0..256).map(|at| {
+        let mut item = scan.snapshots[0].clone();
+        item.source_session_id = format!("overrun-{at:04}");
+        item.attribution_facts.retain(|fact| fact.field != "root_session_ref");
+        item
+    }).collect::<Vec<_>>();
+    money::set_deferred_compare_cursor_for_test(&fixture.support, now, 7);
+    money::set_page_fault_for_test(money::PageFault::SetupOverrun);
+    let counts = money::shadow_page_at(&fixture.support, &dense, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::store::flush();
+    assert_eq!(counts.refused_deadline, 0, "{counts:?}");
+    assert_eq!(counts.families, 256, "{counts:?}");
+    assert_eq!(counts.families_deadline_deferred, 255, "only later families wait: {counts:?}");
+    assert!(u128::from(counts.capture_us + counts.family_setup_us) >= money::setup_stop_for_test().as_micros(),
+        "common setup ran to its stop: {counts:?}");
+    assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+    let schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    let rows = money_jsonl_rows(&fixture.support);
+    let families = rows.iter().filter(|row| row["row"] == "family").collect::<Vec<_>>();
+    assert_eq!(families.iter().map(|row| row["family"].as_str().unwrap().to_owned()).collect::<Vec<_>>(), schedule,
+        "family rows follow the schedule, not the comparison rotation");
+    assert!(!families[0]["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "the first scheduled family is attempted: {}", families[0]);
+    assert!(families[1..].iter().all(|row| row["p1_reasons"] == serde_json::json!(["deadline"])));
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Common setup that runs all the way to its stop (an injected busy stall of
+/// the acknowledgement, telemetry and retirement steps) cannot starve the
+/// page: the first scheduled family still gets its own setup and body, and
+/// is built, within the real 250 ms money allowance (no injected page clock).
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_setup_stall_still_builds_first_scheduled_family() {
+    money_p1b_stall_still_builds_first_scheduled_family("money-p1b-setup-stall", money::PageFault::SetupStall);
+}
+
+/// MONEY round 4: scheduling (keying every root) that runs all the way to the
+/// setup stop cannot starve the page either: family zero is selected from the
+/// roots keyed so far, the rest is keyed after it, and family zero is built
+/// within the real 250 ms money allowance.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_schedule_stall_still_builds_first_scheduled_family() {
+    money_p1b_stall_still_builds_first_scheduled_family("money-p1b-schedule-stall", money::PageFault::ScheduleStall);
+}
+
+/// MONEY round 4 review: scheduling cut off after keying a captured root and
+/// an older uncaptured one still makes the captured root family zero (on
+/// equal turns plain schedule order would pick the older, uncaptured root
+/// and defer the captured one), so its fresh capture is built, not purged.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_cut_off_schedule_keeps_a_captured_family_zero() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-cut-off-captured-zero");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let _ = money::take_shadow_lines_for_test();
+    let captured = money::captured_roots_for_test(&fixture.support).into_iter()
+        .max_by_key(|root| money::family_key_for_test(root)).expect("the scan captured its families");
+    money::keep_captures_of_root_for_test(&fixture.support, &captured);
+    assert_eq!(money::captured_roots_for_test(&fixture.support), BTreeSet::from([captured.clone()]));
+    money::set_schedule_stall_after_for_test(2);
+    money::set_page_fault_for_test(money::PageFault::ScheduleStall);
+    let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::set_schedule_stall_after_for_test(0);
+    money::store::flush();
+    println!("MONEY_P1B_CUT_OFF families={} keyed_after_first={} unbuilt={} captures_taken={} captures_purged={} money_us={}",
+        counts.families, counts.families_keyed_after_first, counts.families_unbuilt, counts.captures_taken, counts.captures_purged, counts.money_us);
+    assert_eq!(counts.refused_deadline + counts.refused_budget, 0, "{counts:?}");
+    assert!(counts.families >= 3, "{counts:?}");
+    assert_eq!(counts.families_keyed_after_first, counts.families - 2, "scheduling was cut off after two roots: {counts:?}");
+    assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+    let schedule = money::last_page_schedule_for_test();
+    assert_eq!(schedule.len() as u64, counts.families, "{schedule:?}");
+    assert!(schedule.iter().all(|root| *root == captured || money::family_key_for_test(root) < money::family_key_for_test(&captured)),
+        "every other root is older on equal turns, so the second keyed root is older and uncaptured: {schedule:?}");
+    assert_eq!(schedule[0], captured, "the captured root is family zero: {schedule:?}");
+    assert!(counts.captures_taken > 0, "{counts:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let first = rows.iter().find(|row| row["row"] == "family" && row["family"] == money::hashed_id_for_test(&captured).as_str())
+        .unwrap_or_else(|| panic!("family zero is written: {counts:?}"));
+    assert!(first["category"] != "unbuilt" && first["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !first["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "family zero is built: {first}");
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+fn money_p1b_stall_still_builds_first_scheduled_family(name: &str, fault: money::PageFault) {
+    let (fixture, index, scan) = money_armed_scan(name);
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let _ = money::take_shadow_lines_for_test();
+    money::set_page_fault_for_test(fault);
+    let started = std::time::Instant::now();
+    let counts = money::shadow_page_at(&fixture.support, &scan.snapshots, &index,
+        &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+        &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+    let elapsed = started.elapsed();
+    money::set_page_fault_for_test(money::PageFault::None);
+    money::store::flush();
+    println!("MONEY_P1B_STALL fault={fault:?} setup_stop_us={} capture_us={} setup_us={} money_us={} wall_us={} families={} unbuilt={} deferred_deadline={} keyed_after_first={} captures_taken={}",
+        money::setup_stop_for_test().as_micros(), counts.capture_us, counts.family_setup_us, counts.money_us, elapsed.as_micros(),
+        counts.families, counts.families_unbuilt, counts.families_deadline_deferred, counts.families_keyed_after_first, counts.captures_taken);
+    assert_eq!(counts.refused_deadline + counts.refused_budget, 0, "{counts:?}");
+    assert!(u128::from(counts.capture_us + counts.family_setup_us) >= money::setup_stop_for_test().as_micros(),
+        "the stalled phase ran to the setup stop: {counts:?}");
+    if fault == money::PageFault::ScheduleStall {
+        assert_eq!(counts.families_keyed_after_first, counts.families - 1,
+            "only family zero was keyed before the setup stop: {counts:?}");
+    } else {
+        assert_eq!(counts.families_keyed_after_first, 0, "{counts:?}");
+    }
+    assert!(counts.captures_taken > 0, "{counts:?}");
+    assert!(counts.families_unbuilt < counts.families, "{counts:?}");
+    assert!(u128::from(counts.money_us) <= (money::PAGE_MAX_ELAPSED + MONEY_P1B_CI_SCHEDULING_TOLERANCE).as_micros(), "{counts:?}");
+    let schedule = money::last_page_schedule_for_test().iter()
+        .map(|root| money::hashed_id_for_test(root.as_str())).collect::<Vec<_>>();
+    assert_eq!(schedule.len() as u64, counts.families, "{schedule:?}");
+    let rows = money_jsonl_rows(&fixture.support);
+    let first = rows.iter().find(|row| row["row"] == "family" && row["family"] == schedule[0].as_str())
+        .unwrap_or_else(|| panic!("the first scheduled family is written: {schedule:?}"));
+    assert!(first["category"] != "unbuilt" && first["members_built"].as_u64().is_some_and(|members| members > 0)
+        && !first["p1_reasons"].as_array().unwrap().iter().any(|reason| reason == "deadline"),
+        "the first scheduled family is built: {first}");
+    assert_eq!(money::reserved_for_test(), 0);
     money::disable_shadow_for_test(&fixture.support);
 }
 
@@ -1747,6 +1985,93 @@ fn money_p1b_steps_outside_the_body_are_charged_to_money_us() {
     money::store::flush();
     let _ = money::take_shadow_lines_for_test();
     money::capture::purge_scope_for_test(&fixture.support);
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Starvation receipt: a page whose next capture plan cannot be installed
+/// says so on the shadow line. With the whole capture ceiling held the plan
+/// cannot be funded; once released, the next page installs it.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_plan_install_failure_is_counted() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-plan-install-failed");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let dense = (0..money::capture::NEXT_PAGE_FAMILIES + 6).map(|at| {
+        let mut item = scan.snapshots[0].clone();
+        item.source_session_id = format!("plan-{at:04}");
+        item.attribution_facts.retain(|fact| fact.field != "root_session_ref");
+        item
+    }).collect::<Vec<_>>();
+    let page = |now| {
+        let counts = money::shadow_page_at(&fixture.support, &dense, &index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+        money::store::flush();
+        counts
+    };
+    // Release the scan's captures first, so the page's own purge frees no funds.
+    money::capture::purge_scope_for_test(&fixture.support);
+    let _ = money::take_shadow_lines_for_test();
+    let held = money::capture::hold_capture_ceiling_for_test();
+    let refused = page(now);
+    drop(held);
+    assert_eq!(refused.refused_deadline + refused.refused_budget, 0, "{refused:?}");
+    assert_eq!(refused.plan_install_failed, 1, "{refused:?}");
+    assert_eq!(refused.full_page_zero_built, 0, "no fresh captures: {refused:?}");
+    let lines = money::take_shadow_lines_for_test();
+    assert_eq!(lines.last().unwrap()["counts"]["plan_install_failed"], 1, "{lines:?}");
+    // MONEY decision (fail closed, never stale): neither the plan nor its
+    // fallback could be funded, so the scope keeps a closed plan that lists
+    // nothing and allows no optional capture (formerly: no plan at all).
+    assert_eq!((refused.plan_install_failed_funds, refused.fallback_plan_installed), (1, 0), "{refused:?}");
+    assert_eq!(money::capture::planned_families_for_test(&fixture.support), Some(BTreeSet::new()));
+    assert_eq!(money::capture::plan_allows_capture_for_test(&fixture.support), Some(false));
+    let installed = page(now + 1);
+    assert_eq!(installed.plan_install_failed, 0, "{installed:?}");
+    assert_eq!(money::capture::planned_families_for_test(&fixture.support).map(|plan| plan.len()),
+        Some(money::capture::NEXT_PAGE_FAMILIES));
+    assert_eq!(money::reserved_for_test(), 0);
+    money::disable_shadow_for_test(&fixture.support);
+}
+
+/// Starvation receipt: a page with fresh captures that builds no family is
+/// counted on the shadow line; a page without captures and a page that
+/// builds are not.
+#[test]
+#[serial(claude_request_money_shadow)]
+fn money_p1b_full_page_zero_built_is_counted() {
+    let (fixture, index, scan) = money_armed_scan("money-p1b-full-zero-built");
+    let now = census_pipeline_window("2026-08-02T08:00:00Z");
+    let page = |snapshots: &[crate::snapshots::SnapshotItem], index: &ScanIndex, now| {
+        let counts = money::shadow_page_at(&fixture.support, snapshots, index,
+            &crate::claude_local_otel::ClaudeLocalOtelLoadReport::default(),
+            &crate::claude_local_otel::ClaudeTraceOwnershipLoadReport::default(), true, now);
+        money::store::flush();
+        counts
+    };
+    let _ = money::take_shadow_lines_for_test();
+    money::set_page_fault_for_test(money::PageFault::BodyDeadline);
+    let starved = page(&scan.snapshots, &index, now);
+    money::set_page_fault_for_test(money::PageFault::None);
+    // No family was reached: its captures are purged, never taken.
+    assert!(starved.captures_purged > 0, "{starved:?}");
+    assert_eq!(starved.captures_taken, 0, "{starved:?}");
+    assert_eq!(starved.families_unbuilt, starved.families, "{starved:?}");
+    assert_eq!(starved.full_page_zero_built, 1, "{starved:?}");
+    let lines = money::take_shadow_lines_for_test();
+    assert_eq!(lines.last().unwrap()["counts"]["full_page_zero_built"], 1, "{lines:?}");
+    let skip = page(&scan.snapshots, &index, now + 1);
+    assert_eq!(skip.captures_taken + skip.captures_purged, 0, "{skip:?}");
+    assert_eq!(skip.full_page_zero_built, 0, "a page without captures is not a starved Full page: {skip:?}");
+    money::capture::begin_page(&fixture.support);
+    let mut full_index = ScanIndex::default();
+    let full = crate::snapshots::scan_source_roots_with_test_limit(SnapshotSource::ClaudeCode,
+        std::slice::from_ref(&fixture.root), &mut full_index, "2026-08-02T08:00:00Z", 183, 16, true).unwrap();
+    let built = page(&full.snapshots, &full_index, now + 2);
+    assert!(built.captures_taken > 0, "{built:?}");
+    assert!(built.families_unbuilt < built.families, "{built:?}");
+    assert_eq!(built.full_page_zero_built, 0, "{built:?}");
     assert_eq!(money::reserved_for_test(), 0);
     money::disable_shadow_for_test(&fixture.support);
 }
