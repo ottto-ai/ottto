@@ -24701,7 +24701,32 @@ impl OwnedSourceScan {
                             codex_state_only_blocked_session_ids.insert(group.owner.clone());
                             continue;
                         }
-                        if used > 0 && (own || used + group.members.len() > file_limit) {
+                        // G1: a group whose selected members are all re-reads
+                        // never takes file allowance a waiting census-member
+                        // singleton needs (own page or not, fenced or not).
+                        // It waits for a page without one; its members stay
+                        // pending as re-reads.
+                        let rereads_crowd_members = !sampled_scan::codex_cursor::census_member(
+                            &codex_selected_flags,
+                            group.members.iter().map(|member| member.path.as_path()),
+                        ) && {
+                            let waiting = identified_candidates
+                                .iter()
+                                .filter(|candidate| {
+                                    let key = local_index_key(&candidate.path);
+                                    !grouped_paths.contains(&key)
+                                        && sampled_scan::codex_cursor::selected_census_member(
+                                            &codex_selected_flags,
+                                            &candidate.path,
+                                        )
+                                })
+                                .count();
+                            waiting > 0
+                                && (own || used + group.members.len() + waiting > file_limit)
+                        };
+                        if rereads_crowd_members
+                            || (used > 0 && (own || used + group.members.len() > file_limit))
+                        {
                             // Keep the existing traversal as the only queue. A whole
                             // group is selected on a subsequent ordinary page.
                             if let Some(traversal) = index.traversal.as_mut() {
@@ -24795,7 +24820,17 @@ impl OwnedSourceScan {
                     while !identified_candidates.is_empty()
                         && used + identified_candidates.len() > file_limit
                     {
-                        if let Some(candidate) = identified_candidates.pop_back() {
+                        // G1: re-reads leave before any census member.
+                        let evict = identified_candidates
+                            .iter()
+                            .rposition(|candidate| {
+                                !sampled_scan::codex_cursor::selected_census_member(
+                                    &codex_selected_flags,
+                                    &candidate.path,
+                                )
+                            })
+                            .unwrap_or(identified_candidates.len() - 1);
+                        if let Some(candidate) = identified_candidates.remove(evict) {
                             if let Some(traversal) = index.traversal.as_mut() {
                                 // G1: a re-read is not re-enrolled.
                                 let census_member =

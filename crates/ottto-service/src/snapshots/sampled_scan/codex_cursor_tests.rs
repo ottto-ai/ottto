@@ -3352,13 +3352,25 @@ fn hinted_page(
     collected_at: &str,
     hints: &[PathBuf],
 ) -> (ScanIndex, SourceScanResult) {
+    hinted_page_limited(fixture, index, cache, collected_at, hints, 10)
+}
+
+/// `hinted_page` with a file limit of `limit` per page.
+fn hinted_page_limited(
+    fixture: &ScanRoot,
+    index: ScanIndex,
+    cache: &Arc<SharedCache>,
+    collected_at: &str,
+    hints: &[PathBuf],
+    limit: usize,
+) -> (ScanIndex, SourceScanResult) {
     let mut scan = OwnedSourceScan::new(
         SnapshotSource::Codex,
         std::slice::from_ref(&fixture.root),
         index,
         collected_at,
         BACKFILL_WINDOW_DAYS,
-        10,
+        limit,
         false,
         None,
         hints,
@@ -3683,6 +3695,259 @@ fn census_close_carries_a_waiting_reread_into_the_next_generation() {
         .collect::<BTreeMap<_, _>>();
     assert_eq!(expected.len(), SESSIONS.len());
     assert_eq!(latest, expected);
+}
+
+/// Per-session (input, output, cache read, requests) of a fresh, uncached
+/// full read of `fixture`.
+fn fresh_totals(fixture: &ScanRoot) -> BTreeMap<String, (u64, u64, u64, u64)> {
+    let (_, fresh) = page(fixture, ScanIndex::default(), None);
+    fresh
+        .snapshots
+        .iter()
+        .map(|item| {
+            (
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            )
+        })
+        .collect()
+}
+
+/// The (census member, watcher hint) flags of `path` while it is pending.
+fn pending_flags(index: &ScanIndex, path: &Path) -> Option<(bool, bool)> {
+    index.traversal.as_ref().and_then(|traversal| {
+        traversal
+            .pending_candidates
+            .iter()
+            .find(|pending| pending.path == path)
+            .map(|pending| (pending.census_member, pending.watcher_hint))
+    })
+}
+
+/// G1 (review of #751): a re-read cursor job that is not a census member
+/// is paused on the page its census closes. `L` was read in the generation
+/// as a singleton, then grew past the singleton budget and was hinted with
+/// its retained state gone, so its re-read is a non-member cursor job (no
+/// K7 fence: no earlier cursor attempt). Page 1 reads the last member and
+/// the census closes while that job is paused. The next generation holds
+/// `L` as a member; the job resumes there without a restart and publishes
+/// exactly once, equal to a fresh full read.
+#[test]
+fn non_member_job_paused_at_census_close_resumes_in_the_next_generation() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const L: &str = "019fa111-2222-7333-8444-777777777731";
+    const M: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777732",
+        "019fa111-2222-7333-8444-777777777733",
+    ];
+    const B: u64 = 2048;
+    let fixture = ScanRoot::with_sessions(&[(L, 4), (M[0], 4), (M[1], 4)]);
+    let small = fixture.len(L);
+    // Two small reads fit one page; the grown `L` never does.
+    let singleton = small * 4;
+    let l_path = fixture.file(L);
+    let l_key = local_index_key(&l_path);
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult| {
+        let mut l_publications = 0;
+        for item in &scan.snapshots {
+            l_publications += usize::from(item.source_session_id == L);
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+        l_publications
+    };
+    with_test_limits(B, singleton, 64, || {
+        // Page 0, two files: `L` and `M0` are read; `M1` waits.
+        let (index, scan) = hinted_page_limited(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+            2,
+        );
+        assert_eq!(record(&scan), 1, "L read as a singleton");
+        assert!(!scan.census_complete);
+        assert_eq!(
+            pending_flags(&index, &fixture.file(M[1])),
+            Some((true, false))
+        );
+        assert_eq!(pending_flags(&index, &l_path), None);
+        let first = census_token(&index).expect("first generation");
+
+        for line in 5..65 {
+            fixture.append(L, &token_line(line));
+        }
+        assert!(fixture.len(L) > singleton);
+        cache.clear();
+        let (index, scan) = hinted_page_limited(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&l_path),
+            2,
+        );
+        let mut l_publications = record(&scan);
+        assert!(
+            scan.census_complete,
+            "the last member was read and the census closed: {}",
+            counters(&cache)
+        );
+        assert_eq!(l_publications, 0, "a paused job publishes nothing");
+        assert_eq!(counter(&cache, |c| c.jobs_started), 1);
+        assert_eq!(
+            cache.cursor_job_key().as_deref(),
+            Some(l_key.as_str()),
+            "the re-read job is paused: {}",
+            counters(&cache)
+        );
+        let second = census_token(&index).expect("the next generation started");
+        assert_ne!(second, first);
+        assert_eq!(pending_flags(&index, &l_path), Some((true, true)));
+
+        let bound = fixture.len(L).div_ceil(B) + 4;
+        let mut index = index;
+        let mut page_number = 2;
+        while counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified) == 0
+            && page_number < 2 + bound
+        {
+            let (next, scan) =
+                hinted_page_limited(&fixture, index, &cache, &collected_at(page_number), &[], 2);
+            index = next;
+            l_publications += record(&scan);
+            page_number += 1;
+        }
+        assert_eq!(
+            counter(&cache, |c| c.jobs_certified) + counter(&cache, |c| c.jobs_uncertified),
+            1,
+            "the job ended within {bound} pages: {}",
+            counters(&cache)
+        );
+        assert_eq!(
+            counter(&cache, |c| c.jobs_started),
+            1,
+            "resumed, never restarted: {}",
+            counters(&cache)
+        );
+        assert_eq!(l_publications, 1, "published exactly once");
+        assert_eq!(index.files[&l_key].size_bytes, fixture.len(L));
+    });
+    assert_eq!(latest, fresh_totals(&fixture));
+}
+
+/// G1 (review of #751): a census that closes with a re-read waiting while
+/// the sweep is partially settled keeps the old path. Nothing is carried and
+/// the unsettled marker stays for the clean follow-up; that walk re-reads the
+/// grown file exactly once, and the totals equal a fresh full read.
+#[test]
+fn unsettled_close_keeps_the_clean_follow_up_and_rereads_once() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    const SESSIONS: [&str; 2] = [
+        "019fa111-2222-7333-8444-777777777741",
+        "019fa111-2222-7333-8444-777777777742",
+    ];
+    let fixture = ScanRoot::with_sessions(&[(SESSIONS[0], 4), (SESSIONS[1], 4)]);
+    let small = fixture.len(SESSIONS[0]);
+    let singleton = small + small / 2;
+    let cache = Arc::new(SharedCache::default());
+    let mut latest = BTreeMap::<String, (u64, u64, u64, u64)>::new();
+    let mut record = |scan: &SourceScanResult, session: &str| {
+        let mut publications = 0;
+        for item in &scan.snapshots {
+            publications += usize::from(item.source_session_id == session);
+            latest.insert(
+                item.source_session_id.clone(),
+                (
+                    item.input_tokens,
+                    item.output_tokens,
+                    item.cache_read_tokens,
+                    item.request_count,
+                ),
+            );
+        }
+        publications
+    };
+    with_test_limits(2048, singleton, 64, || {
+        let (index, scan) = hinted_page(
+            &fixture,
+            ScanIndex::default(),
+            &cache,
+            &collected_at(0),
+            &[],
+        );
+        assert!(!scan.census_complete, "one file is deferred");
+        let [x, y] = if pending_flags(&index, &fixture.file(SESSIONS[0])).is_some() {
+            [SESSIONS[1], SESSIONS[0]]
+        } else {
+            [SESSIONS[0], SESSIONS[1]]
+        };
+        record(&scan, x);
+        let x_path = fixture.file(x);
+        assert_eq!(pending_flags(&index, &fixture.file(y)), Some((true, false)));
+
+        fixture.append(x, &token_line(5));
+        assert!(fixture.len(x) <= singleton);
+        cache.clear();
+        let mut index = index;
+        // An earlier page of this sweep settled only partially.
+        index.mark_bounded_sweep_unsettled();
+        let (index, scan) = hinted_page(
+            &fixture,
+            index,
+            &cache,
+            &collected_at(1),
+            std::slice::from_ref(&x_path),
+        );
+        let mut x_publications = record(&scan, x);
+        assert!(
+            !scan.census_complete,
+            "a partially settled sweep owes a clean follow-up"
+        );
+        assert_eq!(x_publications, 0, "X waited behind the member");
+        assert!(counter(&cache, |c| c.deferred_next_generation) >= 1);
+        assert!(index.traversal.is_none(), "nothing was carried");
+        assert!(index.bounded_sweep_had_unsettled_upload());
+
+        let mut index = index;
+        let mut closed = false;
+        for page_number in 2..8 {
+            let (next, scan) =
+                hinted_page(&fixture, index, &cache, &collected_at(page_number), &[]);
+            index = next;
+            x_publications += record(&scan, x);
+            if scan.census_complete {
+                closed = true;
+                break;
+            }
+        }
+        assert!(closed, "the clean follow-up closed: {}", counters(&cache));
+        assert_eq!(x_publications, 1, "the follow-up re-read X once");
+        assert!(!index.bounded_sweep_had_unsettled_upload());
+        assert_eq!(
+            index.files[&local_index_key(&x_path)].size_bytes,
+            fixture.len(x)
+        );
+    });
+    assert_eq!(latest, fresh_totals(&fixture));
 }
 
 /// §r sizing at the measured event counts. Prints the figures for the PR;
