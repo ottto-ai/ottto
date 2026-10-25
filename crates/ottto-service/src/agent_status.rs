@@ -60,7 +60,7 @@ pub(crate) use codex_saved_quota::scheduled_round_now as codex_scheduled_round_n
 pub use codex_saved_quota::start_codex_quota_scheduler;
 pub(crate) use codex_saved_quota::{
     refresh_codex_quota_now, saved_codex_quota_generation, stop_codex_quota_scheduler,
-    with_codex_home_read_lock,
+    wake_codex_quota_scheduler, with_codex_home_read_lock,
 };
 #[cfg(test)]
 pub(crate) use codex_setup_gate::SetupGateTestClock;
@@ -2259,6 +2259,13 @@ fn collect_codex_slot_candidates(
 
 /// The default Codex home and every accepted managed slot home.
 fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
+    codex_home_slots_checked(status).0
+}
+
+/// [`codex_home_slots`], and whether every settings read it made succeeded:
+/// `false` when the registered bindings or an accepted slot's home could not
+/// be read, so a slot may be missing for a reason that can pass.
+fn codex_home_slots_checked(status: &CodexAccountsStatusV1) -> (Vec<CodexHomeSlot>, bool) {
     let store = FileCodexAccountSlotSettingsStore::default();
     let mut slots = vec![CodexHomeSlot {
         slot_id: "default".to_string(),
@@ -2266,8 +2273,9 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
         home: default_codex_home(),
         registered_binding: None,
     }];
-    let registered = store
-        .registered_bindings()
+    let registered = store.registered_bindings();
+    let mut complete = registered.is_ok();
+    let registered = registered
         .unwrap_or_default()
         .into_iter()
         .filter(|binding| binding.accepted)
@@ -2276,6 +2284,7 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
     for descriptor in &status.managed_slots {
         if let Some(binding) = registered.get(&descriptor.slot_id) {
             let Ok(home) = store.slot_home(&descriptor.slot_id) else {
+                complete = false;
                 continue;
             };
             slots.push(CodexHomeSlot {
@@ -2289,7 +2298,7 @@ fn codex_home_slots(status: &CodexAccountsStatusV1) -> Vec<CodexHomeSlot> {
             });
         }
     }
-    slots
+    (slots, complete)
 }
 
 fn collect_codex_home_candidate(
@@ -15478,6 +15487,28 @@ fn codex_credential_claimed_ids(credentials: &CodexAuthCredentials) -> Option<(S
         }
     }
     Some((account_id, raw_workspace_id))
+}
+
+/// When the binding a credential claims ([`codex_credential_claimed_binding`])
+/// lapses: the earliest expiry of the tokens it is checked against. `None`
+/// when a token's expiry cannot be read.
+fn codex_credential_claim_lapses_at(credentials: &CodexAuthCredentials) -> Option<u64> {
+    [
+        credentials.access_token.as_deref(),
+        credentials.id_token.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(|token| {
+        structurally_valid_live_codex_jwt_claims(token)?
+            .get("exp")?
+            .as_i64()
+            .and_then(|expires_at| u64::try_from(expires_at).ok())
+    })
+    .try_fold(u64::MAX, |earliest, expires_at| {
+        Some(earliest.min(expires_at?))
+    })
+    .filter(|earliest| *earliest != u64::MAX)
 }
 
 /// The account identifier hash the credential claims (not validated), for
