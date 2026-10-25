@@ -2476,15 +2476,16 @@ mod tests {
     fn retired_forward_inflates_gzip_claude_exports_and_refuses_unknown_encodings() {
         use std::io::Write as _;
         let support_dir = crate::test_scratch::ScratchDir::new("relay-retired-gzip");
-        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
-        encoder
-            .write_all(CLAUDE_API_REQUEST_LOG)
-            .expect("compress fixture");
-        let mut request = otlp_post(
-            "/v1/logs",
-            "application/json",
-            &encoder.finish().expect("finish gzip"),
-        );
+        let gzip_member = |bytes: &[u8]| {
+            let mut encoder =
+                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+            encoder.write_all(bytes).expect("compress fixture");
+            encoder.finish().expect("finish gzip")
+        };
+        // An empty first member must not hide the export in the next one.
+        let mut body = gzip_member(b"");
+        body.extend(gzip_member(CLAUDE_API_REQUEST_LOG));
+        let mut request = otlp_post("/v1/logs", "application/json", &body);
         request
             .headers
             .insert("content-encoding".to_string(), "gzip".to_string());
