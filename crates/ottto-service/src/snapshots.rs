@@ -38130,6 +38130,7 @@ fn ensure_bounded_traversal(
         // refusal leaves the old red checkpoint and all pending/fingerprints
         // intact; uncovered history must never turn a memory limit into reads.
         let streaming_carry = window_scratch_admitted
+            && crate::heap_layout_bound::layout_supported()
             && scoped_retry_allowed
             && full_rearm_window_roots.is_empty()
             && index.claude_full_rearm_progress.full_rearm_window.is_none()
