@@ -1,5 +1,7 @@
 // Exercise the actual finish_sync_source exit, not a copied settlement order.
 // All transcripts, credentials and HTTP responses are synthetic and local.
+// Real prepare/finish calls mutate the process-global source manifest cache,
+// so their tests also hold source_manifests across the whole cycle.
 use super::*;
 
 #[derive(Clone, Copy, Debug)]
@@ -402,7 +404,7 @@ fn permanent_finish_pipeline(outcome: FinishOutcome, expected_valid: bool) {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
     permanent_finish_pipeline(FinishOutcome::Permanent, true);
@@ -410,7 +412,7 @@ fn permanent_finish_real_pipeline_preserves_earned_native_lease() {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
     for outcome in [
@@ -424,7 +426,7 @@ fn permanent_finish_real_pipeline_keeps_ineligible_exits_revoked() {
 
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sidecars() {
     permanent_finish_pipeline(FinishOutcome::PermanentWithoutSidecars, true);
@@ -435,7 +437,7 @@ fn permanent_finish_real_pipeline_native_census_does_not_require_optional_sideca
 /// `backend_validation_error`, and the native lease outcome is unchanged.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
     for reason in [
@@ -456,7 +458,7 @@ fn permanent_finish_dominated_refusals_report_settled_residue_every_cycle() {
 /// receives the `census_residue` code.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
     permanent_finish_pipeline(
@@ -476,7 +478,7 @@ fn permanent_finish_dominated_refusals_never_send_unadmitted_census_residue() {
 /// While B is pending, quiet cycles must not report a settled success.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn permanent_finish_dominated_refusal_with_pending_newer_body_is_not_success() {
     if !crate::heap_layout_bound::layout_supported() {
@@ -800,7 +802,7 @@ fn root_absent_family_closure_count(lines: &[serde_json::Value]) -> u64 {
 /// counts once (agent-a is listed by its own line).
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
     for (sibling, name) in [
@@ -821,7 +823,7 @@ fn rootless_family_member_list_offers_no_sibling_through_the_real_pipeline() {
 /// each counts as held through the absent root.
 #[test]
 #[serial]
-#[serial(source_cadences)]
+#[serial(source_cadences, source_manifests)]
 #[serial(client_report)]
 fn rootless_family_root_list_offers_no_subagent_through_the_real_pipeline() {
     let Some((_, lines)) =

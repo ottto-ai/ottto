@@ -22539,6 +22539,7 @@ for line in sys.stdin:
     }
 
     #[test]
+    #[serial]
     fn verify_of_ended_setup_run_lets_sign_in_reconnect_the_connected_mac() {
         const EXPIRED: &str = r#"{"detail":"Setup run expired"}"#;
         let _guard = lock_backend_test_env();
