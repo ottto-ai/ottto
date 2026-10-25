@@ -6990,26 +6990,68 @@ mod phase_b_tests {
         let _shadow_mode = phase_b::ShadowMode::set(true);
         let calibration = admitted_scale_calibration();
         const FILES: usize = 12400;
-        let mut index = ScanIndex::default();
-        let mut next = 0_u64;
-        for file in 0..FILES {
-            let count = MAX_CLAUDE_REQUEST_CENSUS_HASHES / FILES
-                + usize::from(file < MAX_CLAUDE_REQUEST_CENSUS_HASHES % FILES);
-            let key = format!("/phase-b/projects/scale-{file}.jsonl");
-            let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
-            entry.source_file_fingerprint = "a".repeat(64);
-            index.files.insert(key.clone(), entry);
-            let hashes = (next..next + count as u64).collect();
-            next += count as u64;
-            assert_eq!(
-                index
-                    .claude_request_census
-                    .insert_for_test(&key, record('a', hashes)),
-                ClaudeRequestCensusInsert::Stored
-            );
-        }
-        prepare_safety_checkpoint(&mut index);
-        let checkpoint = serde_json::to_vec_pretty(&index).unwrap();
+        let ((mut index, checkpoint, next), original_allocation) =
+            crate::retry_allocation_probe::measure_caller_thread(|| {
+                let mut index = ScanIndex::default();
+                let mut next = 0_u64;
+                for file in 0..FILES {
+                    let count = MAX_CLAUDE_REQUEST_CENSUS_HASHES / FILES
+                        + usize::from(file < MAX_CLAUDE_REQUEST_CENSUS_HASHES % FILES);
+                    let key = format!("/phase-b/projects/scale-{file}.jsonl");
+                    let mut entry = crate::snapshots::tests::manifest_index_entry(Some("body"));
+                    entry.source_file_fingerprint = "a".repeat(64);
+                    index.files.insert(key.clone(), entry);
+                    let hashes = (next..next + count as u64).collect();
+                    next += count as u64;
+                    assert_eq!(
+                        index
+                            .claude_request_census
+                            .insert_for_test(&key, record('a', hashes)),
+                        ClaudeRequestCensusInsert::Stored
+                    );
+                }
+                prepare_safety_checkpoint(&mut index);
+                let checkpoint = serde_json::to_vec_pretty(&index).unwrap();
+                (index, checkpoint, next)
+            });
+        let original_live = usize::try_from(original_allocation.requested_live).unwrap();
+        // Closest main-equivalent construction, not an unmodified main binary:
+        // same native files and frozen main D1 census, no D2 shadow/safety.
+        // main snapshot_sync keeps a committed clone, and committable_subset
+        // constructs a separate file map for a partial save. Exercise those
+        // actual methods, rather than assuming two arbitrary clones are main.
+        let (main_copy_peak, main_native_copies) = {
+            let _main_mode = phase_b::ShadowMode::set(false);
+            let main = ScanIndex {
+                files: index.files.clone(),
+                claude_request_census: main_reference::MainAdmission::from_census(
+                    &index.claude_request_census,
+                )
+                .into_census(),
+                ..ScanIndex::default()
+            };
+            assert_eq!(main.claude_request_census.hash_total, next as usize);
+            let accepted = BTreeSet::from(["body".to_owned()]);
+            let ((committed, partial), construction) =
+                crate::retry_allocation_probe::measure_caller_thread(|| {
+                    let committed = main.clone();
+                    let partial = main.committable_subset(&committed, &accepted, &BTreeMap::new());
+                    assert_eq!(committed.files.len(), FILES);
+                    assert_eq!(partial.files.len(), FILES);
+                    (committed, partial)
+                });
+            // Copying only the resulting native maps reproduces their node
+            // shapes and String payloads, independently of census allocations.
+            let (copies, native) = crate::retry_allocation_probe::measure_caller_thread(|| {
+                (committed.files.clone(), partial.files.clone())
+            });
+            assert_eq!(copies.0.len(), FILES);
+            assert_eq!(copies.1.len(), FILES);
+            (
+                construction.requested_peak_with_overlap,
+                usize::try_from(native.requested_live).unwrap(),
+            )
+        };
         // COST caps additional D2 bytes. These two native file-map copies
         // exist on main too: census adds no ScanIndexEntry fields. Measure
         // their actual requested live bytes separately, but keep them inside
@@ -7056,10 +7098,18 @@ mod phase_b_tests {
         // be below the measured peak, which therefore occurs with BOTH full
         // native maps alive. Decode's native map remains charged in full.
         assert!(allocation.requested_peak_with_overlap > preparation_peak);
+        // Credit no more than the independently measured main-equivalent
+        // native committed/partial pair, even if its tree shapes differ.
+        assert!(main_native_copies >= main_files_baseline);
         let additional_peak = allocation
             .requested_peak_with_overlap
             .checked_sub(main_files_baseline)
             .unwrap();
+        let inclusive_fixture_peak = original_allocation.requested_peak_with_overlap.max(
+            original_live
+                .checked_add(allocation.requested_peak_with_overlap)
+                .unwrap(),
+        );
         let (refused_by, limit, requested) = admission.refusal_receipt();
         assert!(matches!(
             admission.refused_by(),
@@ -7081,6 +7131,15 @@ mod phase_b_tests {
         );
         eprintln!("FIX3_PHASE_B_SCALE_BASELINE raw_peak_bytes={} main_files_baseline_bytes={main_files_baseline} additional_peak_bytes={additional_peak} preparation_peak_upper_bytes={preparation_peak} entry_inline_bytes={} baseline_scope=two_main_native_files_clones decoded_files_charged=true census_and_checkpoint_overlap_charged=true",
             allocation.requested_peak_with_overlap, std::mem::size_of::<ScanIndexEntry>());
+        eprintln!("FIX3_PHASE_B_SCALE_MAIN_REFERENCE main_equivalent_native_copy_bytes={main_native_copies} d2_claimed_native_baseline_bytes={main_files_baseline} main_equivalent_construction_peak_bytes={main_copy_peak} same_fixture_files={FILES} same_fixture_hashes={next} main_only_binary=false equivalent=main_committed_clone_and_partial_save_with_D1_no_D2 native_result_maps_measured_independently=true");
+        eprintln!("FIX3_PHASE_B_SCALE_ACCOUNTINGS old_clones_in_d2_bytes={} new_clones_in_main_bytes={additional_peak} additional_cap_bytes={} old_accounting_gated=false new_accounting_gated=true",
+            allocation.requested_peak_with_overlap, shadow_admission::ADDITIONAL_PEAK_CAP);
+        // No general whole-daemon budget is defined for phase B. The separate
+        // phase-E inclusive gate is 128 MiB less 10%; it is not activation here.
+        // This is the synthetic main+D2 fixture, including pre-existing input,
+        // NOT daemon RSS or allocations from other runtime threads.
+        eprintln!("FIX3_PHASE_B_SCALE_INCLUSIVE main_plus_d2_fixture_peak_bytes={inclusive_fixture_peak} original_fixture_live_bytes={original_live} whole_daemon_peak_bytes=unavailable whole_daemon_rss_measured=false whole_daemon_budget_bytes=undefined whole_daemon_budget_gated=false phase_e_inclusive_limit_bytes={} phase_e_gate_applicable=false main_entry_inline_bytes={} main_counting_owner_inline_growth_bytes=24 scope=synthetic_caller_thread_fixture_including_original_index_and_checkpoint",
+            shadow_admission::ADDITIONAL_PEAK_CAP * 9 / 10, std::mem::size_of::<ScanIndexEntry>());
         assert!(
             additional_peak <= 128 * 1024 * 1024,
             "additional peak receipt: {additional_peak}; raw={} main_files_baseline={main_files_baseline}",
