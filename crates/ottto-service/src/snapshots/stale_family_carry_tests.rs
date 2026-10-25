@@ -3640,6 +3640,42 @@ fn streaming_accepted_carry_matches_the_existing_family_refusals() {
 }
 
 #[test]
+fn accepted_carry_streams_when_request_graph_refuses_even_a_small_family_set() {
+    if !crate::heap_layout_bound::layout_supported() {
+        return;
+    }
+    let mut fixture = scoped_retry_fixture(0, 2, false);
+    let root = fixture.roots[0].clone();
+    let pending = fixture
+        .index
+        .claude_usage_family_pending
+        .get_mut(&root)
+        .unwrap();
+    pending.member_occurrences.clear();
+    pending
+        .member_request_id_hashes
+        .insert(root, (0..12000).map(|n| format!("{n:064x}")).collect());
+    let stale = fixture
+        .index
+        .claude_usage_family_pending
+        .keys()
+        .cloned()
+        .collect();
+    assert!(!claude_stale_family_carry_scratch_admitted(
+        &fixture.index,
+        &stale,
+        0
+    ));
+    let row = carry_start(&mut fixture.index, CARRY_RETRY, BACKFILL_WINDOW_DAYS);
+    assert_eq!(row["carried_pending_families"], 2);
+    assert_eq!(row["rearmed_index_files"], 0);
+    assert_eq!(
+        scoped_retry_full_reads(&fixture.index, &fixture.candidates),
+        0
+    );
+}
+
+#[test]
 fn scaled_retry_defers_without_clearing_when_cancellation_cannot_be_funded() {
     if !crate::heap_layout_bound::layout_supported() {
         return;
