@@ -64,6 +64,7 @@ pub(crate) fn guard_unit_test_egress(builder: ureq::AgentBuilder) -> ureq::Agent
 /// after an environment fixture has dropped. Redirects are disabled above in
 /// tests too: ureq invokes middleware only for the initial request.
 #[cfg(test)]
+#[allow(clippy::result_large_err)] // ureq middleware requires this unboxed Error type
 fn unit_test_loopback_only(
     request: ureq::Request,
     next: ureq::MiddlewareNext<'_>,
